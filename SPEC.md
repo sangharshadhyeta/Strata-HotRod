@@ -15,6 +15,13 @@ Theme, unchanged: keep off the GPU and out of RAM everything that is not being u
 piece in just in time for its computation. The unit of change is Strata's round (at most 96 swaps per 4 verify windows,
 13.48), not a per-token or per-request event as in solid.cpp.
 
+Rule (user, 2026-10-10): the transfer rate between the hardware is a resource as important as RAM and VRAM. Three links
+are budgeted like capacities: NVMe to RAM, RAM to VRAM over PCIe, and NVMe straight to VRAM (design rates in 13.53:
+NVMe 3.55 GB/s, pinned PCIe 24.5 GB/s, RAM 36.6 GB/s, VRAM 254 GB/s). Every step reports bytes moved per link per
+generated token and the link's utilisation; a swap, a promotion or a prefetch is priced against the link it uses (from
+NVMe it costs the slow link, from RAM the PCIe link); a change that raises the hit rate but pushes more bytes over a
+saturated link is not a win. The baseline already shows the disk link, not compute, setting the speed.
+
 Win bar (user, 2026-10-10): more than 25 tokens/s decode on the target (IQ3_S, this machine).
 Baselines measured on the target on 2026-10-10 with the stock Strata engine (greedy, thinking off, MTP on, 3 warm
 requests per kind after a warm-up): IQ3_S at 32K context: code 16.9, reasoning 16.9, prose 29.7, all-runs median 17.2
@@ -963,7 +970,7 @@ Proposal (assistant, awaiting the user): balanced. Budgets follow the topic (min
 
 Request length check for 13.54 (2026-10-09; Strata's reported 43 tokens/s on an RTX 3060 with IQ3_XXS is the only comparable speed, our engine's speed is unknown; prompt reading over 1,000 tokens/s on long texts): 200 tokens about 5 s; 500 tokens about 12 s; 2,000 tokens (reasoning with a cap) about 47 s; 8,000 tokens about 3 min. Balanced option (a step every 4.3 s, up to 8 experts, 0.2% of an illustrative 4,000-expert tier per step) moves about 0.2%, 0.6%, 2.2% and 8.7% of the tier within those requests; fast would be about 4x that (under 1% for a short request, about 35% for a long one). Budgets therefore change over several requests, which fits carry-over (13.35).
 
-## 14. Port order into the Strata fork (proposal, 2026-10-10; awaiting the user)
+## 14. Port order into the Strata fork (proposal, 2026-10-10; user said "go ahead" the same day; order not yet fixed)
 
 Base: the Strata engine on branch `solid-wins`. Each step is one concept, built and judged before the next starts.
 Every step is judged by the same three checks as solid.cpp's hot-rod port: (1) the operator or unit tests it touches,
@@ -976,7 +983,7 @@ per generated token is recorded with every run, because the baseline says the di
 
 | # | Step | Where it comes from | Why now | Test beyond the three checks |
 |---|---|---|---|---|
-| 0 | Counters only: per-token NVMe bytes, per-layer hit / miss, swaps per round, nothing changes | Strata's `/metrics`, solid.cpp's PART_STATS | Without it no later step can be explained | Speed unchanged within the control |
+| 0 | Counters only: bytes moved per link per generated token (NVMe to RAM, RAM to VRAM, NVMe to VRAM) and link utilisation, per-layer hit / miss, swaps per round, nothing changes | Strata's `/metrics`, solid.cpp's PART_STATS | Without it no later step can be explained | Speed unchanged within the control |
 | 1 | Read path for experts that do not fit RAM: no page-locking of mmap'd experts, no kernel read-around for one expert slice (random-access advice or direct reads) | solid.cpp page: two bugs of this kind cost Qwen roughly 4x (2.81 to 12.85 tok/s) | Cheapest step and the baseline reads about 150 MB per token | Bytes read per token before / after |
 | 2 | Stand-in for every miss as a mask on the router before the top-k (13.20), with an off switch; counts still follow the unmasked picks | 13.11, 13.13, 13.20 | The largest single lever solid.cpp measured on a model that does not fit (12.85 against 8.3 tok/s with it off) | Degeneracy check (repeated 4-grams, single-word dominance), long-answer check at reasoning length, hit rate, speed |
 | 3 | Counts and swaps by the spec: one decayed counter per layer-expert (x0.7 per round), unmasked picks, kept rows only (13.40), margin 1.5, grace of one round (13.49), 96 swaps per 4 windows, none while copies are in flight | 13.2c, 13.36, 13.37, 13.40, 13.48 | Gives step 2 its feedback | Hit rate and unmet demand per layer over a long run |
