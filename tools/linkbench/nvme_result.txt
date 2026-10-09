@@ -1,0 +1,31 @@
+NVMe link now: 8.0 GT/s PCIe x4; max 16.0 GT/s PCIe; read_ahead_kb 4096
+--- sequential, O_DIRECT, 1 MiB
+seq   thr=1  chunk=1024  KiB adv=0 | 2.87 GB/s  2733 ops/s
+NVMe link after load: 8.0 GT/s PCIe x4
+--- random, O_DIRECT: expert-sized reads, by reads in flight
+rand  thr=1  chunk=2048  KiB adv=0 | 2.78 GB/s  1324 ops/s  mean 755 us  max 970 us
+rand  thr=4  chunk=2048  KiB adv=0 | 3.53 GB/s  1681 ops/s  mean 2378 us  max 4295 us
+rand  thr=16 chunk=2048  KiB adv=0 | 3.57 GB/s  1700 ops/s  mean 9399 us  max 16084 us
+rand  thr=32 chunk=2048  KiB adv=0 | 3.57 GB/s  1700 ops/s  mean 18770 us  max 45133 us
+rand  thr=1  chunk=896   KiB adv=0 | 1.90 GB/s  2072 ops/s  mean 482 us  max 698 us
+rand  thr=4  chunk=896   KiB adv=0 | 3.44 GB/s  3752 ops/s  mean 1066 us  max 2032 us
+rand  thr=16 chunk=896   KiB adv=0 | 3.56 GB/s  3885 ops/s  mean 4115 us  max 6964 us
+rand  thr=32 chunk=896   KiB adv=0 | 3.57 GB/s  3886 ops/s  mean 8224 us  max 24640 us
+rand  thr=1  chunk=512   KiB adv=0 | 1.38 GB/s  2629 ops/s  mean 380 us  max 549 us
+rand  thr=4  chunk=512   KiB adv=0 | 3.25 GB/s  6198 ops/s  mean 645 us  max 1372 us
+rand  thr=16 chunk=512   KiB adv=0 | 3.56 GB/s  6790 ops/s  mean 2325 us  max 4174 us
+rand  thr=32 chunk=512   KiB adv=0 | 3.56 GB/s  6798 ops/s  mean 4703 us  max 11355 us
+rand  thr=1  chunk=128   KiB adv=0 | 0.81 GB/s  6150 ops/s  mean 163 us  max 326 us
+rand  thr=4  chunk=128   KiB adv=0 | 2.20 GB/s  16781 ops/s  mean 238 us  max 656 us
+rand  thr=16 chunk=128   KiB adv=0 | 2.69 GB/s  20515 ops/s  mean 780 us  max 2676 us
+rand  thr=32 chunk=128   KiB adv=0 | 2.69 GB/s  20525 ops/s  mean 1558 us  max 5635 us
+--- mmap random reads of one 896 KiB expert slice (cold file): kernel read-around (normal) against MADV_RANDOM
+mmap  thr=1  chunk=896   KiB adv=0 | 0.69 GB/s  753 ops/s  mean 1327 us  max 4944 us | device read 2.57 GB/s = 3.72x the bytes used
+mmap  thr=1  chunk=896   KiB adv=1 | 0.15 GB/s  160 ops/s  mean 6256 us  max 10458 us | device read 0.15 GB/s = 0.99x the bytes used
+mmap  thr=8  chunk=896   KiB adv=0 | 1.07 GB/s  1169 ops/s  mean 6838 us  max 29051 us | device read 3.55 GB/s = 3.31x the bytes used
+mmap  thr=8  chunk=896   KiB adv=1 | 0.25 GB/s  272 ops/s  mean 29382 us  max 42145 us | device read 0.24 GB/s = 0.98x the bytes used
+--- RAM memcpy
+ram   thr=1  chunk=1024  KiB adv=0 | 16.98 GB/s  63 ops/s
+ram   thr=6  chunk=1024  KiB adv=0 | 16.30 GB/s  61 ops/s
+ram   thr=12 chunk=1024  KiB adv=0 | 15.54 GB/s  58 ops/s
+DONE

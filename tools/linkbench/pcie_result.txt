@@ -1,0 +1,18 @@
+--- RAM <-> VRAM
+GPU link under load: PCIe gen,width = 4, 16
+bytes          pinned H2D pageable H2D   pinned D2H
+524288.00        23.37 GB/s     17.34 GB/s     25.13 GB/s   (0.50 MiB)
+917504.00        23.89 GB/s     17.55 GB/s     25.64 GB/s   (0.88 MiB)
+2097152.00       24.19 GB/s     17.61 GB/s     25.92 GB/s   (2.00 MiB)
+8388608.00       24.49 GB/s     17.64 GB/s     26.23 GB/s   (8.00 MiB)
+67108864.00      24.55 GB/s     12.11 GB/s     26.34 GB/s   (64.00 MiB)
+268435456.00     24.60 GB/s     11.91 GB/s     26.34 GB/s   (256.00 MiB)
+536870912.00     20.99 GB/s     11.52 GB/s     26.34 GB/s   (512.00 MiB)
+one swap round, 96 x 2 MiB pinned H2D, one stream: 8.30 ms (24.24 GB/s)
+single synchronous 2 MiB pinned H2D: 89 us each
+--- chain: NVMe (O_DIRECT random) -> pinned RAM -> VRAM
+chain NVMe(O_DIRECT)->pinned->VRAM  threads=1  chunk=896 KiB | 1.71 GB/s
+chain NVMe(O_DIRECT)->pinned->VRAM  threads=4  chunk=896 KiB | 3.42 GB/s
+chain NVMe(O_DIRECT)->pinned->VRAM  threads=8  chunk=896 KiB | 3.56 GB/s
+chain NVMe(O_DIRECT)->pinned->VRAM  threads=4  chunk=2048 KiB | 3.51 GB/s
+DONE
