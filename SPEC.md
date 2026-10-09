@@ -1064,3 +1064,13 @@ Status values: UNTESTED, RUNNING, PASSED (the number), FAILED (the number, decis
 
 The order of the tests follows the port order of section 14; T1 is first because it needs no code.
 
+### 15.1 Notes from reading Strata's code for step 2 (the stand-in mask), 2026-10-10
+
+Read only; nothing is implemented yet.
+- The router is two kernels in `moe_route` (`src/core/layer.cpp`): a BF16 projection writes `b.logits` (512 floats), then a fused top-10 (`native_router_top10`, or `router_top10` for other geometries) does softmax over all experts, a stable descending argsort (ties by index), the gather, and the renormalisation to `b.ids` / `b.weights`. The ids and weights are then published to the host by the doorbell, and the host pool computes the misses.
+- Because the weights are renormalised over the chosen ten, the softmax denominator cancels. Setting the logits of non-resident experts to minus infinity before the top-10 therefore gives exactly "the ten best resident experts, renormalised" (the rule of 13.20), with no change to the top-10 kernel.
+- The residency table is already on the GPU: `thits.d_res` for the token graph and `vh.d_res` for verify windows, indexed `layer * n_expert + expert` (slot, or not-resident), refreshed by `res_put` after every swap round. The hit path is already "decided on the device" inside the captured graph, so a small mask kernel between the projection and the top-10 reads it at run time and stays valid across graph replays.
+- The counts must follow the router's unmasked picks (13.13): run a second top-10 on the unmasked logits and count on the device (an atomic increment per (layer, expert)), copied to the host usage array once per round, instead of publishing a second id list per layer. The existing host-side decay (x0.7) and swap selection (`adapt` in `generate.cpp`) stay.
+- With every miss covered there is no expert for the CPU pool to compute; the CPU path and the PCIe share of 13.2d disappear for routed experts, and the per-layer floor of 10 residents (13.21) must hold at all times, including during a swap round (swaps are exchanges).
+- Risks to test (T4, T14): quality at reasoning length, the drafter's acceptance under stand-ins (the draft layer has its own 512 experts, resident), and the windows of 4 rows (verify windows route several tokens through the same mask).
+
