@@ -1,0 +1,136 @@
+[
+ {
+  "arm": "A1",
+  "env": {
+   "STRATA_IO_STATS": "1"
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    10.6,
+    14.7,
+    15.8
+   ],
+   "reasoning": [
+    14.3,
+    17.4,
+    17.3
+   ],
+   "prose": [
+    17.0,
+    26.9,
+    36.0
+   ]
+  },
+  "median_all": 17.0,
+  "tokens_timed": 2064,
+  "requests_logged": 10,
+  "os_read_mb": 312934.2,
+  "expert_read_mb": 898600.8,
+  "major_faults": 292769,
+  "os_mb_per_token": 151.6,
+  "stdout": "== A1 @ http://127.0.0.1:8090  repeats=3 max_tokens=256\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 4.77, 'decode_tps': 4.221632031349603, 'total_s': 6.9}\ncode      decode tok/s: 10.6, 14.7, 15.8   median 14.7   (tokens [256, 256, 256], ttft [7.3, 1.44, 1.91]s)  \"```python def merge_intervals(intervals: list[tuple[int, int]]) -> lis\"\nreasoning decode tok/s: 14.3, 17.4, 17.3   median 17.3   (tokens [256, 256, 256], ttft [7.83, 0.91, 2.2]s)  \"Here is the step-by-step solution to the problem.  ### Step 1: Analyze\"\nprose     decode tok/s: 17.0, 26.9, 36.0   median 26.9   (tokens [159, 187, 182], ttft [5.09, 0.43, 0.27]s)  \"The gale howled like a wounded beast, battering the granite tower unti\"\nALL median 17.0 tok/s   mean of kind-medians 19.6\n"
+ },
+ {
+  "arm": "B1",
+  "env": {
+   "STRATA_IO_PREFETCH": "1",
+   "STRATA_IO_PF_STAGE": "1"
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    16.4,
+    27.9,
+    14.8
+   ],
+   "reasoning": [
+    21.0,
+    29.0,
+    27.2
+   ],
+   "prose": [
+    23.6,
+    30.0,
+    34.2
+   ]
+  },
+  "median_all": 27.2,
+  "tokens_timed": 2032,
+  "requests_logged": 10,
+  "os_read_mb": 161981.2,
+  "expert_read_mb": 949869.9,
+  "major_faults": 18312,
+  "os_mb_per_token": 79.7,
+  "stdout": "== B1 @ http://127.0.0.1:8090  repeats=3 max_tokens=256\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 1.96, 'decode_tps': 8.368265675949065, 'total_s': 3.0}\ncode      decode tok/s: 16.4, 27.9, 14.8   median 16.4   (tokens [256, 256, 256], ttft [2.74, 0.32, 0.3]s)  \"```python def merge_intervals(intervals: list[tuple[int, int]]) -> lis\"\nreasoning decode tok/s: 21.0, 29.0, 27.2   median 27.2   (tokens [256, 256, 256], ttft [7.21, 0.26, 0.26]s)  \"Here is the step-by-step solution to the problem.  ### Step 1: Analyze\"\nprose     decode tok/s: 23.6, 30.0, 34.2   median 30.0   (tokens [173, 155, 168], ttft [2.52, 0.3, 0.22]s)  \"The gale howled like a wounded beast, battering the granite tower unti\"\nALL median 27.2 tok/s   mean of kind-medians 24.5\n"
+ },
+ {
+  "arm": "A2",
+  "env": {
+   "STRATA_IO_STATS": "1"
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    5.1,
+    16.0,
+    16.1
+   ],
+   "reasoning": [
+    17.2,
+    17.2,
+    16.9
+   ],
+   "prose": [
+    17.1,
+    29.1,
+    33.0
+   ]
+  },
+  "median_all": 17.1,
+  "tokens_timed": 2015,
+  "requests_logged": 10,
+  "os_read_mb": 301380.2,
+  "expert_read_mb": 890448.5,
+  "major_faults": 283229,
+  "os_mb_per_token": 149.6,
+  "stdout": "== A2 @ http://127.0.0.1:8090  repeats=3 max_tokens=256\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 4.97, 'decode_tps': 2.9605997254353755, 'total_s': 8.0}\ncode      decode tok/s: 5.1, 16.0, 16.1   median 16.0   (tokens [256, 256, 256], ttft [5.88, 0.66, 2.25]s)  \"```python def merge_intervals(intervals: list[tuple[int, int]]) -> lis\"\nreasoning decode tok/s: 17.2, 17.2, 16.9   median 17.2   (tokens [256, 256, 256], ttft [7.26, 0.98, 2.64]s)  \"Here is the step-by-step solution to the problem.  ### Step 1: Analyze\"\nprose     decode tok/s: 17.1, 29.1, 33.0   median 29.1   (tokens [145, 166, 168], ttft [4.52, 0.4, 0.26]s)  \"The gale howled like a wounded beast, battering the granite tower unti\"\nALL median 17.1 tok/s   mean of kind-medians 20.7\n"
+ },
+ {
+  "arm": "B2",
+  "env": {
+   "STRATA_IO_PREFETCH": "1",
+   "STRATA_IO_PF_STAGE": "1"
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    19.0,
+    27.5,
+    22.1
+   ],
+   "reasoning": [
+    18.0,
+    31.6,
+    32.6
+   ],
+   "prose": [
+    19.9,
+    31.6,
+    32.9
+   ]
+  },
+  "median_all": 27.5,
+  "tokens_timed": 1979,
+  "requests_logged": 10,
+  "os_read_mb": 160279.4,
+  "expert_read_mb": 939797.0,
+  "major_faults": 20099,
+  "os_mb_per_token": 81.0,
+  "stdout": "== B2 @ http://127.0.0.1:8090  repeats=3 max_tokens=256\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 1.96, 'decode_tps': 8.31194050785345, 'total_s': 3.1}\ncode      decode tok/s: 19.0, 27.5, 22.1   median 22.1   (tokens [256, 256, 256], ttft [2.72, 0.33, 0.35]s)  \"```python def merge_intervals(intervals: list[tuple[int, int]]) -> lis\"\nreasoning decode tok/s: 18.0, 31.6, 32.6   median 31.6   (tokens [256, 256, 256], ttft [7.75, 0.44, 0.26]s)  \"Here is the step-by-step solution to the problem.  ### Step 1: Analyze\"\nprose     decode tok/s: 19.9, 31.6, 32.9   median 31.6   (tokens [163, 135, 145], ttft [1.97, 0.3, 0.24]s)  \"The gale howled like a wounded beast, battering the granite tower unti\"\nALL median 27.5 tok/s   mean of kind-medians 28.4\n"
+ }
+]

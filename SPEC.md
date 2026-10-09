@@ -19,6 +19,11 @@ Theme, unchanged: keep off the GPU and out of RAM everything that is not being u
 piece in just in time for its computation. The unit of change is Strata's round (at most 96 swaps per 4 verify windows,
 13.48), not a per-token or per-request event as in solid.cpp.
 
+Test result (T1, 2026-10-10): the stock engine with `STRATA_IO_PREFETCH=1 STRATA_IO_PF_STAGE=1` (no code change) reached an
+all-runs median of 27.2 and 27.5 tokens/s against 17.0 and 17.1 for the default, with the drive read per token down from
+about 150 to 80 MB (section 15, T1). That is above the win bar of the next paragraph on the all-runs median; the code prompts
+alone are still under it.
+
 Rule (user, 2026-10-10): the transfer rate between the hardware is a resource as important as RAM and VRAM. Three links
 are budgeted like capacities: NVMe to RAM, RAM to VRAM over PCIe, and NVMe straight to VRAM (design rates in 13.53:
 NVMe 3.55 GB/s, pinned PCIe 24.5 GB/s, RAM 36.6 GB/s, VRAM 254 GB/s). Every step reports bytes moved per link per
@@ -1041,7 +1046,7 @@ Status values: UNTESTED, RUNNING, PASSED (the number), FAILED (the number, decis
 
 | # | Decision (where it comes from) | Hypothesis | Evidence so far | Test | Passes when | Status |
 |---|---|---|---|---|---|---|
-| T1 | Staged explicit reads for experts that miss the page cache, not page faults (Strata docs; my link measurements) | Bytes read from the drive per token fall and tokens/s rise | Link test: mmap read-around 3.3 to 3.7x amplification; Strata docs: +25.7% on a 3060 with 32 GB (IQ3_XXS) | A1 B1 A2 B2 with `STRATA_IO_PREFETCH=1 STRATA_IO_PF_STAGE=1` against the default | B beats both A runs by more than their spread | RUNNING |
+| T1 | Staged explicit reads for experts that miss the page cache, not page faults (Strata docs; my link measurements) | Bytes read from the drive per token fall and tokens/s rise | Link test: mmap read-around 3.3 to 3.7x amplification; Strata docs: +25.7% on a 3060 with 32 GB (IQ3_XXS) | A1 B1 A2 B2 with `STRATA_IO_PREFETCH=1 STRATA_IO_PF_STAGE=1` against the default | B beats both A runs by more than their spread | **PASSED (2026-10-10).** Median of the 9 timed runs per arm: A1 17.0, A2 17.1 (control, 0.1 apart), B1 27.2, B2 27.5 tok/s = +60%. Per kind (median of 3, B1 / B2 against A1 / A2): code 16.4 / 22.1 against 14.7 / 16.0; reasoning 27.2 / 31.6 against 17.3 / 17.2; prose 30.0 / 31.6 against 26.9 / 29.1. Drive reads per generated token 79.7 / 81.0 MB against 151.6 / 149.6 MB (-47%); major faults 18,312 / 20,099 against 292,769 / 283,229. Single runs within an arm vary widely (code B1 14.8 to 27.9); code is still under 25 in both B medians. Not checked here: that the answers are token-identical to the default (Strata's docs say the greedy hashes match). Only two runs per arm |
 | T2 | Ranked-profile start (Strata's shipped profile, 13 row 1) | The shipped profile's hit rate holds on our prompts and on IQ3_S | Strata's 0.645 held-out hit rate was on its own workload and variant | Hit rate per layer on our prompt kinds, empty start against shipped profile | Profile beats an empty start in the first requests | UNTESTED |
 | T3 | Adaptive rounds of 96 swaps per 4 windows (user, 13.48; Strata default) | 96 per 4 is better than none, than fewer, than more | Strata docs: a slow-CPU box gained +7.9% at 160 per window | `--adapt-swaps` 0, 48, 96, 192 with `--adapt-every` 4 | A setting clears the control; the bytes the swaps move per token stay under the link budget | UNTESTED |
 | T4 | A stand-in for every miss, as a mask on the router (13.20) | Speed rises with no loss of answer quality, and NVMe reads per token fall to the swap traffic | solid.cpp: 12.85 vs 8.3 vs 3.7 tok/s (rank 2 / off / cache off) on one run; but paired tests on gemma-4 and Qwen found no speed gain and more drift; rank 0 was degenerate | Mask on / off, with the degeneracy and long-answer checks, then the floor of residents per layer (10 and higher) | Faster than off by more than the spread, and no degeneracy at reasoning length | UNTESTED |
