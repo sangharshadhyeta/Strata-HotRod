@@ -1,0 +1,993 @@
+# Engine spec: Qwen3.8-Flash-Next (arch `qwen4exp`), GSQ-RCO generic GGUF
+
+Release: `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (the generic, unpruned one; chosen over the Coder release).
+Target variant: **IQ3_S. LOCKED by the user on 2026-10-08. No further variant comparison.** The Q2_0 header was read earlier and is kept only as a size reference.
+
+**DECISION (user, 2026-10-10): this is no longer a from-scratch engine.** We fork Strata (branch `solid-wins` in
+`/home/Projects/Strata`, C++/CUDA engine with a Python server) and port solid.cpp's measured wins into it one concept at
+a time, each step built and tested against the previous build before the next (the hot-rod rule). This supersedes the
+earlier lines "written from scratch", "Host language: Python" and "GPU kernel route and allowed libraries: [OPEN]"
+(Strata's existing kernels and dequantisers are the route; vLLM and solid.cpp stay read-only references). Sections 1-11
+remain the model reference (the math, the tensors, the formats); sections 12-13 are the residency policy that is to be
+implemented inside Strata's engine; section 14 is the port order.
+
+Theme, unchanged: keep off the GPU and out of RAM everything that is not being used at that instant, and bring each
+piece in just in time for its computation. The unit of change is Strata's round (at most 96 swaps per 4 verify windows,
+13.48), not a per-token or per-request event as in solid.cpp.
+
+Win bar (user, 2026-10-10): more than 25 tokens/s decode on the target (IQ3_S, this machine).
+Baselines measured on the target on 2026-10-10 with the stock Strata engine (greedy, thinking off, MTP on, 3 warm
+requests per kind after a warm-up): IQ3_S at 32K context: code 16.9, reasoning 16.9, prose 29.7, all-runs median 17.2
+tok/s, NVMe read 1.87 GB/s (about 150 MB per generated token). IQ3_S with the English draft vocabulary: 16.6 (no gain).
+Unsloth UD-IQ4_XS at 8K context: 4.9 tok/s, NVMe read 1.48 GB/s (about 370 MB per token). Each file measured once.
+
+Single-model inference engine. This spec is derived from reading the reference code (solid.cpp, vLLM, Strata) and the
+GGUF headers. The reference repos are read-only. Nothing here is generic: every choice is for this one model.
+
+Target: Rocky Linux, RTX 3060 12 GB (Ampere, sm_86), 32 GB RAM, 512 GB NVMe.
+
+Status tags used below:
+- [SRC] read directly in reference source, two or more sources agree
+- [SRC1] read in one source only, needs a second check
+- [INFER] (no longer used; section 2 is now fully verified from the header)
+- [OPEN] not known yet, must be found by experiment
+
+All numeric values marked [INFER] or [OPEN] are decided by the GGUF header (step 1 of the plan).
+No number in this file may be hard-coded into the engine until it is read from the file.
+
+---------------------------------------------------------------------------------------------
+
+## 0. Configuration (what we are building for)
+
+### 0.1 Target machine
+
+| Item | Value |
+|---|---|
+| OS | Rocky Linux |
+| GPU | NVIDIA RTX 3060, 12 GB VRAM (Ampere, compute capability 8.6) |
+| RAM | 32 GB |
+| Disk | 512 GB NVMe |
+| Dev machine (not a target) | Windows laptop, Ryzen 7 7735U, 15.3 GB RAM, integrated Radeon, C: 127.6 GB free, F: 79.4 GB free |
+
+### 0.2 Model release
+
+| Item | Value |
+|---|---|
+| Repo | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (generic, unpruned) |
+| Architecture tag | `qwen4exp` |
+| Routed experts | 512 per layer, 10 active per token |
+| Trunk layers | 48 (12 full attention, 36 GDN) |
+| Tensors per file set | 1,224 |
+| Files per variant | 2 shards: weights (shard 1), n-gram table (shard 2, identical in every variant) |
+| Base model (BF16) | 354 GB |
+
+### 0.3 Variants (all sizes from the model card and Strata fingerprints)
+
+| Variant | Avg bpw | Shard 1 (weights) | Shard 2 (n-gram) | Total | Expert types inside | Role for us |
+|---|---|---|---|---|---|---|
+| Q2_0 | 2.40 | 37.6 GB | 28.8 GB | 66.4 GB | Q2_0 only | Header read (data/gguf_header_q2_0) |
+| IQ2_XS | 2.50 | 39.2 GB | 28.8 GB | 68.0 GB | IQ1_M, IQ2_S, IQ2_XXS, Q2_0 | |
+| IQ3_XXS | 3.00 | 47.0 GB | 28.8 GB | 75.8 GB | IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, Q2_0 | |
+| IQ3_S | 3.50 | 54.8 GB | 28.8 GB | 83.6 GB | IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, Q2_0 | **LOCKED target. Header read (data/gguf_header_iq3_s)** |
+
+Published quality (vendor-reported, 3 tasks; BF16 base = 354 GB): IQ3_S task average 93.26 vs BF16 93.12 (AIME25 100.00, GPQA-D 92.93, LCB v6 86.86). IQ3_XXS 92.57, IQ2_XS 89.16, Q2_0 89.07.
+Caveats: self-reported by the quantiser; only three tasks; no independent or long-context test found. Unsloth publishes no quality numbers for its quants (UD-Q4_K_XL 111 GB up to Q8_0 192 GB), so it cannot be ranked against IQ3_S from public data.
+Swift 1.5 (ukisai) is a quantisation of a different, fine-tuned model (Swift Flash Next), not this model, and reports KL divergence only. Not comparable.
+IQ3_S needs these dequantisers for routed experts: IQ2_S, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, Q2_0 (per Strata fingerprint). Its own header must be read before section 6 is final.
+
+The n-gram table (shard 2) is IQ4_NL for every variant, so IQ4_NL is needed from the start.
+
+### 0.4 Sizes from the headers (placement is NOT decided)
+
+| Piece | Q2_0 build | IQ3_S build (target) |
+|---|---|---|
+| Routed experts (144 tensors) | 33,973,862,400 B (all Q2_0) | 50,292,326,400 B (mixed, see section 6) |
+| Everything else in shard 1 | 3,636,231,680 B | 4,511,552,000 B |
+| Shard 1 total (last tensor offset) | 37,610,094,080 B | 54,803,878,400 B |
+| Shard 2: n-gram table (IQ4_NL) | about 28.8 GB | about 28.8 GB |
+| Header size | 11,024,650 B | 11,024,355 B |
+
+Rule from the user (2026-10-08): do not assume what goes in VRAM. Where each tensor group lives
+(GPU, pinned RAM, mmap from NVMe) is decided by measurement on the target machine, not by guess.
+The machine offers 12 GB VRAM, 32 GB RAM and a 512 GB NVMe. Nothing here says what fits where.
+
+Header comparison (Q2_0 vs IQ3_S, both parsed by my reader): tensor names, shapes and order are identical in the two files.
+All model hyperparameters and the whole tokenizer are identical. Only the per-tensor quantisation types differ,
+plus a few general.* keys (file_type 41 vs 26, description, tags, license/base_model keys present only in Q2_0).
+So section 2 holds for every variant; section 6 is per variant.
+
+### 0.5 Model portions and placement (IQ3_S build; sizes from its header)
+
+The last column is our own decision record. Only decided items are filled in. "Undecided" means it will be settled by measurement on the target.
+
+| # | Portion | What it is | Tensors | Size | Touched per token | Placement |
+|---|---|---|---|---|---|---|
+| 1 | Token embedding | Token id to a 2560-vector | 1 | 0.34 GB | 1 row | Undecided |
+| 2 | Output head | 2560-vector to 248,320 logits | 1 | 0.52 GB | all | Undecided |
+| 3 | Hyper-connections | Mix the 4 residual streams (2 per layer + 1 final) | 387 | 1.28 GB | all | Undecided |
+| 4 | Routed experts | 512 per layer x 48 layers (gate, up, down) | 144 | 50.29 GB | 10 of 512 per layer | Tiered by the usage score (decided 2026-10-08): top slice is the fast tier, next slice is not all kept in RAM either, the rest only on NVMe. Cut points: undecided, to be measured |
+| 5 | Shared expert | One always-on expert per layer, plus its gate | 192 | 0.15 GB | all | Undecided |
+| 6 | Router | Picks the 10 experts per layer | 48 | 0.13 GB | all | Undecided |
+| 7 | Indexer | Picks key blocks to attend to (12 attention layers) | 48 | 0.04 GB | 12 layers | Undecided |
+| 8 | Attention | Q, K, V, output, norms (12 layers) | 72 | 0.44 GB | 12 layers | Undecided |
+| 9 | GDN | Linear attention: projections, conv, decay, norm (36 layers) | 324 | 1.56 GB | 36 layers | Undecided |
+| 10 | PLE layer | The extra block on layer 1 | 6 | 0.07 GB | layer 1 only | Undecided |
+| 11 | N-gram table | 16 heads of about 20M rows x 160 values (shard 2, IQ4_NL) | 1 | about 28.8 GB | 16 rows | **NVMe (decided)** |
+| | Runtime state | KV + indexer cache (12 layers), GDN state (36 layers), PLE history | | small | | Undecided |
+| | **Total** | | **1,224** | **about 83.6 GB** | | |
+
+Routed experts and the n-gram table are 79.1 GB of the 83.6 GB (95%). Everything else is 4.5 GB and is used on every token.
+
+---------------------------------------------------------------------------------------------
+
+## 1. Model overview
+
+A 48-layer decoder. Every layer is:
+
+    HC-mix -> token mixer -> HC-combine -> HC-mix -> MoE FFN -> HC-combine
+
+- Token mixer is Gated DeltaNet (GDN, linear attention) on 3 of every 4 layers.
+  Layer i (0-based) is full attention when (i+1) % 4 == 0, otherwise GDN. [SRC: solid.cpp load_arch_hparams, `full_attention_interval` default 4; vLLM `layer_types`]
+- Full-attention layers use QSA: dense GQA attention restricted to the top-k blocks chosen by a
+  small "indexer". Dense is used until the context passes the budget. [SRC]
+- There is no layer norm. Hyper-connections (HC) with 4 parallel residual streams replace
+  every norm. The last HC mixer also replaces the output norm. [SRC]
+- FFN is a sparse MoE (softmax router, top-k routed experts) plus one shared expert with a sigmoid gate. [SRC]
+- One layer also has PLE: an n-gram hash embedding injected into the residual. Its table is the
+  huge 51B-parameter one, held on NVMe/RAM. [SRC]
+- An MTP (multi-token-prediction) draft head exists in the base checkpoint. It is separate
+  and optional; both converters drop it. Out of scope for v1. [SRC]
+- Vision tower (Qwen3-VL ViT, `mmproj` file, 908 MB) is separate. Out of scope for v1.
+
+The generic GGUF has 512 routed experts per layer, 10 active per token [SRC: model card]. (The Coder release has the same 1,224 tensors with 256 experts, so pruning only changes the expert dimension.)
+
+## 2. Hyperparameters (read from the Q2_0 shard-1 header, 2026-10-08) [VERIFIED]
+
+Source of truth: `data/gguf_header_q2_0/header.json` (parsed by my own GGUF reader, header = 11,024,650 bytes, GGUF v3, 73 metadata keys, 1,223 tensors in shard 1; shard 2 holds the 1,224th).
+
+| Symbol | Meaning | Value | GGUF key |
+|---|---|---|---|
+| L | trunk layers | 48 | `qwen4exp.block_count` |
+| ctx | max context | 262,144 | `context_length` |
+| D | hidden size | 2560 | `embedding_length` |
+| vocab | tokens | 248,320 | `tokenizer.ggml.tokens` length |
+| HC | hyper-connection streams | 4 | `hyper_connection.count` |
+| R_hc | HC low rank | 320 | `hyper_connection.low_rank` |
+| n_head | attention heads | 24 | `attention.head_count` |
+| n_kv_head | KV heads | 2 | `attention.head_count_kv` |
+| d_head | head dim (key = value) | 256 | `attention.key_length`, `value_length` |
+| n_rot | rotary dims | 64 | `rope.dimension_count` |
+| rope sections | IMRoPE sections | [11, 11, 10, 0] | `rope.dimension_sections` |
+| rope base | | 10,000,000 | `rope.freq_base` |
+| rms eps | | 1e-6 (9.99999997e-07) | `attention.layer_norm_rms_epsilon` |
+| full-attention interval | | 4 (layers 3,7,...,47) | `full_attention_interval` |
+| GDN conv kernel | | 4 | `ssm.conv_kernel` |
+| GDN d_k = d_v | | 128 | `ssm.state_size` |
+| GDN H_k (key heads) | | 16 | `ssm.group_count` |
+| GDN H_v (value heads) | | 48 | `ssm.time_step_rank` |
+| GDN inner size | = H_v*d_v | 6144 | `ssm.inner_size` |
+| n_expert | routed experts | 512 | `expert_count` |
+| n_expert_used | top-k | 10 | `expert_used_count` |
+| n_ff_exp | routed expert width | 640 | `expert_feed_forward_length` |
+| n_ff_shexp | shared expert width | 640 | `expert_shared_feed_forward_length` |
+| indexer heads n_h | | 4 | `attention.indexer.head_count` |
+| indexer dim d_idx | | 128 | `attention.indexer.key_length` |
+| indexer top-k budget | | 2048 | `attention.indexer.top_k` |
+| compress ratio r | on attention layers | 4 (0 on GDN layers) | `attention.compress_ratios` |
+| PLE layer | 0-based layer index | 1 | `ple.layers` = [1] |
+| PLE n-gram N | | 3 | `ple.ngram_size` |
+| PLE heads per n-gram P | | 8 (so 16 heads total) | `ple.heads_per_ngram` |
+| PLE conv kernel K_p | | 4 (dilation = N = 3) | `ple.conv_kernel` |
+| d_ple | row width | 160 (16 heads x 160 = 2560 = D) | `embedding_length_per_layer_input` |
+| PLE multipliers | uint64 x 3 | 23703573157769, 20109073645365, 8052911324071 | `ple.layer_multipliers` |
+| PLE head vocab sizes | uint64 x 16 | about 20,000,000 each (primes: 20000003, 20000023, ...) | `ple.head_vocab_sizes` |
+| PLE head offsets | uint64 x 16 | 0, 20000003, 40000026, ... (cumulative) | `ple.head_offsets` |
+| PLE table rows | 16 x ~20M | about 320,001,000 rows x 160 = 51.2B params | shard 2 |
+| PLE EOS id | for n-gram cuts | 248044 | `ple.eos_token_id` |
+| PLE image token id | | 248056 | `ple.image_token_id` |
+| tokenizer | | `gpt2` BPE, pre-tokenizer `qwen35` | `tokenizer.ggml.model`, `.pre` |
+| merges | | 247,587 | `tokenizer.ggml.merges` |
+| tokenizer EOS | | 248046 | `tokenizer.ggml.eos_token_id` |
+| BOS / PAD | | 248044 (add_bos = false) | |
+| sampling defaults | | temp 1.0, top_k 20, top_p 0.95 | `general.sampling.*` |
+| chat template | Jinja, about 10k chars | in `tokenizer.chat_template` | |
+| file type / quant version | | 41 / 2 | `general.file_type` |
+
+Derived and checked against tensor shapes: attn_q width 12288 = 24 x 256 x 2; attn_k/v 512 = 2 x 256;
+attn_output input 6144 = 24 x 256; GDN qkv 10240 = 2 x (16 x 128) + 48 x 128; HC norm 10240 = 4 x 2560.
+
+Things the header flags that I did not know before:
+- PLE EOS id (248044) is the BOS/PAD id, while the tokenizer EOS is 248046. The reference converter takes the last entry of `eos_token_id`. Whether 248044 is right for the hash cut is a question for the reference run. [OPEN]
+- The GGUF keeps the tensors under different names than solid.cpp's graph code (`output_hc_*`, not `hc_head_*`). Always use the names in the file.
+
+## 3. Tensor inventory (GGUF names are `blk.N.*`, ggml dim order is [in, out])
+
+Global:
+- `token_embd.weight` [D, vocab]
+- `output.weight` [D, vocab] (not tied)
+- `output_hc_norm` [HC*D], `output_hc_down` [HC*D, R_hc], `output_hc_up` [R_hc, HC*D]   (final mixer, no inject)
+- `per_layer_token_embd.weight` [d_ple, ple_rows]   (the huge n-gram table, lazily read; shard 2 of the file)
+
+Every layer:
+- `hc_attn_norm` [HC*D], `hc_attn_down` [HC*D, R_hc], `hc_attn_up` [R_hc, HC*D], `hc_attn_inject` [HC*D, HC]
+- `hc_ffn_*` same four tensors
+- `ffn_gate_inp` [D, n_expert]; `ffn_gate_exps`/`ffn_up_exps` [D, n_ff_exp, n_expert] (maybe fused as gate_up); `ffn_down_exps` [n_ff_exp, D, n_expert]
+- shared expert: `ffn_gate_shexp`, `ffn_up_shexp` [D, n_ff_shexp]; `ffn_down_shexp` [n_ff_shexp, D]; `ffn_gate_inp_shexp` [D] (one scalar logit per token)
+
+Full-attention layers (i+1)%4==0:
+- `attn_q` [D, 2*d_head*n_head] (query and output-gate interleaved per head), `attn_k`, `attn_v`, `attn_output` [d_head*n_head, D]
+- `attn_q_norm`, `attn_k_norm` [d_head]
+- indexer: `indexer.q_proj` [D, n_h*d_idx], `indexer.k_proj` [D, d_idx], `indexer.q_norm`, `indexer.k_norm` [d_idx]
+  (HF checkpoint has one fused `index_qk_proj`; converter splits first n_h*d_idx rows to q, rest to k) [SRC]
+
+GDN layers:
+- `attn_qkv` [D, 2*key_dim + value_dim] where key_dim = d_k*H_k, value_dim = d_v*H_v
+- `attn_gate` [D, value_dim] (this is z)
+- `ssm_conv1d` [ssm_d_conv, 2*key_dim + value_dim]
+- `ssm_dt.bias` [H_v], `ssm_a` [H_v] (stored as -exp(A_log)), `ssm_beta` [D, H_v], `ssm_alpha` [D, H_v]
+- `ssm_norm` [d_v], `ssm_out` [value_dim, D]
+
+PLE layer only (exactly one; index is 1, 0-based, from `ple.layers`):
+- `ple_key` [D, HC*D], `ple_value` [D, D]
+- `ple_norm_key`, `ple_norm_query`, `ple_norm_conv` [HC*D]
+- `ple_conv1d` [K_p, HC*D]
+
+Note: gamma folding. The HF checkpoint uses Gemma-style norms (`out = xhat * (1 + w)`). The
+reference converter stores `1 + w` for `ple.norm_*` and indexer q/k norms, and the "inherited
+rule" folds HC norms and attn q/k norms too. [SRC] Check in the GGUF whether each norm tensor
+already holds `1 + w`; if it does, multiply by it plainly. [OPEN: per-tensor, verify numerically]
+
+## 4. Forward pass
+
+Notation: x is the residual state `[HC, D]` per token. All norms use f32 math.
+
+### 4.1 Embedding and start state [SRC]
+    e = token_embd[token]            # [D]
+    x = repeat(e, HC)                # HC identical copies
+
+### 4.2 Per-layer loop [SRC]
+    for il in 0..L-1:
+        if il is the PLE layer:  x = PLE(x, il)
+        (m, inj) = HC_mix(x, attn weights)
+        a = token_mixer(m)               # GDN or QSA attention, [D]
+        x = HC_combine(x, a, inj)
+        (m, inj) = HC_mix(x, ffn weights)
+        f = MoE(m)                       # [D]
+        x = HC_combine(x, f, inj)
+    (h, _) = HC_mix(x, output_hc_*, no inject)    # [D], this is the final "norm"
+    logits = output.weight @ h
+
+### 4.3 HC_mix [SRC, solid.cpp build_hc_mix == vLLM GatedResidual.mix, hc_per_branch_norm=True]
+    xn_s  = x_s / sqrt(mean(x_s^2) + eps)           for each stream s separately (length D)
+    xn    = flatten(xn_s) * gamma                    # gamma has HC*D entries
+    lo    = silu( down @ xn / HC )                   # down: [HC*D -> R_hc]
+    gate  = sigmoid( up @ lo )                       # up:   [R_hc -> HC*D]
+    mixed = mean over s of ( gate_s * xn_s )         # [D]
+    inject = inject_w @ xn                           # [HC]  (skipped for the final head mixer)
+Returns `mixed` and `xn`/`inject` for the matching combine.
+
+### 4.4 HC_combine [SRC]
+    w_s = 2 * sigmoid( inject_s / HC )               # inject_s from this layer's matching mix
+    x_s = x_s + block_out * w_s                      # block_out [D] broadcast over streams
+Uses the pre-combine `x` (the residual that went into the mix), not the normalised copy.
+
+### 4.5 Full attention with QSA [SRC for structure, OPEN for details]
+    qfull = Wq m                       # [n_head, 2*d_head]: first d_head = q, second = output gate
+    q = rmsnorm(q, attn_q_norm); k = rmsnorm(Wk m, attn_k_norm); v = Wv m
+    q, k = IMRoPE(q, k, pos)           # 4-section interleaved multimodal rope, text uses same position on all axes
+    attn = softmax(q k^T * (1/sqrt(d_head))) v, over the selected keys (GQA)
+    out  = Wo( attn * sigmoid(gate) )
+Selection (QSA):
+- Indexer keys: `k_raw = Wk_idx m` (one head, d_idx), stored RAW in an indexer cache.
+- Keys are grouped into blocks of r consecutive tokens. Block key = mean of the raw keys in the
+  block, then RMSNorm (`indexer.k_norm`), then RoPE at the block position. [SRC1: solid.cpp pools before norm; vLLM kernel order not yet read, VERIFY]
+- Query: `q_idx = Wq_idx m` as n_h heads, RMSNorm (`indexer.q_norm`), RoPE.
+- Score per block = sum over indexer heads of relu( q_idx_h . blockkey ). [SRC1]
+- Every token inherits its block's score. Mask invisible cells. Take top `width = min(n_kv, budget + r - 1)`
+  tokens, which is whole blocks plus the incomplete tail block. [SRC]
+- Attention then runs only over those cells.
+- Below the budget (n_kv <= budget) selection keeps everything, so attention is dense. [SRC]
+Open: exact visibility/causality rules for the tail block and for a query inside a block (the mask bias). [OPEN]
+
+### 4.6 Gated DeltaNet layer [SRC; this is the Qwen3.5/3-Next GDN with one change]
+    qkv = Wqkv m ; z = Wgate m ; beta = sigmoid(Wbeta m) ; alpha = Walpha m   # per value head
+    qkv = silu( causal_depthwise_conv1d(qkv, ssm_conv1d) )   # conv state: last (ssm_d_conv-1) inputs
+    split into q [H_k, d_k], k [H_k, d_k], v [H_v, d_v]
+    q = l2norm(q); k = l2norm(k)                    # eps = rms eps
+    repeat q,k from H_k to H_v heads (H_v is a multiple of H_k)
+    g = ssm_a * softplus(alpha + dt_bias)           # ssm_a already = -exp(A_log); g <= 0
+    q = q / sqrt(d_k)
+    per value head h, state S_h in R^{d_k x d_v}, per token t:
+        S = exp(g) * S
+        d = (v - S^T k) * beta
+        S = S + k d^T
+        o = S^T q
+    o = rmsnorm(o, ssm_norm) * sigmoid(z)           # the only difference from Qwen3.5: sigmoid, not silu
+    out = ssm_out o
+Prefill may use the chunked (block-parallel) form; decode uses the recurrence above. Both must
+give the same result to within float tolerance. State to keep per GDN layer: S [H_v, d_k, d_v] f32 and the conv tail.
+
+### 4.7 MoE FFN [SRC for shape, OPEN for router details]
+    logits = Wgate_inp m                            # [n_expert]
+    p = softmax(logits); idx = topk(p, n_expert_used)
+    w = p[idx], renormalised to sum 1 ("expert_weights_norm") then * expert_weights_scale   [SRC1, verify both flags in GGUF]
+    routed = sum_j w_j * Down_e( silu(Gate_e m) * Up_e m )
+    shared = Down_s( silu(Gate_s m) * Up_s m ) * sigmoid( w_gate_inp . m )
+    out = routed + shared
+Note: no load-balancing bias in the router. [SRC comment, solid.cpp]
+
+### 4.8 PLE layer (the n-gram embedding) [SRC]
+Token ids for hashing:
+    for each position t, ctx[0] = token[t]; for s = 1..N-1: ctx[s] = token[t-s]
+    an EOS (or a position before the sequence start) cuts the window: that and every older
+    entry become EOS. The token's own EOS does not cut its own context.
+Row lookup for each head:
+    for n = 2..N: mixed_n = XOR_{j<n} ( ctx[j] * mult[j] )
+        for g in 0..P-1:  head h = (n-2)*P + g
+            row_h = (mixed_n mod vocab_size[h]) + offset[h]
+    emb = concat_h table[row_h]                      # [(N-1)*P*d_ple] per token
+Then, with E = emb and x the HC residual state:
+    key   = ple_key E   -> reshape [HC, D] -> per-stream RMSNorm * ple_norm_key
+    query = x           -> per-stream RMSNorm * ple_norm_query
+    s     = sum_D(key * query) / sqrt(D)    per stream   -> [HC]
+    gate  = sigmoid( sign(s) * sqrt(max(|s|, 1e-6)) )
+    value = ple_value E ([D]); gated = value broadcast over streams * gate
+    c     = per-stream RMSNorm(gated) * ple_norm_conv
+    conv  = silu( causal depthwise conv over time, kernel K_p, dilation N, weights ple_conv1d )   # tap k reads (K_p-1-k)*N tokens back
+    x     = x + gated + conv
+The conv needs a history of (K_p-1)*N tokens of `c` per sequence (a per-layer state).
+CRITICAL OPEN POINT on the hash: solid.cpp computes in unsigned 64-bit and uses unsigned `%`.
+vLLM computes in signed int64 with `torch.remainder` (non-negative result) and comments that
+the products "may overflow int64". If a product exceeds 2^63 the two disagree. The constants
+are about 45 bits and token ids are up to ~18 bits, so this can happen. [OPEN: decide by
+testing against reference-generated row ids. Do not pick one from memory.]
+
+## 5. Persistent state per sequence
+
+- Full-attention layers: K and V cache (n_kv_head x d_head), plus the raw indexer key cache (d_idx per token).
+  Only 12 layers (every 4th) have these, so the KV cache is small. [SRC]
+- GDN layers (36): S [H_v, d_k, d_v] f32 and conv tail [ssm_d_conv-1, 2*key_dim+value_dim].
+- PLE layer: conv history [(K_p-1)*N, HC*D] and the last N-1 token ids (for the n-gram window).
+- Rollback (needed only for speculative decoding): snapshots of recurrent state per accepted-token count. Out of scope for v1.
+
+## 6. Quantised weight formats [VERIFIED from the Q2_0 header]
+
+Tensor count per type in shard 1 (1,223 tensors): BF16 483, F32 292, type42 (= Q2_0) 202, Q3_K 91,
+IQ4_XS 56, Q4_K 38, Q5_K 16, Q4_0 16, Q6_K 12, Q5_0 7, IQ4_NL 7, Q8_0 2, F16 1.
+Shard 2 adds IQ4_NL for the n-gram table.
+
+| Type | Seen in | Block layout |
+|---|---|---|
+| Q2_0 (id 42) | all 144 routed expert tensors, many shared-expert / attn_q / attn_gate / attn_qkv tensors, ple_key | 2.25 bits per weight. Block size and scale layout: [OPEN, read ggml source in refs/solid.cpp] |
+| Q3_K | token_embd, attn_k, some shared experts and attn tensors | standard ggml |
+| Q4_K | attn_gate, attn_output, ssm_out, some others | standard ggml |
+| Q5_K | output.weight, attn_v, ssm_out, others | standard ggml |
+| Q6_K | attn_output, ssm_out, shared experts | standard ggml |
+| IQ4_XS | attn_qkv, attn_gate, shared experts | standard ggml |
+| IQ4_NL | some shared-expert down tensors; the whole n-gram table (shard 2) | standard ggml |
+| Q4_0, Q5_0, Q8_0 | shared-expert down tensors | standard ggml |
+| BF16 | HC down/up/inject, router, shared-expert gate, indexer q/k projections, ple_value, ssm alpha/beta, output_hc_down/up | 16-bit |
+| F16 | ple_conv1d | 16-bit |
+| F32 | all norms, ssm_conv1d, ssm_a, ssm_dt.bias | 32-bit |
+
+So the dequantisers needed for the Q2_0 build are: Q2_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL, Q4_0, Q5_0, Q8_0,
+plus BF16/F16/F32 loads. The other variants add more i-quants (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, per Strata fingerprints).
+Reference code for block layouts: `refs/solid.cpp/ggml/src` (ggml-common.h, ggml-quants.c).
+
+### 6.1 IQ3_S build (target), shard 1 [VERIFIED from its header]
+
+Tensor count per type (1,223 tensors): BF16 484, F32 292, Q6_K 129, IQ4_NL 86, Q4_K 47, IQ4_XS 45, IQ2_S 40, Q5_K 35,
+IQ3_XXS 34, IQ3_S 20, type42 (Q2_0) 9, F16 1, Q8_0 1.
+
+Routed expert tensors (144) by type: IQ4_NL 39 (18.40 GB), IQ3_XXS 34 (10.92 GB), IQ2_S 40 (10.75 GB),
+IQ3_S 20 (7.21 GB), Q2_0 9 (2.12 GB), IQ4_XS 2 (0.89 GB). These match the Strata fingerprint exactly.
+
+Dequantisers needed in total for IQ3_S: IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, Q2_0 (experts); Q4_K, Q5_K, Q6_K, Q8_0 (dense);
+BF16, F16, F32. IQ3_S differs from Q2_0 in having no Q3_K, Q4_0, Q5_0 tensors, but adding Q6_K at scale, IQ2_S, IQ3_XXS, IQ3_S and Q8_0.
+Union over the two builds is already 16 formats.
+
+Which tensor uses which type varies by layer (RCO picks per tensor). The full per-tensor type list is in `data/gguf_header_q2_0/header.json`.
+
+## 7. Memory placement
+
+Not decided. See section 0.4. The engine must make placement a configuration of each tensor group
+(device memory, pinned host memory, memory-mapped file) so it can be changed by experiment without
+rewriting kernels. Experiments to run on the target, in order:
+1. Measure usable VRAM and RAM with the CUDA context and OS loaded.
+2. Measure NVMe sequential and random-read throughput for the access sizes the model needs
+   (one expert tensor slice, one n-gram row of 160 values).
+3. Try placements for each tensor group and record tokens per second.
+
+## 8. Tokenizer and chat format
+
+- Model `gpt2` (byte-level BPE), pre-tokenizer name `qwen35`, 248,320 tokens, 247,587 merges, token types array. All in the header. [VERIFIED]
+- The last tokens are `[PAD248316]` ... `[PAD248319]` (padding up to the table size). [VERIFIED]
+- BOS = PAD = 248044, EOS = 248046, `add_bos_token` = false. [VERIFIED]
+- Chat template: Jinja, about 10k characters, stored in `tokenizer.chat_template`; it handles images, videos, tools. [VERIFIED present, not yet read in full]
+- The pre-tokenizer regex for `qwen35` is not in the file as text; it is implied by the name. [OPEN: find the exact regex in refs/solid.cpp (llama-vocab.cpp) or Qwen docs]
+- Special tokens such as `<|vision_start|>` and `<|im_start|>` appear in the token list. [to extract]
+
+## 9. Build plan (each step has a pass/fail check)
+
+1. GGUF reader: parse header, metadata, tensor table, shard 2. Dump every value in sections 2, 3, 6. Check: tensor count is 1224 per file set [SRC fingerprint].
+2. Dequantisers for each type in the file. Check: against a reference dump of a few blocks.
+3. Tokenizer. Check: round-trips on text, matches reference token ids.
+4. Single-layer forward on CPU for each layer kind (HC, GDN, QSA attention, MoE, PLE), in f32. Check each against reference outputs.
+5. Full 48-layer CPU forward for one token. Check: logits against a reference run.
+6. State (KV, GDN, conv), prefill and decode loop, sampling.
+7. CUDA kernels on the 3060: dense GEMV/GEMM, GDN, attention, MoE; expert paging from RAM.
+8. Speed work, then (optionally) MTP drafting, vision.
+
+Reference outputs: we need ground truth logits and per-layer activations from a trusted run.
+Options: run solid.cpp/Strata/vLLM on a machine that fits the model (e.g. rented), or the
+target PC itself once built. We do not need to run them here.
+
+## 10. Known disagreements and risks between the reference implementations
+
+- PLE hash arithmetic (signed vs unsigned), section 4.8.
+- Indexer block key: pool-then-norm (solid.cpp) vs the order inside vLLM's fused kernel. Check `refs/vllm/vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py`.
+- solid.cpp MTP head attends densely (marked "v1 simplification" there). Not relevant to the trunk.
+- Strata's own commit log says stage-buffer pinning corrupted IQ3_S decode after long prompts. A reminder to test long prompts early.
+
+## 11. Source map (where each fact came from)
+
+- Architecture graph: `refs/solid.cpp/src/models/qwen4exp.cpp`
+- HF checkpoint conversion, norm folding, int64 hash constants: `refs/solid.cpp/conversion/qwen4exp.py`
+- GDN recurrence: `refs/solid.cpp/src/models/delta-net-base.cpp`
+- HC reference math: `refs/vllm/vllm/models/qwen4_exp/common/hyperconnection.py`
+- PLE hash/gate/conv doc: `refs/vllm/vllm/models/qwen4_exp/common/ops/ple.py`
+- Decoder layer wiring: `refs/vllm/vllm/models/qwen4_exp/nvidia/model.py`
+- QSA indexer: `refs/vllm/vllm/models/qwen4_exp/nvidia/indexer_qsa.py` (first 330 lines read)
+- Not yet read: qsa.py and ops/qsa*.py (attention details), mtp.py, Strata kernels, tokenizer code, Q2_0.
+
+## 12. Reference: how other engines decide which experts to keep close to the GPU (for study only)
+
+Read from the cloned repos on 2026-10-08. We write our own; none of this is adopted.
+Claims about solid.cpp come from its docs and code comments; nothing here was run.
+
+### 12.1 The Strata profile file (`refs/Strata/data/expert-profile.bin`)
+
+- Format: magic `STRP`, version 1, then n_layers, n_expert, slots, n_ranked (uint32 each), then n_ranked pairs (layer uint16, expert uint16) ranked most-routed first, then a layer x expert table giving each pair's rank. I checked that the table matches the ranked list exactly.
+- The file holds an order, not counts. Routing skew cannot be measured from it directly.
+- 24,576 pairs for the full model (48 x 512); 12,288 for the Coder profile (48 x 256).
+- The top ranks are spread over all layers. Top 4,105 pairs (16.7% of all): 53 to 109 per layer, median 86. Layers 41, 15, 36, 31 and 40 contribute the most to the top 2,000.
+- It is built by `tools/make_profile.py` from routing traces recorded with `--dump-routing`.
+- Skew shows up in measured hit rates. Strata reports a held-out hit rate of 0.645 with 4,105 slots (16.7% of experts), about 3.9 times a uniform pick. Its own source warns that the earlier 0.657 figure was in-sample and that one coverage model claimed 94.9% where 69.2% was measured at 5,805 held.
+- solid.cpp logged hit rates of 0.26 to 0.33 on Qwen with 1,350 slots (5.5% of experts), about 5 to 6 times uniform. Different rigs and workloads, so the two are not directly comparable.
+
+### 12.2 Strata vs the user's solid.cpp
+
+| Aspect | Strata | solid.cpp |
+|---|---|---|
+| Where all experts live | Pinned in RAM (its docs list 48 to 64 GB per variant) | Memory-mapped from the model file |
+| What picks the GPU set | A shipped ranked profile, then adaptive swaps that follow the conversation | Demand-driven: admit after the second miss, LRU/heat eviction; no shipped profile |
+| Prediction | Router lookahead one layer ahead, warming pages and optionally filling spare slots | Lookahead node in the graph, a live-trained pre-router (used for eviction and substitution, not admission), an atlas of similar experts |
+| On a miss | The CPU computes the same expert in place while the GPU does the cached ones | CPU by default; newest commits fetch the expert to the GPU on the miss |
+| Exactness | Every expert computed exactly | Approximate options exist: substitution (on by default), router bias toward cached experts, gate-mass skip |
+| Prompt reading | Streams next-layer experts to the GPU during attention | Cache is decode-only by default |
+| Own measurements | Held-out hit rate 0.645 at 4,105 slots | Hit rate 0.26 to 0.33 at 1,350 slots; experts reread about 14 times from NVMe at about 28% of drive speed |
+
+Notes from solid.cpp's own ledger (docs/ROADMAP.md): substitution lowered greedy agreement with the exact reference to 21.0% against a same-build noise floor of 67.1%; the Qwen speed numbers were taken under disk contention and are marked "rerun before trusting".
+
+## 13. Expert residency design: decision table (we go step by step)
+
+Scope: which routed experts the GPU holds, and how that set changes. Placement of everything else is a separate decision (section 0.5).
+Facts for the Strata and solid.cpp columns were read from the cloned repos (docs, comments, code) on 2026-10-08. Nothing was run.
+The Decision column holds only what the user has decided. "Open" means not discussed yet.
+
+| # | Step | Strata | solid.cpp | Decision |
+|---|---|---|---|---|
+| 1 | Starting state | Cache filled at start from a shipped ranked profile (all 24,576 pairs, ranked by routing frequency on a reference workload) | Starts empty; opt-in history file can pre-admit the hottest, bounded to half of each pool | **As Strata: start from a shipped ranked profile** (decided 2026-10-08) |
+| 2 | Trigger | Periodic: one adaptive round every `adapt_every` verify windows (default 4); a round is skipped if the last round's copies have not landed | Event-driven: a miss can trigger an admission at once (admitted after the 2nd miss) | **Decided (user, 2026-10-08): trigger like solid.cpp (event-driven: a miss can start a change); swapping like Strata (a candidate is paired with the least-used resident expert of the same layer and exchanged for it only when clearly more used; budgets per layer never change).** Count rules, margin, rate limits are still open (13.2, 13.7) |
+| 3 | What is counted | Open, see 13.2 | | **Open: next to discuss** |
+| 4 | Victim choice | Per layer: least-used resident expert, swapped only if the candidate's count exceeds it by 1.5 | Pool-wide: probation drains first, protected capped at 50%, heat tiebreak among 8 candidates, 25% hysteresis, 8 fresh misses before a newcomer may evict | Open |
+| 5 | Slots per layer | Fixed by the profile; swaps stay inside a layer. Its first-come global form measured 2.97% hit rate (cache filled by ~26 layers of the first token); its analysis scored 8 slots/layer at 21.4% and 64/layer at 70.4% | Pools per tensor shape and device; layers compete inside a pool | **Decided: per-layer budgets, no layer competes with another** (user, 2026-10-08). REVISED the same day (13.32): the starting budgets come from the phase 1 weights, and per-layer expert counts then move live in phase 2 within the floor of 10, a cap and a slow decay. **Decided: per-layer budgets come from the profile, counted in bytes not slots** (user, 2026-10-08), because expert size differs by layer in the GSQ-RCO files (see 13.5) |
+| 6 | How much moves per round | At most `adapt_swaps` (default 96) per round, ranked by gain | At most 8 fills per node; queue up to 128 jobs / 512 MiB; one low-priority copy stream per device | Open |
+| 7 | Copy timing | Batched copies between windows while the drafter works; the next window waits for them | Background fills that may land after the layer that needed them | Open |
+| 8 | A miss while a move is pending | The CPU computes the evicted expert meanwhile | CPU by default; newest commits fetch to the GPU on the miss; optional substitution answers the miss with a resident stand-in | **Decided (user, 2026-10-08): every miss is covered by a resident stand-in. No exact miss path, so no uncovered misses.** Quality must be shown with a KL-divergence measurement against an exact run, not greedy agreement. Open: what chooses the stand-in (13.2c) |
+| 9 | Forward-looking signals | None in the swap round (router lookahead exists separately and warms pages) | Lookahead matmul, trained pre-router, atlas | Open |
+| 10 | Persistence | Optional: write the learned state back as a profile; next start uses it | Optional merged history file, refused on model mismatch | Open |
+| 11 | Exactness | Every expert computed exactly; output not bit-identical run to run | Exact for hits and misses; approximations (substitution, router bias, gate-mass skip) are optional | Open |
+
+### 13.1 Trigger: history (superseded by the decision in row 2)
+
+Periodic was first chosen, then reopened, then event-driven was chosen. The notes below are kept for the record; the refinements apply only if the trigger is ever revisited. Proposed refinements to discuss:
+- Define the period in tokens, not verify windows. Windows exist because of speculative decoding, which we do not have at first.
+- A round only submits copies; the swap becomes visible when the copy has landed. Compute never waits on a copy, and a late copy is simply used a round later.
+- Skip a round while the previous round's copies are in flight (as Strata does).
+- Period and per-round cap are parameters, measured on the target. Strata's own calibration found a slower-CPU machine gained +7.9% by swapping more.
+- Evidence is not conclusive either way. Event-driven reacts faster; periodic batches copies and gives one place to apply hysteresis. A period of one token approaches event-driven, so periodic with a tunable period can cover both ends.
+
+### 13.2 Counts: Strata vs solid.cpp (read from code 2026-10-08; decision column is for us to fill)
+
+| Question | Strata | solid.cpp | Decision |
+|---|---|---|---|
+| What counts are kept? | **One** float per (layer, expert): `usage`, 24,576 floats | **Three** things: (a) per non-resident expert a demand record: `count` (misses), `unsubstituted` (misses no stand-in covered), `exact_required` (misses at a top router rank); (b) per resident slot a `heat`; (c) optional cross-run history of selection counts | |
+| What increments it? | +1 for every expert the router picks, for every row of a verify window (hits and misses alike) | (a) +1 per observed miss; (b) +4 per hit (cap 2^20); (c) +1 per selection, merged across runs | |
+| Are non-resident experts counted? | Yes, same counter as residents | Yes, but in a separate record (a), a different unit from heat | |
+| Is the count reset on a move? | No. An evicted expert keeps its count and can swap back in | Yes. The demand record is erased when the fill lands; a slot's heat is zeroed when its content is replaced | |
+| Decay | All counts x0.7 after each adaptive round (clock = rounds, every 4 windows) | Heat is halved every 512 fills (clock = fills, not time or tokens); demand records do not decay, they reset | |
+| Threshold to become a candidate | Decayed count at least 2.0 | `count` at least 2 while free slots exist; at least `readmit_after` = 8 once the pool is full (so the throttle is built into the count) | |
+| Margin to beat the victim | Candidate must exceed the victim's count by more than 1.5, same units | No direct candidate-vs-victim comparison: victim = lowest heat among the 8 coldest-recency slots, with a heat hysteresis | |
+| Compared per layer or globally? | Per layer | Per pool (all layers sharing a tensor shape) | |
+| Which routing is counted? | The router's real picks | The router's picks; admission can be rank-weighted (`exact_required`, weight 0 by default) and counts misses covered by a stand-in separately | |
+| Where does the count start? | Zero; the profile only sets the starting residents | Zero; the history file, if used, pre-admits up to half of each pool | |
+| Known problem recorded in its own code | Counts include drafted rows that may be rejected (not checked) | Decay fires only on fills, so within one busy request heat balloons before decay runs; a hard 50% cap on the protected segment was added to bound it | |
+
+Note for the discussion: Strata's swap compares a candidate and a victim in the same unit (usage). solid.cpp compares different units (a miss tally against slot heat), which is why it needs thresholds, hysteresis and a throttle. A swap rule "like Strata" needs one common unit.
+
+### 13.2b Counts: current lean and candidate features (2026-10-08)
+
+Lean (not decided): the user leans to Strata's counts (one decayed usage counter per layer-expert, compared in one unit).
+
+Under substitution the count must follow what the router wanted (the missed expert E), not what was computed (the stand-in S). Otherwise S looks hot, E looks cold, and E is never swapped in.
+
+Candidate features from solid.cpp (all optional or default-off there, no reported win in its notes; hypotheses to test):
+1. Covered vs uncovered misses: tally separately the misses that a stand-in answered and those it did not (`unsubstituted`). A swap gains more for an uncovered miss.
+2. Rank-aware demand: extra weight for misses at the router's top ranks (`exact_required`, weight 0 by default there).
+3. A higher bar once the pool is full (threshold 2 rises to 8). Strata's margin of 1.5 plays the same role, so likely not needed as well.
+Not proposed: heat with protected/probation segments (built to bound heat that balloons between fills; a single decayed count does not have that problem), cross-run history (Strata can write its learned state back as a profile).
+
+New open sub-questions under row 8 (miss handling):
+- Which misses may substitution cover? solid.cpp's policy: only ranks at or below a minimum rank (with top-10 routing and minimum rank 4, ranks 0 to 3 are about 40% of activations and are computed exactly). This is a policy setting there.
+- What answers a miss that substitution may not cover: a CPU path as in Strata, or a synchronous fetch to the GPU as in solid.cpp's newest commits?
+
+### 13.2c Counts decided, and what substitution-for-every-miss leaves open (2026-10-08)
+
+Decided:
+- Counts: Strata's single decayed usage counter per layer-expert, compared in one unit, with one change: the count follows the router's pick (the missed expert E), not the stand-in that was computed.
+- None of solid.cpp's other count machinery is used (heat with protected/probation segments, per-expert miss records, cross-run history, rank-weighted admission as a separate mechanism).
+- Every miss is answered by a resident stand-in of the same layer. "Covered vs uncovered misses" no longer exists as a feature.
+
+Open:
+- Stand-in choice: **SUPERSEDED on 2026-10-08 (see 13.12): the atlas is dropped; the router's own ranking picks the stand-in.** Was: by similarity, the atlas decides. (solid.cpp builds its atlas from topic-labelled probe runs and co-activation data; rank-aware demand there only weights admission.) Open: how the atlas is built for this model, how the closest resident expert is scored, and whether the router rank breaks ties.
+- Can one resident expert stand in for several misses in the same token?
+- A similarity map for this model has to be built; solid.cpp's atlas tool was run on Gemma only.
+- Quality bar: the KL divergence we accept against an exact run. Reference points: Strata's held-out hit rate was 0.645 at 4,105 slots, so about a third of picks would be stand-ins at that setting (different rig and slot sizes than ours). solid.cpp's own notes say the top-ranked picks carry most of the gate weight, which is why its code limits stand-ins to lower ranks (a policy setting there).
+
+### 13.2d What Strata decides per pick, and what is left for us (read from src/core/expert_source.cpp)
+
+For each distinct expert the router picks in a layer, Strata decides who computes it: resident in VRAM goes to the GPU from its slot; on a second GPU goes there; already landed in a spare swap slot goes to the GPU; otherwise it is a miss, where `(misses * pcie_frac) / 256` of the misses (the last ones in routing order, at most 64) are computed by the GPU reading them over PCIe and the rest by the CPU from RAM. The computed expert is always the one the router asked for. Strata has no stand-in, no similarity data and no atlas.
+
+For us the miss branch disappears: every pick is computed on the GPU, either the router's expert (resident) or its stand-in (not resident). No CPU path, no PCIe split. What carries over is the (layer, expert) to slot table and grouping tokens by expert.
+
+### 13.3 Evidence on substitution from solid.cpp's own notes (docs/ROADMAP.md, docs/LEARNINGS.md)
+
+| Model | Speed vs exact | Greedy agreement with exact | Same-build noise floor |
+|---|---|---|---|
+| Gemma-4 | +1.6% | 21.0% | 67.1% |
+| Qwen3.8-Flash-Next | -1.0% | 54.6% | 41.5% |
+| Ornith-1.5-35B (retired) | +8.11% (the figure behind its default-on setting) | not in these notes | not in these notes |
+
+The Qwen runs were taken under disk contention and are marked "rerun before trusting". Greedy agreement is a weak metric because identical settings only agree 42 to 67% of the time. Proposed measure: KL divergence of next-token distributions against an exact run on fixed text, plus a task score. Substitution also needs a similarity map (the atlas) built for this model.
+
+### 13.4 Check for the claim that cross-layer competition hurt solid.cpp
+
+Not proven. solid.cpp already prints per-layer hit rates in its SUMMARY output (docs/LEARNINGS.md, L4). A layer sitting near zero while others are high would confirm starvation. Strata's 2.97% was the first-come admission form, not an eviction-based pool, so it is a warning, not a measurement of solid.cpp.
+
+### 13.5 Expert size is not uniform in the GSQ-RCO files (from the two headers)
+
+One expert = its gate, up and down slices (each is 1/512 of a stacked tensor). The type is chosen per tensor, so it is the same for all 512 experts of a layer but differs between layers.
+
+| Build | Bytes per expert | Notes |
+|---|---|---|
+| Q2_0 | 1,382,400 in every layer (1.32 MiB) | All 48 layers identical; gate, up and down are all Q2_0 |
+| IQ3_S | 1,510,400 to 2,662,400, mean 2,046,400 (max/min 1.76x) | Seven distinct sizes across layers; in all 48 layers gate, up and down use different types (e.g. layer 0 IQ3_XXS + IQ3_XXS + IQ4_NL = 2,176,000; layer 1 IQ2_S + IQ2_S + Q2_0 = 1,510,400) |
+
+Consequences:
+- A budget must be counted in bytes. A slot count means different things in different layers.
+- A layer's slots all have one size, so a swap inside a layer always swaps equal sizes. That is why the per-layer design needs no size matching during adaptation.
+- A byte budget per layer comes from the profile: take pairs in rank order and add up their sizes. **Decided (user, 2026-10-08): fill by raw routing frequency, not frequency per byte.**
+- Strata supports unequal slot sizes (`open_sized`, "each slot keeps its first size"); I have not checked whether its profile fill weighs size.
+- The profile order depends on routing, which depends slightly on the quantisation, so each variant needs its own profile built from traces of that variant.
+
+### 13.6 Check of the idea "more quantised layers are less important" (IQ3_S header x Strata profile)
+
+Tested on 2026-10-08 using the per-layer expert sizes from the IQ3_S header and the ranking in Strata's shipped profile (one profile, one workload):
+- Correlation between a layer's expert size and its share of the top-ranked pairs: 0.22 (top 2,000), 0.13 (top 4,105), -0.27 (top 8,000). Weak, and the sign changes.
+- Mean rank position per layer vs expert size: Pearson 0.22, Spearman 0.21 (a negative value would mean bigger experts rank hotter).
+- The 8 layers with the biggest experts have mean rank 12,360; the 8 with the smallest 11,891; all layers 12,288.
+So this profile shows no clear link between a layer's bit-width and how often its experts are routed. The ranking-by-frequency decision does not depend on that link. GSQ-RCO picks bit-widths by quantisation sensitivity under a size budget, which is a different thing from routing frequency.
+
+### 13.7 What the trigger + swapping decision leaves open
+
+Strata's swap runs as a periodic round: it looks at all layers together, ranks swaps by gain, and keeps the best `adapt_swaps` (default 96). With an event-driven trigger the same swap happens when a miss arrives:
+1. A miss on expert E in layer L is routed; E's count goes up.
+2. If E qualifies (Strata: count at least 2), it is paired with the least-used resident expert V of layer L.
+3. The swap happens only if E's count exceeds V's by the margin (Strata: 1.5). E replaces V in V's slot (same layer, same size), and V is computed elsewhere until it is swapped back in.
+
+Open points, decided in the counts discussion:
+- Rate limit: **decided as Strata (user, 2026-10-08)**: `adapt_swaps` = 96 swaps at most per round, a round every `adapt_every` = 4 verify windows, and no new round of copies while the previous round's copies are in flight. Both are tunable (Strata's docs show 160 swaps per window helping a slow-CPU machine by +7.9%). Units to fix later: what one "window" is in our engine (one token without speculative decoding; Strata's window checks about 2.4 to 3.2 tokens with its draft model). Strata's global ranking by gain across layers has no per-event equivalent; the cap above replaces it.
+- Whether the counts decay on a clock, per swap or per token (Strata: x0.7 per round).
+- Throttle against churn (solid.cpp: 8 fresh misses before a newcomer may evict).
+- What happens to the missed expert while its copy is pending (row 8, leaning substitution).
+
+### 13.8 The atlas vs the shipped profile (read from solid.cpp and Strata, 2026-10-08)
+
+| | Strata shipped profile | solid.cpp atlas |
+|---|---|---|
+| Question it answers | How often is each (layer, expert) routed? (popularity) | Which experts are alike, i.e. used for the same things? (similarity) |
+| Contents | 24,576 ranked pairs plus a rank table; order only | Per observed cell: position x, y, a specialization score, and a multi-dimensional embedding (`dims`; one note mentions 28 dimensions) |
+| Built from | Routing traces: how many times each pair was picked | Topic-labelled probe prompts (27 prompts, 9 categories, a replication rule of at least 2 probes), and co-activation graphs (experts in the same routing decision; layer L top pick to layer L+1 top pick), factored spectrally; the number of axes is chosen from the data by an eigengap rule; accumulates over runs |
+| Used for | Which experts start resident; fixes per-layer budgets | Choosing which resident expert stands in for a missed one (also warming and eviction in solid.cpp) |
+| Needs the live resident set? | No | Yes: it picks among whatever is resident at that moment |
+| Own warning in the code | Strata's source: ranking is workload-dependent (in-sample 0.657 vs held-out 0.645) | solid.cpp comment: correlation between 2D atlas distance and distance in the 28-dim embedding is -0.003 (noise), so decisions should consult the embedding, not the 2D picture |
+
+The two are different inputs. The profile decides what is resident; the atlas decides which resident expert covers a miss.
+
+Interaction to discuss: residents are chosen by popularity alone (decided), while stand-in quality depends on how close a resident is to the missing expert. A resident set picked purely by frequency may leave regions of the similarity space with no near resident. Not a decision, a point to measure.
+
+Option to discuss: besides topic and co-activation proxies, similarity could be measured directly by how different two experts' outputs are on the same inputs. Not decided.
+
+### 13.9 Atlas construction: decided and debatable (2026-10-08)
+
+Decided (user): build the atlas from topic probes and co-activation, as solid.cpp does.
+Debatable, not decided (user): matching experts by how different their outputs are. Whatever method builds the atlas, it is judged the same way: the KL divergence of the final output against an exact run, so the debate can be settled by measurement.
+For: measures the quantity we care about. Against: needs real activations from a working model; an expert's output difference is only a proxy because the gate weight scales its contribution.
+Sequencing: the atlas and the profile both need routing traces from a running model (our engine or a reference run). Neither can be built before that.
+
+### 13.10 Atlas source narrowed, and the router-ranked stand-in (2026-10-08)
+
+SUPERSEDED (see 13.12): was "co-activation only, topic probes dropped". No atlas is built at all now.
+Stated rule (user): if the router ranks the experts and the top-ranked one is missing, the best-ranked resident becomes the substitute. Details to confirm:
+1. Weight of the stand-in: its own router score renormalised with the other picks, or the weight of the expert it replaces.
+2. Co-activation as a tie-break among the router's top residents, or replaced entirely by the router's ranking.
+3. If the best-ranked resident is already one of the token's other picks, take the next one.
+How it differs from an atlas: uses this token's own router scores (all 512 per layer), needs no stored map; it is the router's top-k restricted to resident experts. Closest solid.cpp relative: router bias toward resident experts (LLAMA_MOE_CACHE_BIAS). Its notes: Qwen hit rate 0.26 to 0.33 at bias 0.5; Gemma greedy agreement 31% against a 67% noise floor; Qwen runs flagged as contaminated, so weak evidence. Risk: when no resident scores well for a token, the best-ranked resident can still be a poor match. Judged, like any method, by KL divergence of the final output against an exact run.
+
+### 13.11 Stand-in weight decided; the design as it stands (2026-10-08)
+
+Decided (user): a stand-in takes its own router score, renormalised together with the other picks of that token. (Reconfirmed 2026-10-08; a misreading in 13.12 was corrected, see 13.13.)
+Confirmed (user): the replacement (swap) system stays alongside the stand-ins. Swaps change slowly which experts are resident; stand-ins cover a miss for the current token.
+
+Per token, per layer, as decided so far:
+1. The router scores all 512 experts and takes its top 10 (the unmasked picks).
+2. Each unmasked pick gets +1 in the decayed usage counter (Strata's counter). Counts follow the router's own picks, never the stand-ins. Counting stand-in-adjusted picks would make it impossible to learn that a non-resident expert is wanted.
+3. A pick that is not resident is replaced by the best-ranked resident expert of the same layer; the weights of all picks are renormalised, the stand-in with its own router score.
+4. A miss can start a swap (event-driven). The candidate (decayed count at least 2.0) is paired with the least-used resident of the same layer and replaces it only if its count exceeds the victim's by more than 1.5.
+5. Rate limit: at most 96 swaps per 4 windows, none while the previous round's copies are in flight. Copies run in the background.
+Start state and budgets: shipped ranked profile, per-layer byte budgets filled by raw routing frequency; the IQ3_S build is locked.
+
+Closed later: co-activation dropped (13.12); duplicates decided (13.13).
+
+### 13.12 No atlas; the stand-in does not take a score (2026-10-08)
+
+Decided (user):
+1. No atlas is needed. Neither topic probes nor co-activation data are built. The stand-in is chosen by the router's own ranking: the best-ranked resident expert of the same layer, by this token's router scores.
+2. [CORRECTED, see 13.13] "Score" meant the +1 in the usage counter, not the gate weight. The earlier reading (the required expert's gate weight goes to the stand-in, no renormalisation) was a misunderstanding and is withdrawn.
+3. The usage counter (Strata's) still counts the originally required expert.
+
+Consequences:
+- Nothing to build for similarity. The sequencing note in 13.9 now concerns only the profile, which still needs routing traces from a running model.
+- Withdrawn: the consequences that depended on the gate-weight reading.
+
+### 13.13 Correction (2026-10-08)
+
+The user's point in 13.12 was about the usage counter: the +1 for a pick goes to the expert the router required, never to the stand-in, because the stand-in was not the router's pick. Normalisation stays.
+
+Standing rules:
+- Gate weights: the stand-in takes its own router score, renormalised together with the other picks of that token (decision of 13.11 stands).
+- Usage counter: +1 only for the originally required (unmasked) pick. The stand-in's use is never counted.
+- No atlas, no co-activation, no topic probes (13.12 item 1 stands). The stand-in is the best-ranked resident expert of the same layer by the token's own router scores.
+- Duplicates: **decided (user, 2026-10-08)**: the stand-in is the best-ranked resident that is not already one of the token's picks. If the best-ranked resident is already picked, take the next one down the ranking. (Reason: with the stand-in's own score used, an already-picked resident would count twice.)
+
+### 13.14 Waiting experts are tiered by the same score (2026-10-08)
+
+Decided (user): not all experts outside the GPU tier are kept in RAM. They follow the same scoring. Ranking by the one usage counter: top slice in the fast tier (per-layer byte budgets, decided), next slice in RAM, the remainder only on NVMe, which holds the master copy of every expert. Cut points come from each tier's capacity and are measured on the target (not decided).
+
+Consequences: every miss is covered by a resident stand-in, so RAM and NVMe are only sources for swaps. A slow tier delays when a swap lands; it never stalls a token.
+
+Prior art read: solid.cpp notes "One policy, three tiers" (2026-08-15, rank by score, top slice to VRAM, next to RAM, rest on disk) and "The RAM buffer, reframed" (2026-08-16). Its measurements: advisory demotion through the OS moved a few percent against a 21x gap; an owned host buffer ran about 30% slower under a 5 GiB cgroup cap, because it took memory from the page cache and did promotions inline on the decode path under a lock; its stated fix is to promote on a background worker. Those tests used an artificial cap, not the real memory split. Strata's low-RAM mode keeps in RAM exactly what the GPU does not hold, and reads the rest from the file when it does not fit.
+
+Open: (a) is the RAM tier a buffer we allocate and manage, or the OS page cache over a memory-mapped file (only the first can enforce the score); (b) does RAM get fixed per-layer byte budgets like the fast tier; (c) promotions into RAM as background prefetch driven by the ranking.
+
+### 13.15 RAM tier answers (2026-10-08)
+
+1. Owned versus page cache: decided by the user "based on the learnings of solid.cpp". Read as: the RAM tier is a buffer we allocate and manage ourselves, so the score can be enforced (the OS page cache can only be advised). Promotion runs on a background worker, never inline on the token path. If experts are read from NVMe with direct reads and not memory-mapped, the page cache does not compete with the buffer (to verify, not assumed).
+2. Budget: decided by the user, follow solid.cpp: one global RAM pool, not per-layer. Reason (assistant, agreed): per-layer budgets matter in the fast tier only because each layer needs residents to stand in for misses; no computation depends on RAM, so a layer with little RAM only means slower swap-ins. Open: is the RAM copy exclusive of the fast tier (Strata and solid.cpp both are) or does it also duplicate what is resident there.
+3. Promotions: CONFIRMED by the user 2026-10-08. Was proposed (assistant): a background worker promotes NVMe to RAM when an expert's score passes the weakest RAM resident by a margin, with a rate limit; the RAM slice is then "next in line" for the fast tier, so an event-driven swap copies from RAM. NVMe reads need many in flight (solid.cpp measured a single page-faulting thread at about 28% of drive speed).
+
+### 13.16 The RAM tier is exclusive: swaps are exchanges (2026-10-08)
+
+Decided (user): the RAM tier does not duplicate what is resident in the fast tier. A swap can be between RAM and the fast tier: the expert evicted from the fast tier is kept in RAM, in the place of the expert that replaced it. Matches Strata's exchange behaviour (copy the evicted expert back into the RAM place of the incoming one).
+
+Consequences (assistant, not yet decided):
+- A swap stays inside one layer, and all experts of a layer have one size, so the exchange swaps equal-sized places.
+- The global RAM pool holds experts of several sizes. IQ3_S has seven distinct sizes (1,510,400 to 2,662,400 bytes), so the pool is organised as seven size classes.
+- If the incoming expert comes from NVMe, the evicted one takes a free RAM place of its size class if its score is above the RAM cut (or displaces the weakest resident of that class); otherwise it is dropped. NVMe is a read-only master copy, so nothing is ever written back to it.
+- Copying the evicted expert to host memory (about 2 MB over PCIe) counts against the swap rate limit.
+
+### 13.17 Do layers differ in how many experts a token needs, and in swap demand? (2026-10-08)
+
+Experts per token: the same in every layer. The header has one `expert_used_count` = 10 for all 48 layers (no per-layer array). Only the cost of a swap differs by layer, since expert size differs (1.51 to 2.66 MB in IQ3_S).
+
+Swap demand per layer is not measured anywhere in our files. An indirect hint from Strata's shipped ranking: every layer receives the same routing mass (10 picks per token), so a layer with more pairs in the global top-N has its picks concentrated on fewer experts, and a layer with few has them spread out.
+- Top 2,000 pairs: per layer min 7 (layer 0), median 43, max 67 (layer 41); 9.6x spread. By band: layers 0-11 hold 353, 12-23 hold 495, 24-35 hold 524, 36-47 hold 628.
+- Top 4,105 pairs: min 53 (layer 0), median 86, max 109 (layer 37); 2.1x spread.
+- Least concentrated: layers 0, 22, 1, 6, 2, 7, 28, 30. Most concentrated: layers 41, 15, 36, 31, 40, 39, 37, 42.
+Reading: early layers, and layer 0 most of all, spread their picks widely, so they are the likeliest to miss and to need swaps. Limits: one profile from one workload, and the ranking shows concentration, not swap counts. solid.cpp's own test of a shallow-layer bonus (more cache for early layers) was a tie at 2x and -2.4% at 4x on Gemma, and was removed.
+Suggestion (not decided): count the swap rate limit in bytes, not swaps, since a swap in a layer with big experts moves more data than one with small experts.
+
+### 13.18 Open: should flat layers get more slots? (2026-10-08)
+
+User's proposal: layers that need more swaps should get more slots. Facts: every layer needs exactly 10 experts per token (13.17); swap demand per layer is probably higher in early, flat layers (layer 0 least concentrated), measured only indirectly.
+Conflict with the decided rule: filling per-layer budgets by raw routing frequency gives flat layers fewer slots (layer 0: 53 of 512 in the top 4,105 vs layer 37: 109), because each of their experts is individually less popular. That rule maximises total hits, not per-layer hit rate and not output quality under substitution.
+Unknown: how much a stand-in damages the output in an early layer vs a late layer. solid.cpp's shallow-layer bonus test (tie at 2x, -2.4% at 4x on Gemma) measured speed with exact compute, so it does not transfer.
+Cost note: layer 0 experts are 2,176,000 bytes each (IQ3_XXS + IQ3_XXS + IQ4_NL), so 20 more slots there is about 43.5 MB.
+Options: A keep frequency-derived budgets; B shift slots toward flat layers to even out hit rates; C start with A, then set per-layer budgets from a per-layer KL measurement of stand-in damage. Not decided.
+
+### 13.19 Per-layer budgets: option C, driven by router requests (2026-10-08)
+
+Decided (user): option C, but the divergence is measured on the router's requests (how much of what the router asked for is not resident), not on output quality. A reference run is not possible, so there is no KL divergence against an exact run in this plan.
+Consequence (noted once): the metric measures how much of the output relies on stand-ins, not how good the stand-ins are. Nothing in the plan measures actual output damage. (Possible later check without a third-party engine: our own engine run with every expert available as the reference. Not decided.)
+How the divergence could be computed from what we already keep: per layer, unmet picks = share of counted router picks that fall on non-resident experts (from the usage counters); unmet gate mass = the router's weight on missing picks as a share of all its weight (needs one extra tally per layer). Suggested: unmet gate mass.
+Open: (1) which measure; (2) objective: minimise total unmet demand (equals option A when every pick counts 1) or cap the worst layer (shifts slots toward flat layers); (3) timing: set once from a profile run, or rebalanced live from the usage counters (this would revise the earlier "fixed per layer from the start").
+
+### 13.20 The stand-in rule equals masked top-k routing (2026-10-08)
+
+Checked numerically: 20,000 random trials (random router scores over 512 experts, random resident sets of 20 to 200, top-10 picks). The decided rule (each missing pick is replaced by the best-ranked resident that is not already picked, weights renormalised) produced exactly the same set as taking the 10 best-scoring resident experts. Zero differences.
+Consequence: the stand-in mechanism can be implemented as one mask on the router scores before the top-10 pick, restricting routing to resident experts. The usage counter still needs the unmasked top-10, so the router's top-10 is computed twice per layer (masked for computing, unmasked for counting).
+Gate-weight vs pick-count measure (13.19): the user leans to the gate-weight measure. Whether it differs from the pick count depends on how concentrated this model's gate weights are across the 10 picks, which is unmeasured (solid.cpp measured it on Gemma only: ranks 4 to 7 hold about 32% of the mass). If the weights are flat across the picks the two measures nearly coincide.
+User's question "should we deliberately push it?": readings offered: (A) bias the router toward resident experts, already done in the hardest form by the mask; (B) swap faster toward the router's top-requested experts; (C) change how the router spreads gate weight, not possible without changing the model. Awaiting the user's reading.
+
+### 13.21 Minimum slots per layer (2026-10-08)
+
+Hard floor: at least 10 resident experts per layer, because the router takes 10 per token and the stand-in rule (masked top-k, 13.20) needs 10 distinct residents. In IQ3_S bytes: 15.10 MB (lightest layer) to 26.62 MB (heaviest) per layer; 982.3 MB (0.98 GB) for all 48 layers, 1.95% of the 50.29 GB routed experts. Swaps are exchanges, so the count never dips below 10 during a swap. This is the minimum for the mechanism to run; a layer held at exactly 10 routes every token through the same 10 experts, so the practical floor for quality is higher and is to be measured.
+Open: the user's "pushing" idea (router requests a light-weight expert while the heavy-weight expert's rank is kept) is unclear. Readings offered: R1 weight the counts by gate weight; R2 alter the router's own weights; R3 accept stand-ins for light misses but protect heavy-weight experts from eviction. Awaiting the user's example.
+
+### 13.22 No bias on the router; the request alone says what to keep (2026-10-08)
+
+Decided (user): nothing is done to the router beyond the decided mask. The router's requests alone tell which experts are better to keep. No soft bias toward resident experts, no weighting of the router's scores, no override of the heavy-weight expert's rank. The usage counter stays +1 per request (13.2c). The "pushing" question in 13.21 is closed.
+The stand-in mask (13.20) is the decided stand-in rule, not a bias, and stays.
+Still open from 13.19: the measure of unmet demand for the per-layer budgets (picks vs gate mass), the objective (minimise total vs cap the worst layer), and the timing (once vs live).
+
+### 13.23 Per-layer budget procedure, as ordered by the user (2026-10-08)
+
+1. Floor: every layer first gets its minimum of 10 resident experts (about 0.98 GB for all 48 layers in IQ3_S).
+2. Divergence: the remaining bytes are distributed by each layer's unmet demand, measured from the usage counters (the share of the router's requests not resident).
+3. Weight: the unmet demand is then refined by gate weight, so a miss on a heavily weighted pick counts for more than a miss on a light one.
+Open inside step 2: where the next expert goes: (a) to the layer with the highest unmet demand (worst-first, evens out hit rates, favours flat layers such as layer 0), or (b) to the highest-demand expert in any layer (minimises total unmet demand, equals frequency fill). Timing (once from a profile run vs live) is still open.
+
+### 13.24 Step 2 of the budget procedure: balance worst-layer-first with highest demand (2026-10-08)
+
+User: worst layer first, but balanced with the highest demand; one worst layer must not fill the fast tier, or the other layers' stand-ins become useless.
+Suggested rule (assistant, awaiting the user's decision): after the 10-expert floor, add the next expert to the layer that maximises gain = d x u, where d = router demand of that layer's next-best non-resident expert and u = that layer's current unmet share (refined by gate weight at step 3). This equals minimising the sum of squared unmet shares across layers; raising u to a higher power moves toward worst-first, power 1 is plain frequency fill. Floor 10 per layer, cap of about 2x the equal share per layer.
+Synthetic check (made-up Zipf-style demand curves with exponent 0 to 1.6, 48 layers, 4,105 slots, floor 10; NOT model data): total/frequency fill gave slots min/median/max 27/94/142 with worst-layer unmet share 0.80 and mean 0.40; d x u gave 12/73/207, worst 0.58, mean 0.41; higher power 10/67/221, worst 0.55; near worst-first 10/58/234, worst 0.52, mean 0.43. Worst-first gave the flattest layer 234 slots (4x the median), which is the hogging the user described. A truly flat layer can never be covered well: each extra slot buys very little.
+Real curves are unknown: Strata's profile stores only an order. Values (power, cap) to be tuned on the target from the unmet-gate-mass distribution per layer.
+
+### 13.25 User's objective: keep misses homogeneous across layers (2026-10-08)
+
+User's proposal: keep the misses homogeneous across the layers. Assistant assessment: a sound goal; it is the minimax rule (minimise the largest per-layer unmet share) with the 10-expert floor and a cap. Perfect homogeneity cannot be reached: layers with concentrated demand sit at the floor with some unmet share that cannot be raised by taking slots away.
+Synthetic check (made-up Zipf-style curves, exponent 0 to 1.6, 48 layers, 4,105 slots, equal share 86; NOT model data):
+- frequency fill: slots 27/94/142, unmet share lowest/highest 0.08/0.80, spread 0.72, mean 0.40.
+- equalise misses, no cap: 10/51/239, 0.16/0.51, spread 0.35, mean 0.44.
+- equalise, cap 2x equal share (171): 10/73/171, 0.16/0.64, spread 0.48, mean 0.43.
+- equalise, cap 1.5x (128): 10/128/128, 0.16/0.73, spread 0.57, mean 0.42.
+Caveat: equal miss rates are not equal damage; per-layer sensitivity to a stand-in is unmeasurable without a reference run. Equal miss rates are a fairness stand-in only.
+Status: the user's lean, not yet final. Open: the cap value (1.5x, 2x the equal share, or other).
+
+### 13.26 Are all layers equally important? (2026-10-08)
+
+Not measured for this model; a reference run is not possible, so there is no direct measure. Closest signal: how the quantiser (GSQ-RCO) spent bits, chosen by sensitivity to quantisation error under a size budget. Routed-expert bits per weight (IQ3_S): layers 0-11 mean 3.08, 12-23 3.22, 24-35 3.47, 36-47 3.55; max 4.33 at layer 47 (last), 3.79 at layers 17, 25, 27, 28, 29, 35, 40; min 2.46 at layers 1, 8, 10, 13, 36. Attention layers average 3.48 bpw vs 3.28 for GDN layers. Dense weights follow suit: layer 47's attention tensors are all Q6_K, layer 23's include Q5_K.
+Reading: later layers, and layer 47 most of all, were judged more sensitive to precision loss. This does not show that a stand-in does more damage there; the link is unproven. Earlier check: bit-width has no clear link with routing frequency (13.6).
+Open: weight all layers equally (default) or weight the unmet share by a per-layer prior taken from the RCO bit-widths.
+
+### 13.27 Standards for ranking layer importance (literature search, 2026-10-08)
+
+Methods found (none run by us):
+- Block Influence (ShortGPT): 1 minus cosine similarity between a layer's input and output hidden states, averaged over calibration text. Needs a forward pass of our own engine, no reference run.
+- Angular distance (Gromov et al.): same similarity as an angle, usually over contiguous blocks; same layer order for single layers.
+- Perplexity impact of removing a layer (Shortened LLaMA): needs our own loss on text; it is an output-quality measure.
+- FinerCut: attention and feed-forward parts scored separately.
+- MoE router statistics: router mass, REAP (routing probability x activation norm), learned router bias, router change under fine-tuning. Need router requests only.
+- Quantisation sensitivity: what GSQ-RCO used; already in the file.
+Caveats: Block Influence order varies with calibration data; hidden-state change is a proxy; rankings tuned on perplexity may not transfer to reasoning; sources disagree on which router signal to trust (activation frequency was less consistent than learned bias in one paper); a depth analysis of one large MoE found diffuse early routing and collapsing late-layer confidence, whereas Strata's profile for our model shows later layers more concentrated, so the pattern is model-specific.
+Ranking available now (expert bits per weight, IQ3_S, higher = judged more sensitive to precision loss): tier 4.33 bpw: [47]; 3.79: [17, 25, 27, 28, 29, 35, 40, 44, 45]; 3.54: [0, 7, 14, 16, 18, 22, 31, 33, 37, 38, 41, 42, 43, 46]; 3.21: [2, 3, 4, 5, 6, 9, 11, 15, 19, 23, 24, 26, 32, 34, 39]; 3.04: [21]; 2.79: [12, 20, 30]; 2.46: [1, 8, 10, 13, 36]. The link between precision sensitivity and damage from a stand-in is unproven.
+Proposal (assistant, awaiting the user): use the tiers as starting layer weights now; recheck with Block Influence once the engine runs on real text.
+
+### 13.28 Layer importance: router statistics and quantisation sensitivity (2026-10-08)
+
+User: router statistics and quantisation sensitivity, leaning to the second.
+Roles (assistant): router statistics give the per-layer unmet demand (unmet gate-mass share, steps 2 and 3 of 13.23); quantisation sensitivity (the RCO bit-widths of 13.27) gives a per-layer weight on it. Score of a layer = weight x unmet share; the allocation (13.25) then works harder to keep misses low in layers the quantiser judged more sensitive.
+Proposed weight: proportional to the layer's expert bits per weight divided by the mean (3.33 bpw): from about 0.74 (2.46 bpw layers 1, 8, 10, 13, 36) to about 1.30 (4.33 bpw, layer 47), a spread of 1.76x. Could be made steeper or flatter. The ranking has only seven tiers, so it is coarse.
+Status: see 13.29 (decided phases). Block Influence from our own engine remains the later recheck (13.27).
+
+### 13.29 Phases and weight scale decided (2026-10-08)
+
+Decided (user): start with quantisation sensitivity, then move toward router statistics. The weight is proportional to the layer's expert bits per weight divided by the mean.
+Phase 1 (no unmet-demand data yet): per-layer budgets from the weights alone (plus the 10-expert floor and a cap); within a layer, experts are taken in the profile's rank order. Phase 2 (once router statistics exist): the weighted unmet-share allocation of 13.25 and 13.28.
+Open: what the weight scales in phase 1. Expert size is proportional to the layer's bits per weight, so if the weight scales BYTES per layer, every layer ends up with the same number of experts (the weight cancels). If it scales the expert COUNT per layer, sensitive layers hold more experts: with an illustrative equal share of 85 experts per layer, layer 1 (weight 0.74) gets about 63 experts (95 MB) and layer 47 (weight 1.30) about 111 experts (294 MB), a 3.1x spread in bytes.
+
+### 13.30 Phase 1 scale decided (2026-10-08)
+
+Decided (user): "as of now", in phase 1 the weight scales the expert COUNT per layer (not the bytes). Per-layer expert count is proportional to the layer's weight (expert bits per weight divided by the mean), with the 10-expert floor and the cap; experts within a layer are taken in the profile's rank order. Bytes per layer follow from count times that layer's expert size. "As of now" means phase 2 (router statistics) may change it.
+
+### 13.31 Why "as of now" (assistant's reading of the user's reason, 2026-10-08)
+
+Reading: a static weight from quantisation sensitivity cannot follow the topic; the topic in use may put little router weight on the layers the quantiser judged sensitive, so slots could sit where the current topic does not need them. Hence router statistics in phase 2.
+Tension with an earlier decision: swaps change which experts a layer holds, but not how many (row 5 of 13: fixed per layer from the start). If demand shifts between layers with the topic, fixed counts cannot follow it. Open (this is question 3 of 13.19): in phase 2, do per-layer expert counts move live with the router statistics (within the floor of 10, a cap, and a slow decay), or stay fixed after a profile run with only the choice of experts adapting?
+
+### 13.32 The live pruned model, and the one decision proposed for change (2026-10-08)
+
+User's framing: the Coder variant is a static pruned version (256 of 512 experts per layer); our system runs a pruned version per request, live.
+DECIDED (user, 2026-10-08: "yes live rebalancing"): row 5 "fixed per layer from the start" becomes "start from the phase 1 weights, then per-layer expert counts may drift live in phase 2", within the floor of 10, the cap, and a slow decay.
+Kept: ranked-profile start, event-driven trigger with Strata-style swaps and rate limit, every miss covered by a resident stand-in, counts follow the router's own requests.
+Cautions: the Coder keeps half the experts in every layer; our resident share is far smaller, so its 91.3% SWE-bench retention says nothing about ours. The Coder has the same expert count in every layer: one data point for equal counts, no evidence that quantisation weighting helps or hurts. Strata ships a Coder profile (data/expert-profile-coder.bin), so topic-specific starting profiles are possible; an idea, not a decision.
+
+### 13.33 The pruned version is based on topic (2026-10-08)
+
+User: the live pruned version is based on topic. Consequences: the usage counter learns what the topic asks for; its decay (Strata: x0.7 per round) is the topic memory, so the decay constant matters; the swap rate limit sets how fast the resident set turns over on a topic change.
+Open: behaviour at a request/conversation boundary: (a) carry over the resident set and counts and let decay fade them; (b) reset to the shipped profile; (c) start from a saved topic-specific profile (as the Coder profile does; Strata can also save the learned state as a profile, even one per project). Not decided.
+
+### 13.34 Live rebalancing decided (2026-10-08)
+
+Decided (user): live rebalancing. Per-layer expert counts start from the phase 1 weights (13.30) and then move live in phase 2 as the router statistics change, within the floor of 10 experts per layer, the cap (value open), and a slow decay so one odd token cannot swing the budgets.
+Open for this: what triggers a budget move (how often, how many experts per move, and whether it shares the swap rate limit of 96 swaps per 4 windows), and the cap value.
+
+### 13.35 Request boundary decided: carry over (2026-10-08)
+
+Decided (user): at a request/conversation boundary, carry over the resident set, the per-layer budgets and the usage counts from the previous topic. The decay handles the old topic: it fades the old counts as the new topic's requests arrive, and the swaps and live rebalancing follow. There is no reset and no special start at a boundary.
+Consequence: the decay constant and the swap rate limit together set how fast the resident set turns over after a topic change; these are the two values to tune on the target. Both are open (Strata's defaults: x0.7 per round, 96 swaps per 4 windows).
+Open from 13.34: how often a budget move happens, how many experts per move, whether it shares the swap rate limit, and the cap value.
+
+### 13.36 Victim choice decided: Strata's rule plus a grace period (2026-10-09)
+
+Decided (user): option B. The victim of a swap is the least-used resident expert of the same layer (Strata's rule, one decayed usage counter), and a newly swapped-in expert cannot be chosen as a victim for a grace period. The idea is borrowed from LFRU's probation segment without a second counter (no heat, no protected segment; the earlier decision to leave out solid.cpp's other count machinery stands). The user's expectation: the grace period also lowers how often swaps happen.
+Why it should (assistant): a newcomer that just won a swap cannot be swapped out again right away, so back-and-forth swaps between two close experts stop.
+Open: the length of the grace period (in rounds, tokens or swaps), and whether it also applies to experts promoted into RAM. To be tuned on the target.
+
+Corrections to the comparison with solid.cpp's page (2026-10-09), pending the user's decision to record it as its own section:
+- Of 21 decisions, 4 conflict (2 repeat documented losses: substituting every miss, an RAM buffer we own; 2 go against listed wins: LFRU eviction, a RAM tier fed from counts). The co-activation item is withdrawn: the page's fix replaced heat-ranked stand-ins with co-activation-ranked ones, and ours is neither.
+- The page's +41% (buffer fed by prediction vs by historical heat) compares two variants of a feature that still measured below having no buffer, so it is "less wrong", not a win over nothing. solid.cpp's "historical heat" for the RAM buffer is a per-expert selection counter (+4 per router pick, capped, epoch-aged); our count is the same family (backward-looking), decayed by x0.7 per round.
+- Our substitution differs from solid.cpp's: at least 10 residents per layer guaranteed; the stand-in is the router's own best-ranked resident for the token; no exact fallback. Whether that avoids the page's rank-0 degeneracy is untested; keep a substitution floor and an off switch for the RAM buffer as testable options.
+
+### 13.37 Rate limit values confirmed (2026-10-09)
+
+Confirmed (user): "96 per 4 seems good": at most 96 swaps per round, a round every 4 windows, none while the previous round's copies are in flight (13.7 values kept). To be tuned on the target if needed.
+Still open: what one "window" is in our engine (one token without speculative decoding), so the limit converts to 96 swaps per 4 tokens; and whether the 96 counts swaps or bytes (layers differ in expert size, 1.51 to 2.66 MB).
+
+### 13.38 Speculative decoding is a requirement (2026-10-09)
+
+Decided (user): speculative tokens (the model's own multi-token-prediction draft block) are a must.
+Facts checked: our IQ3_S GGUF has no draft block: block_count is 48, the highest block index is 47, and there are no nextn/mtp/eh_proj/enorm/hnorm tensors or keys. Both reference converters drop it. Strata fetches the draft layer separately (about 6 GB, +1 GB with images; tools/mtp_pack.py builds it from the BF16 tensors); Unsloth also publishes MTP files separately. The draft block is structurally another trunk block (full attention plus its own 512-expert MoE), plus a fusion projection and its own hyper-connection head.
+Consequences:
+- Units: a "window" is a verify window (the target checks several tokens in one pass). The rate limit "96 swaps per 4 windows" (13.37) therefore keeps Strata's meaning. Strata's windows check about 2.4 to 3.2 tokens per pass; solid.cpp's draft depth 4 won over 8 (a wider window widens the union of experts needed).
+- Recurrent state rollback is in scope: when drafts are rejected, the 36 GDN layers' state and conv tails, and the PLE history, must be restorable per accepted-token count (solid.cpp keeps per-slot rollback copies). This replaces the earlier "out of scope for v1" in section 5.
+- The draft block needs its own expert residency (a 49th layer with 512 experts, counts and a budget), or to be kept fully resident.
+- Counting: a window routes several tokens per layer. Open: do counts include the picks of draft tokens that get rejected (Strata counts every row in the window)?
+- The draft and the target both use the stand-in rule; acceptance is measured against the target under stand-ins.
+Open: draft depth (Strata drafts up to 3; solid.cpp found 4 best on Gemma and 8 worse), the draft file and its quantisation, and whether the 96 limit counts swaps or bytes.
+
+### 13.39 Counting with speculative windows: assistant's opinion (2026-10-09)
+
+Question: do the usage counts include the picks of draft tokens that are rejected?
+Rows of a verify window: inputs x0 (last verified token), d1..dk. If a drafts are accepted, rows 0..a have inputs that became part of the sequence; rows a+1..k have rejected inputs and describe a sequence that never happened.
+Opinion (assistant, awaiting the user): count only rows 0..a, applied after acceptance is known (store per-row picks in the window, apply the +1s afterwards). Reasons: the router's request is what tells what to keep; rejected rows are requests for a token the model did not produce; on prose the draft is accepted only about 40% of the time (solid.cpp's page: 0.38 to 0.68 on prose, 0.73 to 0.90 on code), so many rows would be noise; the drafter's habits would bias the counters. Cost: negligible.
+Counter-argument: Strata counts every row (held-out hit rate 0.645); a rejected draft is usually a near miss and probably correlated with real demand; not measured either way here.
+Make it a switch and compare hit rate and unmet demand on the target. Proposed default: kept rows only.
+
+### 13.40 Counting decided: kept rows only (2026-10-09)
+
+Decided (user): the usage counter counts only the rows of a verify window whose input tokens were kept (rows 0..a after a accepted drafts). The per-row picks are stored during the window and the +1s are applied after acceptance is known. A switch to count every row (Strata's behaviour) stays available for comparison on the target; it is not the default.
+
+### 13.41 Draft depth: evidence and proposal (2026-10-09)
+
+Evidence read:
+- solid.cpp (Gemma-4, paired, three rounds; docs/index.html): depth 4 (was 8) +22%; depth 6 +12%; depth 8 loses 11% against the shipped depth 4; adaptive depth lost 4.2%; Qwen's own calibration also chose 4; confidence gate p_min 0.5 worth +13%. Its depth 4 means 4 drafts, a window of 5 rows (it keeps the verify batch inside a 5-wide MoE kernel path). At 64K context with the draft attached, depth 4 did not load; 2 or less fit.
+- Strata (RTX 3060, IQ3_XXS, Qwen3.8-Flash-Next): `--spec 4` = a verify window of 4 tokens (1 verified + 3 drafts); about 43 tokens/s; 62 to 68% of drafts accepted; 2.4 to 3.2 tokens per window. Drafts are extended only while the draft layer is sure enough (`--spec-min-p`).
+Caveats for us: solid.cpp's reason (a wider window widens the union of experts the cache must serve) matters less when every miss is covered by a stand-in, but the window width still sets the cost of the grouped expert kernels (to measure); prose accepts drafts only 38 to 68% of the time; VRAM can cap the depth.
+Proposal (assistant, awaiting the user): start with a window of 4 rows (3 drafts) and a confidence gate of 0.5; test 5 rows (4 drafts) on the target.
+
+### 13.42 Draft depth decided (2026-10-09)
+
+Decided (user): a verify window of 4 rows (1 verified token + up to 3 drafts) and a draft confidence gate of 0.5. No test of 5 rows. The window is extended only while the draft layer is at least 0.5 sure. The rate limit of 13.37 (96 swaps per round, a round every 4 windows) counts in these windows.
+Still open around speculation: the draft file and its quantisation, residency of the draft block's 512 experts, and whether the 96 limit counts swaps or bytes.
+
+### 13.43 Draft block: file, quantisation and residency (2026-10-09)
+
+User's lean: draft file Q8 ("I guess"), fully resident.
+Strata (include/strata/core/mtp.hpp, tools/mtp_pack.py, tools/mtp_rt.py): packs its own draft file from the 31 `mtp.*` tensors of the original BF16 checkpoint (about 6 GB BF16; the GGUF converters drop the head). Large projections (attention, indexer, shared expert, input fusion) run as Q8_0; hyper-connection and router weights BF16; norms F32 (dense set about 0.18 GB). The 512 routed experts: Q2_0 in the shipped runtime (708 MB; one expert is 1,382,400 bytes, the same as the main Q2_0 build), with Q4_0 (1.42 GB) and Q8_0 (2.67 GB) as comparison arms in the pack tool. All 512 experts live in VRAM and run through the grouped kernels; the layer takes about 0.9 GB. Its probe on the BF16 original accepts 0.89, 0.86, 0.85 of greedy drafts at steps 1 to 3. No recorded acceptance comparison across expert formats was found; its plan picks the format by measured acceptance.
+solid.cpp: draft about 1.8 GiB for Qwen, a Q8_0 MTP file for Gemma, draft cache kept f16.
+Draft quality affects speed only; the verify window decides every emitted token.
+Resident cost: Strata's mix about 0.9 GB; all-Q8 about 2.9 GB.
+Decided: none yet. Open: expert quantisation (Q8_0 as the user guessed, or Q2_0 as Strata), and the source of the draft file (our own pack from the BF16 tensors, or a published MTP GGUF).
+
+### 13.44 Draft block decided: Strata's approach (2026-10-09)
+
+Decided (user): the draft block follows Strata's approach. Routed experts in Q2_0 (708 MB for 512 experts); large projections Q8_0; hyper-connection and router weights BF16; norms F32. The whole block is fully resident (about 0.9 GB with its head, per Strata). Draft quality affects speed only; the verify window decides every token.
+Still open: the source of the draft file (our own pack from the original BF16 `mtp.*` tensors, as Strata does, or a published MTP GGUF), and whether the 96 limit counts swaps or bytes.
+
+### 13.45 Where the draft file comes from (2026-10-09)
+
+User: "the draft file comes from the same place the rest of the model is."
+Checked: the ISTA repo (ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) has no draft file: its root holds the folders IQ2_XS, IQ3_S, IQ3_XXS, Q2_0, assets, tensor-allocation, README.md and the 908 MB vision projector; subfolder contents not listed. Strata's tools/mtp_fetch.py says "The GSQ-RCO GGUF ships no MTP head". The BF16 base checkpoint Qwen/Qwen3.8-Flash-Next (360 GB, 131 shards) has 31 `mtp.*` tensors spread over 28 shards; Strata reads each shard's safetensors header with HTTP range requests, then fetches only those tensors (about 6 GB BF16), pinned to a revision, each checked against SHA256. Its comment (#327): a proxy that ignored the Range header returned the wrong bytes and the drafter then silently accepted nothing, so a range read needs a 206 reply with the right Content-Range and every tensor needs a hash check.
+Reading to confirm with the user: the draft file comes from the original base checkpoint (the same source the quantised model was made from), packed by us: experts Q2_0, projections Q8_0, hyper-connection/router BF16, norms F32 (13.44). Needs a packer of our own (Strata's is round-to-nearest with a per-block scale chosen to minimise squared error, not GSQ).
+Alternative, not verified: Unsloth publishes MTP GGUFs matched to its own main file; compatibility with ISTA's main file is untested.
+
+### 13.46 Draft file source decided (2026-10-09)
+
+Decided (user): the draft block is built from the original base checkpoint (Qwen/Qwen3.8-Flash-Next, the 31 `mtp.*` BF16 tensors, about 6 GB, fetched by range requests), packed by our own packer to the layout of 13.44, with a hash check on every tensor. Rule from Strata's experience (#327): a range read must return a 206 reply whose Content-Range matches the request, and every tensor is checked against a SHA256 of a pinned revision, otherwise a bad proxy can make the drafter silently accept nothing.
+Work items this adds: a range-request fetcher with revision pinning and hash verification, and a Q2_0 / Q8_0 packer. The hashes for our pinned revision must be recorded when the tensors are first fetched (Strata's own hash list belongs to its pinned revision and is a cross-check only if we use the same revision).
+Still open: whether the 96 limit counts swaps or bytes.
+
+### 13.47 Rate limit: swaps or bytes (2026-10-09)
+
+Facts (IQ3_S expert sizes 1,510,400 to 2,662,400 bytes, mean 2,046,400): 96 swaps per round copy 145.0 MB (all lightest layers) to 255.6 MB (all heaviest), mean 196.5 MB. A byte budget of 196.5 MB per round allows about 130 swaps in the lightest layers and about 74 in the heaviest. With the exclusive RAM tier a swap sourced from RAM is an exchange (the evicted expert is copied back to RAM), about double the traffic; a swap sourced from NVMe adds a read of the newcomer. Rough scale (assistant, from Strata's reported 43 tokens/s at about 2.9 tokens per window on an RTX 3060, so a round every 4 windows is about 0.27 s): about 0.7 GB/s upstream at the full limit; an estimate, not ours.
+Trade-off: swaps protect stability (churn) and vary the copy load by 1.76x; bytes protect the link but make heavy layers (the late, more quantisation-sensitive ones) adapt more slowly per round.
+Earlier suggestion (assistant): a byte budget. WITHDRAWN on 2026-10-09, see below.
+
+PCIe facts (2026-10-09). Theoretical per direction: Gen3 about 1 GB/s per lane (x16 about 15.75 GB/s after encoding), Gen4 about 2 (x16 about 32), Gen5 about 4 (x16 about 63); x8 halves. The RTX 3060 is a PCIe 4.0 x16 card (one forum post says some boards wire it x8); the target PC's slot generation and width are unknown and must be measured; nvidia-smi shows Gen1 at idle and the link only trains up under load.
+Measured on an RTX 3060 (solid.cpp's notes, docs/moe-cache-colibri-notes.md, PCIe 4.0 x16): RAM to VRAM pinned 24.5 GB/s (pageable 12 to 17); NVMe (WD Blue SN5000) 3.55 GB/s, 3.43 at queue depth 1; RAM 36.6 GB/s; VRAM 254 GB/s effective in the MoE op.
+At the full limit of 96 swaps per round the upstream traffic is about 0.7 GB/s (about 1.4 GB/s with the copy-back of the exchange), roughly 3 to 6% of the pinned PCIe figure; a 196 MB round takes about 8 ms over PCIe against a window of about 65 ms. An NVMe-sourced round is the tighter case: about 0.7 GB/s is about 20% of the drive's measured speed, about 55 ms per round.
+Conclusion (assistant): PCIe is not the binding limit; the "protects the link" argument for bytes does not hold, and a byte budget would slow the late, quantisation-sensitive layers. Recommendation now: keep Strata's 96 swaps per round (as the user leaned). Watch NVMe-sourced rounds on the target.
+
+### 13.48 Rate limit final: swaps (2026-10-09)
+
+Decided (user): the rate limit counts swaps, not bytes: at most 96 swaps per round, a round every 4 verify windows (a window is 4 rows, 13.42), and no new round while the previous round's copies are in flight. This closes the swaps-or-bytes question. The NVMe-sourced rounds are to be watched on the target.
+
+### 13.49 Grace period length decided (2026-10-09)
+
+Decided (user): the grace period is one round, i.e. 4 verify windows. A newly swapped-in expert cannot be chosen as a victim until the next round; with a round every 4 windows (13.48) this means it is protected for exactly one round. (The earlier record in 13.36 listed the length as open because the "96 per 4" remark was read as the rate limit.)
+Still open: whether the grace period also applies to experts promoted into RAM.
+
+### 13.50 Grace period also applies to RAM promotions (2026-10-09)
+
+Decided (user): the grace period (one round, 4 verify windows, 13.49) also applies to experts promoted into the RAM tier. A newly promoted expert cannot be displaced from RAM until the next round. This closes the grace-period question.
+
+### 13.51 The RAM stage runs one round ahead of the VRAM stage (2026-10-09)
+
+Stated by the user and confirmed by the assistant as following from the design: the RAM promotion round runs one cycle (round) earlier than the VRAM swap round. A candidate for VRAM is then already in RAM when the swap round selects it (PCIe copy about 8 ms for a full round, against about 55 ms from NVMe). The RAM stage sees counts one round older, which is harmless because counts decay only x0.7 per round. Staging load: up to about 96 experts per round, about 196 MB of NVMe reads. The grace period fits: a promoted expert is protected for one round, and the next VRAM swap takes it as an exchange, not a displacement.
+Consequence: a strict pipeline NVMe -> RAM -> VRAM with no direct NVMe -> VRAM swap. A newly hot expert needs two rounds (about 0.5 s at Strata's rate) to reach VRAM instead of one.
+Open: strict pipeline (no direct NVMe to VRAM) or allow a direct NVMe read when a candidate is not yet staged.
+
+### 13.52 Not a strict pipeline: RAM preferred, direct NVMe allowed (2026-10-09)
+
+Decided (user): not the strict pipeline. A VRAM swap takes its candidate from RAM when it is staged and reads directly from NVMe when it is not (solid.cpp has this direct path); RAM is preferred. Supersedes the open question of 13.51.
+Facts: on solid.cpp's RTX 3060 box RAM to VRAM pinned measured 24.5 GB/s and the NVMe 3.55 GB/s; one 7 MB expert step took 289 us from RAM and 1,994 us from NVMe. solid.cpp's "direct" path is a pread() of the whole expert into a pinned host staging buffer followed by the host-to-device copy, not a GPU-direct transfer.
+Time check for the n-1 staging round: a round of 4 windows is about 270 ms at Strata's rate (about 43 tokens/s, 2.9 tokens per window). Staging 96 experts is 196 MB (256 MB at the largest sizes): 55 to 72 ms at 3.55 GB/s, about a quarter of a round. On a SATA drive (0.5 GB/s) it would take 390 to 510 ms, longer than a round, so rounds would be skipped. The target's NVMe model and PCIe generation are unknown.
+Read shape: an expert's gate, up and down slices sit in three separate tensors, so 96 experts is about 288 reads of roughly 0.4 to 1.0 MB each; throughput at that size is unmeasured. Option (not decided): a one-time repack with each expert's three slices contiguous (a sidecar pack), turning it into 96 reads.
+Open: the target's NVMe drive model and PCIe generation (to be measured).
+
+### 13.53 Design values for the target, taken from solid.cpp's measurements (2026-10-09)
+
+Decided (user): no measurement of the target's drive or link; take solid.cpp's measured values (its box is also an RTX 3060 12 GB). Design values: VRAM 254 GB/s effective in the MoE op; RAM to VRAM pinned over PCIe 4.0 x16 24.5 GB/s (pageable 12 to 17); RAM 36.6 GB/s; NVMe 3.55 GB/s (3.43 at queue depth 1). These are the user's chosen design values, not measurements on the target.
+Result of 13.52 under these values: staging 96 experts (196 to 256 MB) takes 55 to 72 ms against a round of about 270 ms, so the n-1 round has about 4x margin.
+Risk noted once: if the target's drive or slot is slower (a SATA drive at 0.5 GB/s needs 390 to 510 ms for the same staging; a Gen3 or x8 slot halves the PCIe figure), the staging check is the first assumption to fail. This closes the open item of 13.52.
+
+### 13.54 Budget moves: how often and how many (proposal, 2026-10-09)
+
+No precedent: Strata fixes per-layer budgets and solid.cpp pools them, so these numbers are our own design, untested.
+Mechanism (assistant): a budget move takes bytes from a donor layer (lowest weighted unmet share) and gives them to a recipient layer (highest), respecting the floor of 10 experts, the cap and the grace period. It runs through the normal swap machinery (the donor evicts its lowest-count residents, the recipient admits its best candidates) and so spends some of that round's 96 swap slots. Experts differ in size between layers (1.51 to 2.66 MB), so a small free-byte reserve absorbs the difference.
+Options (round about 270 ms; time to shift 10% of the fast tier, illustrated with 4,000 resident experts, the real tier size is undecided): slow = a step every 32 rounds (8.6 s), up to 4 swap slots, about 14 min; balanced = every 16 rounds (4.3 s), up to 8 slots, about 3.6 min; fast = every 8 rounds (2.2 s), up to 16 slots, about 54 s. A step uses at most 8 of that round's 96 slots (about 8%) and none in the other rounds.
+Proposal (assistant, awaiting the user): balanced. Budgets follow the topic (minutes), swaps follow tokens.
+
+Request length check for 13.54 (2026-10-09; Strata's reported 43 tokens/s on an RTX 3060 with IQ3_XXS is the only comparable speed, our engine's speed is unknown; prompt reading over 1,000 tokens/s on long texts): 200 tokens about 5 s; 500 tokens about 12 s; 2,000 tokens (reasoning with a cap) about 47 s; 8,000 tokens about 3 min. Balanced option (a step every 4.3 s, up to 8 experts, 0.2% of an illustrative 4,000-expert tier per step) moves about 0.2%, 0.6%, 2.2% and 8.7% of the tier within those requests; fast would be about 4x that (under 1% for a short request, about 35% for a long one). Budgets therefore change over several requests, which fits carry-over (13.35).
+
+## 14. Port order into the Strata fork (proposal, 2026-10-10; awaiting the user)
+
+Base: the Strata engine on branch `solid-wins`. Each step is one concept, built and judged before the next starts.
+Every step is judged by the same three checks as solid.cpp's hot-rod port: (1) the operator or unit tests it touches,
+(2) greedy-output agreement with the previous build, read against a previous-build-against-itself control (greedy
+output is not bit-reproducible here, so a bare "identical" count means nothing), (3) paired speed with its own
+identical-config control. The machine is quiet for every run (no other service, no download, no build). A change counts as
+a win only if it clears the control's spread; solid.cpp's own runs on this card varied by 10 to 20% between identical
+runs. Decode is timed with `qwen_tps.py` (chat endpoint, code / reasoning / prose, thinking off); the NVMe read volume
+per generated token is recorded with every run, because the baseline says the disk sets the speed.
+
+| # | Step | Where it comes from | Why now | Test beyond the three checks |
+|---|---|---|---|---|
+| 0 | Counters only: per-token NVMe bytes, per-layer hit / miss, swaps per round, nothing changes | Strata's `/metrics`, solid.cpp's PART_STATS | Without it no later step can be explained | Speed unchanged within the control |
+| 1 | Read path for experts that do not fit RAM: no page-locking of mmap'd experts, no kernel read-around for one expert slice (random-access advice or direct reads) | solid.cpp page: two bugs of this kind cost Qwen roughly 4x (2.81 to 12.85 tok/s) | Cheapest step and the baseline reads about 150 MB per token | Bytes read per token before / after |
+| 2 | Stand-in for every miss as a mask on the router before the top-k (13.20), with an off switch; counts still follow the unmasked picks | 13.11, 13.13, 13.20 | The largest single lever solid.cpp measured on a model that does not fit (12.85 against 8.3 tok/s with it off) | Degeneracy check (repeated 4-grams, single-word dominance), long-answer check at reasoning length, hit rate, speed |
+| 3 | Counts and swaps by the spec: one decayed counter per layer-expert (x0.7 per round), unmasked picks, kept rows only (13.40), margin 1.5, grace of one round (13.49), 96 swaps per 4 windows, none while copies are in flight | 13.2c, 13.36, 13.37, 13.40, 13.48 | Gives step 2 its feedback | Hit rate and unmet demand per layer over a long run |
+| 4 | Per-layer budgets: phase 1 by bits per weight with floor 10 and cap (13.30); phase 2 live rebalancing, "balanced" option (13.34, 13.54) | 13.21 to 13.35 | Builds on the counters of step 3 | Per-layer unmet share spread, speed |
+| 5 | RAM tier as an owned, exclusive buffer fed by counts, background promotion one round ahead, grace on promotions (13.14 to 13.16, 13.50 to 13.52) | the user's decision, against solid.cpp's two negative results for a host-resident hot buffer (-56% dedicated buffer, -12% mlock pinning) | Last, because the evidence says it can lose; ships with an off switch | Compare with the page cache alone, same run |
+| 6 | Optional: a retention score from a pre-router (solid.cpp: it won at eviction protection, lost at admission) | solid.cpp page | Only if step 3 shows evictions of soon-wanted experts | Hit rate, speed |
+
+Not ported, by decision or by solid.cpp's own measurement: the atlas (13.12), heat with protected / probation segments
+(13.2c), cross-run history, substitution by rank floor, neuron subsetting (a loss on gemma-4 and Qwen), router bias
+(not a default there; 13.22 declines it), lazy KV commit (opt-in there).
+Already in Strata: draft window of 4 rows with a 0.5 confidence gate, int8 KV, router lookahead, shipped ranked profile.
+Open for this port: how the router is masked inside Strata's graph (read src/core before step 2), and which quality
+check stands in for a KL divergence against an exact run, which is not possible here (13.19).
+
