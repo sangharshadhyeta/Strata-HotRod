@@ -970,6 +970,33 @@ Proposal (assistant, awaiting the user): balanced. Budgets follow the topic (min
 
 Request length check for 13.54 (2026-10-09; Strata's reported 43 tokens/s on an RTX 3060 with IQ3_XXS is the only comparable speed, our engine's speed is unknown; prompt reading over 1,000 tokens/s on long texts): 200 tokens about 5 s; 500 tokens about 12 s; 2,000 tokens (reasoning with a cap) about 47 s; 8,000 tokens about 3 min. Balanced option (a step every 4.3 s, up to 8 experts, 0.2% of an illustrative 4,000-expert tier per step) moves about 0.2%, 0.6%, 2.2% and 8.7% of the tier within those requests; fast would be about 4x that (under 1% for a short request, about 35% for a long one). Budgets therefore change over several requests, which fits carry-over (13.35).
 
+### 13.55 Link rates measured on the target (2026-10-10; the user allowed measuring instead of borrowing 13.53)
+
+Machine quiet (no service, no download). Programs: `nvme_bench.c`, `pcie_bench.cu` (kept in the job's `linkbench` folder).
+Each figure is one run; the NVMe reads are O_DIRECT unless marked mmap.
+
+| Link | Measured | Note |
+|---|---|---|
+| NVMe, the drive's link | PCIe 3.0 x4 (8 GT/s), the drive supports 4.0 x4 | Behind chipset root port `00:1c.4` (Gigabyte H610M K DDR4); the port's own maximum is 8 GT/s. Not a software setting. Stays at 8 GT/s under load. `read_ahead_kb` of the device is 4096 |
+| NVMe, sequential 1 MiB, one reader | 2.87 GB/s | |
+| NVMe, random, 4 or more reads in flight | **3.57 GB/s** (the ceiling) | 2 MiB: 3.53 (4 in flight), 3.57 (16, 32); 896 KiB: 3.44, 3.56, 3.57; 512 KiB: 3.25, 3.56; 128 KiB: 2.20, 2.69 (20,500 reads/s) |
+| NVMe, random, ONE read in flight | 2.78 GB/s at 2 MiB, 1.90 at 896 KiB, 1.38 at 512 KiB, 0.81 at 128 KiB | Latency 755 / 482 / 380 / 163 microseconds a read |
+| NVMe via mmap, one 896 KiB slice per read, kernel default read-around | 0.69 GB/s useful (1 reader), 1.07 GB/s useful (8 readers) | The device read 2.57 and 3.55 GB/s to deliver that: **3.7x and 3.3x read amplification**; the same drive gives 3.44 GB/s useful with 4 explicit reads in flight |
+| NVMe via mmap with MADV_RANDOM | 0.15 GB/s (1), 0.25 GB/s (8) | No amplification (0.99x) but each 4 KiB page is its own synchronous read: not a fix by itself |
+| RAM copy (memcpy) | 17.0 GB/s (1 thread), 16.3 (6), 15.5 (12) | Bytes copied per second; the memory traffic is twice that |
+| RAM to VRAM, pinned, 0.5 to 256 MiB | **23.4 to 24.6 GB/s** (21.0 at 512 MiB) | The GPU link trains to PCIe 4.0 x16 under load (gen 1 at idle). 2 MiB: 24.2 GB/s |
+| RAM to VRAM, pageable | 17.3 to 17.6 GB/s up to 8 MiB, 11.5 to 12.1 above | Pinned is needed for the engine's swaps |
+| VRAM to RAM, pinned | 25.1 to 26.3 GB/s | |
+| One swap round, 96 x 2 MiB pinned, one stream | **8.3 ms** (24.2 GB/s) | A single synchronous 2 MiB copy: 89 microseconds |
+| Chain NVMe (O_DIRECT, random) to pinned RAM to VRAM, 896 KiB | 1.71 GB/s (1 in flight), 3.42 (4), 3.56 (8); 3.51 at 2 MiB, 4 in flight | NVMe-limited: the PCIe step adds nothing once 4 reads are in flight |
+
+What it says:
+- The design values of 13.53 are confirmed on this machine (NVMe 3.55 against 3.57; pinned PCIe 24.5 against 24.6).
+- The NVMe is the narrow link by a factor of about 7, and the engine must keep at least 4 reads in flight to use it.
+- Staging 96 experts (196 to 256 MB) takes 55 to 72 ms at 3.57 GB/s with 4 or more reads in flight, but 100 to 130 ms or more with one in flight (13.52's check holds only with the queue filled).
+- **A bound on the win bar.** At about 150 MB read per generated token (the IQ3_S baseline) a fully used NVMe delivers at most 3.57 GB/s / 0.150 GB = about 24 tokens/s, and the baseline used 1.87 GB/s (52% of the ceiling). So 25 tokens/s needs the bytes per token to fall (a higher hit rate, less read amplification), not only the reads to get faster. The 150 MB figure was counted over the whole run including warm-up page-ins, so it is an estimate.
+- Hardware: a board with a CPU-attached PCIe 4.0 x4 M.2 slot would double the drive's ceiling on paper; no free CPU-attached port exists on this board (only `00:01.0`, the GPU's, is CPU-attached). Premature before step 1 (the read path) shows how much of the present link is used.
+
 ## 14. Port order into the Strata fork (proposal, 2026-10-10; user said "go ahead" the same day; order not yet fixed)
 
 Base: the Strata engine on branch `solid-wins`. Each step is one concept, built and judged before the next starts.
@@ -985,6 +1012,7 @@ per generated token is recorded with every run, because the baseline says the di
 |---|---|---|---|---|
 | 0 | Counters only: bytes moved per link per generated token (NVMe to RAM, RAM to VRAM, NVMe to VRAM) and link utilisation, per-layer hit / miss, swaps per round, nothing changes | Strata's `/metrics`, solid.cpp's PART_STATS | Without it no later step can be explained | Speed unchanged within the control |
 | 1 | Read path for experts that do not fit RAM: no page-locking of mmap'd experts, no kernel read-around for one expert slice (random-access advice or direct reads) | solid.cpp page: two bugs of this kind cost Qwen roughly 4x (2.81 to 12.85 tok/s) | Cheapest step and the baseline reads about 150 MB per token | Bytes read per token before / after |
+| 1b | What is kept where (mostly VRAM): placement is measured per machine, taken from solid.cpp's calibration instead of Strata's formulas. The requested context is fixed first and placement gives way to it (solid.cpp's inversion: 4,096 to 65,536 tokens, 4 slots, once the order was fixed); candidates are pinned to the requested context and one that cannot hold it fails (its early runs measured at 4k what they served at 64k and picked a cache that ran out of memory); the search is ordered by what each knob does: knobs that change the fixed cost first (context, KV precision, micro-batch, placement, draft width), then knobs that divide what is left (expert-cache size, the draft's share), then knobs that spend no bytes (admission, stand-ins, eviction); cheap probes only shortlist, anything within 15% of the best is re-measured at full answer length in the configuration actually served; a degeneracy check (repeated 4-grams, single-word dominance) vetoes a candidate, a fidelity score does not; a reserve floor of VRAM is kept for what is allocated after the cache sizes itself (graphs, prefill buffers; 1,500 MiB on solid.cpp's card). Built on Strata's own `tools/calibrate.py`; results cached per model, GPU and context, and carrying the version of the checks | solid.cpp page: "Nothing to tune", "The calibration was optimising a machine that does not exist", "A correction", the ordering table | The user's instruction of 2026-10-10: positioning is taken from solid and tested | Re-run on the target: the chosen placement against Strata's formula, paired, with an identical-config control; bytes per link per token |
 | 2 | Stand-in for every miss as a mask on the router before the top-k (13.20), with an off switch; counts still follow the unmasked picks | 13.11, 13.13, 13.20 | The largest single lever solid.cpp measured on a model that does not fit (12.85 against 8.3 tok/s with it off) | Degeneracy check (repeated 4-grams, single-word dominance), long-answer check at reasoning length, hit rate, speed |
 | 3 | Counts and swaps by the spec: one decayed counter per layer-expert (x0.7 per round), unmasked picks, kept rows only (13.40), margin 1.5, grace of one round (13.49), 96 swaps per 4 windows, none while copies are in flight | 13.2c, 13.36, 13.37, 13.40, 13.48 | Gives step 2 its feedback | Hit rate and unmet demand per layer over a long run |
 | 4 | Per-layer budgets: phase 1 by bits per weight with floor 10 and cap (13.30); phase 2 live rebalancing, "balanced" option (13.34, 13.54) | 13.21 to 13.35 | Builds on the counters of step 3 | Per-layer unmet share spread, speed |
