@@ -11,6 +11,10 @@ earlier lines "written from scratch", "Host language: Python" and "GPU kernel ro
 remain the model reference (the math, the tensors, the formats); sections 12-13 are the residency policy that is to be
 implemented inside Strata's engine; section 14 is the port order.
 
+**"Decided" in this file records a choice by the user, not a result.** Every decision stays UNTESTED until its row in the
+test ledger (section 15) holds a measurement on the target; a decision whose test fails is reopened, whoever made it.
+The expected effects written in the text (for example the NVMe traffic of 13.55) are hypotheses with their test named.
+
 Theme, unchanged: keep off the GPU and out of RAM everything that is not being used at that instant, and bring each
 piece in just in time for its computation. The unit of change is Strata's round (at most 96 swaps per 4 verify windows,
 13.48), not a per-token or per-request event as in solid.cpp.
@@ -1025,4 +1029,33 @@ Not ported, by decision or by solid.cpp's own measurement: the atlas (13.12), he
 Already in Strata: draft window of 4 rows with a 0.5 confidence gate, int8 KV, router lookahead, shipped ranked profile.
 Open for this port: how the router is masked inside Strata's graph (read src/core before step 2), and which quality
 check stands in for a KL divergence against an exact run, which is not possible here (13.19).
+
+## 15. Test ledger (2026-10-10): every decision, its hypothesis, its test, and where it stands
+
+Common rules for every row. The machine is quiet. Arms are interleaved with an identical-config control, and the control's
+spread is the bar a change must clear (solid.cpp measured 10 to 20% between identical runs on this card). The model's
+file cache is emptied before each start. Quality is judged by the degeneracy check (repeated 4-grams, single-word
+dominance) and a long-answer check at reasoning length; agreement with an earlier build is read against a build-against-itself
+control. Each run records tokens/s per prompt kind, bytes per token per link (13.55), and the hit rate per layer.
+Status values: UNTESTED, RUNNING, PASSED (the number), FAILED (the number, decision reopened).
+
+| # | Decision (where it comes from) | Hypothesis | Evidence so far | Test | Passes when | Status |
+|---|---|---|---|---|---|---|
+| T1 | Staged explicit reads for experts that miss the page cache, not page faults (Strata docs; my link measurements) | Bytes read from the drive per token fall and tokens/s rise | Link test: mmap read-around 3.3 to 3.7x amplification; Strata docs: +25.7% on a 3060 with 32 GB (IQ3_XXS) | A1 B1 A2 B2 with `STRATA_IO_PREFETCH=1 STRATA_IO_PF_STAGE=1` against the default | B beats both A runs by more than their spread | RUNNING |
+| T2 | Ranked-profile start (Strata's shipped profile, 13 row 1) | The shipped profile's hit rate holds on our prompts and on IQ3_S | Strata's 0.645 held-out hit rate was on its own workload and variant | Hit rate per layer on our prompt kinds, empty start against shipped profile | Profile beats an empty start in the first requests | UNTESTED |
+| T3 | Adaptive rounds of 96 swaps per 4 windows (user, 13.48; Strata default) | 96 per 4 is better than none, than fewer, than more | Strata docs: a slow-CPU box gained +7.9% at 160 per window | `--adapt-swaps` 0, 48, 96, 192 with `--adapt-every` 4 | A setting clears the control; the bytes the swaps move per token stay under the link budget | UNTESTED |
+| T4 | A stand-in for every miss, as a mask on the router (13.20) | Speed rises with no loss of answer quality, and NVMe reads per token fall to the swap traffic | solid.cpp: 12.85 vs 8.3 vs 3.7 tok/s (rank 2 / off / cache off) on one run; but paired tests on gemma-4 and Qwen found no speed gain and more drift; rank 0 was degenerate | Mask on / off, with the degeneracy and long-answer checks, then the floor of residents per layer (10 and higher) | Faster than off by more than the spread, and no degeneracy at reasoning length | UNTESTED |
+| T5 | Counts follow the router's unmasked picks, kept rows only (13.40) | Better hit rate and less churn than counting every row | Reasoned only; Strata counts every row | Switch: kept rows against every row | Hit rate or unmet demand better by more than the spread | UNTESTED |
+| T6 | Swap margin 1.5 and a grace period of one round (13.36, 13.49) | Fewer back-and-forth swaps with no loss of hit rate | Reasoned only | Swaps per round and the share of swapped-in experts evicted within two rounds, grace on / off | The churn falls and the hit rate does not | UNTESTED |
+| T7 | Per-layer expert counts from bits per weight, floor 10, cap (13.30) | Better than equal counts and than the profile's frequency fill | Weak: bit-width has no clear link with routing frequency (13.6) | Three fills, same total bytes | The spread of unmet share or the speed beats the others | UNTESTED |
+| T8 | Live rebalancing of budgets, "balanced" option (13.34, 13.54) | Follows a topic change | None | A request sequence with a topic switch | Hit rate recovers faster than with fixed budgets | UNTESTED |
+| T9 | RAM tier as an owned, exclusive buffer fed by counts, promotion one round ahead (13.14 to 13.16, 13.51) | Better than the OS page cache alone | solid.cpp measured two host-resident hot buffers as losses (-56%, -12%); Strata's staged mode is +25.7% at 32 GB and -32.6% at 16 GB | With and without the buffer, same run | Beats the page cache alone | UNTESTED |
+| T10 | Direct NVMe to VRAM allowed besides the RAM route (13.52) | Few swaps need it, and it does not stall a round | Link test: chain reaches 3.5 GB/s with 4 reads in flight | Count the share of swaps sourced from NVMe and the rounds skipped | Rounds are not skipped | UNTESTED |
+| T11 | Draft window of 4 rows, gate 0.5 (13.42) | Best on IQ3_S here | solid.cpp: depth 4 +22%, gate +13% on gemma-4; Strata's default is the same | `--spec` 3, 4, 5 and `--spec-min-p` 0.5 against 0.7 | The default is not beaten by more than the spread | UNTESTED |
+| T12 | Placement measured, not a formula (step 1b) | The search finds a better split of VRAM than Strata's formula | solid.cpp: placement and margin results were opposite on two models | Strata's formula against the search, paired | The search wins at the context actually served | UNTESTED |
+| T13 | KV precision int8 (Strata default) | Right at 32K on 12 GB | solid.cpp: f16 was 3.5 to 4% faster when VRAM was comfortable, q8_0 was needed for the draft to load | int8 against f16 at 32K, with the draft loaded | Winner by more than the spread | UNTESTED |
+| T14 | The link budget premise: with stand-ins, NVMe traffic is only swaps, at most about 17 MB per token (13.55) | The counters show it | None on this box | Bytes read from the drive per token once T4 and T3 are on | At or under 17 MB per token in steady state | UNTESTED |
+| T15 | English draft vocabulary (`--draft-vocab en`) | Faster on English and code | Strata docs: 1 to 2% | Measured once: 16.6 against 17.2 (no gain, within the spread) | | FAILED (one run each; not repeated) |
+
+The order of the tests follows the port order of section 14; T1 is first because it needs no code.
 
