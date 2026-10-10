@@ -1095,3 +1095,20 @@ Capped testbed, measured (one request per prompt kind, so only direction is reli
 
 Result: under the same safe cap staging is about 33% faster and reads 35% less from the drive than the page-fault path, in all three prompt kinds. This reproduces T1's direction (T1 itself: 17.0 / 17.1 to 27.2 / 27.5 uncapped) at a lower speed. From here every measurement is taken inside the cap (`AB_CAP_GB`, default 24; 25 for the arms above) and compared with these numbers, not with the uncapped ones: a change has to show up where the file cache is short, which is what the stand-in and tiering work targets.
 
+## 16. Defaults of the fork, for reference (2026-10-10)
+
+What a plain start does today, and which test chose it (section 15).
+
+| Setting | Default | Switch | Why / ledger row |
+|---|---|---|---|
+| Staged expert reads (explicit pread into staging buffers instead of page faults) | **ON** (stock Strata: off) | `STRATA_IO_PREFETCH=0`, `STRATA_IO_PF_STAGE=0` | T1 passed: +60% uncapped (27.2 against 17 tok/s); capped at 25 GB +33% |
+| I/O threads for staged reads | 8 | `STRATA_IO_PF_THREADS` | T16 failed: 16 no better |
+| Prefetch depth | 2 | `STRATA_IO_PREFETCH_DEPTH` | T16 failed: 3 worse |
+| Stand-in mask (router restricted to VRAM-resident experts) | **OFF** | `STRATA_STANDIN=1` | built (09d4bed), untested (T4, T14) |
+| Swap round | every 4 verify windows, 96 swaps | `--adapt-every`, `--adapt-swaps` | Strata's own refresh unit |
+| `--resident-experts` (RAM budget = MemAvailable minus 4 GiB, `STRATA_RESIDENT_HEADROOM_GIB`) | not used | `--resident-experts` | T17 failed: 9.8 tok/s, 225 MB free at worst, swap grew to 786 MB |
+| Model config `strata-iq3_s.json` | `--mmap-experts --spec 4 --spec-min-p 0.5 --mtp /mnt/nvme/strata-data/mtp/rt --kv int8 --max-context 32768 --expert-cache auto --prefill auto`, draft vocabulary `en` | the json | T15 (en vocabulary) failed on a single run |
+| Test containment | systemd scope, `MemoryMax` 24 GB (`AB_CAP_GB`), `MemoryHigh` 1 GB under, no swap; guard stops an arm at under 1.5 GB available or 1.5 GB swap growth | `tools/linkbench/strata_ab.py` | 15.2: two hard resets from uncapped runs |
+
+Known state: uncapped, the staged default reaches about 27 tok/s but only because the file cache takes nearly all RAM; capped it is about 11.4. Closing that gap safely (a memory governor) is the next work item, then the stand-in test.
+
