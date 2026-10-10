@@ -1913,6 +1913,10 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
     src_ = src;
     x_.assign((size_t) (8 * n_embd), 0.f);
+    for (int j = 0; j < 2; ++j) {
+        pred_[j].assign(routers_.size() * (size_t) n_expert, 0);
+        pred_valid_[j].assign(routers_.size(), 0);
+    }
     thread_ = std::thread([this] { run(); });
     return true;
 }
@@ -1929,6 +1933,16 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
         pending_ = true;
     }
     cv_.notify_one();
+}
+
+void RouterLookahead::clear_predictions() {
+    for (int j = 0; j < 2; ++j) std::fill(pred_valid_[j].begin(), pred_valid_[j].end(), (uint8_t) 0);
+}
+bool RouterLookahead::has_prediction(int j, int64_t layer) const {
+    return j >= 0 && j < 2 && layer >= 0 && (size_t) layer < pred_valid_[j].size() && pred_valid_[j][(size_t) layer] != 0;
+}
+bool RouterLookahead::predicted_at(int j, int64_t layer, int64_t e) const {
+    return has_prediction(j, layer) && e >= 0 && e < n_expert_ && pred_[j][(size_t) layer * (size_t) n_expert_ + (size_t) e] != 0;
 }
 
 void RouterLookahead::set_max_tokens(int n) {
@@ -2006,6 +2020,12 @@ void RouterLookahead::run() {
                 if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;   // on the GPU
                 if (std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
             }
+        }
+        if (dj < 2) {   // for the measurement: what this prediction held (the prompt thread reads it after the layer's routing)
+            uint8_t* row = pred_[dj].data() + (size_t) layer * (size_t) n_expert_;
+            std::fill(row, row + n_expert_, (uint8_t) 0);
+            for (const int64_t e : want) row[e] = 1;
+            pred_valid_[dj][(size_t) layer] = 1;
         }
         src_->warm(layer, want.data(), (int64_t) want.size());
         if (fs != nullptr && dj == 0)   // the next layer only: a deeper guess is too often wrong to spend a copy on

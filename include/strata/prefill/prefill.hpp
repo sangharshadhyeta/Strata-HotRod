@@ -189,6 +189,7 @@ private:
     core::RouterLookahead* lookahead_ = nullptr;     ///< set_lookahead
     std::vector<uint16_t> la_bf_;                    ///< the sampled router-input rows (bf16), host
     std::vector<float> la_x_;                        ///< ... as floats, what the lookahead takes
+    int64_t la_s_[12] = {};                          ///< STRATA_PREFILL_LOOKAHEAD_STATS: layers, then per prediction (+1, +2, either) layers / experts / hits
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool

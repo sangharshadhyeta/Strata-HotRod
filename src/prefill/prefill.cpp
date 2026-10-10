@@ -3045,6 +3045,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const uint32_t bits = (uint32_t) la_bf_[i] << 16;
                                 std::memcpy(&la_x_[i], &bits, sizeof(float));
                             }
+                            if (l == LB) lookahead_->clear_predictions();   // (measurement) this chunk's predictions only
                             lookahead_->submit(l, la_x_.data(), la_n, m.host_res);
                         }
                         if (m.cpu_pend) {   // the measured share: the last CPU-sharing layer's GPU time is final now
@@ -3096,6 +3097,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = ids_h[(size_t) i];
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
+                        }
+                        // STRATA_PREFILL_LOOKAHEAD_STATS=1 (measurement): of the experts this layer routed to that were not on the GPU, how many
+                        // the prediction made one layer back (+1) and two layers back (+2) held, over the layers that got one
+                        if (static const bool la_stats = std::getenv("STRATA_PREFILL_LOOKAHEAD_STATS") != nullptr;
+                            la_stats && lookahead_ != nullptr && la_tok > 0) {
+                            const bool p0 = lookahead_->has_prediction(0, l), p1 = lookahead_->has_prediction(1, l);
+                            int64_t nr = 0, a0 = 0, a1 = 0, an = 0;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                if (m.cnt[(size_t) e] == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0)) continue;
+                                ++nr;
+                                const bool x0 = lookahead_->predicted_at(0, l, e), x1 = lookahead_->predicted_at(1, l, e);
+                                a0 += x0; a1 += x1; an += x0 || x1;
+                            }
+                            la_s_[0] += 1;
+                            if (p0) { la_s_[1] += 1; la_s_[2] += nr; la_s_[3] += a0; }
+                            if (p1) { la_s_[4] += 1; la_s_[5] += nr; la_s_[6] += a1; }
+                            if (p0 || p1) { la_s_[7] += 1; la_s_[8] += nr; la_s_[9] += an; }
+                            if (l + 1 == LE) {
+                                auto pct = [](int64_t h, int64_t n) { return n > 0 ? 100.0 * (double) h / (double) n : 0.0; };
+                                std::fprintf(stderr, "strata prefill lookahead: %lld layers; +1 predicted %lld layers, %.1f%% of the routed non-resident experts "
+                                             "were in it; +2 %lld layers, %.1f%%; either %lld layers, %.1f%%\n",
+                                             (long long) la_s_[0], (long long) la_s_[1], pct(la_s_[3], la_s_[2]), (long long) la_s_[4],
+                                             pct(la_s_[6], la_s_[5]), (long long) la_s_[7], pct(la_s_[9], la_s_[8]));
+                                for (int64_t& v : la_s_) v = 0;
+                            }
                         }
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)

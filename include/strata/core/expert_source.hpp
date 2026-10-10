@@ -241,9 +241,17 @@ public:
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
     double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
+    /// Measurement only (STRATA_PREFILL_LOOKAHEAD_STATS): what the prediction for `layer` held, from one layer back (j = 0) and
+    /// from two back (j = 1): `has_prediction` says whether one was made since `clear_predictions` (a busy thread skips a
+    /// request), `predicted_at` whether expert `e` was in it.  The sets leave out experts already on the GPU.
+    void clear_predictions();
+    bool has_prediction(int j, int64_t layer) const;
+    bool predicted_at(int j, int64_t layer, int64_t e) const;
 
 private:
     void run();
+    std::vector<uint8_t> pred_[2];                  ///< [j][layer * n_expert + e]
+    std::vector<uint8_t> pred_valid_[2];            ///< [j][layer]
     std::vector<std::vector<uint16_t>> routers_;
     int64_t n_embd_ = 0, n_expert_ = 0;
     int k_ = 10;
