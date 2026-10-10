@@ -28,6 +28,9 @@ def ask(prompt, max_tokens=None):
     body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": NO_CAP, "temperature": 0, "stream": False}
     if not THINK:
         body.update({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}})
+    # BENCH_FLOORS=2,2,4: the per-part stand-in floors of SPEC 17 (thinking, answer, code) sent with every request
+    if os.environ.get("BENCH_FLOORS"):
+        body["strata_standin_floors"] = [int(x) for x in os.environ["BENCH_FLOORS"].split(",")]
     req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     t0 = time.time()
