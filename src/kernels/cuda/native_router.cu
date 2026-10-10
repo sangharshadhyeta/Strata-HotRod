@@ -188,7 +188,7 @@ static unsigned long long* g_detail = nullptr;   // the decode rows' detail coun
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
-                                 unsigned long long* __restrict__ detail, int32_t* __restrict__ rows) {
+                                 unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
     // the floor lives in host-mapped memory, read at every launch, so a captured graph follows a change the host makes between
@@ -287,6 +287,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                 atomicAdd(detail + 22 + rb, 1ull);
                 atomicAdd(detail + 27 + gb, 1ull);
             }
+            if (repl != nullptr) atomicAdd(repl + e, 1.0f);   // SWAP2: this expert was wanted and a stand-in served it
             id[r] = best;
             ++swaps;
         }
@@ -333,12 +334,30 @@ void route_cfg_set_floor(int lo) {
 }
 const RouteCfg* route_cfg_device() { return g_cfg_dev; }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           unsigned long long* stats, void* stream, float* want, int32_t* rows) {
+                           unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     route_resident_k<<<(unsigned) ((n_tok + 31) / 32), 32, 0, static_cast<cudaStream_t>(stream)>>>(
-        logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr);
+        logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
+        n_tok <= 8 ? repl : nullptr);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+static float* g_repl = nullptr;
+static size_t g_repl_n = 0;
+void route_repl_alloc(size_t n) {
+    if (g_repl != nullptr || n == 0) return;
+    if (cudaMalloc((void**) &g_repl, n * sizeof(float)) != cudaSuccess) { g_repl = nullptr; return; }
+    cudaMemset(g_repl, 0, n * sizeof(float));
+    g_repl_n = n;
+}
+float* route_repl_layer(int64_t layer, int64_t n_expert) { return g_repl ? g_repl + (size_t) (layer * n_expert) : nullptr; }
+bool route_repl_active() { return g_repl != nullptr; }
+void route_repl_drain(float* usage2, size_t n) {
+    if (g_repl == nullptr || usage2 == nullptr || n < g_repl_n) return;
+    std::vector<float> h(g_repl_n);
+    if (cudaMemcpy(h.data(), g_repl, g_repl_n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    cudaMemset(g_repl, 0, g_repl_n * sizeof(float));
+    for (size_t i = 0; i < g_repl_n; ++i) usage2[i] += h[i];
 }
 void route_detail_alloc() {
     if (g_detail != nullptr) return;

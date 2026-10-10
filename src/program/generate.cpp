@@ -7475,6 +7475,14 @@ int main(int argc, char** argv) {
         const int swap_grace = [] { const char* v = std::getenv("STRATA_SWAP_GRACE"); return v ? std::max(0, std::atoi(v)) : 0; }();
         std::vector<int64_t> swapped_at((size_t) (g.n_layers * g.n_expert), -1000000);
         int64_t swap_round = 0;
+        // SWAP2 (STRATA_SWAP2_MAX=n, default 0 = off; opt-in): quality swaps.  A non-resident expert of rank >= the floor is replaced by a resident stand-in
+        // and never counted as demand, so the swap round never brings it in.  The kernel counts the experts stand-ins replaced (usage2); a round may bring
+        // the most replaced ones (usage2 >= STRATA_SWAP2_MIN, default 3) into slots NOTHING needs (a resident whose own use is below STRATA_SWAP2_COLD,
+        // default 1.0, in the same decayed units), at most n a round, after the demand swaps: speed is not spent on quality.
+        const int swap2_max = [] { const char* v = std::getenv("STRATA_SWAP2_MAX"); return v ? std::max(0, std::atoi(v)) : 0; }();
+        const float swap2_min = [] { const char* v = std::getenv("STRATA_SWAP2_MIN"); return v ? (float) std::atof(v) : 3.0f; }();
+        const float swap2_cold = [] { const char* v = std::getenv("STRATA_SWAP2_COLD"); return v ? (float) std::atof(v) : 1.0f; }();
+        std::vector<float> usage2(swap2_max > 0 ? (size_t) (g.n_layers * g.n_expert) : 0, 0.0f);
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
@@ -7505,6 +7513,39 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if (swap2_max > 0) {   // SWAP2: after the demand swaps, into cold slots only
+                strata::kernels::route_repl_drain(usage2.data(), usage2.size());
+                std::vector<char> taken((size_t) (g.n_layers * g.n_expert), 0);
+                for (const Swap& s : swaps) { taken[(size_t) (s.layer * g.n_expert + s.in)] = 1; taken[(size_t) (s.layer * g.n_expert + s.out)] = 1; }
+                std::vector<Swap> extra;
+                std::vector<std::pair<float, int32_t>> c2, v2;
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    c2.clear();
+                    v2.clear();
+                    const float* u = drive.d.usage.data() + l * g.n_expert;
+                    const float* u2 = usage2.data() + l * g.n_expert;
+                    const int32_t* r = host_res.data() + l * g.n_expert;
+                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                        if (taken[(size_t) (l * g.n_expert + e)]) continue;
+                        if (r[e] < 0) { if (u2[e] >= swap2_min && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) c2.emplace_back(u2[e], e); }
+                        else if (u[e] < swap2_cold && (swap_grace == 0 || swap_round - swapped_at[(size_t) (l * g.n_expert + e)] > swap_grace)) v2.emplace_back(u[e], e);
+                    }
+                    if (c2.empty() || v2.empty()) continue;
+                    std::sort(c2.begin(), c2.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                    std::sort(v2.begin(), v2.end(), [](auto& a, auto& b) { return a.first < b.first; });
+                    for (size_t i = 0; i < std::min(c2.size(), v2.size()); ++i)
+                        extra.push_back({0.001f * c2[i].first, (int32_t) l, c2[i].second, v2[i].second});
+                }
+                std::sort(extra.begin(), extra.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+                if ((int) extra.size() > swap2_max) extra.resize((size_t) swap2_max);
+                static int64_t swap2_total = 0;
+                swap2_total += (int64_t) extra.size();
+                static const bool say2 = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
+                if (say2 && !extra.empty())
+                    std::fprintf(stderr, "strata serve: SWAP2: %zu quality swaps this round (%lld in all) into slots with use < %.2f\n", extra.size(), (long long) swap2_total, swap2_cold);
+                swaps.insert(swaps.end(), extra.begin(), extra.end());
+                for (float& v : usage2) v *= o.adapt_decay;
+            }
             for (const Swap& s : swaps) swapped_at[(size_t) (s.layer * g.n_expert + s.in)] = swap_round;   // the grace starts now
             // STRATA_TRACE_ADAPT: what each serve swap round saw and did (default off, one getenv)
             static const bool trace_serve_adapt = std::getenv("STRATA_TRACE_ADAPT") != nullptr;

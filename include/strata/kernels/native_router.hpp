@@ -41,7 +41,13 @@ const RouteCfg* route_cfg_device();
 /// before any swap. Needs route_cfg_init first.
 /// `rows` is nullptr or the layer's [8 rows][10] slice of the per-row record (route_rows_layer): the same original picks per window row.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr);
+                           unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr);
+/// SWAP2 (STRATA_SWAP2_MAX > 0): the experts stand-ins replaced, counted per (layer, expert) on the device (route_repl_layer is the layer's slice);
+/// route_repl_drain adds them to a host array and clears them.  The swap round may bring the most replaced ones into slots nothing needs.
+void route_repl_alloc(size_t n);
+float* route_repl_layer(int64_t layer, int64_t n_expert);
+bool route_repl_active();
+void route_repl_drain(float* usage2, size_t n);
 /// SPEC 13.40 (STRATA_COUNT_KEPT=1): the per-row record of the router's original top-10, so the swap round counts only the rows of a
 /// window whose input token was kept (rows 0..a after a accepted drafts).  `route_rows_apply(kept, ...)` adds those rows' picks to the
 /// host usage table after the acceptance is known; with this on the atomic count (`want`) is not used.
