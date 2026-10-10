@@ -71,6 +71,7 @@ struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
     bool count = false;   ///< decode windows count the router's own top-10 on the device (route_want_*)
+    int maxrank = 0;      ///< STRATA_ROUTE_MAXRANK=<n>: a stand-in must be within the router's first n places of all 512 (0: any)
     float bias = 0.0f;    ///< STRATA_ROUTE_BIAS=<beta>: the CCE bias, ln(1 + beta) added to a resident expert's logit before the top-10
     float edge = -1.0f;   ///< STRATA_ROUTE_RESIDENT_EDGE=<logits>: the rank below `lo` is replaced only by a close substitute
     unsigned long long* d_stats = nullptr;
@@ -107,6 +108,7 @@ RouteResidentCfg& route_resident_cfg() {
         // a fractional floor: STRATA_ROUTE_RESIDENT_RANKS=2-9 with STRATA_ROUTE_RESIDENT_EDGE=1 is "floor 1.5" (rank 1 is
         // replaced only by a substitute within 1 logit of it)
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) r.edge = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_ROUTE_MAXRANK")) r.maxrank = std::max(0, std::atoi(v));
         // STRATA_ROUTE_BIAS=<beta> (solid.cpp's LLAMA_MOE_CACHE_BIAS): alone, with STRATA_ROUTE_RESIDENT=1e-6 (the kernel runs, no rank is replaced)
         if (const char* v = std::getenv("STRATA_ROUTE_BIAS")) { const double b = std::atof(v); r.bias = b > 0.0 ? (float) std::log1p(b) : 0.0f; }
         return r;
@@ -440,11 +442,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
         // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
         strata::kernels::route_cfg_init(route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().margin,
-                                        route_resident_cfg().edge, route_resident_cfg().bias);
+                                        route_resident_cfg().edge, route_resident_cfg().bias, route_resident_cfg().maxrank);
     }
     if (route_resident_cfg().margin > 0.0f)
-        std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, edge %g, router bias ln(1+beta) %g, decode windows %s)\n",
+        std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, edge %g, router bias ln(1+beta) %g, stand-in within the router's first %d places, decode windows %s)\n",
                      route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().edge, route_resident_cfg().bias,
+                     route_resident_cfg().maxrank,
                      strata::kernels::route_want_active() ? "counted from the router's own top-10 for the swap round" : "counted as routed");
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {

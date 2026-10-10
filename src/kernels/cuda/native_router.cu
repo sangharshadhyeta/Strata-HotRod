@@ -198,6 +198,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     const float margin = ((const volatile RouteCfg*) cfg)->margin;
     const float edge = ((const volatile RouteCfg*) cfg)->edge;
     const float bias = ((const volatile RouteCfg*) cfg)->bias;
+    const int maxrank = ((const volatile RouteCfg*) cfg)->maxrank;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
     // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
@@ -263,6 +264,13 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             if (!used) { best = f; bl = l[f]; }
         }
         // the edge rank (lo - 1, a fractional floor such as 1.5) is replaced only by a close substitute (within `edge`)
+        // item 21: the stand-in's place in the router's own ranking of all 512 experts (10 = the router's next choice after its ten
+        // picks); a stand-in further down than `maxrank` is refused and the exact expert is fetched instead
+        if (best >= 0 && maxrank > 0) {
+            int place = 0;
+            for (int f = 0; f < 512; ++f) place += l[f] > bl;
+            if (place >= maxrank) best = -1;
+        }
         if (best >= 0 && l[e] - bl <= (r < lo ? edge : margin)) {
             if (detail != nullptr) {
                 // what was replaced and by what (per replacement): the weight of the replaced pick, the substitute's place in
@@ -303,7 +311,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
 // floors (thinking / answer / code, a fence tracker) lived here and were removed after the benchmark showed no gain (SPEC 18.1).
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
-void route_cfg_init(int lo, int hi, float margin, float edge, float bias) {
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank) {
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
@@ -313,6 +321,7 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias) {
     g_cfg_host->margin = margin;
     g_cfg_host->edge = edge;
     g_cfg_host->bias = bias;
+    g_cfg_host->maxrank = maxrank;
     __sync_synchronize();
 }
 void route_cfg_set_floor(int lo) {

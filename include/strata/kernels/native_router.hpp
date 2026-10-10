@@ -28,9 +28,10 @@ struct RouteCfg {
     int32_t hi;
     float margin;
     float edge;
+    int32_t maxrank;   ///< a stand-in must sit within this many places of the router's own ranking of all 512 experts (0 = any)
     float bias;   ///< CCE router bias: ln(1 + beta) added to a resident expert's logit before the top-10 (0 = off)
 };
-void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f);   ///< before graph capture
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, int maxrank = 0);   ///< before graph capture
 void route_cfg_set_floor(int lo);                                ///< between windows
 const RouteCfg* route_cfg_device();
 /// STRATA_ROUTE_RESIDENT: swap non-resident picks of the segment's floor ranks for resident ones within the margin (see the .cu).
