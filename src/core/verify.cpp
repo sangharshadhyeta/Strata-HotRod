@@ -423,6 +423,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     (void) route_resident_cfg().stats();   // STRATA_ROUTE_RESIDENT: the counters are allocated outside graph capture
     if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count)
         strata::kernels::route_want_alloc((size_t) (g.n_layers * g.n_expert));
+    if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_TRACE_ADAPT") != nullptr)
+        strata::kernels::route_detail_alloc();
     if (route_resident_cfg().margin > 0.0f)
         std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, decode windows %s)\n",
                      route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,

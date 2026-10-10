@@ -30,4 +30,9 @@ float* route_want_layer(int64_t layer, int64_t n_expert);   ///< nullptr when no
 bool route_want_active();
 /// Adds the counts since the last call to the host `usage` table (n_layers * n_expert) and clears them.
 void route_want_drain(float* usage, size_t n);
+/// STRATA_TRACE_ADAPT: cumulative counters of the decode rows' router picks (16 uint64): [0..9] picks of rank r that were not
+/// resident, [10] router weight on them (x1e6), [11] rows, [12] rows with the top-1 not resident, [13] rows with a
+/// non-resident pick among the top 5. Allocated outside graph capture; read on the host between windows.
+void route_detail_alloc();
+void route_detail_read(unsigned long long* out16);   // 48 entries: [16..21] replaced-pick weight buckets (<1%,<2,<5,<10,<20,>=20), [22..26] substitute rank in the router ranking (<20,<40,<80,<160,>=160), [27..32] score gap (<0.5,<1,<2,<4,<8,>=8), [33..42] summed weight per rank x1e6
 }

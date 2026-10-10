@@ -183,13 +183,32 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
 // picked when its logit is within `margin` of the replaced one; the weights are then the softmax of the selected
 // logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
 // stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
+static unsigned long long* g_detail = nullptr;   // the decode rows' detail counters (route_detail_alloc), see below
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
-                                 unsigned long long* __restrict__ stats, float* __restrict__ want) {
+                                 unsigned long long* __restrict__ stats, float* __restrict__ want,
+                                 unsigned long long* __restrict__ detail) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
+    // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
+    // (x1e6), [11] rows, [12] rows whose top-1 is not resident, [13] rows with a non-resident pick among the top 5
+    if (detail != nullptr) {
+        int top5 = 0;
+        for (int r = 0; r < 10; ++r) {
+            if (res[id[r]] < 0) {
+                atomicAdd(detail + r, 1ull);
+                atomicAdd(detail + 10, (unsigned long long) (weights[(size_t) t * 10 + r] * 1e6f));
+                if (r == 0) atomicAdd(detail + 12, 1ull);
+                if (r < 5) top5 = 1;
+            }
+        }
+        atomicAdd(detail + 11, 1ull);
+        if (top5) atomicAdd(detail + 13, 1ull);
+        // the router weight at each rank (x1e6, summed over rows): [33 + r]
+        for (int r = 0; r < 10; ++r) atomicAdd(detail + 33 + r, (unsigned long long) (weights[(size_t) t * 10 + r] * 1e6f));
+    }
     // what the router WANTS, counted before any swap: the picks the host sees afterwards are confined to resident experts
     // and cannot say which expert the swap round should bring in (`want` is the layer's slice of the usage counter)
     if (want != nullptr)
@@ -208,7 +227,24 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             for (int q = 0; q < 10; ++q) used |= id[q] == f;
             if (!used) { best = f; bl = l[f]; }
         }
-        if (best >= 0 && l[e] - bl <= margin) { id[r] = best; ++swaps; }
+        if (best >= 0 && l[e] - bl <= margin) {
+            if (detail != nullptr) {
+                // what was replaced and by what (per replacement): the weight of the replaced pick, the substitute's place in
+                // the router's own ranking of all 512 experts, and the score gap to it
+                const float w = weights[(size_t) t * 10 + r];
+                const int wb = w < 0.01f ? 0 : w < 0.02f ? 1 : w < 0.05f ? 2 : w < 0.10f ? 3 : w < 0.20f ? 4 : 5;
+                int gr = 0;
+                for (int f = 0; f < 512; ++f) gr += l[f] > bl;
+                const int rb = gr < 20 ? 0 : gr < 40 ? 1 : gr < 80 ? 2 : gr < 160 ? 3 : 4;
+                const float gap = l[e] - bl;
+                const int gb = gap < 0.5f ? 0 : gap < 1.f ? 1 : gap < 2.f ? 2 : gap < 4.f ? 3 : gap < 8.f ? 4 : 5;
+                atomicAdd(detail + 16 + wb, 1ull);
+                atomicAdd(detail + 22 + rb, 1ull);
+                atomicAdd(detail + 27 + gb, 1ull);
+            }
+            id[r] = best;
+            ++swaps;
+        }
     }
     int after = 0;
     for (int r = 0; r < 10; ++r) after += res[id[r]] < 0;
@@ -230,9 +266,18 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                            int rank_lo, int rank_hi, unsigned long long* stats, void* stream, float* want) {
     if (!stream || n_tok < 1 || !res_layer) throw std::invalid_argument("native_route_resident: bad arguments");
     route_resident_k<<<(unsigned) ((n_tok + 31) / 32), 32, 0, static_cast<cudaStream_t>(stream)>>>(
-        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats, want);
+        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats, want, n_tok <= 8 ? g_detail : nullptr);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void route_detail_alloc() {
+    if (g_detail != nullptr) return;
+    if (cudaMalloc((void**) &g_detail, 48 * sizeof(unsigned long long)) != cudaSuccess) { g_detail = nullptr; return; }
+    cudaMemset(g_detail, 0, 48 * sizeof(unsigned long long));
+}
+void route_detail_read(unsigned long long* out16) {
+    if (g_detail == nullptr) { for (int i = 0; i < 48; ++i) out16[i] = 0; return; }
+    cudaMemcpy(out16, g_detail, 48 * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
 }
 
 // ---- the router's wanted-expert counter (step 3 of SPEC.md 13.20): n_layers * n_expert floats on the device, filled by

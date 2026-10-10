@@ -7476,8 +7476,45 @@ int main(int argc, char** argv) {
                 swaps_seen += (int64_t) swaps.size();
                 double usum = 0.0, umax = 0.0;
                 for (float uv : drive.d.usage) { usum += uv; umax = std::max<double>(umax, uv); }
-                std::fprintf(stderr, "strata serve: ADAPT round %lld: %zu swaps this round (%lld in all), usage sum %.0f max %.1f\n",
-                             (long long) rounds_seen, swaps.size(), (long long) swaps_seen, usum, umax);
+                // supply and demand of this round: the non-resident experts the router wanted at least twice (the swap
+                // rule's candidates) against the swaps the round may make
+                int64_t ncand = 0;
+                double cand_mass = 0.0;
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        if (host_res[(size_t) (l * g.n_expert + e)] < 0 && drive.d.usage[(size_t) (l * g.n_expert + e)] >= 2.0f) {
+                            ++ncand;
+                            cand_mass += drive.d.usage[(size_t) (l * g.n_expert + e)];
+                        }
+                std::fprintf(stderr, "strata serve: ADAPT round %lld: %zu swaps this round (%lld in all), usage sum %.0f max %.1f, "
+                                     "%lld non-resident candidates (count >= 2, %.0f picks) for %d swaps\n",
+                             (long long) rounds_seen, swaps.size(), (long long) swaps_seen, usum, umax, (long long) ncand,
+                             cand_mass, o.adapt_swaps);
+                if (rounds_seen % 5 == 0) {
+                    unsigned long long dt[48];
+                    strata::kernels::route_detail_read(dt);
+                    if (dt[11] > 0) {
+                        std::fprintf(stderr, "strata serve: ROUTE router weight at rank 0..9 (%% of the row):");
+                        for (int r = 0; r < 10; ++r) std::fprintf(stderr, " %.1f", 100.0 * (dt[33 + r] / 1e6) / dt[11]);
+                        std::fprintf(stderr, "\n");
+                        unsigned long long nrep = 0;
+                        for (int b = 0; b < 6; ++b) nrep += dt[16 + b];
+                        if (nrep > 0) {
+                            std::fprintf(stderr, "strata serve: ROUTE %llu replacements; replaced pick's weight (<1%% <2%% <5%% <10%% <20%% >=20%%):", nrep);
+                            for (int b = 0; b < 6; ++b) std::fprintf(stderr, " %.0f%%", 100.0 * dt[16 + b] / nrep);
+                            std::fprintf(stderr, "; substitute's place in the router's ranking (<20 <40 <80 <160 >=160):");
+                            for (int b = 0; b < 5; ++b) std::fprintf(stderr, " %.0f%%", 100.0 * dt[22 + b] / nrep);
+                            std::fprintf(stderr, "; score gap to it (<0.5 <1 <2 <4 <8 >=8):");
+                            for (int b = 0; b < 6; ++b) std::fprintf(stderr, " %.0f%%", 100.0 * dt[27 + b] / nrep);
+                            std::fprintf(stderr, "\n");
+                        }
+                        std::fprintf(stderr, "strata serve: ROUTE decode rows %llu: top-1 not resident %.1f%%, a non-resident pick in the top 5 "
+                                             "%.1f%%, router weight on non-resident picks %.1f%%; non-resident by rank 0..9 (%%):",
+                                     dt[11], 100.0 * dt[12] / dt[11], 100.0 * dt[13] / dt[11], 100.0 * (dt[10] / 1e6) / dt[11]);
+                        for (int r = 0; r < 10; ++r) std::fprintf(stderr, " %.0f", 100.0 * dt[r] / dt[11]);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
             }
             // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
             auto home_of = [&](int64_t layer) -> SwapHome {
