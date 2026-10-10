@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -184,11 +185,15 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
 // stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
-                                 unsigned long long* __restrict__ stats) {
+                                 unsigned long long* __restrict__ stats, float* __restrict__ want) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
+    // what the router WANTS, counted before any swap: the picks the host sees afterwards are confined to resident experts
+    // and cannot say which expert the swap round should bring in (`want` is the layer's slice of the usage counter)
+    if (want != nullptr)
+        for (int r = 0; r < 10; ++r) atomicAdd(want + id[r], 1.0f);
     int swaps = 0, tail = 0, before = 0;
     for (int r = 0; r < 10; ++r) before += res[id[r]] < 0;
     for (int r = lo; r <= hi && r < 10; ++r) {
@@ -222,11 +227,32 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     }
 }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
-                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream) {
+                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream, float* want) {
     if (!stream || n_tok < 1 || !res_layer) throw std::invalid_argument("native_route_resident: bad arguments");
     route_resident_k<<<(unsigned) ((n_tok + 31) / 32), 32, 0, static_cast<cudaStream_t>(stream)>>>(
-        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats);
+        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats, want);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+// ---- the router's wanted-expert counter (step 3 of SPEC.md 13.20): n_layers * n_expert floats on the device, filled by
+// route_resident_k, drained into the host usage table before each swap round.
+static float* g_want = nullptr;
+static size_t g_want_n = 0;
+void route_want_alloc(size_t n) {
+    if (g_want != nullptr || n == 0) return;
+    if (cudaMalloc((void**) &g_want, n * sizeof(float)) != cudaSuccess) { g_want = nullptr; return; }
+    cudaMemset(g_want, 0, n * sizeof(float));
+    g_want_n = n;
+}
+float* route_want_layer(int64_t layer, int64_t n_expert) { return g_want ? g_want + (size_t) (layer * n_expert) : nullptr; }
+bool route_want_active() { return g_want != nullptr; }
+// A pick counted between the copy and the clear is lost: the counts are approximate by nature.
+void route_want_drain(float* usage, size_t n) {
+    if (g_want == nullptr || usage == nullptr || n < g_want_n) return;
+    std::vector<float> h(g_want_n);
+    if (cudaMemcpy(h.data(), g_want, g_want_n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    cudaMemset(g_want, 0, g_want_n * sizeof(float));
+    for (size_t i = 0; i < g_want_n; ++i) usage[i] += h[i];
 }
 }

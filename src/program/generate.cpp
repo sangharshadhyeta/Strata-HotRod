@@ -34,7 +34,6 @@
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
-#include "strata/kernels/standin_mask.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -5591,16 +5590,6 @@ int main(int argc, char** argv) {
         }
         thits.d_res = d_res;
         thits.n_expert = g.n_expert;
-        // the stand-in for every miss (STRATA_STANDIN=1, SPEC.md 13.20): the router is restricted to the experts this
-        // table says are in VRAM. One GPU only (a layer split keeps a table per stage); the table is refreshed in place
-        // after every swap round, so the pointer stays valid for the run and for captured graphs.
-        if (!multi_gpu) {
-            strata::kernels::standin_set_table(d_res, (int) g.n_expert);
-            if (strata::kernels::standin_enabled())
-                std::fprintf(stderr, "strata generate: stand-in mask ON (STRATA_STANDIN=1): the router picks only experts resident in VRAM "
-                                     "(decode windows of up to %d rows; a layer with fewer than k resident experts is left unmasked)\n",
-                             strata::kernels::standin_max_rows());
-        }
         // a file-backed arena (STRATA_ARENA_MMAP): the experts no GPU holds are the ones the CPU pool and the
         // prompt path will read - start reading them now instead of faulting them in 4 KB at a time mid-request
         // ... and the ones a GPU holds are handed back first (STRATA_ARENA_RELEASE=0 keeps them): the fill read the
@@ -7453,6 +7442,7 @@ int main(int argc, char** argv) {
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size());   // what the unmasked router wanted (13.20)
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -7478,6 +7468,17 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            // STRATA_TRACE_ADAPT: what each serve swap round saw and did (default off, one getenv)
+            static const bool trace_serve_adapt = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
+            if (trace_serve_adapt) {
+                static int64_t rounds_seen = 0, swaps_seen = 0;
+                ++rounds_seen;
+                swaps_seen += (int64_t) swaps.size();
+                double usum = 0.0, umax = 0.0;
+                for (float uv : drive.d.usage) { usum += uv; umax = std::max<double>(umax, uv); }
+                std::fprintf(stderr, "strata serve: ADAPT round %lld: %zu swaps this round (%lld in all), usage sum %.0f max %.1f\n",
+                             (long long) rounds_seen, swaps.size(), (long long) swaps_seen, usum, umax);
+            }
             // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
             auto home_of = [&](int64_t layer) -> SwapHome {
                 const int stn = multi_gpu ? stage_of(layer) : 0;
@@ -7807,6 +7808,7 @@ int main(int argc, char** argv) {
                     a_last = a_win;
                     ++a_rounds;
                     a_t0 = Clock::now();
+                    strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size());   // 13.20
                     a_usage = drive.d.usage;
                     a_res = host_res;
                     // #477: the routing counted, as adapt() counts it (--expert-profile-save; else `heat` is empty)
@@ -11603,6 +11605,7 @@ int main(int argc, char** argv) {
         auto adapt = [&]() -> bool {
             const Clock::time_point ta = Clock::now();
             ++adapt_rounds;
+            strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size());   // what the unmasked router wanted (13.20)
             // STRATA_TRACE_ADAPT: why an adapt round did or did not swap.  Default off, one getenv, and it
             // reports the only thing that can make an adapt round a coin flip: whether the PREVIOUS round's
             // asynchronous expert copies had landed by the time this round started.

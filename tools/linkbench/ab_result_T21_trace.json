@@ -1,0 +1,61 @@
+[
+ {
+  "arm": "T1",
+  "env": {
+   "STRATA_STANDIN": "1",
+   "STRATA_TRACE_ADAPT": "1"
+  },
+  "engine_sha": "31ad952b8387f7cb",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 37,
+   "peak_cg_current_mb": 29639.8,
+   "peak_cg_anon_mb": 2336.9,
+   "peak_cg_file_mb": 27305.8,
+   "peak_eng_rss_mb": 20307.1,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 929.0,
+   "min_sys_avail_mb": 25920.3,
+   "min_sys_free_mb": 222.1,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 15161,
+   "pswpout": 239182,
+   "pgmajfault": 16074,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 87,
+   "swap_used_mb_before": 0,
+   "swap_used_mb_after": 926
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    25.7
+   ],
+   "reasoning": [
+    47.1
+   ],
+   "prose": [
+    43.9
+   ]
+  },
+  "median_all": 43.9,
+  "tokens_timed": 315,
+  "requests_logged": 4,
+  "os_read_mb": 50207.6,
+  "expert_read_mb": 24657.0,
+  "major_faults": 15380,
+  "os_mb_per_token": 159.4,
+  "stdout": "== T1 @ http://127.0.0.1:8090  repeats=1 max_tokens=256\nwarm-up: {'tokens': 5, 'prompt_tokens': 15, 'ttft_s': 0.29, 'decode_tps': 45.5689623328227, 'total_s': 0.4}\ncode      decode tok/s: 25.7   median 25.7   (tokens [34], ttft [0.46]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.111)]  \"The user is asking for a Python function that merges overlapping inter\"\nreasoning decode tok/s: 47.1   median 47.1   (tokens [256], ttft [13.15]s)  degeneracy (repeat-4gram, top-word) [(0.04, 0.091)]  \"Here is the step-by-step calculation to determine the meeting time and\"\nprose     decode tok/s: 43.9   median 43.9   (tokens [25], ttft [0.44]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.25)]  \"Write a short, vivid paragraph about a lighthouse keeper who finds a m\"\nALL median 43.9 tok/s   mean of kind-medians 38.9\n"
+ }
+]

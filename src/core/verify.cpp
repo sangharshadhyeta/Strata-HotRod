@@ -14,7 +14,6 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_router.hpp"
-#include "strata/kernels/standin_mask.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -71,6 +70,7 @@ RouteResidentCfg& route_resident_cfg();
 struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
+    bool count = false;   ///< decode windows count the router's own top-10 on the device (route_want_*)
     unsigned long long* d_stats = nullptr;
     unsigned long long* stats() {
         if (d_stats == nullptr && margin > 0.0f) {
@@ -93,8 +93,15 @@ struct RouteResidentCfg {
 RouteResidentCfg& route_resident_cfg() {
     static RouteResidentCfg c = [] {
         RouteResidentCfg r;
+        // STRATA_STANDIN=1 (SPEC.md 13.20): every non-resident pick of every rank gets the best resident expert, whatever its
+        // score (an unlimited margin over ranks 0-9 is exactly "the k best resident experts, softmax over the chosen"), and
+        // the router's own top-10 is counted for the swap round. An explicit STRATA_ROUTE_RESIDENT / _RANKS still wins.
+        const char* si = std::getenv("STRATA_STANDIN");
+        if (si != nullptr && std::atoi(si) != 0) { r.margin = 1e30f; r.lo = 0; r.hi = 9; r.count = true; }
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) r.margin = (float) std::atof(v);
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &r.lo, &r.hi);
+        // STRATA_ROUTE_RESIDENT_COUNT=1|0: count what the unmasked router wanted (decode windows) for the swap round
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_COUNT")) r.count = std::atoi(v) != 0;
         return r;
     }();
     return c;
@@ -414,6 +421,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
     (void) route_resident_cfg().stats();   // STRATA_ROUTE_RESIDENT: the counters are allocated outside graph capture
+    if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count)
+        strata::kernels::route_want_alloc((size_t) (g.n_layers * g.n_expert));
+    if (route_resident_cfg().margin > 0.0f)
+        std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, decode windows %s)\n",
+                     route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
+                     strata::kernels::route_want_active() ? "counted from the router's own top-10 for the swap round" : "counted as routed");
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
         Verifier* none = nullptr;
@@ -1301,10 +1314,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
-                // the stand-in for every miss (SPEC.md 13.20, STRATA_STANDIN=1): the window's rows may pick only the experts
-                // in VRAM. This is the router the decode window really takes (512 x 10), so the mask has to sit here: T19's
-                // first run masked only moe_route/moe_route_window, which this path never calls, and showed no effect.
-                strata::kernels::standin_mask(logits_ + tb * NE, n, (int) NE, (int) K, (int) l, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
@@ -1327,7 +1336,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
-                                      route_resident_cfg().stats() + (n <= 8 ? 4 : 0), cs);
+                                      route_resident_cfg().stats() + (n <= 8 ? 4 : 0), cs,
+                                      n <= 8 ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (ar_on()) {

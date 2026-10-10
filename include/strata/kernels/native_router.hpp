@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels {
@@ -18,6 +19,15 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
 /// STRATA_ROUTE_RESIDENT: swap non-resident tail-rank experts for resident ones within `margin` logits (see the .cu).
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
+/// `want` is nullptr or the layer's slice of the wanted-expert counter (route_want_layer): the router's own top-10, counted
+/// before any swap.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
-                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream);
+                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream, float* want = nullptr);
+/// The wanted-expert counter: what the unmasked router picked, for the swap round (a router confined to resident experts
+/// cannot tell the swap round which expert to bring in). Allocated once (outside graph capture), n_layers * n_expert floats.
+void route_want_alloc(size_t n);
+float* route_want_layer(int64_t layer, int64_t n_expert);   ///< nullptr when not allocated
+bool route_want_active();
+/// Adds the counts since the last call to the host `usage` table (n_layers * n_expert) and clears them.
+void route_want_drain(float* usage, size_t n);
 }

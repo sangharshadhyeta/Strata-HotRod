@@ -1,0 +1,257 @@
+[
+ {
+  "arm": "K0",
+  "env": {},
+  "engine_sha": "31ad952b8387f7cb",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 111,
+   "peak_cg_current_mb": 29695.9,
+   "peak_cg_anon_mb": 2607.9,
+   "peak_cg_file_mb": 27075.3,
+   "peak_eng_rss_mb": 24749.0,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 1104.2,
+   "min_sys_avail_mb": 25845.5,
+   "min_sys_free_mb": 217.7,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 123096,
+   "pswpout": 300507,
+   "pgmajfault": 101076,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 158,
+   "swap_used_mb_before": 0,
+   "swap_used_mb_after": 1050
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    14.8,
+    25.5,
+    28.0
+   ],
+   "reasoning": [
+    19.2,
+    30.1,
+    22.8
+   ],
+   "prose": [
+    17.3,
+    24.8,
+    26.2
+   ]
+  },
+  "median_all": 24.8,
+  "tokens_timed": 2008,
+  "requests_logged": 10,
+  "os_read_mb": 199955.8,
+  "expert_read_mb": 966206.7,
+  "major_faults": 33707,
+  "os_mb_per_token": 99.6,
+  "stdout": "== K0 @ http://127.0.0.1:8090  repeats=3 max_tokens=256\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 1.98, 'decode_tps': 8.270912909300652, 'total_s': 3.1}\ncode      decode tok/s: 14.8, 25.5, 28.0   median 25.5   (tokens [256, 256, 256], ttft [2.77, 0.42, 0.42]s)  degeneracy (repeat-4gram, top-word) [(0.01, 0.038), (0.01, 0.05), (0.01, 0.048)]  \"```python def merge_intervals(intervals: list[tuple[int, int]]) -> lis\"\nreasoning decode tok/s: 19.2, 30.1, 22.8   median 22.8   (tokens [256, 256, 256], ttft [6.71, 0.32, 0.25]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.062), (0.0, 0.062), (0.0, 0.062)]  \"Here is the step-by-step solution to the problem.  ### Step 1: Analyze\"\nprose     decode tok/s: 17.3, 24.8, 26.2   median 24.8   (tokens [168, 163, 141], ttft [3.85, 0.47, 0.47]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.128), (0.0, 0.124), (0.0, 0.113)]  \"The gale howled like a wounded beast, battering the granite tower unti\"\nALL median 24.8 tok/s   mean of kind-medians 24.4\n"
+ },
+ {
+  "arm": "K1",
+  "env": {
+   "STRATA_ROUTE_RESIDENT": "2"
+  },
+  "engine_sha": "31ad952b8387f7cb",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 90,
+   "peak_cg_current_mb": 29696.0,
+   "peak_cg_anon_mb": 2482.9,
+   "peak_cg_file_mb": 27134.4,
+   "peak_eng_rss_mb": 24436.1,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 1186.8,
+   "min_sys_avail_mb": 26675.1,
+   "min_sys_free_mb": 218.2,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 103603,
+   "pswpout": 71046,
+   "pgmajfault": 89759,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 82,
+   "swap_used_mb_before": 1042,
+   "swap_used_mb_after": 1145
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    23.9,
+    36.4,
+    39.7
+   ],
+   "reasoning": [
+    23.7,
+    29.3,
+    31.1
+   ],
+   "prose": [
+    21.1,
+    30.0,
+    39.5
+   ]
+  },
+  "median_all": 30.0,
+  "tokens_timed": 2011,
+  "requests_logged": 10,
+  "os_read_mb": 190429.5,
+  "expert_read_mb": 623251.7,
+  "major_faults": 38206,
+  "os_mb_per_token": 94.7,
+  "stdout": "== K1 @ http://127.0.0.1:8090  repeats=3 max_tokens=256\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 1.64, 'decode_tps': 11.658573646973364, 'total_s': 2.4}\ncode      decode tok/s: 23.9, 36.4, 39.7   median 36.4   (tokens [256, 256, 256], ttft [2.31, 0.22, 0.2]s)  degeneracy (repeat-4gram, top-word) [(0.021, 0.041), (0.01, 0.038), (0.009, 0.045)]  \"```python def merge_intervals(intervals: list[tuple[int, int]]) -> lis\"\nreasoning decode tok/s: 23.7, 29.3, 31.1   median 29.3   (tokens [256, 256, 256], ttft [5.97, 0.3, 0.29]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.06), (0.0, 0.066), (0.0, 0.057)]  \"Here is the step-by-step solution to the problem.  ### Step 1: Analyze\"\nprose     decode tok/s: 21.1, 30.0, 39.5   median 30.0   (tokens [163, 158, 154], ttft [2.01, 0.48, 0.31]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.096), (0.0, 0.096), (0.0, 0.094)]  \"The gale howled like a wounded beast, battering the lighthouse\u2019s thick\"\nALL median 30.0 tok/s   mean of kind-medians 31.9\n"
+ },
+ {
+  "arm": "K2",
+  "env": {
+   "STRATA_ROUTE_RESIDENT": "2",
+   "STRATA_ROUTE_RESIDENT_COUNT": "1"
+  },
+  "engine_sha": "31ad952b8387f7cb",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 98,
+   "peak_cg_current_mb": 29695.9,
+   "peak_cg_anon_mb": 2488.5,
+   "peak_cg_file_mb": 27137.3,
+   "peak_eng_rss_mb": 24141.4,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 1221.5,
+   "min_sys_avail_mb": 26634.3,
+   "min_sys_free_mb": 216.3,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 58442,
+   "pswpout": 52006,
+   "pgmajfault": 57818,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 56,
+   "swap_used_mb_before": 1138,
+   "swap_used_mb_after": 1211
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    24.4,
+    35.7,
+    40.3
+   ],
+   "reasoning": [
+    20.2,
+    25.7,
+    26.1
+   ],
+   "prose": [
+    15.9,
+    27.6,
+    28.7
+   ]
+  },
+  "median_all": 26.1,
+  "tokens_timed": 2020,
+  "requests_logged": 10,
+  "os_read_mb": 229723.9,
+  "expert_read_mb": 676493.7,
+  "major_faults": 37132,
+  "os_mb_per_token": 113.7,
+  "stdout": "== K2 @ http://127.0.0.1:8090  repeats=3 max_tokens=256\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 1.63, 'decode_tps': 12.091036542417898, 'total_s': 2.4}\ncode      decode tok/s: 24.4, 35.7, 40.3   median 35.7   (tokens [256, 256, 256], ttft [2.4, 0.21, 0.2]s)  degeneracy (repeat-4gram, top-word) [(0.009, 0.045), (0.01, 0.038), (0.01, 0.038)]  \"```python def merge_intervals(intervals: list[tuple[int, int]]) -> lis\"\nreasoning decode tok/s: 20.2, 25.7, 26.1   median 25.7   (tokens [256, 256, 256], ttft [6.49, 0.3, 0.31]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.066), (0.0, 0.07), (0.0, 0.06)]  \"Here is the step-by-step solution to the problem.  ### Step 1: Analyze\"\nprose     decode tok/s: 15.9, 27.6, 28.7   median 27.6   (tokens [149, 153, 182], ttft [2.96, 0.4, 0.31]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.118), (0.0, 0.099), (0.0, 0.109)]  \"The gale screamed against the reinforced glass of the lantern room, sh\"\nALL median 26.1 tok/s   mean of kind-medians 29.7\n"
+ },
+ {
+  "arm": "K3",
+  "env": {
+   "STRATA_STANDIN": "1"
+  },
+  "engine_sha": "31ad952b8387f7cb",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 48,
+   "peak_cg_current_mb": 29693.9,
+   "peak_cg_anon_mb": 2326.0,
+   "peak_cg_file_mb": 27323.7,
+   "peak_eng_rss_mb": 20605.5,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 1205.8,
+   "min_sys_avail_mb": 26932.6,
+   "min_sys_free_mb": 260.8,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 87278,
+   "pswpout": 33724,
+   "pgmajfault": 63217,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 34,
+   "swap_used_mb_before": 1206,
+   "swap_used_mb_after": 1173
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    25.7,
+    33.3,
+    33.1
+   ],
+   "reasoning": [
+    44.1,
+    56.2,
+    46.1
+   ],
+   "prose": [
+    23.0,
+    52.8,
+    27.2
+   ]
+  },
+  "median_all": 33.3,
+  "tokens_timed": 887,
+  "requests_logged": 10,
+  "os_read_mb": 65854.8,
+  "expert_read_mb": 34752.7,
+  "major_faults": 20210,
+  "os_mb_per_token": 74.2,
+  "stdout": "== K3 @ http://127.0.0.1:8090  repeats=3 max_tokens=256\nwarm-up: {'tokens': 5, 'prompt_tokens': 15, 'ttft_s': 0.29, 'decode_tps': 45.53495075275413, 'total_s': 0.4}\ncode      decode tok/s: 25.7, 33.3, 33.1   median 33.1   (tokens [34, 33, 256], ttft [0.46, 0.1, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.111), (0.0, 0.115), (0.239, 0.054)]  \"The user is asking for a Python function that merges overlapping inter\"\nreasoning decode tok/s: 44.1, 56.2, 46.1   median 46.1   (tokens [256, 7, 256], ttft [7.85, 0.1, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.047, 0.061), (0.0, 0.0), (0.007, 0.07)]  \"Here is the step-by solution to determine the meeting time and the dis\"\nprose     decode tok/s: 23.0, 52.8, 27.2   median 27.2   (tokens [6, 21, 18], ttft [0.43, 0.1, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.0), (0.0, 0.235), (0.0, 0.214)]  \"<|im_start|>assistant <|im_start|>assistant\"\nALL median 33.3 tok/s   mean of kind-medians 35.4\n"
+ }
+]

@@ -10,6 +10,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/native_router.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/kq_avx1.hpp"
@@ -3136,7 +3137,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
-    if (!d.usage.empty())
+    // with the residency-biased router counting (STRATA_STANDIN=1 / STRATA_ROUTE_RESIDENT_COUNT=1) decode windows are counted
+    // on the device from the router's own top-10 (route_want_drain): the ids seen here are already confined to the resident
+    // experts and could not tell which expert to bring in
+    if (!d.usage.empty() && !(strata::kernels::route_want_active() && n_tok <= 8))
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.

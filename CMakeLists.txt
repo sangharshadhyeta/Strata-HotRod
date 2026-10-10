@@ -311,7 +311,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/s2_gemv_quads.cu
                           src/kernels/cuda/s2_gemv_fast.cu
                           src/kernels/cuda/router_top10.cu
-                          src/kernels/cuda/standin_mask.cu
                           src/kernels/cuda/quantize_act.cu
                           src/kernels/cuda/rope.cu
                           src/kernels/cuda/sampler.cu
