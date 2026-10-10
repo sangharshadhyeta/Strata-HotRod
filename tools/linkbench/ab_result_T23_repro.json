@@ -1,0 +1,127 @@
+[
+ {
+  "arm": "P0",
+  "env": {
+   "STRATA_STANDIN": "1",
+   "STRATA_ROUTE_RESIDENT_COUNT": "0"
+  },
+  "engine_sha": "193a2d6a4d7b873c",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 31,
+   "peak_cg_current_mb": 29599.4,
+   "peak_cg_anon_mb": 2326.1,
+   "peak_cg_file_mb": 27226.7,
+   "peak_eng_rss_mb": 20068.5,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 772.0,
+   "min_sys_avail_mb": 26002.7,
+   "min_sys_free_mb": 223.2,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 25235,
+   "pswpout": 197372,
+   "pgmajfault": 22007,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 38,
+   "swap_used_mb_before": 0,
+   "swap_used_mb_after": 743
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    84.7,
+    80.5
+   ],
+   "reasoning": [
+    48.9,
+    49.0
+   ],
+   "prose": [
+    61.1,
+    61.0
+   ]
+  },
+  "median_all": 61.1,
+  "tokens_timed": 180,
+  "requests_logged": 7,
+  "os_read_mb": 45718.9,
+  "expert_read_mb": 19785.9,
+  "major_faults": 13503,
+  "os_mb_per_token": 254.0,
+  "stdout": "== P0 @ http://127.0.0.1:8090  repeats=2 max_tokens=256\nwarm-up: {'tokens': 5, 'prompt_tokens': 15, 'ttft_s': 0.3, 'decode_tps': 45.67179992541031, 'total_s': 0.4}\ncode      decode tok/s: 84.7, 80.5   median 82.6   (tokens [34, 34], ttft [0.46, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.111), (0.0, 0.111)]  \"The user is asking for a Python function that merges overlapping inter\"\nreasoning decode tok/s: 48.9, 49.0   median 48.9   (tokens [36, 36], ttft [11.47, 0.11]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.048), (0.0, 0.048)]  \"Let me work this out step-by-step.  **Step 1: Head-start advantage.** \"\nprose     decode tok/s: 61.1, 61.0   median 61.0   (tokens [20, 20], ttft [0.44, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.25), (0.0, 0.25)]  \"The user's request is a bit of a message in a bottle on a stormy night\"\nALL median 61.0 tok/s   mean of kind-medians 64.2\n"
+ },
+ {
+  "arm": "P1",
+  "env": {
+   "STRATA_STANDIN": "1",
+   "STRATA_ROUTE_RESIDENT_COUNT": "0",
+   "STRATA_TRACE_ADAPT": "1"
+  },
+  "engine_sha": "193a2d6a4d7b873c",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 30,
+   "peak_cg_current_mb": 29691.7,
+   "peak_cg_anon_mb": 2343.3,
+   "peak_cg_file_mb": 27328.6,
+   "peak_eng_rss_mb": 20200.1,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 863.2,
+   "min_sys_avail_mb": 26881.6,
+   "min_sys_free_mb": 268.9,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 25540,
+   "pswpout": 34712,
+   "pgmajfault": 21766,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 10,
+   "swap_used_mb_before": 742,
+   "swap_used_mb_after": 848
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    84.4,
+    80.2
+   ],
+   "reasoning": [
+    57.3,
+    60.0
+   ],
+   "prose": [
+    64.6,
+    64.5
+   ]
+  },
+  "median_all": 64.6,
+  "tokens_timed": 148,
+  "requests_logged": 7,
+  "os_read_mb": 46320.7,
+  "expert_read_mb": 19806.6,
+  "major_faults": 14081,
+  "os_mb_per_token": 313.0,
+  "stdout": "== P1 @ http://127.0.0.1:8090  repeats=2 max_tokens=256\nwarm-up: {'tokens': 5, 'prompt_tokens': 15, 'ttft_s': 0.32, 'decode_tps': 45.19967670671911, 'total_s': 0.4}\ncode      decode tok/s: 84.4, 80.2   median 82.3   (tokens [34, 34], ttft [0.46, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.111), (0.0, 0.111)]  \"The user is asking for a Python function that merges overlapping inter\"\nreasoning decode tok/s: 57.3, 60.0   median 58.6   (tokens [20, 20], ttft [10.25, 0.11]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.1), (0.0, 0.1)]  \"Let me work through this step-by-step.  **Step 1: Head-start offset**\"\nprose     decode tok/s: 64.6, 64.5   median 64.5   (tokens [20, 20], ttft [0.43, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.25), (0.0, 0.25)]  \"The user's request is a bit of a message in a bottle on a stormy night\"\nALL median 64.5 tok/s   mean of kind-medians 68.5\n"
+ }
+]
