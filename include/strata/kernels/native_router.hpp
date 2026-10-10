@@ -34,8 +34,9 @@ struct RouteCfg {
     float want_lo;     ///< the demand counter's weight for a pick the floor replaces (rank >= lo); a pick below the floor counts 1 (default 1)
     int32_t maxrank;   ///< a stand-in must sit within this many places of the router's own ranking of all 512 experts (0 = any)
     float bias;   ///< CCE router bias: ln(1 + beta) added to a resident expert's logit before the top-10 (0 = off)
+    float wmax;   ///< HOBBIT-style weight floor (STRATA_ROUTE_WMAX): a missed pick is replaced only when the router's own weight on it is below this (0 = off, the rank floor alone decides)
 };
-void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, int maxrank = 0, float want_lo = 1.f, float repl_gap = 0.f);   ///< before graph capture
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, int maxrank = 0, float want_lo = 1.f, float repl_gap = 0.f, float wmax = 0.f);   ///< before graph capture
 void route_cfg_set_floor(int lo);                                ///< between windows
 const RouteCfg* route_cfg_device();
 /// STRATA_ROUTE_RESIDENT: swap non-resident picks of the segment's floor ranks for resident ones within the margin (see the .cu).

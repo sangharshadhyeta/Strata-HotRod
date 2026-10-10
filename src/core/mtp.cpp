@@ -335,6 +335,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     const bool kv_int8_was = qsa_kv_int8();
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+    // STRATA_MTP_KV_FP16=1 (opt-in, a test of solid.cpp's rule "quantise the large consumer whose output is checked, leave the small
+    // one whose worth is its agreement with the target": the drafter's one layer keeps FP16 K/V beside an INT8 main K/V)
+    static const bool draft_fp16 = [] { const char* e = std::getenv("STRATA_MTP_KV_FP16"); return e != nullptr && e[0] == '1'; }();
+    if (draft_fp16 && kv_int8_was) qsa_set_kv_int8(false);
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {

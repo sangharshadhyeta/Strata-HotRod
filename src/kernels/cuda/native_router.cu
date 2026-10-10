@@ -201,6 +201,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     const int maxrank = ((const volatile RouteCfg*) cfg)->maxrank;
     const float want_lo = ((const volatile RouteCfg*) cfg)->want_lo;
     const float repl_gap = ((const volatile RouteCfg*) cfg)->repl_gap;
+    const float wmax = ((const volatile RouteCfg*) cfg)->wmax;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
     // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
@@ -256,6 +257,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     for (int r = (edge >= 0.f && lo > 0) ? lo - 1 : lo; r <= hi && r < 10; ++r) {
         const int e = id[r];
         if (res[e] >= 0) continue;
+        if (wmax > 0.f && weights[(size_t) t * 10 + r] >= wmax) continue;   // a heavy pick stays exact: fetched / computed on the CPU
         ++tail;
         int best = -1;
         float bl = -INFINITY;
@@ -315,7 +317,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
 // floors (thinking / answer / code, a fence tracker) lived here and were removed after the benchmark showed no gain (SPEC 18.1).
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
-void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank, float want_lo, float repl_gap) {
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank, float want_lo, float repl_gap, float wmax) {
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
@@ -328,6 +330,7 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
     g_cfg_host->maxrank = maxrank;
     g_cfg_host->want_lo = want_lo;
     g_cfg_host->repl_gap = repl_gap;
+    g_cfg_host->wmax = wmax;
     __sync_synchronize();
 }
 void route_cfg_set_floor(int lo) {

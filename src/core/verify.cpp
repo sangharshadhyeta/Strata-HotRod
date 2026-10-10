@@ -78,6 +78,7 @@ struct RouteResidentCfg {
     float want_lo = 1.0f; ///< STRATA_WANT_LOW=<w>: the swap round's demand counts a pick the floor replaces (rank >= lo) as w, a pick below the floor as 1
     int maxrank = 0;      ///< STRATA_ROUTE_MAXRANK=<n>: a stand-in must be within the router's first n places of all 512 (0: any)
     float bias = 0.0f;    ///< STRATA_ROUTE_BIAS=<beta>: the CCE bias, ln(1 + beta) added to a resident expert's logit before the top-10
+    float wmax = 0.0f;    ///< STRATA_ROUTE_WMAX=<w>: a missed pick is replaced only when the router's weight on it is below w (0: off)
     float edge = -1.0f;   ///< STRATA_ROUTE_RESIDENT_EDGE=<logits>: the rank below `lo` is replaced only by a close substitute
     // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
     // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
@@ -143,6 +144,7 @@ RouteResidentCfg& route_resident_cfg() {
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) r.edge = (float) std::atof(v);
         if (const char* v = std::getenv("STRATA_WANT_LOW")) r.want_lo = std::max(0.0f, (float) std::atof(v));
         if (const char* v = std::getenv("STRATA_ROUTE_MAXRANK")) r.maxrank = std::max(0, std::atoi(v));
+        if (const char* v = std::getenv("STRATA_ROUTE_WMAX")) r.wmax = std::max(0.0f, (float) std::atof(v));
         // STRATA_ROUTE_BIAS=<beta>: the CCE bias.  (v0.1.42 has the same idea as STRATA_ROUTE_PRIOR, route_prior.cu: to be merged into one)
         if (const char* v = std::getenv("STRATA_ROUTE_BIAS")) { const double b = std::atof(v); r.bias = b > 0.0 ? (float) std::log1p(b) : 0.0f; }
         return true;
@@ -506,7 +508,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
         // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
         strata::kernels::route_cfg_init(route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().margin,
-                                        route_resident_cfg().edge, route_resident_cfg().bias, route_resident_cfg().maxrank, route_resident_cfg().want_lo, route_resident_cfg().repl_gap);
+                                        route_resident_cfg().edge, route_resident_cfg().bias, route_resident_cfg().maxrank, route_resident_cfg().want_lo, route_resident_cfg().repl_gap, route_resident_cfg().wmax);
     }
     if (route_resident_cfg().margin > 0.0f)
         std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, edge %g, router bias ln(1+beta) %g, stand-in within the router's first %d places, decode windows %s)\n",
