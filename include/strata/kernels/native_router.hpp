@@ -18,21 +18,23 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
 /// The stand-in floors (SPEC 17), in host-mapped memory the router kernel reads at every launch, so a captured graph follows a
-/// change the host makes between windows. `lo[seg]` is the first rank that may be replaced for the segment being written
-/// (0 thinking, 1 prose, 2 code); `hi` the last (9); `margin` the largest score gap a replacement may have (1e30 = any);
-/// `edge` >= 0 makes the floor fractional: the rank below `lo` is replaced too, but only by a substitute within `edge` logits
-/// of it (a floor of 1.5 is lo 2 with an edge margin on rank 1); -1 = off.
+/// change the host makes between windows. `lo[0..2]` are the floors of thinking, of the answer, and of code (the first rank that
+/// may be replaced; a HIGHER number replaces less, so it is the more careful); `eff` is the floor in force now, which the kernel
+/// reads: the floor of the part being written, and inside a code fence never less careful than the code floor. `hi` the last
+/// rank (9); `margin` the largest score gap a replacement may have (1e30 = any); `edge` >= 0 makes the floor fractional: the
+/// rank below the floor is replaced too, but only by a substitute within `edge` logits of it; -1 = off.
 struct RouteCfg {
     int32_t lo[3];
     int32_t hi;
     float margin;
     float edge;
-    int32_t seg;
+    int32_t eff;
 };
 void route_cfg_init(int lo_think, int lo_prose, int lo_code, int hi, float margin, float edge);   ///< before graph capture
-void route_cfg_set_segment(int seg);                                                              ///< 0 thinking, 1 prose, 2 code
-/// A request's floors (-1 = the environment's) and the segment it starts in; a no-op while the stand-in is off.
-void route_cfg_request(int lo_think, int lo_prose, int lo_code, int seg);
+/// The state of the answer being written: inside the thinking, inside a code fence. Never lowers the floor below the part's own.
+void route_cfg_set_state(bool in_think, bool in_fence);
+/// A request's floors (-1 = the environment's) and whether it starts inside the thinking; a no-op while the stand-in is off.
+void route_cfg_request(int lo_think, int lo_prose, int lo_code, bool in_think);
 const RouteCfg* route_cfg_device();
 /// STRATA_ROUTE_RESIDENT: swap non-resident picks of the segment's floor ranks for resident ones within the margin (see the .cu).
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
