@@ -34,6 +34,14 @@ class PromptCache:
         self.entries: dict[str, dict] = {}
         self.stats = {"saves": 0, "restores": 0, "restore_refused": 0, "dropped": 0}
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        # owner-only, as solid.cpp's cache is: the entries hold the prompts (the sidecar lists their token ids).  makedirs does not change a directory
+        # that exists, and a file made with open() takes the umask, so both are set here; entries from an earlier version are tightened too
+        try:
+            os.chmod(self.dir, 0o700)
+            for name in os.listdir(self.dir):
+                os.chmod(os.path.join(self.dir, name), 0o600)
+        except OSError:
+            pass
         self._scan()
 
     # ---- the index: the small sidecar files only, never the state files
@@ -132,7 +140,7 @@ class PromptCache:
             return f"prompt cache: the engine saved {saved} tokens, this server expected {len(tokens)} to {len(tokens) + 2}; entry dropped"
         meta = {"fingerprint": self.fingerprint, "tokens": tokens, "used": time.time()}
         tmp = os.path.join(self.dir, key + ".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
             json.dump(meta, f)
         os.replace(tmp, os.path.join(self.dir, key + ".json"))   # the sidecar last and whole: an entry exists only with both
         self.entries[key] = {"tokens": tokens, "bytes": os.path.getsize(path), "used": meta["used"]}
