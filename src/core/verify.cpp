@@ -14,6 +14,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/standin_mask.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -1300,6 +1301,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                // the stand-in for every miss (SPEC.md 13.20, STRATA_STANDIN=1): the window's rows may pick only the experts
+                // in VRAM. This is the router the decode window really takes (512 x 10), so the mask has to sit here: T19's
+                // first run masked only moe_route/moe_route_window, which this path never calls, and showed no effect.
+                strata::kernels::standin_mask(logits_ + tb * NE, n, (int) NE, (int) K, (int) l, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)

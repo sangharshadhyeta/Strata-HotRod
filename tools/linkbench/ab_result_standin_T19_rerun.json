@@ -1,0 +1,60 @@
+[
+ {
+  "arm": "C1",
+  "env": {
+   "STRATA_STANDIN": "1"
+  },
+  "engine_sha": "95475ad9f72c88f8",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 34,
+   "peak_cg_current_mb": 29332.9,
+   "peak_cg_anon_mb": 2325.5,
+   "peak_cg_file_mb": 26976.7,
+   "peak_eng_rss_mb": 20242.9,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 708.5,
+   "min_sys_avail_mb": 25952.5,
+   "min_sys_free_mb": 249.9,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 4208,
+   "pswpout": 181000,
+   "pgmajfault": 7572,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 86,
+   "swap_used_mb_before": 0,
+   "swap_used_mb_after": 706
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    88.2
+   ],
+   "reasoning": [
+    86.2
+   ],
+   "prose": [
+    101.5
+   ]
+  },
+  "median_all": 88.2,
+  "tokens_timed": 545,
+  "requests_logged": 4,
+  "os_read_mb": 46186.2,
+  "expert_read_mb": 19815.4,
+  "major_faults": 13642,
+  "os_mb_per_token": 84.7,
+  "stdout": "== C1 @ http://127.0.0.1:8090  repeats=1 max_tokens=256\nwarm-up: {'tokens': 3, 'prompt_tokens': 15, 'ttft_s': 0.29, 'decode_tps': 71.54158031640442, 'total_s': 0.3}\ncode      decode tok/s: 88.2   median 88.2   (tokens [33], ttft [0.41]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.115)]  \"The user is thinking about a function that merges overlapping interval\"\nreasoning decode tok/s: 86.2   median 86.2   (tokens [256], ttft [11.45]s)  degeneracy (repeat-4gram, top-word) [(0.543, 0.076)]  \"Let me work through this step-by-step.  **Step 1: Head-start advantage\"\nprose     decode tok/s: 101.5   median 101.5   (tokens [256], ttft [0.39]s)  degeneracy (repeat-4gram, top-word) [(0.964, 0.329)]  \"The user's request is a bit of a word of a word of a word of a word of\"\nALL median 88.2 tok/s   mean of kind-medians 91.9\n"
+ }
+]
