@@ -219,6 +219,8 @@ public:
     virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
     /// Whether `warm` does anything (the predictor is not run otherwise).
     virtual bool warms() const { return false; }
+    /// Whether the expert's bytes are in the host page cache now (a swap-in of it costs a copy, not a drive read); sources without a file tier say true.
+    virtual bool page_cached(int64_t, int64_t) const { return true; }
 protected:
     /// What model_inputs() returns; set by a source's open().
     void record_inputs(const std::string& pack_experts, const std::string& gguf,
@@ -699,6 +701,11 @@ public:
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
     bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
+    bool page_cached(int64_t layer, int64_t expert) const override {
+        uint64_t total = 0;
+        const uint64_t got = cached_bytes(layer, expert, total, false);
+        return total == 0 || got * 2 >= total;
+    }
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
     int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }

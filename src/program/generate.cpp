@@ -8191,6 +8191,9 @@ int main(int argc, char** argv) {
         const int swap_grace = [] { const char* v = std::getenv("STRATA_SWAP_GRACE"); return v ? std::max(0, std::atoi(v)) : 0; }();
         std::vector<int64_t> swapped_at((size_t) (g.n_layers * g.n_expert), -1000000);
         int64_t swap_round = 0;
+        // STRATA_SWAP_COST=<c> (opt-in): a swap-in candidate whose bytes are not in the page cache has its heat divided by 1 + c (cost-aware, after GreedyDual-Size)
+        const float swap_cost = [] { const char* v = std::getenv("STRATA_SWAP_COST"); return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f; }();
+        int64_t cost_cut = 0;
         // SWAP2 (STRATA_SWAP2_MAX=n, default 0 = off; opt-in): quality swaps.  A non-resident expert of rank >= the floor is replaced by a resident stand-in
         // and never counted as demand, so the swap round never brings it in.  The kernel counts the experts stand-ins replaced (usage2); a round may bring
         // the most replaced ones (usage2 >= STRATA_SWAP2_MIN, default 3) into slots NOTHING needs (a resident whose own use is below STRATA_SWAP2_COLD,
@@ -8221,6 +8224,12 @@ int main(int argc, char** argv) {
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                if (swap_cost > 0.0f && srcp != nullptr) {   // GreedyDual-Size (the solid page): a swap-in of an expert the page cache lacks costs a drive read, so its heat counts for less
+                    const size_t top = std::min<size_t>(cand.size(), 6);
+                    for (size_t i = 0; i < top; ++i)
+                        if (!srcp->page_cached(l, cand[i].second)) { cand[i].first /= (1.0f + swap_cost); ++cost_cut; }
+                    std::sort(cand.begin(), cand.begin() + (ptrdiff_t) top, [](auto& a, auto& b) { return a.first > b.first; });
+                }
                 const size_t nc = std::min(cand.size(), vict.size());
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });

@@ -249,3 +249,18 @@ Nothing here was built yet; each needs its own A/B (identical-copy control, pair
 | 10 | Sync fetch on miss (ranks 0-1 wait for the fetch, not CPU matmul) | Closed one gap; still far from 40 tok/s; solid defaults FORCE_GPU on | Ranks 0-1 computed on CPU from RAM | Try only after item 1-3; CPU share is off by decision |
 
 Not worth porting (page's own evidence): neuron subsetting (we measured about 81% mass width, about 0% dead), entropy-coded experts (2.7% for IQ3_S), atlas warming (tie), adaptive draft length (-4.2%), n-gram drafter (tie), shallow-layer eviction bonus (removed), micro-batch 1024 (costs prefill), prerouter as admission (hurts), PagedAttention (solid skipped it too), lower q4_0 KV (excluded by policy).
+
+### Status of the candidates (11 Oct, after the code was read; results of the runs follow in SPEC 20 9u)
+
+| # | Candidate | Status |
+|---|---|---|
+| 1 | PLE term in the look-ahead input | NOT APPLICABLE to Qwen: solid's own `qwen4exp.cpp` asserts "supports only one PLE layer" (layer 1), and Strata's SPEC 4.8 has the PLE injected once, at layer 1, into the residual. The page's 49.88 to 70.00 was measured on gemma-4, whose per-layer n-gram slice is injected at every layer and is known one layer early. After layer 1 there is no term left that is known exactly and is missing from the stale hidden state. Nothing to build. |
+| 2 | Prediction as retention | NOT BUILT, mechanism mismatch: solid's eviction happens per miss (LFRU) and the prediction decides what not to throw away. Strata swaps in rounds from decayed use counts (`adapt` in generate.cpp); the look-ahead predicts only non-resident experts (it skips resident ones), and a prediction for the next one or two layers would protect a handful of experts out of 24,576 slots a round. Use counts already are the retention signal. |
+| 3 | Gate-weight floor (HOBBIT) | BUILT, opt-in: `STRATA_ROUTE_WMAX=<w>` (native_router.cu: a missed pick is replaced only when the router's weight on it is below w; heavier picks stay exact). Arms W04 / W08 (ranks 0-9) and W29 (ranks 2-9 plus the weight floor) in queue 47. |
+| 4 | Cost-aware swap-in (GreedyDual-Size) | BUILT, opt-in: `STRATA_SWAP_COST=<c>`: the top 6 swap-in candidates of a layer that are not in the page cache (mincore, sampled) have their heat divided by 1 + c. Arms C1 / C3 in queue 48. |
+| 5 | Identical-copy noise-floor arm | ALREADY IN the harness: `strata_ab.py` interleaves arms and repeats the first one as "the identical-config control"; queues 47 and 48 each end with the repeated baseline. |
+| 6 | Cache-size / reserve sweep | Queue 48: `--vram-reserve-mib` 400 / 550 / 1000 against the auto 700. |
+| 7 | Draft K/V in FP16 beside INT8 main K/V | BUILT, opt-in: `STRATA_MTP_KV_FP16=1` (mtp.cpp). Arm K16 in queue 47. |
+| 8 | Recurrent state in f16 | NOT BUILT, by arithmetic: the 36 GDN layers hold about 111 MiB; f16 saves about 55 MiB = about 20 of 2,808 expert slots (0.7%), against a quality risk on a state that accumulates over the whole context. |
+| 9 | Per-tensor slot validity | NOT APPLICABLE by structure: a Strata slot holds one whole expert blob (gate, up and down together, one copy); `host_res[layer * n_expert + e]` is one entry per expert, so a bit cleared for one tensor cannot leave the others stale. The failed-copy path is covered by FC / FT (SPEC 9t). |
+| 10 | Synchronous fetch on a miss (ranks 0-1) | ALREADY TESTED in another form: waiting for a copy before computing a miss on the GPU is what the staged PCIe path did (13-20 tok/s, stall = the copy chain, SPEC 9i); `STRATA_FORESIGHT` retest 35.2. Not repeated. |
