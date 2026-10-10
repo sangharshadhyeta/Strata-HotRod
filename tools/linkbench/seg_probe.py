@@ -6,12 +6,12 @@ and a maths request (no code), then prints each request's answer head so it can 
 to `thinking 0` at token 248069 (</think>); the code request toggles `fence 1` / `fence 0` at 71093 (or 52451) around its block;
 the maths request makes no SEG line.
 
-usage: seg_probe.py URL [FLOORS=2,2,4]
+usage: seg_probe.py URL [anything: ignored]   (the floors come from SEG_FLOORS, default 2,2,4; strata_ab.py can run it as AB_TPS)
 """
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 
 url = sys.argv[1]
-floors = [int(x) for x in (sys.argv[2] if len(sys.argv) > 2 else "2,2,4").split(",")]
+floors = [int(x) for x in os.environ.get("SEG_FLOORS", "2,2,4").split(",")]
 
 
 def ask(prompt, think):
