@@ -1125,10 +1125,6 @@ bool FileExpertSource::open_gguf(std::string& err) {
                 }
                 void* view = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
                 if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: cannot map " + path; return false; }
-                // STRATA_MADV_RANDOM=1 (SPEC 20 item 6): a page fault on this mapping reads exactly its page, not the kernel's read-around window
-                // (a 2.3 MiB expert touched through the mapping, e.g. by a DMA copy from it, otherwise pulls several MiB per fault)
-                if (const char* mr = std::getenv("STRATA_MADV_RANDOM"); mr != nullptr && std::atoi(mr) != 0)
-                    (void) madvise(view, (size_t) st.st_size, MADV_RANDOM);
                 m.fd = fd;
                 m.bytes = (uint64_t) st.st_size;
                 m.base = (const uint8_t*) view;
@@ -3655,28 +3651,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++d.tail_experts;
             }
         }
-        // STRATA_PCIE_STAGED=1 (opt-in, needs the DMA mode, `--pcie-mode dma`; generate.cpp turns the default mode into it): a miss
-        // that is not in the pinned RAM arena is read from the file by the source (a stage buffer, or the page cache's mapping) AFTER
-        // the plan is published and then copied to the GPU's staging by the copy engine - the GPU computes it, the CPU does not, and
-        // no big pinned arena is needed.  The reads overlap the GPU's VRAM groups.
-        static const bool staged_pcie = [] { const char* v = std::getenv("STRATA_PCIE_STAGED"); return v != nullptr && std::atoi(v) != 0; }();
-        const bool staged_ok = staged_pcie && d.plan->pcie_mode == 0;
-        const bool pcie_ok = d.pcie_num > 0 && (staged_ok || d.src->pcie_layer(d.layers));
+        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
-        if (staged_pcie) {   // the first windows with a miss: what the staged path saw (STRATA_PCIE_STAGED only)
-            static std::atomic<int> said{0};
-            if (nmiss > 0 && said.fetch_add(1) < 6)
-                std::fprintf(stderr, "staged pcie: layer %lld nmiss %d pcie_num %d mode %d staged_ok %d pcie_ok %d m %d cap %d\n",
-                             (long long) d.layers, nmiss, d.pcie_num, d.plan->pcie_mode, (int) staged_ok, (int) pcie_ok, m,
-                             (int) d.plan->staging_cap);
-        }
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
-        int32_t pcie_exp[64];       // the expert of each PCIe group (a staged read needs it after the publish)
-        bool pcie_staged[64];       // true: dma_src[q] is not read yet
-        int n_staged = 0;
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
@@ -3703,14 +3683,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
-                        const bool stage_it = src == nullptr && staged_ok;
-                        if (src != nullptr || stage_it) {
+                        if (src != nullptr) {
                             kd = 1;
                             dma_src[fetches] = src;
                             pcie_i0[fetches] = i0;
-                            pcie_exp[fetches] = e;
-                            pcie_staged[fetches] = stage_it;
-                            n_staged += stage_it ? 1 : 0;
                             ++fetches;
                         }
                     }
@@ -3753,61 +3729,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
-        if (n_staged > 0) {   // the staged misses: read now (the GPU is already running the VRAM groups), then copied below
-            const auto st0 = std::chrono::steady_clock::now();
-            // The staged experts are read with explicit preads into the dispatch's own pinned ring (several threads), never through the
-            // file mapping: a DMA copy from the mapping faults its pages in 4 KiB at a time under the kernel's read-around (a major fault
-            // pulled about 12 MB in the first staged test), and MADV_RANDOM alone makes those faults 4 KiB reads (solid.cpp 76a2a6896).
-            // Three rings rotate, so a ring is rewritten three windows after its copy was queued (the GPU needs a layer's copy before it
-            // can route the next layer).
-            const size_t scap = (size_t) std::max<int64_t>(P.staging_cap, 1);
-            const size_t mb = (size_t) lay.max_blob;
-            if (d.pcie_host == nullptr) {
-                void* hp = nullptr;
-                if (cudaHostAlloc(&hp, 3 * scap * mb, cudaHostAllocDefault) != cudaSuccess) {
-                    cudaGetLastError();
-                    d.failed = true;
-                    d.fail = "the staged PCIe path could not allocate its pinned ring";
-                    d.fail_layer = d.layers;
-                    return;
-                }
-                d.pcie_host = (uint8_t*) hp;
-            }
-            uint8_t* ring = d.pcie_host + (size_t) (d.pcie_ring++ % 3) * scap * mb;
-            int qs[64], nq = 0;
-            for (int q = 0; q < fetches; ++q) if (pcie_staged[q]) qs[nq++] = q;
-            std::atomic<int> next_q{0};
-            std::atomic<bool> read_bad{false};
-            auto work = [&]() {
-                for (;;) {
-                    const int i = next_q.fetch_add(1);
-                    if (i >= nq) break;
-                    if (!d.src->copy_blob(d.layers, pcie_exp[qs[i]], ring + (size_t) qs[i] * mb)) read_bad.store(true);
-                }
-            };
-            {
-                std::vector<std::thread> th;
-                for (int t = 1; t < std::min(nq, 4); ++t) th.emplace_back(work);
-                work();
-                for (auto& t : th) t.join();
-            }
-            if (read_bad.load()) {
-                d.failed = true;
-                d.fail = "the expert source could not read a blob for the staged PCIe path";
-                d.fail_layer = d.layers;
-                ++d.missing;
-                return;
-            }
-            for (int i = 0; i < nq; ++i) {
-                dma_src[qs[i]] = ring + (size_t) qs[i] * mb;
-                ++d.pcie_staged_reads;
-            }
-            d.pcie_staged_us += (uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - st0).count();
-        }
-        const auto ft0 = std::chrono::steady_clock::now();
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
-        if (n_staged > 0)
-            d.pcie_fetch_us += (uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ft0).count();
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -4826,9 +4748,6 @@ ForesightSwap::~ForesightSwap() {
     if (slot)
         for (int64_t i = 0; i < n_layers * slots; ++i)
             if (slot[(size_t) i].ev) cudaEventDestroy((cudaEvent_t) slot[(size_t) i].ev);
-    if (slot)
-        for (int64_t i = 0; i < n_layers * slots; ++i)
-            if (slot[(size_t) i].host) cudaFreeHost(slot[(size_t) i].host);
 }
 
 void ForesightSwap::fill_loop() {
@@ -4847,26 +4766,6 @@ void ForesightSwap::fill_loop() {
         const int dev = layer_dev[(size_t) l];
         if (dev != cur_dev) { cudaSetDevice(dev); cur_dev = dev; }
         cudaStream_t s = (cudaStream_t) card_stream[(size_t) layer_card[(size_t) l]];
-        if (sl.src == nullptr && sl.from != nullptr) {   // STRATA_PCIE_STAGED: read the expert from the file tier here
-            bool ok = false;
-            if (sl.host == nullptr) {
-                void* p = nullptr;
-                if (cudaHostAlloc(&p, (size_t) sl.bytes, cudaHostAllocDefault) == cudaSuccess) sl.host = (uint8_t*) p;
-                else cudaGetLastError();
-            }
-            if (sl.host != nullptr) ok = sl.from->copy_blob(l, sl.expert, sl.host);
-            if (!ok) {   // not readable: free the slot again (it stays marked loading and never issued otherwise)
-                std::lock_guard<std::mutex> smu_lk(smu_);
-                where[(size_t) (l * n_expert + sl.expert)] = -1;
-                sl.expert = -1;
-                sl.loading = false;
-                sl.ready = false;
-                sl.last_ref = 0;
-                continue;
-            }
-            sl.src = sl.host;
-            ++staged_reads;
-        }
         if (cudaMemcpyAsync((void*) sl.dptr, sl.src, sl.bytes, cudaMemcpyHostToDevice, s) != cudaSuccess ||
             cudaEventRecord((cudaEvent_t) sl.ev, s) != cudaSuccess) {
             cudaGetLastError();
@@ -4939,18 +4838,9 @@ void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t exp
     const int c = layer_card[(size_t) layer];
     if (card_round[(size_t) c] != now) { card_round[(size_t) c] = now; card_used[(size_t) c] = 0; }
     if (card_used[(size_t) c] >= budget) { ++over_budget; return; }
-    // async copies need pinned host memory.  STRATA_PCIE_STAGED=1: an expert the file tier holds is read by the FILLER thread (not here,
-    // under smu_, and not on the pool's thread) into the slot's own pinned buffer, then copied; `b` stays null until then.
-    static const bool staged_fs = [] { const char* v = std::getenv("STRATA_PCIE_STAGED"); return v != nullptr && std::atoi(v) != 0; }();
-    if (src == nullptr) return;
-    const uint8_t* b = nullptr;
-    const bool is_pinned = src->pinned(layer, expert);
-    if (is_pinned) {
-        b = src->blob(layer, expert);
-        if (b == nullptr) return;
-    } else if (!staged_fs || !predicted_copy) {
-        return;   // a miss the pool just served (note_miss) is not read again on the pool's thread
-    }
+    if (src == nullptr || !src->pinned(layer, expert)) return;   // async copies need the pinned arena
+    const uint8_t* b = src->blob(layer, expert);
+    if (b == nullptr) return;
     int best = -1;
     uint64_t best_ref = ~0ull;
     for (int s = 0; s < slots; ++s) {   // an empty slot, else the one used longest ago that no window can still read
@@ -4974,7 +4864,6 @@ void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t exp
     sl.loading = true;
     sl.issued.store(false, std::memory_order_relaxed);
     sl.src = b;
-    sl.from = b == nullptr ? src : nullptr;
     sl.last_ref = now;
     where[key] = (int16_t) best;
     ++card_used[(size_t) c];
@@ -4995,7 +4884,6 @@ std::string ForesightSwap::report() const {
                   (unsigned long long) hits, (unsigned long long) copies, (unsigned long long) predicted,
                   (unsigned long long) pending, (unsigned long long) busy, (unsigned long long) over_budget, verify ? "" : "");
     std::string r = buf;
-    if (staged_reads.load() > 0) r += ", " + std::to_string(staged_reads.load()) + " read from the file tier by the filler (STRATA_PCIE_STAGED)";
     if (verify) r += ", verified " + std::to_string(verify_ok) + " ok / " + std::to_string(verify_bad) + " BAD";
     return r;
 }
