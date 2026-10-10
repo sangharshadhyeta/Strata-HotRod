@@ -8194,6 +8194,8 @@ int main(int argc, char** argv) {
         // the most replaced ones (usage2 >= STRATA_SWAP2_MIN, default 3) into slots NOTHING needs (a resident whose own use is below STRATA_SWAP2_COLD,
         // default 1.0, in the same decayed units), at most n a round, after the demand swaps: speed is not spent on quality.
         const int swap2_max = strata::kernels::route_swap2_max();   // default 2 (SPEC 20 9n); STRATA_SWAP2_MAX=0 off
+        // what the adaptive tier has DONE since the start (always on: a feature that silently stops working is worse than one never built; the per-request line below reports the difference)
+        int64_t life_rounds = 0, life_swaps = 0, life_quality = 0;
         const float swap2_min = [] { const char* v = std::getenv("STRATA_SWAP2_MIN"); return v ? (float) std::atof(v) : 3.0f; }();
         const float swap2_cold = [] { const char* v = std::getenv("STRATA_SWAP2_COLD"); return v ? (float) std::atof(v) : 1.0f; }();
         std::vector<float> usage2(swap2_max > 0 ? (size_t) (g.n_layers * g.n_expert) : 0, 0.0f);
@@ -8252,6 +8254,7 @@ int main(int argc, char** argv) {
                 }
                 std::sort(extra.begin(), extra.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
                 if ((int) extra.size() > swap2_max) extra.resize((size_t) swap2_max);
+                life_quality += (int64_t) extra.size();
                 static int64_t swap2_total = 0;
                 swap2_total += (int64_t) extra.size();
                 static const bool say2 = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
@@ -8261,6 +8264,8 @@ int main(int argc, char** argv) {
                 for (float& v : usage2) v *= o.adapt_decay;
             }
             for (const Swap& s : swaps) swapped_at[(size_t) (s.layer * g.n_expert + s.in)] = swap_round;   // the grace starts now
+            ++life_rounds;
+            life_swaps += (int64_t) swaps.size();
             // STRATA_TRACE_ADAPT: what each serve swap round saw and did (default off, one getenv)
             static const bool trace_serve_adapt = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
             if (trace_serve_adapt) {
@@ -12112,6 +12117,17 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            // the work the engine's own helpers did during this request (always on; the differences of lifetime counters): swap rounds and swaps (quality swaps among them),
+            // the router look-ahead's predicted experts and the layers it skipped.  A zero beside a busy request is the sign of a helper that stopped.
+            {
+                static int64_t prev_rounds = 0, prev_swaps = 0, prev_quality = 0, prev_pred = 0, prev_skip = 0;
+                const int64_t la_pred = drive.d.lookahead != nullptr ? drive.d.lookahead->predicted() : 0;
+                const int64_t la_skip = drive.d.lookahead != nullptr ? drive.d.lookahead->skipped() : 0;
+                std::fprintf(stderr, "strata serve: work done: swap rounds %lld (%lld swaps, %lld quality), look-ahead %lld predicted experts (%lld layers skipped)%s\n",
+                             (long long) (life_rounds - prev_rounds), (long long) (life_swaps - prev_swaps), (long long) (life_quality - prev_quality),
+                             (long long) (la_pred - prev_pred), (long long) (la_skip - prev_skip), drive.d.lookahead == nullptr ? " [look-ahead off]" : "");
+                prev_rounds = life_rounds; prev_swaps = life_swaps; prev_quality = life_quality; prev_pred = la_pred; prev_skip = la_skip;
+            }
             // a low draft acceptance is a silent slowdown (solid.cpp's page: an MTP head drafting at 0.19 runs about 2x slower): said once, with its numbers and
             // what to check.  Typical here 0.55 to 0.8; 300 drafts offered make the share a fair reading.
             if (use_mtp && draft_offered >= 300) {
