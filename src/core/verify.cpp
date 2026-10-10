@@ -71,6 +71,7 @@ struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
     bool count = false;   ///< decode windows count the router's own top-10 on the device (route_want_*)
+    float repl_gap = 0.0f; ///< STRATA_SWAP2_GAP=<logits>: a replaced pick counts for a quality swap only when its stand-in scores at least this far below it
     float want_lo = 1.0f; ///< STRATA_WANT_LOW=<w>: the swap round's demand counts a pick the floor replaces (rank >= lo) as w, a pick below the floor as 1
     int maxrank = 0;      ///< STRATA_ROUTE_MAXRANK=<n>: a stand-in must be within the router's first n places of all 512 (0: any)
     float bias = 0.0f;    ///< STRATA_ROUTE_BIAS=<beta>: the CCE bias, ln(1 + beta) added to a resident expert's logit before the top-10
@@ -109,6 +110,7 @@ RouteResidentCfg& route_resident_cfg() {
         // a fractional floor: STRATA_ROUTE_RESIDENT_RANKS=2-9 with STRATA_ROUTE_RESIDENT_EDGE=1 is "floor 1.5" (rank 1 is
         // replaced only by a substitute within 1 logit of it)
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) r.edge = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_SWAP2_GAP")) r.repl_gap = std::max(0.0f, (float) std::atof(v));
         if (const char* v = std::getenv("STRATA_WANT_LOW")) r.want_lo = std::max(0.0f, (float) std::atof(v));
         if (const char* v = std::getenv("STRATA_ROUTE_MAXRANK")) r.maxrank = std::max(0, std::atoi(v));
         // STRATA_ROUTE_BIAS=<beta> (solid.cpp's LLAMA_MOE_CACHE_BIAS): alone, with STRATA_ROUTE_RESIDENT=1e-6 (the kernel runs, no rank is replaced)
@@ -446,7 +448,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
         // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
         strata::kernels::route_cfg_init(route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().margin,
-                                        route_resident_cfg().edge, route_resident_cfg().bias, route_resident_cfg().maxrank, route_resident_cfg().want_lo);
+                                        route_resident_cfg().edge, route_resident_cfg().bias, route_resident_cfg().maxrank, route_resident_cfg().want_lo, route_resident_cfg().repl_gap);
     }
     if (route_resident_cfg().margin > 0.0f)
         std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, edge %g, router bias ln(1+beta) %g, stand-in within the router's first %d places, decode windows %s)\n",

@@ -200,6 +200,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     const float bias = ((const volatile RouteCfg*) cfg)->bias;
     const int maxrank = ((const volatile RouteCfg*) cfg)->maxrank;
     const float want_lo = ((const volatile RouteCfg*) cfg)->want_lo;
+    const float repl_gap = ((const volatile RouteCfg*) cfg)->repl_gap;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
     // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
@@ -287,7 +288,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                 atomicAdd(detail + 22 + rb, 1ull);
                 atomicAdd(detail + 27 + gb, 1ull);
             }
-            if (repl != nullptr) atomicAdd(repl + e, 1.0f);   // SWAP2: this expert was wanted and a stand-in served it
+            // SWAP2: this expert was wanted and a stand-in served it; counted for a quality swap only when the stand-in is poor (STRATA_SWAP2_GAP logits)
+            if (repl != nullptr && l[e] - bl >= repl_gap) atomicAdd(repl + e, 1.0f);
             id[r] = best;
             ++swaps;
         }
@@ -313,7 +315,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
 // floors (thinking / answer / code, a fence tracker) lived here and were removed after the benchmark showed no gain (SPEC 18.1).
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
-void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank, float want_lo) {
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank, float want_lo, float repl_gap) {
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
@@ -325,6 +327,7 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
     g_cfg_host->bias = bias;
     g_cfg_host->maxrank = maxrank;
     g_cfg_host->want_lo = want_lo;
+    g_cfg_host->repl_gap = repl_gap;
     __sync_synchronize();
 }
 void route_cfg_set_floor(int lo) {

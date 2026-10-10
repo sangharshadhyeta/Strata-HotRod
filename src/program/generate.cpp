@@ -11182,13 +11182,16 @@ int main(int argc, char** argv) {
                 static unsigned long long prev_det[48] = {};
                 unsigned long long det[48] = {};
                 strata::kernels::route_detail_read(det);
-                unsigned long long repl = 0;
+                unsigned long long repl = 0, poor = 0;
                 for (int b = 16; b < 22; ++b) repl += det[b] - prev_det[b];
+                for (int b = 29; b < 33; ++b) poor += det[b] - prev_det[b];   // the gap buckets [27 + 0..5]: 2..5 = the stand-in is >= 1 logit below the pick
                 const unsigned long long rows = det[11] - prev_det[11];
                 for (int b = 0; b < 48; ++b) prev_det[b] = det[b];
                 if (rows > 0)
-                    std::fprintf(stderr, "strata serve: stand-ins: %llu replaced picks in %llu layer-rows = %.4f per layer-row (%.2f per generated token over %lld layers)\n",
-                                 repl, rows, (double) repl / (double) rows, (double) repl / (double) produced_n, (long long) g.n_layers);
+                    std::fprintf(stderr, "strata serve: stand-ins: %llu replaced picks in %llu layer-rows = %.4f per layer-row (%.2f per generated token over %lld layers); "
+                                         "poor (>= 1 logit below the pick) %llu = %.4f per layer-row\n",
+                                 repl, rows, (double) repl / (double) rows, (double) repl / (double) produced_n, (long long) g.n_layers,
+                                 poor, (double) poor / (double) rows);
             }
             if (req_look > 0) {
                 char off[160] = "";
