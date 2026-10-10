@@ -4989,7 +4989,10 @@ int main(int argc, char** argv) {
         // STRATA_LOOKAHEAD_K=<n>: experts predicted per token (default 10); =floor: the first rank the stand-in floor replaces
         // (STRATA_ROUTE_RESIDENT_RANKS lo): a stand-in covers every pick from there on, so only the picks above it are read ahead
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
+        // default (SPEC 20 9j: 55.0 against 44.8 tok/s, drive 9 against 64 MB a token): "floor" whenever the stand-in floor is on, so only the picks it cannot
+        // replace are read ahead; STRATA_LOOKAHEAD_K=10 restores the earlier breadth.  The look-ahead only moves pages: no output changes.
         int la_k = 10;
+        if (kv == nullptr) kv = "floor";
         if (kv != nullptr && std::strcmp(kv, "floor") == 0) {
             int lo = 6, hi = 9;
             if (const char* rr = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(rr, "%d-%d", &lo, &hi);
