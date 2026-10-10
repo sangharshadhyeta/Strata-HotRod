@@ -7500,6 +7500,34 @@ int main(int argc, char** argv) {
                                      "%lld non-resident candidates (count >= 2, %.0f picks) for %d swaps\n",
                              (long long) rounds_seen, swaps.size(), (long long) swaps_seen, usum, umax, (long long) ncand,
                              cand_mass, o.adapt_swaps);
+                if (rounds_seen % 5 == 0) {   // SPEC 13.19 / 13.25: how even are the misses across the layers, and what each layer holds
+                    std::vector<std::pair<double, int>> unmet;   // (share of the router's requests on non-resident experts, layer)
+                    std::vector<int> nres;
+                    for (int64_t l = 0; l < g.n_layers; ++l) {
+                        double tot = 0.0, miss = 0.0;
+                        int nr = 0;
+                        for (int64_t e = 0; e < g.n_expert; ++e) {
+                            const double v = drive.d.usage[(size_t) (l * g.n_expert + e)];
+                            tot += v;
+                            if (host_res[(size_t) (l * g.n_expert + e)] < 0) miss += v; else ++nr;
+                        }
+                        nres.push_back(nr);
+                        if (tot > 0.0) unmet.emplace_back(miss / tot, (int) l);
+                    }
+                    if (!unmet.empty()) {
+                        std::sort(unmet.begin(), unmet.end());
+                        std::vector<int> nsort = nres;
+                        std::sort(nsort.begin(), nsort.end());
+                        std::fprintf(stderr, "strata serve: LAYERS unmet share of the router's requests: min %.3f (layer %d), median %.3f, max %.3f "
+                                             "(layer %d); resident experts per layer min %d, median %d, max %d; the five worst layers:",
+                                     unmet.front().first, unmet.front().second, unmet[unmet.size() / 2].first, unmet.back().first, unmet.back().second,
+                                     nsort.front(), nsort[nsort.size() / 2], nsort.back());
+                        for (size_t k = 0; k < 5 && k < unmet.size(); ++k)
+                            std::fprintf(stderr, " L%d %.3f (%d resident)", unmet[unmet.size() - 1 - k].second, unmet[unmet.size() - 1 - k].first,
+                                         nres[(size_t) unmet[unmet.size() - 1 - k].second]);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
                 if (rounds_seen % 5 == 0) {
                     unsigned long long dt[48];
                     strata::kernels::route_detail_read(dt);
