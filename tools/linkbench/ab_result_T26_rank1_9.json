@@ -1,0 +1,67 @@
+[
+ {
+  "arm": "M1",
+  "env": {
+   "STRATA_ROUTE_RESIDENT": "1e30",
+   "STRATA_ROUTE_RESIDENT_RANKS": "1-9"
+  },
+  "engine_sha": "c9844a4f7fa007cb",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 92,
+   "peak_cg_current_mb": 29696.0,
+   "peak_cg_anon_mb": 2364.1,
+   "peak_cg_file_mb": 27202.3,
+   "peak_eng_rss_mb": 20989.8,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 942.8,
+   "min_sys_avail_mb": 26363.2,
+   "min_sys_free_mb": 239.0,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 30908,
+   "pswpout": 246177,
+   "pgmajfault": 29339,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 78,
+   "swap_used_mb_before": 0,
+   "swap_used_mb_after": 935
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    10.6,
+    42.0,
+    53.1
+   ],
+   "reasoning": [
+    50.2,
+    53.2,
+    61.2
+   ],
+   "prose": [
+    36.0,
+    38.5,
+    44.4
+   ]
+  },
+  "median_all": 44.4,
+  "tokens_timed": 3538,
+  "requests_logged": 10,
+  "os_read_mb": 272243.7,
+  "expert_read_mb": 397086.3,
+  "major_faults": 19377,
+  "os_mb_per_token": 76.9,
+  "stdout": "== M1 @ http://127.0.0.1:8090  repeats=3 max_tokens=900\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 0.86, 'decode_tps': 21.80883382672056, 'total_s': 1.3}\ncode      decode tok/s: 10.6, 42.0, 53.1   median 42.0   (tokens [7, 257, 245], ttft [1.45, 0.13, 0.12]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.0), (0.011, 0.061), (0.012, 0.058)]  \"def merge_intervals(intervals):\"\nreasoning decode tok/s: 50.2, 53.2, 61.2   median 53.2   (tokens [900, 900, 796], ttft [9.43, 0.21, 0.2]s)  degeneracy (repeat-4gram, top-word) [(0.021, 0.062), (0.031, 0.078), (0.006, 0.053)]  \"Here is the step-step solution to the problem.  ### Step 1: Analyze th\"\nprose     decode tok/s: 36.0, 38.5, 44.4   median 38.5   (tokens [161, 123, 149], ttft [1.14, 0.17, 0.12]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.121), (0.0, 0.116), (0.0, 0.122)]  \"The gale screamed against the lantern glass, a rhythmic, howling chaos\"\nALL median 44.4 tok/s   mean of kind-medians 44.5\n"
+ }
+]
