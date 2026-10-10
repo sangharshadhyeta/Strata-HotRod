@@ -6511,6 +6511,16 @@ int main(int argc, char** argv) {
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
+            // the prompt path's use of the router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens a layer; off unless set), as in the
+            // one-shot path below: the lookahead takes that many tokens a prediction, where decode sends at most 8
+            if (drive.d.lookahead != nullptr && !multi_gpu) {
+                if (const char* v = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); v != nullptr && std::atoi(v) > 0) {
+                    lookahead.set_max_tokens(std::atoi(v));
+                    sp.set_lookahead(&lookahead);
+                    std::fprintf(stderr, "strata serve: the prompt path feeds the router lookahead (%d tokens a layer, depth %d)\n",
+                                 lookahead.max_tokens(), lookahead.depth());
+                }
+            }
             if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
@@ -11233,6 +11243,16 @@ int main(int argc, char** argv) {
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
         if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+        // the prompt path's use of the router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens a layer; off unless set): the lookahead
+        // takes that many tokens a prediction, where decode sends at most 8
+        if (drive.d.lookahead != nullptr) {
+            if (const char* v = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); v != nullptr && std::atoi(v) > 0) {
+                lookahead.set_max_tokens(std::atoi(v));
+                prefill.set_lookahead(&lookahead);
+                std::fprintf(stderr, "strata generate: the prompt path feeds the router lookahead (%d tokens a layer, depth %d)\n",
+                             lookahead.max_tokens(), lookahead.depth());
+            }
+        }
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {

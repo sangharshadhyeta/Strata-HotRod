@@ -1846,6 +1846,7 @@ int64_t Prefill::ring_max_slots() {
 
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+void Prefill::set_lookahead(core::RouterLookahead* la) { lookahead_ = la; }
 void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #if !defined(STRATA_USE_HIP)
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
@@ -2985,6 +2986,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
                         if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
                         else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        // router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens, default 0 = off): an evenly spaced sample of this layer's
+                        // router input comes to the host behind the ids, on the same stream, and goes to the lookahead after the sync below
+                        static const int la_tok = [] { const char* v = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); return v ? std::max(0, std::atoi(v)) : 0; }();
+                        int64_t la_n = 0;
+                        if (lookahead_ != nullptr && la_tok > 0 && !stream_all && l + 1 < g.n_layers) {
+                            la_n = std::min<int64_t>(T, la_tok);
+                            const int64_t la_stride = std::max<int64_t>(1, T / la_n);
+                            la_bf_.resize((size_t) (la_n * N));
+                            cudaMemcpy2DAsync(la_bf_.data(), (size_t) N * 2, m.mixed_bf, (size_t) (la_stride * N) * 2, (size_t) N * 2, (size_t) la_n,
+                                              cudaMemcpyDeviceToHost, m.cs);
+                        }
                         const bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr &&
                                                lay.native && !m.pp && !lay.fmt.empty();
                         // auto shares only while the layers that share cost less per non-resident expert than their
@@ -3027,6 +3039,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           l, p0);
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
+                        if (la_n > 0) {   // the sample is on the host: predict the next layers' experts and warm their pages now
+                            la_x_.resize(la_bf_.size());
+                            for (size_t i = 0; i < la_bf_.size(); ++i) {
+                                const uint32_t bits = (uint32_t) la_bf_[i] << 16;
+                                std::memcpy(&la_x_[i], &bits, sizeof(float));
+                            }
+                            lookahead_->submit(l, la_x_.data(), la_n, m.host_res);
+                        }
                         if (m.cpu_pend) {   // the measured share: the last CPU-sharing layer's GPU time is final now
                             m.cpu_pend = false;
                             float g_ms = 0;

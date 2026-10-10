@@ -234,6 +234,9 @@ public:
     /// STRATA_IO_PREFETCH_DEPTH: how many layers ahead of `layer` are predicted and warmed (default 1, the next layer).
     /// A deeper one predicts layer + j from layer's input, which is less exact the further it looks.
     void set_depth(int d) { depth_ = d < 1 ? 1 : d > 4 ? 4 : d; }
+    /// How many tokens one prediction takes (default 8, the decode window; the prompt path sends a sample of up to 512).
+    void set_max_tokens(int n);
+    int max_tokens() const { return max_tok_; }
     int depth() const { return depth_; }
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
@@ -245,6 +248,7 @@ private:
     int64_t n_embd_ = 0, n_expert_ = 0;
     int k_ = 10;
     int depth_ = 1;
+    int max_tok_ = 8;                               ///< (under mu_)
     ExpertSource* src_ = nullptr;
     std::thread thread_;
     std::mutex mu_;

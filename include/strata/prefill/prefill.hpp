@@ -180,8 +180,15 @@ public:
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
+    /// The router lookahead (the decode path's, expert_source.hpp): for a chunk staged after its routing, a sample of each MoE
+    /// layer's router input (STRATA_PREFILL_LOOKAHEAD_TOK tokens, default 32; 0 = off) predicts the next layers' experts and
+    /// warms their pages while this layer's are read.  It only warms pages: which experts are computed does not change.
+    void set_lookahead(core::RouterLookahead* la);
 
 private:
+    core::RouterLookahead* lookahead_ = nullptr;     ///< set_lookahead
+    std::vector<uint16_t> la_bf_;                    ///< the sampled router-input rows (bf16), host
+    std::vector<float> la_x_;                        ///< ... as floats, what the lookahead takes
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool

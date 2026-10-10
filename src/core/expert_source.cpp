@@ -1922,13 +1922,19 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
-        n_tok_ = std::min<int64_t>(n_tok, 8);
+        n_tok_ = std::min<int64_t>(n_tok, max_tok_);
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
         host_res_ = host_res;
         pending_ = true;
     }
     cv_.notify_one();
+}
+
+void RouterLookahead::set_max_tokens(int n) {
+    std::lock_guard<std::mutex> lk(mu_);
+    max_tok_ = n < 8 ? 8 : n > 512 ? 512 : n;
+    x_.assign((size_t) max_tok_ * (size_t) n_embd_, 0.f);
 }
 
 void RouterLookahead::run() {
@@ -1949,6 +1955,7 @@ void RouterLookahead::run() {
             nt = n_tok_;
             host_res = host_res_;
             fs = fs_;
+            if (logits.size() < (size_t) max_tok_ * (size_t) n_expert_) logits.resize((size_t) max_tok_ * (size_t) n_expert_);
         }
         const auto t0 = std::chrono::steady_clock::now();
         const int64_t layer0 = layer;
@@ -1959,12 +1966,17 @@ void RouterLookahead::run() {
         // one (kq_avx1.cpp) or, without AVX, the same sums in plain C++.  From the Strata_Dirigo fork (rwkeyes): an
         // AVX-only Xeon E5-2687W died here (vpmovzxwd) on its first request.  An estimate only (which experts to
         // prefetch); the order of the additions differs between the three, the output does not depend on it.
+        // (the multi-token dots take at most 8 tokens a call: more tokens, as the prompt path sends, go in runs of 8)
         if (strata::kernels::cpu::cpu_avx2_ok()) {
-            strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
-                                                      x_.data(), (int) nt, logits.data());
+            for (int64_t t0 = 0; t0 < nt; t0 += 8)
+                strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
+                                                          x_.data() + (size_t) t0 * (size_t) n_embd_, (int) std::min<int64_t>(8, nt - t0),
+                                                          logits.data() + (size_t) t0 * (size_t) n_expert_);
         } else if (strata::kernels::cpu::cpu_avx1_ok()) {
-            strata::kernels::cpu::bf16_rows_dot_multi_avx1(routers_[(size_t) layer].data(), (int) n_expert_,
-                                                           (int) n_embd_, x_.data(), (int) nt, logits.data());
+            for (int64_t t0 = 0; t0 < nt; t0 += 8)
+                strata::kernels::cpu::bf16_rows_dot_multi_avx1(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
+                                                               x_.data() + (size_t) t0 * (size_t) n_embd_, (int) std::min<int64_t>(8, nt - t0),
+                                                               logits.data() + (size_t) t0 * (size_t) n_expert_);
         } else {
             // a mul and an add, not std::fma: without an FMA instruction that is a libm call per element (74x
             // slower on a Xeon E5-2665, measured by the fork)
