@@ -9879,7 +9879,12 @@ int main(int argc, char** argv) {
                 if (t == req_seg_ids[0]) in_think = true;                                // <think>
                 else if (t == req_seg_ids[1]) { in_think = false; in_fence = false; }    // </think>
                 else if (t >= 0 && (t == req_seg_ids[2] || t == req_seg_ids[3])) in_fence = !in_fence;   // a fence opens or closes
-                if (th != in_think || fe != in_fence) strata::kernels::route_cfg_set_state(in_think, in_fence);
+                if (th != in_think || fe != in_fence) {
+                    strata::kernels::route_cfg_set_state(in_think, in_fence);
+                    static const bool trace_seg = std::getenv("STRATA_TRACE_SEG") != nullptr;   // each change of the state, with its token
+                    if (trace_seg)
+                        std::fprintf(stderr, "strata serve: SEG token %lld -> thinking %d, fence %d\n", (long long) t, (int) in_think, (int) in_fence);
+                }
             };
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
