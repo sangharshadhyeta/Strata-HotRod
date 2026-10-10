@@ -2005,6 +2005,16 @@ struct PeTimer {
 }  // namespace
 
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    // solid.cpp's silent-corruption bug class (a failed prefill copy still published its slot): a copy call that RETURNS an error (an argument error is not
+    // a stream error, so the stream check at the end of the chunk does not see it) is recorded here and fails the request, loudly
+    std::atomic<int> copy_bad{0};
+    auto note_copy = [&](cudaError_t ce) {
+        if (ce != cudaSuccess) {
+            int none = 0;
+            copy_bad.compare_exchange_strong(none, (int) ce);
+            (void) cudaGetLastError();
+        }
+    };
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
@@ -2339,11 +2349,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                 if (en.job < 0) {
-                    cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                    note_copy(cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy));
                     ++stats_.experts_dma;
                 } else {
                     const uint8_t* hb = m.stager->wait(en.job);
-                    cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
+                    note_copy(cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy));
                     m.stager->issued_one(en.job, m.copy);
                 }
                 cudaEventRecord(m.copied[sl], m.copy);
@@ -2387,11 +2397,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                     if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                     if (en.job < 0) {
-                        cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                        note_copy(cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy));
                         ++iss_dma;
                     } else {
                         const uint8_t* hb = m.stager->wait(en.job);
-                        cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
+                        note_copy(cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy));
                         m.stager->issued_one(en.job, m.copy);
                     }
                     cudaEventRecord(m.copied[sl], m.copy);
@@ -4108,6 +4118,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // (PR #121) an expert copy that failed on the copy stream surfaces here, not in the next request
     if (const cudaError_t cst = cudaStreamSynchronize(m.copy); cst != cudaSuccess) {
         err = std::string("prefill: expert copy stream: ") + cudaGetErrorString(cst);
+        return false;
+    }
+    if (const int cb = copy_bad.load(); cb != 0) {
+        err = std::string("prefill: an expert copy call failed: ") + cudaGetErrorString((cudaError_t) cb) + " (the prompt's experts are not trusted: the request stops)";
         return false;
     }
     if (kv_prefetch) {
