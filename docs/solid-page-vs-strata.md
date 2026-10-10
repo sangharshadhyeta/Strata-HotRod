@@ -230,3 +230,22 @@ Pending added by this screen: 22. persisted heat as a cold-start fix (PS1/PS2, q
 | 4 | Box "Then the same two maps were run through the live server, and were indistinguishable": the probe atlas (AUC 0.7116) 58.45 tok/s, 71.20% hit; the chance-level incremental atlas (AUC 0.4823) 58.43 tok/s, 71.28% hit; "the map's advantage is real as a statement about maps and never reaches the mechanism consuming it" | a map's quality did not move the live number | the same kind of result on our side: a better predictor needs a consumer that can use it; our consumer is the page cache (the narrow read-ahead, +23%), and the consumers that tried to use predictions as VRAM fills (Foresight, the staged path) lost | consistent; the atlas, if built last, must be tested through the whole system, not as a map |
 
 Pending: 23. the residency view (the Brain view) and the atlas stay LAST, by agreement; 24. (done, 11 Oct) the always-on "work done" line.
+
+## Candidates from snapshots 13-39 (s12-s38), ranked (11 Oct)
+
+Nothing here was built yet; each needs its own A/B (identical-copy control, paired prompts, three repeats).
+
+| Rank | Candidate (page section) | What solid measured | Strata today | Next step |
+|---|---|---|---|---|
+| 1 | PLE / n-gram embedding as an input to the look-ahead predictor (prerouter) | Largest lever in the run: 70.00 vs 49.88 tok/s without it; its absence caps router look-ahead at 59.3% | Look-ahead uses router weights one layer back only (recall +1 79.5-86.6%); no PLE term | Add the PLE slice to the look-ahead input, measure recall and tok/s (pending item) |
+| 2 | Prediction as retention, not admission ("eviction protection") | Gemma: admission 56.6 hurts, eviction protection 71.4 wins; Qwen: eviction+substitution 10.69 best of four | Swap rounds and SWAP2 pick victims by use count only; predictions feed only read-ahead | Protect predicted-wanted experts from being the swap victim; A/B vs current victim rule |
+| 3 | Gate-weight floor instead of rank floor (HOBBIT, page s30 "where this session stopped") | Faithful idea, never built there: skip/replace picks below a gate-mass threshold | Floor is by rank (2-9); router logits already in native_router.cu | Replace only picks whose gate weight is under a threshold; compare degeneration/degradation against rank floor |
+| 4 | Cost-aware (GreedyDual-Size) eviction tiebreak | Heat weighed by NVMe-vs-RAM cost tier; noise-neutral, correctness fix under RAM pressure | Strata is drive-bound with page cache; tiers not distinguished in slot choice | Low cost to try in SWAP2 gap: weigh cold-in-page-cache experts higher |
+| 5 | Measurement controls | Identical-copy arm as noise floor; agreement prefix vs a previous-vs-previous control (greedy not reproducible) | strata_ab.py has repeats but no identical-copy arm | Add an AB identical-copy arm to the harness |
+| 6 | Tighter VRAM margin, measured per machine (fit-target 1024 to 320: +11.7% on Ornith, inverts on Gemma) | Margin cannot be deleted: covers allocation after the probe | Cache-size sweep (1,024/1,536/2,048) still pending | Run the sweep and lower the reserve until the first OOM-yield |
+| 7 | Draft KV kept f16 while target KV is int8/q8 | 0.97 acceptance pays, 0.43 costs; quantised KV degrades agreement | Check MTP KV precision in Strata | Read mtp.cpp, confirm f16 |
+| 8 | Recurrent-state dtype f16 (-ctr/-cts) | 62.81 to 31.41 MiB | GDN state about 111 MiB fixed | Saves about 55 MiB only; low priority |
+| 9 | Per-tensor slot validity (stale LFRU hit-mask bug: one tensor's bit cleared left others reading garbage) | Garbled output, root-caused | FC/FT fault test (queue44) covers copy failures | Read slot-valid logic for gate/up/down in verify.cpp |
+| 10 | Sync fetch on miss (ranks 0-1 wait for the fetch, not CPU matmul) | Closed one gap; still far from 40 tok/s; solid defaults FORCE_GPU on | Ranks 0-1 computed on CPU from RAM | Try only after item 1-3; CPU share is off by decision |
+
+Not worth porting (page's own evidence): neuron subsetting (we measured about 81% mass width, about 0% dead), entropy-coded experts (2.7% for IQ3_S), atlas warming (tie), adaptive draft length (-4.2%), n-gram drafter (tie), shallow-layer eviction bonus (removed), micro-batch 1024 (costs prefill), prerouter as admission (hurts), PagedAttention (solid skipped it too), lower q4_0 KV (excluded by policy).
