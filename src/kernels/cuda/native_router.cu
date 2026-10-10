@@ -188,7 +188,7 @@ static unsigned long long* g_detail = nullptr;   // the decode rows' detail coun
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
-                                 unsigned long long* __restrict__ detail) {
+                                 unsigned long long* __restrict__ detail, int32_t* __restrict__ rows) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
     // the floor lives in host-mapped memory, read at every launch, so a captured graph follows a change the host makes between
@@ -220,6 +220,10 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     // and cannot say which expert the swap round should bring in (`want` is the layer's slice of the usage counter)
     if (want != nullptr)
         for (int r = 0; r < 10; ++r) atomicAdd(want + id[r], 1.0f);
+    // SPEC 13.40: the same picks, kept per ROW of the window instead of summed, so the host can count only the rows whose input token was
+    // kept once the acceptance is known (`rows` is the layer's [8 rows][10] slice; the atomic count above is then off)
+    if (rows != nullptr)
+        for (int r = 0; r < 10; ++r) rows[t * 10 + r] = id[r];
     int swaps = 0, tail = 0, before = 0;
     for (int r = 0; r < 10; ++r) before += res[id[r]] < 0;
     for (int r = (edge >= 0.f && lo > 0) ? lo - 1 : lo; r <= hi && r < 10; ++r) {
@@ -293,10 +297,10 @@ void route_cfg_set_floor(int lo) {
 }
 const RouteCfg* route_cfg_device() { return g_cfg_dev; }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           unsigned long long* stats, void* stream, float* want) {
+                           unsigned long long* stats, void* stream, float* want, int32_t* rows) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     route_resident_k<<<(unsigned) ((n_tok + 31) / 32), 32, 0, static_cast<cudaStream_t>(stream)>>>(
-        logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr);
+        logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -329,5 +333,29 @@ void route_want_drain(float* usage, size_t n) {
     if (cudaMemcpy(h.data(), g_want, g_want_n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
     cudaMemset(g_want, 0, g_want_n * sizeof(float));
     for (size_t i = 0; i < g_want_n; ++i) usage[i] += h[i];
+}
+// ---- SPEC 13.40 (T5): the router's original top-10 per window row and layer ([layer][8 rows][10]), for counting only the rows whose input
+// token was kept.  The kernel writes it every window (rows beyond the window keep older values: the host reads only the kept rows).
+static int32_t* g_rows = nullptr;
+static int64_t g_rows_layers = 0;
+void route_rows_alloc(int64_t n_layers) {
+    if (g_rows != nullptr || n_layers <= 0) return;
+    if (cudaMalloc((void**) &g_rows, (size_t) n_layers * 8 * 10 * sizeof(int32_t)) != cudaSuccess) { g_rows = nullptr; return; }
+    cudaMemset(g_rows, 0xff, (size_t) n_layers * 8 * 10 * sizeof(int32_t));   // -1 everywhere
+    g_rows_layers = n_layers;
+}
+int32_t* route_rows_layer(int64_t layer) { return g_rows ? g_rows + (size_t) layer * 80 : nullptr; }
+bool route_rows_active() { return g_rows != nullptr; }
+void route_rows_apply(int kept, float* usage, int64_t n_layers, int64_t n_expert) {
+    if (g_rows == nullptr || usage == nullptr || kept < 1 || n_layers > g_rows_layers) return;
+    if (kept > 8) kept = 8;
+    std::vector<int32_t> h((size_t) n_layers * 80);
+    if (cudaMemcpy(h.data(), g_rows, h.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    for (int64_t l = 0; l < n_layers; ++l)
+        for (int t = 0; t < kept; ++t)
+            for (int r = 0; r < 10; ++r) {
+                const int32_t e = h[(size_t) l * 80 + (size_t) t * 10 + (size_t) r];
+                if (e >= 0 && e < n_expert) usage[(size_t) (l * n_expert + e)] += 1.0f;
+            }
 }
 }

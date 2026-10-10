@@ -7449,11 +7449,17 @@ int main(int argc, char** argv) {
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
+        // SPEC 13.36 / 13.49 (T6): a grace period. STRATA_SWAP_GRACE=N rounds: an expert swapped in cannot be chosen as a victim for the next N
+        // rounds (0 = off, the rule as it was: the least-used resident expert of the layer is the victim)
+        const int swap_grace = [] { const char* v = std::getenv("STRATA_SWAP_GRACE"); return v ? std::max(0, std::atoi(v)) : 0; }();
+        std::vector<int64_t> swapped_at((size_t) (g.n_layers * g.n_expert), -1000000);
+        int64_t swap_round = 0;
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size());   // what the unmasked router wanted (13.20)
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            ++swap_round;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -7464,7 +7470,7 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    else if (swap_grace == 0 || swap_round - swapped_at[(size_t) (l * g.n_expert + e)] > swap_grace) vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -7478,6 +7484,7 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            for (const Swap& s : swaps) swapped_at[(size_t) (s.layer * g.n_expert + s.in)] = swap_round;   // the grace starts now
             // STRATA_TRACE_ADAPT: what each serve swap round saw and did (default off, one getenv)
             static const bool trace_serve_adapt = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
             if (trace_serve_adapt) {
@@ -10861,6 +10868,9 @@ int main(int argc, char** argv) {
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
+                // SPEC 13.40 (STRATA_COUNT_KEPT=1): the rows whose input token was kept are rows 0..a; count only those picks
+                if (strata::kernels::route_rows_active() && !drive.d.usage.empty())
+                    strata::kernels::route_rows_apply(a + 1, drive.d.usage.data(), g.n_layers, g.n_expert);
                 x = outv[(size_t) a];
                 p += a + 1;
             }

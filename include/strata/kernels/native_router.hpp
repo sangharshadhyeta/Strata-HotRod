@@ -36,8 +36,16 @@ const RouteCfg* route_cfg_device();
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
 /// `want` is nullptr or the layer's slice of the wanted-expert counter (route_want_layer): the router's own top-10, counted
 /// before any swap. Needs route_cfg_init first.
+/// `rows` is nullptr or the layer's [8 rows][10] slice of the per-row record (route_rows_layer): the same original picks per window row.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           unsigned long long* stats, void* stream, float* want = nullptr);
+                           unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr);
+/// SPEC 13.40 (STRATA_COUNT_KEPT=1): the per-row record of the router's original top-10, so the swap round counts only the rows of a
+/// window whose input token was kept (rows 0..a after a accepted drafts).  `route_rows_apply(kept, ...)` adds those rows' picks to the
+/// host usage table after the acceptance is known; with this on the atomic count (`want`) is not used.
+void route_rows_alloc(int64_t n_layers);
+int32_t* route_rows_layer(int64_t layer);   ///< nullptr when not allocated
+bool route_rows_active();
+void route_rows_apply(int kept, float* usage, int64_t n_layers, int64_t n_expert);
 /// The wanted-expert counter: what the unmasked router picked, for the swap round (a router confined to resident experts
 /// cannot tell the swap round which expert to bring in). Allocated once (outside graph capture), n_layers * n_expert floats.
 void route_want_alloc(size_t n);

@@ -427,6 +427,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     (void) route_resident_cfg().stats();   // STRATA_ROUTE_RESIDENT: the counters are allocated outside graph capture
     if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count)
         strata::kernels::route_want_alloc((size_t) (g.n_layers * g.n_expert));
+    // SPEC 13.40 (T5): STRATA_COUNT_KEPT=1 counts only the kept rows of a verify window (the host applies them after the acceptance)
+    if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count && std::getenv("STRATA_COUNT_KEPT") != nullptr &&
+        std::atoi(std::getenv("STRATA_COUNT_KEPT")) != 0)
+        strata::kernels::route_rows_alloc(g.n_layers);
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_TRACE_ADAPT") != nullptr)
         strata::kernels::route_detail_alloc();
     if (route_resident_cfg().margin > 0.0f) {
@@ -1348,7 +1352,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
                                       route_resident_cfg().stats() + (n <= 8 ? 4 : 0), cs,
-                                      n <= 8 ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr);
+                                      n <= 8 && !strata::kernels::route_rows_active() ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr,
+                                      n <= 8 ? strata::kernels::route_rows_layer(l) : nullptr);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (ar_on()) {
