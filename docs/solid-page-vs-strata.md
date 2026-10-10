@@ -74,6 +74,10 @@ Pending items raised so far (updated 10 Oct after snapshot 5; all need the GPU u
 11. Main request after the review: wire the router lookahead into the decode swap round.
 12. CCE router bias (solid `llama-graph.cpp:2248`, page snapshot 6): ln(1+beta) on resident experts before the top-10, weights from unbiased scores; beta 0.25/0.5, alone and with the floor; hit rate, speed, then read answers.
 13. KV fp16 against int8, 3 repeats each (one arm each showed 41.4 against 45.9, spread about 3).
+12 (user 10 Oct: "ye add cce router bias"): BUILT, not yet measured: `STRATA_ROUTE_BIAS=<beta>` (kernel `route_resident_k`, `bias` in RouteCfg); bias-only = also `STRATA_ROUTE_RESIDENT=1e-6`; combined with the floor = the floor's margin as usual.
+14. CPU-off with the lookahead (user 10 Oct: "we need a flag to stop cpu computation ... now since the lookahead is there the results should be better for the substitution"): the flag EXISTS: `--pcie-frac 1.0` (every miss computed by the GPU over PCIe, the CPU none; default 0.55). Recorded: with the RAM tier (the PCIe path needs pinned experts) 0.8 gave 41.5, 1.0 gave 41.7 against 40.5 at 0.55 (SPEC 20 9a/9c). To re-run with the lookahead and Foresight on and the floor 2-9, and with CCE bias.
+15. KV streaming: HAVE (`--kv-resident N`, `generate.cpp:674`); user guessed it was missing; nothing to port.
+16. LAST (user 10 Oct): the atlas, integrated with the lookahead, the router, the swap round and the mapping; "option also we will consider last" (user's words, to be clarified when we reach it).
 
 ## s03 (snapshot 4) - the rest of the three quality gates, "what the guard could not see", "what the ladder decides now", the start of "Run it the way it was measured", line by line
 
