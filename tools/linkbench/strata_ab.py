@@ -119,8 +119,12 @@ def run_arm(name, env_extra, cfg, log, port):
     # and it had to be hard-reset): past the cap the kernel kills the server, not the machine. MEMORY_CAP_GB leaves the rest of
     # the system (the shell, the editor, the kernel) about 7 GB.
     unit = f"strata-ab-{name}-{int(time.time())}"
-    cap = ["systemd-run", "--scope", "--quiet", f"--unit={unit}", "-p", f"MemoryMax={MEMORY_CAP_GB}G",
-           "-p", f"MemoryHigh={MEMORY_CAP_GB - 1}G", "-p", "MemorySwapMax=0"]
+    # AB_NO_HIGH=1: only the hard MemoryMax. MemoryHigh makes the kernel throttle the scope while it reclaims (the R1 trace showed
+    # 230,000 'high' events), so a run next to it measures the throttle as well as the engine.
+    cap = ["systemd-run", "--scope", "--quiet", f"--unit={unit}", "-p", f"MemoryMax={MEMORY_CAP_GB}G"]
+    if os.environ.get("AB_NO_HIGH") != "1":
+        cap += ["-p", f"MemoryHigh={MEMORY_CAP_GB - 1}G"]
+    cap += ["-p", "MemorySwapMax=0"]
     srv = subprocess.Popen(cap + [ROOT + "/.venv/bin/python", ROOT + "/serve/server.py", "--engine", "strata", "--config", cfg, "--port", str(port)],
                            cwd=ROOT, env=env, stdout=open("/root/.claude/jobs/743230e4/tmp/strata_ab_server.out", "w"), stderr=subprocess.STDOUT)
     from memtrace import MemTrace   # where the memory goes, once a second (tools/linkbench/memtrace.py)

@@ -1,0 +1,64 @@
+[
+ {
+  "arm": "N1",
+  "env": {},
+  "engine_sha": "cc77ba221314f081",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 101,
+   "peak_cg_current_mb": 29588.3,
+   "peak_cg_anon_mb": 2591.5,
+   "peak_cg_file_mb": 26786.7,
+   "peak_eng_rss_mb": 25485.1,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 1081.5,
+   "min_sys_avail_mb": 25783.6,
+   "min_sys_free_mb": 224.1,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 149986,
+   "pswpout": 307693,
+   "pgmajfault": 108274,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 75,
+   "swap_used_mb_before": 0,
+   "swap_used_mb_after": 1040
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    17.0,
+    27.0,
+    28.6
+   ],
+   "reasoning": [
+    20.3,
+    27.9,
+    31.2
+   ],
+   "prose": [
+    21.4,
+    27.7,
+    37.2
+   ]
+  },
+  "median_all": 27.7,
+  "tokens_timed": 2012,
+  "requests_logged": 10,
+  "os_read_mb": 172989.2,
+  "expert_read_mb": 951213.3,
+  "major_faults": 13908,
+  "os_mb_per_token": 86.0,
+  "stdout": "== N1 @ http://127.0.0.1:8090  repeats=3 max_tokens=256\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 1.95, 'decode_tps': 8.129222572645919, 'total_s': 3.1}\ncode      decode tok/s: 17.0, 27.0, 28.6   median 27.0   (tokens [256, 256, 256], ttft [2.75, 0.33, 0.5]s)  degeneracy (repeat-4gram, top-word) [(0.01, 0.05), (0.01, 0.05), (0.01, 0.05)]  \"```python def merge_intervals(intervals: list[tuple[int, int]]) -> lis\"\nreasoning decode tok/s: 20.3, 27.9, 31.2   median 27.9   (tokens [256, 256, 256], ttft [6.35, 0.3, 0.26]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.062), (0.0, 0.062), (0.0, 0.062)]  \"Here is the step-by-step solution to the problem.  ### Step 1: Analyze\"\nprose     decode tok/s: 21.4, 27.7, 37.2   median 27.7   (tokens [192, 145, 139], ttft [2.3, 0.31, 0.29]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.136), (0.0, 0.118), (0.0, 0.114)]  \"The gale howled like a wounded beast, battering the granite tower unti\"\nALL median 27.7 tok/s   mean of kind-medians 27.5\n"
+ }
+]
