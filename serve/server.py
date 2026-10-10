@@ -959,6 +959,13 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        # SPEC 17, the stand-in floor per task: "strata_seg" ({"start": 0|1, "ids": [think open, think close, code fence],
+        # "floors": [thinking, prose, code]}, built by Service.with_segments) tells the engine which segment the answer
+        # starts in, which token ids move it, and the first rank each segment may have replaced by a resident stand-in
+        seg = sampling.get("strata_seg")
+        if isinstance(seg, dict):
+            keys += (f" seg={int(seg['start'])} segids={','.join(str(int(i)) for i in seg['ids'])}"
+                     f" floors={','.join(str(int(f)) for f in seg['floors'])}")
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -3403,6 +3410,27 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    def segment_ids(self) -> tuple:
+        """(think open, think close, code fence) token ids for the engine's segment tracker (SPEC 17); -1 where the text is not
+        one token. Worked out once from the tokenizer."""
+        ids = getattr(self, "_segment_ids", None)
+        if ids is None:
+            def one(text, special):
+                t = self.tok.encode(text, parse_special=special)
+                return int(t[0]) if len(t) == 1 else -1
+            ids = self._segment_ids = (one("<think>", True), one("</think>", True), one("```", False))
+        return ids
+
+    def with_segments(self, sampling, thinking):
+        """The request with "strata_seg" added when it carries "strata_standin_floors": [thinking, prose, code] (three whole
+        numbers 0 to 10: the first rank of that task whose pick may be replaced by a resident stand-in). Without the field the
+        request is returned unchanged, so nothing differs from today's behaviour."""
+        floors = (sampling or {}).get("strata_standin_floors")
+        if not (isinstance(floors, (list, tuple)) and len(floors) == 3
+                and all(isinstance(f, int) and not isinstance(f, bool) and 0 <= f <= 10 for f in floors)):
+            return sampling
+        return {**sampling, "strata_seg": {"start": 0 if thinking else 1, "ids": list(self.segment_ids()), "floors": list(floors)}}
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
@@ -3410,6 +3438,7 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        sampling = self.with_segments(sampling, thinking)   # SPEC 17: per-task stand-in floors, when the request gives them
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
