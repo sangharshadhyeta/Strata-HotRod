@@ -60,13 +60,18 @@ Corrections to what I told you earlier about this screen: (a) "margin 2 was test
 | 17 | Table row "Reproducibility (text identity across 5 greedy repeats)": the cache admits experts between requests, GPU and CPU compute take different quantised paths, so identical greedy requests diverge by a word as the cache warms; cache off 5 of 5 identical, on 1 of 5; "Removed. It fired nine times, always at exactly 2-of-5" | check removed | The same cause is in Strata's own startup text ("the GPU computes the experts in the cache; it rounds differently from the CPU, so a reply can differ slightly from a run without the cache"). MEASURED: 2, 3 and 4 of 6 long-prompt replies identical between settings that change nothing in the computation (SPEC 20). Not measured: whether a control without stand-ins and without swaps is deterministic | agree; PENDING: determinism test (control twice; 2-9 with `--adapt-swaps 0` twice) to find the source |
 | 18 | Row "Fidelity bar (similarity to a substitution-free reference)": substitution serves a different expert by construction, so wording diverges; rejected ranks 6, 4 and 2, leaving rank 10 at 6.18 tok/s; "Demoted to a reported number. Rank 2 scores fidelity 0.00 and answers 4 of 4 verifiable questions correctly" | demoted | Strata has no fidelity gate. First-differing-word was measured (T22): control against itself 72 / 113 / 21 words, rank 2-9 and lower differ earlier; the reading showed 2-9 correct (T25: 9 of 9) | agree: wording differs, correctness held |
 
-Pending items raised so far (not started unless marked):
-1. Margin at floor 2-9: margins 2, 4, 8 (RUNNING, `queue9.py`; arms MG2, MG4, MG8).
-2. `tools/calibrate.py` on this install: does it find anything over the defaults.
-3. The page's serving method: 10 questions, thinking on, temperature 1.0; control against 2-9 (and probabilistic draft acceptance on and off, page snapshot 13).
+Pending items raised so far (updated 10 Oct after snapshot 5; all need the GPU unless marked):
+1. DONE: margin at floor 2-9 (MG2 40.9, MG4 43.7, MG8 43.6 against 44.6: no gain; SPEC 20 9g).
+2. DROPPED by the user: `tools/calibrate.py` run and auto-calibration.
+3. The page's serving method: 10 questions, thinking ON, temperature 1.0; control against 2-9 (and probabilistic draft acceptance on and off). Raised in snapshots 4 and 5: every speed we quote was measured thinking off, temperature 0.
 4. True cache-off arm.
 5. Determinism: the control twice, and 2-9 with `--adapt-swaps 0` twice.
-6. MADV_RANDOM on the expert mapping, decode-only drive bytes per token before and after.
+6. MADV_RANDOM on the expert mapping, decode-only drive bytes per token before and after (low priority: decode page faults are only 50-680 a request).
+7. Concurrency: `--batch 2` serving two requests at once, speed per request.
+8. `--spec-min-p 0` (no confidence gate).
+9. Draft window above 5 (`--spec 6`).
+10. Decode prefetch and lookahead on/off: decode-only drive bytes per token (the engine's "used/unused" counters are not proof of waste).
+11. Main request after the review: wire the router lookahead into the decode swap round.
 
 ## s03 (snapshot 4) - the rest of the three quality gates, "what the guard could not see", "what the ladder decides now", the start of "Run it the way it was measured", line by line
 
