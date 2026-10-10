@@ -197,6 +197,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     const int hi = ((const volatile RouteCfg*) cfg)->hi;
     const float margin = ((const volatile RouteCfg*) cfg)->margin;
     const float edge = ((const volatile RouteCfg*) cfg)->edge;
+    const float bias = ((const volatile RouteCfg*) cfg)->bias;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
     // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
@@ -224,6 +225,29 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     // kept once the acceptance is known (`rows` is the layer's [8 rows][10] slice; the atomic count above is then off)
     if (rows != nullptr)
         for (int r = 0; r < 10; ++r) rows[t * 10 + r] = id[r];
+    // CCE router bias (Cache-Conditional Experts, arXiv 2412.00099; solid.cpp LLAMA_MOE_CACHE_BIAS): the top-10 is chosen again on the
+    // logits with `bias` (= ln(1 + beta), i.e. the score times 1 + beta) added to every resident expert, so a near tie goes to the expert
+    // that costs nothing to fetch.  Counted above (want, rows, detail) from the router's own picks.  The weights stay the softmax of the
+    // UNBIASED logits of the chosen experts: every chosen expert is computed exactly as the router would score it.
+    if (bias > 0.f) {
+        int32_t pick[10];
+        for (int r = 0; r < 10; ++r) {
+            int best = -1;
+            float bs = -INFINITY;
+            for (int f = 0; f < 512; ++f) {
+                bool used = false;
+                for (int q = 0; q < r; ++q) used |= pick[q] == f;
+                const float s = l[f] + (res[f] >= 0 ? bias : 0.f);
+                if (!used && s > bs) { bs = s; best = f; }
+            }
+            pick[r] = best;
+        }
+        float m = -INFINITY;
+        for (int r = 0; r < 10; ++r) m = fmaxf(m, l[pick[r]]);
+        float ex[10], sum = 0.f;
+        for (int r = 0; r < 10; ++r) { ex[r] = expf(l[pick[r]] - m); sum += ex[r]; }
+        for (int r = 0; r < 10; ++r) { id[r] = pick[r]; weights[(size_t) t * 10 + r] = ex[r] / sum; }
+    }
     int swaps = 0, tail = 0, before = 0;
     for (int r = 0; r < 10; ++r) before += res[id[r]] < 0;
     for (int r = (edge >= 0.f && lo > 0) ? lo - 1 : lo; r <= hi && r < 10; ++r) {
@@ -279,7 +303,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
 // floors (thinking / answer / code, a fence tracker) lived here and were removed after the benchmark showed no gain (SPEC 18.1).
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
-void route_cfg_init(int lo, int hi, float margin, float edge) {
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias) {
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
@@ -288,6 +312,7 @@ void route_cfg_init(int lo, int hi, float margin, float edge) {
     g_cfg_host->hi = hi;
     g_cfg_host->margin = margin;
     g_cfg_host->edge = edge;
+    g_cfg_host->bias = bias;
     __sync_synchronize();
 }
 void route_cfg_set_floor(int lo) {
