@@ -44,6 +44,8 @@ struct ForesightSwap {
         const uint8_t* src = nullptr;        ///< the host blob being copied in
         uint64_t bytes = 0;
         void* ev = nullptr;                  ///< cudaEvent_t on the layer's card
+        ExpertSource* from = nullptr;        ///< STRATA_PCIE_STAGED: the source the filler reads the (unpinned) expert from
+        uint8_t* host = nullptr;             ///< that read's own pinned buffer (cudaHostAlloc, lazily), the copy's source: it lives until the slot is reused
     };
 
     int slots = 0, budget = 32, admit = 1, depth = 4;
@@ -62,6 +64,7 @@ struct ForesightSwap {
     std::atomic<bool> failed{false};
     // counters (dispatch thread)
     uint64_t hits = 0, copies = 0, busy = 0, over_budget = 0, pending = 0, predicted = 0;   // (under smu_)
+    std::atomic<uint64_t> staged_reads{0};   ///< STRATA_PCIE_STAGED: experts the filler read from the file tier
     bool verify = false;                     ///< STRATA_FS_VERIFY=1: read every landed slot back and compare (slow, tests)
     uint64_t verify_ok = 0, verify_bad = 0;
 

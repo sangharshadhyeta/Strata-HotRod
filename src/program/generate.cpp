@@ -11131,8 +11131,10 @@ int main(int argc, char** argv) {
                 // STRATA_PCIE_STAGED: PCIe experts read from the file after the plan went out (cumulative since start)
                 if (drive.d.pcie_staged_reads > 0) {
                     const size_t used = std::strlen(off);
-                    std::snprintf(off + used, sizeof off - used, "; %llu staged from the file (total)",
-                                  (unsigned long long) drive.d.pcie_staged_reads);
+                    std::snprintf(off + used, sizeof off - used, "; %llu staged from the file (total, %.0f us each reading + %.0f us each in the copy call, in the pool)",
+                                  (unsigned long long) drive.d.pcie_staged_reads,
+                                  (double) drive.d.pcie_staged_us / (double) drive.d.pcie_staged_reads,
+                                  (double) drive.d.pcie_fetch_us / (double) drive.d.pcie_staged_reads);
                 }
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
                              100.0 * (double) req_hits / (double) req_look,

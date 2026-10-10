@@ -420,6 +420,10 @@ struct ExpertDispatch {
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
     int pcie_num = 0;
+    uint8_t* pcie_host = nullptr;     ///< STRATA_PCIE_STAGED: 3 rings x staging_cap pinned blobs the staged reads land in (cudaHostAlloc, lazily)
+    int pcie_ring = 0;                ///< the ring the next window's staged reads use
+    uint64_t pcie_staged_us = 0;      ///< STRATA_PCIE_STAGED: the pool thread's time in the staged reads (prefetch + blob), microseconds
+    uint64_t pcie_fetch_us = 0;       ///< STRATA_PCIE_STAGED: the pool thread's time in the copy call (P.fetch) of windows with a staged read
     uint64_t pcie_staged_reads = 0;   ///< STRATA_PCIE_STAGED: PCIe-group experts read from the file after the publish
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
