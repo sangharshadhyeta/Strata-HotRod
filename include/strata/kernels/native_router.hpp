@@ -1,4 +1,6 @@
 #pragma once
+#include <algorithm>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 
@@ -45,6 +47,14 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                            unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr);
 /// SWAP2 (STRATA_SWAP2_MAX > 0): the experts stand-ins replaced, counted per (layer, expert) on the device (route_repl_layer is the layer's slice);
 /// route_repl_drain adds them to a host array and clears them.  The swap round may bring the most replaced ones into slots nothing needs.
+inline int route_swap2_max() {
+    static const int v = [] { const char* e = std::getenv("STRATA_SWAP2_MAX"); return e != nullptr ? std::max(0, std::atoi(e)) : 2; }();
+    return v;
+}
+inline float route_swap2_gap() {
+    static const float v = [] { const char* e = std::getenv("STRATA_SWAP2_GAP"); return e != nullptr ? std::max(0.0f, (float) std::atof(e)) : 1.0f; }();
+    return v;
+}
 void route_repl_alloc(size_t n);
 float* route_repl_layer(int64_t layer, int64_t n_expert);
 bool route_repl_active();

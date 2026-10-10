@@ -141,7 +141,8 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 // (Prefill::arm_cpu_share) it is the share's own limit instead: the share applies to staged chunks only.
 int64_t g_stream_min_share = 0;
 inline int64_t stream_all_min() {
-    static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
+    // default 1000000: one routed-only prompt path for every chunk size (SPEC 19.9); STRATA_PREFILL_STREAM_MIN=-1 restores the ring from 1024-token chunks
+    static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) 1000000; }();
     if (env >= 0) return env;
     return g_stream_min_share > 0 ? g_stream_min_share : (int64_t) 1024;
 }
@@ -2988,7 +2989,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         else cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
                         // router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens, default 0 = off): an evenly spaced sample of this layer's
                         // router input comes to the host behind the ids, on the same stream, and goes to the lookahead after the sync below
-                        static const int la_tok = [] { const char* v = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); return v ? std::max(0, std::atoi(v)) : 0; }();
+                        static const int la_tok = [] { const char* v = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); return v ? std::max(0, std::atoi(v)) : 512; }();
                         int64_t la_n = 0;
                         if (lookahead_ != nullptr && la_tok > 0 && !stream_all && l + 1 < g.n_layers) {
                             la_n = std::min<int64_t>(T, la_tok);

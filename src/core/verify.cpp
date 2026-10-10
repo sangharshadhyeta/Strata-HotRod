@@ -71,7 +71,7 @@ struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
     bool count = false;   ///< decode windows count the router's own top-10 on the device (route_want_*)
-    float repl_gap = 0.0f; ///< STRATA_SWAP2_GAP=<logits>: a replaced pick counts for a quality swap only when its stand-in scores at least this far below it
+    float repl_gap = strata::kernels::route_swap2_gap(); ///< STRATA_SWAP2_GAP=<logits>: a replaced pick counts for a quality swap only when its stand-in scores at least this far below it
     float want_lo = 1.0f; ///< STRATA_WANT_LOW=<w>: the swap round's demand counts a pick the floor replaces (rank >= lo) as w, a pick below the floor as 1
     int maxrank = 0;      ///< STRATA_ROUTE_MAXRANK=<n>: a stand-in must be within the router's first n places of all 512 (0: any)
     float bias = 0.0f;    ///< STRATA_ROUTE_BIAS=<beta>: the CCE bias, ln(1 + beta) added to a resident expert's logit before the top-10
@@ -110,7 +110,6 @@ RouteResidentCfg& route_resident_cfg() {
         // a fractional floor: STRATA_ROUTE_RESIDENT_RANKS=2-9 with STRATA_ROUTE_RESIDENT_EDGE=1 is "floor 1.5" (rank 1 is
         // replaced only by a substitute within 1 logit of it)
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) r.edge = (float) std::atof(v);
-        if (const char* v = std::getenv("STRATA_SWAP2_GAP")) r.repl_gap = std::max(0.0f, (float) std::atof(v));
         if (const char* v = std::getenv("STRATA_WANT_LOW")) r.want_lo = std::max(0.0f, (float) std::atof(v));
         if (const char* v = std::getenv("STRATA_ROUTE_MAXRANK")) r.maxrank = std::max(0, std::atoi(v));
         // STRATA_ROUTE_BIAS=<beta> (solid.cpp's LLAMA_MOE_CACHE_BIAS): alone, with STRATA_ROUTE_RESIDENT=1e-6 (the kernel runs, no rank is replaced)
@@ -436,7 +435,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     (void) route_resident_cfg().stats();   // STRATA_ROUTE_RESIDENT: the counters are allocated outside graph capture
     if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count)
         strata::kernels::route_want_alloc((size_t) (g.n_layers * g.n_expert));
-    if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_SWAP2_MAX") != nullptr && std::atoi(std::getenv("STRATA_SWAP2_MAX")) > 0)
+    if (route_resident_cfg().margin > 0.0f && strata::kernels::route_swap2_max() > 0)
         strata::kernels::route_repl_alloc((size_t) (g.n_layers * g.n_expert));
     // SPEC 13.40 (T5): STRATA_COUNT_KEPT=1 counts only the kept rows of a verify window (the host applies them after the acceptance)
     if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count && std::getenv("STRATA_COUNT_KEPT") != nullptr &&

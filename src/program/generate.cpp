@@ -556,7 +556,7 @@ struct Options {
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
-    int adapt_every = 4;
+    int adapt_every = 1;   // SPEC 20 9m: a round every window (was 4) now that the look-ahead leaves the drive free
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     /// --adapt-async 1 (--serve with the resident RAM mode; opt-in): the adaptive tier's rounds advance between verify
     /// windows on a helper thread instead of one window waiting for a whole round (see the tier in the --serve block).
@@ -583,7 +583,7 @@ struct Options {
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
-    int adapt_swaps = 96;
+    int adapt_swaps = 64;   // SPEC 20 9m (was 96 a 4-window round)
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -1553,6 +1553,11 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
 // what the x16 share costs.  Continuous (#485): before, 19.9 GB/s gave 0.42 and 20.0 the full 0.55 (and 4.0 GB/s
 // gave 0.08, 3.9 none), so a reading near either edge moved the share by a quarter of its range.  From 20 GB/s up
 // (an x16 PCIe 4/5 link: ~26-28 GB/s) the share is unchanged.
+// STRATA_PREFILL_LOOKAHEAD_TOK: tokens a layer the prompt path samples for the router look-ahead; default 512 (SPEC 19.9: a measured win), 0 = off
+const char* prefill_lookahead_env() {
+    const char* v = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK");
+    return v != nullptr ? v : "512";
+}
 // --pcie-mode as the Verifier's code: 0 dma, 1 direct, 2 kernel (auto).  STRATA_PCIE_STAGED=1 (SPEC 20 item 20) reads a miss that is not
 // in the pinned arena from the file and copies it by DMA, so `auto` becomes dma then (direct and kernel read pinned host memory in place).
 int pcie_mode_code(const std::string& m) {
@@ -6535,7 +6540,7 @@ int main(int argc, char** argv) {
             // the prompt path's use of the router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens a layer; off unless set), as in the
             // one-shot path below: the lookahead takes that many tokens a prediction, where decode sends at most 8
             if (drive.d.lookahead != nullptr && !multi_gpu) {
-                if (const char* v = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); v != nullptr && std::atoi(v) > 0) {
+                if (const char* v = prefill_lookahead_env(); v != nullptr && std::atoi(v) > 0) {
                     lookahead.set_max_tokens(std::atoi(v));
                     sp.set_lookahead(&lookahead);
                     std::fprintf(stderr, "strata serve: the prompt path feeds the router lookahead (%d tokens a layer, depth %d)\n",
@@ -7479,7 +7484,7 @@ int main(int argc, char** argv) {
         // and never counted as demand, so the swap round never brings it in.  The kernel counts the experts stand-ins replaced (usage2); a round may bring
         // the most replaced ones (usage2 >= STRATA_SWAP2_MIN, default 3) into slots NOTHING needs (a resident whose own use is below STRATA_SWAP2_COLD,
         // default 1.0, in the same decayed units), at most n a round, after the demand swaps: speed is not spent on quality.
-        const int swap2_max = [] { const char* v = std::getenv("STRATA_SWAP2_MAX"); return v ? std::max(0, std::atoi(v)) : 0; }();
+        const int swap2_max = strata::kernels::route_swap2_max();   // default 2 (SPEC 20 9n); STRATA_SWAP2_MAX=0 off
         const float swap2_min = [] { const char* v = std::getenv("STRATA_SWAP2_MIN"); return v ? (float) std::atof(v) : 3.0f; }();
         const float swap2_cold = [] { const char* v = std::getenv("STRATA_SWAP2_COLD"); return v ? (float) std::atof(v) : 1.0f; }();
         std::vector<float> usage2(swap2_max > 0 ? (size_t) (g.n_layers * g.n_expert) : 0, 0.0f);
@@ -11379,7 +11384,7 @@ int main(int argc, char** argv) {
         // the prompt path's use of the router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens a layer; off unless set): the lookahead
         // takes that many tokens a prediction, where decode sends at most 8
         if (drive.d.lookahead != nullptr) {
-            if (const char* v = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); v != nullptr && std::atoi(v) > 0) {
+            if (const char* v = prefill_lookahead_env(); v != nullptr && std::atoi(v) > 0) {
                 lookahead.set_max_tokens(std::atoi(v));
                 prefill.set_lookahead(&lookahead);
                 std::fprintf(stderr, "strata generate: the prompt path feeds the router lookahead (%d tokens a layer, depth %d)\n",
