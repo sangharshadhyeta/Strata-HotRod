@@ -35,6 +35,9 @@ void route_cfg_init(int lo_think, int lo_prose, int lo_code, int hi, float margi
 void route_cfg_set_state(bool in_think, bool in_fence);
 /// A request's floors (-1 = the environment's) and whether it starts inside the thinking; a no-op while the stand-in is off.
 void route_cfg_request(int lo_think, int lo_prose, int lo_code, bool in_think);
+/// STRATA_STANDIN_PARTS=1: the per-part floors are on. Off (the default) the stand-in has ONE floor, the environment's, for every
+/// request and every part of an answer, and a request's floors and the thinking / fence tracker are ignored.
+bool route_cfg_parts();
 const RouteCfg* route_cfg_device();
 /// STRATA_ROUTE_RESIDENT: swap non-resident picks of the segment's floor ranks for resident ones within the margin (see the .cu).
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.

@@ -9873,7 +9873,9 @@ int main(int argc, char** argv) {
             // a missed or extra fence cannot leave the state wrong beyond it.
             strata::kernels::route_cfg_request(req_floors[0], req_floors[1], req_floors[2], req_seg == 0);
             bool in_think = req_seg == 0, in_fence = false;
+            const bool parts_on = strata::kernels::route_cfg_parts();   // STRATA_STANDIN_PARTS=1; off: one floor for everything
             auto seg_track = [&](int64_t t) {
+                if (!parts_on) return;
                 if (req_seg_ids[0] < 0 && req_seg_ids[1] < 0 && req_seg_ids[2] < 0 && req_seg_ids[3] < 0) return;
                 const bool th = in_think, fe = in_fence;
                 if (t == req_seg_ids[0]) in_think = true;                                // <think>

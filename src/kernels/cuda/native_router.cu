@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <cstdlib>
 #include <vector>
 
 namespace strata::kernels {
@@ -276,12 +277,17 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
 static int g_lo_default[3] = {0, 0, 0};   // the floors of the environment, restored for a request that gives none
+// STRATA_STANDIN_PARTS=1 turns the per-part floors on (a request's floors, the thinking / fence tracker). Off (the default): ONE
+// floor, the environment's, for every request and every part of an answer; a request's floors and the tracker are ignored.
+static bool g_parts = false;
+bool route_cfg_parts() { return g_parts; }
 static int eff_floor(const RouteCfg* c, bool in_think, bool in_fence) {
     const int base = in_think ? c->lo[0] : c->lo[1];
     return in_fence ? (base > c->lo[2] ? base : c->lo[2]) : base;
 }
 void route_cfg_request(int lo_think, int lo_prose, int lo_code, bool in_think) {
     if (g_cfg_host == nullptr) return;     // the stand-in is off: nothing to set
+    if (!g_parts) { lo_think = lo_prose = lo_code = -1; in_think = false; }   // one floor for everything: the request's are ignored
     g_cfg_host->lo[0] = lo_think >= 0 ? lo_think : g_lo_default[0];
     g_cfg_host->lo[1] = lo_prose >= 0 ? lo_prose : g_lo_default[1];
     g_cfg_host->lo[2] = lo_code >= 0 ? lo_code : g_lo_default[2];
@@ -293,6 +299,9 @@ void route_cfg_init(int lo_think, int lo_prose, int lo_code, int hi, float margi
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
     }
+    const char* parts = std::getenv("STRATA_STANDIN_PARTS");
+    g_parts = parts != nullptr && std::atoi(parts) != 0;
+    if (!g_parts) lo_think = lo_code = lo_prose;   // one floor for everything, whatever STRATA_ROUTE_FLOORS says
     g_cfg_host->lo[0] = g_lo_default[0] = lo_think;
     g_cfg_host->lo[1] = g_lo_default[1] = lo_prose;
     g_cfg_host->lo[2] = g_lo_default[2] = lo_code;
