@@ -1141,3 +1141,28 @@ Every measurement in this document so far is greedy: the engine's default is gre
 - **A possible benefit, equally untested.** A modest temperature can break repetition loops, the degeneracy the user named as the real failure; the floor might allow a lower temperature or the reverse.
 - **Test, after the benchmark sweep (SPEC 15, T-rows to follow):** the same GSM8K and HumanEval at two or three floors (the control, 2-9, 1.5-9) and temperatures 0.3, 0.7 and 1.0, with more than one sample per question at the higher temperatures (sampling adds its own noise), and with a sample of the answers read, as the rule is.
 
+## 18. Benchmark sweep: accuracy against the stand-in floor (started 2026-10-10; filled in as each arm finishes)
+
+GSM8K (the first 50 of a fixed 100-question sample, ground-truth number) and HumanEval (the first 30 of a fixed 40-problem sample, run against the benchmark's own tests), greedy, no limit on an answer's length except the 32,768-token context, hard 29 GB memory cap with no throttle, one run per arm. Rows are rebuilt by `tools/linkbench/bench_table.py`. The scores are ground-truth correctness; an answer sample of each arm is read as well (SPEC 15, quality is read) and noted below the table. With 50 and 30 questions, one question is 2 and 3.3 points: a difference of a few points between arms is noise, which the second control copy (BC2) shows.
+
+<!-- BENCH-TABLE-START -->
+| Arm | Replaced | GSM8K correct | HumanEval pass | Answer tok/s (prompt time included) | Longest answer (tokens) | State |
+|---|---|---:|---:|---:|---:|---|
+| BC | control (nothing replaced) | 30 / 32 | 0 / 0 | 9.7 | 551 | running |
+| B2 | ranks 2-9 | | | | | pending |
+| B15 | 2-9 plus rank 1 only by a close substitute (floor 1.5) | | | | | pending |
+| B1 | ranks 1-9 | | | | | pending |
+| B05 | 1-9 plus rank 0 only by a close substitute (floor 0.5) | | | | | pending |
+| B0 | ranks 0-9 | | | | | pending |
+| B3 | ranks 3-9 | | | | | pending |
+| B4 | ranks 4-9 | | | | | pending |
+| B5 | ranks 5-9 | | | | | pending |
+| B6 | ranks 6-9 | | | | | pending |
+| B7 | ranks 7-9 | | | | | pending |
+| B8 | ranks 8-9 | | | | | pending |
+| B9 | rank 9 only | | | | | pending |
+| BC2 | control, second copy (the noise floor) | | | | | pending |
+<!-- BENCH-TABLE-END -->
+
+Reading notes (answers read per arm): none yet.
+
