@@ -959,9 +959,10 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
-        # SPEC 17, the stand-in floor per task: "strata_seg" ({"start": 0|1, "ids": [think open, think close, code fence],
+        # SPEC 17, the stand-in floor per task: "strata_seg" ({"start": 0|1|2, "ans": 1|2, "ids": [think open, think close],
         # "floors": [thinking, prose, code]}, built by Service.with_segments) tells the engine which segment the answer
-        # starts in, which token ids move it, and the first rank each segment may have replaced by a resident stand-in
+        # starts in, what the answer is once thinking ends (declared by the request), which two control-token ids move it,
+        # and the first rank each segment may have replaced by a resident stand-in
         seg = sampling.get("strata_seg")
         if isinstance(seg, dict):
             keys += (f" seg={int(seg['start'])} ans={int(seg['ans'])} segids={','.join(str(int(i)) for i in seg['ids'])}"
