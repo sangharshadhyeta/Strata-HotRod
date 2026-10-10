@@ -185,11 +185,18 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
 // stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
 static unsigned long long* g_detail = nullptr;   // the decode rows' detail counters (route_detail_alloc), see below
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
-                                 const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
+                                 const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
-                                 unsigned long long* __restrict__ detail, float edge) {
+                                 unsigned long long* __restrict__ detail) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
+    // the floors live in host-mapped memory, read at every launch, so a captured graph follows a change the host makes between
+    // windows (SPEC 17): the floor of the segment being written (thinking, prose or code), the margin and the edge margin
+    const int seg = ((const volatile RouteCfg*) cfg)->seg;
+    const int lo = ((const volatile RouteCfg*) cfg)->lo[seg < 0 ? 0 : (seg > 2 ? 2 : seg)];
+    const int hi = ((const volatile RouteCfg*) cfg)->hi;
+    const float margin = ((const volatile RouteCfg*) cfg)->margin;
+    const float edge = ((const volatile RouteCfg*) cfg)->edge;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
     // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
@@ -263,11 +270,35 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         atomicAdd(stats + 3, (unsigned long long) after);
     }
 }
-void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
-                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream, float* want, float edge) {
-    if (!stream || n_tok < 1 || !res_layer) throw std::invalid_argument("native_route_resident: bad arguments");
+// ---- the floors (SPEC 17): one small struct in host-mapped memory, read by the kernel at every launch.  The host sets it once
+// (route_cfg_init: one floor per task, thinking / prose / code) and moves `seg` between windows (route_cfg_set_segment).
+static RouteCfg* g_cfg_host = nullptr;
+static RouteCfg* g_cfg_dev = nullptr;
+void route_cfg_init(int lo_think, int lo_prose, int lo_code, int hi, float margin, float edge) {
+    if (g_cfg_host == nullptr) {
+        if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
+        if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
+    }
+    g_cfg_host->lo[0] = lo_think;
+    g_cfg_host->lo[1] = lo_prose;
+    g_cfg_host->lo[2] = lo_code;
+    g_cfg_host->hi = hi;
+    g_cfg_host->margin = margin;
+    g_cfg_host->edge = edge;
+    g_cfg_host->seg = 1;   // prose until a segment tracker says otherwise
+    __sync_synchronize();
+}
+void route_cfg_set_segment(int seg) {
+    if (g_cfg_host == nullptr) return;
+    g_cfg_host->seg = seg < 0 ? 0 : (seg > 2 ? 2 : seg);
+    __sync_synchronize();
+}
+const RouteCfg* route_cfg_device() { return g_cfg_dev; }
+void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
+                           unsigned long long* stats, void* stream, float* want) {
+    if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     route_resident_k<<<(unsigned) ((n_tok + 31) / 32), 32, 0, static_cast<cudaStream_t>(stream)>>>(
-        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats, want, n_tok <= 8 ? g_detail : nullptr, edge);
+        logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

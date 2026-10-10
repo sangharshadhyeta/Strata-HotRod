@@ -429,6 +429,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         strata::kernels::route_want_alloc((size_t) (g.n_layers * g.n_expert));
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_TRACE_ADAPT") != nullptr)
         strata::kernels::route_detail_alloc();
+    if (route_resident_cfg().margin > 0.0f) {
+        // the floors (SPEC 17): one per task, thinking / prose / code; STRATA_ROUTE_FLOORS=2,1,4 sets the three, otherwise all
+        // three are the `lo` of STRATA_ROUTE_RESIDENT_RANKS. The segment is prose until a segment tracker moves it.
+        int fl[3] = {route_resident_cfg().lo, route_resident_cfg().lo, route_resident_cfg().lo};
+        if (const char* v = std::getenv("STRATA_ROUTE_FLOORS")) std::sscanf(v, "%d,%d,%d", &fl[0], &fl[1], &fl[2]);
+        strata::kernels::route_cfg_init(fl[0], fl[1], fl[2], route_resident_cfg().hi, route_resident_cfg().margin,
+                                        route_resident_cfg().edge);
+    }
     if (route_resident_cfg().margin > 0.0f)
         std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, edge %g, decode windows %s)\n",
                      route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().edge,
@@ -1341,10 +1349,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
-                                      route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
                                       route_resident_cfg().stats() + (n <= 8 ? 4 : 0), cs,
-                                      n <= 8 ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr,
-                                      route_resident_cfg().edge);
+                                      n <= 8 ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (ar_on()) {
