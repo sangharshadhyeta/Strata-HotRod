@@ -964,7 +964,7 @@ class StrataEngine:
         # starts in, which token ids move it, and the first rank each segment may have replaced by a resident stand-in
         seg = sampling.get("strata_seg")
         if isinstance(seg, dict):
-            keys += (f" seg={int(seg['start'])} segids={','.join(str(int(i)) for i in seg['ids'])}"
+            keys += (f" seg={int(seg['start'])} ans={int(seg['ans'])} segids={','.join(str(int(i)) for i in seg['ids'])}"
                      f" floors={','.join(str(int(f)) for f in seg['floors'])}")
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
@@ -3411,14 +3411,14 @@ class Service:
         return now
 
     def segment_ids(self) -> tuple:
-        """(think open, think close, code fence) token ids for the engine's segment tracker (SPEC 17); -1 where the text is not
-        one token. Worked out once from the tokenizer."""
+        """(think open, think close) token ids for the engine's segment tracker (SPEC 17): the model's own control tokens, -1 where
+        the text is not one token. Worked out once from the tokenizer. Nothing else is looked at: no text, no pattern."""
         ids = getattr(self, "_segment_ids", None)
         if ids is None:
-            def one(text, special):
-                t = self.tok.encode(text, parse_special=special)
+            def one(text):
+                t = self.tok.encode(text, parse_special=True)
                 return int(t[0]) if len(t) == 1 else -1
-            ids = self._segment_ids = (one("<think>", True), one("</think>", True), one("```", False))
+            ids = self._segment_ids = (one("<think>"), one("</think>"))
         return ids
 
     def with_segments(self, sampling, thinking):
@@ -3429,7 +3429,10 @@ class Service:
         if not (isinstance(floors, (list, tuple)) and len(floors) == 3
                 and all(isinstance(f, int) and not isinstance(f, bool) and 0 <= f <= 10 for f in floors)):
             return sampling
-        return {**sampling, "strata_seg": {"start": 0 if thinking else 1, "ids": list(self.segment_ids()), "floors": list(floors)}}
+        # what the answer is, declared by the request ("strata_standin_task": "code"), never guessed from the text or the tokens
+        answer = 2 if sampling.get("strata_standin_task") == "code" else 1
+        return {**sampling, "strata_seg": {"start": 0 if thinking else answer, "ans": answer,
+                                            "ids": list(self.segment_ids()), "floors": list(floors)}}
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).

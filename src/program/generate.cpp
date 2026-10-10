@@ -8993,11 +8993,14 @@ int main(int argc, char** argv) {
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             // SPEC 17, the stand-in floor per task: seg=0|1|2 is the segment the answer starts in (0 thinking, 1 prose,
-            // 2 code); segids=<think open>,<think close>,<code fence> are the token ids that move it (the server has the
-            // tokenizer); floors=<think>,<prose>,<code> the first rank each segment may have replaced by a resident
-            // stand-in. Absent = the floors of the environment and the segment stays prose (today's behaviour).
+            // 2 code); ans=1|2 what the answer is once thinking ends (declared by the request); segids=<think open>,
+            // <think close> are the model's own control-token ids that end and begin thinking (the server has the
+            // tokenizer; compared for equality, nothing else is looked at); floors=<think>,<prose>,<code> the first rank
+            // each segment may have replaced by a resident stand-in. Absent = the floors of the environment and the
+            // segment stays prose (today's behaviour).
             int req_seg = 1;
-            long long req_seg_ids[3] = {-1, -1, -1};
+            int req_ans = 1;   // ans=1|2: the answer's kind, declared by the request (1 prose, 2 code); never guessed from tokens
+            long long req_seg_ids[2] = {-1, -1};
             int req_floors[3] = {-1, -1, -1};
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
@@ -9026,7 +9029,8 @@ int main(int argc, char** argv) {
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "seg") req_seg = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 2);
-                    else if (key == "segids") std::sscanf(tok.c_str() + eq + 1, "%lld,%lld,%lld", &req_seg_ids[0], &req_seg_ids[1], &req_seg_ids[2]);
+                    else if (key == "ans") req_ans = std::clamp(std::atoi(tok.c_str() + eq + 1), 1, 2);
+                    else if (key == "segids") std::sscanf(tok.c_str() + eq + 1, "%lld,%lld", &req_seg_ids[0], &req_seg_ids[1]);
                     else if (key == "floors") std::sscanf(tok.c_str() + eq + 1, "%d,%d,%d", &req_floors[0], &req_floors[1], &req_floors[2]);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
@@ -9869,11 +9873,12 @@ int main(int argc, char** argv) {
             strata::kernels::route_cfg_request(req_floors[0], req_floors[1], req_floors[2], req_seg);
             int seg_now = req_seg;
             auto seg_track = [&](int64_t t) {
-                if (req_seg_ids[0] < 0 && req_seg_ids[1] < 0 && req_seg_ids[2] < 0) return;
+                // only the model's own control tokens move the segment, compared for equality: no text, no pattern. What the
+                // answer is (prose or code) is declared by the request (`ans=`), not guessed from the tokens.
+                if (req_seg_ids[0] < 0 && req_seg_ids[1] < 0) return;
                 int s = seg_now;
                 if (t == req_seg_ids[0]) s = 0;                      // <think>: thinking
-                else if (t == req_seg_ids[1]) s = 1;                 // </think>: prose
-                else if (t == req_seg_ids[2] && seg_now != 0) s = seg_now == 2 ? 1 : 2;   // a code fence opens or closes code
+                else if (t == req_seg_ids[1]) s = req_ans;           // </think>: the answer, of the kind the request declared
                 if (s != seg_now) { seg_now = s; strata::kernels::route_cfg_set_segment(s); }
             };
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
