@@ -8210,6 +8210,36 @@ int main(int argc, char** argv) {
             strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size());   // what the unmasked router wanted (13.20)
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             ++swap_round;
+            // STRATA_RESIDENCY_FILE=<path> (the server sets it for the Monitor's residency view): at most every 2 s, one JSON snapshot of which experts
+            // are in VRAM - a character per expert, 0 not resident, 1 resident and cold (decayed use < 1), 2 warm (< 4), 3 hot - written aside and renamed
+            static const char* res_file = std::getenv("STRATA_RESIDENCY_FILE");
+            static Clock::time_point res_last = Clock::now() - std::chrono::hours(1);
+            if (res_file != nullptr && res_file[0] != '\0' && Clock::now() - res_last >= std::chrono::seconds(2)) {
+                res_last = Clock::now();
+                std::string js = "{\"v\":1,\"time\":" + std::to_string((long long) std::time(nullptr)) + ",\"layers\":" + std::to_string((long long) g.n_layers) +
+                                 ",\"experts\":" + std::to_string((long long) g.n_expert) + ",\"round\":" + std::to_string((long long) life_rounds) +
+                                 ",\"swaps\":" + std::to_string((long long) life_swaps) + ",\"quality_swaps\":" + std::to_string((long long) life_quality) + ",\"rows\":[";
+                int64_t n_res = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    js += l ? ",\"" : "\"";
+                    const float* uu = drive.d.usage.data() + l * g.n_expert;
+                    const int32_t* rr = host_res.data() + l * g.n_expert;
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        const bool in = rr[e] >= 0;
+                        n_res += in;
+                        js += !in ? '0' : uu[e] < 1.0f ? '1' : uu[e] < 4.0f ? '2' : '3';
+                    }
+                    js += '"';
+                }
+                js += "],\"resident\":" + std::to_string((long long) n_res) + "}";
+                const std::string tmp = std::string(res_file) + ".tmp";
+                {
+                    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+                    f << js;
+                }
+                std::error_code ec;
+                std::filesystem::rename(tmp, res_file, ec);
+            }
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;

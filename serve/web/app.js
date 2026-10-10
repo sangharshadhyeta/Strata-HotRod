@@ -192,6 +192,7 @@ function render(m) {
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderResidency(m.residency);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -201,6 +202,36 @@ function since(t) {
   if (!t) return "";
   const s = Math.max(0, Date.now() / 1000 - t);
   return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
+}
+// the experts held in VRAM, from the engine's swap round: rows[layer][expert] is '0' not resident, '1' resident and idle, '2' used, '3' hot
+function renderResidency(r) {
+  const card = $("res-card");
+  card.hidden = !r;
+  if (!r) return;                                  // an older engine, or no swap round yet
+  const canvas = $("res-canvas"), n = r.experts, rows = r.rows;
+  if (canvas.width !== n || canvas.height !== rows.length) { canvas.width = n; canvas.height = rows.length; }
+  const css = getComputedStyle(document.documentElement);
+  const tone = (name, fallback) => {                // "#rrggbb" of a token, drawn into an ImageData
+    const v = css.getPropertyValue(name).trim();
+    const m = /^#([0-9a-f]{6})$/i.exec(v) || /^#([0-9a-f]{6})$/i.exec(fallback);
+    const x = parseInt(m[1], 16);
+    return [(x >> 16) & 255, (x >> 8) & 255, x & 255];
+  };
+  const bg = tone("--st-surface-2", "#f7f7f7"), acc = tone("--st-accent", "#10b981"), hot = tone("--st-accent-hover", "#0c8a60");
+  const surf = tone("--st-surface", "#ffffff");
+  const idle = acc.map((c, i) => Math.round(0.28 * c + 0.72 * surf[i]));
+  const colors = [bg, idle, acc, hot];
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(n, rows.length);
+  rows.forEach((row, y) => {
+    for (let x = 0; x < n; x++) {
+      const c = colors[row.charCodeAt(x) - 48] || bg, o = (y * n + x) * 4;
+      img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
+    }
+  });
+  ctx.putImageData(img, 0, 0);
+  const total = r.layers * r.experts;
+  $("res-sum").textContent = `${fmt(r.resident)} of ${fmt(total)} experts · ${fmt(r.swaps)} swaps in ${fmt(r.round)} rounds${r.quality_swaps ? ` (${fmt(r.quality_swaps)} for quality)` : ""}`;
 }
 function renderConvCache(c) {
   $("cc-card").hidden = !c;

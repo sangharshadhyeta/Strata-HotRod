@@ -126,6 +126,16 @@
         </div>
       </div>
 
+      <div class="st-card res-card" id="res-card" hidden>
+        <div class="req-head"><span class="card-title">Experts in VRAM</span><span class="muted small" id="res-sum"></span></div>
+        <canvas class="res-canvas" id="res-canvas" role="img" aria-label="Map of the experts held in GPU memory, one row per layer, one cell per expert"></canvas>
+        <div class="res-legend" aria-hidden="true">
+          <span><i class="res-sw res-sw--0"></i>not in VRAM</span><span><i class="res-sw res-sw--1"></i>resident, idle</span>
+          <span><i class="res-sw res-sw--2"></i>resident, used</span><span><i class="res-sw res-sw--3"></i>resident, hot</span>
+        </div>
+        <p class="muted small res-note">One row per layer (top is the first), one cell per expert. The engine refreshes the map every couple of seconds while it swaps experts in and out.</p>
+      </div>
+
       <div class="st-card cc-card" id="cc-card">
         <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
         <div class="cc-bars" id="cc-bars" hidden>

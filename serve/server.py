@@ -2486,6 +2486,24 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None) -> list[int]:
     return out
 
 
+RESIDENCY_FILE = os.path.join(tempfile.gettempdir(), f"strata-residency-{os.getpid()}.json")
+
+
+def residency_view(max_age_s: float = 30.0) -> dict | None:
+    """/metrics: which experts are in VRAM (a layer-by-expert map the engine's swap round writes every couple of seconds
+    to STRATA_RESIDENCY_FILE); None when the engine has not written one (an older engine, or nothing swapped yet) or
+    the file is stale."""
+    try:
+        st = os.stat(RESIDENCY_FILE)
+        if time.time() - st.st_mtime > max_age_s:
+            return None
+        with open(RESIDENCY_FILE, "rb") as f:
+            d = json.loads(f.read())
+        return d if isinstance(d, dict) and d.get("v") == 1 and isinstance(d.get("rows"), list) else None
+    except (OSError, ValueError):
+        return None
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -2497,6 +2515,7 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
+    env.setdefault("STRATA_RESIDENCY_FILE", RESIDENCY_FILE)   # the engine's expert map for the Monitor (residency_view)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -3258,7 +3277,7 @@ class Service:
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "conversation_cache": conversation_cache_view(engine, hist, totals, parked), "residency": residency_view(),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
