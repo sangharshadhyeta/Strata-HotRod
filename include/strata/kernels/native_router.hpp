@@ -1,4 +1,6 @@
 #pragma once
+#include <algorithm>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 
@@ -28,10 +30,12 @@ struct RouteCfg {
     int32_t hi;
     float margin;
     float edge;
+    float repl_gap;    ///< SWAP2: only a replaced pick whose stand-in is at least this many logits below it is counted for a quality swap (0 = every one)
+    float want_lo;     ///< the demand counter's weight for a pick the floor replaces (rank >= lo); a pick below the floor counts 1 (default 1)
     int32_t maxrank;   ///< a stand-in must sit within this many places of the router's own ranking of all 512 experts (0 = any)
     float bias;   ///< CCE router bias: ln(1 + beta) added to a resident expert's logit before the top-10 (0 = off)
 };
-void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, int maxrank = 0);   ///< before graph capture
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, int maxrank = 0, float want_lo = 1.f, float repl_gap = 0.f);   ///< before graph capture
 void route_cfg_set_floor(int lo);                                ///< between windows
 const RouteCfg* route_cfg_device();
 /// STRATA_ROUTE_RESIDENT: swap non-resident picks of the segment's floor ranks for resident ones within the margin (see the .cu).
@@ -40,7 +44,21 @@ const RouteCfg* route_cfg_device();
 /// before any swap. Needs route_cfg_init first.
 /// `rows` is nullptr or the layer's [8 rows][10] slice of the per-row record (route_rows_layer): the same original picks per window row.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr);
+                           unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr);
+/// SWAP2 (STRATA_SWAP2_MAX > 0): the experts stand-ins replaced, counted per (layer, expert) on the device (route_repl_layer is the layer's slice);
+/// route_repl_drain adds them to a host array and clears them.  The swap round may bring the most replaced ones into slots nothing needs.
+inline int route_swap2_max() {
+    static const int v = [] { const char* e = std::getenv("STRATA_SWAP2_MAX"); return e != nullptr ? std::max(0, std::atoi(e)) : 2; }();
+    return v;
+}
+inline float route_swap2_gap() {
+    static const float v = [] { const char* e = std::getenv("STRATA_SWAP2_GAP"); return e != nullptr ? std::max(0.0f, (float) std::atof(e)) : 1.0f; }();
+    return v;
+}
+void route_repl_alloc(size_t n);
+float* route_repl_layer(int64_t layer, int64_t n_expert);
+bool route_repl_active();
+void route_repl_drain(float* usage2, size_t n);
 /// SPEC 13.40 (STRATA_COUNT_KEPT=1): the per-row record of the router's original top-10, so the swap round counts only the rows of a
 /// window whose input token was kept (rows 0..a after a accepted drafts).  `route_rows_apply(kept, ...)` adds those rows' picks to the
 /// host usage table after the acceptance is known; with this on the atomic count (`want`) is not used.
