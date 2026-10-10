@@ -22,7 +22,10 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
 /// `want` is nullptr or the layer's slice of the wanted-expert counter (route_want_layer): the router's own top-10, counted
 /// before any swap.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
-                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream, float* want = nullptr);
+                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream, float* want = nullptr,
+                           float edge = -1.0f);
+/// `edge` >= 0 makes the floor fractional: the rank below `rank_lo` is replaced too, but only by a substitute whose score is
+/// within `edge` logits of its own (a floor of 1.5 is rank_lo 2 with an edge margin on rank 1). -1 = off.
 /// The wanted-expert counter: what the unmasked router picked, for the swap round (a router confined to resident experts
 /// cannot tell the swap round which expert to bring in). Allocated once (outside graph capture), n_layers * n_expert floats.
 void route_want_alloc(size_t n);

@@ -187,7 +187,7 @@ static unsigned long long* g_detail = nullptr;   // the decode rows' detail coun
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, float margin, int lo, int hi,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
-                                 unsigned long long* __restrict__ detail) {
+                                 unsigned long long* __restrict__ detail, float edge) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
     const float* l = logits + (size_t) t * 512;
@@ -215,7 +215,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         for (int r = 0; r < 10; ++r) atomicAdd(want + id[r], 1.0f);
     int swaps = 0, tail = 0, before = 0;
     for (int r = 0; r < 10; ++r) before += res[id[r]] < 0;
-    for (int r = lo; r <= hi && r < 10; ++r) {
+    for (int r = (edge >= 0.f && lo > 0) ? lo - 1 : lo; r <= hi && r < 10; ++r) {
         const int e = id[r];
         if (res[e] >= 0) continue;
         ++tail;
@@ -227,7 +227,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             for (int q = 0; q < 10; ++q) used |= id[q] == f;
             if (!used) { best = f; bl = l[f]; }
         }
-        if (best >= 0 && l[e] - bl <= margin) {
+        // the edge rank (lo - 1, a fractional floor such as 1.5) is replaced only by a close substitute (within `edge`)
+        if (best >= 0 && l[e] - bl <= (r < lo ? edge : margin)) {
             if (detail != nullptr) {
                 // what was replaced and by what (per replacement): the weight of the replaced pick, the substitute's place in
                 // the router's own ranking of all 512 experts, and the score gap to it
@@ -263,10 +264,10 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     }
 }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
-                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream, float* want) {
+                           int rank_lo, int rank_hi, unsigned long long* stats, void* stream, float* want, float edge) {
     if (!stream || n_tok < 1 || !res_layer) throw std::invalid_argument("native_route_resident: bad arguments");
     route_resident_k<<<(unsigned) ((n_tok + 31) / 32), 32, 0, static_cast<cudaStream_t>(stream)>>>(
-        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats, want, n_tok <= 8 ? g_detail : nullptr);
+        logits, ids, weights, res_layer, n_tok, margin, rank_lo, rank_hi, stats, want, n_tok <= 8 ? g_detail : nullptr, edge);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

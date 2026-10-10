@@ -21,15 +21,17 @@ n_he = int(os.environ.get("BENCH_N_HE", len(sets["humaneval"])))
 THINK = os.environ.get("BENCH_THINK") == "1"   # the model thinks (inside <think>) before it answers: the reasoning task, scored on the final answer
 
 
-def ask(prompt, max_tokens):
-    body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens * (4 if THINK else 1), "temperature": 0,
-            "stream": False}
+NO_CAP = 30000   # no limit on an answer's length except the context window (32,768 tokens): the user's rule, an answer ends when the model ends it
+
+
+def ask(prompt, max_tokens=None):
+    body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": NO_CAP, "temperature": 0, "stream": False}
     if not THINK:
         body.update({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}})
     req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=1800) as r:
+    with urllib.request.urlopen(req, timeout=3600) as r:
         d = json.loads(r.read())
     return d["choices"][0]["message"]["content"] or "", (d.get("usage") or {}).get("completion_tokens", 0), time.time() - t0
 

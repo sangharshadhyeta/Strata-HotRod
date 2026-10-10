@@ -71,6 +71,7 @@ struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
     bool count = false;   ///< decode windows count the router's own top-10 on the device (route_want_*)
+    float edge = -1.0f;   ///< STRATA_ROUTE_RESIDENT_EDGE=<logits>: the rank below `lo` is replaced only by a close substitute
     unsigned long long* d_stats = nullptr;
     unsigned long long* stats() {
         if (d_stats == nullptr && margin > 0.0f) {
@@ -102,6 +103,9 @@ RouteResidentCfg& route_resident_cfg() {
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &r.lo, &r.hi);
         // STRATA_ROUTE_RESIDENT_COUNT=1|0: count what the unmasked router wanted (decode windows) for the swap round
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_COUNT")) r.count = std::atoi(v) != 0;
+        // a fractional floor: STRATA_ROUTE_RESIDENT_RANKS=2-9 with STRATA_ROUTE_RESIDENT_EDGE=1 is "floor 1.5" (rank 1 is
+        // replaced only by a substitute within 1 logit of it)
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) r.edge = (float) std::atof(v);
         return r;
     }();
     return c;
@@ -426,8 +430,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_TRACE_ADAPT") != nullptr)
         strata::kernels::route_detail_alloc();
     if (route_resident_cfg().margin > 0.0f)
-        std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, decode windows %s)\n",
-                     route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
+        std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, edge %g, decode windows %s)\n",
+                     route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().edge,
                      strata::kernels::route_want_active() ? "counted from the router's own top-10 for the swap round" : "counted as routed");
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
@@ -1339,7 +1343,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
                                       route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
                                       route_resident_cfg().stats() + (n <= 8 ? 4 : 0), cs,
-                                      n <= 8 ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr);
+                                      n <= 8 ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr,
+                                      route_resident_cfg().edge);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (ar_on()) {
