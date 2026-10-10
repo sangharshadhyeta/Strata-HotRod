@@ -73,7 +73,9 @@ def io_lines(text):
     return rows
 
 
-MEMORY_CAP_GB = 24            # the server's memory cap (page cache included), no swap
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+REPEATS = os.environ.get("AB_REPEATS", "3")   # timed requests per prompt kind (AB_REPEATS=1 for a short, watched first run)
+MEMORY_CAP_GB = int(os.environ.get("AB_CAP_GB", "24"))   # the server's memory cap (page cache included), no swap; the soft limit is 1 GB under
 MIN_AVAILABLE_MB = 1500       # stop the arm when less RAM than this is available
 MAX_SWAP_GROWTH_MB = 1500     # or when the swap in use has grown by more than this since the arm began
 VMSTAT_KEYS =("pswpin", "pswpout", "pgmajfault", "compact_stall", "compact_fail", "thp_fault_fallback")
@@ -116,10 +118,13 @@ def run_arm(name, env_extra, cfg, log, port):
     # The server runs in its own memory-capped systemd scope with NO swap (10 Oct 2026: two uncapped runs froze this 31 GB box
     # and it had to be hard-reset): past the cap the kernel kills the server, not the machine. MEMORY_CAP_GB leaves the rest of
     # the system (the shell, the editor, the kernel) about 7 GB.
-    cap = ["systemd-run", "--scope", "--quiet", "-p", f"MemoryMax={MEMORY_CAP_GB}G", "-p", f"MemoryHigh={MEMORY_CAP_GB - 2}G",
-           "-p", "MemorySwapMax=0"]
+    unit = f"strata-ab-{name}-{int(time.time())}"
+    cap = ["systemd-run", "--scope", "--quiet", f"--unit={unit}", "-p", f"MemoryMax={MEMORY_CAP_GB}G",
+           "-p", f"MemoryHigh={MEMORY_CAP_GB - 1}G", "-p", "MemorySwapMax=0"]
     srv = subprocess.Popen(cap + [ROOT + "/.venv/bin/python", ROOT + "/serve/server.py", "--engine", "strata", "--config", cfg, "--port", str(port)],
                            cwd=ROOT, env=env, stdout=open("/root/.claude/jobs/743230e4/tmp/strata_ab_server.out", "w"), stderr=subprocess.STDOUT)
+    from memtrace import MemTrace   # where the memory goes, once a second (tools/linkbench/memtrace.py)
+    trace = MemTrace(unit, srv.pid, f"/root/.claude/jobs/743230e4/tmp/memtrace_{name}.csv").start()
     # Memory guard (10 Oct 2026: a run on this 31 GB box thrashed swap until the machine hung and was reset): if the RAM left
     # or the swap grown crosses a line at any moment of the arm, the server is stopped at once and the arm is void.
     guard = {"tripped": None, "done": False}
@@ -142,20 +147,25 @@ def run_arm(name, env_extra, cfg, log, port):
     while time.time() - t0 < 900 and not health(port).get("loaded"):
         if srv.poll() is not None:
             guard["done"] = True
-            return {"arm": name, "error": "server died while loading", "memory_guard": guard["tripped"]}
+            trace.stop()
+            return {"arm": name, "error": "server died while loading", "memory_guard": guard["tripped"], "memtrace": trace.peaks()}
         time.sleep(5)
     if not health(port).get("loaded"):
         guard["done"] = True
         stop(srv.pid)
-        return {"arm": name, "error": "not loaded in 15 minutes", "memory_guard": guard["tripped"]}
+        trace.stop()
+        return {"arm": name, "error": "not loaded in 15 minutes", "memory_guard": guard["tripped"], "memtrace": trace.peaks()}
     load_s = time.time() - t0
-    p = subprocess.run([sys.executable, TPS, f"http://127.0.0.1:{port}", name, "3", "256"], capture_output=True, text=True)
+    p = subprocess.run([sys.executable, TPS, f"http://127.0.0.1:{port}", name, REPEATS, "256"], capture_output=True, text=True)
     guard["done"] = True
     watcher.join(timeout=30)
     if guard["tripped"] is None:
         stop(srv.pid)
     else:
-        return {"arm": name, "error": "void: memory guard tripped", "memory_guard": guard["tripped"]}
+        trace.stop()
+        return {"arm": name, "error": "void: memory guard tripped", "memory_guard": guard["tripped"], "memtrace": trace.peaks()}
+    trace.stop()
+    oom_events = trace.peaks().get("events_at_end", {})
     with open(log, "rb") as f:
         f.seek(start_size)
         logtext = f.read().decode("utf-8", "replace")
@@ -173,7 +183,7 @@ def run_arm(name, env_extra, cfg, log, port):
     kernel["swap_used_mb_before"] = swap_used0
     kernel["swap_used_mb_after"] = meminfo_mb("SwapTotal") - meminfo_mb("SwapFree")
     return {"arm": name, "env": env_extra, "engine_sha": engine_sha, "prefetch_on": "file tier io prefetch ON" in logtext,
-            "kernel_during_arm": kernel, "files_dropped": dropped, "load_s": round(load_s), "decode_tok_s": kinds,
+            "memtrace": trace.peaks(), "kernel_during_arm": kernel, "files_dropped": dropped, "load_s": round(load_s), "decode_tok_s": kinds,
             "median_all": allr[len(allr) // 2] if allr else None, "tokens_timed": tokens,
             "requests_logged": len(rows), "os_read_mb": round(sum(r[0] for r in rows), 1), "expert_read_mb": round(sum(r[2] for r in rows), 1),
             "major_faults": sum(r[1] for r in rows),

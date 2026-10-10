@@ -1075,3 +1075,22 @@ Read only; nothing is implemented yet.
 - With every miss covered there is no expert for the CPU pool to compute; the CPU path and the PCIe share of 13.2d disappear for routed experts, and the per-layer floor of 10 residents (13.21) must hold at all times, including during a swap round (swaps are exchanges).
 - Risks to test (T4, T14): quality at reasoning length, the drafter's acceptance under stand-ins (the draft layer has its own 512 experts, resident), and the windows of 4 rows (verify windows route several tokens through the same mask).
 
+### 15.2 The memory incident of 10 Oct 2026 and the capped testbed
+
+What happened: two runs of the interleaved A/B (the fork's new default, then the old page-fault path) froze this 31 GB machine and it was hard-reset twice (about 06:09 and 06:20). Evidence: the last system-log lines before the first reset are the power key ("Powering off") after the terminal host had already failed; XFS journal recovery on every filesystem at boot; no kernel OOM-kill lines and no hardware, storage or machine-check errors in `/var/log/messages`; the failed run's own log showed threads stuck on the drive, a 14.5 s GPU wait, and about 3.7 GB swapped out and 1.8 GB swapped in within one arm. So: a thrash and hang, not an orderly OOM kill. The cause is inferred, not observed.
+
+Trace of a capped run (`tools/linkbench/memtrace.py`, one row a second, the server in a `systemd-run` scope with a hard cap and no swap):
+- The engine's own anonymous memory peaks at 1.9 to 2.6 GB. Nothing is locked or pinned. The scope's size is file cache of the memory-mapped model (20 to 22 GB of the 22.5 to 24.6 GB). The engine's resident set (13 to 19 GB) is mostly mapped model pages.
+- So an uncapped run lets the file cache grow into all of RAM (28 GB in the earlier runs) and squeezes everything else, with swap traffic on the SATA drive (swappiness is 10, swap is 16 GB on the slow SATA SSD). The cap confines that: swap stayed at 0, nothing was swapped in or out anywhere, and the rest of the machine kept 1.9 to 3.9 GB truly free.
+- The price is speed. The model's working set wants about 28 GB of cache; at a cap of 24 GB the drive is read for about 314 MB per token, at 25 GB about 295 MB (uncapped, 80 MB).
+
+Capped testbed, measured (one request per prompt kind, so only direction is reliable):
+
+| Arm (cap 25 GB, no swap) | tok/s code / reasoning / prose | median | drive MB per token | major faults | least free memory |
+|---|---|---:|---:|---:|---:|
+| Staged reads (the fork's default) | 10.7 / 11.4 / 13.7 | 11.4 | 295 | 43,896 | 1.9 GB |
+| Page-fault path (`STRATA_IO_PREFETCH=0`) | 8.6 / 8.4 / 11.6 | 8.6 | 454 | 220,942 | 2.2 GB |
+| Staged reads, cap 24 GB | 10.5 / 10.2 / 12.8 | 10.5 | 314 | 48,293 | 3.9 GB |
+
+Result: under the same safe cap staging is about 33% faster and reads 35% less from the drive than the page-fault path, in all three prompt kinds. This reproduces T1's direction (T1 itself: 17.0 / 17.1 to 27.2 / 27.5 uncapped) at a lower speed. From here every measurement is taken inside the cap (`AB_CAP_GB`, default 24; 25 for the arms above) and compared with these numbers, not with the uncapped ones: a change has to show up where the file cache is short, which is what the stand-in and tiering work targets.
+
