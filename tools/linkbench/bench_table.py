@@ -10,15 +10,17 @@ T = "/root/.claude/jobs/743230e4/tmp"
 SPEC = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "SPEC.md")
 START, END = "<!-- BENCH-TABLE-START -->", "<!-- BENCH-TABLE-END -->"
 # arm, what it replaces (ranks lo-9 are replaced, with the router's top picks 0..lo-1 exact; "edge" = a fractional floor)
-ARMS = [("BC", "control (nothing replaced)"), ("B2", "ranks 2-9"), ("B15", "2-9 plus rank 1 only by a close substitute (floor 1.5)"),
-        ("B1", "ranks 1-9"), ("B05", "1-9 plus rank 0 only by a close substitute (floor 0.5)"), ("B0", "ranks 0-9"),
-        ("B3", "ranks 3-9"), ("B4", "ranks 4-9"), ("B5", "ranks 5-9"), ("B6", "ranks 6-9"), ("B7", "ranks 7-9"),
-        ("B8", "ranks 8-9"), ("B9", "rank 9 only"), ("BC2", "control, second copy (the noise floor)")]
+ARMS = [("BC", "control (nothing replaced)"), ("B2", "ranks 2-9"),
+        ("E1", "2-9, rank 1 only by a substitute within 1 logit (the edge, margin 1)"),
+        ("E2", "2-9, rank 1 only within 2 logits (edge margin 2)"), ("E4", "2-9, rank 1 only within 4 logits (edge margin 4)"),
+        ("B1", "ranks 1-9 (rank 1 at any distance)"), ("BC2", "control, second copy (the noise floor)"), ("B0", "ranks 0-9"),
+        ("B6", "ranks 6-9"), ("B4", "ranks 4-9"), ("B9", "rank 9 only"), ("B8", "ranks 8-9"), ("B7", "ranks 7-9"),
+        ("B5", "ranks 5-9"), ("B3", "ranks 3-9")]
 done = {}
-p = f"{T}/ab_result_bench.json"
-if os.path.exists(p):
-    for d in json.load(open(p)):
-        done[d["arm"]] = d
+for p in (f"{T}/ab_result_bench.json", f"{T}/ab_result_bench2.json"):
+    if os.path.exists(p):
+        for d in json.load(open(p)):
+            done[d["arm"]] = d
 rows = ["| Arm | Replaced | GSM8K correct | HumanEval pass | Answer tok/s (prompt time included) | Longest answer (tokens) | State |",
         "|---|---|---:|---:|---:|---:|---|"]
 for arm, what in ARMS:

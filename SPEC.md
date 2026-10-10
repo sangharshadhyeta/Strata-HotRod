@@ -1166,3 +1166,15 @@ GSM8K (the first 50 of a fixed 100-question sample, ground-truth number) and Hum
 
 Reading notes (answers read per arm): none yet.
 
+## 19. Queued for later (user, 2026-10-10): the swap budget, and what the links allow
+
+Nothing here has been run; the figures marked "worked out" are arithmetic from measured link rates, not measurements.
+
+- **What can be set.** `--adapt-swaps N` (default 96), `--adapt-every N` windows (default 4) and `--adapt-decay` (default 0.7) are flags, so they go in the `args` of the config JSON and need no rebuild. Two constants are written into the swap rule in `src/program/generate.cpp` and are not flags: a candidate needs a count of at least 2.0, and must beat the victim by at least 1.5. They would need a code edit and stay as they are for now.
+- **Why the budget is worth testing.** The trace of T21 / T22 showed every round using its full 96 swaps with more than a thousand candidates waiting, so the budget is binding, not spare.
+- **What the links allow (measured: pinned RAM to VRAM 24.2 GB/s, one round of 96 x 2 MiB in 8.3 ms; NVMe 3.57 GB/s; section 13.55).** Worked out for a round of about 270 to 390 ms: from pinned RAM over PCIe about 3,000 to 4,500 experts of 2 MiB per round, so PCIe is not the limit and the 2,721 GPU cache slots are; from the NVMe about 500 to 700 per round if nothing else used the drive. In the control arms the misses already read about 100 MB per token at 20 to 28 tok/s, about 2 to 3.5 GB/s, nearly the whole drive; that leaves about 0.5 to 1 GB/s for swaps, about 100 to 250 experts per round, so 96 is already near a sensible budget for drive-sourced swaps, and raising it blindly can lose speed.
+- **The tests, after the floor-edge sweep (SPEC 18), at the chosen floor (ranks 2-9 unless the sweep says otherwise).**
+  1. `--adapt-swaps` 48, 96, 192 and `--adapt-every` 2, 4, 8: nine short arms; tok/s, the engine's drive bytes per token, and a sample of the answers read.
+  2. The RAM-tier mode again, WITHOUT the memory throttle (`--resident-experts`, AB_NO_HIGH=1): T17 failed under the throttled scope, which was a testbed artefact (T18). In that mode swaps come over PCIe from pinned RAM (22.5 GiB of the roughly 83 GB model), where a much larger swap budget is affordable; try it with `--adapt-swaps` 192 and 384.
+  3. Only if 1 or 2 shows a gain: the two constants.
+
