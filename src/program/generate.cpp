@@ -7533,6 +7533,14 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, " L%d %.3f (%d resident)", unmet[unmet.size() - 1 - k].second, unmet[unmet.size() - 1 - k].first,
                                          nres[(size_t) unmet[unmet.size() - 1 - k].second]);
                         std::fprintf(stderr, "\n");
+                        // every layer, for tools/layer_budget_profile.py: the unmet share x1000 and the resident count, layer 0 first
+                        std::vector<double> by_layer((size_t) g.n_layers, -1.0);
+                        for (const auto& up : unmet) by_layer[(size_t) up.second] = up.first;
+                        std::fprintf(stderr, "strata serve: LAYERVEC unmet_permille");
+                        for (int64_t l = 0; l < g.n_layers; ++l) std::fprintf(stderr, " %d", (int) std::lround(by_layer[(size_t) l] * 1000.0));
+                        std::fprintf(stderr, " | resident");
+                        for (int64_t l = 0; l < g.n_layers; ++l) std::fprintf(stderr, " %d", nres[(size_t) l]);
+                        std::fprintf(stderr, "\n");
                     }
                 }
                 if (rounds_seen % 5 == 0) {
