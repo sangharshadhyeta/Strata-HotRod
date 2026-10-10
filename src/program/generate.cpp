@@ -4174,16 +4174,22 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: the file tier reads through the file cache (STRATA_UNBUFFERED_LOAD=%s "
                                  "ignored: without --resident-budget-gib the file cache holds the experts)\n", env);
         }
-        // Linux I/O path (opt in): whole-blob preads instead of page faults, and the predicted experts of the next
-        // layers read ahead on I/O threads while the current layer computes (see FileExpertSource::set_io_prefetch)
-        if (const char* v = std::getenv("STRATA_IO_PREFETCH"); v != nullptr && std::atoi(v) != 0) {
+        // Linux I/O path: whole-blob preads instead of page faults, and the predicted experts of the next
+        // layers read ahead on I/O threads while the current layer computes (see FileExpertSource::set_io_prefetch).
+        // solid-wins fork: ON by default where it is available (SPEC.md T1, RTX 3060 with 32 GB, IQ3_S: 17.0 -> 27.2
+        // tokens/s, drive reads per token 150 -> 80 MB; the docs measured -32.6% for the staging variant at 16 GB).
+        // STRATA_IO_PREFETCH=0 restores the page-fault path.
+        const char* pf_env = std::getenv("STRATA_IO_PREFETCH");
+        const bool pf_asked = pf_env != nullptr && std::atoi(pf_env) != 0;
+        if (pf_asked || pf_env == nullptr) {
             const char* th = std::getenv("STRATA_IO_PF_THREADS");
             src.set_io_prefetch(true, th != nullptr ? std::atoi(th) : 0);
             if (src.io_prefetch())
-                std::fprintf(stderr, "strata generate: file tier io prefetch ON (STRATA_IO_PREFETCH=1): whole-blob preads, "
+                std::fprintf(stderr, "strata generate: file tier io prefetch ON (%s): whole-blob preads, "
                                      "the layer's uncached experts and the predicted ones read by %s I/O threads (STRATA_IO_PF_THREADS, default 8)\n",
+                             pf_asked ? "STRATA_IO_PREFETCH=1" : "default in this fork; STRATA_IO_PREFETCH=0 turns it off",
                              th != nullptr ? th : "8");
-            else
+            else if (pf_asked)
                 std::fprintf(stderr, "strata generate: STRATA_IO_PREFETCH=1 is not available here (Linux mapped file tier "
                                      "only, not with unbuffered reads); the file tier reads as before\n");
             if (src.io_prefetch()) {   // recommend, never force: the engine runs as asked

@@ -73,24 +73,89 @@ def io_lines(text):
     return rows
 
 
+MEMORY_CAP_GB = 24            # the server's memory cap (page cache included), no swap
+MIN_AVAILABLE_MB = 1500       # stop the arm when less RAM than this is available
+MAX_SWAP_GROWTH_MB = 1500     # or when the swap in use has grown by more than this since the arm began
+VMSTAT_KEYS =("pswpin", "pswpout", "pgmajfault", "compact_stall", "compact_fail", "thp_fault_fallback")
+
+
+def vmstat():
+    out = {}
+    for line in open("/proc/vmstat"):
+        k, _, v = line.partition(" ")
+        if k in VMSTAT_KEYS:
+            out[k] = int(v)
+    return out
+
+
+def meminfo_mb(key):
+    for line in open("/proc/meminfo"):
+        if line.startswith(key + ":"):
+            return int(line.split()[1]) // 1024
+    return None
+
+
+def sha_of(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 22), b""):
+            h.update(b)
+    return h.hexdigest()[:16]
+
+
 def run_arm(name, env_extra, cfg, log, port):
+    engine = json.load(open(cfg)).get("exe", "")
+    engine_sha = sha_of(engine) if engine and os.path.exists(engine) else None
     dropped = drop_cache()
+    vm0 = vmstat()
+    swap_used0 = meminfo_mb("SwapTotal") - meminfo_mb("SwapFree")
     start_size = os.path.getsize(log) if os.path.exists(log) else 0
     env = dict(os.environ)
     env.update(env_extra)
-    srv = subprocess.Popen([ROOT + "/.venv/bin/python", ROOT + "/serve/server.py", "--engine", "strata", "--config", cfg, "--port", str(port)],
+    # The server runs in its own memory-capped systemd scope with NO swap (10 Oct 2026: two uncapped runs froze this 31 GB box
+    # and it had to be hard-reset): past the cap the kernel kills the server, not the machine. MEMORY_CAP_GB leaves the rest of
+    # the system (the shell, the editor, the kernel) about 7 GB.
+    cap = ["systemd-run", "--scope", "--quiet", "-p", f"MemoryMax={MEMORY_CAP_GB}G", "-p", f"MemoryHigh={MEMORY_CAP_GB - 2}G",
+           "-p", "MemorySwapMax=0"]
+    srv = subprocess.Popen(cap + [ROOT + "/.venv/bin/python", ROOT + "/serve/server.py", "--engine", "strata", "--config", cfg, "--port", str(port)],
                            cwd=ROOT, env=env, stdout=open("/root/.claude/jobs/743230e4/tmp/strata_ab_server.out", "w"), stderr=subprocess.STDOUT)
+    # Memory guard (10 Oct 2026: a run on this 31 GB box thrashed swap until the machine hung and was reset): if the RAM left
+    # or the swap grown crosses a line at any moment of the arm, the server is stopped at once and the arm is void.
+    guard = {"tripped": None, "done": False}
+
+    def watch():
+        while not guard["done"]:
+            avail = meminfo_mb("MemAvailable")
+            grown = (meminfo_mb("SwapTotal") - meminfo_mb("SwapFree")) - swap_used0
+            if avail < MIN_AVAILABLE_MB or grown > MAX_SWAP_GROWTH_MB:
+                guard["tripped"] = f"MemAvailable {avail} MB, swap grown {grown} MB"
+                print(f"MEMORY GUARD tripped in arm {name}: {guard['tripped']} - stopping the server", flush=True)
+                stop(srv.pid)
+                return
+            time.sleep(1)
+
+    import threading
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
     t0 = time.time()
     while time.time() - t0 < 900 and not health(port).get("loaded"):
         if srv.poll() is not None:
-            return {"arm": name, "error": "server died while loading"}
+            guard["done"] = True
+            return {"arm": name, "error": "server died while loading", "memory_guard": guard["tripped"]}
         time.sleep(5)
     if not health(port).get("loaded"):
+        guard["done"] = True
         stop(srv.pid)
-        return {"arm": name, "error": "not loaded in 15 minutes"}
+        return {"arm": name, "error": "not loaded in 15 minutes", "memory_guard": guard["tripped"]}
     load_s = time.time() - t0
     p = subprocess.run([sys.executable, TPS, f"http://127.0.0.1:{port}", name, "3", "256"], capture_output=True, text=True)
-    stop(srv.pid)
+    guard["done"] = True
+    watcher.join(timeout=30)
+    if guard["tripped"] is None:
+        stop(srv.pid)
+    else:
+        return {"arm": name, "error": "void: memory guard tripped", "memory_guard": guard["tripped"]}
     with open(log, "rb") as f:
         f.seek(start_size)
         logtext = f.read().decode("utf-8", "replace")
@@ -103,7 +168,12 @@ def run_arm(name, env_extra, cfg, log, port):
             tokens += sum(int(x) for x in line.split("(tokens [")[1].split("]")[0].replace(",", " ").split())
     rows = io_lines(logtext)
     allr = sorted(x for v in kinds.values() for x in v)
-    return {"arm": name, "env": env_extra, "files_dropped": dropped, "load_s": round(load_s), "decode_tok_s": kinds,
+    vm1 = vmstat()
+    kernel = {k: vm1[k] - vm0[k] for k in vm1}
+    kernel["swap_used_mb_before"] = swap_used0
+    kernel["swap_used_mb_after"] = meminfo_mb("SwapTotal") - meminfo_mb("SwapFree")
+    return {"arm": name, "env": env_extra, "engine_sha": engine_sha, "prefetch_on": "file tier io prefetch ON" in logtext,
+            "kernel_during_arm": kernel, "files_dropped": dropped, "load_s": round(load_s), "decode_tok_s": kinds,
             "median_all": allr[len(allr) // 2] if allr else None, "tokens_timed": tokens,
             "requests_logged": len(rows), "os_read_mb": round(sum(r[0] for r in rows), 1), "expert_read_mb": round(sum(r[2] for r in rows), 1),
             "major_faults": sum(r[1] for r in rows),

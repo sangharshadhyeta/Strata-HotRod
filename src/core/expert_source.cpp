@@ -580,9 +580,12 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     io_threads_ = threads > 0 ? threads : 8;
     if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::atoi(v) != 0;
-    {   // experts.bin: fill the page cache from the workers and let the kernels read the mapping (STRATA_IO_PF_STAGE=1: stage)
+    {   // experts.bin: fill the page cache from the workers and let the kernels read the mapping; otherwise stage.
+        // solid-wins fork: staging is the DEFAULT (SPEC.md T1 measured the staged variant; the fill variant was not
+        // measured on this box). STRATA_IO_PF_STAGE=0 selects the fill variant.
         const char* v = std::getenv("STRATA_IO_PF_STAGE");
-        io_fill_ = role_ptr_.empty() && !(v != nullptr && std::atoi(v) != 0);
+        const bool stage = v == nullptr || std::atoi(v) != 0;
+        io_fill_ = role_ptr_.empty() && !stage;
     }
     io_pf_ = true;
     io_stats_ = true;
