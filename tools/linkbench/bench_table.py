@@ -39,7 +39,10 @@ def log_split():
     started = re.findall(r"^=== arm (\w+)", open(f"{T}/ab_run_bench2.log").read(), re.M) if os.path.exists(f"{T}/ab_run_bench2.log") else []
     running = started[-1] if started and started[-1] not in chain2 else None
     # an arm that has just started has not served anything yet: its section holds no request lines, or does not exist at all
-    if running and sections and not req_re.search(sections[-1]):
+    # (the arm's own file appears with its first answered question: until then the last section is the last finished arm's)
+    if running and not os.path.exists(f"{T}/bench_{running}.json"):
+        running = None
+    elif running and sections and not req_re.search(sections[-1]):
         sections = sections[:-1]
         running = None
     end = len(sections) - (1 if running else 0)
