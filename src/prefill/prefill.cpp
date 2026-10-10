@@ -2015,6 +2015,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             (void) cudaGetLastError();
         }
     };
+    auto xcopy = [&](void* dst, const void* src, size_t bytes, cudaStream_t st) {
+        static const int fault_at = [] { const char* v = std::getenv("STRATA_PREFILL_FAULT_COPY"); return v ? std::max(0, std::atoi(v)) : 0; }();
+        static std::atomic<int> n_copy{0};
+        const bool inject = fault_at > 0 && n_copy.fetch_add(1) + 1 == fault_at;
+        if (inject) std::fprintf(stderr, "prefill: STRATA_PREFILL_FAULT_COPY=%d: this expert copy is made to fail (a test)\n", fault_at);
+        note_copy(cudaMemcpyAsync(inject ? nullptr : dst, src, bytes, cudaMemcpyHostToDevice, st));
+    };
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
@@ -2270,8 +2277,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const PeerPrefill::PsEntry& en = P.pseq[P.p_issued];
                 const size_t sl = P.p_issued % (size_t) P.RP;
                 if (P.plive[sl]) cudaStreamWaitEvent(P.s_cp, P.pused[sl], 0);
-                cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l),
-                                cudaMemcpyHostToDevice, P.s_cp);
+                xcopy(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l), P.s_cp);
                 cudaEventRecord(P.pcopied[sl], P.s_cp);
                 P.plive[sl] = 1;
                 ++P.p_issued;
@@ -2349,11 +2355,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                 if (en.job < 0) {
-                    note_copy(cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy));
+                    xcopy(m.stage_dev[sl], en.blob, bytes, m.copy);
                     ++stats_.experts_dma;
                 } else {
                     const uint8_t* hb = m.stager->wait(en.job);
-                    note_copy(cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy));
+                    xcopy(m.stage_dev[sl], hb, bytes, m.copy);
                     m.stager->issued_one(en.job, m.copy);
                 }
                 cudaEventRecord(m.copied[sl], m.copy);
@@ -2397,11 +2403,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                     if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                     if (en.job < 0) {
-                        note_copy(cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy));
+                        xcopy(m.stage_dev[sl], en.blob, bytes, m.copy);
                         ++iss_dma;
                     } else {
                         const uint8_t* hb = m.stager->wait(en.job);
-                        note_copy(cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy));
+                        xcopy(m.stage_dev[sl], hb, bytes, m.copy);
                         m.stager->issued_one(en.job, m.copy);
                     }
                     cudaEventRecord(m.copied[sl], m.copy);
@@ -3693,14 +3699,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                xcopy(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), m.copy);
                                 ++stats_.experts_dma;
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                                xcopy(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), m.copy);
                                 m.stager->issued_one(job_of[j], m.copy);
+                            }
+                            if (const int cb = copy_bad.load(); cb != 0) {
+                                err = std::string("prefill: an expert copy call failed: ") + cudaGetErrorString((cudaError_t) cb) + " (the prompt's experts are not trusted: the request stops)";
+                                return false;
                             }
                             cudaEventRecord(m.copied[sl], m.copy);
                             m.stage_live[sl] = true;

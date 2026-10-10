@@ -12112,6 +12112,19 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            // a low draft acceptance is a silent slowdown (solid.cpp's page: an MTP head drafting at 0.19 runs about 2x slower): said once, with its numbers and
+            // what to check.  Typical here 0.55 to 0.8; 300 drafts offered make the share a fair reading.
+            if (use_mtp && draft_offered >= 300) {
+                static bool said_low_acceptance = false;
+                const double acc = (double) draft_accepted / (double) draft_offered;
+                if (!said_low_acceptance && acc < 0.35) {
+                    said_low_acceptance = true;
+                    std::fprintf(stderr, "strata serve: WARNING: low draft acceptance: %lld of %lld drafts accepted (%.0f%%; typical here 55 to 80%%). Each rejected draft is a verified-and-thrown-away row, so the "
+                                         "speculative window can run slower than no drafting. Check: the MTP head matches this model (--mtp), the draft vocabulary does not exclude the tokens this "
+                                         "text uses (STRATA_MTP_FULL_HEAD=1 drafts over the whole vocabulary), and a high sampling temperature (acceptance falls as it rises)\n",
+                                 (long long) draft_accepted, (long long) draft_offered, 100.0 * acc);
+                }
+            }
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
             // raises the hit rate while the PCIe reads may make the decode slower)
