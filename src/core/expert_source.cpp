@@ -3202,12 +3202,21 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
+        // STRATA_PCIE_STAGED=1 (opt-in, needs the DMA mode, `--pcie-mode dma`; generate.cpp turns the default mode into it): a miss
+        // that is not in the pinned RAM arena is read from the file by the source (a stage buffer, or the page cache's mapping) AFTER
+        // the plan is published and then copied to the GPU's staging by the copy engine - the GPU computes it, the CPU does not, and
+        // no big pinned arena is needed.  The reads overlap the GPU's VRAM groups.
+        static const bool staged_pcie = [] { const char* v = std::getenv("STRATA_PCIE_STAGED"); return v != nullptr && std::atoi(v) != 0; }();
+        const bool staged_ok = staged_pcie && d.plan->pcie_mode == 0;
+        const bool pcie_ok = d.pcie_num > 0 && (staged_ok || d.src->pcie_layer(d.layers));
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
+        int32_t pcie_exp[64];       // the expert of each PCIe group (a staged read needs it after the publish)
+        bool pcie_staged[64];       // true: dma_src[q] is not read yet
+        int n_staged = 0;
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
@@ -3229,10 +3238,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
-                        if (src != nullptr) {
+                        const bool stage_it = src == nullptr && staged_ok;
+                        if (src != nullptr || stage_it) {
                             kd = 1;
                             dma_src[fetches] = src;
                             pcie_i0[fetches] = i0;
+                            pcie_exp[fetches] = e;
+                            pcie_staged[fetches] = stage_it;
+                            n_staged += stage_it ? 1 : 0;
                             ++fetches;
                         }
                     }
@@ -3275,6 +3288,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
+        if (n_staged > 0) {   // the staged misses: read now (the GPU is already running the VRAM groups), then copied below
+            int64_t want[64];
+            int nw = 0;
+            for (int q = 0; q < fetches; ++q) if (pcie_staged[q]) want[nw++] = pcie_exp[q];
+            d.src->prefetch(d.layers, want, nw);
+            for (int q = 0; q < fetches; ++q)
+                if (pcie_staged[q]) {
+                    dma_src[q] = d.src->blob(d.layers, pcie_exp[q]);
+                    if (dma_src[q] == nullptr) {
+                        d.failed = true;
+                        d.fail = "the expert source could not produce a blob for the staged PCIe path";
+                        d.fail_layer = d.layers;
+                        d.fail_expert = pcie_exp[q];
+                        ++d.missing;
+                        return;
+                    }
+                    ++d.pcie_staged_reads;
+                }
+        }
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
         for (int64_t i = 0; i < n; ++i) {

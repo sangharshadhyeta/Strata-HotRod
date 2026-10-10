@@ -1553,6 +1553,13 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
 // what the x16 share costs.  Continuous (#485): before, 19.9 GB/s gave 0.42 and 20.0 the full 0.55 (and 4.0 GB/s
 // gave 0.08, 3.9 none), so a reading near either edge moved the share by a quarter of its range.  From 20 GB/s up
 // (an x16 PCIe 4/5 link: ~26-28 GB/s) the share is unchanged.
+// --pcie-mode as the Verifier's code: 0 dma, 1 direct, 2 kernel (auto).  STRATA_PCIE_STAGED=1 (SPEC 20 item 20) reads a miss that is not
+// in the pinned arena from the file and copies it by DMA, so `auto` becomes dma then (direct and kernel read pinned host memory in place).
+int pcie_mode_code(const std::string& m) {
+    const char* st = std::getenv("STRATA_PCIE_STAGED");
+    if (st != nullptr && std::atoi(st) != 0 && m == "auto") return 0;
+    return m == "dma" ? 0 : m == "direct" ? 1 : 2;
+}
 double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
@@ -6860,7 +6867,7 @@ int main(int argc, char** argv) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
-                stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                stage_ver(st).set_pcie_mode(pcie_mode_code(o.pcie_mode));
             }
         }
         if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans
@@ -6868,9 +6875,9 @@ int main(int argc, char** argv) {
             split_drive_b.plan[0] = ver_b.plan_sink();
             split_drive_b.plan[1] = stages[0]->ver_b.plan_sink();
             stages[0]->ver_b.set_split(o.spec_split);
-            stages[0]->ver_b.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+            stages[0]->ver_b.set_pcie_mode(pcie_mode_code(o.pcie_mode));
             ver_b.set_split(o.spec_split);
-            ver_b.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+            ver_b.set_pcie_mode(pcie_mode_code(o.pcie_mode));
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
@@ -6881,7 +6888,7 @@ int main(int argc, char** argv) {
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_mode(pcie_mode_code(o.pcie_mode));
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it
@@ -11121,6 +11128,12 @@ int main(int argc, char** argv) {
                                   "all %lld routed)", (long long) req_offload,
                                   100.0 * (double) req_offload / (double) (req_look + req_offload),
                                   (long long) (req_look + req_offload));
+                // STRATA_PCIE_STAGED: PCIe experts read from the file after the plan went out (cumulative since start)
+                if (drive.d.pcie_staged_reads > 0) {
+                    const size_t used = std::strlen(off);
+                    std::snprintf(off + used, sizeof off - used, "; %llu staged from the file (total)",
+                                  (unsigned long long) drive.d.pcie_staged_reads);
+                }
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
@@ -11653,7 +11666,7 @@ int main(int argc, char** argv) {
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_mode(pcie_mode_code(o.pcie_mode));
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
