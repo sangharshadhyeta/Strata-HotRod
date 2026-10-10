@@ -1148,23 +1148,25 @@ GSM8K (the first 50 of a fixed 100-question sample, ground-truth number) and Hum
 <!-- BENCH-TABLE-START -->
 | Arm | Replaced | GSM8K correct | HumanEval pass | Answer tok/s (prompt time included) | Longest answer (tokens) | State |
 |---|---|---:|---:|---:|---:|---|
-| BC | control (nothing replaced) | 30 / 32 | 0 / 0 | 9.7 | 551 | running |
+| BC | control (nothing replaced) | 48 / 50 | 30 / 30 | 9.7 | 4445 | done |
 | B2 | ranks 2-9 | | | | | pending |
-| B15 | 2-9 plus rank 1 only by a close substitute (floor 1.5) | | | | | pending |
-| B1 | ranks 1-9 | | | | | pending |
-| B05 | 1-9 plus rank 0 only by a close substitute (floor 0.5) | | | | | pending |
-| B0 | ranks 0-9 | | | | | pending |
-| B3 | ranks 3-9 | | | | | pending |
-| B4 | ranks 4-9 | | | | | pending |
-| B5 | ranks 5-9 | | | | | pending |
-| B6 | ranks 6-9 | | | | | pending |
-| B7 | ranks 7-9 | | | | | pending |
-| B8 | ranks 8-9 | | | | | pending |
-| B9 | rank 9 only | | | | | pending |
+| E1 | 2-9, rank 1 only by a substitute within 1 logit (the edge, margin 1) | | | | | pending |
+| E2 | 2-9, rank 1 only within 2 logits (edge margin 2) | | | | | pending |
+| E4 | 2-9, rank 1 only within 4 logits (edge margin 4) | | | | | pending |
+| B1 | ranks 1-9 (rank 1 at any distance) | | | | | pending |
 | BC2 | control, second copy (the noise floor) | | | | | pending |
+| B0 | ranks 0-9 | | | | | pending |
+| B6 | ranks 6-9 | | | | | pending |
+| B4 | ranks 4-9 | | | | | pending |
+| B9 | rank 9 only | | | | | pending |
+| B8 | ranks 8-9 | | | | | pending |
+| B7 | ranks 7-9 | | | | | pending |
+| B5 | ranks 5-9 | | | | | pending |
+| B3 | ranks 3-9 | | | | | pending |
 <!-- BENCH-TABLE-END -->
 
-Reading notes (answers read per arm): none yet.
+Reading notes (answers read per arm):
+- **BC (control), read:** the two GSM8K misses are different kinds. Question 18 (tomato vines, reference 21, answered 14) is a real error: the model decided only Steve's six a day counts and left out his girlfriend's three. Question 31 (air conditioner, reference 81, answered 135) is the model being right and the reference wrong: saving 5 hours of a 900 W unit is 900 x 5 = 4.5 kWh a day, 135 kWh in 30 days; the reference subtracts the energy of 5 hours from the energy of 8 hours and gets 2,700 Wh a day, which is the energy still used, not saved (a known label problem). The score is kept as the benchmark gives it (48 / 50); read, the control has 49 of 50 correct. The longest answer, 4,445 tokens (GSM8K question 38, a cheerleader-pyramid puzzle), is not a loop: the model deliberated at length and finished with a worked, correct answer (21 feet); a 700-token cap would have scored it wrong. All 30 HumanEval functions pass their tests.
 
 ## 19. Queued for later (user, 2026-10-10): the swap budget, and what the links allow
 
