@@ -8992,14 +8992,6 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
-            // SPEC 17, the stand-in floor per task: seg=0 the request starts inside the thinking, 1 in the answer;
-            // segids=<think open>,<think close>,<fence>,<fence with a leading space> the token ids the tracker compares for
-            // equality (the server has the tokenizer; nothing else is looked at); floors=<think>,<answer>,<code> the first
-            // rank each part may have replaced by a resident stand-in (a higher number replaces less). Absent = the floors
-            // of the environment (today's behaviour).
-            int req_seg = 1;   // seg=0: the request starts inside the thinking; anything else: in the answer
-            long long req_seg_ids[4] = {-1, -1, -1, -1};   // <think>, </think>, then the two tokens that hold a code fence
-            int req_floors[3] = {-1, -1, -1};
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -9026,9 +9018,6 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
-                    else if (key == "seg") req_seg = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 1);
-                    else if (key == "segids") std::sscanf(tok.c_str() + eq + 1, "%lld,%lld,%lld,%lld", &req_seg_ids[0], &req_seg_ids[1], &req_seg_ids[2], &req_seg_ids[3]);
-                    else if (key == "floors") std::sscanf(tok.c_str() + eq + 1, "%d,%d,%d", &req_floors[0], &req_floors[1], &req_floors[2]);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9865,29 +9854,6 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
-            // SPEC 17: this request's stand-in floors and whether it starts inside the thinking. The tracker below compares each
-            // committed token id for EQUALITY with four ids the server looked up (<think>, </think>, the two tokens that hold a
-            // code fence) and looks at nothing else: no text, no pattern. A fence token toggles `in_fence`; the floor in force is
-            // then never less careful than the code floor, so a fence can only make the stand-in more careful, and a fence that
-            // is missed costs nothing beyond the answer's own floor. `</think>` ends the thinking and clears the fence state, so
-            // a missed or extra fence cannot leave the state wrong beyond it.
-            strata::kernels::route_cfg_request(req_floors[0], req_floors[1], req_floors[2], req_seg == 0);
-            bool in_think = req_seg == 0, in_fence = false;
-            const bool parts_on = strata::kernels::route_cfg_parts();   // STRATA_STANDIN_PARTS=1; off: one floor for everything
-            auto seg_track = [&](int64_t t) {
-                if (!parts_on) return;
-                if (req_seg_ids[0] < 0 && req_seg_ids[1] < 0 && req_seg_ids[2] < 0 && req_seg_ids[3] < 0) return;
-                const bool th = in_think, fe = in_fence;
-                if (t == req_seg_ids[0]) in_think = true;                                // <think>
-                else if (t == req_seg_ids[1]) { in_think = false; in_fence = false; }    // </think>
-                else if (t >= 0 && (t == req_seg_ids[2] || t == req_seg_ids[3])) in_fence = !in_fence;   // a fence opens or closes
-                if (th != in_think || fe != in_fence) {
-                    strata::kernels::route_cfg_set_state(in_think, in_fence);
-                    static const bool trace_seg = std::getenv("STRATA_TRACE_SEG") != nullptr;   // each change of the state, with its token
-                    if (trace_seg)
-                        std::fprintf(stderr, "strata serve: SEG token %lld -> thinking %d, fence %d\n", (long long) t, (int) in_think, (int) in_fence);
-                }
-            };
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
@@ -10567,7 +10533,6 @@ int main(int argc, char** argv) {
                     bool eos = false;
                     for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
-                        seg_track((int64_t) outp[(size_t) i]);
                         strata::core::progress_beat();
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
@@ -10819,7 +10784,6 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
-                    seg_track((int64_t) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);

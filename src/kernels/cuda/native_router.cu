@@ -191,9 +191,9 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  unsigned long long* __restrict__ detail) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
-    // the floors live in host-mapped memory, read at every launch, so a captured graph follows a change the host makes between
-    // windows (SPEC 17): the floor in force now (the host sets it from the part being written), the margin and the edge margin
-    const int lo = ((const volatile RouteCfg*) cfg)->eff;
+    // the floor lives in host-mapped memory, read at every launch, so a captured graph follows a change the host makes between
+    // windows: the floor, the margin and the edge margin
+    const int lo = ((const volatile RouteCfg*) cfg)->lo;
     const int hi = ((const volatile RouteCfg*) cfg)->hi;
     const float margin = ((const volatile RouteCfg*) cfg)->margin;
     const float edge = ((const volatile RouteCfg*) cfg)->edge;
@@ -270,50 +270,25 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         atomicAdd(stats + 3, (unsigned long long) after);
     }
 }
-// ---- the floors (SPEC 17): one small struct in host-mapped memory, read by the kernel at every launch.  The host sets it once
-// (route_cfg_init: the floors of thinking, of the answer and of code) and moves `eff`, the floor in force, between windows
-// (route_cfg_set_state). A higher floor replaces less. Inside a code fence the floor is never less careful than the code floor,
-// so a fence can only make the stand-in more careful, never less.
+// ---- the floor: one small struct in host-mapped memory, read by the kernel at every launch.  The host sets it once (route_cfg_init)
+// and could move it between windows (route_cfg_set_floor; nothing does today).  A higher floor replaces less.  SPEC 17's per-part
+// floors (thinking / answer / code, a fence tracker) lived here and were removed after the benchmark showed no gain (SPEC 18.1).
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
-static int g_lo_default[3] = {0, 0, 0};   // the floors of the environment, restored for a request that gives none
-// STRATA_STANDIN_PARTS=1 turns the per-part floors on (a request's floors, the thinking / fence tracker). Off (the default): ONE
-// floor, the environment's, for every request and every part of an answer; a request's floors and the tracker are ignored.
-static bool g_parts = false;
-bool route_cfg_parts() { return g_parts; }
-static int eff_floor(const RouteCfg* c, bool in_think, bool in_fence) {
-    const int base = in_think ? c->lo[0] : c->lo[1];
-    return in_fence ? (base > c->lo[2] ? base : c->lo[2]) : base;
-}
-void route_cfg_request(int lo_think, int lo_prose, int lo_code, bool in_think) {
-    if (g_cfg_host == nullptr) return;     // the stand-in is off: nothing to set
-    if (!g_parts) { lo_think = lo_prose = lo_code = -1; in_think = false; }   // one floor for everything: the request's are ignored
-    g_cfg_host->lo[0] = lo_think >= 0 ? lo_think : g_lo_default[0];
-    g_cfg_host->lo[1] = lo_prose >= 0 ? lo_prose : g_lo_default[1];
-    g_cfg_host->lo[2] = lo_code >= 0 ? lo_code : g_lo_default[2];
-    g_cfg_host->eff = eff_floor(g_cfg_host, in_think, false);
-    __sync_synchronize();
-}
-void route_cfg_init(int lo_think, int lo_prose, int lo_code, int hi, float margin, float edge) {
+void route_cfg_init(int lo, int hi, float margin, float edge) {
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
     }
-    const char* parts = std::getenv("STRATA_STANDIN_PARTS");
-    g_parts = parts != nullptr && std::atoi(parts) != 0;
-    if (!g_parts) lo_think = lo_code = lo_prose;   // one floor for everything, whatever STRATA_ROUTE_FLOORS says
-    g_cfg_host->lo[0] = g_lo_default[0] = lo_think;
-    g_cfg_host->lo[1] = g_lo_default[1] = lo_prose;
-    g_cfg_host->lo[2] = g_lo_default[2] = lo_code;
+    g_cfg_host->lo = lo;
     g_cfg_host->hi = hi;
     g_cfg_host->margin = margin;
     g_cfg_host->edge = edge;
-    g_cfg_host->eff = eff_floor(g_cfg_host, false, false);   // the answer's floor until a request or the tracker says otherwise
     __sync_synchronize();
 }
-void route_cfg_set_state(bool in_think, bool in_fence) {
+void route_cfg_set_floor(int lo) {
     if (g_cfg_host == nullptr) return;
-    g_cfg_host->eff = eff_floor(g_cfg_host, in_think, in_fence);
+    g_cfg_host->lo = lo;
     __sync_synchronize();
 }
 const RouteCfg* route_cfg_device() { return g_cfg_dev; }

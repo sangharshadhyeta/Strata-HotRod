@@ -17,27 +17,20 @@ bool native_router_enabled();
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
-/// The stand-in floors (SPEC 17), in host-mapped memory the router kernel reads at every launch, so a captured graph follows a
-/// change the host makes between windows. `lo[0..2]` are the floors of thinking, of the answer, and of code (the first rank that
-/// may be replaced; a HIGHER number replaces less, so it is the more careful); `eff` is the floor in force now, which the kernel
-/// reads: the floor of the part being written, and inside a code fence never less careful than the code floor. `hi` the last
-/// rank (9); `margin` the largest score gap a replacement may have (1e30 = any); `edge` >= 0 makes the floor fractional: the
-/// rank below the floor is replaced too, but only by a substitute within `edge` logits of it; -1 = off.
+/// The stand-in's ONE floor, in host-mapped memory the router kernel reads at every launch, so a captured graph follows a change
+/// the host makes between windows (nothing moves it today; a controller that follows the drive's load, SPEC 19.8, would).
+/// `lo` is the first rank that may be replaced (a HIGHER number replaces less, so it is the more careful); `hi` the last (9);
+/// `margin` the largest score gap a replacement may have (1e30 = any); `edge` >= 0 makes the floor fractional: the rank below the
+/// floor is replaced too, but only by a substitute within `edge` logits of it; -1 = off. (SPEC 17's per-part floors, with a
+/// thinking / fence tracker, were built, measured and REMOVED: no gain from a higher code floor, see SPEC 17 and 18.1.)
 struct RouteCfg {
-    int32_t lo[3];
+    int32_t lo;
     int32_t hi;
     float margin;
     float edge;
-    int32_t eff;
 };
-void route_cfg_init(int lo_think, int lo_prose, int lo_code, int hi, float margin, float edge);   ///< before graph capture
-/// The state of the answer being written: inside the thinking, inside a code fence. Never lowers the floor below the part's own.
-void route_cfg_set_state(bool in_think, bool in_fence);
-/// A request's floors (-1 = the environment's) and whether it starts inside the thinking; a no-op while the stand-in is off.
-void route_cfg_request(int lo_think, int lo_prose, int lo_code, bool in_think);
-/// STRATA_STANDIN_PARTS=1: the per-part floors are on. Off (the default) the stand-in has ONE floor, the environment's, for every
-/// request and every part of an answer, and a request's floors and the thinking / fence tracker are ignored.
-bool route_cfg_parts();
+void route_cfg_init(int lo, int hi, float margin, float edge);   ///< before graph capture
+void route_cfg_set_floor(int lo);                                ///< between windows
 const RouteCfg* route_cfg_device();
 /// STRATA_ROUTE_RESIDENT: swap non-resident picks of the segment's floor ranks for resident ones within the margin (see the .cu).
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.

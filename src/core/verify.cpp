@@ -430,11 +430,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_TRACE_ADAPT") != nullptr)
         strata::kernels::route_detail_alloc();
     if (route_resident_cfg().margin > 0.0f) {
-        // the floors (SPEC 17): one per task, thinking / prose / code; STRATA_ROUTE_FLOORS=2,1,4 sets the three, otherwise all
-        // three are the `lo` of STRATA_ROUTE_RESIDENT_RANKS. The segment is prose until a segment tracker moves it.
-        int fl[3] = {route_resident_cfg().lo, route_resident_cfg().lo, route_resident_cfg().lo};
-        if (const char* v = std::getenv("STRATA_ROUTE_FLOORS")) std::sscanf(v, "%d,%d,%d", &fl[0], &fl[1], &fl[2]);
-        strata::kernels::route_cfg_init(fl[0], fl[1], fl[2], route_resident_cfg().hi, route_resident_cfg().margin,
+        // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
+        // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
+        strata::kernels::route_cfg_init(route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().margin,
                                         route_resident_cfg().edge);
     }
     if (route_resident_cfg().margin > 0.0f)

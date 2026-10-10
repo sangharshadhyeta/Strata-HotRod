@@ -107,6 +107,15 @@ def sha_of(path):
 
 
 def run_arm(name, env_extra, cfg, log, port):
+    # The install's config carries the default stand-in (STRATA_ROUTE_RESIDENT 1e30, ranks 2-9) in its "env", and the server applies a
+    # config's env OVER the process environment: an arm that sets its own, or the control (no setting, nothing replaced), would
+    # silently run 2-9. The arm runner therefore serves a copy of the config without those keys; the arm's environment decides.
+    c = json.load(open(cfg))
+    for k in [k for k in (c.get("env") or {}) if k.startswith("STRATA_ROUTE_RESIDENT")]:
+        c["env"].pop(k)
+    cfg_arm = f"/root/.claude/jobs/743230e4/tmp/ab_cfg_{name}.json"
+    json.dump(c, open(cfg_arm, "w"), indent=1)
+    cfg = cfg_arm
     engine = json.load(open(cfg)).get("exe", "")
     engine_sha = sha_of(engine) if engine and os.path.exists(engine) else None
     dropped = drop_cache()
