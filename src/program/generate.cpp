@@ -11176,6 +11176,20 @@ int main(int argc, char** argv) {
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
             // raises the hit rate while the PCIe reads may make the decode slower)
+            // STRATA_TRACE_ADAPT: how many picks a stand-in served in this request's decode windows (the kernel's detail counters: the replaced picks by
+            // weight bucket [16..21] over the layer-rows [11]) - the number the quality swaps (STRATA_SWAP2_MAX) are meant to lower
+            if (static const bool trace_standin = std::getenv("STRATA_TRACE_ADAPT") != nullptr; trace_standin && produced_n > 0) {
+                static unsigned long long prev_det[48] = {};
+                unsigned long long det[48] = {};
+                strata::kernels::route_detail_read(det);
+                unsigned long long repl = 0;
+                for (int b = 16; b < 22; ++b) repl += det[b] - prev_det[b];
+                const unsigned long long rows = det[11] - prev_det[11];
+                for (int b = 0; b < 48; ++b) prev_det[b] = det[b];
+                if (rows > 0)
+                    std::fprintf(stderr, "strata serve: stand-ins: %llu replaced picks in %llu layer-rows = %.4f per layer-row (%.2f per generated token over %lld layers)\n",
+                                 repl, rows, (double) repl / (double) rows, (double) repl / (double) produced_n, (long long) g.n_layers);
+            }
             if (req_look > 0) {
                 char off[160] = "";
                 if (req_offload > 0)
