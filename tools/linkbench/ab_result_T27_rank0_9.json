@@ -1,0 +1,67 @@
+[
+ {
+  "arm": "M0",
+  "env": {
+   "STRATA_ROUTE_RESIDENT": "1e30",
+   "STRATA_ROUTE_RESIDENT_RANKS": "0-9"
+  },
+  "engine_sha": "c9844a4f7fa007cb",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 32,
+   "peak_cg_current_mb": 29647.8,
+   "peak_cg_anon_mb": 2320.2,
+   "peak_cg_file_mb": 27294.9,
+   "peak_eng_rss_mb": 20198.2,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 759.8,
+   "min_sys_avail_mb": 26055.0,
+   "min_sys_free_mb": 267.7,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 9157,
+   "pswpout": 193832,
+   "pgmajfault": 11036,
+   "compact_stall": 0,
+   "compact_fail": 0,
+   "thp_fault_fallback": 59,
+   "swap_used_mb_before": 0,
+   "swap_used_mb_after": 753
+  },
+  "files_dropped": 15,
+  "load_s": 10,
+  "decode_tok_s": {
+   "code": [
+    84.8,
+    80.6,
+    80.5
+   ],
+   "reasoning": [
+    77.1,
+    78.8,
+    78.9
+   ],
+   "prose": [
+    61.1,
+    61.0,
+    60.8
+   ]
+  },
+  "median_all": 78.8,
+  "tokens_timed": 186,
+  "requests_logged": 10,
+  "os_read_mb": 46143.3,
+  "expert_read_mb": 19812.6,
+  "major_faults": 13687,
+  "os_mb_per_token": 248.1,
+  "stdout": "== M0 @ http://127.0.0.1:8090  repeats=3 max_tokens=900\nwarm-up: {'tokens': 5, 'prompt_tokens': 15, 'ttft_s': 0.3, 'decode_tps': 45.615795798735164, 'total_s': 0.4}\ncode      decode tok/s: 84.8, 80.6, 80.5   median 80.6   (tokens [34, 34, 34], ttft [0.46, 0.1, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.111), (0.0, 0.111), (0.0, 0.111)]  \"The user is asking for a Python function that merges overlapping inter\"\nreasoning decode tok/s: 77.1, 78.8, 78.9   median 78.8   (tokens [8, 8, 8], ttft [11.97, 0.11, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]  \"Let me work this out step-by\"\nprose     decode tok/s: 61.1, 61.0, 60.8   median 61.0   (tokens [20, 20, 20], ttft [0.48, 0.1, 0.1]s)  degeneracy (repeat-4gram, top-word) [(0.0, 0.25), (0.0, 0.25), (0.0, 0.25)]  \"The user's request is a bit of a message in a bottle on a stormy night\"\nALL median 78.8 tok/s   mean of kind-medians 73.5\n"
+ }
+]
