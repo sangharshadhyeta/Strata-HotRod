@@ -3210,6 +3210,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const bool staged_ok = staged_pcie && d.plan->pcie_mode == 0;
         const bool pcie_ok = d.pcie_num > 0 && (staged_ok || d.src->pcie_layer(d.layers));
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
+        if (staged_pcie) {   // the first windows with a miss: what the staged path saw (STRATA_PCIE_STAGED only)
+            static std::atomic<int> said{0};
+            if (nmiss > 0 && said.fetch_add(1) < 6)
+                std::fprintf(stderr, "staged pcie: layer %lld nmiss %d pcie_num %d mode %d staged_ok %d pcie_ok %d m %d cap %d\n",
+                             (long long) d.layers, nmiss, d.pcie_num, d.plan->pcie_mode, (int) staged_ok, (int) pcie_ok, m,
+                             (int) d.plan->staging_cap);
+        }
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
