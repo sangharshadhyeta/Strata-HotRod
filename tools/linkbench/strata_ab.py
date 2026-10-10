@@ -10,7 +10,7 @@ usage: strata_ab.py CONFIG_JSON LOGFILE OUT_JSON PORT ARM...   (ARM = NAME:ENV1=
 import json, os, signal, subprocess, sys, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TPS = "/root/.claude/jobs/743230e4/tmp/qwen_tps.py"
+TPS = os.environ.get("AB_TPS", "/root/.claude/jobs/743230e4/tmp/qwen_tps.py")   # AB_TPS=tools/linkbench/bench.py: accuracy on GSM8K / HumanEval instead of speed prompts
 MODEL_DIRS = ["/mnt/nvme/models/qwen38-flash-next/GSQ-RCO-IQ3_S/IQ3_S", "/mnt/nvme/strata-data/packs/iq3_s"]
 
 
@@ -160,7 +160,9 @@ def run_arm(name, env_extra, cfg, log, port):
         trace.stop()
         return {"arm": name, "error": "not loaded in 15 minutes", "memory_guard": guard["tripped"], "memtrace": trace.peaks()}
     load_s = time.time() - t0
-    p = subprocess.run([sys.executable, TPS, f"http://127.0.0.1:{port}", name, REPEATS, "256"], capture_output=True, text=True)
+    # AB_MAX_TOKENS: answers cut at 256 tokens stop before the result (the reasoning prompt), so quality read from them is partial
+    p = subprocess.run([sys.executable, TPS, f"http://127.0.0.1:{port}", name, REPEATS, os.environ.get("AB_MAX_TOKENS", "256")],
+                       capture_output=True, text=True)
     guard["done"] = True
     watcher.join(timeout=30)
     if guard["tripped"] is None:
