@@ -36,7 +36,14 @@ def ask(prompt, max_tokens=None):
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=3600) as r:
         d = json.loads(r.read())
+    # the whole reply is kept (10 Oct 2026: "are these really empty?"): the server files reasoning text under `reasoning_content` and
+    # tool calls under `tool_calls`, so an empty `content` is not yet an empty answer
+    global LAST_RAW
+    LAST_RAW = {"message": d["choices"][0]["message"], "finish_reason": d["choices"][0].get("finish_reason"), "usage": d.get("usage")}
     return d["choices"][0]["message"]["content"] or "", (d.get("usage") or {}).get("completion_tokens", 0), time.time() - t0
+
+
+LAST_RAW = None
 
 
 def number_after_answer(text):
@@ -93,7 +100,7 @@ for i, q in enumerate(sets["gsm8k"][:n_gsm]):
     text, n, dt = ask(q["question"] + "\n\nSolve it step by step, then finish with a final line of the form: Answer: <number>", 700)
     got, want = number_after_answer(text), gsm_truth(q["answer"])
     ok = got is not None and abs(got - want) < 1e-6
-    res["gsm8k"].append({"i": i, "ok": ok, "got": got, "want": want, "tokens": n, "s": round(dt, 1), "text": text})
+    res["gsm8k"].append({"i": i, "ok": ok, "got": got, "want": want, "tokens": n, "s": round(dt, 1), "text": text, "raw": LAST_RAW})
     tok += n
     sec += dt
     print(f"gsm8k {i + 1}/{n_gsm} {'ok' if ok else 'WRONG'} (want {want}, got {got}) {n} tokens {dt:.0f}s", flush=True)
@@ -101,7 +108,7 @@ for i, q in enumerate(sets["gsm8k"][:n_gsm]):
 for i, q in enumerate(sets["humaneval"][:n_he]):
     text, n, dt = ask("Complete the following Python function. Reply with the complete function in one ```python code block.\n\n" + q["prompt"], 700)
     ok, err = run_tests(q["prompt"], code_block(text), q["test"], q["entry_point"])
-    res["humaneval"].append({"i": i, "task": q["task_id"], "ok": ok, "err": err, "tokens": n, "s": round(dt, 1), "text": text})
+    res["humaneval"].append({"i": i, "task": q["task_id"], "ok": ok, "err": err, "tokens": n, "s": round(dt, 1), "text": text, "raw": LAST_RAW})
     tok += n
     sec += dt
     print(f"humaneval {i + 1}/{n_he} {q['task_id']} {'pass' if ok else 'FAIL'} {n} tokens {dt:.0f}s", flush=True)
