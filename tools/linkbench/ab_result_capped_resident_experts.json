@@ -1,0 +1,58 @@
+[
+ {
+  "arm": "R1",
+  "env": {},
+  "engine_sha": "06d30b1d6547c4af",
+  "prefetch_on": true,
+  "memtrace": {
+   "samples": 95,
+   "peak_cg_current_mb": 28673.7,
+   "peak_cg_anon_mb": 25397.2,
+   "peak_cg_file_mb": 10313.2,
+   "peak_eng_rss_mb": 27346.7,
+   "peak_eng_locked_mb": 0.0,
+   "peak_eng_swap_mb": 0.0,
+   "peak_sys_swap_used_mb": 786.0,
+   "min_sys_avail_mb": 2598.9,
+   "min_sys_free_mb": 225.4,
+   "events_at_end": {
+    "ev_high": 0,
+    "ev_max": 0,
+    "ev_oom": 0,
+    "ev_oom_kill": 0
+   },
+   "cg_pgmajfault_at_end": 0
+  },
+  "kernel_during_arm": {
+   "pswpin": 39858,
+   "pswpout": 208275,
+   "pgmajfault": 31954,
+   "compact_stall": 5,
+   "compact_fail": 5,
+   "thp_fault_fallback": 8149,
+   "swap_used_mb_before": 0,
+   "swap_used_mb_after": 772
+  },
+  "files_dropped": 15,
+  "load_s": 20,
+  "decode_tok_s": {
+   "code": [
+    9.8
+   ],
+   "reasoning": [
+    9.6
+   ],
+   "prose": [
+    12.7
+   ]
+  },
+  "median_all": 9.8,
+  "tokens_timed": 657,
+  "requests_logged": 4,
+  "os_read_mb": 252146.9,
+  "expert_read_mb": 241173.8,
+  "major_faults": 15582,
+  "os_mb_per_token": 383.8,
+  "stdout": "== R1 @ http://127.0.0.1:8090  repeats=1 max_tokens=256\nwarm-up: {'tokens': 10, 'prompt_tokens': 15, 'ttft_s': 0.87, 'decode_tps': 12.338204281745384, 'total_s': 1.6}\ncode      decode tok/s: 9.8   median 9.8   (tokens [256], ttft [1.75]s)  \"```python def merge_intervals(intervals: list[tuple[int, int]]) -> lis\"\nreasoning decode tok/s: 9.6   median 9.6   (tokens [256], ttft [6.75]s)  \"Here is the step-by-step solution to the problem.  ### Step 1: Analyze\"\nprose     decode tok/s: 12.7   median 12.7   (tokens [145], ttft [2.97]s)  \"The gale howled like a wounded beast, battering the granite tower unti\"\nALL median 9.8 tok/s   mean of kind-medians 10.7\n"
+ }
+]
