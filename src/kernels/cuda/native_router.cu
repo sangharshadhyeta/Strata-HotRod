@@ -199,6 +199,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     const float edge = ((const volatile RouteCfg*) cfg)->edge;
     const float bias = ((const volatile RouteCfg*) cfg)->bias;
     const int maxrank = ((const volatile RouteCfg*) cfg)->maxrank;
+    const float want_lo = ((const volatile RouteCfg*) cfg)->want_lo;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
     // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
@@ -221,7 +222,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     // what the router WANTS, counted before any swap: the picks the host sees afterwards are confined to resident experts
     // and cannot say which expert the swap round should bring in (`want` is the layer's slice of the usage counter)
     if (want != nullptr)
-        for (int r = 0; r < 10; ++r) atomicAdd(want + id[r], 1.0f);
+        for (int r = 0; r < 10; ++r) atomicAdd(want + id[r], r < lo ? 1.0f : want_lo);   // STRATA_WANT_LOW: a pick the floor replaces counts less
     // SPEC 13.40: the same picks, kept per ROW of the window instead of summed, so the host can count only the rows whose input token was
     // kept once the acceptance is known (`rows` is the layer's [8 rows][10] slice; the atomic count above is then off)
     if (rows != nullptr)
@@ -311,7 +312,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
 // floors (thinking / answer / code, a fence tracker) lived here and were removed after the benchmark showed no gain (SPEC 18.1).
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
-void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank) {
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank, float want_lo) {
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
@@ -322,6 +323,7 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
     g_cfg_host->edge = edge;
     g_cfg_host->bias = bias;
     g_cfg_host->maxrank = maxrank;
+    g_cfg_host->want_lo = want_lo;
     __sync_synchronize();
 }
 void route_cfg_set_floor(int lo) {
@@ -389,7 +391,7 @@ void route_rows_apply(int kept, float* usage, int64_t n_layers, int64_t n_expert
         for (int t = 0; t < kept; ++t)
             for (int r = 0; r < 10; ++r) {
                 const int32_t e = h[(size_t) l * 80 + (size_t) t * 10 + (size_t) r];
-                if (e >= 0 && e < n_expert) usage[(size_t) (l * n_expert + e)] += 1.0f;
+                if (e >= 0 && e < n_expert) usage[(size_t) (l * n_expert + e)] += (g_cfg_host == nullptr || r < g_cfg_host->lo) ? 1.0f : g_cfg_host->want_lo;
             }
 }
 }

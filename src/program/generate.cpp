@@ -4986,8 +4986,19 @@ int main(int argc, char** argv) {
             routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
             ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
+        // STRATA_LOOKAHEAD_K=<n>: experts predicted per token (default 10); =floor: the first rank the stand-in floor replaces
+        // (STRATA_ROUTE_RESIDENT_RANKS lo): a stand-in covers every pick from there on, so only the picks above it are read ahead
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead)) {
+        int la_k = 10;
+        if (kv != nullptr && std::strcmp(kv, "floor") == 0) {
+            int lo = 6, hi = 9;
+            if (const char* rr = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(rr, "%d-%d", &lo, &hi);
+            const char* rm = std::getenv("STRATA_ROUTE_RESIDENT");
+            la_k = rm != nullptr && std::atof(rm) > 0.0 ? std::max(1, lo) : 10;
+        } else if (kv != nullptr) {
+            la_k = std::atoi(kv);
+        }
+        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, la_k, srcp, err, fs_ahead)) {
             drive.d.lookahead = &lookahead;
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
                 lookahead.set_depth(std::atoi(dv));
