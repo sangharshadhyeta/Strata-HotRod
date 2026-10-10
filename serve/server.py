@@ -51,6 +51,8 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
+from prompt_cache import PromptCache   # serve/prompt_cache.py: the prompt cache on disk (config "prompt_cache_path")
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
@@ -2603,6 +2605,7 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
+        self.pcache = None                            # the prompt cache on disk (config "prompt_cache_path"; off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -3484,6 +3487,17 @@ class Service:
                         self.last_request_at = time.time()
                         rate.clear()                    # the previous request's samples must not leak into this one
                     before = getattr(self.engine, "last", None)
+                    pc_read = None                      # the prompt tokens this request read (the prompt cache saves after a long read)
+                    if self.pcache is not None and not par and not emb:
+                        # the long start of this prompt may be on disk (a conversation the engine no longer holds, after a restart)
+                        try:
+                            note = self.pcache.before(self.engine, ids)
+                            if note:
+                                print(f"[strata] {note}", flush=True)
+                        except (EngineDied, EngineSilent):
+                            raise
+                        except Exception as e:          # the cache is an extra: its failure never fails a request
+                            print(f"[strata] prompt cache (before): {e!r}", flush=True)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     for ev in opening:
@@ -3681,6 +3695,7 @@ class Service:
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
+                            pc_read = last.get("prompt_read")
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -3743,6 +3758,15 @@ class Service:
                                 self.status.update(busy=False)
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
+                        if (self.pcache is not None and not par and not emb and finish in ("stop", "length") and not cancel.is_set()
+                                and len(segments) == 1 and not recovery_count):
+                            # one plain pass: the engine holds the prompt and what it wrote; a long read is saved while the fifo is held
+                            try:
+                                note = self.pcache.after(self.engine, ids, raw_ids, pc_read)
+                                if note:
+                                    print(f"[strata] {note}", flush=True)
+                            except Exception as e:
+                                print(f"[strata] prompt cache (after): {e!r}", flush=True)
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
@@ -5790,6 +5814,20 @@ def main() -> int:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    # "prompt_cache_path": the prompt cache on disk (serve/prompt_cache.py): a long prompt that had to be read is saved by itself, and
+    # restored by itself before a request that continues it, also after a restart.  An entry carries a fingerprint of the engine
+    # file, its arguments and the model, so a rebuilt engine or another setting never restores an old one.
+    if cfg.get("prompt_cache_path"):
+        try:
+            exe = cfg.get("exe") or ""
+            st_exe = os.stat(exe) if exe and os.path.exists(exe) else None
+            fp = hashlib.sha256(json.dumps([cfg.get("model_name"), exe, st_exe.st_size if st_exe else 0, st_exe.st_mtime_ns if st_exe else 0,
+                                            cfg.get("args")], sort_keys=True, default=str).encode()).hexdigest()[:32]
+            svc.pcache = PromptCache(slot_save_dir(cfg["prompt_cache_path"], cfg.get("cwd")), fp,
+                                     limit_bytes=int(cfg["prompt_cache_gib"] * (1 << 30)) if cfg.get("prompt_cache_gib") else None)
+        except (ValueError, OSError) as e:
+            raise SystemExit(f"[strata] prompt cache: {e}")
+        print(f"[strata] prompt cache on: {svc.pcache.dir} ({len(svc.pcache.entries)} entries kept from earlier)", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
