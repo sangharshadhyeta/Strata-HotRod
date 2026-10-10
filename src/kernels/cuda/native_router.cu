@@ -274,14 +274,23 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
 // (route_cfg_init: one floor per task, thinking / prose / code) and moves `seg` between windows (route_cfg_set_segment).
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
+static int g_lo_default[3] = {0, 0, 0};   // the floors of the environment, restored for a request that gives none
+void route_cfg_request(int lo_think, int lo_prose, int lo_code, int seg) {
+    if (g_cfg_host == nullptr) return;     // the stand-in is off: nothing to set
+    g_cfg_host->lo[0] = lo_think >= 0 ? lo_think : g_lo_default[0];
+    g_cfg_host->lo[1] = lo_prose >= 0 ? lo_prose : g_lo_default[1];
+    g_cfg_host->lo[2] = lo_code >= 0 ? lo_code : g_lo_default[2];
+    g_cfg_host->seg = seg < 0 ? 0 : (seg > 2 ? 2 : seg);
+    __sync_synchronize();
+}
 void route_cfg_init(int lo_think, int lo_prose, int lo_code, int hi, float margin, float edge) {
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
     }
-    g_cfg_host->lo[0] = lo_think;
-    g_cfg_host->lo[1] = lo_prose;
-    g_cfg_host->lo[2] = lo_code;
+    g_cfg_host->lo[0] = g_lo_default[0] = lo_think;
+    g_cfg_host->lo[1] = g_lo_default[1] = lo_prose;
+    g_cfg_host->lo[2] = g_lo_default[2] = lo_code;
     g_cfg_host->hi = hi;
     g_cfg_host->margin = margin;
     g_cfg_host->edge = edge;

@@ -8992,6 +8992,13 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            // SPEC 17, the stand-in floor per task: seg=0|1|2 is the segment the answer starts in (0 thinking, 1 prose,
+            // 2 code); segids=<think open>,<think close>,<code fence> are the token ids that move it (the server has the
+            // tokenizer); floors=<think>,<prose>,<code> the first rank each segment may have replaced by a resident
+            // stand-in. Absent = the floors of the environment and the segment stays prose (today's behaviour).
+            int req_seg = 1;
+            long long req_seg_ids[3] = {-1, -1, -1};
+            int req_floors[3] = {-1, -1, -1};
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -9018,6 +9025,9 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "seg") req_seg = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 2);
+                    else if (key == "segids") std::sscanf(tok.c_str() + eq + 1, "%lld,%lld,%lld", &req_seg_ids[0], &req_seg_ids[1], &req_seg_ids[2]);
+                    else if (key == "floors") std::sscanf(tok.c_str() + eq + 1, "%d,%d,%d", &req_floors[0], &req_floors[1], &req_floors[2]);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9854,6 +9864,18 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            // SPEC 17: this request's stand-in floors and the segment it starts in; the tracker below moves the segment as
+            // the committed tokens open and close the thinking and the code blocks (a no-op without the request's ids)
+            strata::kernels::route_cfg_request(req_floors[0], req_floors[1], req_floors[2], req_seg);
+            int seg_now = req_seg;
+            auto seg_track = [&](int64_t t) {
+                if (req_seg_ids[0] < 0 && req_seg_ids[1] < 0 && req_seg_ids[2] < 0) return;
+                int s = seg_now;
+                if (t == req_seg_ids[0]) s = 0;                      // <think>: thinking
+                else if (t == req_seg_ids[1]) s = 1;                 // </think>: prose
+                else if (t == req_seg_ids[2] && seg_now != 0) s = seg_now == 2 ? 1 : 2;   // a code fence opens or closes code
+                if (s != seg_now) { seg_now = s; strata::kernels::route_cfg_set_segment(s); }
+            };
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
@@ -10533,6 +10555,7 @@ int main(int argc, char** argv) {
                     bool eos = false;
                     for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
+                        seg_track((int64_t) outp[(size_t) i]);
                         strata::core::progress_beat();
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
@@ -10784,6 +10807,7 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                    seg_track((int64_t) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);

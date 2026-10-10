@@ -31,6 +31,8 @@ struct RouteCfg {
 };
 void route_cfg_init(int lo_think, int lo_prose, int lo_code, int hi, float margin, float edge);   ///< before graph capture
 void route_cfg_set_segment(int seg);                                                              ///< 0 thinking, 1 prose, 2 code
+/// A request's floors (-1 = the environment's) and the segment it starts in; a no-op while the stand-in is off.
+void route_cfg_request(int lo_think, int lo_prose, int lo_code, int seg);
 const RouteCfg* route_cfg_device();
 /// STRATA_ROUTE_RESIDENT: swap non-resident picks of the segment's floor ranks for resident ones within the margin (see the .cu).
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
