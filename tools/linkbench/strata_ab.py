@@ -188,9 +188,17 @@ def run_arm(name, env_extra, cfg, log, port):
     for line in p.stdout.splitlines():
         if "decode tok/s:" in line:
             kind = line.split()[0]
-            rates = [float(x) for x in line.split("decode tok/s:")[1].split("median")[0].replace(",", " ").split()]
+            rates = []   # a line without the median (a repeat that gave no figure) must not end the whole arm's result
+            for x in line.split("decode tok/s:")[1].split("median")[0].replace(",", " ").split():
+                try:
+                    rates.append(float(x))
+                except ValueError:
+                    break
             kinds[kind] = rates
-            tokens += sum(int(x) for x in line.split("(tokens [")[1].split("]")[0].replace(",", " ").split())
+            try:
+                tokens += sum(int(x) for x in line.split("(tokens [")[1].split("]")[0].replace(",", " ").split())
+            except (IndexError, ValueError):
+                pass
     rows = io_lines(logtext)
     allr = sorted(x for v in kinds.values() for x in v)
     vm1 = vmstat()
