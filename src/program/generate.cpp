@@ -34,6 +34,7 @@
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/kernels/standin_mask.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -5590,6 +5591,16 @@ int main(int argc, char** argv) {
         }
         thits.d_res = d_res;
         thits.n_expert = g.n_expert;
+        // the stand-in for every miss (STRATA_STANDIN=1, SPEC.md 13.20): the router is restricted to the experts this
+        // table says are in VRAM. One GPU only (a layer split keeps a table per stage); the table is refreshed in place
+        // after every swap round, so the pointer stays valid for the run and for captured graphs.
+        if (!multi_gpu) {
+            strata::kernels::standin_set_table(d_res, (int) g.n_expert);
+            if (strata::kernels::standin_enabled())
+                std::fprintf(stderr, "strata generate: stand-in mask ON (STRATA_STANDIN=1): the router picks only experts resident in VRAM "
+                                     "(decode windows of up to %d rows; a layer with fewer than k resident experts is left unmasked)\n",
+                             strata::kernels::standin_max_rows());
+        }
         // a file-backed arena (STRATA_ARENA_MMAP): the experts no GPU holds are the ones the CPU pool and the
         // prompt path will read - start reading them now instead of faulting them in 4 KB at a time mid-request
         // ... and the ones a GPU holds are handed back first (STRATA_ARENA_RELEASE=0 keeps them): the fill read the

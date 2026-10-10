@@ -12,6 +12,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/router_top10.hpp"
+#include "strata/kernels/standin_mask.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -367,6 +368,9 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 //      `bf16_gemv_split` exists for precisely this case; its own header says so.  Measured here:
 //      LEDGER L41 -> L42.
 project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
+// ---- the stand-in for every miss (SPEC.md 13.20; STRATA_STANDIN=1): the router may pick only experts that are in VRAM.
+//      The top-k renormalises over the chosen k, so masking the logits is exactly "the k best resident experts".
+strata::kernels::standin_mask(b.logits, 1, (int) g.n_expert, (int) k, layer, stream);
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
 if (native_router_enabled() && g.n_expert == 512 && k == 10) {
@@ -414,6 +418,7 @@ bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t
                                 g.n_expert, stream);
     else
         bf16_gemv_fp32_mmvf_cols(x, (const uint16_t*) w_router->data, logits, g.n_embd, g.n_expert, n, stream);
+    strata::kernels::standin_mask(logits, n, (int) g.n_expert, (int) k, layer, stream);   // the verify window's rows (13.20)
     router_top10(logits, n, (int) g.n_expert, (int) k, ids, weights, stream);
     return true;
 }
