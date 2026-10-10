@@ -38,6 +38,10 @@ def log_split():
     sections = open(LOG, errors="replace").read().split(MARK)[1:]
     started = re.findall(r"^=== arm (\w+)", open(f"{T}/ab_run_bench2.log").read(), re.M) if os.path.exists(f"{T}/ab_run_bench2.log") else []
     running = started[-1] if started and started[-1] not in chain2 else None
+    # an arm that has just started has not served anything yet: its section holds no request lines, or does not exist at all
+    if running and sections and not req_re.search(sections[-1]):
+        sections = sections[:-1]
+        running = None
     end = len(sections) - (1 if running else 0)
     by_arm = {}
     for i, a in enumerate(chain2):
