@@ -188,7 +188,8 @@ static unsigned long long* g_detail = nullptr;   // the decode rows' detail coun
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
-                                 unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl) {
+                                 unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl,
+                                 const uint8_t* __restrict__ ring) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
     // the floor lives in host-mapped memory, read at every launch, so a captured graph follows a change the host makes between
@@ -252,17 +253,19 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         for (int r = 0; r < 10; ++r) { ex[r] = expf(l[pick[r]] - m); sum += ex[r]; }
         for (int r = 0; r < 10; ++r) { id[r] = pick[r]; weights[(size_t) t * 10 + r] = ex[r] / sum; }
     }
+    // STRATA_RING: an expert whose look-ahead ring copy has landed counts as resident (the host plan finds it in the ring)
+    auto have = [&](int f) { return res[f] >= 0 || (ring != nullptr && ring[f] != 0); };
     int swaps = 0, tail = 0, before = 0;
-    for (int r = 0; r < 10; ++r) before += res[id[r]] < 0;
+    for (int r = 0; r < 10; ++r) before += !have(id[r]);
     for (int r = (edge >= 0.f && lo > 0) ? lo - 1 : lo; r <= hi && r < 10; ++r) {
         const int e = id[r];
-        if (res[e] >= 0) continue;
+        if (have(e)) continue;
         if (wmax > 0.f && weights[(size_t) t * 10 + r] >= wmax) continue;   // a heavy pick stays exact: fetched / computed on the CPU
         ++tail;
         int best = -1;
         float bl = -INFINITY;
         for (int f = 0; f < 512; ++f) {
-            if (res[f] < 0 || l[f] <= bl) continue;
+            if (!have(f) || l[f] <= bl) continue;
             bool used = false;
             for (int q = 0; q < 10; ++q) used |= id[q] == f;
             if (!used) { best = f; bl = l[f]; }
@@ -297,7 +300,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         }
     }
     int after = 0;
-    for (int r = 0; r < 10; ++r) after += res[id[r]] < 0;
+    for (int r = 0; r < 10; ++r) after += !have(id[r]);
     if (swaps) {
         float m = -INFINITY;
         for (int r = 0; r < 10; ++r) m = fmaxf(m, l[id[r]]);
@@ -340,14 +343,25 @@ void route_cfg_set_floor(int lo) {
 }
 const RouteCfg* route_cfg_device() { return g_cfg_dev; }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl) {
+                           unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
+                           const uint8_t* ring) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     route_resident_k<<<(unsigned) ((n_tok + 31) / 32), 32, 0, static_cast<cudaStream_t>(stream)>>>(
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
-        n_tok <= 8 ? repl : nullptr);
+        n_tok <= 8 ? repl : nullptr, ring);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
+static uint8_t* g_ring = nullptr;
+static size_t g_ring_n = 0;
+void route_ring_alloc(size_t n) {
+    if (g_ring != nullptr || n == 0) return;
+    if (cudaMalloc((void**) &g_ring, n) != cudaSuccess) { cudaGetLastError(); g_ring = nullptr; return; }
+    cudaMemset(g_ring, 0, n);
+    g_ring_n = n;
+}
+uint8_t* route_ring_ptr() { return g_ring; }
+const uint8_t* route_ring_layer(int64_t layer, int64_t n_expert) { return g_ring ? g_ring + (size_t) (layer * n_expert) : nullptr; }
 static float* g_repl = nullptr;
 static size_t g_repl_n = 0;
 void route_repl_alloc(size_t n) {

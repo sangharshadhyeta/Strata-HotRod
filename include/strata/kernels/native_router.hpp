@@ -45,7 +45,15 @@ const RouteCfg* route_cfg_device();
 /// before any swap. Needs route_cfg_init first.
 /// `rows` is nullptr or the layer's [8 rows][10] slice of the per-row record (route_rows_layer): the same original picks per window row.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr);
+                           unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr,
+                           const uint8_t* ring = nullptr);
+/// STRATA_RING (the look-ahead ring): one byte per (layer, expert) on the device, 1 while a Foresight ring slot holds the expert and
+/// its copy has landed (set on the copy stream after the copy, cleared before the slot is refilled).  The router counts such an
+/// expert as resident: a pick it holds is computed exactly on the GPU from the slot, and it may serve as a stand-in.  Allocated
+/// once, outside graph capture, before the first window.
+void route_ring_alloc(size_t n);
+uint8_t* route_ring_ptr();                                   ///< the whole table (nullptr when not allocated)
+const uint8_t* route_ring_layer(int64_t layer, int64_t n_expert);   ///< the layer's slice, nullptr when not allocated
 /// SWAP2 (STRATA_SWAP2_MAX > 0): the experts stand-ins replaced, counted per (layer, expert) on the device (route_repl_layer is the layer's slice);
 /// route_repl_drain adds them to a host array and clears them.  The swap round may bring the most replaced ones into slots nothing needs.
 inline int route_swap2_max() {

@@ -2372,7 +2372,10 @@ void RouterLookahead::run() {
             pstamp_[(size_t) layer].store(sgen + 1, std::memory_order_release);
         }
         src_->warm(layer, want.data(), (int64_t) want.size());
-        if (fs != nullptr && dj == 0)   // the next layer only: a deeper guess is too often wrong to spend a copy on
+        // the next layer only: a deeper guess is too often wrong to spend a copy on - except for the look-ahead ring (STRATA_RING),
+        // whose copies must land before the layer is routed: the next layer's slots are mostly refused there (its router may run any
+        // moment), so the layer after it is the one the ring fills
+        if (fs != nullptr && (dj == 0 || fs->ring))
             for (const int64_t e : want) fs->predict(src_, layer, (int32_t) e);
         predicted_.fetch_add((int64_t) want.size(), std::memory_order_relaxed);
         }
@@ -3568,6 +3571,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    if (d.fs != nullptr) d.fs->at_layer.store(d.layers, std::memory_order_release);   // STRATA_RING's refill guard
     if (d.lookahead != nullptr) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
@@ -4728,6 +4732,10 @@ bool ForesightSwap::init(int slots_per_layer, int64_t layers, int64_t experts, c
             }
         }
     }
+    if (ring) {   // STRATA_RING: the filler threads read the file tier themselves (one card: checked by foresight_swap_from_env)
+        for (int t = 0; t < ring_threads; ++t) ring_fillers_.emplace_back([this, t] { ring_fill_loop(t); });
+        return true;
+    }
     filler_ = std::thread([this] { fill_loop(); });
     return true;
 }
@@ -4739,6 +4747,8 @@ ForesightSwap::~ForesightSwap() {
     }
     cv_.notify_all();
     if (filler_.joinable()) filler_.join();
+    for (auto& t : ring_fillers_)
+        if (t.joinable()) t.join();
     for (size_t c = 0; c < card_dev.size(); ++c) {
         const OnDevice on(card_dev[c]);
         if (card_stream[c]) cudaStreamSynchronize((cudaStream_t) card_stream[c]);
@@ -4776,6 +4786,71 @@ void ForesightSwap::fill_loop() {
     }
 }
 
+// STRATA_RING: one filler thread.  It reads a slot's expert from the file tier (page cache, or the drive) into one of its own pinned
+// buffers, queues the copy into the slot and, behind it on the same stream, sets the expert's byte in the router's ring table.  A
+// buffer is reused once its copy has finished (four per thread, so the reads run ahead of the copies).
+void ForesightSwap::ring_fill_loop(int t) {
+    constexpr int kBufs = 4;
+    const int dev = card_dev[0];
+    cudaSetDevice(dev);
+    cudaStream_t s = (cudaStream_t) card_stream[0];
+    const size_t mb = (size_t) strata::kernels::cpu::expert_layout().max_blob;
+    uint8_t* buf[kBufs] = {};
+    cudaEvent_t bev[kBufs] = {};
+    bool ok = true;
+    for (int i = 0; i < kBufs && ok; ++i) {
+        void* p = nullptr;
+        ok = cudaHostAlloc(&p, mb, cudaHostAllocDefault) == cudaSuccess &&
+             cudaEventCreateWithFlags(&bev[i], cudaEventDisableTiming) == cudaSuccess;
+        buf[i] = (uint8_t*) p;
+    }
+    if (!ok) {
+        cudaGetLastError();
+        if (!failed.exchange(true)) std::fprintf(stderr, "strata serve: look-ahead ring: filler %d cannot allocate its pinned buffers - ring off\n", t);
+    }
+    int next = 0;
+    for (;;) {
+        int64_t idx;
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
+            if (stop_) break;
+            idx = queue_.front();
+            queue_.pop_front();
+        }
+        Slot& sl = slot[(size_t) idx];
+        const int64_t l = idx / slots;
+        const int32_t e = sl.expert;   // fixed while the slot is loading and not issued (request_locked skips such slots)
+        bool good = ok && !failed.load(std::memory_order_relaxed) && sl.from != nullptr && e >= 0;
+        if (good) {
+            cudaEventSynchronize(bev[next]);   // this buffer's previous copy has finished
+            good = sl.from->copy_blob(l, e, buf[next]);
+            if (!good) ring_read_fail.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (good)
+            good = cudaMemcpyAsync((void*) sl.dptr, buf[next], sl.bytes, cudaMemcpyHostToDevice, s) == cudaSuccess &&
+                   cudaEventRecord(bev[next], s) == cudaSuccess && cudaEventRecord((cudaEvent_t) sl.ev, s) == cudaSuccess &&
+                   cudaMemsetAsync(ready_dev + (size_t) (l * n_expert + e), 1, 1, s) == cudaSuccess;
+        if (!good) {   // not read or not queued: the slot goes back to empty (never marked issued, so never used)
+            cudaGetLastError();
+            std::lock_guard<std::mutex> smu_lk(smu_);
+            if (e >= 0 && where[(size_t) (l * n_expert + e)] == (int16_t) (idx % slots)) where[(size_t) (l * n_expert + e)] = -1;
+            sl.expert = -1;
+            sl.loading = false;
+            sl.ready = false;
+            sl.last_ref = 0;
+            continue;
+        }
+        sl.issued.store(true, std::memory_order_release);
+        ring_reads.fetch_add(1, std::memory_order_relaxed);
+        next = (next + 1) % kBufs;
+    }
+    for (int i = 0; i < kBufs; ++i) {
+        if (bev[i]) { cudaEventSynchronize(bev[i]); cudaEventDestroy(bev[i]); }
+        if (buf[i]) cudaFreeHost(buf[i]);
+    }
+}
+
 bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr) {
     std::lock_guard<std::mutex> smu_lk(smu_);
     const int s = where[(size_t) (layer * n_expert + expert)];
@@ -4792,10 +4867,16 @@ bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr)
         sl.ready = true;
         sl.loading = false;
         if (verify) {   // test mode: the bytes the GPU will read must be the expert's own
-            std::vector<uint8_t> back((size_t) sl.bytes);
+            std::vector<uint8_t> back((size_t) sl.bytes), want_b;
+            const uint8_t* want = sl.src;
+            if (want == nullptr && sl.from != nullptr) {   // STRATA_RING: the expert's bytes read again from the file tier
+                want_b.resize((size_t) sl.bytes);
+                if (sl.from->copy_blob(layer, expert, want_b.data())) want = want_b.data();
+            }
             const OnDevice on(layer_dev[(size_t) layer]);
-            const bool same = cudaMemcpy(back.data(), (const void*) sl.dptr, (size_t) sl.bytes, cudaMemcpyDeviceToHost) ==
-                                  cudaSuccess && std::memcmp(back.data(), sl.src, (size_t) sl.bytes) == 0;
+            const bool same = want != nullptr &&
+                              cudaMemcpy(back.data(), (const void*) sl.dptr, (size_t) sl.bytes, cudaMemcpyDeviceToHost) ==
+                                  cudaSuccess && std::memcmp(back.data(), want, (size_t) sl.bytes) == 0;
             if (same) ++verify_ok;
             else {
                 cudaGetLastError();
@@ -4838,7 +4919,68 @@ void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t exp
     const int c = layer_card[(size_t) layer];
     if (card_round[(size_t) c] != now) { card_round[(size_t) c] = now; card_used[(size_t) c] = 0; }
     if (card_used[(size_t) c] >= budget) { ++over_budget; return; }
-    if (src == nullptr || !src->pinned(layer, expert)) return;   // async copies need the pinned arena
+    if (src == nullptr) return;
+    if (ring) {
+        // the router of layer `layer` may already have read the ring flags once the pool is past layer - 2: a slot of it is
+        // then refilled only when it is empty or the cache holds its expert (the router finds that one in the cache)
+        const int64_t cur = at_layer.load(std::memory_order_acquire);
+        if (layer <= cur) { ++ring_too_late; return; }
+        const bool may_evict = layer >= cur + 2;
+        int best = -1;
+        uint64_t best_ref = ~0ull;
+        bool fresh_only = true;
+        for (int s = 0; s < slots; ++s) {
+            Slot& sl = slot[(size_t) (layer * slots + s)];
+            if (sl.loading) {   // in flight: never taken; landed: an ordinary candidate
+                if (!sl.issued.load(std::memory_order_acquire)) continue;
+                const cudaError_t q = cudaEventQuery((cudaEvent_t) sl.ev);
+                if (q != cudaSuccess) { if (q != cudaErrorNotReady) cudaGetLastError(); continue; }
+                sl.loading = false;
+                sl.ready = true;
+            }
+            if (sl.expert < 0) { best = s; break; }
+            if (host_res != nullptr && host_res[(size_t) (layer * n_expert + sl.expert)] >= 0) { best = s; break; }   // a copy the cache holds too
+            if (!may_evict) continue;
+            if (sl.last_ref >= now) continue;   // asked for (or predicted) in this window
+            fresh_only = false;
+            if (sl.last_ref < best_ref) { best_ref = sl.last_ref; best = s; }
+        }
+        if (best < 0) {
+            if (!may_evict) ++ring_guarded;
+            else if (fresh_only) ++ring_all_fresh;
+            else ++busy;
+            return;
+        }
+        Slot& sl = slot[(size_t) (layer * slots + best)];
+        cudaStream_t cs = (cudaStream_t) card_stream[(size_t) c];
+        if (sl.expert >= 0) {
+            where[(size_t) (layer * n_expert + sl.expert)] = -1;
+            // the old expert leaves the router's table before the new copy lands in its place (same stream, queued first)
+            if (cudaMemsetAsync(ready_dev + (size_t) (layer * n_expert + sl.expert), 0, 1, cs) != cudaSuccess) {
+                cudaGetLastError();
+                if (!failed.exchange(true)) std::fprintf(stderr, "strata serve: look-ahead ring: a flag clear failed - ring off\n");
+                return;
+            }
+        }
+        sl.expert = expert;
+        sl.ready = false;
+        sl.loading = true;
+        sl.issued.store(false, std::memory_order_relaxed);
+        sl.src = nullptr;
+        sl.from = src;
+        sl.last_ref = now;
+        where[key] = (int16_t) best;
+        ++card_used[(size_t) c];
+        ++copies;
+        if (predicted_copy) ++predicted;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            queue_.push_back(layer * slots + best);
+        }
+        cv_.notify_one();
+        return;
+    }
+    if (!src->pinned(layer, expert)) return;   // async copies need the pinned arena
     const uint8_t* b = src->blob(layer, expert);
     if (b == nullptr) return;
     int best = -1;
@@ -4884,6 +5026,13 @@ std::string ForesightSwap::report() const {
                   (unsigned long long) hits, (unsigned long long) copies, (unsigned long long) predicted,
                   (unsigned long long) pending, (unsigned long long) busy, (unsigned long long) over_budget, verify ? "" : "");
     std::string r = buf;
+    if (ring) {
+        std::snprintf(buf, sizeof buf, "; look-ahead ring: %llu read from the file tier (%llu failed), %llu predictions too late "
+                                       "(layer already routed), %llu refused (next layer, no free slot), %llu refused (all slots this window's)",
+                      (unsigned long long) ring_reads.load(), (unsigned long long) ring_read_fail.load(),
+                      (unsigned long long) ring_too_late, (unsigned long long) ring_guarded, (unsigned long long) ring_all_fresh);
+        r += buf;
+    }
     if (verify) r += ", verified " + std::to_string(verify_ok) + " ok / " + std::to_string(verify_bad) + " BAD";
     return r;
 }
@@ -4891,8 +5040,15 @@ std::string ForesightSwap::report() const {
 ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
                                        const std::vector<int>& devices) {
     const char* v = std::getenv("STRATA_FS_SLOTS");
-    const int slots = v ? std::atoi(v) : 0;
+    const char* rv = std::getenv("STRATA_RING");
+    const bool ring = rv != nullptr && std::atoi(rv) != 0;
+    const int slots = v ? std::atoi(v) : ring ? 8 : 0;
     if (slots <= 0) return nullptr;
+    if (ring && (devices.size() != 1 || strata::kernels::route_ring_ptr() == nullptr)) {
+        std::fprintf(stderr, "strata serve: look-ahead ring: %s - swap space off\n",
+                     devices.size() != 1 ? "one GPU only" : "the router's ring table is missing (needs STRATA_ROUTE_RESIDENT)");
+        return nullptr;
+    }
     if (const char* dp = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); dp && std::atoi(dp) != 0) {
         std::fprintf(stderr, "strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan "
                              "resident layers without the host)\n");
@@ -4900,7 +5056,10 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     }
     auto* f = new ForesightSwap();
     auto env_int = [](const char* name, int def, int lo) { const char* e = std::getenv(name); const int x = e ? std::atoi(e) : def; return x < lo ? lo : x; };
-    f->budget = env_int("STRATA_FS_BUDGET", 32, 1);
+    f->ring = ring;
+    f->ready_dev = ring ? strata::kernels::route_ring_ptr() : nullptr;
+    f->ring_threads = std::min(16, env_int("STRATA_RING_THREADS", 4, 1));
+    f->budget = env_int("STRATA_FS_BUDGET", ring ? 1024 : 32, 1);
     f->admit = env_int("STRATA_FS_ADMIT", 1, 1);
     f->depth = env_int("STRATA_FS_DEPTH", 4, 2);
     f->verify = env_int("STRATA_FS_VERIFY", 0, 0) != 0;
@@ -4911,8 +5070,10 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
         return nullptr;
     }
     std::fprintf(stderr, "strata serve: foresight swap: %d slots per layer on %zu card(s), up to %d copies per card and "
-                         "window, admit after %d miss(es), reuse after %d windows\n",
-                 f->slots, devices.size(), f->budget, f->admit, f->depth);
+                         "window, admit after %d miss(es), reuse after %d windows%s\n",
+                 f->slots, devices.size(), f->budget, f->admit, f->depth,
+                 ring ? " - LOOK-AHEAD RING: predicted experts read from the file tier, landed ones routed as resident" : "");
+    if (ring) std::fprintf(stderr, "strata serve: look-ahead ring: %d filler threads\n", f->ring_threads);
     return f;
 }
 

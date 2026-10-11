@@ -5396,7 +5396,9 @@ int main(int argc, char** argv) {
     strata::core::RouterLookahead lookahead;
     // #1348, one prefetch design: with the Foresight swap space on (STRATA_FS_SLOTS) the look-ahead also runs on the pinned-RAM
     // tiers, where there are no pages to warm, and feeds its predictions to the swap space (STRATA_FS_AHEAD=0: not)
-    const bool fs_ahead = srcp != nullptr && [] { const char* v = std::getenv("STRATA_FS_SLOTS"); return v != nullptr && std::atoi(v) > 0; }() &&
+    // STRATA_RING=1 (the look-ahead ring) turns the swap space on by itself (8 slots a layer unless STRATA_FS_SLOTS says otherwise)
+    const bool ring_on = [] { const char* v = std::getenv("STRATA_RING"); return v != nullptr && std::atoi(v) != 0; }();
+    const bool fs_ahead = srcp != nullptr && (ring_on || [] { const char* v = std::getenv("STRATA_FS_SLOTS"); return v != nullptr && std::atoi(v) > 0; }()) &&
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
@@ -5427,13 +5429,19 @@ int main(int argc, char** argv) {
         } else if (kv != nullptr) {
             la_k = std::atoi(kv);
         }
+        // the look-ahead ring serves the ranks the floor does not leave to a stand-in when their copy is in time: STRATA_RING_RANKS
+        // (default 2, ranks 0-1) predicted per token, whatever the floor says (with the ring the floor is 0-9)
+        if (ring_on && (std::getenv("STRATA_LOOKAHEAD_K") == nullptr || std::strcmp(std::getenv("STRATA_LOOKAHEAD_K"), "floor") == 0)) {
+            const char* rr = std::getenv("STRATA_RING_RANKS");
+            la_k = std::max(1, std::min(10, rr != nullptr ? std::atoi(rr) : 2));
+        }
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, la_k, srcp, err, fs_ahead || la_stats)) {
             drive.d.lookahead = &lookahead;
             if (la_stats) lookahead.enable_stats(g.n_layers);
             if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
                 lookahead.set_depth(std::atoi(dv));
-            else if (srcp == &src && src.io_prefetch())
-                lookahead.set_depth(2);
+            else if ((srcp == &src && src.io_prefetch()) || ring_on)
+                lookahead.set_depth(2);   // the ring fills the layer after next: the next one's router may already have run
             std::fprintf(stderr, "strata generate: routing-aware prefetch on (the next layer's router%s)\n",
                          fs_ahead ? ", feeding the Foresight swap space" : ", file tier");
         } else {
@@ -8091,6 +8099,7 @@ int main(int argc, char** argv) {
             std::vector<int> card((size_t) g.n_layers, 0);
             for (int64_t l = 0; l < g.n_layers; ++l) card[(size_t) l] = multi_gpu ? stage_of(l) : 0;
             fs_swap.reset(strata::core::foresight_swap_from_env(g.n_layers, g.n_expert, card, devs));
+            if (fs_swap) fs_swap->host_res = drive.d.host_res;   // STRATA_RING: a ring slot whose expert the cache holds is free
             drive.d.fs = fs_swap.get();
             if (fs_swap && drive.d.lookahead != nullptr) lookahead.set_foresight(fs_swap.get());
         }

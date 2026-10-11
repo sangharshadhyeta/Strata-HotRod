@@ -19,6 +19,16 @@
 // Switches: STRATA_FS_SLOTS (per layer and card), STRATA_FS_BUDGET (copies per card per finished window, default 32),
 // STRATA_FS_ADMIT (misses within the last 4 windows before an expert is copied, default 1), STRATA_FS_DEPTH,
 // STRATA_FS_VERIFY=1 (test mode: every slot is read back and compared with its source the first time it is used).
+//
+// STRATA_RING=1 (the look-ahead ring, after solid.cpp's lookahead admission; opt-in): the swap space becomes the GPU-only path for
+// the ranks the stand-in floor would otherwise replace (STRATA_RING_RANKS, default 2: ranks 0-1).  The router look-ahead predicts
+// those ranks for the next TWO layers; filler threads (STRATA_RING_THREADS, default 4) read each predicted expert from the file tier
+// (page cache or drive) into a small pinned buffer and copy it into a slot of its layer; after the copy the expert's byte in the
+// router's ring table (route_ring_alloc) is set on the same stream.  The router counts a landed ring expert as resident, so a
+// rank 0-1 pick it holds is computed exactly on the GPU, and a pick whose copy has not landed is replaced by a resident stand-in
+// (STRATA_ROUTE_RESIDENT_RANKS=0-9): the GPU never waits for a copy and the CPU computes nothing.  A slot of layer T is refilled
+// only while the pool works on a layer before T - 1 (the router of T cannot have read its flag yet), or when the cache already
+// holds its expert; its flag is cleared on the copy stream before the new copy.  STRATA_FS_SLOTS defaults to 8 with the ring.
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -44,6 +54,7 @@ struct ForesightSwap {
         const uint8_t* src = nullptr;        ///< the host blob being copied in
         uint64_t bytes = 0;
         void* ev = nullptr;                  ///< cudaEvent_t on the layer's card
+        ExpertSource* from = nullptr;         ///< STRATA_RING: the source the filler reads the expert from (src stays null)
     };
 
     int slots = 0, budget = 32, admit = 1, depth = 4;
@@ -63,6 +74,14 @@ struct ForesightSwap {
     // counters (dispatch thread)
     uint64_t hits = 0, copies = 0, busy = 0, over_budget = 0, pending = 0, predicted = 0;   // (under smu_)
     bool verify = false;                     ///< STRATA_FS_VERIFY=1: read every landed slot back and compare (slow, tests)
+    // STRATA_RING
+    bool ring = false;
+    int ring_threads = 4;
+    uint8_t* ready_dev = nullptr;            ///< the router's ring table (route_ring_ptr), n_layers x n_expert bytes
+    const int32_t* host_res = nullptr;       ///< the cache's residency (n_layers x n_expert, slot or -1): a ring slot whose expert it holds is free
+    std::atomic<int64_t> at_layer{-1};       ///< the layer the pool works on (set first thing in each dispatch)
+    std::atomic<uint64_t> ring_reads{0}, ring_read_fail{0};
+    uint64_t ring_too_late = 0, ring_guarded = 0, ring_all_fresh = 0;   // (under smu_)
     uint64_t verify_ok = 0, verify_bad = 0;
 
     /// Allocates the slots on each card and starts the filler.  `card_of_layer[l]` indexes `devices` (CUDA ids).
@@ -89,7 +108,9 @@ private:
     std::deque<int64_t> queue_;              ///< slot indices whose copy the filler issues
     bool stop_ = false;
     std::thread filler_;
+    std::vector<std::thread> ring_fillers_;
     void fill_loop();
+    void ring_fill_loop(int t);
 };
 
 ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,

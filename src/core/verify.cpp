@@ -504,6 +504,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         strata::kernels::route_rows_alloc(g.n_layers);
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_TRACE_ADAPT") != nullptr)
         strata::kernels::route_detail_alloc();
+    // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
+    if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
+        strata::kernels::route_ring_alloc((size_t) (g.n_layers * g.n_expert));
     if (route_resident_cfg().margin > 0.0f) {
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
         // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
@@ -1433,7 +1436,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs,
                                       n <= 8 && !strata::kernels::route_rows_active() ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr,
                                       n <= 8 ? strata::kernels::route_rows_layer(l) : nullptr,
-                                      n <= 8 ? strata::kernels::route_repl_layer(l, g.n_expert) : nullptr);
+                                      n <= 8 ? strata::kernels::route_repl_layer(l, g.n_expert) : nullptr,
+                                      n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (ar_on()) {
