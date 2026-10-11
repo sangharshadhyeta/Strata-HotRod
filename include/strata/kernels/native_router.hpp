@@ -51,6 +51,16 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
 /// its copy has landed (set on the copy stream after the copy, cleared before the slot is refilled).  The router counts such an
 /// expert as resident: a pick it holds is computed exactly on the GPU from the slot, and it may serve as a stand-in.  Allocated
 /// once, outside graph capture, before the first window.
+/// STRATA_RING_GPU (the look-ahead as a graph node): at each layer l of a decode window the router of layers l+1 and l+2 is applied to
+/// layer l's MoE input on the GPU and their top-10 are written straight into host-mapped memory, [n_layers][2][8 rows][10], where the
+/// pool reads them at layer l's dispatch (after the doorbell, which the kernels precede in the stream).  Punctual: a fixed lead of one
+/// and two layers, no thread to be busy or late.  Allocated once, outside graph capture.
+void route_pred_alloc(int64_t n_layers);
+bool route_pred_active();
+const int32_t* route_pred_host();                                   ///< the table the host reads
+int32_t* route_pred_dev(int64_t target_layer, int dist);            ///< dist 1 or 2: the slab of 8 x 10 ids, device alias
+float* route_pred_logits();                                          ///< scratch, 8 x 512 floats
+float* route_pred_weights();                                         ///< scratch, 8 x 10 floats
 void route_ring_alloc(size_t n);
 uint8_t* route_ring_ptr();                                   ///< the whole table (nullptr when not allocated)
 const uint8_t* route_ring_layer(int64_t layer, int64_t n_expert);   ///< the layer's slice, nullptr when not allocated

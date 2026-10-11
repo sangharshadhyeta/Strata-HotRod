@@ -352,6 +352,29 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
+static int32_t* g_pred_host = nullptr;
+static int32_t* g_pred_dev = nullptr;
+static float* g_pred_logits = nullptr;
+static float* g_pred_w = nullptr;
+void route_pred_alloc(int64_t n_layers) {
+    if (g_pred_host != nullptr || n_layers <= 0) return;
+    const size_t n = (size_t) n_layers * 2 * 8 * 10;
+    if (cudaHostAlloc((void**) &g_pred_host, n * sizeof(int32_t), cudaHostAllocMapped) != cudaSuccess) { cudaGetLastError(); g_pred_host = nullptr; return; }
+    if (cudaHostGetDevicePointer((void**) &g_pred_dev, g_pred_host, 0) != cudaSuccess ||
+        cudaMalloc((void**) &g_pred_logits, 8 * 512 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &g_pred_w, 8 * 10 * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        g_pred_host = nullptr;
+        g_pred_dev = nullptr;
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) g_pred_host[i] = -1;
+}
+bool route_pred_active() { return g_pred_host != nullptr; }
+const int32_t* route_pred_host() { return g_pred_host; }
+int32_t* route_pred_dev(int64_t target_layer, int dist) { return g_pred_dev ? g_pred_dev + ((size_t) target_layer * 2 + (size_t) (dist - 1)) * 80 : nullptr; }
+float* route_pred_logits() { return g_pred_logits; }
+float* route_pred_weights() { return g_pred_w; }
 static uint8_t* g_ring = nullptr;
 static size_t g_ring_n = 0;
 void route_ring_alloc(size_t n) {

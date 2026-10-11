@@ -8100,6 +8100,13 @@ int main(int argc, char** argv) {
             for (int64_t l = 0; l < g.n_layers; ++l) card[(size_t) l] = multi_gpu ? stage_of(l) : 0;
             fs_swap.reset(strata::core::foresight_swap_from_env(g.n_layers, g.n_expert, card, devs));
             if (fs_swap) fs_swap->host_res = drive.d.host_res;   // STRATA_RING: a ring slot whose expert the cache holds is free
+            if (fs_swap && fs_swap->ring && strata::kernels::route_pred_active()) {   // STRATA_RING_GPU: the look-ahead is a graph node
+                drive.d.gpu_pred = strata::kernels::route_pred_host();
+                const char* rr = std::getenv("STRATA_RING_RANKS");
+                drive.d.gpu_pred_ranks = std::max(1, std::min(10, rr != nullptr ? std::atoi(rr) : 2));
+                std::fprintf(stderr, "strata serve: look-ahead ring: the look-ahead runs on the GPU (layers +1 and +2, ranks 0-%d)\n",
+                             drive.d.gpu_pred_ranks - 1);
+            }
             drive.d.fs = fs_swap.get();
             if (fs_swap && drive.d.lookahead != nullptr) lookahead.set_foresight(fs_swap.get());
         }

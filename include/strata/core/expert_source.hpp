@@ -457,6 +457,11 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
+    /// STRATA_RING_GPU: the GPU look-ahead's table ([n_layers][2][8][10] ids, route_pred_host); when set the pool feeds the ring from it at
+    /// every layer's dispatch and the CPU look-ahead thread is not used.  `gpu_pred_ranks`: the ranks (per token) it feeds (STRATA_RING_RANKS).
+    const int32_t* gpu_pred = nullptr;
+    int gpu_pred_ranks = 2;
+    int64_t pred_fed = 0;          ///< experts the GPU look-ahead offered the ring (not resident, before its own dedupe)
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe

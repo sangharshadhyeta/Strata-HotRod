@@ -504,6 +504,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         strata::kernels::route_rows_alloc(g.n_layers);
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_TRACE_ADAPT") != nullptr)
         strata::kernels::route_detail_alloc();
+    // STRATA_RING_GPU (default on with the ring): the look-ahead as a graph node, its table (allocated here, before any graph capture)
+    if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0 &&
+        (std::getenv("STRATA_RING_GPU") == nullptr || std::atoi(std::getenv("STRATA_RING_GPU")) != 0) && g.n_expert == 512)
+        strata::kernels::route_pred_alloc(g.n_layers);
     // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
         strata::kernels::route_ring_alloc((size_t) (g.n_layers * g.n_expert));
@@ -1423,6 +1427,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+        }
+        // STRATA_RING_GPU: the look-ahead as a graph node.  Layers l+1 and l+2's routers on THIS layer's MoE input (the residual stream
+        // changes little from one layer to the next), their top-10 into host-mapped memory before the doorbell below.
+        if (strata::kernels::route_pred_active() && n <= 8 && NE == 512 && K == 10 && native_router_enabled()) {
+            try {
+                for (int dist = 1; dist <= 2; ++dist) {
+                    if (l + dist >= g.n_layers) break;
+                    const LayerView vt(wt, l + dist);
+                    const WeightRef* w_next = vt.get("ffn_gate_inp.weight");
+                    if (w_next == nullptr || w_next->kind != WeightKind::Bf16InF32) continue;
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_next->data, strata::kernels::route_pred_logits(), NE, N,
+                                              NE, n, cs);
+                    native_router_top10_multi(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
+                                              strata::kernels::route_pred_weights(), n, cs);
+                }
+            } catch (const std::exception& e) { err = "verify look-ahead node: " + std::string(e.what()); return false; }
         }
         // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
         // resident experts; the weights stay the router's (route_prior.cu)

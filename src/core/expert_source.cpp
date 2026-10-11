@@ -3572,7 +3572,21 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (d.fs != nullptr) d.fs->at_layer.store(d.layers, std::memory_order_release);   // STRATA_RING's refill guard
-    if (d.lookahead != nullptr) {
+    if (d.gpu_pred != nullptr && d.fs != nullptr && d.fs->ring && d.host_res != nullptr && n_tok <= 8) {
+        // the GPU look-ahead's picks for the next two layers (computed on this layer's input, before the doorbell this dispatch followed)
+        for (int dist = 1; dist <= 2; ++dist) {
+            const int64_t target = d.layers + dist;
+            if (target >= d.fs->n_layers) break;
+            for (int64_t t = 0; t < n_tok; ++t)
+                for (int r = 0; r < d.gpu_pred_ranks && r < 10; ++r) {
+                    const int32_t e = d.gpu_pred[(((size_t) target * 2 + (size_t) (dist - 1)) * 8 + (size_t) t) * 10 + (size_t) r];
+                    if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+                    d.fs->predict(d.src, target, e);
+                    ++d.pred_fed;
+                }
+        }
+    }
+    if (d.lookahead != nullptr && d.gpu_pred == nullptr) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
             d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
