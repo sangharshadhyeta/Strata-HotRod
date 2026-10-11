@@ -3681,8 +3681,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
                     // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
-                } else if (d.fs != nullptr && d.fs->take(d.layers, e, ptr)) {
+                } else if (d.fs != nullptr && (d.fs->take(d.layers, e, ptr) || (d.fs->ring && d.fs->fetch_now(d.src, d.layers, e, ptr)))) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
+                                                   // (STRATA_RING: or it was read into a slot just now: the CPU computes nothing)
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
@@ -4851,6 +4852,92 @@ void ForesightSwap::ring_fill_loop(int t) {
     }
 }
 
+bool ForesightSwap::fetch_now(ExpertSource* src, int64_t layer, int32_t expert, unsigned long long& ptr) {
+    if (!ring || src == nullptr || failed.load(std::memory_order_relaxed) || layer < 0 || layer >= n_layers || expert < 0 ||
+        expert >= n_expert)
+        return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t key = (size_t) (layer * n_expert + expert);
+    const int c = layer_card[(size_t) layer];
+    bool queued_now = false;
+    int s;
+    {
+        std::lock_guard<std::mutex> smu_lk(smu_);
+        const uint64_t now = completed.load(std::memory_order_acquire);
+        s = where[key];
+        if (s < 0) {   // not on its way: take a slot of the layer (the router of this layer has run: its flags can change)
+            int best = -1;
+            uint64_t best_ref = ~0ull;
+            for (int q = 0; q < slots; ++q) {
+                Slot& sl = slot[(size_t) (layer * slots + q)];
+                if (sl.loading) {
+                    if (!sl.issued.load(std::memory_order_acquire)) continue;
+                    const cudaError_t qe = cudaEventQuery((cudaEvent_t) sl.ev);
+                    if (qe != cudaSuccess) { if (qe != cudaErrorNotReady) cudaGetLastError(); continue; }
+                    sl.loading = false;
+                    sl.ready = true;
+                }
+                if (sl.expert < 0) { best = q; break; }
+                if (host_res != nullptr && host_res[(size_t) (layer * n_expert + sl.expert)] >= 0) { best = q; break; }
+                if (sl.last_ref + (uint64_t) depth > now) continue;   // a plan of the last windows may still read it
+                if (sl.last_ref < best_ref) { best_ref = sl.last_ref; best = q; }
+            }
+            if (best < 0) { ++now_none; return false; }
+            Slot& sl = slot[(size_t) (layer * slots + best)];
+            cudaStream_t cs = (cudaStream_t) card_stream[(size_t) c];
+            if (sl.expert >= 0) {
+                where[(size_t) (layer * n_expert + sl.expert)] = -1;
+                if (cudaMemsetAsync(ready_dev + (size_t) (layer * n_expert + sl.expert), 0, 1, cs) != cudaSuccess) {
+                    cudaGetLastError();
+                    ++now_none;
+                    return false;
+                }
+            }
+            sl.expert = expert;
+            sl.ready = false;
+            sl.loading = true;
+            sl.issued.store(false, std::memory_order_relaxed);
+            sl.src = nullptr;
+            sl.from = src;
+            sl.last_ref = now;
+            where[key] = (int16_t) best;
+            ++copies;
+            s = best;
+            queued_now = true;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                queue_.push_front(layer * slots + best);   // before the predictions: this one is waited for
+            }
+            cv_.notify_one();
+        }
+    }
+    Slot& sl = slot[(size_t) (layer * slots + s)];
+    // the filler reads the file and queues the copy (issued), then the copy finishes on the card's stream
+    const auto deadline = t0 + std::chrono::milliseconds(200);
+    while (!sl.issued.load(std::memory_order_acquire)) {
+        {
+            std::lock_guard<std::mutex> smu_lk(smu_);
+            if (sl.expert != expert || failed.load(std::memory_order_relaxed)) { ++now_none; return false; }   // the filler gave the slot back
+        }
+        if (std::chrono::steady_clock::now() > deadline) { ++now_timeout; return false; }
+        std::this_thread::yield();
+    }
+    if (cudaEventSynchronize((cudaEvent_t) sl.ev) != cudaSuccess) { cudaGetLastError(); ++now_timeout; return false; }
+    {
+        std::lock_guard<std::mutex> smu_lk(smu_);
+        if (sl.expert != expert) { ++now_none; return false; }
+        sl.ready = true;
+        sl.loading = false;
+        sl.last_ref = completed.load(std::memory_order_acquire);
+        ptr = sl.dptr;
+        ++hits;
+        ++now_hits;
+        if (!queued_now) ++now_waited;
+        now_wait_us += (uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    }
+    return true;
+}
+
 bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr) {
     std::lock_guard<std::mutex> smu_lk(smu_);
     const int s = where[(size_t) (layer * n_expert + expert)];
@@ -5032,6 +5119,12 @@ std::string ForesightSwap::report() const {
                       (unsigned long long) ring_reads.load(), (unsigned long long) ring_read_fail.load(),
                       (unsigned long long) ring_too_late, (unsigned long long) ring_guarded, (unsigned long long) ring_all_fresh);
         r += buf;
+        std::snprintf(buf, sizeof buf, "; exact on the GPU at the plan: %llu fetched now (%llu of them an in-flight copy waited for), "
+                                       "%.0f us each on average, %llu no slot, %llu timed out",
+                      (unsigned long long) now_hits, (unsigned long long) now_waited,
+                      now_hits ? (double) now_wait_us / (double) now_hits : 0.0, (unsigned long long) now_none,
+                      (unsigned long long) now_timeout);
+        r += buf;
     }
     if (verify) r += ", verified " + std::to_string(verify_ok) + " ok / " + std::to_string(verify_bad) + " BAD";
     return r;
@@ -5059,9 +5152,10 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     f->ring = ring;
     f->ready_dev = ring ? strata::kernels::route_ring_ptr() : nullptr;
     f->ring_threads = std::min(16, env_int("STRATA_RING_THREADS", 4, 1));
+    if (ring && std::getenv("STRATA_FS_DEPTH") == nullptr) f->depth = 2;   // one GPU, no pipelined windows: a plan is done with its slots by the next window
     f->budget = env_int("STRATA_FS_BUDGET", ring ? 1024 : 32, 1);
     f->admit = env_int("STRATA_FS_ADMIT", 1, 1);
-    f->depth = env_int("STRATA_FS_DEPTH", 4, 2);
+    f->depth = env_int("STRATA_FS_DEPTH", ring ? 2 : 4, 2);
     f->verify = env_int("STRATA_FS_VERIFY", 0, 0) != 0;
     std::string err;
     if (!f->init(std::min(slots, 64), layers, experts, card_of_layer, devices, err)) {

@@ -82,6 +82,7 @@ struct ForesightSwap {
     std::atomic<int64_t> at_layer{-1};       ///< the layer the pool works on (set first thing in each dispatch)
     std::atomic<uint64_t> ring_reads{0}, ring_read_fail{0};
     uint64_t ring_too_late = 0, ring_guarded = 0, ring_all_fresh = 0;   // (under smu_)
+    uint64_t now_hits = 0, now_waited = 0, now_none = 0, now_timeout = 0, now_wait_us = 0;   // fetch_now (dispatch thread)
     uint64_t verify_ok = 0, verify_bad = 0;
 
     /// Allocates the slots on each card and starts the filler.  `card_of_layer[l]` indexes `devices` (CUDA ids).
@@ -93,6 +94,10 @@ struct ForesightSwap {
     bool take(int64_t layer, int32_t expert, unsigned long long& ptr);
     /// The pool, for an expert the CPU computes now: maybe copy it into a slot of its layer for the next windows.
     void note_miss(ExpertSource* src, int64_t layer, int32_t expert);
+    /// STRATA_RING, the pool, for an expert no cache and no landed slot holds (its predicted copy was late or never made): the GPU
+    /// still computes it exactly - it is read into a slot of its layer NOW (or the in-flight copy is waited for) and its address
+    /// returned once it has landed.  False only when no slot is free or the read fails: then (and only then) the CPU computes it.
+    bool fetch_now(ExpertSource* src, int64_t layer, int32_t expert, unsigned long long& ptr);
     /// The router look-ahead (any thread), for an expert the next layer's router predicts and no cache holds: maybe copy
     /// it into a slot of that layer now, so that the copy has landed when the layer's plan is made.  One prefetch design
     /// with note_miss (the same slots, budget and reuse rule); a prediction only ever moves bytes, the plan is still made
