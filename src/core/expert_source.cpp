@@ -3681,7 +3681,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
                     // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
-                } else if (d.fs != nullptr && (d.fs->take(d.layers, e, ptr) || (d.fs->ring && d.fs->fetch_now(d.src, d.layers, e, ptr)))) {
+                } else if (d.fs != nullptr && (d.fs->take(d.layers, e, ptr) || (d.fs->ring && d.fs->ring_wait && d.fs->fetch_now(d.src, d.layers, e, ptr)))) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                                                    // (STRATA_RING: or it was read into a slot just now: the CPU computes nothing)
                 } else {
@@ -5150,6 +5150,7 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     auto* f = new ForesightSwap();
     auto env_int = [](const char* name, int def, int lo) { const char* e = std::getenv(name); const int x = e ? std::atoi(e) : def; return x < lo ? lo : x; };
     f->ring = ring;
+    f->ring_wait = !(rv != nullptr && std::atoi(rv) == 2);
     f->ready_dev = ring ? strata::kernels::route_ring_ptr() : nullptr;
     f->ring_threads = std::min(16, env_int("STRATA_RING_THREADS", 4, 1));
     if (ring && std::getenv("STRATA_FS_DEPTH") == nullptr) f->depth = 2;   // one GPU, no pipelined windows: a plan is done with its slots by the next window
@@ -5166,7 +5167,9 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     std::fprintf(stderr, "strata serve: foresight swap: %d slots per layer on %zu card(s), up to %d copies per card and "
                          "window, admit after %d miss(es), reuse after %d windows%s\n",
                  f->slots, devices.size(), f->budget, f->admit, f->depth,
-                 ring ? " - LOOK-AHEAD RING: predicted experts read from the file tier, landed ones routed as resident" : "");
+                 ring ? (f->ring_wait ? " - LOOK-AHEAD RING: predicted experts read from the file tier, a late one waited for (no CPU)"
+                                 : " - LOOK-AHEAD RING (hybrid): predicted experts read from the file tier, a late one left to the CPU")
+                 : "");
     if (ring) std::fprintf(stderr, "strata serve: look-ahead ring: %d filler threads\n", f->ring_threads);
     return f;
 }

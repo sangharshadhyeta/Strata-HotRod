@@ -20,6 +20,8 @@
 // STRATA_FS_ADMIT (misses within the last 4 windows before an expert is copied, default 1), STRATA_FS_DEPTH,
 // STRATA_FS_VERIFY=1 (test mode: every slot is read back and compared with its source the first time it is used).
 //
+// STRATA_RING=2 is the hybrid: the same ring, but an expert whose predicted copy has not landed at the plan is computed by the CPU as
+// without the ring (the GPU never waits).  STRATA_RING=1 (below) waits for it instead, so the CPU computes nothing.
 // STRATA_RING=1 (the look-ahead ring, after solid.cpp's lookahead admission; opt-in): the swap space becomes the GPU-only path for
 // the ranks the stand-in floor would otherwise replace (STRATA_RING_RANKS, default 2: ranks 0-1).  The router look-ahead predicts
 // those ranks for the next TWO layers; filler threads (STRATA_RING_THREADS, default 4) read each predicted expert from the file tier
@@ -76,6 +78,7 @@ struct ForesightSwap {
     bool verify = false;                     ///< STRATA_FS_VERIFY=1: read every landed slot back and compare (slow, tests)
     // STRATA_RING
     bool ring = false;
+    bool ring_wait = true;                   ///< STRATA_RING=1: a late expert is fetched and waited for; STRATA_RING=2: it is left to the CPU (no GPU wait)
     int ring_threads = 4;
     uint8_t* ready_dev = nullptr;            ///< the router's ring table (route_ring_ptr), n_layers x n_expert bytes
     const int32_t* host_res = nullptr;       ///< the cache's residency (n_layers x n_expert, slot or -1): a ring slot whose expert it holds is free
