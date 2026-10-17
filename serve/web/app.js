@@ -208,8 +208,12 @@ function renderResidency(r) {
   const card = $("res-card");
   card.hidden = !r;
   if (!r) return;                                  // an older engine, or no swap round yet
-  const canvas = $("res-canvas"), n = r.experts, rows = r.rows;
-  if (canvas.width !== n || canvas.height !== rows.length) { canvas.width = n; canvas.height = rows.length; }
+  const canvas = $("res-canvas"), n = r.experts, rows = r.rows, L = rows.length;
+  // one layer = a block of bw x bh cells (512 experts: 32 x 16), the blocks tiled bcols across with a 1-cell gap: every expert is a square
+  const bw = n % 32 === 0 ? 32 : Math.ceil(Math.sqrt(n)), bh = Math.ceil(n / bw);
+  const bcols = Math.min(L, 8), brows = Math.ceil(L / bcols);
+  const cw = bcols * bw + (bcols - 1), ch = brows * bh + (brows - 1);
+  if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
   const css = getComputedStyle(document.documentElement);
   const tone = (name, fallback) => {                // "#rrggbb" of a token, drawn into an ImageData
     const v = css.getPropertyValue(name).trim();
@@ -222,10 +226,15 @@ function renderResidency(r) {
   const idle = acc.map((c, i) => Math.round(0.28 * c + 0.72 * surf[i]));
   const colors = [bg, idle, acc, hot];
   const ctx = canvas.getContext("2d");
-  const img = ctx.createImageData(n, rows.length);
-  rows.forEach((row, y) => {
-    for (let x = 0; x < n; x++) {
-      const c = colors[row.charCodeAt(x) - 48] || bg, o = (y * n + x) * 4;
+  const img = ctx.createImageData(cw, ch);
+  const gap = tone("--st-line", "#e5e7eb");           // the 1-cell gaps between the layers' blocks
+  for (let i = 0; i < cw * ch; i++) {
+    img.data[i * 4] = gap[0]; img.data[i * 4 + 1] = gap[1]; img.data[i * 4 + 2] = gap[2]; img.data[i * 4 + 3] = 255;
+  }
+  rows.forEach((row, l) => {
+    const x0 = (l % bcols) * (bw + 1), y0 = Math.floor(l / bcols) * (bh + 1);
+    for (let e = 0; e < n; e++) {
+      const c = colors[row.charCodeAt(e) - 48] || bg, o = ((y0 + Math.floor(e / bw)) * cw + x0 + (e % bw)) * 4;
       img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
     }
   });
@@ -828,7 +837,7 @@ async function send() {
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
-  let firstAt = null, thinkStart = null, usage = null, frame = 0;
+  let firstAt = null, thinkStart = null, usage = null, timings = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
   try {
     const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
@@ -856,6 +865,7 @@ async function send() {
         try { j = JSON.parse(data); } catch (e) { continue; }
         if (j.error) throw new Error(j.error.message || "the engine reported an error");
         if (j.usage) usage = j.usage;
+        if (j.timings) timings = j.timings;   // the engine's own speeds: the prompt read and the decode
         if (j.strata_mcp) onTool(m, j.strata_mcp);
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
@@ -882,7 +892,12 @@ async function send() {
   const n = usage ? usage.completion_tokens : null;
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
+    // under the answer: the speed the engine measured for reading the prompt and for decoding (as llama.cpp's own page shows them),
+    // else this page's own average from the first token
+    const rd = timings && timings.prompt_per_second, wr = timings && timings.predicted_per_second;
+    const speeds = (rd ? ` · prompt ${fmt(rd, 1)} tok/s` : "") +
+                   (wr ? ` · decode ${fmt(wr, 1)} tok/s` : secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : "");
+    m.meta = `${fmt(n)} tokens${speeds}${m.stopped ? " · stopped" : ""}` +
              (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
   } else if (m.stopped) {
     m.meta = "Stopped";
