@@ -150,6 +150,63 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
+// The same contract for other (experts, top-k) shapes - Qwen3.6-35B-A3B's 256 / 8 - one warp per token, n_tok tokens
+// (8 per block).  The 512 / 10 path keeps its own kernels above (the Flash-Next bits), this template is only used
+// for the other shapes.
+template <int NE, int K>
+__launch_bounds__(256, 1)
+__global__ void route_topk(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                           int n_tok) {
+    static_assert(NE % 32 == 0 && K <= 32, "experts in whole warps, at most 32 picks");
+    constexpr int V = NE / 32;
+    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
+    if (tk >= n_tok) return;
+    logits += (size_t) tk * NE; ids += (size_t) tk * K; weights += (size_t) tk * K;
+    const int lane = threadIdx.x;
+    float values[V];
+#pragma unroll
+    for (int i = 0; i < V; ++i) values[i] = logits[lane + i * 32];
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < V; ++i) maximum = max(maximum, values[i]);
+    maximum = warp_max(maximum);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < V; ++i) {
+        values[i] = expf(values[i] - maximum);
+        sum += values[i];
+    }
+    const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+    for (int i = 0; i < V; ++i) {
+        values[i] *= reciprocal;
+        if (__isnanf(values[i])) values[i] = -FLT_MAX;
+    }
+    float selected = 0.0f, selected_sum = 0.0f;
+    for (int rank = 0; rank < K; ++rank) {
+        float best = values[0];
+        int expert = lane;
+#pragma unroll
+        for (int i = 1; i < V; ++i) {
+            if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+        }
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+        }
+        if ((expert & 31) == lane) {
+            values[expert / 32] = -INFINITY;
+            ids[rank] = expert;
+            selected_sum += best;
+        }
+        if (rank == lane) selected = best;
+    }
+    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < K) weights[lane] = selected * inverse_selected_sum;
+}
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -178,6 +235,22 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
+bool native_router_topk_supported(int n_expert, int k) { return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8); }
+void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream) {
+    if (n_expert == 512 && k == 10) {   // Flash-Next: the pinned kernels above, unchanged
+        if (n_tok == 1) native_router_top10(logits, ids, weights, stream);
+        else native_router_top10_multi(logits, ids, weights, n_tok, stream);
+        return;
+    }
+    if (!stream || n_tok < 1 || !native_router_topk_supported(n_expert, k) ||
+        !valid(logits, (size_t) n_tok * n_expert * 4) || !valid(ids, (size_t) n_tok * k * 4) ||
+        !valid(weights, (size_t) n_tok * k * 4))
+        throw std::invalid_argument("native_router_topk: a stream, a supported (experts, k) and aligned buffers");
+    route_topk<256, 8><<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+        logits, ids, weights, n_tok);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
 
 // STRATA_ROUTE_RESIDENT (EXPERIMENTAL, opt-in, changes the output): residency-biased routing for 512 x 10.
 // After the top-10: for the ranks lo..hi a non-resident expert is replaced by the best resident expert not already
@@ -185,13 +258,21 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
 // logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
 // stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
 static unsigned long long* g_detail = nullptr;   // the decode rows' detail counters (route_detail_alloc), see below
+//
+// One warp per token (upstream 0.1.45's form).  This was one THREAD per token scanning all 512 experts for every rank (4 ranks x 512 x 12 scalar
+// ops on up to 6 threads, on the critical stream, once per layer): upstream measured the swap at 2.2-2.75 ms of a 19-22 ms window and 0.33 ms in
+// the warp form.  The ranks are still visited in order (a swap changes the set already picked), but the scan is coalesced (lane j reads f = j,
+// j + 32, ...) and reduced within the warp.  The bits are unchanged: a strictly greater logit wins, the smallest expert index breaks ties, and the
+// softmax is the same expression.  Our options ride on lane 0 (the counters, the wanted-expert count, the per-row record, the CCE bias) or are
+// reduced in the warp (the stand-in's place in the router's ranking).
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
                                  unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl,
                                  const uint8_t* __restrict__ ring) {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.x;
     if (t >= n_tok) return;
+    const int lane = (int) threadIdx.x;
     // the floor lives in host-mapped memory, read at every launch, so a captured graph follows a change the host makes between
     // windows: the floor, the margin and the edge margin
     const int lo = ((const volatile RouteCfg*) cfg)->lo;
@@ -205,114 +286,139 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     const float wmax = ((const volatile RouteCfg*) cfg)->wmax;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
-    // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
-    // (x1e6), [11] rows, [12] rows whose top-1 is not resident, [13] rows with a non-resident pick among the top 5
-    if (detail != nullptr) {
-        int top5 = 0;
-        for (int r = 0; r < 10; ++r) {
-            if (res[id[r]] < 0) {
-                atomicAdd(detail + r, 1ull);
-                atomicAdd(detail + 10, (unsigned long long) (weights[(size_t) t * 10 + r] * 1e6f));
-                if (r == 0) atomicAdd(detail + 12, 1ull);
-                if (r < 5) top5 = 1;
+    if (lane == 0) {
+        // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
+        // (x1e6), [11] rows, [12] rows whose top-1 is not resident, [13] rows with a non-resident pick among the top 5
+        if (detail != nullptr) {
+            int top5 = 0;
+            for (int r = 0; r < 10; ++r) {
+                if (res[id[r]] < 0) {
+                    atomicAdd(detail + r, 1ull);
+                    atomicAdd(detail + 10, (unsigned long long) (weights[(size_t) t * 10 + r] * 1e6f));
+                    if (r == 0) atomicAdd(detail + 12, 1ull);
+                    if (r < 5) top5 = 1;
+                }
             }
+            atomicAdd(detail + 11, 1ull);
+            if (top5) atomicAdd(detail + 13, 1ull);
+            // the router weight at each rank (x1e6, summed over rows): [33 + r]
+            for (int r = 0; r < 10; ++r) atomicAdd(detail + 33 + r, (unsigned long long) (weights[(size_t) t * 10 + r] * 1e6f));
         }
-        atomicAdd(detail + 11, 1ull);
-        if (top5) atomicAdd(detail + 13, 1ull);
-        // the router weight at each rank (x1e6, summed over rows): [33 + r]
-        for (int r = 0; r < 10; ++r) atomicAdd(detail + 33 + r, (unsigned long long) (weights[(size_t) t * 10 + r] * 1e6f));
-    }
-    // what the router WANTS, counted before any swap: the picks the host sees afterwards are confined to resident experts
-    // and cannot say which expert the swap round should bring in (`want` is the layer's slice of the usage counter)
-    if (want != nullptr)
-        for (int r = 0; r < 10; ++r) atomicAdd(want + id[r], r < lo ? 1.0f : want_lo);   // STRATA_WANT_LOW: a pick the floor replaces counts less
-    // SPEC 13.40: the same picks, kept per ROW of the window instead of summed, so the host can count only the rows whose input token was
-    // kept once the acceptance is known (`rows` is the layer's [8 rows][10] slice; the atomic count above is then off)
-    if (rows != nullptr)
-        for (int r = 0; r < 10; ++r) rows[t * 10 + r] = id[r];
-    // CCE router bias (Cache-Conditional Experts, arXiv 2412.00099; solid.cpp LLAMA_MOE_CACHE_BIAS): the top-10 is chosen again on the
-    // logits with `bias` (= ln(1 + beta), i.e. the score times 1 + beta) added to every resident expert, so a near tie goes to the expert
-    // that costs nothing to fetch.  Counted above (want, rows, detail) from the router's own picks.  The weights stay the softmax of the
-    // UNBIASED logits of the chosen experts: every chosen expert is computed exactly as the router would score it.
-    if (bias > 0.f) {
-        int32_t pick[10];
-        for (int r = 0; r < 10; ++r) {
-            int best = -1;
-            float bs = -INFINITY;
-            for (int f = 0; f < 512; ++f) {
-                bool used = false;
-                for (int q = 0; q < r; ++q) used |= pick[q] == f;
-                const float s = l[f] + (res[f] >= 0 ? bias : 0.f);
-                if (!used && s > bs) { bs = s; best = f; }
+        // what the router WANTS, counted before any swap: the picks the host sees afterwards are confined to resident experts
+        // and cannot say which expert the swap round should bring in (`want` is the layer's slice of the usage counter)
+        if (want != nullptr)
+            for (int r = 0; r < 10; ++r) atomicAdd(want + id[r], r < lo ? 1.0f : want_lo);   // STRATA_WANT_LOW: a pick the floor replaces counts less
+        // SPEC 13.40: the same picks, kept per ROW of the window instead of summed, so the host can count only the rows whose input token was
+        // kept once the acceptance is known (`rows` is the layer's [8 rows][10] slice; the atomic count above is then off)
+        if (rows != nullptr)
+            for (int r = 0; r < 10; ++r) rows[t * 10 + r] = id[r];
+        // CCE router bias (Cache-Conditional Experts, arXiv 2412.00099; solid.cpp LLAMA_MOE_CACHE_BIAS): the top-10 is chosen again on the
+        // logits with `bias` (= ln(1 + beta), i.e. the score times 1 + beta) added to every resident expert, so a near tie goes to the expert
+        // that costs nothing to fetch.  Counted above (want, rows, detail) from the router's own picks.  The weights stay the softmax of the
+        // UNBIASED logits of the chosen experts: every chosen expert is computed exactly as the router would score it.
+        if (bias > 0.f) {
+            int32_t pick[10];
+            for (int r = 0; r < 10; ++r) {
+                int best = -1;
+                float bs = -INFINITY;
+                for (int f = 0; f < 512; ++f) {
+                    bool used = false;
+                    for (int q = 0; q < r; ++q) used |= pick[q] == f;
+                    const float s = l[f] + (res[f] >= 0 ? bias : 0.f);
+                    if (!used && s > bs) { bs = s; best = f; }
+                }
+                pick[r] = best;
             }
-            pick[r] = best;
+            float m = -INFINITY;
+            for (int r = 0; r < 10; ++r) m = fmaxf(m, l[pick[r]]);
+            float ex[10], sum = 0.f;
+            for (int r = 0; r < 10; ++r) { ex[r] = expf(l[pick[r]] - m); sum += ex[r]; }
+            for (int r = 0; r < 10; ++r) { id[r] = pick[r]; weights[(size_t) t * 10 + r] = ex[r] / sum; }
         }
-        float m = -INFINITY;
-        for (int r = 0; r < 10; ++r) m = fmaxf(m, l[pick[r]]);
-        float ex[10], sum = 0.f;
-        for (int r = 0; r < 10; ++r) { ex[r] = expf(l[pick[r]] - m); sum += ex[r]; }
-        for (int r = 0; r < 10; ++r) { id[r] = pick[r]; weights[(size_t) t * 10 + r] = ex[r] / sum; }
     }
+    __syncwarp();   // lane 0's writes to the ids and weights are what the other lanes read next
+    int32_t my[10];
+    for (int r = 0; r < 10; ++r) my[r] = id[r];
     // STRATA_RING: an expert whose look-ahead ring copy has landed counts as resident (the host plan finds it in the ring)
     auto have = [&](int f) { return res[f] >= 0 || (ring != nullptr && ring[f] != 0); };
     int swaps = 0, tail = 0, before = 0;
-    for (int r = 0; r < 10; ++r) before += !have(id[r]);
+    if (lane == 0)
+        for (int r = 0; r < 10; ++r) before += !have(my[r]);
     for (int r = (edge >= 0.f && lo > 0) ? lo - 1 : lo; r <= hi && r < 10; ++r) {
-        const int e = id[r];
-        if (have(e)) continue;
+        const int e = my[r];
+        if (have(e)) continue;                          // already resident: uniform across the warp
         if (wmax > 0.f && weights[(size_t) t * 10 + r] >= wmax) continue;   // a heavy pick stays exact: fetched / computed on the CPU
-        ++tail;
-        int best = -1;
-        float bl = -INFINITY;
-        for (int f = 0; f < 512; ++f) {
-            if (!have(f) || l[f] <= bl) continue;
+        if (lane == 0) ++tail;
+        float bv = -INFINITY;
+        int bi = -1;
+        for (int f = lane; f < 512; f += 32) {
+            if (!have(f)) continue;
             bool used = false;
-            for (int q = 0; q < 10; ++q) used |= id[q] == f;
-            if (!used) { best = f; bl = l[f]; }
+            for (int q = 0; q < 10; ++q) used |= my[q] == f;
+            if (used) continue;
+            if (l[f] > bv) { bv = l[f]; bi = f; }
         }
-        // the edge rank (lo - 1, a fractional floor such as 1.5) is replaced only by a close substitute (within `edge`)
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) { bv = ov; bi = oi; }
+        }
+        bv = __shfl_sync(0xffffffffu, bv, 0);           // every lane decides the same way from here
+        bi = __shfl_sync(0xffffffffu, bi, 0);
         // item 21: the stand-in's place in the router's own ranking of all 512 experts (10 = the router's next choice after its ten
         // picks); a stand-in further down than `maxrank` is refused and the exact expert is fetched instead
-        if (best >= 0 && maxrank > 0) {
+        if (bi >= 0 && maxrank > 0) {
             int place = 0;
-            for (int f = 0; f < 512; ++f) place += l[f] > bl;
-            if (place >= maxrank) best = -1;
+            for (int f = lane; f < 512; f += 32) place += l[f] > bv;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) place += __shfl_xor_sync(0xffffffffu, place, off);
+            if (place >= maxrank) bi = -1;
         }
-        if (best >= 0 && l[e] - bl <= (r < lo ? edge : margin)) {
+        // the edge rank (lo - 1, a fractional floor such as 1.5) is replaced only by a close substitute (within `edge`)
+        if (bi >= 0 && l[e] - bv <= (r < lo ? edge : margin)) {
             if (detail != nullptr) {
                 // what was replaced and by what (per replacement): the weight of the replaced pick, the substitute's place in
                 // the router's own ranking of all 512 experts, and the score gap to it
-                const float w = weights[(size_t) t * 10 + r];
-                const int wb = w < 0.01f ? 0 : w < 0.02f ? 1 : w < 0.05f ? 2 : w < 0.10f ? 3 : w < 0.20f ? 4 : 5;
                 int gr = 0;
-                for (int f = 0; f < 512; ++f) gr += l[f] > bl;
-                const int rb = gr < 20 ? 0 : gr < 40 ? 1 : gr < 80 ? 2 : gr < 160 ? 3 : 4;
-                const float gap = l[e] - bl;
-                const int gb = gap < 0.5f ? 0 : gap < 1.f ? 1 : gap < 2.f ? 2 : gap < 4.f ? 3 : gap < 8.f ? 4 : 5;
-                atomicAdd(detail + 16 + wb, 1ull);
-                atomicAdd(detail + 22 + rb, 1ull);
-                atomicAdd(detail + 27 + gb, 1ull);
+                for (int f = lane; f < 512; f += 32) gr += l[f] > bv;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) gr += __shfl_xor_sync(0xffffffffu, gr, off);
+                if (lane == 0) {
+                    const float w = weights[(size_t) t * 10 + r];
+                    const int wb = w < 0.01f ? 0 : w < 0.02f ? 1 : w < 0.05f ? 2 : w < 0.10f ? 3 : w < 0.20f ? 4 : 5;
+                    const int rb = gr < 20 ? 0 : gr < 40 ? 1 : gr < 80 ? 2 : gr < 160 ? 3 : 4;
+                    const float gap = l[e] - bv;
+                    const int gb = gap < 0.5f ? 0 : gap < 1.f ? 1 : gap < 2.f ? 2 : gap < 4.f ? 3 : gap < 8.f ? 4 : 5;
+                    atomicAdd(detail + 16 + wb, 1ull);
+                    atomicAdd(detail + 22 + rb, 1ull);
+                    atomicAdd(detail + 27 + gb, 1ull);
+                }
             }
             // SWAP2: this expert was wanted and a stand-in served it; counted for a quality swap only when the stand-in is poor (STRATA_SWAP2_GAP logits)
-            if (repl != nullptr && l[e] - bl >= repl_gap) atomicAdd(repl + e, 1.0f);
-            id[r] = best;
+            if (lane == 0 && repl != nullptr && l[e] - bv >= repl_gap) atomicAdd(repl + e, 1.0f);
+            my[r] = bi;
             ++swaps;
         }
     }
     int after = 0;
-    for (int r = 0; r < 10; ++r) after += !have(id[r]);
-    if (swaps) {
-        float m = -INFINITY;
-        for (int r = 0; r < 10; ++r) m = fmaxf(m, l[id[r]]);
-        float ex[10], sum = 0.0f;
-        for (int r = 0; r < 10; ++r) { ex[r] = expf(l[id[r]] - m); sum += ex[r]; }
-        for (int r = 0; r < 10; ++r) weights[(size_t) t * 10 + r] = ex[r] / sum;
-    }
-    if (stats) {
-        atomicAdd(stats + 0, (unsigned long long) tail);
-        atomicAdd(stats + 1, (unsigned long long) swaps);
-        atomicAdd(stats + 2, (unsigned long long) before);
-        atomicAdd(stats + 3, (unsigned long long) after);
+    if (lane == 0)
+        for (int r = 0; r < 10; ++r) after += !have(my[r]);
+    if (lane == 0) {
+        if (swaps) {
+            float m = -INFINITY;
+            for (int r = 0; r < 10; ++r) m = fmaxf(m, l[my[r]]);
+            float ex[10], sum = 0.0f;
+            for (int r = 0; r < 10; ++r) { ex[r] = expf(l[my[r]] - m); sum += ex[r]; }
+            for (int r = 0; r < 10; ++r) weights[(size_t) t * 10 + r] = ex[r] / sum;
+        }
+        for (int r = 0; r < 10; ++r) id[r] = my[r];
+        if (stats) {
+            atomicAdd(stats + 0, (unsigned long long) tail);
+            atomicAdd(stats + 1, (unsigned long long) swaps);
+            atomicAdd(stats + 2, (unsigned long long) before);
+            atomicAdd(stats + 3, (unsigned long long) after);
+        }
     }
 }
 // ---- the floor: one small struct in host-mapped memory, read by the kernel at every launch.  The host sets it once (route_cfg_init)
@@ -346,7 +452,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
-    route_resident_k<<<(unsigned) ((n_tok + 31) / 32), 32, 0, static_cast<cudaStream_t>(stream)>>>(
+    route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
         n_tok <= 8 ? repl : nullptr, ring);
     const auto error = cudaGetLastError();
