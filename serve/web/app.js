@@ -641,7 +641,7 @@ function msgEl(m, i) {
     el.appendChild(b);
     const meta = document.createElement("div");
     meta.className = "st-msg__meta";
-    meta.textContent = `You · ${timeStr(m.time)}`;
+    meta.textContent = `You · ${timeStr(m.time)}${m.meta ? ` · ${m.meta}` : ""}`;
     el.appendChild(meta);
   } else {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
@@ -724,7 +724,7 @@ function updateAssistant(el, m, streaming) {
     bubble.innerHTML = answerHtml(m);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
-  el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
+  el.querySelector(".meta-text").textContent = m.meta || (streaming ? (m.liveMeta || "") : m.stopped ? "Stopped" : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
 }
 function renderChat() {
@@ -825,6 +825,25 @@ async function send() {
   busy = {controller, msg: m};
   setBusy(true);
 
+  // while it runs: under your message the prompt being read (then its read speed), under the answer the tokens so far and the live decode speed
+  const userEl = el.previousElementSibling, um0 = messages[messages.indexOf(m) - 1];
+  const liveTick = setInterval(() => {
+    const lv = (lastMetrics && lastMetrics.live) || {};
+    const ue = userEl && userEl.querySelector(".st-msg__meta");
+    if (lv.state === "reading") {
+      const tot = lv.prompt_total || lv.prompt_tokens;
+      if (ue && um0) ue.textContent = `You · ${timeStr(um0.time)} · reading the prompt` +
+        (lv.prompt_read != null && tot ? `: ${fmt(lv.prompt_read)} of ${fmt(tot)} tokens` : tot ? ` (${fmt(tot)} tokens)` : "") +
+        (lv.elapsed_s ? ` · ${fmt(lv.elapsed_s, 0)} s` : "");
+    } else if (lv.state === "generating") {
+      if (ue && um0 && lv.prompt_tokens)
+        ue.textContent = `You · ${timeStr(um0.time)} · prompt ${fmt(lv.prompt_tokens)} tokens${lv.prefill_tok_s_mean ? ` read at ${fmt(lv.prefill_tok_s_mean, 1)} tok/s` : ""}`;
+      const sp = lv.tok_s != null ? lv.tok_s : lv.tok_s_mean;
+      m.liveMeta = `${fmt(lv.generated || 0)} tokens${sp != null ? ` · decode ${fmt(sp, 1)} tok/s` : ""}`;
+      const ae = el.querySelector(".meta-text");
+      if (ae && !m.meta) ae.textContent = m.liveMeta;
+    }
+  }, 400);
   const body = {model: health.model, messages: apiMessages(), stream: true,
                 reasoning_effort: settings.thinking};
   if (settings.temperature > 0) {
@@ -888,15 +907,16 @@ async function send() {
     if (e.name === "AbortError") m.stopped = true;
     else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
   }
+  clearInterval(liveTick);
+  m.liveMeta = "";
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
     // under the answer: the speed the engine measured for reading the prompt and for decoding (as llama.cpp's own page shows them),
     // else this page's own average from the first token
-    const rd = timings && timings.prompt_per_second, wr = timings && timings.predicted_per_second;
-    const speeds = (rd ? ` · prompt ${fmt(rd, 1)} tok/s` : "") +
-                   (wr ? ` · decode ${fmt(wr, 1)} tok/s` : secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : "");
+    const wr = timings && timings.predicted_per_second;
+    const speeds = wr ? ` · decode ${fmt(wr, 1)} tok/s` : secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : "";
     m.meta = `${fmt(n)} tokens${speeds}${m.stopped ? " · stopped" : ""}` +
              (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
   } else if (m.stopped) {
@@ -906,6 +926,15 @@ async function send() {
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
   if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
   if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
+  // under YOUR message: the prompt the engine read for it and how fast (the conversation cache's share is not read again)
+  const um = messages[messages.indexOf(m) - 1];
+  if (timings && um && um.role === "user" && (timings.prompt_n || timings.cache_n)) {
+    const read = timings.prompt_n || 0, held = timings.cache_n || 0;
+    um.meta = (read ? `prompt ${fmt(read)} tokens read${timings.prompt_per_second ? ` at ${fmt(timings.prompt_per_second, 1)} tok/s` : ""}` : "prompt not re-read") +
+              (held ? ` · ${fmt(held)} tokens reused` : "");
+    const ue = el.previousElementSibling && el.previousElementSibling.querySelector(".st-msg__meta");
+    if (ue) ue.textContent = `You · ${timeStr(um.time)} · ${um.meta}`;
+  }
   busy = null;
   setBusy(false);
   if (frame) cancelAnimationFrame(frame);
