@@ -179,8 +179,10 @@ int main() {
         ck(cudaMemcpy(d_ids_par, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "up ids par");
         ck(cudaMemcpy(d_w_par, sentinel.data(), sentinel.size() * 4, cudaMemcpyHostToDevice), "up w par");
         ck(cudaMemset(d_stats, 0, 4 * sizeof(unsigned long long)), "zero stats");
-        strata::kernels::native_route_resident(d_logits, d_ids_par, d_w_par, d_res, n_tok, margin, lo, hi,
-                                               d_stats, (void*) stream);
+        // our kernel takes its floor from the shared config (host-mapped, read at every launch): the same window as the reference's, no edge
+        // rank, no CCE bias, no rank gate, no weight floor - every option of ours off, which is what upstream's reference computes
+        strata::kernels::route_cfg_init(lo, hi, margin, -1.0f);
+        strata::kernels::native_route_resident(d_logits, d_ids_par, d_w_par, d_res, n_tok, d_stats, (void*) stream);
         ck(cudaStreamSynchronize(stream), "sync par");
         unsigned long long st_par[4] = {0, 0, 0, 0};
         ck(cudaMemcpy(st_par, d_stats, sizeof(st_par), cudaMemcpyDeviceToHost), "down stats par");
