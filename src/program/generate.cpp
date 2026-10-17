@@ -433,7 +433,8 @@ struct Options {
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
     /// is reserved for a host thread that has nothing to do while the drain runs.
     bool no_host_worker = false;
-    bool coupled_draft = strata::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
+    bool coupled_draft = strata::core::coupled_draft_state(); ///< Coupled draft sampling for MTP drafter under sampling
+    bool spec_prob = strata::core::spec_prob_env();   ///< probabilistic draft acceptance (default on; --no-spec-prob-accept, STRATA_SPEC_PROB=0)
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
     std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
@@ -900,6 +901,9 @@ void usage() {
                  "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
                  "  --coupled-draft      enable coupled draft sampling for MTP drafter under sampling (STRATA_SPEC_COUPLED)\n"
                  "  --no-coupled-draft   disable coupled draft sampling (propose argmax drafts)\n"
+                 "  --spec-prob-accept   probabilistic draft acceptance for sampled requests (default on; STRATA_SPEC_PROB): a draft is accepted\n"
+                 "                       with min(1, p/q) and a reject is resampled from the residual - the output is distributed exactly as the target's\n"
+                 "  --no-spec-prob-accept  exact-match acceptance only (greedy requests are the same either way)\n"
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n"
@@ -1884,6 +1888,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-ple-prefetch") o.no_ple_prefetch = true;
         else if (a == "--coupled-draft") o.coupled_draft = true;
         else if (a == "--no-coupled-draft") o.coupled_draft = false;
+        else if (a == "--spec-prob-accept" || a == "--spec-prob") o.spec_prob = true;
+        else if (a == "--no-spec-prob-accept" || a == "--no-spec-prob") o.spec_prob = false;
         else parsed = false;
         // The chain continues here in a second statement: one chain of 120+ `else if` passed MSVC's limit of 128
         // nested blocks (C1061).  The order of the tests and what each does are unchanged.
@@ -2134,6 +2140,7 @@ int main(int argc, char** argv) {
         } else (void) cudaGetLastError();
     }
 #endif
+    strata::core::set_spec_prob(o.spec_prob);
     strata::core::set_coupled_draft(o.coupled_draft);
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
         std::string hc = o.host_core;

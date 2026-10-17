@@ -1,4 +1,4 @@
-// include/strata/core/spec_prob.hpp - PROBABILISTIC DRAFT ACCEPTANCE (STRATA_SPEC_PROB=1, off by default).
+// include/strata/core/spec_prob.hpp - PROBABILISTIC DRAFT ACCEPTANCE (on by default; STRATA_SPEC_PROB=0 / --no-spec-prob-accept turn it off).
 //
 // Speculative rejection sampling (Leviathan et al. / Chen et al.) for the MTP drafts of a SAMPLED request.  Under
 // sampling the verify window used to accept a draft only when it EQUALS the token the target sampled for that row

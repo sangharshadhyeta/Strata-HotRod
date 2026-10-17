@@ -62,15 +62,19 @@ inline bool& coupled_draft_state() {
     return on;
 }
 
-/// STRATA_SPEC_PROB=1: probabilistic draft acceptance (core/spec_prob.hpp).  It runs on the coupled drafter's
-/// machinery (the chain's sampling over the draft head, the penalty ring), so it switches that setup on too.
-inline bool spec_prob_env() {
-    static const bool on = [] {
+/// Probabilistic draft acceptance (core/spec_prob.hpp): ON BY DEFAULT since 0.1.42-fork (owner decision, 11 Oct; solid.cpp has it on too).
+/// STRATA_SPEC_PROB=0 or --no-spec-prob-accept turns it off.  It only touches requests with temperature above 0; greedy requests stay
+/// byte-identical.  It runs on the coupled drafter's machinery (the chain's sampling over the draft head, the penalty ring), so it
+/// switches that setup on too.
+inline bool& spec_prob_state() {
+    static bool on = [] {
         const char* e = std::getenv("STRATA_SPEC_PROB");
-        return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+        return e == nullptr || *e == '\0' || std::strcmp(e, "0") != 0;
     }();
     return on;
 }
+inline bool spec_prob_env() { return spec_prob_state(); }
+inline void set_spec_prob(bool on) { spec_prob_state() = on; }
 
 /// Whether coupled draft sampling is enabled (via STRATA_SPEC_COUPLED=1 or --coupled-draft CLI flag), or the
 /// probabilistic mode that needs the same buffers and graphs.
