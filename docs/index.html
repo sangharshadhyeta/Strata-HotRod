@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Strata — a 125B model on your own gaming PC</title>
-<meta name="description" content="Strata runs Qwen3.8-Flash-Next on a normal PC with a 12 GB+ NVIDIA or AMD card. Free, open source, nothing leaves your machine.">
+<title>Strata-HotRod — a 125B model on one RTX 3060</title>
+<meta name="description" content="Strata-HotRod runs Qwen3.8-Flash-Next (125B parameters) on one RTX 3060 with 12 GB, 30 GB of RAM and an NVMe SSD, on Linux. Free, open source, nothing leaves your machine.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -142,49 +142,49 @@ header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:36rem;margin
     </g>
   </svg>
   </div>
-  <h1>Run a 125-billion-parameter AI model on your own gaming PC</h1>
-  <p class="tagline">Strata runs Qwen3.8-Flash-Next on a normal PC. It chats, writes code, reads pictures and works with your coding agents. Nothing leaves your machine.</p>
+  <h1>Run a 125-billion-parameter AI model on one RTX 3060</h1>
+  <p class="tagline">Strata-HotRod runs Qwen3.8-Flash-Next with 12 GB of video memory, 30 GB of RAM and an NVMe SSD. It chats, writes code and reads pictures. Nothing leaves your machine. Tested on this one setup only.</p>
   <div class="cta-row">
     <a class="btn btn-shine" href="#install">Install Strata</a>
     <a class="btn btn-ghost" href="https://github.com/AAO-IS2/Strata-HotRod">View on GitHub</a>
   </div>
   <div class="badges">
-    <span class="pill">NVIDIA or AMD · 12 GB+</span>
-    <span class="pill">Windows · Linux</span>
+    <span class="pill">RTX 3060 · 12 GB</span>
+    <span class="pill">Linux (Rocky 9.6)</span>
     <span class="pill">free &amp; open source</span>
     <span class="pill">MIT licensed</span>
   </div>
 </header>
 
 <section class="measured" id="speed">
-  <h4>Qwen3.8-Flash-Next, on a gaming PC with a 12 GB card</h4>
-  <p class="hp-sub">IQ3_S · 128K context · “–” means not measured yet</p>
+  <h4>Qwen3.8-Flash-Next, on one RTX 3060 (12 GB)</h4>
+  <p class="hp-sub">IQ3_S · 128K context · measured 10 and 17 Oct 2026 · “–” means not measured</p>
   <div class="hp-cols">
     <div>
       <div class="hp-group first-group">
         <div class="hp-group-label">Hardware</div>
-        <div class="hp-row"><span>GPU</span><span>RTX 5070 12&nbsp;GB</span></div>
-        <div class="hp-row"><span>CPU</span><span>Ryzen 5 7600</span></div>
-        <div class="hp-row"><span>RAM</span><span>64&nbsp;GB</span></div>
-        <div class="hp-row"><span>total memory</span><span>–</span></div>
+        <div class="hp-row"><span>GPU</span><span>RTX 3060 12&nbsp;GB</span></div>
+        <div class="hp-row"><span>CPU</span><span>Core i5-12400F</span></div>
+        <div class="hp-row"><span>RAM</span><span>30&nbsp;GB</span></div>
+        <div class="hp-row"><span>disk</span><span>500&nbsp;GB NVMe</span></div>
       </div>
       <div class="hp-group">
         <div class="hp-group-label">Throughput</div>
-        <div class="hp-row"><span>prompt processing</span><span>–</span></div>
-        <div class="hp-row"><span>generation</span><span class="hot">~60 tok/s</span></div>
+        <div class="hp-row"><span>prompt (2K tokens)</span><span>14 – 16 s to first word</span></div>
+        <div class="hp-row"><span>generation</span><span class="hot">~54 tok/s</span></div>
       </div>
     </div>
     <div>
       <div class="hp-group first-group">
         <div class="hp-group-label">Placement</div>
         <div class="hp-row"><span>experts on CPU</span><span>–</span></div>
-        <div class="hp-row"><span>context · slots</span><span>128K tok · –</span></div>
+        <div class="hp-row"><span>context · slots</span><span>128K tok · 1</span></div>
       </div>
       <div class="hp-group">
         <div class="hp-group-label">Brain / expert cache</div>
         <div class="hp-row"><span>positioned</span><span>–</span></div>
         <div class="hp-row"><span>hot / warm / cold</span><span>–</span></div>
-        <div class="hp-row"><span>hit rate</span><span>–</span></div>
+        <div class="hp-row"><span>hit rate</span><span>89 – 94%</span></div>
         <div class="hp-row"><span>substitute rate</span><span>–</span></div>
       </div>
     </div>
