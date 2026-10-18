@@ -50,9 +50,6 @@ Tabellen stehen in [DETAILS.md](docs/DETAILS.md#speed-measured). Eine Karte mit 
 RTX 3090 (24 GB) sollte etwa 100-140 Tokens pro Sekunde schreiben. Lange Chats und andere Karten:
 [Tempo jedes Modells](docs/MODELS.md#how-fast-is-each-size), [Ergebnisse aus der Community](docs/COMMUNITY_BENCHMARKS.md).
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata ist kostenlos. Wenn es auf deinem PC gut läuft, hält ein Kaffee die Arbeit daran am Laufen.</sub></p>
-
 ## Was du brauchst
 
 | | |
@@ -233,7 +230,3 @@ und Unsloth. Strata nutzt Teile von [llama.cpp / ggml](https://github.com/ggml-o
 paar Teile und alle Modelle haben eigene Lizenzen ([welche](docs/HOW_IT_WORKS.md#license)).
 
 ## Strata unterstützen
-
-Strata ist kostenlos und Open Source. Wenn es dir nützt, kannst du die Entwicklung unterstützen:
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>

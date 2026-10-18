@@ -47,9 +47,6 @@ NVIDIA：Q2_0 用的是引擎 0.1.36，其他各行用的是 0.1.26（4K 回答�
 100-140 个 token。长对话和其他显卡的数据：[各模型的速度](docs/MODELS.md#how-fast-is-each-size)、
 [社区测试结果](docs/COMMUNITY_BENCHMARKS.md)。
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请我喝杯咖啡" height="50"></a><br>
-<sub>Strata 是免费的。如果它在你的电脑上跑得不错，请我喝杯咖啡，让这个项目继续下去。</sub></p>
-
 ## 你需要什么
 
 | | |
@@ -211,7 +208,3 @@ NVIDIA 和 AMD 的步骤完全一样。安装程序会识别你的显卡，并�
 有各自的许可证（[具体是哪些](docs/HOW_IT_WORKS.md#license)）。
 
 ## 支持 Strata
-
-Strata 免费且开源。如果它对你有用，欢迎支持它的开发：
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请我喝杯咖啡" height="50"></a></p>

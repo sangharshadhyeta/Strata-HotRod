@@ -48,9 +48,6 @@ NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K pro
 about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
 [community results](docs/COMMUNITY_BENCHMARKS.md).
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
-
 ## What you need
 
 | | |
@@ -237,7 +234,3 @@ and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org
 parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
 
 ## Support Strata
-
-Strata is free and open source. If it is useful to you, you can support its development:
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>

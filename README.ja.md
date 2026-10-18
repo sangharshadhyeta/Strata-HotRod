@@ -48,9 +48,6 @@ NVIDIA の測定には、Q2_0 のみエンジン 0.1.36、それ以外は 0.1.26
 毎秒およそ 100-140 トークンの生成速度が見込めます。長いチャットや他のカードでの性能については、[モデルごとの速度](docs/MODELS.md#how-fast-is-each-size)や
 [コミュニティの測定結果](docs/COMMUNITY_BENCHMARKS.md)を参照してください。
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata は無料で使えます。お使いの PC で快適に動いたら、コーヒー 1 杯分のご支援が開発を続ける励みになります。</sub></p>
-
 ## 必要なもの
 
 | | |
@@ -223,7 +220,3 @@ Strata は [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) の一部�
 各モデルには、それぞれ別のライセンスが適用されます（[ライセンスの詳細](docs/HOW_IT_WORKS.md#license)）。
 
 ## Strata を支援する
-
-Strata は無料で使えるオープンソースソフトウェアです。役に立ったら、開発へのご支援をお願いします。
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
