@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata — a 125B model on your own gaming PC</title>
+<meta name="description" content="Strata runs Qwen3.8-Flash-Next on a normal PC with a 12 GB+ NVIDIA or AMD card. Free, open source, nothing leaves your machine.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+html{scroll-behavior:smooth;}
+:root{
+  --bg:#08090b; --bg-2:#0d0f13; --card:#131519; --card-2:#1a1d23;
+  --border:#24272e; --border-soft:#1c1e24;
+  --fg:#edeef1; --muted:#8b8f98; --muted-2:#5c6068;
+  --fire:#ff6a2b; --ice:#3d8bff;
+  --shine:linear-gradient(180deg,rgba(255,255,255,.09),rgba(255,255,255,0) 40%);
+  --font-display:'Bricolage Grotesque','Manrope',-apple-system,sans-serif;
+  --font-body:'Manrope',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --font-mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,monospace;
+}
+*{box-sizing:border-box;}
+html{background:var(--bg);}
+body{background:var(--bg);color:var(--fg);font-family:var(--font-body);margin:0;line-height:1.65;-webkit-font-smoothing:antialiased;}
+a{color:var(--fg);text-decoration:none;}
+.wrap{max-width:960px;margin:0 auto;padding:0 1.25rem 6rem;position:relative;}
+
+/* ambient background: fire on the left, ice on the right */
+.bg-artefacts{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none;}
+.bg-artefacts::before{content:"";position:absolute;inset:0;
+  background-image:radial-gradient(circle at 1px 1px,rgba(255,255,255,.05) 1px,transparent 0);
+  background-size:34px 34px;
+  mask-image:radial-gradient(ellipse 70% 55% at 50% 0%,#000 30%,transparent 75%);}
+.glow{position:absolute;border-radius:50%;filter:blur(110px);opacity:.18;}
+.glow.g1{width:520px;height:520px;top:40px;left:50%;transform:translateX(-120%);background:var(--fire);}
+.glow.g2{width:520px;height:520px;top:40px;left:50%;transform:translateX(20%);background:var(--ice);}
+
+/* nav */
+.topnav{position:sticky;top:0;z-index:20;background:rgba(8,9,11,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid transparent;}
+.topnav.scrolled{border-bottom-color:var(--border-soft);}
+.topnav-inner{display:flex;align-items:center;justify-content:space-between;padding:.85rem 1.25rem;max-width:960px;margin:0 auto;}
+.topnav .brand{display:flex;align-items:center;gap:.55rem;font-family:var(--font-display);font-weight:700;font-size:1.02rem;}
+.topnav .brand img{width:26px;height:26px;border-radius:7px;display:block;object-fit:cover;object-position:50% 38%;}
+.topnav nav{display:flex;align-items:center;gap:1.4rem;}
+.topnav nav a{color:var(--muted);font-size:.87rem;font-weight:500;}
+.topnav nav a:hover{color:var(--fg);}
+@media (max-width:640px){.topnav nav a.nav-link{display:none;}}
+
+/* buttons */
+.btn{font-family:var(--font-body);font-weight:600;font-size:.92rem;padding:.7rem 1.3rem;border-radius:999px;display:inline-flex;align-items:center;gap:.5rem;border:1px solid var(--border);transition:transform .15s ease,border-color .15s ease,box-shadow .15s ease;}
+.btn:hover{transform:translateY(-1px);}
+.topnav .btn{padding:.45rem .95rem;font-size:.83rem;}
+.btn-shine{background-image:var(--shine),linear-gradient(180deg,#2a2d33,#0a0b0d);color:#fff;border-color:#2e3138;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.22),0 0 22px -6px rgba(255,106,43,.35),0 12px 26px -14px rgba(0,0,0,.9);}
+.btn-shine:hover{border-color:var(--fire);box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 0 26px -4px rgba(255,106,43,.55);}
+.btn-ghost{background:var(--card);color:var(--muted);}
+.btn-ghost:hover{color:var(--fg);border-color:var(--ice);}
+
+/* hero */
+header.hero{padding:2.5rem 1rem 3rem;text-align:center;}
+.emblem{position:relative;width:min(100%,560px);aspect-ratio:1;margin:0 auto -.5rem;mix-blend-mode:screen;}
+.emblem svg{position:absolute;inset:0;width:100%;height:100%;}
+header.hero h1{font-family:var(--font-display);font-weight:700;letter-spacing:-.01em;text-wrap:balance;font-size:3rem;line-height:1.1;margin:.2rem 0;}
+header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:36rem;margin:.9rem auto 2rem;text-wrap:balance;}
+.cta-row{display:flex;gap:.7rem;justify-content:center;flex-wrap:wrap;margin-bottom:1.75rem;}
+.badges{display:flex;gap:.5rem;justify-content:center;flex-wrap:wrap;}
+.pill{font-family:var(--font-mono);font-size:.72rem;color:var(--muted);border:1px solid var(--border-soft);background:var(--bg-2);padding:.28rem .65rem;border-radius:999px;}
+@media (max-width:640px){header.hero h1{font-size:2.25rem;}}
+
+/* measured card (same layout as the solid.cpp hero panel) */
+.measured{width:min(100%,44rem);margin:0 auto;text-align:left;background:var(--card);background-image:var(--shine);border:1px solid var(--border);border-radius:14px;padding:1.1rem 1.2rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 20px 44px -26px rgba(0,0,0,.9);font-size:.82rem;}
+.measured h4{margin:0 0 .15rem;font-size:.8rem;color:var(--fg);font-weight:700;}
+.measured .hp-sub{color:var(--muted-2);font-size:.72rem;margin:0 0 .7rem;}
+.measured .hp-row{display:flex;justify-content:space-between;gap:.6rem;padding:.22rem 0;border-top:1px solid var(--border-soft);}
+.measured .hp-row.first{border-top:none;}
+.measured .hp-row span:first-child{color:var(--muted);}
+.measured .hp-row span:last-child{color:var(--fg);font-variant-numeric:tabular-nums;text-align:right;}
+.measured .hp-group{margin-top:.7rem;padding-top:.55rem;border-top:1px solid var(--border);}
+.measured .hp-group-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted-2);margin-bottom:.15rem;}
+.measured .hp-row span.hot{color:var(--fire);font-weight:700;}
+.measured .first-group{margin-top:0;padding-top:0;border-top:none;}
+.hp-cols{display:grid;grid-template-columns:1fr 1fr;gap:0 2rem;}
+@media (max-width:600px){.hp-cols{grid-template-columns:1fr;}}
+.measured .hp-note{color:var(--muted-2);font-size:.7rem;margin:.7rem 0 0;padding-top:.6rem;border-top:1px solid var(--border);line-height:1.5;}
+.measured .hp-note strong{color:var(--muted);}
+</style>
+</head>
+<body>
+<div class="bg-artefacts"><div class="glow g1"></div><div class="glow g2"></div></div>
+
+<div class="topnav" id="topnav">
+  <div class="topnav-inner">
+    <a class="brand" href="#">Strata-HotRod</a>
+    <nav>
+      <a class="nav-link" href="#install">Install</a>
+      <a class="nav-link" href="#speed">Speed</a>
+      <a class="nav-link" href="#docs">Docs</a>
+      <a class="btn btn-shine" href="https://github.com/AAO-IS2/Strata-HotRod">GitHub</a>
+    </nav>
+  </div>
+</div>
+
+<div class="wrap">
+<header class="hero">
+  <div class="emblem">
+    <svg viewBox="0 0 1254 1254" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <defs>
+      <!-- Flame distortion: two turbulence layers drifting upward, driving a displacement map -->
+      <filter id="flame" x="-10%" y="-10%" width="120%" height="120%" color-interpolation-filters="sRGB">
+        <feTurbulence id="t1" type="fractalNoise" baseFrequency="0.012 0.02" numOctaves="2" seed="3" result="n1"/>
+        <feTurbulence id="t2" type="fractalNoise" baseFrequency="0.03 0.05" numOctaves="2" seed="8" result="n2"/>
+        <feBlend in="n1" in2="n2" mode="multiply" result="noise"/>
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="38" xChannelSelector="R" yChannelSelector="G" result="d"/>
+        <feGaussianBlur in="d" stdDeviation="0.6"/>
+      </filter>
+      <filter id="soft"><feGaussianBlur stdDeviation="14"/></filter>
+
+      <!-- Mask: everything EXCEPT the hexagon and the wordmark, so only the flames move -->
+      <mask id="flameMask" maskUnits="userSpaceOnUse" x="0" y="0" width="1254" height="1254">
+        <rect width="1254" height="1254" fill="#fff"/>
+        <g filter="url(#soft)" fill="#000">
+          <polygon points="630,80 975,278 975,678 630,880 285,678 285,278"/>
+          <rect x="150" y="850" width="980" height="270"/>
+        </g>
+      </mask>
+      <mask id="coreMask" maskUnits="userSpaceOnUse" x="0" y="0" width="1254" height="1254">
+        <rect width="1254" height="1254" fill="#000"/>
+        <g filter="url(#soft)" fill="#fff">
+          <polygon points="630,80 975,278 975,678 630,880 285,678 285,278"/>
+          <rect x="150" y="850" width="980" height="270"/>
+        </g>
+      </mask>
+    </defs>
+
+    <!-- Static base: hexagon + wordmark stay crisp -->
+    <g mask="url(#coreMask)"><g id="core"><image href="Neon Fire and Ice Hot Rod Logo.png" width="1254" height="1254"/></g></g>
+
+    <!-- Moving flames, two phases for a fuller flicker -->
+    <g mask="url(#flameMask)">
+      <image href="Neon Fire and Ice Hot Rod Logo.png" width="1254" height="1254" filter="url(#flame)" id="flameA"/>
+    </g>
+  </svg>
+  </div>
+  <h1>Run a 125-billion-parameter AI model on your own gaming PC</h1>
+  <p class="tagline">Strata runs Qwen3.8-Flash-Next on a normal PC. It chats, writes code, reads pictures and works with your coding agents. Nothing leaves your machine.</p>
+  <div class="cta-row">
+    <a class="btn btn-shine" href="#install">Install Strata</a>
+    <a class="btn btn-ghost" href="https://github.com/AAO-IS2/Strata-HotRod">View on GitHub</a>
+  </div>
+  <div class="badges">
+    <span class="pill">NVIDIA or AMD · 12 GB+</span>
+    <span class="pill">Windows · Linux</span>
+    <span class="pill">free &amp; open source</span>
+    <span class="pill">MIT licensed</span>
+  </div>
+</header>
+
+<section class="measured" id="speed">
+  <h4>Qwen3.8-Flash-Next, on a gaming PC with a 12 GB card</h4>
+  <p class="hp-sub">IQ3_S · 128K context · “–” means not measured yet</p>
+  <div class="hp-cols">
+    <div>
+      <div class="hp-group first-group">
+        <div class="hp-group-label">Hardware</div>
+        <div class="hp-row"><span>GPU</span><span>RTX 5070 12&nbsp;GB</span></div>
+        <div class="hp-row"><span>CPU</span><span>Ryzen 5 7600</span></div>
+        <div class="hp-row"><span>RAM</span><span>64&nbsp;GB</span></div>
+        <div class="hp-row"><span>total memory</span><span>–</span></div>
+      </div>
+      <div class="hp-group">
+        <div class="hp-group-label">Throughput</div>
+        <div class="hp-row"><span>prompt processing</span><span>–</span></div>
+        <div class="hp-row"><span>generation</span><span class="hot">~60 tok/s</span></div>
+      </div>
+    </div>
+    <div>
+      <div class="hp-group first-group">
+        <div class="hp-group-label">Placement</div>
+        <div class="hp-row"><span>experts on CPU</span><span>–</span></div>
+        <div class="hp-row"><span>context · slots</span><span>128K tok · –</span></div>
+      </div>
+      <div class="hp-group">
+        <div class="hp-group-label">Brain / expert cache</div>
+        <div class="hp-row"><span>positioned</span><span>–</span></div>
+        <div class="hp-row"><span>hot / warm / cold</span><span>–</span></div>
+        <div class="hp-row"><span>hit rate</span><span>–</span></div>
+        <div class="hp-row"><span>substitute rate</span><span>–</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+</div>
+
+<script>
+(() => {
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const t1 = document.getElementById('t1'), t2 = document.getElementById('t2');
+  const disp = document.querySelector('feDisplacementMap');
+  const flameA = document.getElementById('flameA'), core = document.getElementById('core');
+
+  // Smooth random signal: random lattice values, smoothstep-interpolated.
+  // Each channel gets its own random lattice and speed, so nothing repeats or syncs.
+  function makeNoise() {
+    const v = Array.from({length: 4096}, Math.random);
+    return x => {
+      const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f);
+      return v[i & 4095] * (1 - u) + v[(i + 1) & 4095] * u;
+    };
+  }
+  const n = Array.from({length: 7}, makeNoise);
+  const rnd = (k, t, speed) => n[k](t * speed + k * 97.3);          // 0..1
+  const mix = (a, b, w) => a + (b - a) * w;
+
+  // Random gusts: sudden flares at irregular intervals that decay quickly
+  let gust = 0, nextGust = 1500 + Math.random() * 2500;
+  function frame(ms) {
+    if (!reduce) {
+      const t = ms / 1000;
+      if (ms > nextGust) { gust = 0.4 + Math.random() * 0.6; nextGust = ms + 2500 + Math.random() * 4500; }
+      gust *= 0.985;
+
+      t1.setAttribute('baseFrequency',
+        mix(0.009, 0.017, rnd(0, t, 0.55)).toFixed(5) + ' ' + mix(0.014, 0.028, rnd(1, t, 0.7)).toFixed(5));
+      t2.setAttribute('baseFrequency',
+        mix(0.022, 0.040, rnd(2, t, 0.9)).toFixed(5) + ' ' + mix(0.035, 0.068, rnd(3, t, 1.2)).toFixed(5));
+      disp.setAttribute('scale', (mix(20, 34, rnd(4, t, 0.8)) + gust * 10).toFixed(1));
+
+      const sy = 1 + (rnd(5, t, 1.0) - 0.5) * 0.012 + gust * 0.008;
+      flameA.setAttribute('transform', `translate(0 ${(1254 * (1 - sy)).toFixed(2)}) scale(1 ${sy.toFixed(4)})`);
+
+      const b = 1 + (rnd(6, t, 1.4) - 0.5) * 0.16 + gust * 0.06;
+      core.style.filter = `brightness(${b.toFixed(3)}) saturate(${(1 + (b - 1) * 0.8).toFixed(3)})`;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+
+(function(){
+  var nav=document.getElementById('topnav');
+  var f=function(){nav.classList.toggle('scrolled',window.scrollY>8);};
+  addEventListener('scroll',f,{passive:true});f();
+})();
+</script>
+</body>
+</html>
