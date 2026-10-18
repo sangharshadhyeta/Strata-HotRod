@@ -1935,6 +1935,9 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
+        # the tokens the engine emitted after the consumer stopped reading (drained after STOP): a pass that is continued
+        # (the thinking budget's wrap-up) takes them, so its next prompt is exactly what the engine holds and is reused
+        self.tail_ids = []
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -2043,6 +2046,11 @@ class StrataEngine:
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
+                    if line.startswith("T "):                 # emitted before the STOP was seen: the engine holds them
+                        try:
+                            self.tail_ids.append(int(line[2:]))
+                        except ValueError:
+                            pass
                     if not self.can_stop:
                         heard = time.monotonic()
 
@@ -4476,6 +4484,32 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        # The budget's cut can fall inside a verify window: the engine finishes the window (its accepted
+                        # drafts) before it sees the STOP and holds those tokens.  Take them into this pass, so the next
+                        # pass's prompt is exactly the engine's sequence and is reused; dropped, the engine's recurrent
+                        # state cannot step back to the cut and it reads the whole pass again from its last checkpoint
+                        # (measured: 2,273 tokens, ~15 s, in the middle of the answer).
+                        closed_itself = False
+                        tail_ids = list(getattr(self.engine, "tail_ids", None) or []) if wrap and not cancel.is_set() else []
+                        for t in tail_ids:
+                            n += 1
+                            raw_ids.append(t)
+                            if t in self.stop_ids:      # the model ended its reply within the window
+                                finish = "stop"
+                                wrap = False
+                                break
+                            seg.append(t)
+                            thinking_n += parser.state in ("reasoning", "rcall")
+                            piece = detok.push(t)
+                            tail = (tail + piece)[-2:]
+                            evs = cut(parser.feed(piece))
+                            self._note(n, evs, st, rate)
+                            for ev in evs:
+                                if ev.kind in ("content", "tool_start", "tool_call"):
+                                    answered = True
+                                yield "event", ev
+                        if wrap and tail_ids and parser.state != "reasoning":
+                            closed_itself = True        # it closed its thinking itself in those tokens: no wrap-up
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -4549,7 +4583,7 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = (force or "") if closed_itself else REASONING_WRAP_UP + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
