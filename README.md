@@ -101,12 +101,43 @@ curl http://127.0.0.1:8095/v1/chat/completions \
 
 This is how this PC was set up. It has not been repeated on another machine.
 
-1. A recent NVIDIA driver, the CUDA 13 toolkit and gcc-toolset-13 (Rocky Linux 9; other distributions are untested).
-2. `git clone` this repository and run **`./setup.sh`**. It makes the Python environment, downloads the model
-   (about 80 GB: allow the time and the disk) and writes the config `strata-<model>.json`.
-3. Start it with `./setup.sh` again, or run `serve/server.py --engine strata --port 8095 --config strata-iq3_s.json`.
-4. For pictures, build the encoder (`tools/vision`, the CPU build) and add a `"vision"` section to the config with
-   the encoder, the model's `mmproj` file and the first model file. The engine then starts with `--vision`.
+You need a recent NVIDIA driver, the CUDA 13 toolkit and gcc-toolset-13 (Rocky Linux 9; other distributions are
+untested), and about 80 GB free on the NVMe for the model.
+
+**Install** (once; it makes the Python environment, compiles the engine, downloads the model and writes the config
+`strata-iq3_s.json`):
+
+```bash
+sudo dnf install -y git gcc-toolset-13
+git clone https://github.com/sangharshadhyeta/Strata-HotRod.git
+cd Strata-HotRod
+scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build --yes --no-start
+```
+
+- `--build` matters: without it, setup downloads upstream's ready-made engine, which does not have this fork's changes.
+- `--model IQ3_S` is the size tested here. Setup says IQ3_S wants a 64 GB PC; naming it explicitly is the consent, and
+  it runs on this 30 GB PC.
+- Add `--models-dir /path/on/nvme` to put the model files somewhere other than the default.
+
+**Run** (inside a memory limit; `--host 0.0.0.0` and a key let other devices on your network use it):
+
+```bash
+systemd-run --scope -p MemoryMax=29G -p MemorySwapMax=0 \
+  .venv/bin/python serve/server.py --engine strata --config strata-iq3_s.json \
+  --port 8095 --host 0.0.0.0 --api-key YOUR_KEY
+```
+
+When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095` in a browser. For this PC only, leave out
+`--host` and `--api-key`. Stop it with Ctrl+C.
+
+**Update** (the newest code, then the engine compiled again where its source changed; the model files are kept):
+
+```bash
+scl enable gcc-toolset-13 -- ./update.sh --build
+```
+
+**Pictures:** build the encoder (`tools/vision`, the CPU build) and add a `"vision"` section to the config with the
+encoder, the model's `mmproj` file and the first model file. The engine then starts with `--vision`.
 
 Every option is described in [docs/DETAILS.md](docs/DETAILS.md) (upstream's reference; it covers more than we tested).
 
