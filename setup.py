@@ -2353,6 +2353,17 @@ def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool) -> 
     return env
 
 
+def hotrod_default_env(family: str, model: str, hip: bool) -> dict:
+    """Hot Rod: the run-config "env" this fork's measured setup ran with (Qwen3.8-Flash-Next IQ3_S on an RTX 3060, README):
+    stand-ins for ranks 2-9 (an unlimited margin: a pick not on the card gets the best resident expert; ranks 0-1 stay
+    exact), the quality-swap counting of the experts stand-ins replaced (SWAP2), and the elastic K/V starting at 4096
+    tokens.  Written for the CUDA IQ3_S config only; any other model's config is left as upstream writes it."""
+    if family != "qwen" or model != "IQ3_S" or hip:
+        return {}
+    return {"STRATA_ROUTE_RESIDENT": "1e30", "STRATA_ROUTE_RESIDENT_RANKS": "2-9",
+            "STRATA_SWAP2_MAX": "2", "STRATA_SWAP2_GAP": "1", "STRATA_KV_GROW_INIT": "4096"}
+
+
 def menu_families(hip: bool) -> list:
     """The families the model menu lists, in menu order.  The NVFP4 packs run on NVIDIA cards only (the AMD and Intel
     engines have no NVFP4 kernels), so on those the menu does not offer them; `--family nvfp4` still says why not."""
@@ -4523,7 +4534,8 @@ def write_config(path: Path, cfg: dict):
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
-                       "STRATA_ROUTE_TAIL_SKIP"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
+                       "STRATA_ROUTE_TAIL_SKIP", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_RESIDENT_RANKS", "STRATA_SWAP2_MAX",
+                       "STRATA_SWAP2_GAP", "STRATA_KV_GROW_INIT"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
 # (0.1.44 dropped them with the rest of SETUP_ENV).
@@ -7017,6 +7029,10 @@ def main() -> int:
         cfg["cuda"] = 12
     if (uenv := unsloth_default_env(family, model, hip, in_budget)):
         cfg["env"] = uenv
+    if (henv := hotrod_default_env(family, model, hip)):
+        cfg["env"] = {**(cfg.get("env") or {}), **henv}
+        # the measured setup's PCIe share: none (the engine's 0.55 default for a native pack was not what was measured)
+        args += ["--pcie-frac", "0"]
     if hip:
         cfg["backend"] = "hip"
         # the dense prompt GEMMs through hipBLASLt with kernels measured on this GPU generation (tools/hip; +40-60%

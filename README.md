@@ -25,23 +25,26 @@ other model sizes may work in upstream Strata, but we have not run them, so we d
 
 ## How fast is it?
 
-Measured on the machine above. A token is about ¾ of a word.
+Measured on the machine above, with the settings the install below writes. A token is about ¾ of a word.
 
-**Writing answers** (the same install config, 3 repeats of 3 kinds of prompt, 900 tokens each, 17 Oct 2026):
+**Writing answers** (17 Oct 2026). Three kinds of prompt, each asked three times in a row; answers stop at 900 tokens.
+The first time a prompt is asked is what a new question gets. The repeats run faster, because that prompt's experts are
+already on the card.
 
-| Context window | Median | Range |
-| --- | ---: | ---: |
-| 128K tokens | **53.7 tokens/s** | 51.8 - 59.4 |
-| 32K tokens | 57.6 tokens/s | |
+| Prompt (answer length) | 128K context, first ask | 128K, repeats | 32K context, first ask (5 runs) |
+| --- | ---: | ---: | ---: |
+| Code (240 - 320 tokens) | 43.9 tokens/s | 67.9, 76.1 | 43.0 - 44.0 |
+| Reasoning (790 - 900 tokens) | 53.7 tokens/s | 64.1, 71.7 | 53.7 - 61.8 |
+| Story (140 - 180 tokens) | 41.8 tokens/s | 43.1, 51.1 | 36.1 - 39.8 |
 
-While a coding agent used it for real work (long prompts, thinking on), the server log shows 28 to 45 tokens per second,
-with 89 to 93% of the experts found on the graphics card.
+The 128K column is one run; the 32K column is five runs with the same settings, which shows how much one run varies.
 
-**Reading a prompt** (seconds until the first word; a different text each time, 10 Oct 2026):
+**Reading a prompt** (seconds until the first word; a different text each time; one run on 10 Oct 2026, before the
+0.1.45 merge):
 
 | Prompt | First word after |
 | --- | ---: |
-| 150 - 260 tokens | 4 - 9 s |
+| 150 - 260 tokens | 3.8 - 5.8 s |
 | 430 - 500 tokens | 7.5 - 10.5 s |
 | 1,600 - 2,100 tokens | 14 - 16 s |
 
@@ -66,15 +69,11 @@ The detail is in [SPEC.md](SPEC.md).
 Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md)):
 
 - **Stand-in experts.** For each token the two best experts are always the real ones. Lower-ranked experts that are not on
-  the card can be replaced by a similar one that is, so the card does not wait for the SSD. Swap rounds move the experts a
-  chat asks for onto the card in the background.
-- **Guessing ahead.** A small draft head guesses the next words and the big model checks them together. Probabilistic
-  acceptance of the guesses is on by default (`--no-spec-prob-accept` turns it off).
-- **A look-ahead ring** for fetching experts early (opt-in with `STRATA_RING=1`; it was slower on this machine).
+  the card are replaced by a similar one that is, so the card does not wait for the SSD. Swap rounds move the experts a
+  chat asks for onto the card in the background. The install writes these settings for IQ3_S.
+- **Guessing ahead.** A small draft head guesses the next words and the big model checks them together, with
+  probabilistic acceptance of the guesses (`--no-spec-prob-accept` turns it off).
 - **The app:** live speeds while it works, and the experts-on-the-card map in the Monitor.
-- **Pictures.** The model reads images through a processor-based encoder, so the graphics card keeps all its memory for
-  experts. Tested on 18 Oct 2026 with generated images: text, shapes and colours were read correctly. A new picture adds a
-  few seconds before the answer starts.
 
 ## Using it
 
@@ -92,10 +91,8 @@ curl http://127.0.0.1:8095/v1/chat/completions \
 - **Sampling:** a request that sets no temperature is decoded greedily. The model's card
   ([Best Practices](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#best-practices)) recommends temperature 1.0, top-p 0.95
   and top-k 20 with thinking on, and temperature 0.7, top-p 0.8 and top-k 20 with thinking off. Set them in your client.
-- **Pictures:** send an `image_url` part in the message (base64 or a link). More in [docs/IMAGES.md](docs/IMAGES.md).
 - **One request at a time.** While one request runs, the others wait.
-- **Run it inside a memory limit.** Two uncapped runs once froze this 30 GB PC. We start the server in a limited scope:
-  `systemd-run --scope -p MemoryMax=29G -p MemorySwapMax=0 ...`
+- **Run it inside a memory limit.** Two uncapped runs once froze this 30 GB PC; the run command below sets one.
 
 ## Setting it up
 
@@ -136,8 +133,10 @@ When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095` i
 scl enable gcc-toolset-13 -- ./update.sh --build
 ```
 
-**Pictures:** build the encoder (`tools/vision`, the CPU build) and add a `"vision"` section to the config with the
-encoder, the model's `mmproj` file and the first model file. The engine then starts with `--vision`.
+**Pictures (optional):** build the encoder (`tools/vision`, the CPU build) and add a `"vision"` section to the config
+with the encoder, the model's `mmproj` file and the first model file. The engine then starts with `--vision`, and a
+message can carry an `image_url` part (base64 or a link; more in [docs/IMAGES.md](docs/IMAGES.md)). A new picture adds a
+few seconds before the answer starts.
 
 Every option is described in [docs/DETAILS.md](docs/DETAILS.md) (upstream's reference; it covers more than we tested).
 
