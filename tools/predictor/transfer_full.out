@@ -1,0 +1,23 @@
+[    5s] loaded 24708 tokens
+[   17s] IN layer 8 done
+[   27s] IN layer 16 done
+[   37s] IN layer 24 done
+[   47s] IN layer 32 done
+[   57s] IN layer 40 done
+
+IN: d=1, mean over layers 1..47
+                  r01@2   r01@4   r01@8   r03@8   cov10
+   reuse           55.3    74.4    86.4    79.4    64.0
+   theirs          71.7    89.4    96.2    92.3    77.5
+   theirs+ft       77.6    93.5    98.2    95.6    82.4
+[   76s] SHIFT layer 8 done
+[   86s] SHIFT layer 16 done
+[   96s] SHIFT layer 24 done
+[  106s] SHIFT layer 32 done
+[  115s] SHIFT layer 40 done
+
+SHIFT: d=1, mean over layers 1..47
+                  r01@2   r01@4   r01@8   r03@8   cov10
+   reuse           54.8    74.0    86.4    79.1    63.8
+   theirs          67.5    85.5    93.8    89.1    74.0
+   theirs+ft       68.4    85.9    93.8    89.4    75.2

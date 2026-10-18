@@ -4211,6 +4211,66 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+namespace {
+// STRATA_ROUTER_TRACE=<file> (measurement only, off by default): one record per call of expert_pool_dispatch_multi, i.e. for every MoE layer of every
+// decode window, the layer's router input (bf16) and the experts the router chose.  It is the training and scoring data for expert predictors
+// (tools/predictor/).  File: u32 "RTR1", then records  u32 step | u16 layer | u8 n_tok | u8 k | per token: u16[H] bf16 input, i16[k] ids (rank order).
+// `step` counts windows (it advances at layer 0).  Run with the stand-ins OFF (no STRATA_ROUTE_RESIDENT) so `ids` are the model's own top-k.
+struct RouterTrace {
+    std::mutex mu;
+    FILE* f = nullptr;
+    uint32_t step = 0;
+    uint64_t calls = 0;
+    ~RouterTrace() { if (f != nullptr) std::fclose(f); }
+};
+RouterTrace& router_trace() { static RouterTrace t; return t; }
+bool router_trace_on() {
+    static const bool on = [] {
+        const char* p = std::getenv("STRATA_ROUTER_TRACE");
+        if (p == nullptr || *p == 0) return false;
+        RouterTrace& t = router_trace();
+        t.f = std::fopen(p, "wb");
+        if (t.f == nullptr) { std::fprintf(stderr, "strata: STRATA_ROUTER_TRACE: cannot open %s\n", p); return false; }
+        std::setvbuf(t.f, nullptr, _IOFBF, 1 << 22);
+        const uint32_t magic = 0x31525452u;   // "RTR1"
+        std::fwrite(&magic, 4, 1, t.f);
+        std::fprintf(stderr, "strata: STRATA_ROUTER_TRACE=%s (measurement: every MoE layer's router input and routed experts of every decode window)\n", p);
+        return true;
+    }();
+    return on;
+}
+inline uint16_t trace_f32_to_bf16(float v) {
+    uint32_t b;
+    std::memcpy(&b, &v, 4);
+    if ((b & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((b >> 16) | 0x40u);   // NaN stays a NaN
+    b += 0x7fffu + ((b >> 16) & 1u);                                              // round to nearest even
+    return (uint16_t) (b >> 16);
+}
+void router_trace_write(int64_t layer, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k) {
+    constexpr int64_t kH = strata::kernels::cpu::H;
+    RouterTrace& t = router_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    if (t.f == nullptr) return;
+    if (layer == 0) ++t.step;
+    const uint32_t step = t.step;
+    const uint16_t l16 = (uint16_t) layer;
+    const uint8_t nt = (uint8_t) n_tok, kk = (uint8_t) k;
+    std::fwrite(&step, 4, 1, t.f);
+    std::fwrite(&l16, 2, 1, t.f);
+    std::fwrite(&nt, 1, 1, t.f);
+    std::fwrite(&kk, 1, 1, t.f);
+    std::vector<uint16_t> row((size_t) kH);
+    std::vector<int16_t> tid((size_t) k);
+    for (int64_t tk = 0; tk < n_tok; ++tk) {
+        for (int64_t i = 0; i < kH; ++i) row[(size_t) i] = trace_f32_to_bf16(x_f[(size_t) (tk * kH + i)]);
+        std::fwrite(row.data(), 2, (size_t) kH, t.f);
+        for (int64_t r = 0; r < k; ++r) tid[(size_t) r] = (int16_t) ids[(size_t) (tk * k + r)];
+        std::fwrite(tid.data(), 2, (size_t) k, t.f);
+    }
+    if ((++t.calls & 0x3ffu) == 0) std::fflush(t.f);
+}
+}  // namespace
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -4221,6 +4281,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    if (router_trace_on() && x_f != nullptr && ids != nullptr && k >= 1 && k <= 16) router_trace_write(d.layers, x_f, ids, n_tok, k);
     if (d.fs != nullptr) d.fs->at_layer.store(d.layers, std::memory_order_release);   // STRATA_RING's refill guard
     if (d.gpu_pred != nullptr && d.fs != nullptr && d.fs->ring && d.host_res != nullptr && n_tok <= 8) {
         // the GPU look-ahead's picks for the next two layers (computed on this layer's input, before the doorbell this dispatch followed)

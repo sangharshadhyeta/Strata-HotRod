@@ -1,0 +1,36 @@
+[    1s] records 411215 | complete steps 8566 | tokens 24708
+[    5s] loaded X 6.1 GB
+[    6s] {'IN': (19829, 4879), 'SHIFT': (19025, 5683)}
+[   93s] IN done
+
+IN | d=1 | layers scored 47 | ridge lambda chosen: 100% at 0.3
+                    r01@2   r01@4   r01@8   r03@8   cov10
+   router-reuse      55.3    74.4    86.4    79.4    64.0
+   ridge (ours)      71.8    89.2    96.1    92.6    79.3
+
+IN | d=2 | layers scored 46 | ridge lambda chosen: 100% at 0.3
+                    r01@2   r01@4   r01@8   r03@8   cov10
+   router-reuse      46.5    64.3    77.8    69.6    55.0
+   ridge (ours)      66.9    85.2    93.7    89.1    75.1
+
+IN | d=3 | layers scored 45 | ridge lambda chosen: 100% at 0.3
+                    r01@2   r01@4   r01@8   r03@8   cov10
+   router-reuse      42.5    59.3    72.7    64.3    50.7
+   ridge (ours)      64.3    82.5    91.8    86.8    72.8
+[  179s] SHIFT done
+
+SHIFT | d=1 | layers scored 47 | ridge lambda chosen: 100% at 0.3
+                    r01@2   r01@4   r01@8   r03@8   cov10
+   router-reuse      54.8    74.0    86.4    79.1    63.8
+   ridge (ours)      57.5    74.7    85.3    79.3    66.5
+
+SHIFT | d=2 | layers scored 46 | ridge lambda chosen: 100% at 0.3
+                    r01@2   r01@4   r01@8   r03@8   cov10
+   router-reuse      45.3    63.2    77.3    68.8    54.6
+   ridge (ours)      51.0    67.5    78.9    72.3    60.3
+
+SHIFT | d=3 | layers scored 45 | ridge lambda chosen: 100% at 0.3
+                    r01@2   r01@4   r01@8   r03@8   cov10
+   router-reuse      41.1    57.9    71.9    63.5    50.4
+   ridge (ours)      47.7    63.5    74.7    68.3    56.9
+[  179s] saved
