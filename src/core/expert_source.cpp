@@ -4616,6 +4616,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    {
+        const int bk = njobs < 5 ? njobs : 5;
+        int64_t ent = 0;
+        for (int j = 0; j < njobs; ++j) ent += d.jobs_multi[(size_t) j].nt;
+        d.run_ms_by[bk] += ms(c3, c4);
+        ++d.run_n_by[bk];
+        d.run_ent_by[bk] += ent;
+    }
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;

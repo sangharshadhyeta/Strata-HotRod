@@ -14725,6 +14725,20 @@ int main(int argc, char** argv) {
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L),
                              dt_adapt_wait / w, dt_adapt_join / w, (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w);
+                std::fprintf(stderr, "strata decode CPU pool per layer (since start), by CPU experts:");
+                for (int b = 0; b < 6; ++b)
+                    if (drive.d.run_n_by[b] > 0)
+                        std::fprintf(stderr, " %d%s: %lld layers %.3f ms %.2f entries;", b, b == 5 ? "+" : "", (long long) drive.d.run_n_by[b],
+                                     drive.d.run_ms_by[b] / (double) drive.d.run_n_by[b], (double) drive.d.run_ent_by[b] / (double) drive.d.run_n_by[b]);
+                {   // the pool's three phases per layer with CPU work: gate+up rows (split over the threads), the host's activation quantize, down rows
+                    int64_t cpu_layers = 0;
+                    for (int b = 1; b < 6; ++b) cpu_layers += drive.d.run_n_by[b];
+                    if (drive.d.pool != nullptr && cpu_layers > 0)
+                        std::fprintf(stderr, " phases per CPU layer: gate+up %.3f ms, quantize %.3f ms, down %.3f ms",
+                                     drive.d.pool->ms_multi_gu / (double) cpu_layers, drive.d.pool->ms_multi_q / (double) cpu_layers,
+                                     drive.d.pool->ms_multi_down / (double) cpu_layers);
+                }
+                std::fprintf(stderr, "\n");
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
                                  (long long) aov_flips, ver.ms_gate);

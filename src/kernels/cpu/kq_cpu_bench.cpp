@@ -20,6 +20,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <random>
 #include <string>
 #include <thread>
@@ -59,13 +62,18 @@ void make_blob(const cpu::NativeFmt& f, uint8_t* blob, std::mt19937& rng) {
     std::vector<float> row((size_t) std::max(kH, kFF));
     const auto* tg = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
     const auto* td = ggml_get_type_traits_cpu((ggml_type) f.d_type);
+    // an i-quant (IQ3_S) has no ggml-cpu from_float: its rows go through ggml_quantize_chunk (no importance matrix)
+    auto quant = [](const ggml_type_traits_cpu* tr, int type, const float* src, uint8_t* dst, int64_t n) {
+        if (tr->from_float != nullptr) tr->from_float(src, dst, n);
+        else ggml_quantize_chunk((ggml_type) type, src, dst, 0, 1, n, nullptr);
+    };
     for (int64_t r = 0; r < 2 * kFF; ++r) {
         for (int64_t i = 0; i < kH; ++i) row[(size_t) i] = nd(rng);
-        tg->from_float(row.data(), blob + (size_t) r * f.gu_row, kH);
+        quant(tg, f.gu_type, row.data(), blob + (size_t) r * f.gu_row, kH);
     }
     for (int64_t r = 0; r < kH; ++r) {
         for (int64_t i = 0; i < kFF; ++i) row[(size_t) i] = nd(rng);
-        td->from_float(row.data(), blob + f.down_off + (size_t) r * f.d_row, kFF);
+        quant(td, f.d_type, row.data(), blob + f.down_off + (size_t) r * f.d_row, kFF);
     }
 }
 
@@ -110,6 +118,10 @@ int main(int argc, char** argv) {
         const size_t E = std::max<size_t>(64, ((size_t) mb << 20) / f.bytes);
         std::unique_ptr<uint8_t[]> mem(new uint8_t[E * f.bytes + 4096]);
         uint8_t* blobs = (uint8_t*) (((uintptr_t) mem.get() + 4095) & ~(uintptr_t) 4095);
+#if defined(__linux__)
+        // KQ_NOHUGE=1: the blobs on 4 KB pages (as the engine's page-cache and staging reads are), not transparent huge pages
+        if (const char* v = std::getenv("KQ_NOHUGE"); v != nullptr && v[0] == '1') madvise(blobs, E * f.bytes, MADV_NOHUGEPAGE);
+#endif
         {   // 16 distinct experts, copied over the whole buffer (the bytes in DRAM are what is measured)
             std::mt19937 rng(1234 + gt * 64 + dt);
             const size_t U = std::min<size_t>(16, E);

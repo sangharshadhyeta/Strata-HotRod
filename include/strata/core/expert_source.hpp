@@ -593,6 +593,8 @@ struct ExpertDispatch {
     int64_t tail_skipped = 0;
     int64_t tail_experts = 0;
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
+    double run_ms_by[6] = {};          ///< the pool call's time per layer, by the CPU experts it computed (0..4, 5+), cumulative
+    int64_t run_n_by[6] = {}, run_ent_by[6] = {};   ///< layers in each bucket, and their token entries
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
