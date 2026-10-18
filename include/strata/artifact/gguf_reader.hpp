@@ -618,6 +618,35 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// GLM-5.3-Flash's guard (glm5-next): every key core::glm5_geometry_from_gguf reads must be present and numeric, the
+/// per-layer attention.head_count_kv list (0 = KDA linear-attention layer, else a nope-MLA layer) must name every layer,
+/// and the one structure llama.cpp's implementation asserts (4 hyper-connection streams) must hold.
+inline std::string check_architecture_glm5next(const GgufFile& g) {
+    static const char* const keys[] = {
+        "glm5-next.block_count",               "glm5-next.embedding_length",         "glm5-next.feed_forward_length",
+        "glm5-next.attention.head_count",      "glm5-next.attention.q_lora_rank",    "glm5-next.attention.kv_lora_rank",
+        "glm5-next.attention.key_length_mla",  "glm5-next.attention.value_length_mla", "glm5-next.kda.head_dim",
+        "glm5-next.ssm.conv_kernel",           "glm5-next.expert_count",             "glm5-next.expert_used_count",
+        "glm5-next.expert_feed_forward_length", "glm5-next.expert_shared_count",     "glm5-next.leading_dense_block_count",
+        "glm5-next.attention.indexer.head_count", "glm5-next.attention.indexer.key_length",
+        "glm5-next.attention.indexer.top_k",   "glm5-next.attention.indexer.kpool",  "glm5-next.hyper_connection.count",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num()) return std::string(k) + " is not a number";
+    }
+    const uint64_t layers = g.get("glm5-next.block_count")->u;
+    const MetaValue* kv = g.get("glm5-next.attention.head_count_kv");
+    if (!kv) return "missing glm5-next.attention.head_count_kv";
+    if (kv->type != MetaType::ARRAY || kv->count != layers || kv->items.size() != kv->count)
+        return "glm5-next.attention.head_count_kv must list one entry for each of the " + std::to_string(layers) +
+               " layers (0 = linear attention)";
+    if (g.get("glm5-next.hyper_connection.count")->u != 4) return "glm5-next.hyper_connection.count must be 4";
+    if (g.get("glm5-next.attention.indexer.kpool")->u < 2) return "glm5-next.attention.indexer.kpool must be at least 2";
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -805,6 +834,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::Glm5Next) return check_architecture_glm5next(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);
