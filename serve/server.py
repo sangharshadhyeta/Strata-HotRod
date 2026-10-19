@@ -2327,6 +2327,7 @@ class Vision:
         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
         self.elastic = cfg.get("elastic") is True
+        self.gpu = bool(cfg.get("gpu"))                 # a CPU encoder needs no VRAM: its elastic start holds none
         self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         if not lazy and not self.elastic:
@@ -2868,6 +2869,35 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None) -> list[int]:
 RESIDENCY_FILE = os.path.join(tempfile.gettempdir(), f"strata-residency-{os.getpid()}.json")
 
 
+def _drop_stale_residency_files():
+    """The residency file is per server process and was never removed: 269 of them had piled up in /tmp (19 Oct).  At start,
+    the files of servers that no longer run are deleted; this server's own file goes when it ends."""
+    tmp = tempfile.gettempdir()
+    for name in os.listdir(tmp):
+        if not (name.startswith("strata-residency-") and name.endswith(".json")):
+            continue
+        pid = name[len("strata-residency-"):-len(".json")]
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            os.kill(int(pid), 0)          # the process still runs (or is another user's): leave its file
+        except ProcessLookupError:
+            try:
+                os.remove(os.path.join(tmp, name))
+            except OSError:
+                pass
+        except PermissionError:
+            pass
+
+
+try:
+    _drop_stale_residency_files()
+except OSError:
+    pass
+import atexit as _atexit  # noqa: E402
+_atexit.register(lambda: os.path.exists(RESIDENCY_FILE) and os.remove(RESIDENCY_FILE))
+
+
 def residency_view(max_age_s: float = 30.0) -> dict | None:
     """/metrics: which experts are in VRAM (a layer-by-expert map the engine's swap round writes every couple of seconds
     to STRATA_RESIDENCY_FILE); None when the engine has not written one (an older engine, or nothing swapped yet) or
@@ -3364,7 +3394,7 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
-        if hasattr(self.engine, "vram") and self.loaded():
+        if getattr(v, "gpu", True) and hasattr(self.engine, "vram") and self.loaded():
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
@@ -4706,6 +4736,10 @@ class Service:
                                     print(f"[strata] {note}", flush=True)
                             except Exception as e:
                                 print(f"[strata] prompt cache (after): {e!r}", flush=True)
+                        elif self.pcache is not None and not par and not emb:
+                            # a turn that ended otherwise (cancel, error, recovery) may have changed what the engine
+                            # holds: a pending save-on-switch must not save a state it no longer names
+                            self.pcache.forget()
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
@@ -7248,7 +7282,11 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        def flush_prompt_cache():   # save on switch: the conversation the engine still holds is saved before it ends
+            note = svc.pcache.flush(engine) if getattr(svc, "pcache", None) is not None else None
+            if note:
+                print(f"[strata] {note}", flush=True)
+        closers = [httpd.shutdown, flush_prompt_cache, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:

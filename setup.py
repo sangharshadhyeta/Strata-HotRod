@@ -5913,7 +5913,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         vt = vision_tokens(getattr(a, "vision_tokens", None), vision, old_cfg)
         cfg["args"].append("--vision")
         cfg["vision"] = {"exe": str(eng / VEXE), "mmproj": str(mmproj), "model": str(gguf), "gpu": vision == "gpu",
-                         "max_tokens": vt}          # the text model, opened vocab-only
+                         "max_tokens": vt,          # the text model, opened vocab-only
+                         "elastic": True}           # started with the first picture, stopped after 120 s without one
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     elif getattr(a, "vision_tokens", None) is not None:
@@ -7116,7 +7117,8 @@ def main() -> int:
         vt = vision_tokens(a.vision_tokens, vision, old_cfg if old_cfg.is_file() else adopted)
         cfg["vision"] = {"exe": str(eng / VEXE), "mmproj": str(mmproj),     # the text model, opened vocab-only:
                          "model": str(ready_paths(model, models_dir)["dense"] if ready else shards[0]),
-                         "gpu": vision == "gpu", "max_tokens": vt}
+                         "gpu": vision == "gpu", "max_tokens": vt,
+                         "elastic": True}   # started with the first picture, stopped after 120 s without one (~1 GB RAM)
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     elif a.vision_tokens is not None:
