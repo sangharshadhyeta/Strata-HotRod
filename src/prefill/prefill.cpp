@@ -2618,6 +2618,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // (on cs, the compute stream: these copies do not overlap compute, so their time adds to the prompt's)
     uint64_t lm_copy_bytes = 0;
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> lm_copy_ev;
+    // STRATA_PREFILL_PHASE_TIMERS=1 (diagnosis, off by default): the layer-major passes' compute, split by category.  ph(c)
+    // records an event on cs at a step's start, and the time from one mark to the next is charged to the first one's category
+    // (PT_END closes a pass).  The events are read once, after the layer loop; the passes add no sync.
+    enum : int { PT_OTHER = 0, PT_ATTN, PT_GDN, PT_ROUTER, PT_WAIT, PT_EXPERTS, PT_SHARED, PT_END = -1 };
+    static const bool phase_timers = [] { const char* e = std::getenv("STRATA_PREFILL_PHASE_TIMERS"); return e != nullptr && e[0] == '1'; }();
+    struct PhTimers {
+        std::vector<cudaEvent_t> pool;              // the events, grown as marks need them; destroyed on exit
+        std::vector<std::pair<int, size_t>> marks;  // (category, pool index), in order over all passes
+        size_t used = 0;
+        int64_t passes = 0;
+        ~PhTimers() { for (cudaEvent_t e : pool) cudaEventDestroy(e); }
+    } ph_t;
     auto lm_mark = [&](bool begin) {
         cudaEvent_t e = nullptr;
         if (cudaEventCreate(&e) != cudaSuccess) { (void) cudaGetLastError(); return; }
@@ -2643,6 +2655,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bool ple_pending = ple_on && (phase == PH_FULL || (phase == PH_LAYER && lay == std::max<int64_t>(LB, 1)));
         int64_t kv_pending = -1;
         if (phase == PH_LAYER) lm_mark(true);
+        const bool ph_on = phase_timers && phase == PH_LAYER;
+        if (ph_on) ++ph_t.passes;
+        auto ph = [&](int cat) {
+            if (!ph_on) return;
+            if (ph_t.used == ph_t.pool.size()) {
+                cudaEvent_t e = nullptr;
+                if (cudaEventCreate(&e) != cudaSuccess) { (void) cudaGetLastError(); return; }
+                ph_t.pool.push_back(e);
+            }
+            const size_t i = ph_t.used++;
+            cudaEventRecord(ph_t.pool[i], cs);
+            ph_t.marks.push_back({cat, i});
+        };
         if (phase == PH_LAYER || phase == PH_TAIL) {   // this chunk's residual comes back from the host
             if (!lm_copy(m.R, lmh.R + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice)) return false;
         }
@@ -3050,6 +3075,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
         for (int64_t l = l_from; l < l_to; ++l) {
+            ph(PT_OTHER);
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
@@ -3195,6 +3221,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
+                    ph(PT_GDN);
                     const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
                                           *wo = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
                                           *wb = need(v, "ssm_beta.weight", err), *wc = need(v, "ssm_conv1d.weight", err),
@@ -3220,6 +3247,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
+                    ph(PT_ATTN);
                     const core::QsaState& st = ss.qsa_states[qsa_index];
                     const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
                                           *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
@@ -3465,6 +3493,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsu = need(v, "ffn_up_shexp.weight", err),
                                           *wsd = need(v, "ffn_down_shexp.weight", err);
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
+                    ph(PT_ROUTER);
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
@@ -3542,7 +3571,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
                     const bool defer_shared = !stream_all && stream_ahead_enabled();
+                    ph(PT_SHARED);
                     if (!defer_shared && !shared_expert()) return false;
+                    ph(PT_EXPERTS);
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -3619,12 +3650,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                             }
                             b.e1 = e;
+                            ph(PT_WAIT);
                             if (k > k0) {
                                 // one copy stream, in order: the batch's last blob covers the others
                                 pt.mark(kPfWaitCopy, cs);
                                 wait_issued(k - 1);
                                 cudaStreamWaitEvent(m.cs, m.copied[(k - 1) % (size_t) m.ring], 0);
                             }
+                            ph(PT_EXPERTS);
                             pt.mark(kPfGemmGU, cs);
                             if (fused_nat) {
                                 const auto& f = lay.fmt[(size_t) l];
@@ -3786,7 +3819,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         if (defer_shared) {
                             pt.mark(kPfRouter, cs);   // keep the existing router+shared timing attribution
+                            ph(PT_SHARED);
                             if (!shared_expert()) return false;
+                            ph(PT_EXPERTS);
                             pt.mark(kPfHostGroup, cs);
                         }
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
@@ -4455,8 +4490,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (gg.n <= gg.first) return;
                             const auto& f = lay.fmt[(size_t) l];
                             if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
+                                ph(PT_WAIT);
                                 pt.mark(kPfWaitCopy, cs);
                                 cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
+                                ph(PT_EXPERTS);
                                 pt.mark(kPfDequant, cs);
                             }
                             // NVFP4: each expert's scales go next to its group slot in the same launch
@@ -4633,10 +4670,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1,
                                                  m.host_res[(size_t) l * m.g->n_expert + e])) return false;
                                 } else {
+                                    ph(PT_WAIT);
                                     if (!group_resident) {   // grouped: the flush waits once, on the group's last copy
                                         pt.mark(kPfWaitCopy, cs);
                                         cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
                                     }
+                                    ph(PT_EXPERTS);
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j], -1)) return false;
                                     --pending;   // compute recorded the slot's release event before any reuse
                                 }
@@ -4661,11 +4700,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 release_to(e);
                                 if (k < kend && seq[k].e == e) {
                                     const int sl = (int) (k % (size_t) m.ring);
+                                    ph(PT_WAIT);
                                     wait_issued(k);
                                     if (!group_gather) {
                                         pt.mark(kPfWaitCopy, cs);
                                         cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
                                     }
+                                    ph(PT_EXPERTS);
                                     if (!compute(j, m.stage_dev[sl], sl, -1)) return false;
                                     consumed = ++k;
                                     if (!group_gather || gg_nslots == 0) give_back(consumed);   // its group was gathered
@@ -4682,6 +4723,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             release_to(m.g->n_expert);
                         }
                     }
+                    ph(PT_OTHER);
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)
                         if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
@@ -4747,6 +4789,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                 }
+                ph(PT_OTHER);
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
                 // control vector)
@@ -4813,6 +4856,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
         }
         if (phase == PH_LAYER) {   // the layer-major pass: the residual goes back, and so does the norm the next layer's first half reads
+            ph(PT_END);
             lm_mark(true);
             struct EndMark { decltype(lm_mark)& f; ~EndMark() { f(false); } } end_mark{lm_mark};
             if (!lm_copy(lmh.R + (size_t) c0 * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost)) return false;
@@ -5042,6 +5086,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         lm_copy_ev.clear();
         std::fprintf(stderr, "strata prefill: layer-major residual traffic: %.1f GB host<->device in %.1f s of copies on the compute stream\n",
                      (double) lm_copy_bytes / 1e9, copy_ms / 1000.0);
+        if (phase_timers && ph_t.passes > 0 && !ph_t.marks.empty()) {
+            // one stream: the last mark (a pass's end) completes after all the others, so one sync reads every interval
+            cudaEventSynchronize(ph_t.pool[ph_t.marks.back().second]);
+            double ms[PT_SHARED + 1] = {};
+            for (size_t i = 0; i + 1 < ph_t.marks.size(); ++i) {
+                const int cat = ph_t.marks[i].first;
+                float t = 0;
+                if (cat >= 0 && cudaEventElapsedTime(&t, ph_t.pool[ph_t.marks[i].second], ph_t.pool[ph_t.marks[i + 1].second]) == cudaSuccess)
+                    ms[cat] += t;
+            }
+            std::fprintf(stderr, "strata prefill: layer-major compute: attn %.2f s, gdn %.2f s, router %.2f s, expert-wait %.2f s, "
+                                 "experts %.2f s, shared %.2f s, other %.2f s (passes %lld)\n",
+                         ms[PT_ATTN] / 1000.0, ms[PT_GDN] / 1000.0, ms[PT_ROUTER] / 1000.0, ms[PT_WAIT] / 1000.0,
+                         ms[PT_EXPERTS] / 1000.0, ms[PT_SHARED] / 1000.0, ms[PT_OTHER] / 1000.0, (long long) ph_t.passes);
+        }
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
