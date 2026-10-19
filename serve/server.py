@@ -3439,7 +3439,8 @@ class Service:
         if not getattr(v, "elastic", False):
             return
         print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
-              f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
+              "without one" + (f"; while it runs the expert cache keeps {v.elastic_mib} MiB free for it" if getattr(v, "gpu", True)
+                              else " (on the CPU: no VRAM held)"), flush=True)
 
         def loop():
             while True:
