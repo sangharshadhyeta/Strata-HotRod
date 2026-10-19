@@ -2090,12 +2090,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
             }
-            if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
             if (sh_fk != nullptr) {   // the shared stream's end, paired with its fork (not in the cs chain)
-                cudaEvent_t sh_end = stage_event(sh_cs_, err);
+                cudaEvent_t sh_end = stage_event(sh_cs_, err);   // before ev_join_: the join back to cs covers this node
                 if (sh_end == nullptr) return false;
                 stage_cur_->shared.push_back({sh_fk, sh_end});
             }
+            if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
         }
         if (strata::kernels::cpu::expert_layout().native) {
             if (!qdedup)
