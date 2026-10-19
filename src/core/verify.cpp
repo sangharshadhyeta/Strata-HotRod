@@ -90,6 +90,9 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// STRATA_DECODE_STAGE_TIMERS=1: the decode window's stage boundaries (Verifier::stage_mark); the ids index stage_ms_
+inline bool g_stage_timers() { static const bool on = [] { const char* v = std::getenv("STRATA_DECODE_STAGE_TIMERS"); return v != nullptr && v[0] == '1'; }(); return on; }
+enum StageId : int { kStOther = 0, kStPost, kStHc, kStAttn, kStGdn, kStFfn, kStRouter, kStDoor, kStShared };
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
@@ -582,6 +585,88 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 
+// STRATA_DECODE_STAGE_TIMERS: the event pool of one window graph (its capture's events, created before the capture)
+void Verifier::stage_prepare(int key, int64_t n_layers) {
+    StageChain& c = stage_chains_[key];
+    for (cudaEvent_t e : c.owned) cudaEventDestroy(e);
+    c.owned.clear();
+    c.used = 0;
+    c.marks.clear();
+    c.shared.clear();
+    const size_t need = (size_t) n_layers * 2 * kStagePerLayer + 8;   // two token groups at most, plus the window's ends
+    c.owned.reserve(need);
+    for (size_t i = 0; i < need; ++i) {
+        cudaEvent_t e = nullptr;
+        if (cudaEventCreateWithFlags(&e, cudaEventDefault) != cudaSuccess) {   // timing on: cudaEventElapsedTime reads it
+            (void) cudaGetLastError();
+            break;
+        }
+        c.owned.push_back(e);
+    }
+}
+
+// The next pooled event, recorded on `s` while it is captured as an external event-record node: the graph node records
+// the event each time the graph replays (a plain capture-time record would leave no timing at replay).
+cudaEvent_t Verifier::stage_event(cudaStream_t s, std::string& err) {
+    StageChain& c = *stage_cur_;
+    if (c.used >= c.owned.size()) {
+        err = "verify: the decode stage timers ran out of events";
+        return nullptr;
+    }
+#if defined(cudaEventRecordExternal)
+    cudaEvent_t e = c.owned[c.used++];
+    if (cudaEventRecordWithFlags(e, s, cudaEventRecordExternal) != cudaSuccess) {
+        err = "verify: a decode stage timer could not be recorded in the window graph";
+        return nullptr;
+    }
+    return e;
+#else
+    (void) s;
+    err = "verify: STRATA_DECODE_STAGE_TIMERS needs cudaEventRecordExternal (CUDA 12.3 or newer)";
+    return nullptr;
+#endif
+}
+
+bool Verifier::stage_mark(cudaStream_t s, int stage, std::string& err) {
+    if (stage_cur_ == nullptr) return true;
+    cudaEvent_t e = stage_event(s, err);
+    if (e == nullptr) return false;
+    stage_cur_->marks.push_back({e, stage});
+    return true;
+}
+
+// After a window's sync: the time of each interval of the chain, charged to the stage that ends it
+void Verifier::stage_harvest(int key) {
+    auto it = stage_chains_.find(key);
+    if (it == stage_chains_.end()) return;
+    const StageChain& c = it->second;
+    for (size_t k = 1; k < c.marks.size(); ++k) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, c.marks[k - 1].ev, c.marks[k].ev) == cudaSuccess)
+            stage_ms_[c.marks[k].stage] += (double) ms;
+        else
+            (void) cudaGetLastError();
+    }
+    for (const auto& p : c.shared) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, p.first, p.second) == cudaSuccess) stage_shared_ms_ += (double) ms;
+        else (void) cudaGetLastError();
+    }
+    if (++stage_windows_ % 200 == 0) stage_report();
+}
+
+void Verifier::stage_report() const {
+    if (stage_windows_ == 0) return;
+    const double w = (double) stage_windows_;
+    std::fprintf(stderr,
+                 "strata decode stages (ms/window over %lld windows): post-tail %.3f, hc-read %.3f, attn %.3f, gdn %.3f, "
+                 "ffn-read %.3f, router %.3f, doorbell %.3f, shared %.3f, other %.3f; shared stream %.3f (forked, overlaps, "
+                 "not in the sum)\n",
+                 (long long) stage_windows_, stage_ms_[kStPost] / w, stage_ms_[kStHc] / w, stage_ms_[kStAttn] / w,
+                 stage_ms_[kStGdn] / w, stage_ms_[kStFfn] / w, stage_ms_[kStRouter] / w, stage_ms_[kStDoor] / w,
+                 stage_ms_[kStShared] / w, stage_ms_[kStOther] / w, stage_shared_ms_ / w);
+}
+
 Verifier::~Verifier() {
 #if defined(STRATA_GPU_METAL)
     strata::metal_engine::window_destroy(metal_);
@@ -595,6 +680,9 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    stage_report();   // STRATA_DECODE_STAGE_TIMERS: the cumulative per-window averages, if any window was timed
+    for (auto& kv : stage_chains_)
+        for (cudaEvent_t e : kv.second.owned) cudaEventDestroy(e);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     for (auto& e : exec_nr_)
@@ -1309,6 +1397,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             inputs_pending = false;
         }
         stamp(l, 1, grp);
+        if (!stage_mark(cs, kStHc, err)) return false;
         float* xm = mixed_ + tb * N;
         bool il_ready = false;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
         // a projection input's q8_1 blocks and their interleaved copy in one launch (native_quantize_q8_1_il, the same
@@ -1849,8 +1938,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
+        if (!stage_mark(cs, is_qsa_layer(g, l) ? kStAttn : kStGdn, err)) return false;
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
+        if (!stage_mark(cs, kStFfn, err)) return false;
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
         static const bool sh_fork_late_env = [] {
@@ -1860,9 +1951,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool sh_fork = sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
         const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
+        cudaEvent_t sh_fk = nullptr;   // STRATA_DECODE_STAGE_TIMERS: the fork's boundary on cs (paired with the shared stream's end)
         if (sh_fork && !sh_fork_late) {
             cudaEventRecord(ev_fork_, cs);
             cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+            if (stage_cur_ != nullptr && (sh_fk = stage_event(cs, err)) == nullptr) return false;
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
@@ -1929,6 +2022,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+        if (!stage_mark(cs, kStRouter, err)) return false;
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1958,8 +2052,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (sh_fork_late) {
                 cudaEventRecord(ev_fork_, cs);
                 cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+                if (stage_cur_ != nullptr && (sh_fk = stage_event(cs, err)) == nullptr) return false;
             }
         }
+        if (!stage_mark(cs, kStDoor, err)) return false;
+        if (!stage_mark(cs, kStOther, err)) return false;   // what came after the doorbell before the shared expert's stamp
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
         {
@@ -1994,6 +2091,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
             }
             if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
+            if (sh_fk != nullptr) {   // the shared stream's end, paired with its fork (not in the cs chain)
+                cudaEvent_t sh_end = stage_event(sh_cs_, err);
+                if (sh_end == nullptr) return false;
+                stage_cur_->shared.push_back({sh_fk, sh_end});
+            }
         }
         if (strata::kernels::cpu::expert_layout().native) {
             if (!qdedup)
@@ -2001,6 +2103,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         stamp(l, 18, grp);
+        if (!stage_mark(cs, kStShared, err)) return false;   // the cs side of the shared expert (its stream: the pair above)
         return true;
     };
 
@@ -2147,9 +2250,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
         }
+        if (!stage_mark(cs, kStPost, err)) return false;   // the post-tail: the expert waits, the combine, the write
         return true;
     };
 
+    if (!stage_mark(cs, kStOther, err)) return false;   // the window's start (marks[0]: no time of its own)
     for (int grp = 0; grp < G; ++grp)
         if (!pre(lb_, grp)) return false;
     for (int64_t l = lb_; l < le_; ++l)
@@ -2264,6 +2369,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
+    if (!stage_mark(cs, kStOther, err)) return false;   // the head
     stamp(g.n_layers, 1, 0);
     return true;
 }
@@ -2323,12 +2429,18 @@ bool Verifier::capture(int T, std::string& err) {
         else
             (void) cudaGetLastError();
     }
+    // STRATA_DECODE_STAGE_TIMERS: the stage events are created before the capture starts (its thread-local mode)
+    const int stage_key = T * 2 + (ar_off_ ? 1 : 0);
+    const bool stage_on = g_stage_timers();
+    if (stage_on) stage_prepare(stage_key, g_->n_layers);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
     }
     std::string rerr;
+    stage_cur_ = stage_on ? &stage_chains_[stage_key] : nullptr;
     const bool ok = record_window(T, cs_, rerr);
+    stage_cur_ = nullptr;
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
@@ -2974,6 +3086,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (g_stage_timers()) stage_harvest(T * 2 + (ar_off_ ? 1 : 0));   // after the window's own sync: no new one
     if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;

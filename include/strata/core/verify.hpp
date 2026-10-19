@@ -506,6 +506,29 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    // STRATA_DECODE_STAGE_TIMERS=1 (off: no events, the graphs unchanged): stage boundaries recorded on the capturing
+    // stream as event-record nodes inside each decode window graph, read back after the window's own sync in run().
+    // Keyed by the window size and the graph variant (T * 2 + ar_off_).  The times of one window are the intervals
+    // between consecutive boundaries in the stream's order; the forked shared-expert stream is a separate pair.
+    static constexpr int kStageN = 9;          // other, post-tail, hc-read, attn, gdn, ffn-read, router, doorbell, shared
+    static constexpr int kStagePerLayer = 10;  // boundaries per layer and token group (incl. the shared stream's pair)
+    struct StageMark { cudaEvent_t ev; int stage; };
+    struct StageChain {
+        std::vector<cudaEvent_t> owned;   // created before the capture, destroyed with the verifier
+        size_t used = 0;
+        std::vector<StageMark> marks;     // the capturing stream's boundaries in its order; marks[0] = the window's start
+        std::vector<std::pair<cudaEvent_t, cudaEvent_t>> shared;   // the forked shared stream: (fork on cs, end on sh)
+    };
+    std::map<int, StageChain> stage_chains_;
+    StageChain* stage_cur_ = nullptr;   // set by capture() around record_window (null: off, or a batch window)
+    double stage_ms_[kStageN] = {};     // summed over the windows harvested, all layers and groups
+    double stage_shared_ms_ = 0.0;      // the forked shared stream's time (it overlaps the chain: not in the sum)
+    int64_t stage_windows_ = 0;
+    void stage_prepare(int key, int64_t n_layers);
+    cudaEvent_t stage_event(cudaStream_t s, std::string& err);
+    bool stage_mark(cudaStream_t s, int stage, std::string& err);
+    void stage_harvest(int key);
+    void stage_report() const;
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
