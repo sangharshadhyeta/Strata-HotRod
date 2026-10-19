@@ -515,6 +515,20 @@ struct Alloc {
     }
 };
 
+// The layer-major expert map's bytes in the borrowed budget: 0 unless STRATA_PREFILL_LAYER_MAJOR is set (the env is
+// unset: no region, the plan and the carve are as before).  STRATA_PREFILL_LM_MAP_MIB sets the size (default 700 MiB).
+// bytes_needed counts it and carve takes it from the same loan, so the planner's chunk and the carve agree.
+inline uint64_t lm_map_budget() {
+    static const uint64_t bytes = [] {
+        const char* v = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
+        if (v == nullptr || std::atoi(v) == 0) return (uint64_t) 0;
+        const char* mb = std::getenv("STRATA_PREFILL_LM_MAP_MIB");
+        const long long mib = mb != nullptr ? std::atoll(mb) : 700;
+        return mib > 0 ? (uint64_t) mib << 20 : (uint64_t) 0;
+    }();
+    return bytes;
+}
+
 }  // namespace
 
 // Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
@@ -968,6 +982,8 @@ struct Prefill::Impl {
     float* ple_norm = nullptr;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
+    uint8_t* lm_map = nullptr;               // the layer-major expert map, a slice of the borrowed loan (carve); null: cudaMalloc
+    uint64_t lm_map_bytes = 0;
     PrefillStats* stats = nullptr;
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     strata::kernels::KvHostPools stage;
@@ -1517,6 +1533,18 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
+    // The layer-major expert map (STRATA_PREFILL_LAYER_MAJOR=1): a slice of the borrowed loan, taken last so it never
+    // starves another buffer, and counted by bytes_needed.  Not fatal: a map that does not fit leaves lm_map null, and
+    // run_impl falls back to its cudaMalloc.  An owned layout (no loan) takes none.
+    m.lm_map = nullptr;
+    m.lm_map_bytes = 0;
+    if (o.base != nullptr && lm_map_budget() > 0) {
+        bool okm = true;
+        if (uint8_t* p = o.take<uint8_t>((size_t) lm_map_budget(), okm)) {
+            m.lm_map = p;
+            m.lm_map_bytes = lm_map_budget();
+        }
+    }
     m.T = (int64_t) T;
     return ok;
 }
@@ -2208,6 +2236,8 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
     take_stage(o, ss, s, stage, ok);
+    // the layer-major expert map, borrowed (carve takes it from the same loan, last); an owned layout keeps cudaMalloc
+    if (!owned_pages && lm_map_budget() > 0) o.take<uint8_t>((size_t) lm_map_budget(), ok);
     return o.used + (8u << 20);   // alignment slack
 }
 
@@ -2523,13 +2553,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         uint16_t* xnlo = nullptr;  // its low part (bf16x2 only): T * D per chunk
         cudaEvent_t ev = nullptr;  // recorded after a layer's last compute: the map's readers are done
         uint8_t* map = nullptr;    // the expert map: a layer's streamed experts, kept for the chunks after its first
+        bool map_shared = false;   // the map is the borrowed loan's slice (Impl::lm_map): owned by the loan, not freed here
         ~LmHost() {
             if (R) cudaFreeHost(R);
             if (grs) cudaFreeHost(grs);
             if (xn) cudaFreeHost(xn);
             if (xnlo) cudaFreeHost(xnlo);
             if (ev) cudaEventDestroy(ev);
-            if (map) cudaFree(map);
+            if (map && !map_shared) cudaFree(map);
         }
     } lmh;
     struct LmSync {   // an early return drains the layer-major copies before their host and device buffers go
@@ -4871,14 +4902,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             lm = false;
         }
     }
+    const char* lm_map_src = "none";
     if (lm) {
-        // the expert map: as much of the device as the first try gets (a layer's experts that do not fit stream as before)
-        for (const size_t want : {(size_t) 700 << 20, (size_t) 256 << 20}) {
-            if (cudaMalloc((void**) &lmh.map, want) == cudaSuccess) {
-                lm_cap = want;
-                break;
+        if (m.lm_map != nullptr) {
+            // the expert map from the borrowed loan (carve): its bytes are the loan's, so it is not cudaFree'd here
+            lmh.map = m.lm_map;
+            lmh.map_shared = true;
+            lm_cap = (size_t) m.lm_map_bytes;
+            lm_map_src = "borrowed";
+        } else {
+            // the expert map: as much of the device as the first try gets (a layer's experts that do not fit stream as before)
+            for (const size_t want : {(size_t) 700 << 20, (size_t) 256 << 20}) {
+                if (cudaMalloc((void**) &lmh.map, want) == cudaSuccess) {
+                    lm_cap = want;
+                    lm_map_src = "cudaMalloc";
+                    break;
+                }
+                (void) cudaGetLastError();
             }
-            (void) cudaGetLastError();
         }
         lm_off.assign((size_t) g.n_expert, -1);
         lm_steps.assign((size_t) n * strata::kernels::kStepCount, 0);
@@ -4927,8 +4968,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         for (int64_t ci = 0; ci < nch; ++ci)
             if (!run_chunk(ci * C, PH_TAIL, 0)) return false;
         std::fprintf(stderr, "strata prefill: layer-major: %lld chunks, %lld layers, %lld experts streamed, %lld reused from "
-                             "the layer map (%.0f MB)\n", (long long) nch, (long long) g.n_layers,
-                     (long long) (stats_.experts_streamed - streamed0), (long long) lm_reused, lm_cap / 1048576.0);
+                             "the layer map (%.0f MB, %s)\n", (long long) nch, (long long) g.n_layers,
+                     (long long) (stats_.experts_streamed - streamed0), (long long) lm_reused, lm_cap / 1048576.0,
+                     lm_map_src);
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
