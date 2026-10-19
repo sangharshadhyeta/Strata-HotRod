@@ -988,6 +988,8 @@ struct Prefill::Impl {
     uint64_t region_bytes = 0;
     uint8_t* lm_map = nullptr;               // the layer-major expert map, a slice of the borrowed loan (carve); null: cudaMalloc
     uint64_t lm_map_bytes = 0;
+    uint8_t* lm_dev = nullptr;               // the loan's tail after carve: the layer-major residual state's device bytes (256-aligned)
+    uint64_t lm_dev_bytes = 0;               // (null / 0: no remainder - an owned layout, a spilled loan, or nothing left)
     PrefillStats* stats = nullptr;
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     strata::kernels::KvHostPools stage;
@@ -1548,6 +1550,15 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.lm_map = p;
             m.lm_map_bytes = lm_map_budget();
         }
+    }
+    // What is left of the loan after every take above: run_impl's layer-major residual state lives here, on the GPU, for the
+    // prompt's first tokens.  An owned layout, or a loan that spilled to cudaMalloc, has no remainder.
+    m.lm_dev = nullptr;
+    m.lm_dev_bytes = 0;
+    if (o.base != nullptr && !o.spilled && o.used < o.cap) {
+        const uintptr_t a = ((uintptr_t) (o.base + o.used) + 255) & ~(uintptr_t) 255;
+        const uintptr_t end = (uintptr_t) (o.base + o.cap);
+        if (a < end) { m.lm_dev = (uint8_t*) a; m.lm_dev_bytes = (uint64_t) (end - a); }
     }
     m.T = (int64_t) T;
     return ok;
@@ -2607,6 +2618,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         float* grs = nullptr;      // the row scales a layer's last write leaves for the next layer's first half: T * HC
         uint16_t* xn = nullptr;    // the xn16 image of the same: T * xs per chunk (xs: the widest row stride)
         uint16_t* xnlo = nullptr;  // its low part (bf16x2 only): T * D per chunk
+        // the first n_dev tokens' state is on the GPU instead (the loan's tail, Impl::lm_dev; not freed here): the four
+        // device arrays hold n_dev tokens each, and the host arrays above hold tokens [n_dev, n)
+        int64_t n_dev = 0;
+        float* Rd = nullptr;
+        float* grsd = nullptr;
+        uint16_t* xnd = nullptr;
+        uint16_t* xnlod = nullptr;
         cudaEvent_t ev = nullptr;  // recorded after a layer's last compute: the map's readers are done
         uint8_t* map = nullptr;    // the expert map: a layer's streamed experts, kept for the chunks after its first
         bool map_shared = false;   // the map is the borrowed loan's slice (Impl::lm_map): owned by the loan, not freed here
@@ -2631,7 +2649,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const size_t lm_xs = (size_t) (D + (hc_pad() ? XN_PAD : 0));
     // the layer-major passes' residual traffic: bytes, and CUDA event pairs around each pass's copy-in and copy-out groups
     // (on cs, the compute stream: these copies do not overlap compute, so their time adds to the prompt's)
-    uint64_t lm_copy_bytes = 0;
+    uint64_t lm_copy_bytes = 0;        // host<->device
+    uint64_t lm_dev_copy_bytes = 0;    // device-to-device: the chunks whose state is on the GPU (LmHost::n_dev)
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> lm_copy_ev;
     // STRATA_PREFILL_PHASE_TIMERS=1 (diagnosis, off by default): the layer-major passes' compute, split by category.  ph(c)
     // records an event on cs at a step's start, and the time from one mark to the next is charged to the first one's category
@@ -2655,11 +2674,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         else cudaEventDestroy(e);
     };
     auto lm_copy = [&](void* dst, const void* src, size_t bytes, cudaMemcpyKind kind) -> bool {
-        lm_copy_bytes += bytes;
+        if (kind == cudaMemcpyDeviceToDevice) lm_dev_copy_bytes += bytes;
+        else lm_copy_bytes += bytes;
         if (bytes == 0 || cudaMemcpyAsync(dst, src, bytes, kind, cs) == cudaSuccess) return true;
         err = std::string("prefill: the layer-major copy failed: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     };
+    // a chunk's state at token c0, `w` elements a token: the GPU array for the first lmh.n_dev tokens, else the host array
+    // (which starts at token n_dev); and the copy kind for it (device-to-device on the GPU, the given direction otherwise)
+    auto lm_at = [&](auto* host, auto* dev, int64_t c0, size_t w) {
+        return c0 < lmh.n_dev ? dev + (size_t) c0 * w : host + (size_t) (c0 - lmh.n_dev) * w;
+    };
+    auto lm_kind = [&](int64_t c0, cudaMemcpyKind k) { return c0 < lmh.n_dev ? cudaMemcpyDeviceToDevice : k; };
     bool lm_skip_cpu_share = false;   // set once the layer-major path is taken: its chunks do not hold the CPU pool
     auto run_chunk = [&](int64_t c0, int phase, int64_t lay) -> bool {
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0, ci = c0 / C;
@@ -2685,7 +2711,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             ph_t.marks.push_back({cat, i});
         };
         if (phase == PH_LAYER || phase == PH_TAIL) {   // this chunk's residual comes back from the host
-            if (!lm_copy(m.R, lmh.R + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice)) return false;
+            if (!lm_copy(m.R, lm_at(lmh.R, lmh.Rd, c0, D), (size_t) T * D * 4, lm_kind(c0, cudaMemcpyHostToDevice))) return false;
         }
         if (phase == PH_LAYER) {   // its QSA step records, and the norm the layer before left for this half
             std::copy_n(lm_steps.data() + (size_t) c0 * strata::kernels::kStepCount, (size_t) T * strata::kernels::kStepCount,
@@ -2695,9 +2721,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
             if (lm_carry[(size_t) ci]) {
-                if (!lm_copy(m.grs, lmh.grs + (size_t) c0 * HC, (size_t) T * HC * 4, cudaMemcpyHostToDevice) ||
-                    !lm_copy(m.xn16, lmh.xn + (size_t) c0 * lm_xs, (size_t) T * lm_xs * 2, cudaMemcpyHostToDevice) ||
-                    (m.xn16_lo && !lm_copy(m.xn16_lo, lmh.xnlo + (size_t) c0 * D, (size_t) T * D * 2, cudaMemcpyHostToDevice)))
+                if (!lm_copy(m.grs, lm_at(lmh.grs, lmh.grsd, c0, HC), (size_t) T * HC * 4, lm_kind(c0, cudaMemcpyHostToDevice)) ||
+                    !lm_copy(m.xn16, lm_at(lmh.xn, lmh.xnd, c0, lm_xs), (size_t) T * lm_xs * 2, lm_kind(c0, cudaMemcpyHostToDevice)) ||
+                    (m.xn16_lo && !lm_copy(m.xn16_lo, lm_at(lmh.xnlo, lmh.xnlod, c0, D), (size_t) T * D * 2, lm_kind(c0, cudaMemcpyHostToDevice))))
                     return false;
                 normed = true;
             }
@@ -2887,7 +2913,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         };
         if (setup && !kv_prefetch_after(LB, qsa_index)) return false;
         if (phase == PH_SETUP) {   // the layer-major setup: the residual goes to the host for the layers' passes
-            if (!lm_copy(lmh.R + (size_t) c0 * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost)) return false;
+            if (!lm_copy(lm_at(lmh.R, lmh.Rd, c0, D), m.R, (size_t) T * D * 4, lm_kind(c0, cudaMemcpyDeviceToHost))) return false;
             host_setup_ms += ms_since(tsetup);
             return true;
         }
@@ -4876,12 +4902,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             ph(PT_END);
             lm_mark(true);
             struct EndMark { decltype(lm_mark)& f; ~EndMark() { f(false); } } end_mark{lm_mark};
-            if (!lm_copy(lmh.R + (size_t) c0 * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost)) return false;
+            if (!lm_copy(lm_at(lmh.R, lmh.Rd, c0, D), m.R, (size_t) T * D * 4, lm_kind(c0, cudaMemcpyDeviceToHost))) return false;
             lm_carry[(size_t) ci] = normed ? 1 : 0;
             if (normed &&
-                (!lm_copy(lmh.grs + (size_t) c0 * HC, m.grs, (size_t) T * HC * 4, cudaMemcpyDeviceToHost) ||
-                 !lm_copy(lmh.xn + (size_t) c0 * lm_xs, m.xn16, (size_t) T * lm_xs * 2, cudaMemcpyDeviceToHost) ||
-                 (m.xn16_lo && !lm_copy(lmh.xnlo + (size_t) c0 * D, m.xn16_lo, (size_t) T * D * 2, cudaMemcpyDeviceToHost))))
+                (!lm_copy(lm_at(lmh.grs, lmh.grsd, c0, HC), m.grs, (size_t) T * HC * 4, lm_kind(c0, cudaMemcpyDeviceToHost)) ||
+                 !lm_copy(lm_at(lmh.xn, lmh.xnd, c0, lm_xs), m.xn16, (size_t) T * lm_xs * 2, lm_kind(c0, cudaMemcpyDeviceToHost)) ||
+                 (m.xn16_lo && !lm_copy(lm_at(lmh.xnlo, lmh.xnlod, c0, D), m.xn16_lo, (size_t) T * D * 2, lm_kind(c0, cudaMemcpyDeviceToHost)))))
                 return false;
             return true;
         }
@@ -5019,8 +5045,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): %s\n",
                      (long long) n, (long long) C, why);
     }
+    // The GPU part of the residual state (STRATA_LM_DEVICE=0 keeps it all in pinned RAM): the longest prefix of whole chunks
+    // whose state fits the loan's tail (Impl::lm_dev).  A chunk is on the GPU iff its whole range fits; the last chunk may be
+    // shorter.  Each array is 256-byte aligned, as carve's takes are.
+    static const bool lm_device_env = [] { const char* e = std::getenv("STRATA_LM_DEVICE"); return !(e != nullptr && e[0] == '0' && e[1] == '\0'); }();
+    auto lm_gpu_bytes = [&](int64_t t) -> uint64_t {
+        auto up = [](uint64_t b) { return (b + 255) & ~(uint64_t) 255; };
+        uint64_t b = up((uint64_t) t * D * 4) + up((uint64_t) t * HC * 4) + up((uint64_t) t * lm_xs * 2);
+        if (m.xn16_lo) b += up((uint64_t) t * D * 2);
+        return b;
+    };
+    int64_t n_dev = 0;
+    if (lm_device_env && m.lm_dev != nullptr && m.lm_dev_bytes > 0 && C > 0) {
+        for (int64_t k = (n + C - 1) / C; k > 0; --k) {
+            const int64_t t = std::min(k * C, n);
+            if (lm_gpu_bytes(t) <= m.lm_dev_bytes) { n_dev = t; break; }
+        }
+    }
     if (lm) {   // the residuals are pinned (they cannot be paged out): refused when they would not leave the memory floor free
-        const uint64_t need = (uint64_t) layer_major_host_bytes(n);
+        const uint64_t need = (uint64_t) layer_major_host_bytes(n - n_dev);   // the host part only
         const auto mem = core::sample_host_memory();
         if (mem && !core::conversation_memory_admit(mem->available, need, host_floor_bytes())) {
             std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): its residuals need "
@@ -5031,10 +5074,27 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
     }
     if (lm) {
-        const bool ok = cudaHostAlloc((void**) &lmh.R, (size_t) n * D * 4, cudaHostAllocDefault) == cudaSuccess &&
-                        cudaHostAlloc((void**) &lmh.grs, (size_t) n * HC * 4, cudaHostAllocDefault) == cudaSuccess &&
-                        cudaHostAlloc((void**) &lmh.xn, (size_t) n * lm_xs * 2, cudaHostAllocDefault) == cudaSuccess &&
-                        (!m.xn16_lo || cudaHostAlloc((void**) &lmh.xnlo, (size_t) n * D * 2, cudaHostAllocDefault) == cudaSuccess) &&
+        // the GPU part: carved from the loan's tail in the order R, grs, xn, xnlo (never freed here: the loan owns it)
+        lmh.n_dev = n_dev;
+        if (n_dev > 0) {
+            uint8_t* p = m.lm_dev;
+            auto take = [&](uint64_t bytes) -> void* {
+                void* q = p;
+                p += (bytes + 255) & ~(uint64_t) 255;
+                return q;
+            };
+            lmh.Rd = (float*) take((uint64_t) n_dev * D * 4);
+            lmh.grsd = (float*) take((uint64_t) n_dev * HC * 4);
+            lmh.xnd = (uint16_t*) take((uint64_t) n_dev * lm_xs * 2);
+            if (m.xn16_lo) lmh.xnlod = (uint16_t*) take((uint64_t) n_dev * D * 2);
+        }
+        // the host part: tokens [n_dev, n) (a zero-size part is not allocated)
+        const size_t nh = (size_t) (n - n_dev);
+        auto host_arr = [&](void** pp, size_t bytes) { return bytes == 0 || cudaHostAlloc(pp, bytes, cudaHostAllocDefault) == cudaSuccess; };
+        const bool ok = host_arr((void**) &lmh.R, nh * D * 4) &&
+                        host_arr((void**) &lmh.grs, nh * HC * 4) &&
+                        host_arr((void**) &lmh.xn, nh * lm_xs * 2) &&
+                        (!m.xn16_lo || host_arr((void**) &lmh.xnlo, nh * D * 2)) &&
                         cudaEventCreateWithFlags(&lmh.ev, cudaEventDisableTiming) == cudaSuccess;
         if (!ok) {   // no pinned RAM for the residuals: the default path (nothing has run yet)
             (void) cudaGetLastError();
@@ -5042,6 +5102,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                  "for the residuals not available\n", (long long) n, (long long) C);
             lm = false;
         }
+        if (lm)
+            std::fprintf(stderr, "strata prefill: layer-major state: %lld of %lld tokens on the GPU (%.0f MiB of the loan), the rest in "
+                                 "pinned RAM\n", (long long) n_dev, (long long) n, lm_gpu_bytes(n_dev) / 1048576.0);
     }
     const char* lm_map_src = "none";
     if (lm) {
@@ -5124,8 +5187,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         lm_copy_ev.clear();
         if (phase_timers)
-            std::fprintf(stderr, "strata prefill: layer-major residual traffic: %.1f GB host<->device in %.1f s of copies on the compute stream\n",
-                         (double) lm_copy_bytes / 1e9, copy_ms / 1000.0);
+            std::fprintf(stderr, "strata prefill: layer-major residual traffic: %.1f GB host<->device and %.1f GB on the device in %.1f s of "
+                                 "copies on the compute stream\n", (double) lm_copy_bytes / 1e9, (double) lm_dev_copy_bytes / 1e9, copy_ms / 1000.0);
         if (phase_timers && ph_t.passes > 0 && !ph_t.marks.empty()) {
             // one stream: the last mark (a pass's end) completes after all the others, so one sync reads every interval
             cudaEventSynchronize(ph_t.pool[ph_t.marks.back().second]);

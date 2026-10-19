@@ -4178,14 +4178,17 @@ def kv_streaming_ram_gb(ctx, kv) -> float:
     return ctx * (13 * KV_CELL_BYTES.get(kv, 1056)) / 1e9
 
 
-def kv_streaming_wanted(model, ctx, kv, ram, choice="auto") -> bool:
+def kv_streaming_wanted(model, ctx, kv, ram, choice="auto", files_mode=False) -> bool:
     """Will setup stream this model's KV cache on this PC: from 64K up, when the RAM holds the cache beside the
-    model's experts (+1 GB); `--kv-streaming on|off` overrides the RAM test (the owner's rule), and WSL never
-    streams.  Step 7 writes `--kv-resident` on exactly this answer, and the launcher's preset diff
-    asks it too: a config's `--kv-resident` and a preset's "auto" are the same setting when this says yes."""
+    model's experts (+1 GB); in files mode (the experts read from the NVMe through the mapping, no RAM budget) the
+    experts take no RAM, so the RAM holds the cache alone (+1 GB). `--kv-streaming on|off` overrides the RAM test
+    (the owner's rule), and WSL never streams.  Step 7 writes `--kv-resident` on exactly this answer, and the
+    launcher's preset diff asks it too: a config's `--kv-resident` and a preset's "auto" are the same setting when
+    this says yes."""
     if is_wsl() or choice == "off":
         return False
-    return ctx >= 65536 and (ram >= MODELS[model]["ram_gb"] + kv_streaming_ram_gb(ctx, kv) + 1 or choice == "on")
+    experts_gb = 0 if files_mode else MODELS[model]["ram_gb"]
+    return ctx >= 65536 and (ram >= experts_gb + kv_streaming_ram_gb(ctx, kv) + 1 or choice == "on")
 
 
 def low_ram_one_gpu_why(model, ram, choice, sel=None) -> list[str]:
@@ -6906,7 +6909,9 @@ def main() -> int:
     # when it fits.
     kv_ram_gb = kv_streaming_ram_gb(ctx, kv)      # the branches below are kv_streaming_wanted, with its messages
     # --kv-streaming on|off overrides the RAM test (the owner's rule); WSL stays off - it cannot stream.
-    stream_fits = ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1
+    # files mode (the same test as the launch step's): the experts are mapped from the NVMe, so they take no RAM
+    files_mode = "--mmap-experts" in args and "--resident-budget-gib" not in args and "--resident-experts" not in args
+    stream_fits = ram >= (0 if files_mode else MODELS[model]["ram_gb"]) + kv_ram_gb + 1
     if is_wsl() and ctx >= 65536:
         ok("WSL: KV streaming off (the driver pins only about 1 GB of RAM); the KV cache stays in VRAM")
         if a.kv_streaming == "on":
@@ -6918,9 +6923,9 @@ def main() -> int:
         args += ["--kv-resident", "32768"]
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
         if not stream_fits:
-            warn(f"KV streaming needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{MODELS[model]['ram_gb']} GB {model} "
-                 f"uses; this PC has {ram:.0f}. Kept as you chose (--kv-streaming on): it may page or run out of RAM "
-                 "under load")
+            beside = "" if files_mode else f" beside the ~{MODELS[model]['ram_gb']} GB {model} uses"
+            warn(f"KV streaming needs ~{kv_ram_gb:.1f} GB of RAM{beside}; this PC has {ram:.0f}. Kept as you chose "
+                 "(--kv-streaming on): it may page or run out of RAM under load")
         if q4_split:                                   # #498: no budget to take it out of
             pass
         elif budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget

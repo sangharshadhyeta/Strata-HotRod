@@ -565,7 +565,9 @@ struct Options {
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
-    int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
+    /// KV streaming: resident cells per QSA layer. -1 (default): auto - 32768 from a 65536-token context up when the
+    /// RAM holds the K/V's host copy; 0: all in VRAM; N: N resident cells
+    int64_t kv_resident = -1;
     bool kv_grow = true;               ///< the elastic K/V (kvg_ensure): ON by default since 11 Oct (SPEC 20 9q, 9r, 9s: no loss at 32k, +8% decode and the slots back at 100k tokens of a 131k window); --no-kv-grow / STRATA_KV_GROW=0 turn it off
     bool kv_grow_asked = false;        ///< --kv-grow or STRATA_KV_GROW given: only then does a rig that cannot use it hear why
     std::string dump_residual;
@@ -3086,11 +3088,10 @@ int main(int argc, char** argv) {
     if (kv_rot != nullptr && kv_rot[0] == '1' && o.kv == "int8")
         std::fprintf(stderr, "strata generate: STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation (opt-in)\n");
     strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
-    if (o.kv_resident < 0) {
+    if (o.kv_resident < -1) {   // -1 is auto: decided once the geometry (the QSA layer count) is known, below
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
         return 2;
     }
-    strata::core::qsa_set_kv_resident(o.kv_resident);
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
@@ -3606,6 +3607,39 @@ int main(int argc, char** argv) {
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
+    // K/V streaming, auto (--kv-resident -1, the default): on for a context of 65536 or more when the RAM holds the
+    // K/V's host copy (every QSA layer's pinned copy, carved as qsa_state_init does). Decided here: the geometry is
+    // final, and nothing has read o.kv_resident yet (the session sizing and kv-grow below both see the value).
+    if (o.kv_resident == -1) {
+        const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
+        const int fmt = strata::core::qsa_kv_hybrid() ? strata::kernels::kKvHybrid
+                      : strata::core::qsa_kv_q4()     ? strata::kernels::kKvQ4
+                      : strata::core::qsa_kv_int8()   ? strata::kernels::kKvInt8
+                                                      : strata::kernels::kKvF16;
+        const uint64_t pages = (uint64_t) ((o.max_context + qs.page_size - 1) / qs.page_size);
+        const uint64_t host_bytes = pages * strata::kernels::kv_block_bytes(qs, fmt) * (uint64_t) g.n_qsa_layers();
+        const bool wsl = std::filesystem::exists("/dev/dxg");   // the WSL test layer.cpp's kv_host_alloc makes
+        const auto mem = strata::core::sample_host_memory();
+        const uint64_t need = host_bytes + ((uint64_t) o.conversation_cache_min_free_mib << 20);
+        char why[160] = "";
+        if (o.max_context < 65536) std::snprintf(why, sizeof why, "context below 65536");
+        else if (g.n_qsa_layers() == 0) std::snprintf(why, sizeof why, "no QSA layers");
+        else if (wsl) std::snprintf(why, sizeof why, "WSL");
+        else if (!mem) std::snprintf(why, sizeof why, "RAM cannot be read");
+        else if (mem->available < need)
+            std::snprintf(why, sizeof why, "RAM: need %.2f GiB, %.2f GiB available",
+                          (double) need / 1073741824.0, (double) mem->available / 1073741824.0);
+        if (why[0] == '\0') {
+            o.kv_resident = 32768;
+            std::fprintf(stderr, "strata generate: K/V streaming auto: on - 32768 resident cells per attention layer in "
+                                 "VRAM, the K/V's %.2f GiB host copy in RAM (--kv-resident 0 keeps it all in VRAM)\n",
+                         (double) host_bytes / 1073741824.0);
+        } else {
+            o.kv_resident = 0;
+            std::fprintf(stderr, "strata generate: K/V streaming auto: off (%s)\n", why);
+        }
+    }
+    strata::core::qsa_set_kv_resident(o.kv_resident);
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
@@ -13048,6 +13082,9 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+            // STRATA_LM_DEVICE (default on; 0: the layer-major residuals stay in pinned RAM): the loan also holds the
+            // layer-major state's device part (see the extra slots in lend)
+            static const bool lm_device_on = [] { const char* e = std::getenv("STRATA_LM_DEVICE"); return !(e != nullptr && e[0] == '0' && e[1] == '\0'); }();
             auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
@@ -13102,7 +13139,17 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
                                          "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
-                        first = (int32_t) (p.cache->slots() - need_p);
+                        // The layer-major prompt (more than one chunk) keeps each token's residual state on the GPU, in
+                        // the loan's tail, as far as the slots left after the chunk's own buffers (and the 128-slot floor)
+                        // hold it (Prefill::run_impl: the state's first tokens; the rest is pinned RAM).  The state's bytes
+                        // become slots by the same cache_slots_for as the chunk's own; the extra slots are refilled after
+                        // the prompt with the rest (the lent experts are those at or past `first`).  STRATA_LM_DEVICE=0: none.
+                        int64_t extra_p = 0;
+                        if (lm_device_on && tokens > want_p)
+                            extra_p = std::max<int64_t>(0, std::min<int64_t>(
+                                cache_slots_for(*p.cache, strata::prefill::Prefill::layer_major_host_bytes(tokens)),
+                                p.cache->slots() - 128 - need_p));
+                        first = (int32_t) (p.cache->slots() - need_p - extra_p);
                     }
                     if (want_p != p.sp->chunk() || first != p.first_now) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
