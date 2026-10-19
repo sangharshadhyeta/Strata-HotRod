@@ -15101,6 +15101,16 @@ int main(int argc, char** argv) {
                     ic_prev = ic;
                     fb_prev = fb;
                 }
+                {   // read_direct (O_DIRECT): the bytes the batches asked for vs the bytes their requests read, since the previous one
+                    static uint64_t dq_prev = 0, dr_prev = 0;
+                    const uint64_t dq = strata::core::FileExpertSource::direct_requested_bytes();
+                    const uint64_t dr = strata::core::FileExpertSource::direct_read_bytes();
+                    if (dr != dr_prev)
+                        std::fprintf(stderr, "strata serve: direct reads: %.1f MB requested, %.1f MB read\n",
+                                     (double) (dq - dq_prev) / 1e6, (double) (dr - dr_prev) / 1e6);
+                    dq_prev = dq;
+                    dr_prev = dr;
+                }
             }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)

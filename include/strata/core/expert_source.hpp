@@ -793,6 +793,9 @@ public:
     /// the time spent reading the files, summed over threads.
     uint64_t file_blob_bytes() const { return file_blob_bytes_.load(std::memory_order_relaxed); }
     double file_ms() const { return (double) file_us_.load(std::memory_order_relaxed) / 1000.0; }
+    /// read_direct totals since the start (Linux): bytes the batches asked for, and bytes their requests read.
+    static uint64_t direct_requested_bytes();
+    static uint64_t direct_read_bytes();
     /// Threads `prefetch` reads the GGUF with (STRATA_FETCH_THREADS, default 8).
     void set_fetch_threads(int n) { fetch_threads_ = n < 1 ? 1 : n; }
     /// #286: read the experts straight from the drive (Windows: FILE_FLAG_NO_BUFFERING, overlapped; Linux: O_DIRECT and

@@ -1902,6 +1902,12 @@ bool FileExpertSource::map_view(std::string& why) {
 #endif
 }
 
+// read_direct totals (Linux branch): bytes the batches asked for (the blobs' windows) and bytes the requests read
+// (the 4 KiB rounding and any gap bytes merged in).  Relaxed atomics, one add per batch.
+static std::atomic<uint64_t> g_direct_requested{0}, g_direct_read{0};
+uint64_t FileExpertSource::direct_requested_bytes() { return g_direct_requested.load(std::memory_order_relaxed); }
+uint64_t FileExpertSource::direct_read_bytes() { return g_direct_read.load(std::memory_order_relaxed); }
+
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 #if defined(_WIN32)
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
@@ -2024,6 +2030,12 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     // own context and aligned buffer, kept for its next batch, so concurrent batches never see each other's events.
     constexpr uint64_t kSector = 4096, kMerge = 32ull << 20;
     constexpr long kDepth = 256;   // requests in flight per thread; a larger batch is read in waves of this many
+    // STRATA_DIRECT_MERGE_GAP_KIB=N: two windows are merged into one request only when the gap between them is at
+    // most N KiB (the gap bytes are read too); unset or 0: only touching or overlapping windows merge (as before).
+    static const uint64_t kGapBytes = [] {
+        const char* v = std::getenv("STRATA_DIRECT_MERGE_GAP_KIB");
+        return (v != nullptr && v[0] != '\0' && std::atol(v) > 0) ? (uint64_t) std::atol(v) * 1024 : 0ull;
+    }();
     struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
     struct Req { int fd; uint64_t a0, size, pos; };
     struct Scratch {
@@ -2082,7 +2094,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         if (!sc.req.empty() && x.file == last_file) {
             Req& q = sc.req.back();
             const uint64_t end = q.a0 + q.size, xend = x.a0 + x.size;
-            if (x.a0 <= end && std::max(end, xend) - q.a0 <= kMerge) {
+            if (x.a0 <= end + kGapBytes && std::max(end, xend) - q.a0 <= kMerge) {
                 if (xend > end) {
                     total += xend - end;
                     q.size = xend - q.a0;
@@ -2097,6 +2109,12 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         last_file = x.file;
         x.req = sc.req.size() - 1;
         x.in_req = 0;
+    }
+    {
+        uint64_t asked = 0;
+        for (const Window& x : sc.win) asked += x.n;
+        g_direct_requested.fetch_add(asked, std::memory_order_relaxed);
+        g_direct_read.fetch_add(total, std::memory_order_relaxed);
     }
     if (total > sc.cap) {
         std::free(sc.buf);
