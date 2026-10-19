@@ -2806,9 +2806,29 @@ void FileExpertSource::stop_pagecache_warm() {
     if (warm_thread_.joinable()) warm_thread_.join();
 }
 
-// STRATA_PAGECACHE_WARM_GIB (default 10; =0 off): the page-cache warm's budget in bytes
-static uint64_t pagecache_warm_bytes() {
+// STRATA_PAGECACHE_WARM_GIB (default 10; =0 off): the page-cache warm's budget in bytes, 0 when not positive.
+// "auto" is sized here, when the warm starts: MemAvailable minus STRATA_PAGECACHE_WARM_HEADROOM_GIB (default 4), floored at 0.
+// `note`, when given, receives the " (auto: X GiB of Y GiB available)" text for the log line ("" for a fixed count).
+static uint64_t pagecache_warm_bytes(std::string* note = nullptr) {
     const char* v = std::getenv("STRATA_PAGECACHE_WARM_GIB");
+    if (note != nullptr) note->clear();
+    if (v != nullptr && std::strcmp(v, "auto") == 0) {
+        std::ifstream info("/proc/meminfo");
+        std::stringstream text;
+        text << info.rdbuf();
+        const uint64_t avail = detail::meminfo_bytes(text.str(), "MemAvailable");
+        const char* h = std::getenv("STRATA_PAGECACHE_WARM_HEADROOM_GIB");
+        const double headroom_gib = h != nullptr ? std::atof(h) : 4.0;
+        const uint64_t headroom = headroom_gib > 0 ? (uint64_t) (headroom_gib * 1073741824.0) : (uint64_t) 0;
+        const uint64_t bytes = avail > headroom ? avail - headroom : (uint64_t) 0;
+        if (note != nullptr) {
+            char buf[128];
+            std::snprintf(buf, sizeof buf, " (auto: %.2f GiB of %.2f GiB available)", (double) bytes / 1073741824.0,
+                          (double) avail / 1073741824.0);
+            *note = buf;
+        }
+        return bytes;
+    }
     const double g = v != nullptr ? std::atof(v) : 10.0;
     return g > 0 ? (uint64_t) (g * 1073741824.0) : (uint64_t) 0;
 }
@@ -2817,7 +2837,8 @@ void FileExpertSource::start_files_pagecache_warm(const ExpertCache& cache,
                                                   const std::vector<std::pair<int32_t, int32_t>>& rank) {
     // Files mode (no RAM budget, no RAM copy): the file cache IS the expert tier, so the warm asks for the ranked experts
     // that no GPU cache holds, hottest first - the same order pin_cache_complement collects for a budget.
-    const uint64_t budget = pagecache_warm_bytes();
+    std::string auto_note;
+    const uint64_t budget = pagecache_warm_bytes(&auto_note);
     if (budget == 0 || base_ == nullptr || !cache.valid() || rank.empty()) return;
 #if !defined(__linux__)
     (void) cache;   // the warm is Linux only (start_pagecache_warm): no log line for a warm that does not run
@@ -2835,8 +2856,8 @@ void FileExpertSource::start_files_pagecache_warm(const ExpertCache& cache,
     }
     if (order.empty()) return;
     std::fprintf(stderr, "FileExpertSource: page-cache warm, files mode (no RAM budget): up to %.2f GiB of the %zu ranked "
-                         "experts no GPU cache holds, hottest first (STRATA_PAGECACHE_WARM_GIB)\n",
-                 (double) budget / 1073741824.0, order.size());
+                         "experts no GPU cache holds, hottest first (STRATA_PAGECACHE_WARM_GIB)%s\n",
+                 (double) budget / 1073741824.0, order.size(), auto_note.c_str());
     start_pagecache_warm(order, budget);
 }
 
@@ -2902,7 +2923,8 @@ bool FileExpertSource::pin_cache_complement(
     // STRATA_PAGECACHE_WARM_GIB (default 10; =0 off): the ranked experts the budget leaves on the files, hottest first
     // (warm_order), warmed into the page cache by a SCHED_IDLE thread - the fixed tier's hot set, but reclaimable.
     // (A budget of 0 holds every expert: nothing to warm.)
-    const uint64_t warm_bytes = pagecache_warm_bytes();
+    std::string warm_note;   // STRATA_PAGECACHE_WARM_GIB=auto: the size the warm will use, for its start line
+    const uint64_t warm_bytes = pagecache_warm_bytes(&warm_note);
     std::vector<std::pair<int32_t, int32_t>> warm_order;
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
@@ -3507,7 +3529,12 @@ bool FileExpertSource::pin_cache_complement(
                      additional_gpu_pairs.size());
     }
     std::fflush(stderr);
-    if (!warm_order.empty()) start_pagecache_warm(warm_order, warm_bytes);
+    if (!warm_order.empty()) {
+        if (!warm_note.empty())
+            std::fprintf(stderr, "FileExpertSource: page-cache warm starts, up to %.2f GiB%s\n",
+                         (double) warm_bytes / 1073741824.0, warm_note.c_str());
+        start_pagecache_warm(warm_order, warm_bytes);
+    }
     return true;
 }
 
