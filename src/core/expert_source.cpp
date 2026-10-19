@@ -2738,7 +2738,7 @@ bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
     return override_.empty() || override_[index] == nullptr;
 }
 
-bool FileExpertSource::prompt_copies(int64_t layer, int64_t expert) const {
+bool FileExpertSource::prompt_copies(int64_t layer, int64_t expert, bool count) const {
     if (transient(layer, expert)) return true;
     // STRATA_PROMPT_DIRECT: the prompt's blobs go through copy_blobs' O_DIRECT reader (pdirect_), not the mapping's
     // page faults - a prompt then no longer pushes ~55 GB per chunk through the page cache (19 Oct: with only the
@@ -2762,7 +2762,7 @@ bool FileExpertSource::prompt_copies(int64_t layer, int64_t expert) const {
         bool all = ns > 0;
         for (int i = 0; all && i < ns; ++i) all = sp[i].n > 0 && resident_in(sp[i].p, sp[i].n) >= sp[i].n;
         if (all) {
-            g_prompt_cached.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+            if (count) g_prompt_cached.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
             return false;
         }
     }

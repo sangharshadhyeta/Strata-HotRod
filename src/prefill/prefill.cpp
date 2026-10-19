@@ -584,10 +584,13 @@ struct Stager {
         for (int t = 0; t < nthreads; ++t)
             threads.emplace_back([this] {
                 // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
-                // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
+                // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read).
+                // With --aux-cpus off they take the process's start CPUs minus the host's and the workers' (a new thread
+                // inherits the host's single CPU otherwise: aux_cpus::place_copy_thread)
                 static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::atoi(v) == 0; }();
                 if (keep) strata::aux_cpus::note_owned_thread();
-                else strata::aux_cpus::pin_current_thread();
+                else if (strata::aux_cpus::enabled()) strata::aux_cpus::pin_current_thread();
+                else strata::aux_cpus::place_copy_thread();
                 work();
             });
         return true;
@@ -1315,7 +1318,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         // instead of 71 s on an RTX 5070 / NVMe PC (4 threads, 16 deep: the defaults, kept for every other source)
         bool files = false;
         for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
-            for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->prompt_copies(l, e);
+            for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->prompt_copies(l, e, /*count=*/false);
         // The same holds for a pack's experts.bin read through its mapping (IQ3_S here): a blob outside the RAM copy is a page
         // fault on the drive, so the copies need many reads in flight.  MEASURED (10 Oct 2026, RTX 3060 + PCIe 3.0 x4 NVMe, IQ3_S pack
         // 83 GB with 22.5 GiB in RAM): a 2,000-token prompt 26.4 to 28.4 s -> 18.1 to 20.4 s with 32 threads and a 128-deep ring

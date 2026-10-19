@@ -354,6 +354,38 @@ inline std::vector<int> plan() {
     return s.plan;
 }
 
+namespace detail {
+/// The CPUs a prompt copy thread runs on while the feature is off: the CPUs the process started with (`configure`'s
+/// snapshot) minus the host's and the pool workers' (every CPU it started with when none is left).  Caller holds `mu`.
+inline std::vector<int> copy_cpus_locked(const State& s) {
+    std::vector<int> out;
+    for (int c : s.allowed)
+        if (c != s.host_cpu && std::find(s.workers.begin(), s.workers.end(), c) == s.workers.end()) out.push_back(c);
+    if (out.empty()) out = s.allowed;
+    return out;
+}
+}  // namespace detail
+
+/// The CPUs the prompt's copy threads run on (see place_copy_thread); {} when `configure` saw none.
+inline std::vector<int> copy_cpus() {
+    detail::State& s = detail::state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    return detail::copy_cpus_locked(s);
+}
+
+/// A copy thread the prompt stager creates while the feature is off: it moves itself to copy_cpus().  Its creator is the
+/// host, whose single CPU a new thread would otherwise inherit.  False when nothing changed.
+inline bool place_copy_thread() {
+    detail::State& s = detail::state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    const std::vector<int> cpus = detail::copy_cpus_locked(s);
+    if (cpus.empty()) return false;
+    cpu_set_t to;
+    CPU_ZERO(&to);
+    for (int c : cpus) CPU_SET(c, &to);
+    return sched_setaffinity(0, sizeof to, &to) == 0;
+}
+
 /// Reads sysfs for the cores of the process's CPUs.  `cpus` empty: every CPU `configure` saw.
 inline std::vector<LogicalCpu> read_topology(const std::vector<int>& cpus) {
     auto read_id = [](int cpu, const char* what) -> long {
@@ -418,6 +450,8 @@ inline bool enabled() { return false; }
 inline bool place_off_host() { return false; }   // (a new thread does not inherit the host's CPU set here)
 inline int release_host_inheritors() { return 0; }
 inline std::vector<int> plan() { return {}; }
+inline std::vector<int> copy_cpus() { return {}; }
+inline bool place_copy_thread() { return false; }
 inline std::string set_topology(int, const std::vector<int>&) { return "strata aux cpus: not available on this system"; }
 
 #endif

@@ -213,8 +213,9 @@ public:
     virtual bool transient(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
     /// The prompt path's question: does the source copy this blob into the stager's buffer (copy_blobs) instead of the
     /// stager reading the mapping?  transient(), plus - with STRATA_PROMPT_DIRECT's O_DIRECT reader open - every
-    /// blob not in the RAM tier, so prompt reads bypass the page cache.  Only prefill asks this.
-    virtual bool prompt_copies(int64_t layer, int64_t expert) const { return transient(layer, expert); }
+    /// blob not in the RAM tier, so prompt reads bypass the page cache.  Only prefill asks this.  `count`: the call is a
+    /// copy decision (its blob is copied this chunk), so the page-cache counter counts it; a probe passes false.
+    virtual bool prompt_copies(int64_t layer, int64_t expert, bool count = true) const { (void) count; return transient(layer, expert); }
     /// STRATA_PROMPT_DIRECT_MIN_TOKENS: prefill sets this per run - on for a prompt of at least that many tokens, off for
     /// a shorter one (its blobs then stay on the buffered mapping, and their pages stay in the cache for decode).
     virtual void set_prompt_direct_active(bool on) { (void) on; }
@@ -868,7 +869,7 @@ public:
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
-    bool prompt_copies(int64_t layer, int64_t expert) const override;
+    bool prompt_copies(int64_t layer, int64_t expert, bool count = true) const override;
     void set_prompt_direct_active(bool on) override { prompt_direct_active_.store(on, std::memory_order_relaxed); }
     bool prompt_direct_on() const override { return prompt_direct_active_.load(std::memory_order_relaxed) && !pdirect_.empty(); }
     double cached_share(int64_t samples) const override;

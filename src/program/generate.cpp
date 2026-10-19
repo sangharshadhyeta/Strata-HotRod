@@ -5692,6 +5692,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s\n",
                      strata::aux_cpus::set_topology(ht.host_core, std::vector<int>(ht.worker_cores.begin(),
                                                                                    ht.worker_cores.begin() + (long) nw)).c_str());
+        // the prompt's copy threads: the aux plan when it is on, else the start CPUs minus the host's and the workers' (place_copy_thread)
+        const std::vector<int> cc = strata::aux_cpus::enabled() ? strata::aux_cpus::plan() : strata::aux_cpus::copy_cpus();
+        std::string ccs;
+        for (size_t i = 0; i < cc.size(); ++i) ccs += (i ? "," : "") + std::to_string(cc[i]);
+        std::fprintf(stderr, "prompt copy threads: CPUs %s\n", cc.empty() ? "none" : ccs.c_str());
     }
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
