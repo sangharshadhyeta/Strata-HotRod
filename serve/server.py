@@ -7124,8 +7124,27 @@ def main() -> int:
         try:
             exe = cfg.get("exe") or ""
             st_exe = os.stat(exe) if exe and os.path.exists(exe) else None
+            # Hot Rod (19 Oct): settings that change only HOW FAST the same state is computed (the prompt chunk, the RAM tier,
+            # swap rounds, PCIe share, the expert cache, drafting) are left out, so tuning them no longer drops every saved
+            # prompt - each such change emptied the cache (41 GB, "0 entries kept"); the prompt path's output was measured
+            # identical across these. The engine file, the model, the K/V format and the context stay in it, and the engine
+            # still checks every restored file itself.
+            speed_only = {"--prefill", "--resident-budget-gib", "--adapt-every", "--adapt-swaps", "--pcie-frac",
+                          "--expert-cache", "--spec", "--spec-min-p", "--mmap-experts", "--resident-experts",
+                          "--expert-profile", "--pool-workers", "--pool-tasks"}
+            state_args, skip = [], False
+            args_l = list(cfg.get("args") or [])
+            for i, x in enumerate(args_l):
+                if skip:
+                    skip = False
+                    continue
+                if x in speed_only:
+                    # a flag with a value: its value is the next argument unless that is another flag
+                    skip = i + 1 < len(args_l) and not str(args_l[i + 1]).startswith("--")
+                    continue
+                state_args.append(x)
             fp = hashlib.sha256(json.dumps([cfg.get("model_name"), exe, st_exe.st_size if st_exe else 0, st_exe.st_mtime_ns if st_exe else 0,
-                                            cfg.get("args")], sort_keys=True, default=str).encode()).hexdigest()[:32]
+                                            state_args], sort_keys=True, default=str).encode()).hexdigest()[:32]
             svc.pcache = PromptCache(slot_save_dir(cfg["prompt_cache_path"], cfg.get("cwd")), fp,
                                      limit_bytes=int(cfg["prompt_cache_gib"] * (1 << 30)) if cfg.get("prompt_cache_gib") else None)
         except (ValueError, OSError) as e:
