@@ -2412,12 +2412,14 @@ struct PeTimer {
 };
 }  // namespace
 
-// STRATA_PROMPT_DIRECT_MIN_TOKENS: the shortest prompt whose expert reads go O_DIRECT (default 16384); read once.  A shorter
-// prompt reads buffered, as before the O_DIRECT reader existed, so its experts stay in the page cache for decode.
+// STRATA_PROMPT_DIRECT_MIN_TOKENS: the shortest prompt whose expert reads go O_DIRECT (default 0: every prompt); read once.
+// A shorter prompt reads buffered, so its experts stay in the page cache for decode.  Measured 19 Oct (16384 vs 0, 8.5k
+// prompt, 10 GiB tier): buffered reading gave decode ~3% (52.8-54.3 vs 51.4-52.8 tok/s) but cost the prompt 4-5 s
+// (30.8 vs 25.3 / 27.4 s), a net loss for any answer under ~10k tokens - so it is opt-in.
 static int64_t prompt_direct_min_tokens() {
     static const int64_t v = [] {
         const char* e = std::getenv("STRATA_PROMPT_DIRECT_MIN_TOKENS");
-        return e != nullptr ? (int64_t) std::max(0L, std::atol(e)) : (int64_t) 16384;
+        return e != nullptr ? (int64_t) std::max(0L, std::atol(e)) : (int64_t) 0;
     }();
     return v;
 }
