@@ -6996,7 +6996,9 @@ def main() -> int:
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
-            elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
+            # a CPU encoder needs no VRAM, so its elastic start does not need the engine's vram_elastic
+            cpu_vision = not cfg["vision"].get("gpu")
+            elastic = cfg["vision"].get("elastic") is True and (cfg.get("vram_elastic") is True or cpu_vision)
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
                   "loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
@@ -7004,7 +7006,7 @@ def main() -> int:
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
+            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True and not cpu_vision:
                 print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
