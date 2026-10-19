@@ -7037,6 +7037,12 @@ def main() -> int:
         # streamed them twice (19 Oct, 2 alternated pairs: 38 -> 24 s to the first word, decode +12%, half the NVMe reads)
         if "--prefill" in args and args[args.index("--prefill") + 1] == "auto":
             args[args.index("--prefill") + 1] = "auto:16384"
+        # a 10 GiB RAM tier of the most-used experts, unpinned (STRATA_RESIDENT_PIN=0: pinning pressed the 30 GB box):
+        # a prompt's pass over all 55 GB of experts flushes the page cache, not this tier (19 Oct, 2 alternated pairs:
+        # decode 49.1 / 51.5 -> 55.7 / 53.9 tok/s, the read wait per decode window 13.6 / 18.1 -> 9.5 / 10.7 ms)
+        if "--resident-budget-gib" not in args and "--resident-experts" not in args:
+            args += ["--resident-budget-gib", "10"]
+            cfg["env"]["STRATA_RESIDENT_PIN"] = "0"
     if hip:
         cfg["backend"] = "hip"
         # the dense prompt GEMMs through hipBLASLt with kernels measured on this GPU generation (tools/hip; +40-60%
