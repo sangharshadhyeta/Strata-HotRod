@@ -7033,6 +7033,10 @@ def main() -> int:
         cfg["env"] = {**(cfg.get("env") or {}), **henv}
         # the measured setup's PCIe share: none (the engine's 0.55 default for a native pack was not what was measured)
         args += ["--pcie-frac", "0"]
+        # prompt chunks up to 16384 tokens: every chunk streams the experts again, so an 8.5k prompt read as 8192 + 362
+        # streamed them twice (19 Oct, 2 alternated pairs: 38 -> 24 s to the first word, decode +12%, half the NVMe reads)
+        if "--prefill" in args and args[args.index("--prefill") + 1] == "auto":
+            args[args.index("--prefill") + 1] = "auto:16384"
     if hip:
         cfg["backend"] = "hip"
         # the dense prompt GEMMs through hipBLASLt with kernels measured on this GPU generation (tools/hip; +40-60%
