@@ -1,6 +1,7 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
@@ -2084,6 +2085,9 @@ uint64_t Prefill::layer_major_host_bytes(int64_t n_tokens) {
     const uint64_t lm_xs = (uint64_t) (D + (hc_pad() ? XN_PAD : 0));
     return (uint64_t) n_tokens * ((uint64_t) D * 4 + (uint64_t) HC * 4 + lm_xs * 2 + (uint64_t) D * 2);
 }
+static std::atomic<uint64_t> g_lm_host_floor{2560ull << 20};
+void Prefill::set_host_floor_bytes(uint64_t bytes) { g_lm_host_floor.store(bytes); }
+uint64_t Prefill::host_floor_bytes() { return g_lm_host_floor.load(); }
 
 // --prefill-pipe (opt-in; STRATA_PREFILL_PIPE): a layer split reads a prompt as a pipeline - stage s reads chunk c while
 // stage s+1 reads chunk c-1. A stage-chunk costs its layers x (b + a C): a fixed part per chunk (b: the pass over the
@@ -2855,7 +2859,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < l_from; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
         auto kv_prefetch_after = [&](int64_t layer, int64_t ordinal) -> bool {
-            if (!kv_prefetch || p0 <= 0) return true;
+            if (!kv_prefetch || p0 <= 0 || phase != PH_FULL) return true;   // layer-major passes run all chunks of a layer before the next layer: layer l+1's prefix is not written yet, so no prefetch (opt-in STRATA_KV_PREFETCH, chunk-major only)
             if (kv_pending >= 0) return true;   // one staging pool: the pending prefetch has not been consumed yet
             for (int64_t l = layer; l < LE; ++l) {
                 if (!core::is_qsa_layer(g, l)) continue;
@@ -4995,26 +4999,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // routed experts stream from the SSD once per prompt instead of once per chunk.  The chunks' layer state (GDN, QSA
     // KV and indexer, the PLE history) advances in chunk order within each layer, as it did; only m.R moves through the host.
     // Only the plain path takes it: more than one chunk, this Prefill runs the whole stack, no layer split, no peer or
-    // helper, no KV streaming, no CPU share, and not the routed-stream walk (stream_all).  Anything else keeps the default.
+    // helper, no CPU share, and not the routed-stream walk (stream_all).  With K/V streaming each (layer, chunk) pass stages
+    // that layer's prefix [0, p0) as the chunk-major loop does (the earlier chunks of the layer are already appended).
+    // Anything else keeps the default.
     static const bool lm_env = [] {
         const char* v = std::getenv("STRATA_PREFILL_LAYER_MAJOR");   // on by default; =0 keeps the chunk-major loop
         return v == nullptr || std::atoi(v) != 0;
     }();
-    bool kv_staged = false;
-    for (int64_t o = 0; o < g.n_qsa_layers(); ++o) kv_staged = kv_staged || ss.qsa_states[o].kv_mode == 1;
     const bool walk_all = m.ring > STAGE && std::min(C, n) >= stream_all_min() && m.src != nullptr;
     // the CPU share (small chunks' experts on the pool) does not decide it: a layer-major run simply skips the share
     bool lm = lm_env && n > C && LB == 0 && LE == g.n_layers && hand_in_ == nullptr && next_ == nullptr && !helped &&
-              m.pp == nullptr && !kv_staged && !walk_all;
+              m.pp == nullptr && !walk_all;
     if (!lm && lm_env && n > C && hand_in_ == nullptr) {   // a multi-chunk prompt that could have used it: the first condition that failed
         const char* why = LB != 0 || LE != g.n_layers ? "a layer split"
                         : next_ != nullptr ? "a pipeline stage"
                         : helped ? "a helper GPU"
                         : m.pp != nullptr ? "a peer GPU"
-                        : kv_staged ? "K/V streaming"
                         : "the routed-stream walk (STRATA_PREFILL_STREAM_MIN)";
         std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): %s\n",
                      (long long) n, (long long) C, why);
+    }
+    if (lm) {   // the residuals are pinned (they cannot be paged out): refused when they would not leave the memory floor free
+        const uint64_t need = (uint64_t) layer_major_host_bytes(n);
+        const auto mem = core::sample_host_memory();
+        if (mem && !core::conversation_memory_admit(mem->available, need, host_floor_bytes())) {
+            std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): its residuals need "
+                                 "%.1f GiB of pinned RAM, %.1f GiB available above the %.1f GiB floor\n", (long long) n, (long long) C,
+                         need / 1073741824.0, (mem->available > host_floor_bytes() ? mem->available - host_floor_bytes() : 0) / 1073741824.0,
+                         host_floor_bytes() / 1073741824.0);
+            lm = false;
+        }
     }
     if (lm) {
         const bool ok = cudaHostAlloc((void**) &lmh.R, (size_t) n * D * 4, cudaHostAllocDefault) == cudaSuccess &&

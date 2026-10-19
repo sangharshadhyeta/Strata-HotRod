@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -2925,6 +2926,9 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 
 void FileExpertSource::start_pagecache_warm(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget_bytes) {
     stop_pagecache_warm();
+    // the list and budget of this warm, kept for rewarm() (after each request)
+    if (&order != &warm_last_order_) warm_last_order_ = order;
+    warm_last_budget_ = budget_bytes;
 #if defined(__linux__)
     // The blobs as (file, offset, bytes) ranges, taken now from the mapping: the thread then touches no source state.
     struct WarmRange { uint64_t off, n; int file; };
@@ -2944,22 +2948,31 @@ void FileExpertSource::start_pagecache_warm(const std::vector<std::pair<int32_t,
         ++experts;
     }
     if (ranges.empty()) return;
+    const uint64_t run_no = ++warm_runs_;
     std::vector<std::string> paths = paths_;
     PageWarm* w = &warm_;
     {
         std::lock_guard<std::mutex> lk(w->mu);
         w->quit = false;
     }
-    warm_thread_ = std::thread([w, paths, ranges, experts, bytes]() {
+    warm_thread_ = std::thread([w, paths, ranges, experts, bytes, run_no]() {
         sched_param none{};
         (void) sched_setscheduler(0, SCHED_IDLE, &none);   // this thread only (pid 0): runs when nothing else wants the CPU
         std::vector<int> fds;
         for (const std::string& p : paths) fds.push_back(::open(p.c_str(), O_RDONLY | O_CLOEXEC));
         const auto t0 = std::chrono::steady_clock::now();
         constexpr uint64_t kChunk = 64ull << 20;   // one pause per 64 MiB asked for
+        // a request in progress holds the drive: wait until it ends (set_request_active(false) wakes this); false = stop
+        auto wait_idle = [w]() -> bool {
+            std::unique_lock<std::mutex> lk(w->mu);
+            while (w->busy.load() && !w->quit)
+                w->cv.wait_for(lk, std::chrono::milliseconds(50), [w] { return w->quit || !w->busy.load(); });
+            return !w->quit;
+        };
         uint64_t since_pause = 0;
-        bool stopped = false;
+        bool stopped = !wait_idle();   // a warm started while a request runs waits for it
         for (const WarmRange& r : ranges) {
+            if (stopped) break;
             {
                 std::lock_guard<std::mutex> lk(w->mu);
                 if (w->quit) { stopped = true; break; }
@@ -2969,13 +2982,16 @@ void FileExpertSource::start_pagecache_warm(const std::vector<std::pair<int32_t,
             since_pause += r.n;
             if (since_pause < kChunk) continue;
             since_pause = 0;
-            std::unique_lock<std::mutex> lk(w->mu);
-            w->cv.wait_for(lk, std::chrono::milliseconds(20), [w] { return w->quit; });
-            if (w->quit) { stopped = true; break; }
+            {
+                std::unique_lock<std::mutex> lk(w->mu);
+                w->cv.wait_for(lk, std::chrono::milliseconds(20), [w] { return w->quit; });
+                if (w->quit) { stopped = true; break; }
+            }
+            if (!wait_idle()) { stopped = true; break; }
         }
         for (int fd : fds)
             if (fd >= 0) ::close(fd);
-        if (!stopped)
+        if (!stopped && run_no == 1)   // the log line is said once; later runs (rewarm) are silent
             std::fprintf(stderr, "FileExpertSource: page cache warmed with %zu experts (%.2f GiB) in %.1f s\n", experts,
                          (double) bytes / 1073741824.0,
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -2992,6 +3008,18 @@ void FileExpertSource::stop_pagecache_warm() {
     }
     warm_.cv.notify_all();
     if (warm_thread_.joinable()) warm_thread_.join();
+}
+
+void FileExpertSource::set_request_active(bool on) {
+    warm_.busy.store(on);
+    if (!on) warm_.cv.notify_all();
+}
+
+void FileExpertSource::rewarm() {
+    const std::vector<std::pair<int32_t, int32_t>> last = warm_last_order_;   // a copy: start_pagecache_warm rewrites the member
+    const uint64_t budget = warm_last_budget_;
+    if (last.empty() || budget == 0) return;
+    start_pagecache_warm(last, budget);
 }
 
 // The kernel's "high" free-memory watermarks summed over the zones (/proc/zoneinfo, pages): below them kswapd and then direct
@@ -3030,16 +3058,22 @@ static uint64_t pagecache_warm_bytes(uint64_t reserve, std::string* note = nullp
     const uint64_t total = detail::meminfo_bytes(text.str(), "MemTotal");
     const uint64_t avail = detail::meminfo_bytes(text.str(), "MemAvailable");
     if (total == 0) return 0;   // no /proc/meminfo (not Linux): the warm is Linux only anyway
+    // The engine's memory limit: the cgroup's (memory.max, minus its usage) when that is lower than MemAvailable.
+    const auto mem = sample_host_memory();
+    const uint64_t room = mem && mem->available > 0 ? std::min<uint64_t>(avail, mem->available) : avail;
     uint64_t keep = reserve + kernel_high_watermark_bytes();
     if (const char* h = std::getenv("STRATA_PAGECACHE_WARM_HEADROOM_GIB"))
         keep = std::atof(h) > 0 ? (uint64_t) (std::atof(h) * 1073741824.0) : (uint64_t) 0;
-    const uint64_t cap = avail > keep ? avail - keep : (uint64_t) 0;
+    const uint64_t cap = room > keep ? room - keep : (uint64_t) 0;
     const uint64_t bytes = is_third ? std::min<uint64_t>(total / 3, cap) : cap;
     if (note != nullptr) {
-        char buf[200];
-        std::snprintf(buf, sizeof buf, " (%s: %.2f GiB of %.2f GiB available, %.2f GiB kept free for the engine's prompt buffers "
-                      "and the kernel's reclaim watermarks)", is_third ? "third" : "auto", (double) bytes / 1073741824.0,
-                      (double) avail / 1073741824.0, (double) keep / 1073741824.0);
+        char buf[260];
+        char prompt[64] = "";
+        if (reserve > 0) std::snprintf(prompt, sizeof prompt, " and %.2f GiB for the prompt path", (double) reserve / 1073741824.0);
+        std::snprintf(buf, sizeof buf, " (%s: %.2f GiB of %.2f GiB available (%s), %.2f GiB kept free (the kernel's reclaim "
+                      "watermarks%s))", is_third ? "third" : "auto", (double) bytes / 1073741824.0,
+                      (double) room / 1073741824.0, mem ? memory_source_name(mem->source) : "meminfo", (double) keep / 1073741824.0,
+                      prompt);
         *note = buf;
     }
     return bytes;
@@ -3132,7 +3166,7 @@ bool FileExpertSource::pin_cache_complement(
     int64_t budget_lent = 0, budget_lendable = 0;   // the lend region's slots kept by a budget (below), and its size
     uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
-    // STRATA_PAGECACHE_WARM_GIB (unset or auto: everything free beyond 4 GiB; =0 off): the ranked experts the budget leaves on the files, hottest first
+    // STRATA_PAGECACHE_WARM_GIB (unset or auto: what the engine's memory limit (cgroup or RAM, the smaller) leaves free beyond the prompt path's pinned buffers and the kernel's watermarks; =0 off): the ranked experts the budget leaves on the files, hottest first
     // (warm_order), warmed into the page cache by a SCHED_IDLE thread - the fixed tier's hot set, but reclaimable.
     // (A budget of 0 holds every expert: nothing to warm.)
     std::string warm_note;   // how the warm's size was computed (unset or "auto"), for its start line
@@ -4327,6 +4361,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     d.fs->predict(d.src, target, e);
                     ++d.pred_fed;
                 }
+        }
+    }
+    if (d.gpu_pred != nullptr && d.gpu_pred_warm && d.host_res != nullptr && n_tok <= 8 && d.src != nullptr) {
+        // STRATA_LOOKAHEAD_GPU: the GPU look-ahead's picks for the next two layers (computed on this layer's input before the doorbell),
+        // warmed on the file tier as the CPU look-ahead's are - without recomputing the routers on the CPU
+        for (int dist = 1; dist <= 2; ++dist) {
+            const int64_t target = d.layers + dist;
+            if (target >= d.n_layers) break;
+            int64_t want[8 * 10];
+            int64_t nw = 0;
+            for (int64_t t = 0; t < n_tok; ++t)
+                for (int r = 0; r < d.gpu_pred_ranks && r < 10; ++r) {
+                    const int32_t e = d.gpu_pred[(((size_t) target * 2 + (size_t) (dist - 1)) * 8 + (size_t) t) * 10 + (size_t) r];
+                    if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+                    if (std::find(want, want + nw, (int64_t) e) == want + nw) want[nw++] = e;
+                }
+            if (nw > 0) d.src->warm(target, want, nw);
+            d.pred_fed += nw;
         }
     }
     if (d.lookahead != nullptr && d.gpu_pred == nullptr) {

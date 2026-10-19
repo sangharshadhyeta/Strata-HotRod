@@ -323,6 +323,98 @@ void rss_probe(const char* where) {
     std::fflush(stderr);
 }
 
+// STRATA_RAM_TRACE=1 (diagnosis, off by default): one line per request with what the host's memory did over it - the kernel's
+// reclaim and fault counters (/proc/vmstat), this process's cgroup (v2) and its pressure, MemAvailable.  Nothing is read
+// unless the switch is on.
+const bool ram_trace = [] { const char* v = std::getenv("STRATA_RAM_TRACE"); return v != nullptr && std::atoi(v) != 0; }();
+struct RamSnap {
+    unsigned long long vm[7] = {};        // /proc/vmstat: pgscan_direct, pgsteal_direct, allocstall_normal, allocstall_movable, pgscan_kswapd, workingset_refault_file, pgmajfault
+    unsigned long long cg[6] = {};        // cgroup memory.stat: pgscan, pgsteal, workingset_refault_file, pgmajfault, file, anon
+    unsigned long long cg_stall_us = 0;   // memory.pressure "some" total (microseconds)
+    unsigned long long cg_current = 0;    // memory.current
+    long long cg_max = -1;                // memory.max (-1: none)
+    double psi_some10 = 0.0, psi_full10 = 0.0;   // memory.pressure avg10
+    unsigned long long mem_available_kb = 0;     // /proc/meminfo MemAvailable
+};
+
+// out[i] = the value of the "key value" line keys[i] in `path` (0 when the key is missing).  False when the file cannot be opened.
+bool ram_kv(const std::string& path, const char* const* keys, unsigned long long* out, size_t n) {
+    for (size_t i = 0; i < n; ++i) out[i] = 0;
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream in(line);
+        std::string key;
+        unsigned long long v = 0;
+        if (!(in >> key >> v)) continue;
+        for (size_t i = 0; i < n; ++i)
+            if (key == keys[i]) out[i] = v;
+    }
+    return true;
+}
+
+// This process's cgroup (v2) directory: the "0::" line of /proc/self/cgroup under /sys/fs/cgroup; empty when there is none.
+std::string ram_cgroup_dir() {
+    std::ifstream f("/proc/self/cgroup");
+    std::string line;
+    while (std::getline(f, line))
+        if (line.rfind("0::", 0) == 0) return "/sys/fs/cgroup" + line.substr(3);
+    return {};
+}
+
+// The counters now.  False when /proc/vmstat cannot be read; missing files and keys read as 0 (memory.max: none).
+bool ram_snap(RamSnap& s) {
+    static const char* const vm_keys[7] = {"pgscan_direct", "pgsteal_direct", "allocstall_normal", "allocstall_movable",
+                                           "pgscan_kswapd", "workingset_refault_file", "pgmajfault"};
+    static const char* const cg_keys[6] = {"pgscan", "pgsteal", "workingset_refault_file", "pgmajfault", "file", "anon"};
+    static const char* const mi_keys[1] = {"MemAvailable:"};
+    const bool ok = ram_kv("/proc/vmstat", vm_keys, s.vm, 7);
+    ram_kv("/proc/meminfo", mi_keys, &s.mem_available_kb, 1);
+    const std::string dir = ram_cgroup_dir();
+    if (!dir.empty()) {
+        ram_kv(dir + "/memory.stat", cg_keys, s.cg, 6);
+        std::string word;
+        if (std::ifstream f(dir + "/memory.current"); f >> word) s.cg_current = std::strtoull(word.c_str(), nullptr, 10);
+        word.clear();
+        if (std::ifstream f(dir + "/memory.max"); f >> word && word != "max") s.cg_max = (long long) std::strtoull(word.c_str(), nullptr, 10);
+        std::ifstream pf(dir + "/memory.pressure");
+        std::string line;
+        while (std::getline(pf, line)) {
+            std::istringstream in(line);
+            std::string kind, tok;
+            in >> kind;
+            const bool some = kind == "some";
+            if (!some && kind != "full") continue;
+            while (in >> tok) {
+                if (tok.rfind("avg10=", 0) == 0) (some ? s.psi_some10 : s.psi_full10) = std::atof(tok.c_str() + 6);
+                else if (some && tok.rfind("total=", 0) == 0) s.cg_stall_us = std::strtoull(tok.c_str() + 6, nullptr, 10);
+            }
+        }
+    }
+    return ok;
+}
+
+// The request's line: the differences a -> b of the counters, and b's levels (memory.current, memory.max, the file and anon
+// of memory.stat, the pressure averages, MemAvailable).
+void ram_trace_print(const RamSnap& a, const RamSnap& b) {
+    auto diff = [](unsigned long long from, unsigned long long to) -> unsigned long long { return to >= from ? to - from : 0; };
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    char max_txt[32];
+    if (b.cg_max < 0) std::snprintf(max_txt, sizeof max_txt, "none");
+    else std::snprintf(max_txt, sizeof max_txt, "%.2f", (double) b.cg_max / gib);
+    std::fprintf(stderr, "strata serve: RAM trace: direct reclaim scanned %llu stole %llu stalls %llu, kswapd scanned %llu, refaults %llu, "
+                         "major faults %llu; cgroup: scanned %llu stole %llu refaults %llu major faults %llu, memory stall %.0f ms "
+                         "(psi some avg10 %.2f full %.2f), %.2f of %s GiB used (file %.2f anon %.2f), MemAvailable %.2f GiB (STRATA_RAM_TRACE)\n",
+                 diff(a.vm[0], b.vm[0]), diff(a.vm[1], b.vm[1]), diff(a.vm[2], b.vm[2]) + diff(a.vm[3], b.vm[3]),
+                 diff(a.vm[4], b.vm[4]), diff(a.vm[5], b.vm[5]), diff(a.vm[6], b.vm[6]),
+                 diff(a.cg[0], b.cg[0]), diff(a.cg[1], b.cg[1]), diff(a.cg[2], b.cg[2]), diff(a.cg[3], b.cg[3]),
+                 (double) diff(a.cg_stall_us, b.cg_stall_us) / 1000.0, b.psi_some10, b.psi_full10,
+                 (double) b.cg_current / gib, max_txt, (double) b.cg[4] / gib, (double) b.cg[5] / gib,
+                 (double) b.mem_available_kb / (1024.0 * 1024.0));
+    std::fflush(stderr);
+}
+
 bool refill_blocking() {
     static const bool v = std::getenv("STRATA_REFILL_BLOCKING") != nullptr;
     return v;
@@ -6433,6 +6525,7 @@ int main(int argc, char** argv) {
     drive.d.pool = &pool;
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
+    drive.d.n_layers = g.n_layers;
     drive.d.jobs.resize((size_t) K);
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
@@ -7748,8 +7841,10 @@ int main(int argc, char** argv) {
             src.stage_lend_regions(std::move(stage_lends));
         }
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
-        // the page-cache warm leaves free what the prompt path pins for the longest prompt --max-context allows
-        src.set_warm_reserve(strata::prefill::Prefill::layer_major_host_bytes(o.max_context));
+        // no RAM kept back for the prompt path: a long prompt's pinned buffers take room from the warm (clean page cache, the
+        // kernel drops it) and the warm refills after the request (rewarm)
+        strata::prefill::Prefill::set_host_floor_bytes((uint64_t) o.conversation_cache_min_free_mib << 20);
+        src.set_warm_reserve(0);
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);
         std::string whole_err;
@@ -7862,11 +7957,12 @@ int main(int argc, char** argv) {
 #endif
     }
     // files mode (no RAM budget, no RAM copy): the file cache is the expert tier, so the page-cache warm asks for the ranked
-    // experts no GPU cache holds, hottest first (STRATA_PAGECACHE_WARM_GIB; default: what is free beyond the prompt path's
-    // pinned buffers for --max-context and the kernel's watermarks).  With --resident-cpu-experts and no budget the RAM copy
-    // holds every expert, so there is nothing to warm then.
+    // experts no GPU cache holds, hottest first (STRATA_PAGECACHE_WARM_GIB; default: what is free beyond the kernel's watermarks).
+    // With --resident-cpu-experts and no budget the RAM copy holds every expert, so there is nothing to warm then.
     if (!o.resident_cpu_experts && srcp == &src && o.mmap_experts && xcache.valid()) {
-        src.set_warm_reserve(strata::prefill::Prefill::layer_major_host_bytes(o.max_context));
+        // no RAM kept back for the prompt path: a long prompt's pinned buffers take room from the warm (clean page cache, the
+        // kernel drops it) and the warm refills after the request (rewarm)
+        src.set_warm_reserve(0);
         src.start_files_pagecache_warm(xcache, profile_all.empty() ? profile : profile_all);
     }
     // (the arena mode has no RAM copy to exchange with: its experts are always in RAM, the tier only copies them in)
@@ -9456,6 +9552,17 @@ int main(int argc, char** argv) {
                 drive.d.gpu_pred_ranks = std::max(1, std::min(10, rr != nullptr ? std::atoi(rr) : 2));
                 std::fprintf(stderr, "strata serve: look-ahead ring: the look-ahead runs on the GPU (layers +1 and +2, ranks 0-%d)\n",
                              drive.d.gpu_pred_ranks - 1);
+            }
+            // STRATA_LOOKAHEAD_GPU (default on; =0 off): the GPU look-ahead's picks warm the file tier (no ring; the CPU look-ahead is not used in decode)
+            if (drive.d.gpu_pred == nullptr && strata::kernels::route_pred_active() && drive.d.lookahead != nullptr) {
+                const char* lg = std::getenv("STRATA_LOOKAHEAD_GPU");
+                if (lg == nullptr || std::atoi(lg) != 0) {
+                    drive.d.gpu_pred = strata::kernels::route_pred_host();
+                    drive.d.gpu_pred_ranks = drive.d.lookahead->k();
+                    drive.d.gpu_pred_warm = true;
+                    std::fprintf(stderr, "strata serve: look-ahead on the GPU (layers +1 and +2, ranks 0-%d), warming the file tier; the CPU look-ahead is not used in decode\n",
+                                 drive.d.gpu_pred_ranks - 1);
+                }
             }
             drive.d.fs = fs_swap.get();
             if (fs_swap && drive.d.lookahead != nullptr) lookahead.set_foresight(fs_swap.get());
@@ -11628,6 +11735,9 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") break;
+            // STRATA_RAM_TRACE=1: the host's memory counters at the start of this iteration (the RAM trace line follows the request's prompt line)
+            RamSnap ram_a;
+            if (ram_trace) ram_snap(ram_a);
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() {
@@ -11641,6 +11751,14 @@ int main(int argc, char** argv) {
                     strata::core::progress_at("idle");
                 }
             } busy_scope;
+            // the page-cache warm pauses while this iteration runs (a request reads the drive; the warm never competes with it).
+            // The guard ends the pause on every exit of the iteration (error replies, continue, return); after a request
+            // that read prompt tokens the warm runs again (rewarm, after the DONE line).
+            struct WarmPause {
+                strata::core::FileExpertSource& s;
+                explicit WarmPause(strata::core::FileExpertSource& x) : s(x) { s.set_request_active(true); }
+                ~WarmPause() { s.set_request_active(false); }
+            } warm_pause{src};
             {   // #2065: said, never changed - the free VRAM now (the verify windows' captures and the batch layouts
                 // eat into what startup reported), once per 128 MiB lower it gets
                 size_t vf_b = 0, vt_b = 0;
@@ -15034,6 +15152,14 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (ram_trace) {   // STRATA_RAM_TRACE=1: this request's RAM line, before the warm runs again below (it reads the drive)
+                RamSnap ram_b;
+                ram_snap(ram_b);
+                ram_trace_print(ram_a, ram_b);
+            }
+            // the request is done: the warm runs again with its list (evicted pages come back; cached ones cost only the hint)
+            src.set_request_active(false);
+            if (read_n > 0) src.rewarm();
             // the work the engine's own helpers did during this request (always on; the differences of lifetime counters): swap rounds and swaps (quality swaps among them),
             // the router look-ahead's predicted experts and the layers it skipped.  A zero beside a busy request is the sign of a helper that stopped.
             {

@@ -89,6 +89,9 @@ public:
     /// The pinned host memory a layer-major prompt of `n_tokens` allocates (its residual, row scales and xn16 images, the
     /// bf16x2 low part counted): what the page-cache warm must leave free for the longest prompt --max-context allows.
     static uint64_t layer_major_host_bytes(int64_t n_tokens);
+    /// The RAM the layer-major residuals must leave free (generate sets --conversation-cache-min-free-mib; default 2560 MiB).
+    static void set_host_floor_bytes(uint64_t bytes);
+    static uint64_t host_floor_bytes();
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk

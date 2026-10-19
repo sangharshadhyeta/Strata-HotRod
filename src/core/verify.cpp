@@ -713,6 +713,7 @@ Verifier::~Verifier() {
     if (ev_commit_) cudaEventDestroy(ev_commit_);
     if (prof_pin_) cudaFreeHost(prof_pin_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
+    if (ev_q8_) cudaEventDestroy(ev_q8_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     for (cudaStream_t s : df_side_)
         if (s) cudaStreamDestroy(s);
@@ -760,8 +761,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_TRACE_ADAPT") != nullptr)
         strata::kernels::route_detail_alloc();
     // STRATA_RING_GPU (default on with the ring): the look-ahead as a graph node, its table (allocated here, before any graph capture)
-    if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0 &&
-        (std::getenv("STRATA_RING_GPU") == nullptr || std::atoi(std::getenv("STRATA_RING_GPU")) != 0) && g.n_expert == 512)
+    // STRATA_LOOKAHEAD_GPU (default on; =0 off): the same table without the ring - the GPU look-ahead warms the file tier
+    // (20 Oct A/B: 48.1 -> 47.2 ms a decode window, the host's per-layer time 15.8 -> 12.6 ms: the CPU's router recompute is gone)
+    if (route_resident_cfg().margin > 0.0f && g.n_expert == 512 &&
+        ((std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0 &&
+          (std::getenv("STRATA_RING_GPU") == nullptr || std::atoi(std::getenv("STRATA_RING_GPU")) != 0)) ||
+         (std::getenv("STRATA_LOOKAHEAD_GPU") == nullptr || std::atoi(std::getenv("STRATA_LOOKAHEAD_GPU")) != 0)))
         strata::kernels::route_pred_alloc(g.n_layers);
     // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
@@ -1032,6 +1037,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_q8_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
         return false;
@@ -2078,8 +2084,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // STRATA_VERIFY_QDEDUP=1 (not with the forked shared-expert stream, which quantizes into its own buffer): the
             // experts' q8_1 image of xm is made first and the shared expert's gate/up read it (quantize_q8_1_rows and
             // native_quantize_q8_1 write the same bytes)
-            qdedup = g_qdedup() && !sh_fork && strata::kernels::cpu::expert_layout().native;
-            if (qdedup && !q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            // With the forked shared stream (sh_fork): the experts' quantize goes on cs first, and sh_cs_ waits on an event
+            // recorded after it, so the shared expert reads the same image (q8_ffn keeps the old path: no qdedup with sh_fork)
+            const bool sh_q8_first = sh_fork && g_qdedup() && strata::kernels::cpu::expert_layout().native && !q8_ffn;
+            qdedup = sh_q8_first || (g_qdedup() && !sh_fork && strata::kernels::cpu::expert_layout().native);
+            if (sh_q8_first) {
+                quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                cudaEventRecord(ev_q8_, cs);
+                cudaStreamWaitEvent(sh_stream, ev_q8_, 0);
+            } else if (qdedup && !q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
             if (!shared_expert_native_bf16_enabled()) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);

@@ -287,6 +287,7 @@ public:
     void set_max_tokens(int n);
     int max_tokens() const { return max_tok_; }
     int depth() const { return depth_; }
+    int k() const { return k_; }
     /// STRATA_LOOKAHEAD_STATS=1 (measurement only): remember each prediction (top k, k+4 and k+10 per token) and let the
     /// dispatch score it against the experts the next layer really routes outside the GPU cache.
     void enable_stats(int64_t n_layers);
@@ -467,6 +468,7 @@ struct ExpertDispatch {
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
     int64_t n_expert = strata::kernels::cpu::NE;
+    int64_t n_layers = 0;          ///< the model's layers (the GPU look-ahead's table bound; set by the driver)
 
     /// Counters, for the driver to report rather than for control flow.
     int64_t layers = 0;
@@ -581,6 +583,7 @@ struct ExpertDispatch {
     /// STRATA_RING_GPU: the GPU look-ahead's table ([n_layers][2][8][10] ids, route_pred_host); when set the pool feeds the ring from it at
     /// every layer's dispatch and the CPU look-ahead thread is not used.  `gpu_pred_ranks`: the ranks (per token) it feeds (STRATA_RING_RANKS).
     const int32_t* gpu_pred = nullptr;
+    bool gpu_pred_warm = false;   ///< STRATA_LOOKAHEAD_GPU: the GPU look-ahead's picks are warmed on the file tier (no ring), the CPU look-ahead thread is not used in decode
     int gpu_pred_ranks = 2;
     int64_t pred_fed = 0;          ///< experts the GPU look-ahead offered the ring (not resident, before its own dedupe)
     int pcie_num = 0;
@@ -722,6 +725,11 @@ public:
     /// buffers for the longest prompt --max-context allows).  Set before the warm starts; the kernel's high watermarks are
     /// added to it when the warm is sized.
     void set_warm_reserve(uint64_t bytes) { warm_reserve_ = bytes; }
+    /// The serve loop: a request runs (the warm pauses) / ended.
+    void set_request_active(bool on);
+    /// The warm again with its last list (after a request: pages a prompt's pinned buffers or reads evicted come back;
+    /// cached ones cost only the hint).
+    void rewarm();
     /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
     /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
     /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,
@@ -1071,10 +1079,14 @@ private:
         std::mutex mu;
         std::condition_variable cv;
         bool quit = false;
+        std::atomic<bool> busy{false};   // a request is running: the warm pauses (it never competes with a request for the drive)
     };
     PageWarm warm_;
     std::thread warm_thread_;
     uint64_t warm_reserve_ = 0;   // set_warm_reserve
+    std::vector<std::pair<int32_t, int32_t>> warm_last_order_;   // the last warm's list and budget (rewarm)
+    uint64_t warm_last_budget_ = 0;
+    uint64_t warm_runs_ = 0;   // warms started (the first one logs)
     /// Starts the warm over `order` (hottest first, the experts the tier does not hold) until `budget_bytes` of blobs.
     void start_pagecache_warm(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget_bytes);
     /// Stops and joins the warm thread (a no-op when none runs); close() calls it first.

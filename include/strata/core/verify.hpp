@@ -545,6 +545,7 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    cudaEvent_t ev_q8_ = nullptr;   // STRATA_VERIFY_QDEDUP with the forked shared stream: cs's q8_1 of the MoE input, waited on by sh_cs_
     // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
     // on these side streams (record_window); the same kernels on the same inputs, only their order is freer
     bool df_branch_ = false;
