@@ -2510,122 +2510,177 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     int ple_buf = 0;
 
     if (hand_in_ == nullptr) stopped_at_ = -1;
-    for (int64_t c0 = 0; c0 < n; c0 += C) {
-        if (should_stop && should_stop()) { err = "cancelled"; return false; }
-        // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
-        // waits for the later stages to read them)
-        if (c0 > 0 && hand_in_ == nullptr && stop_at_chunk && stop_at_chunk()) {
-            stopped_at_ = c0;
-            break;
+    // ---- the chunks.  A chunk's work runs in one of four phases: FULL (the default: every step of the chunk, in the
+    // order it always ran), and the layer-major path (STRATA_PREFILL_LAYER_MAJOR=1, see the driver below): SETUP (the
+    // embeddings, the PLE rows and the QSA step records; the residual goes to the host), LAYER (the residual, the step
+    // records and the norm the layer before left come back from the host; this layer's body runs; the residual goes
+    // back) and TAIL (the residual comes back and the chunk is reported).  Each phase runs the default's statements, in order.
+    enum LmPhase : int { PH_FULL = 0, PH_SETUP = 1, PH_LAYER = 2, PH_TAIL = 3 };
+    struct LmHost {   // the layer-major path's pinned host copies, its event, and the expert map's device buffer
+        float* R = nullptr;        // every chunk's residual: T * D floats per chunk, in token order
+        float* grs = nullptr;      // the row scales a layer's last write leaves for the next layer's first half: T * HC
+        uint16_t* xn = nullptr;    // the xn16 image of the same: T * xs per chunk (xs: the widest row stride)
+        uint16_t* xnlo = nullptr;  // its low part (bf16x2 only): T * D per chunk
+        cudaEvent_t ev = nullptr;  // recorded after a layer's last compute: the map's readers are done
+        uint8_t* map = nullptr;    // the expert map: a layer's streamed experts, kept for the chunks after its first
+        ~LmHost() {
+            if (R) cudaFreeHost(R);
+            if (grs) cudaFreeHost(grs);
+            if (xn) cudaFreeHost(xn);
+            if (xnlo) cudaFreeHost(xnlo);
+            if (ev) cudaEventDestroy(ev);
+            if (map) cudaFree(map);
         }
-        if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
-        const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
-        core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
-        ++stats_.chunks;
-        pt.mark(kPfStart, cs);
+    } lmh;
+    struct LmSync {   // an early return drains the layer-major copies before their host and device buffers go
+        cudaStream_t s = nullptr;
+        ~LmSync() { if (s) cudaStreamSynchronize(s); }
+    } lm_sync;
+    bool lm_on = false, lm_first = false;   // the expert map: this run's layer-major passes, and the layer's first chunk
+    size_t lm_cap = 0, lm_used = 0, lm_reused = 0;
+    std::vector<int64_t> lm_off;            // per expert: its offset in the map for the current layer, or -1
+    std::vector<int32_t> lm_steps;          // every token's QSA step records (a layer's pass uploads its chunk's)
+    std::vector<char> lm_carry;             // per chunk: the next layer's first half finds its norm in grs and xn16
+    const size_t lm_xs = (size_t) (D + (hc_pad() ? XN_PAD : 0));
+    auto lm_copy = [&](void* dst, const void* src, size_t bytes, cudaMemcpyKind kind) -> bool {
+        if (bytes == 0 || cudaMemcpyAsync(dst, src, bytes, kind, cs) == cudaSuccess) return true;
+        err = std::string("prefill: the layer-major copy failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    };
+    auto run_chunk = [&](int64_t c0, int phase, int64_t lay) -> bool {
+        const int64_t T = std::min(C, n - c0), p0 = pos0 + c0, ci = c0 / C;
+        const int64_t l_from = phase == PH_LAYER ? lay : LB;
+        const int64_t l_to = phase == PH_LAYER ? lay + 1 : phase == PH_TAIL ? LB : LE;   // TAIL: no layers
+        const bool setup = phase == PH_FULL || phase == PH_SETUP;
         const auto tsetup = Clock::now();
-        // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
-        // previous stage handed on
-        if (hand_in_ != nullptr && hand_ev_ != nullptr) {
-            // STRATA_HANDOFF_PIPE: each piece's upload waits on the GPU for its download on the stage before.  The
-            // stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a smaller
-            // chunk here) every piece is waited for before the one copy.
-            const auto* ev = static_cast<const cudaEvent_t*>(hand_ev_);
-            const bool whole = c0 == 0 && T == n;
-            bool ok = true;
-            for (int i = 0; ok && i < hand_pieces_; ++i) {
-                int64_t r0 = 0, nr = 0;
-                handoff_piece(n, hand_pieces_, i, r0, nr);
-                ok = cudaStreamWaitEvent(m.cs, ev[i], 0) == cudaSuccess;
-                if (ok && whole && nr > 0)
-                    ok = cudaMemcpyAsync(m.R + (size_t) r0 * D, hand_in_ + (size_t) r0 * D, (size_t) nr * D * 4,
-                                         cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
-            }
-            if (ok && !whole)
-                ok = cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice,
-                                     m.cs) == cudaSuccess;
-            if (!ok) {
-                err = std::string("prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): ") +
-                      cudaGetErrorString(cudaGetLastError());
+        bool normed = false;   // F-2: the previous half's write already normed R for this half (grs, xn16)
+        bool ple_pending = ple_on && (phase == PH_FULL || (phase == PH_LAYER && lay == std::max<int64_t>(LB, 1)));
+        int64_t kv_pending = -1;
+        if (phase == PH_LAYER || phase == PH_TAIL) {   // this chunk's residual comes back from the host
+            if (!lm_copy(m.R, lmh.R + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice)) return false;
+        }
+        if (phase == PH_LAYER) {   // its QSA step records, and the norm the layer before left for this half
+            std::copy_n(lm_steps.data() + (size_t) c0 * strata::kernels::kStepCount, (size_t) T * strata::kernels::kStepCount,
+                        m.steps_host.data());
+            if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
+                err = "prefill: the QSA step records' upload failed";
                 return false;
             }
-        } else if (hand_in_ != nullptr) {
-            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
-                cudaSuccess) {
-                err = "prefill: the layer split's hand-off upload failed";
-                return false;
+            if (lm_carry[(size_t) ci]) {
+                if (!lm_copy(m.grs, lmh.grs + (size_t) c0 * HC, (size_t) T * HC * 4, cudaMemcpyHostToDevice) ||
+                    !lm_copy(m.xn16, lmh.xn + (size_t) c0 * lm_xs, (size_t) T * lm_xs * 2, cudaMemcpyHostToDevice) ||
+                    (m.xn16_lo && !lm_copy(m.xn16_lo, lmh.xnlo + (size_t) c0 * D, (size_t) T * D * 2, cudaMemcpyHostToDevice)))
+                    return false;
+                normed = true;
             }
         }
-        // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
-        // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
-        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
-        const core::NativeEmbed* nemb = core::native_embed();
-        const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
-        if (batched && nemb == nullptr &&
-            (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
-             (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
-            batched = false;
-        for (int64_t t = 0; batched && t < T; ++t) {
-            const int64_t tok = tokens[c0 + t];
-            if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
-            else m.tok_host[(size_t) t] = (int32_t) tok;
-        }
-        if (batched) {
-            if (!m.tok_up.upload(m.tok_dev, m.tok_host.data(), (size_t) T, m.cs)) {
-                err = "prefill: the token id upload failed";
-                return false;
-            }
-            if (nemb) {
-                nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
-            } else {
-                const auto* codes = (const uint8_t*) wemb->data;
-                const auto* scales = (const float*) (codes + wemb->codes_bytes);
-                const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
-                                                       : nullptr;
-                strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
-                                                      wemb->code_bits, wemb->code_bias, wemb->group_elems,
-                                                      (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                      (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
-            }
-        }
-        for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T;) {
-            const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
-            if (row) {
-                // #1996: the picture's rows live in the caller's (pageable) memory.  A run of consecutive rows is
-                // gathered into one pinned slot and goes up as one copy; the slot is guarded by its event.
-                const int64_t row_bytes = N * 4, run_max = std::max<int64_t>(1, (4 << 20) / row_bytes);
-                int64_t t1 = t + 1;
-                while (t1 < T && t1 - t < run_max && embd_rows[p0 + t1]) ++t1;
-                void* stage = m.up_ring.acquire((size_t) ((t1 - t) * row_bytes));
-                cudaError_t e = cudaSuccess;
-                if (stage != nullptr) {
-                    for (int64_t r = t; r < t1; ++r)
-                        std::memcpy((char*) stage + (size_t) ((r - t) * row_bytes), embd_rows[p0 + r], (size_t) row_bytes);
-                    e = m.up_ring.submit(m.emb + t * N, stage, (size_t) ((t1 - t) * row_bytes), m.cs);
-                } else {   // no pinned RAM: row by row from the caller's memory, each waited for
-                    for (int64_t r = t; r < t1 && e == cudaSuccess; ++r)
-                        e = core::PinnedRing::direct(m.emb + r * N, embd_rows[p0 + r], (size_t) row_bytes, m.cs);
+        if (setup) {
+            if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
+            core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
+            ++stats_.chunks;
+            pt.mark(kPfStart, cs);
+            // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
+            // previous stage handed on
+            if (hand_in_ != nullptr && hand_ev_ != nullptr) {
+                // STRATA_HANDOFF_PIPE: each piece's upload waits on the GPU for its download on the stage before.  The
+                // stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a smaller
+                // chunk here) every piece is waited for before the one copy.
+                const auto* ev = static_cast<const cudaEvent_t*>(hand_ev_);
+                const bool whole = c0 == 0 && T == n;
+                bool ok = true;
+                for (int i = 0; ok && i < hand_pieces_; ++i) {
+                    int64_t r0 = 0, nr = 0;
+                    handoff_piece(n, hand_pieces_, i, r0, nr);
+                    ok = cudaStreamWaitEvent(m.cs, ev[i], 0) == cudaSuccess;
+                    if (ok && whole && nr > 0)
+                        ok = cudaMemcpyAsync(m.R + (size_t) r0 * D, hand_in_ + (size_t) r0 * D, (size_t) nr * D * 4,
+                                             cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
                 }
-                if (e != cudaSuccess) {
-                    err = "prefill: the image embedding upload failed";
+                if (ok && !whole)
+                    ok = cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice,
+                                         m.cs) == cudaSuccess;
+                if (!ok) {
+                    err = std::string("prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): ") +
+                          cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                t = t1;
-            } else {
-                if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, m.cs, err)) return false;
-                ++t;
+            } else if (hand_in_ != nullptr) {
+                if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
+                    cudaSuccess) {
+                    err = "prefill: the layer split's hand-off upload failed";
+                    return false;
+                }
             }
+            // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
+            // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
+            bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
+            const core::NativeEmbed* nemb = core::native_embed();
+            const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+            if (batched && nemb == nullptr &&
+                (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
+                 (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+                batched = false;
+            for (int64_t t = 0; batched && t < T; ++t) {
+                const int64_t tok = tokens[c0 + t];
+                if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+                else m.tok_host[(size_t) t] = (int32_t) tok;
+            }
+            if (batched) {
+                if (!m.tok_up.upload(m.tok_dev, m.tok_host.data(), (size_t) T, m.cs)) {
+                    err = "prefill: the token id upload failed";
+                    return false;
+                }
+                if (nemb) {
+                    nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
+                } else {
+                    const auto* codes = (const uint8_t*) wemb->data;
+                    const auto* scales = (const float*) (codes + wemb->codes_bytes);
+                    const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
+                                                           : nullptr;
+                    strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
+                                                          wemb->code_bits, wemb->code_bias, wemb->group_elems,
+                                                          (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
+                                                          (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
+                }
+            }
+            for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T;) {
+                const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
+                if (row) {
+                    // #1996: the picture's rows live in the caller's (pageable) memory.  A run of consecutive rows is
+                    // gathered into one pinned slot and goes up as one copy; the slot is guarded by its event.
+                    const int64_t row_bytes = N * 4, run_max = std::max<int64_t>(1, (4 << 20) / row_bytes);
+                    int64_t t1 = t + 1;
+                    while (t1 < T && t1 - t < run_max && embd_rows[p0 + t1]) ++t1;
+                    void* stage = m.up_ring.acquire((size_t) ((t1 - t) * row_bytes));
+                    cudaError_t e = cudaSuccess;
+                    if (stage != nullptr) {
+                        for (int64_t r = t; r < t1; ++r)
+                            std::memcpy((char*) stage + (size_t) ((r - t) * row_bytes), embd_rows[p0 + r], (size_t) row_bytes);
+                        e = m.up_ring.submit(m.emb + t * N, stage, (size_t) ((t1 - t) * row_bytes), m.cs);
+                    } else {   // no pinned RAM: row by row from the caller's memory, each waited for
+                        for (int64_t r = t; r < t1 && e == cudaSuccess; ++r)
+                            e = core::PinnedRing::direct(m.emb + r * N, embd_rows[p0 + r], (size_t) row_bytes, m.cs);
+                    }
+                    if (e != cudaSuccess) {
+                        err = "prefill: the image embedding upload failed";
+                        return false;
+                    }
+                    t = t1;
+                } else {
+                    if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, m.cs, err)) return false;
+                    ++t;
+                }
+            }
+            if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
         }
-        if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
         // were read ahead during the previous chunk; the first chunk's are read beside layer 0 - they are needed from
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
-        if (ple_on && !ple_next.valid())
+        if (ple_pending && !ple_next.valid())
             ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
                 strata::aux_cpus::pin_current_thread();
                 return ple_gather(c0, b, ple_next_err);
             });
-        bool ple_pending = ple_on;
         // the chunk's rows onto the device just before layer 1 reads them, and the next chunk's gather started
         auto ple_land = [&]() -> bool {
             if (!ple_pending) return true;
@@ -2659,17 +2714,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.ms_ple += ms_since(tp);
             return true;
         };
-        for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
-        // ---- the QSA step records of every position in the chunk
-        for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
-        if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
-            err = "prefill: the QSA step records' upload failed";
-            return false;
+        if (setup) {
+            for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
+            // ---- the QSA step records of every position in the chunk
+            for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
+            if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
+                err = "prefill: the QSA step records' upload failed";
+                return false;
+            }
+            if (phase == PH_SETUP)
+                std::copy_n(m.steps_host.data(), (size_t) T * strata::kernels::kStepCount,
+                            lm_steps.data() + (size_t) c0 * strata::kernels::kStepCount);
         }
 
         int64_t qsa_index = 0, gdn_index = 0;
-        for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        int64_t kv_pending = -1;
+        for (int64_t l = 0; l < l_from; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
         auto kv_prefetch_after = [&](int64_t layer, int64_t ordinal) -> bool {
             if (!kv_prefetch || p0 <= 0) return true;
             if (kv_pending >= 0) return true;   // one staging pool: the pending prefetch has not been consumed yet
@@ -2697,7 +2756,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             return true;
         };
-        if (!kv_prefetch_after(LB, qsa_index)) return false;
+        if (setup && !kv_prefetch_after(LB, qsa_index)) return false;
+        if (phase == PH_SETUP) {   // the layer-major setup: the residual goes to the host for the layers' passes
+            if (!lm_copy(lmh.R + (size_t) c0 * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost)) return false;
+            host_setup_ms += ms_since(tsetup);
+            return true;
+        }
         // step 3: this chunk's stream - every non-resident expert of every layer, layer by layer in id order (entry
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
@@ -2882,8 +2946,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             p_issue_until((size_t) m.pp->RP);
             cudaSetDevice(pd);
         }
-        host_setup_ms += ms_since(tsetup);
-        bool normed = false;   // F-2: the previous half's write already normed R for this half (grs, xn16)
+        if (phase == PH_FULL) host_setup_ms += ms_since(tsetup);
         // #579 #613 (opt-in diagnosis, STRATA_PF_STEP_SYNC=1): the compute and copy streams are waited for after each
         // step named below, a step that took over 250 ms is logged, and a stall's report names the step it is in.
         // Slower (a sync per step); the bytes are the same.
@@ -2898,7 +2961,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fprintf(stderr, "strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)\n",
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
-        for (int64_t l = LB; l < LE; ++l) {
+        for (int64_t l = l_from; l < l_to; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
@@ -4222,6 +4285,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (lm_on && !lm_first && lm_off[(size_t) e] >= 0) continue;   // layer-major: in the map
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
                                 if (m.src->transient(l, e)) {   // CS-T: copied by the source
@@ -4239,6 +4303,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                             if (resident) return true;
+                            if (lm_on && !lm_first && lm_off[(size_t) e] >= 0) {   // layer-major: the layer's map has it
+                                stage_of[j] = -2;
+                                ++lm_reused;
+                                return true;
+                            }
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % stage_n;
                             const auto th = Clock::now();
@@ -4260,6 +4329,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (const int cb = copy_bad.load(); cb != 0) {
                                 err = std::string("prefill: an expert copy call failed: ") + cudaGetErrorString((cudaError_t) cb) + " (the prompt's experts are not trusted: the request stops)";
                                 return false;
+                            }
+                            if (lm_on && lm_first) {
+                                const size_t bytes = (size_t) lay.blob_bytes(l), off = (lm_used + 255) & ~(size_t) 255;
+                                if (off + bytes <= lm_cap) {
+                                    note_copy(cudaMemcpyAsync(lmh.map + off, m.stage_dev[sl], bytes, cudaMemcpyDeviceToDevice, m.copy));
+                                    lm_off[(size_t) e] = (int64_t) off;
+                                    lm_used = off + bytes;
+                                }
                             }
                             cudaEventRecord(m.copied[sl], m.copy);
                             m.stage_live[sl] = true;
@@ -4462,7 +4539,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     ++staged;
                                 }
                                 const int32_t e = order[j];
-                                if (stage_of[j] < 0) {
+                                if (stage_of[j] == -2) {   // layer-major: the expert's buffer in the layer's map
+                                    if (!compute(j, lmh.map + lm_off[(size_t) e], -1, -1)) return false;
+                                } else if (stage_of[j] < 0) {
                                     ++stats_.experts_resident;
                                     if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1,
                                                  m.host_res[(size_t) l * m.g->n_expert + e])) return false;
@@ -4646,6 +4725,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
         }
+        if (phase == PH_LAYER) {   // the layer-major pass: the residual goes back, and so does the norm the next layer's first half reads
+            if (!lm_copy(lmh.R + (size_t) c0 * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost)) return false;
+            lm_carry[(size_t) ci] = normed ? 1 : 0;
+            if (normed &&
+                (!lm_copy(lmh.grs + (size_t) c0 * HC, m.grs, (size_t) T * HC * 4, cudaMemcpyDeviceToHost) ||
+                 !lm_copy(lmh.xn + (size_t) c0 * lm_xs, m.xn16, (size_t) T * lm_xs * 2, cudaMemcpyDeviceToHost) ||
+                 (m.xn16_lo && !lm_copy(lmh.xnlo + (size_t) c0 * D, m.xn16_lo, (size_t) T * D * 2, cudaMemcpyDeviceToHost))))
+                return false;
+            return true;
+        }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
         if (issuer.joinable()) {
             issuer.join();
@@ -4704,7 +4793,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return next_->run_impl(tokens + c0, T, p0, next_err_);
             });
             hand_buf_ ^= 1;
-            continue;   // the last stage reports the chunk (on_chunk)
+            return true;   // the last stage reports the chunk (on_chunk)
         }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
@@ -4753,6 +4842,93 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
+        return true;
+    };
+    // ---- the chunks.  Default: every chunk through every layer, in order.  Layer-major (STRATA_PREFILL_LAYER_MAJOR=1,
+    // opt-in): every chunk's setup, then each layer over all the chunks in order, then every chunk's tail, so a layer's
+    // routed experts stream from the SSD once per prompt instead of once per chunk.  The chunks' layer state (GDN, QSA
+    // KV and indexer, the PLE history) advances in chunk order within each layer, as it did; only m.R moves through the host.
+    // Only the plain path takes it: more than one chunk, this Prefill runs the whole stack, no layer split, no peer or
+    // helper, no KV streaming, no CPU share, and not the routed-stream walk (stream_all).  Anything else keeps the default.
+    static const bool lm_env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    bool kv_staged = false;
+    for (int64_t o = 0; o < g.n_qsa_layers(); ++o) kv_staged = kv_staged || ss.qsa_states[o].kv_mode == 1;
+    const bool walk_all = m.ring > STAGE && std::min(C, n) >= stream_all_min() && m.src != nullptr;
+    const bool cpu_share_run = cpu_pool_ != nullptr && cpu_share_on() && !walk_all && !pipe_chunked;
+    bool lm = lm_env && n > C && LB == 0 && LE == g.n_layers && hand_in_ == nullptr && next_ == nullptr && !helped &&
+              m.pp == nullptr && !kv_staged && !walk_all && !cpu_share_run;
+    if (lm) {
+        const bool ok = cudaHostAlloc((void**) &lmh.R, (size_t) n * D * 4, cudaHostAllocDefault) == cudaSuccess &&
+                        cudaHostAlloc((void**) &lmh.grs, (size_t) n * HC * 4, cudaHostAllocDefault) == cudaSuccess &&
+                        cudaHostAlloc((void**) &lmh.xn, (size_t) n * lm_xs * 2, cudaHostAllocDefault) == cudaSuccess &&
+                        (!m.xn16_lo || cudaHostAlloc((void**) &lmh.xnlo, (size_t) n * D * 2, cudaHostAllocDefault) == cudaSuccess) &&
+                        cudaEventCreateWithFlags(&lmh.ev, cudaEventDisableTiming) == cudaSuccess;
+        if (!ok) {   // no pinned RAM for the residuals: the default path (nothing has run yet)
+            (void) cudaGetLastError();
+            lm = false;
+        }
+    }
+    if (lm) {
+        // the expert map: as much of the device as the first try gets (a layer's experts that do not fit stream as before)
+        for (const size_t want : {(size_t) 700 << 20, (size_t) 256 << 20}) {
+            if (cudaMalloc((void**) &lmh.map, want) == cudaSuccess) {
+                lm_cap = want;
+                break;
+            }
+            (void) cudaGetLastError();
+        }
+        lm_off.assign((size_t) g.n_expert, -1);
+        lm_steps.assign((size_t) n * strata::kernels::kStepCount, 0);
+        lm_carry.assign((size_t) ((n + C - 1) / C), 0);
+        lm_sync.s = m.cs;
+    }
+    const int64_t streamed0 = stats_.experts_streamed;
+    if (!lm) {
+        for (int64_t c0 = 0; c0 < n; c0 += C) {
+            if (should_stop && should_stop()) { err = "cancelled"; return false; }
+            // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
+            // waits for the later stages to read them)
+            if (c0 > 0 && hand_in_ == nullptr && stop_at_chunk && stop_at_chunk()) {
+                stopped_at_ = c0;
+                break;
+            }
+            if (!run_chunk(c0, PH_FULL, 0)) return false;
+        }
+    } else {
+        int64_t nch = 0;   // the chunks set up (a stop before one ends the run before it, as in the default)
+        for (int64_t c0 = 0; c0 < n; c0 += C, ++nch) {
+            if (should_stop && should_stop()) { err = "cancelled"; return false; }
+            if (c0 > 0 && stop_at_chunk && stop_at_chunk()) {
+                stopped_at_ = c0;
+                break;
+            }
+            if (!run_chunk(c0, PH_SETUP, 0)) return false;
+        }
+        lm_on = true;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (should_stop && should_stop()) { err = "cancelled"; return false; }
+            // the previous layer's last reads of the map are done before this layer's first writes into it
+            cudaStreamWaitEvent(m.copy, lmh.ev, 0);
+            std::fill(lm_off.begin(), lm_off.end(), (int64_t) -1);
+            lm_used = 0;
+            for (int64_t ci = 0; ci < nch; ++ci) {
+                lm_first = ci == 0;
+                if (!run_chunk(ci * C, PH_LAYER, l)) return false;
+            }
+            if (cudaEventRecord(lmh.ev, cs) != cudaSuccess) {
+                err = std::string("prefill: the layer-major layer event: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
+        lm_on = false;
+        for (int64_t ci = 0; ci < nch; ++ci)
+            if (!run_chunk(ci * C, PH_TAIL, 0)) return false;
+        std::fprintf(stderr, "strata prefill: layer-major: %lld chunks, %lld layers, %lld experts streamed, %lld reused from "
+                             "the layer map (%.0f MB)\n", (long long) nch, (long long) g.n_layers,
+                     (long long) (stats_.experts_streamed - streamed0), (long long) lm_reused, lm_cap / 1048576.0);
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
