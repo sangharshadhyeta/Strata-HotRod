@@ -562,7 +562,17 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
 FileExpertSource::~FileExpertSource() { close(); }
 
 // The microseconds since `t0` (the timers below: a clock read and an atomic add each, on paths that run per blob or per window).
+// STRATA_IO_TIMERS=1 (diagnosis, off by default): the blob()/prefetch() timers below read the clock only when it is set;
+// off, tnow() is the zero time point and us_since() of it is 0 (no clock reads on the fetch path).
+static bool io_timers_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_IO_TIMERS"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+static inline std::chrono::steady_clock::time_point tnow() {
+    return io_timers_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+}
 static inline uint64_t us_since(std::chrono::steady_clock::time_point t0) {
+    if (t0 == std::chrono::steady_clock::time_point{}) return 0;
     return (uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
 }
 
@@ -877,7 +887,7 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
     }
     bool have;
     {
-        const auto tl = std::chrono::steady_clock::now();
+        const auto tl = tnow();
         std::lock_guard<std::mutex> lk(stage_mu_);
         t_blob_lock_us_.fetch_add(us_since(tl), std::memory_order_relaxed);
         have = stage_of_.find(key) != stage_of_.end();
@@ -1507,7 +1517,7 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
         io_crit_n_.fetch_add(1, std::memory_order_relaxed);
     };
     {
-        const auto tl = std::chrono::steady_clock::now();
+        const auto tl = tnow();
         std::unique_lock<std::mutex> lk(stage_mu_);
         t_blob_lock_us_.fetch_add(us_since(tl), std::memory_order_relaxed);
         const bool have = claim_stage(key, v, fill);
@@ -1522,7 +1532,7 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
         }
         if (have) {
             // another thread (a prefetch, the adaptive tier) is filling it: wait for that
-            const auto tw = std::chrono::steady_clock::now();
+            const auto tw = tnow();
             stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
             t_blob_wait_us_.fetch_add(us_since(tw), std::memory_order_relaxed);
             if (stage_key_[v] != key) return nullptr;   // its fill failed
@@ -1563,7 +1573,7 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
     std::vector<int64_t> reserved;
     std::vector<char> cold;
     if (only_uncached) {
-        const auto tp = std::chrono::steady_clock::now();
+        const auto tp = tnow();
         cold.assign((size_t) n, 0);
         for (int64_t i = 0; i < n; ++i) {
             const int64_t e = experts[i];
@@ -1602,7 +1612,7 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
         }
     }
     for (const int64_t e : reserved) io_enqueue(layer, e, kPosDemand);
-    const auto tf = std::chrono::steady_clock::now();
+    const auto tf = tnow();
     fill_many(todo);
     t_pf_fill_us_.fetch_add(us_since(tf), std::memory_order_relaxed);
     if (io_pf_ && !todo.empty()) {
@@ -1713,11 +1723,11 @@ void FileExpertSource::run_fill(size_t nt, const std::function<void()>& work) {
     }
     if (!fill_pool_on_) {
         std::vector<std::thread> th;
-        const auto tc = std::chrono::steady_clock::now();
+        const auto tc = tnow();
         for (size_t t = 1; t < nt; ++t) th.emplace_back(work);
         t_pf_thread_us_.fetch_add(us_since(tc), std::memory_order_relaxed);
         work();
-        const auto tj = std::chrono::steady_clock::now();
+        const auto tj = tnow();
         for (auto& t : th) t.join();
         t_pf_thread_us_.fetch_add(us_since(tj), std::memory_order_relaxed);
         return;
@@ -1735,7 +1745,7 @@ void FileExpertSource::run_fill(size_t nt, const std::function<void()>& work) {
     }
     fill_cv_.notify_all();
     work();
-    const auto tj = std::chrono::steady_clock::now();
+    const auto tj = tnow();
     {
         std::unique_lock<std::mutex> lk(fill_mu_);
         const auto it = std::find(fill_q_.begin(), fill_q_.end(), &job);
@@ -3984,7 +3994,7 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
             s->t_blob_us_.fetch_add(us_since(t0), std::memory_order_relaxed);
             s->n_blob_.fetch_add(1, std::memory_order_relaxed);
         }
-    } timed{this, std::chrono::steady_clock::now()};
+    } timed{this, tnow()};
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint8_t* result = nullptr;
     bool from_files = true;

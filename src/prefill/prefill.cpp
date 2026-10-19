@@ -2631,6 +2631,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         ~PhTimers() { for (cudaEvent_t e : pool) cudaEventDestroy(e); }
     } ph_t;
     auto lm_mark = [&](bool begin) {
+        if (!phase_timers) return;   // the copy timing is part of STRATA_PREFILL_PHASE_TIMERS (off by default: no events)
         cudaEvent_t e = nullptr;
         if (cudaEventCreate(&e) != cudaSuccess) { (void) cudaGetLastError(); return; }
         cudaEventRecord(e, cs);
@@ -5084,8 +5085,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (pr.second != nullptr) cudaEventDestroy(pr.second);
         }
         lm_copy_ev.clear();
-        std::fprintf(stderr, "strata prefill: layer-major residual traffic: %.1f GB host<->device in %.1f s of copies on the compute stream\n",
-                     (double) lm_copy_bytes / 1e9, copy_ms / 1000.0);
+        if (phase_timers)
+            std::fprintf(stderr, "strata prefill: layer-major residual traffic: %.1f GB host<->device in %.1f s of copies on the compute stream\n",
+                         (double) lm_copy_bytes / 1e9, copy_ms / 1000.0);
         if (phase_timers && ph_t.passes > 0 && !ph_t.marks.empty()) {
             // one stream: the last mark (a pass's end) completes after all the others, so one sync reads every interval
             cudaEventSynchronize(ph_t.pool[ph_t.marks.back().second]);
