@@ -2561,11 +2561,12 @@ bool FileExpertSource::prompt_copies(int64_t layer, int64_t expert) const {
     if (complement_ready_ && resident_blob(index) != nullptr) return false;
     if (!(override_.empty() || override_[index] == nullptr)) return false;
 #if defined(__linux__)
-    // STRATA_PROMPT_DIRECT_CACHED=1: a blob whose pages are all in the page cache is copied through the mapping (no drive
-    // read, no O_DIRECT bypass of the cache).  One mincore per span; a failed or partial answer keeps the O_DIRECT read.
+    // STRATA_PROMPT_DIRECT_CACHED (on by default; =0 off): a blob whose pages are all in the page cache is copied through the
+    // mapping (no drive read, no O_DIRECT bypass of the cache).  One mincore per span; a failed or partial answer keeps the
+    // O_DIRECT read.  With the page-cache warm, 19 Oct: 45k prompt 73.7 -> 58.7 / 59.1 s, 41-44 GB of its reads from RAM.
     static const bool cached_first = [] {
         const char* v = std::getenv("STRATA_PROMPT_DIRECT_CACHED");
-        return v != nullptr && std::strcmp(v, "1") == 0;
+        return v == nullptr || std::strcmp(v, "0") != 0;
     }();
     if (cached_first) {
         Span sp[3];
@@ -2864,11 +2865,11 @@ bool FileExpertSource::pin_cache_complement(
     int64_t budget_lent = 0, budget_lendable = 0;   // the lend region's slots kept by a budget (below), and its size
     uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
-    // STRATA_PAGECACHE_WARM_GIB (opt in): the ranked experts the budget leaves on the files, hottest first (warm_order);
-    // unset, nothing is collected and the warm does not start.
+    // STRATA_PAGECACHE_WARM_GIB (default 10; =0 off): the ranked experts the budget leaves on the files, hottest first
+    // (warm_order), warmed into the page cache by a SCHED_IDLE thread - the fixed tier's hot set, but reclaimable.
     const uint64_t warm_bytes = [] {
         const char* v = std::getenv("STRATA_PAGECACHE_WARM_GIB");
-        const double g = v != nullptr ? std::atof(v) : 0.0;
+        const double g = v != nullptr ? std::atof(v) : 10.0;
         return g > 0 ? (uint64_t) (g * 1073741824.0) : (uint64_t) 0;
     }();
     std::vector<std::pair<int32_t, int32_t>> warm_order;

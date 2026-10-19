@@ -615,7 +615,7 @@ struct Options {
     bool prefill_auto = false;
     /// #282, opt-in: the largest chunk `--prefill auto` may take - 8192 by default; `--prefill auto:16384` or
     /// `auto:32768` (or STRATA_PREFILL_AUTO_MAX) lets it go further, never past the context
-    int64_t prefill_auto_max = 8192;
+    int64_t prefill_auto_max = 16384;
     /// #1630: a bare `--prefill auto` stops here on a Windows HIP build (0: no cap). A chunk the user names is not capped.
     int64_t prefill_auto_cap = 0;
     /// a bare `--prefill auto` (no ":N", no STRATA_PREFILL_AUTO_MAX): the gfx12 Linux rule below may raise its ceiling
@@ -2443,8 +2443,9 @@ int main(int argc, char** argv) {
             o.prefill_auto = v == "auto" || v.rfind("auto:", 0) == 0;
             // #282: auto:N (N = 16384 or 32768) or STRATA_PREFILL_AUTO_MAX lets auto take chunks above 8192
             const char* env_max = std::getenv("STRATA_PREFILL_AUTO_MAX");
+            // a bare auto takes up to 16384 (19 Oct: auto:16384 is the measured default; VRAM still caps the chunk)
             const long long want_max = v.rfind("auto:", 0) == 0 ? std::atoll(v.c_str() + 5)
-                                     : (o.prefill_auto && env_max != nullptr ? std::atoll(env_max) : 8192);
+                                     : (o.prefill_auto && env_max != nullptr ? std::atoll(env_max) : 16384);
             o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
             {   // #1630: Windows HIP, RX 7900 XTX: a first long prompt at 8192-token chunks charged ~70 GB of commit and
@@ -2625,10 +2626,12 @@ int main(int argc, char** argv) {
             const double gib = std::atof(next("--resident-budget-gib"));
             if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0\n"); return 2; }
             o.resident_budget = (uint64_t) (gib * 1073741824.0);
-            o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
+            o.mmap_experts = o.resident_cpu_experts = true;
             o.resident_headroom = 4ull << 30;
-            if (const char* v = std::getenv("STRATA_RESIDENT_PIN"); v != nullptr && std::string(v) == "0")
-                o.resident_pin = false;
+            // unpinned by default (19 Oct: a pinned 16 GiB tier pressed every other program on a 31 GB box); STRATA_RESIDENT_PIN=1 pins
+            o.resident_pin = false;
+            if (const char* v = std::getenv("STRATA_RESIDENT_PIN"); v != nullptr && std::string(v) == "1")
+                o.resident_pin = true;
             if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
                 o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
         }
