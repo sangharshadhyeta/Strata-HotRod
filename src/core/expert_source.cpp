@@ -2527,6 +2527,17 @@ bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
     return override_.empty() || override_[index] == nullptr;
 }
 
+bool FileExpertSource::prompt_copies(int64_t layer, int64_t expert) const {
+    if (transient(layer, expert)) return true;
+    // STRATA_PROMPT_DIRECT: the prompt's blobs go through copy_blobs' O_DIRECT reader (pdirect_), not the mapping's
+    // page faults - a prompt then no longer pushes ~55 GB per chunk through the page cache (19 Oct: with only the
+    // reader opened, the stager kept memcpy-ing from the mapping: the same 21k faults and bytes as buffered)
+    if (pdirect_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (complement_ready_ && resident_blob(index) != nullptr) return false;
+    return override_.empty() || override_[index] == nullptr;
+}
+
 double FileExpertSource::cached_share(int64_t samples) const {
 #if defined(__linux__)
     if (role_ptr_.empty() || unmapped_ || samples <= 0 || n_layers_ <= 0 || n_expert_ <= 0) return -1.0;

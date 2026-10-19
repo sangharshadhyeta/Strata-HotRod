@@ -1299,7 +1299,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         // instead of 71 s on an RTX 5070 / NVMe PC (4 threads, 16 deep: the defaults, kept for every other source)
         bool files = false;
         for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
-            for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
+            for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->prompt_copies(l, e);
         // The same holds for a pack's experts.bin read through its mapping (IQ3_S here): a blob outside the RAM copy is a page
         // fault on the drive, so the copies need many reads in flight.  MEASURED (10 Oct 2026, RTX 3060 + PCIe 3.0 x4 NVMe, IQ3_S pack
         // 83 GB with 22.5 GiB in RAM): a 2,000-token prompt 26.4 to 28.4 s -> 18.1 to 20.4 s with 32 threads and a 128-deep ring
@@ -2823,7 +2823,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
-                    if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
+                    if (m.src->prompt_copies(l, e)) {   // CS-T: copied by the source into the stager's buffer
                         job = (int) js.size();
                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
                     } else {
@@ -4288,7 +4288,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (lm_on && !lm_first && lm_off[(size_t) e] >= 0) continue;   // layer-major: in the map
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
-                                if (m.src->transient(l, e)) {   // CS-T: copied by the source
+                                if (m.src->prompt_copies(l, e)) {   // CS-T: copied by the source
                                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
                                     continue;
                                 }
