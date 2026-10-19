@@ -2614,7 +2614,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::vector<int32_t> lm_steps;          // every token's QSA step records (a layer's pass uploads its chunk's)
     std::vector<char> lm_carry;             // per chunk: the next layer's first half finds its norm in grs and xn16
     const size_t lm_xs = (size_t) (D + (hc_pad() ? XN_PAD : 0));
+    // the layer-major passes' residual traffic: bytes, and CUDA event pairs around each pass's copy-in and copy-out groups
+    // (on cs, the compute stream: these copies do not overlap compute, so their time adds to the prompt's)
+    uint64_t lm_copy_bytes = 0;
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> lm_copy_ev;
+    auto lm_mark = [&](bool begin) {
+        cudaEvent_t e = nullptr;
+        if (cudaEventCreate(&e) != cudaSuccess) { (void) cudaGetLastError(); return; }
+        cudaEventRecord(e, cs);
+        if (begin) lm_copy_ev.push_back({e, nullptr});
+        else if (!lm_copy_ev.empty() && lm_copy_ev.back().second == nullptr) lm_copy_ev.back().second = e;
+        else cudaEventDestroy(e);
+    };
     auto lm_copy = [&](void* dst, const void* src, size_t bytes, cudaMemcpyKind kind) -> bool {
+        lm_copy_bytes += bytes;
         if (bytes == 0 || cudaMemcpyAsync(dst, src, bytes, kind, cs) == cudaSuccess) return true;
         err = std::string("prefill: the layer-major copy failed: ") + cudaGetErrorString(cudaGetLastError());
         return false;
@@ -2629,6 +2642,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bool normed = false;   // F-2: the previous half's write already normed R for this half (grs, xn16)
         bool ple_pending = ple_on && (phase == PH_FULL || (phase == PH_LAYER && lay == std::max<int64_t>(LB, 1)));
         int64_t kv_pending = -1;
+        if (phase == PH_LAYER) lm_mark(true);
         if (phase == PH_LAYER || phase == PH_TAIL) {   // this chunk's residual comes back from the host
             if (!lm_copy(m.R, lmh.R + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice)) return false;
         }
@@ -2646,6 +2660,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     return false;
                 normed = true;
             }
+            lm_mark(false);
         }
         if (setup) {
             if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
@@ -4798,6 +4813,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
         }
         if (phase == PH_LAYER) {   // the layer-major pass: the residual goes back, and so does the norm the next layer's first half reads
+            lm_mark(true);
+            struct EndMark { decltype(lm_mark)& f; ~EndMark() { f(false); } } end_mark{lm_mark};
             if (!lm_copy(lmh.R + (size_t) c0 * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost)) return false;
             lm_carry[(size_t) ci] = normed ? 1 : 0;
             if (normed &&
@@ -5013,6 +5030,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              "the layer map (%.0f MB, %s)\n", (long long) nch, (long long) g.n_layers,
                      (long long) (stats_.experts_streamed - streamed0), (long long) lm_reused, lm_cap / 1048576.0,
                      lm_map_src);
+        // the residual traffic of the passes (copy-in at a pass's start, copy-out at its end), timed by its CUDA events
+        double copy_ms = 0;
+        if (!lm_copy_ev.empty() && lm_copy_ev.back().second != nullptr) cudaEventSynchronize(lm_copy_ev.back().second);
+        for (auto& pr : lm_copy_ev) {
+            float t = 0;
+            if (pr.second != nullptr && cudaEventElapsedTime(&t, pr.first, pr.second) == cudaSuccess) copy_ms += t;
+            cudaEventDestroy(pr.first);
+            if (pr.second != nullptr) cudaEventDestroy(pr.second);
+        }
+        lm_copy_ev.clear();
+        std::fprintf(stderr, "strata prefill: layer-major residual traffic: %.1f GB host<->device in %.1f s of copies on the compute stream\n",
+                     (double) lm_copy_bytes / 1e9, copy_ms / 1000.0);
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
