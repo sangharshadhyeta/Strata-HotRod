@@ -15122,6 +15122,14 @@ int main(int argc, char** argv) {
                                      (unsigned long long) (ic.pf_dropped - ic_prev.pf_dropped),
                                      (double) (ic.crit_us - ic_prev.crit_us) / 1e3,
                                      (unsigned long long) (ic.crit_n - ic_prev.crit_n));
+                    // STRATA_IO_TIMERS=1: where the host's fetch time went this request (totals; divide by the decode windows of the timing line)
+                    if (ic.blob_us != ic_prev.blob_us || ic.pf_fill_us != ic_prev.pf_fill_us)
+                        std::fprintf(stderr, "; blob() %llu calls %.1f ms (lock %.1f, waits on fills %.1f); prefetch %llu calls: residency "
+                                             "probes %.1f ms, fills %.1f ms, fill threads %.1f ms",
+                                     (unsigned long long) (ic.blob_n - ic_prev.blob_n), (double) (ic.blob_us - ic_prev.blob_us) / 1e3,
+                                     (double) (ic.blob_lock_us - ic_prev.blob_lock_us) / 1e3, (double) (ic.blob_wait_us - ic_prev.blob_wait_us) / 1e3,
+                                     (unsigned long long) (ic.pf_calls - ic_prev.pf_calls), (double) (ic.pf_probe_us - ic_prev.pf_probe_us) / 1e3,
+                                     (double) (ic.pf_fill_us - ic_prev.pf_fill_us) / 1e3, (double) (ic.pf_thread_us - ic_prev.pf_thread_us) / 1e3);
                     std::fprintf(stderr, "\n");
                     io_prev = io_now;
                     ic_prev = ic;
