@@ -2412,6 +2412,22 @@ struct PeTimer {
 };
 }  // namespace
 
+// STRATA_PROMPT_DIRECT_MIN_TOKENS: the shortest prompt whose expert reads go O_DIRECT (default 16384); read once.  A shorter
+// prompt reads buffered, as before the O_DIRECT reader existed, so its experts stay in the page cache for decode.
+static int64_t prompt_direct_min_tokens() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PROMPT_DIRECT_MIN_TOKENS");
+        return e != nullptr ? (int64_t) std::max(0L, std::atol(e)) : (int64_t) 16384;
+    }();
+    return v;
+}
+// STRATA_PREFILL_LOOKAHEAD_TOK: the look-ahead's tokens a layer. An explicit value always wins; otherwise 512, or 0 for a run
+// whose prompt reads are O_DIRECT (the look-ahead only warms the page cache, which those reads skip).  -1: not set.
+static int prompt_lookahead_env_tokens() {
+    static const int v = [] { const char* e = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); return e ? std::max(0, std::atoi(e)) : -1; }();
+    return v;
+}
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     // solid.cpp's silent-corruption bug class (a failed prefill copy still published its slot): a copy call that RETURNS an error (an argument error is not
     // a stream error, so the stream check at the end of the chunk does not see it) is recorded here and fails the request, loudly
@@ -2540,6 +2556,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     int ple_buf = 0;
 
     if (hand_in_ == nullptr) stopped_at_ = -1;
+    // Per-run O_DIRECT decision for the prompt's expert reads (the source's flag, read by prompt_copies at the stager's and
+    // the jobs' decisions below). Only the first stage decides, for the shared source; prompt_total_ is the whole prompt on a
+    // layer split, else this run's n.  The look-ahead count follows it (la_tok, below).
+    int la_tok = 512;
+    if (m.src != nullptr) {
+        if (hand_in_ == nullptr) {
+            const int64_t whole = std::max<int64_t>(prompt_total_, n);
+            const int64_t min_tok = prompt_direct_min_tokens();
+            m.src->set_prompt_direct_active(whole >= min_tok);
+            if (pos0 == 0) {   // once per prompt: its read path and why
+                const char* how = m.src->prompt_direct_on()
+                    ? "unbuffered (O_DIRECT)"
+                    : (whole >= min_tok ? "buffered (the O_DIRECT reader is not open)" : "buffered");
+                std::fprintf(stderr, "strata prefill: the prompt's %lld tokens read experts %s: %s\n", (long long) whole, how,
+                             m.src->prompt_direct_on() ? "a prompt of at least STRATA_PROMPT_DIRECT_MIN_TOKENS (page cache left to decode for shorter ones)"
+                             : whole >= min_tok ? "O_DIRECT is off for this model or tier, so the page cache is used"
+                                                : ("a prompt under STRATA_PROMPT_DIRECT_MIN_TOKENS=" + std::to_string((long long) min_tok) + ", its pages stay cached for decode").c_str());
+            }
+        }
+        la_tok = prompt_lookahead_env_tokens() >= 0 ? prompt_lookahead_env_tokens() : (m.src->prompt_direct_on() ? 0 : 512);
+    } else if (prompt_lookahead_env_tokens() >= 0) {
+        la_tok = prompt_lookahead_env_tokens();
+    }
     // ---- the chunks.  A chunk's work runs in one of four phases: FULL (the default: every step of the chunk, in the
     // order it always ran), and the layer-major path (STRATA_PREFILL_LAYER_MAJOR=1, see the driver below): SETUP (the
     // embeddings, the PLE rows and the QSA step records; the residual goes to the host), LAYER (the residual, the step
@@ -3603,7 +3642,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         // router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens, default 0 = off): an evenly spaced sample of this layer's
                         // router input comes to the host behind the ids, on the same stream, and goes to the lookahead after the sync below
-                        static const int la_tok = [] { const char* v = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); return v ? std::max(0, std::atoi(v)) : 512; }();
                         int64_t la_n = 0;
                         if (lookahead_ != nullptr && la_tok > 0 && !stream_all && l + 1 < g.n_layers) {
                             la_n = std::min<int64_t>(T, la_tok);

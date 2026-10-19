@@ -2549,8 +2549,9 @@ bool FileExpertSource::prompt_copies(int64_t layer, int64_t expert) const {
     if (transient(layer, expert)) return true;
     // STRATA_PROMPT_DIRECT: the prompt's blobs go through copy_blobs' O_DIRECT reader (pdirect_), not the mapping's
     // page faults - a prompt then no longer pushes ~55 GB per chunk through the page cache (19 Oct: with only the
-    // reader opened, the stager kept memcpy-ing from the mapping: the same 21k faults and bytes as buffered)
-    if (pdirect_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    // reader opened, the stager kept memcpy-ing from the mapping: the same 21k faults and bytes as buffered).
+    // Only for a run that set prompt_direct_active (STRATA_PROMPT_DIRECT_MIN_TOKENS): a shorter prompt stays buffered.
+    if (!prompt_direct_active_.load(std::memory_order_relaxed) || pdirect_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (complement_ready_ && resident_blob(index) != nullptr) return false;
     return override_.empty() || override_[index] == nullptr;

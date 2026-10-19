@@ -214,6 +214,11 @@ public:
     /// stager reading the mapping?  transient(), plus - with STRATA_PROMPT_DIRECT's O_DIRECT reader open - every
     /// blob not in the RAM tier, so prompt reads bypass the page cache.  Only prefill asks this.
     virtual bool prompt_copies(int64_t layer, int64_t expert) const { return transient(layer, expert); }
+    /// STRATA_PROMPT_DIRECT_MIN_TOKENS: prefill sets this per run - on for a prompt of at least that many tokens, off for
+    /// a shorter one (its blobs then stay on the buffered mapping, and their pages stay in the cache for decode).
+    virtual void set_prompt_direct_active(bool on) { (void) on; }
+    /// Whether this run's prompt reads go through the O_DIRECT reader (prompt_copies may answer true for them).
+    virtual bool prompt_direct_on() const { return false; }
     /// #1353: of the bytes `transient` experts would be copied from, the share whose pages are in RAM right now (a
     /// GGUF read in place whose page cache is warm), measured on a sample of up to `samples` experts; -1 when this
     /// source cannot tell (not a file source, or no residency query on this OS).  The prompt path's stager uses it to
@@ -851,6 +856,8 @@ public:
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
     bool prompt_copies(int64_t layer, int64_t expert) const override;
+    void set_prompt_direct_active(bool on) override { prompt_direct_active_.store(on, std::memory_order_relaxed); }
+    bool prompt_direct_on() const override { return prompt_direct_active_.load(std::memory_order_relaxed) && !pdirect_.empty(); }
     double cached_share(int64_t samples) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// pp-opt, unbuffered: the file-tier blobs of the run in one read_direct batch (neighbours merged into one request)
@@ -930,6 +937,7 @@ private:
     bool map_view(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
+    std::atomic<bool> prompt_direct_active_{true};   ///< set_prompt_direct_active: this run's prompt reads are O_DIRECT (a short prompt: off)
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source

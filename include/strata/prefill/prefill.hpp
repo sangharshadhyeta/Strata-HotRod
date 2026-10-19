@@ -240,9 +240,13 @@ public:
     /// layer's router input (STRATA_PREFILL_LOOKAHEAD_TOK tokens, default 32; 0 = off) predicts the next layers' experts and
     /// warms their pages while this layer's are read.  It only warms pages: which experts are computed does not change.
     void set_lookahead(core::RouterLookahead* la);
+    /// The whole prompt's length when this Prefill reads a segment of it (a layer split's first stage): the STRATA_PROMPT_DIRECT_MIN_TOKENS
+    /// test uses it.  0: the run's own n.
+    void set_prompt_total(int64_t total) { prompt_total_ = total; }
 
 private:
     core::RouterLookahead* lookahead_ = nullptr;     ///< set_lookahead
+    int64_t prompt_total_ = 0;                       ///< set_prompt_total
     std::vector<uint16_t> la_bf_;                    ///< the sampled router-input rows (bf16), host
     std::vector<float> la_x_;                        ///< ... as floats, what the lookahead takes
     int64_t la_s_[12] = {};                          ///< STRATA_PREFILL_LOOKAHEAD_STATS: layers, then per prediction (+1, +2, either) layers / experts / hits

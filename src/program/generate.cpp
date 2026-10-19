@@ -7831,11 +7831,11 @@ int main(int argc, char** argv) {
             if (!ub && [] { const char* v = std::getenv("STRATA_PROMPT_DIRECT"); return v == nullptr || v[0] != '0'; }()) {
                 std::string pw;
                 const bool pd = src.open_prompt_direct(pw);
+                // per prompt (prefill run_impl): O_DIRECT only for prompts of STRATA_PROMPT_DIRECT_MIN_TOKENS tokens or more, and
+                // the router look-ahead is off for those runs only (prefill.cpp, la_tok). No global setenv here any more.
                 std::fprintf(stderr, "strata generate: the prompt path's expert reads %s\n",
-                             pd ? "go unbuffered (STRATA_PROMPT_DIRECT, on by default)" : ("stay buffered: " + pw).c_str());
-                // the prompt look-ahead only warms the page cache, which unbuffered prompt reads skip: 31 GB of a 45k
-                // prompt's guesses went unused (19 Oct). Off unless STRATA_PREFILL_LOOKAHEAD_TOK is set explicitly.
-                if (pd && std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK") == nullptr) setenv("STRATA_PREFILL_LOOKAHEAD_TOK", "0", 0);
+                             pd ? "may go unbuffered (STRATA_PROMPT_DIRECT, prompts of STRATA_PROMPT_DIRECT_MIN_TOKENS or more)"
+                                : ("stay buffered: " + pw).c_str());
             }
         }
 #endif
@@ -13044,6 +13044,7 @@ int main(int argc, char** argv) {
                     ConvCheckpoint::PromptPlan& p;
                     ~SegPlanScope() { p = {}; }
                 } seg_plan_scope{seg_plan};
+                sp.set_prompt_total((int64_t) ids.size());   // the whole prompt: STRATA_PROMPT_DIRECT_MIN_TOKENS tests it, not a segment
                 auto run = [&](int64_t q, int64_t r) -> bool {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
                     return sp.run(ids.data() + q, r - q, q, e);
