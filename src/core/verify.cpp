@@ -1072,6 +1072,7 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
+    if (strata::kernels::native_router_fused_on()) strata::kernels::native_router_fused_init();   // STRATA_ROUTER_FUSED: its counter, before any capture
     if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count)
         strata::kernels::route_want_alloc((size_t) (g.n_layers * g.n_expert));
     if (route_resident_cfg().margin > 0.0f && strata::kernels::route_swap2_max() > 0)
@@ -2566,6 +2567,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool sg_ready = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
+                // STRATA_ROUTER_FUSED=1: the GEMV and the top-10 in one launch (native_router.cu).  Taken only without the _aux
+                // (STRATA_LFUSE shared-gate) row, which needs the GEMV launch of its own; n <= 4 rows (shared memory).
+                if (w_sgi == nullptr && native_router_fused_on() &&
+                    native_router_fused_supported(N, NE, n, mixed_ + tb * N, N, w_router->data)) {
+                    native_router_gemv_top10_fused(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE,
+                                                   ids_ + tb * K, w_ + tb * K, N, NE, n, cs);
+                } else {
                 if (w_sgi != nullptr)
                     sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
                                                              logits_ + tb * NE, NE, N, NE, n,
@@ -2574,6 +2582,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                }
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
         } else if (dec_batch) {

@@ -20,6 +20,14 @@ bool native_router_enabled();
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
+/// STRATA_ROUTER_FUSED=1 (opt-in, read once): the router GEMV (`x` [n_tok][n_in] with row stride ldx, `w` the bf16 [512][n_in]) and the
+/// 512 x 10 top-10 in ONE launch.  Writes the logits [n_tok][512] (bit-identical to bf16_gemv_fp32_mmvf_multi), ids and weights (as
+/// native_router_top10_multi).  Needs native_router_fused_init() before any graph capture; `supported` is false until then.
+bool native_router_fused_on();
+void native_router_fused_init();
+bool native_router_fused_supported(int64_t n_in, int64_t n_out, int n_tok, const void* x, int64_t ldx, const void* w);
+void native_router_gemv_top10_fused(const float* x, int64_t ldx, const uint16_t* w, float* logits, int32_t* ids, float* weights,
+                                    int64_t n_in, int64_t n_out, int n_tok, void* stream);
 /// The stand-in's ONE floor, in host-mapped memory the router kernel reads at every launch, so a captured graph follows a change
 /// the host makes between windows (nothing moves it today; a controller that follows the drive's load, SPEC 19.8, would).
 /// `lo` is the first rank that may be replaced (a HIGHER number replaces less, so it is the more careful); `hi` the last (9);

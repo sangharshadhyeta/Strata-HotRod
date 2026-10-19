@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <atomic>
@@ -102,16 +103,13 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
-__launch_bounds__(256, 1)
-__global__ void route_multi(const float* __restrict__ logits, int32_t* __restrict__ ids,
-                            float* __restrict__ weights, int n_tok) {
-    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
-    if (tk >= n_tok) return;
-    logits += (size_t) tk * 512; ids += (size_t) tk * 10; weights += (size_t) tk * 10;
-    const int lane = threadIdx.x;
+// One warp's top-10 of one token's 512 logits (the route_multi body, shared with the fused router below): lane = the warp's lane.
+// The logits are read through L2 (__ldcg), so a warp may read a row another CTA of the same launch just wrote.
+__device__ __forceinline__ void route_warp_top10(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                                                 float* __restrict__ weights, const int lane) {
     float values[16];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+    for (int i = 0; i < 16; ++i) values[i] = __ldcg(logits + lane + i * 32);
     __syncwarp();
     float maximum = -INFINITY;
 #pragma unroll
@@ -153,6 +151,83 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
     selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+}
+__launch_bounds__(256, 1)
+__global__ void route_multi(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                            float* __restrict__ weights, int n_tok) {
+    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
+    if (tk >= n_tok) return;
+    route_warp_top10(logits + (size_t) tk * 512, ids + (size_t) tk * 10, weights + (size_t) tk * 10, threadIdx.x);
+}
+// STRATA_ROUTER_FUSED (opt-in): the router GEMV (bf16_f32_mmvf_multi_kernel, NT = n_tok, n_in = 2560, 256 threads: the 224/256
+// choice is mmvf_block_size's) and the 512 x 10 top-10 in ONE launch.  kFusedRows rows per CTA, one warp per row.  The CTA
+// stages the n_tok activation rows in shared memory once (40 KB at 4 x 2560).  Each row keeps the GEMV's arithmetic exactly: the
+// 256 "virtual threads" of the 256-thread kernel are emulated by the warp's 32 lanes x 8 (virtual thread v = lane + 32 s, pairs
+// v, v + 256, ...), each with its own fp32 accumulator per token, in the same pair order and two ordered FMAs; the 8 virtual
+// warps are then reduced with the same xor butterfly, the warp partials sit in lanes 0..7 and lanes 8..31 hold 0.  The logits are
+// therefore bit-identical to the two-launch path.  The CTA that finishes LAST (atomic counter, fenced) runs the top-10 of every
+// token with route_warp_top10, the very code route_multi runs, so the ids and weights (ties: the lower index) are identical too.
+// R = 16 rows (warps) per CTA: the 40 KB of staged activations allow 2 CTAs per SM (100 KB shared on GA106), so 512 / 16 = 32 CTAs
+// are all resident in one wave (R = 8 would be 64 CTAs, 8 of them queued behind a full wave; R = 4 or 2 queue far more).
+constexpr int kFusedRows = 16;
+constexpr int kFusedThreads = 32 * kFusedRows;
+constexpr int kFusedMaxTok = 4;               // the shared-memory staging bound (n_tok * n_in * 4 bytes, under 48 KB)
+static unsigned int* g_fused_done = nullptr;  // the CTA counter: the last CTA to finish resets it to 0 (allocated at init)
+__launch_bounds__(kFusedThreads, 1)
+__global__ void router_gemv_top10_fused_k(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
+                                          float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                          int n_in, int n_tok, unsigned int* __restrict__ done) {
+    extern __shared__ float2 sx[];   // [n_tok][n_in / 2]: the activations, read once per CTA
+    __shared__ bool last;
+    const int tid = (int) threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int half = n_in / 2;
+    for (int i = tid; i < n_tok * half; i += kFusedThreads) {
+        const int k = i / half, p = i - k * half;
+        sx[i] = reinterpret_cast<const float2*>(x + (size_t) k * ldx)[p];
+    }
+    __syncthreads();
+    const int row = (int) blockIdx.x * kFusedRows + warp;
+    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(w + (size_t) row * n_in);
+    float acc[8][kFusedMaxTok];      // [virtual warp s][token k]
+#pragma unroll
+    for (int s = 0; s < 8; ++s)
+#pragma unroll
+        for (int k = 0; k < kFusedMaxTok; ++k) acc[s][k] = 0.0f;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        for (int pair = lane + 32 * s; pair < half; pair += 256) {   // virtual thread v = lane + 32 s, stride 256 pairs
+            const uint32_t weight = weights2[pair];
+            const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+#pragma unroll
+            for (int k = 0; k < kFusedMaxTok; ++k) {
+                if (k < n_tok) {
+                    const float2 input = sx[k * half + pair];
+                    acc[s][k] = __fmaf_rn(w0, input.x, acc[s][k]);
+                    acc[s][k] = __fmaf_rn(w1, input.y, acc[s][k]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < kFusedMaxTok; ++k) {
+        // the 8 virtual warps' sums: warp s's total is in every lane; lane s keeps it, lanes 8..31 keep 0 (as partials[k][8..31])
+        float keep = 0.0f;
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            const float total = warp_sum(acc[s][k]);
+            if (lane == s) keep = total;
+        }
+        const float out = warp_sum(keep);
+        if (k < n_tok && lane == 0) logits[(size_t) k * 512 + row] = out;
+    }
+    __threadfence();                 // this CTA's logits are visible device-wide before the counter moves
+    __syncthreads();
+    if (tid == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    // the last CTA: one warp per token, the route_multi selection on the 512 logits every CTA wrote
+    if (tid == 0) *done = 0u;        // the next launch starts from zero
+    if (warp < n_tok) route_warp_top10(logits + (size_t) warp * 512, ids + (size_t) warp * 10, weights + (size_t) warp * 10, lane);
 }
 // The same contract for other (experts, top-k) shapes - Qwen3.6-35B-A3B's 256 / 8 - one warp per token, n_tok tokens
 // (8 per block).  The 512 / 10 path keeps its own kernels above (the Flash-Next bits), this template is only used
@@ -236,6 +311,31 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
     route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+bool native_router_fused_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSED"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+void native_router_fused_init() {   // before any graph capture: the CTA counter is a device allocation
+    if (g_fused_done != nullptr) return;
+    if (cudaMalloc((void**) &g_fused_done, sizeof(unsigned int)) != cudaSuccess) { cudaGetLastError(); g_fused_done = nullptr; return; }
+    cudaMemset(g_fused_done, 0, sizeof(unsigned int));
+}
+bool native_router_fused_supported(int64_t n_in, int64_t n_out, int n_tok, const void* x, int64_t ldx, const void* w) {
+    // n_out 512 (the 512 x 10 router), n_in even and staged in shared memory for up to kFusedMaxTok rows (under 48 KB), aligned
+    return g_fused_done != nullptr && n_out == 512 && n_tok >= 1 && n_tok <= kFusedMaxTok && n_in > 0 && (n_in & 1) == 0 &&
+           n_in <= 3072 && (ldx & 1) == 0 && x != nullptr && w != nullptr && (reinterpret_cast<uintptr_t>(x) & 7u) == 0 &&
+           (reinterpret_cast<uintptr_t>(w) & 3u) == 0;
+}
+void native_router_gemv_top10_fused(const float* x, int64_t ldx, const uint16_t* w, float* logits, int32_t* ids, float* weights,
+                                    int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+    if (!stream || g_fused_done == nullptr || n_out != 512 || n_tok < 1 || n_tok > kFusedMaxTok)
+        throw std::invalid_argument("native router (fused): needs a stream, init, 512 outputs and 1..4 rows");
+    const size_t shared = (size_t) n_tok * (size_t) n_in * sizeof(float);   // [n_tok][n_in / 2] float2
+    router_gemv_top10_fused_k<<<(unsigned) (512 / kFusedRows), kFusedThreads, shared, static_cast<cudaStream_t>(stream)>>>(
+        x, ldx, w, logits, ids, weights, (int) n_in, n_tok, g_fused_done);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
