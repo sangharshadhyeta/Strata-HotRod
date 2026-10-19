@@ -747,6 +747,21 @@ public:
     /// nothing changed, when the expert holds no place or an exchange / staged state makes the place unsafe to touch.
     /// Called after the refill copy that read the place has completed (the caller synchronized its stream).
     bool release_resident_place(int64_t layer, int64_t expert);
+    /// STRATA_LOOKAHEAD_PROMOTE (RAM overlay): a prediction the io workers read (warm -> io_enqueue, not the demand reads) is
+    /// read into a promotion buffer of its own and, when the RAM copy can take it (a free place of its layer, or a RAM-held
+    /// expert of the layer that is not on the GPU and whose usage is below 1.0), queued here.  drain_promotions places the
+    /// queued ones on the serve thread between windows (where no pool job reads the copy), with the same place logic as
+    /// take_resident_place.  `usage` (the adaptive tier's; may be empty) is read by the io workers as a heuristic (racy
+    /// reads, acceptable: it only decides whether to read ahead); set it only after its last assign.  Off: nothing.
+    void set_lookahead_promote(bool on, const std::vector<float>* usage);
+    bool lookahead_promote() const { return promo_on_.load(std::memory_order_acquire); }
+    /// Serve thread, between windows, with no adaptive round in flight and nothing staged.  `busy` is indexed layer *
+    /// n_expert + expert (true: on a GPU).  Returns the number of experts placed.  Every queued entry is consumed.
+    uint64_t drain_promotions(const std::vector<float>& usage, const std::vector<char>& busy);
+    bool promotions_queued() const;
+    /// Experts placed by promotion / the first demand read of a promoted place (its flag is cleared by that read).
+    uint64_t promotions() const { return promo_n_.load(std::memory_order_relaxed); }
+    uint64_t promotion_hits() const { return promo_hits_.load(std::memory_order_relaxed); }
     /// The RAM tier gives back `bytes` of its arena to the OS: the coldest RAM-held places (lowest `usage`, flat-indexed
     /// layer * n_expert + expert; empty = all zero) are given up through release_resident_place, and each one's whole pages
     /// are madvise(MADV_DONTNEED)'d so the kernel takes them back (the place stays on complement_free_; take_resident_place
@@ -1148,6 +1163,27 @@ private:
     uint64_t complement_bytes_ = 0;
     std::vector<uint64_t> complement_offsets_;
     std::vector<std::vector<uint64_t>> complement_free_;   ///< per layer: places release_resident_place gave up (free)
+    mutable std::mutex tier_mu_;                      ///< complement_free_: the io workers' promotion check vs the serve thread's release / take
+    /// place_expert: the one place rule of take_resident_place and the promotions.  A free place of the layer first; else
+    /// (allow_victim) the coldest RAM-held expert of the layer not flagged in busy gives its place to `out`, when its usage is
+    /// below `victim_limit`.  `victim_out` (may be null) gets the victim's index (-1: none).  Serve thread only.
+    bool place_expert(int64_t layer, int64_t out, const std::vector<float>& usage, const std::vector<char>& busy,
+                      const uint8_t* bytes, bool allow_victim, float victim_limit, int64_t* victim_out);
+    // ---- STRATA_LOOKAHEAD_PROMOTE (see set_lookahead_promote).  The io workers write promo_q_ / promo_busy_ under promo_mu_
+    // only; the RAM copy and complement_offsets_ are written on the serve thread (drain_promotions) alone.
+    struct Promo { int64_t layer, expert; std::vector<uint8_t> bytes; };
+    /// io worker: the prediction is one the RAM tier could take now (a free place or a victim below 1.0); a heuristic
+    bool promote_wanted(int64_t layer, int64_t expert) const;
+    /// io worker: reads the prediction's blob into a promotion buffer and queues it (no stage buffer is used)
+    void promote_read(int64_t layer, int64_t expert);
+    std::atomic<bool> promo_on_{false};
+    std::atomic<const std::vector<float>*> promo_usage_{nullptr};
+    mutable std::mutex promo_mu_;
+    std::deque<Promo> promo_q_;                  ///< read, not yet placed (drain_promotions takes them all)
+    std::vector<char> promo_busy_;               ///< per (layer, expert): queued or being read (cleared when drain places / drops it)
+    std::vector<std::vector<uint8_t>> promo_spare_;   ///< buffers drain_promotions gave back (reused by the io workers)
+    std::unique_ptr<std::atomic<uint8_t>[]> promo_flag_;   ///< per (layer, expert): placed by promotion, first demand read not yet seen
+    std::atomic<uint64_t> promo_n_{0}, promo_hits_{0};
     detail::ExchangeStorage exchange_storage_; // authoritative when active; original arenas still own memory
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered

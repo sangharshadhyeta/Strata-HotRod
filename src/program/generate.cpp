@@ -653,6 +653,7 @@ struct Options {
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
     bool resident_budget_auto = false;   // --resident-budget-gib auto: resident_budget = the host room, resolved before the file tier is set up
+    bool resident_budget_given = false;  // --resident-budget-gib on the command line (off/0 included): the files-mode default does not apply
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -2309,6 +2310,13 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
+// STRATA_LOOKAHEAD_PROMOTE (default on; =0: the look-ahead stays off under the RAM overlay as before): the decode look-ahead's
+// predictions are promoted into the RAM tier (FileExpertSource::set_lookahead_promote) instead of read into stage buffers
+static bool lookahead_promote_env() {
+    const char* v = std::getenv("STRATA_LOOKAHEAD_PROMOTE");
+    return v == nullptr || std::atoi(v) != 0;
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -2742,6 +2750,8 @@ int main(int argc, char** argv) {
         else if (a == "--resident-budget-gib") {
             // `auto`: the RAM room the page-cache warm's auto uses (host_ram_room_bytes), sized where the file tier is set up
             const std::string arg = next("--resident-budget-gib");
+            o.resident_budget_given = true;
+            if (arg == "off" || arg == "0") continue;   // files mode without the RAM tier (the default turns it on: below)
             const bool budget_auto = arg == "auto";
             const double gib = budget_auto ? 0.0 : std::atof(arg.c_str());
             if (!budget_auto && !(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0 or auto\n"); return 2; }
@@ -2955,6 +2965,19 @@ int main(int argc, char** argv) {
         return 2;
     }
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
+    // The RAM tier is the default in files mode (--mmap-experts with a static profile and no RAM budget given): VRAM -> RAM ->
+    // NVMe, the tier an overlay on files mode's I/O, the look-ahead promoting into it - the same settings as
+    // --resident-budget-gib auto, set here where that flag's are.  20 Oct, 262144 context: decode +5% (8.5k) / +11% (45k),
+    // the drive's read wait 12.5 -> 7-9 ms a window, refaults 0.7-2 M -> 1-41 k a request.  --resident-budget-gib off: without.
+    if (!o.resident_budget_given && o.mmap_experts && !o.resident_cpu_experts && !o.expert_profile.empty()) {
+        o.resident_budget_auto = true;
+        o.resident_cpu_experts = true;
+        o.resident_headroom = 4ull << 30;
+        o.resident_pin = false;
+        if (const char* v = std::getenv("STRATA_RESIDENT_PIN"); v != nullptr && std::string(v) == "1") o.resident_pin = true;
+        if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
+            o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+    }
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
         return 2;
@@ -8005,7 +8028,11 @@ int main(int argc, char** argv) {
         // 20 Oct: not taken under the RAM overlay (decode 48.7 tok/s with it against 55.9 without); STRATA_LOOKAHEAD=1 set
         // explicitly still allows it there (an opt-in to measure)
         const bool la_explicit = [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v != nullptr && std::atoi(v) != 0; }();
-        if (drive.d.lookahead == nullptr && !la_tried && (!src.io_overlay_active() || la_explicit)) start_routing_lookahead();
+        // 20 Oct: the predictions were read into stage buffers (70-88% unused), so they only competed with demand misses; under
+        // STRATA_LOOKAHEAD_PROMOTE (default on) they are promoted into the RAM tier (set_lookahead_promote, below), so it starts again
+        const bool la_promote = src.io_overlay_active() && lookahead_promote_env();
+        src.set_lookahead_promote(la_promote, nullptr);   // free places only until the decode's usage is published (below)
+        if (drive.d.lookahead == nullptr && !la_tried && (!src.io_overlay_active() || la_explicit || la_promote)) start_routing_lookahead();
         // the RAM tier gives its coldest places back when a layer-major prompt's residuals do not fit (prefill.cpp run_impl);
         // the serve thread runs that between decode windows, the place's usage is read then
         if (resident_ok && src.complement_ready())
@@ -14863,6 +14890,14 @@ int main(int argc, char** argv) {
                     }
                 }
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+                // STRATA_LOOKAHEAD_PROMOTE: the predictions the io workers read take RAM places here - between windows, with the same
+                // guards as the RAM_ADAPT swaps below (no adaptive round in flight, nothing pending, no pool job reading the copy)
+                if (src.promotions_queued() && pending.empty() && (!ajob || astate == AState::Idle) && !multi_gpu && !peer.valid() &&
+                    !remote_opt && o.batch == 0) {
+                    std::vector<char> gpu_busy(host_res.size());
+                    for (size_t k = 0; k < gpu_busy.size(); ++k) gpu_busy[k] = host_res[k] >= 0;
+                    src.drain_promotions(drive.d.usage, gpu_busy);
+                }
                 // STRATA_RAM_ADAPT=<n> (opt-in, the resident RAM mode on one GPU): the RAM copy is chosen once, at
                 // start, so an expert it does not hold is read from the file every time the conversation routes to
                 // it.  With this, before a window and while no adaptive round is in flight, up to n experts the windows
@@ -15371,17 +15406,24 @@ int main(int argc, char** argv) {
             // the router look-ahead's predicted experts and the layers it skipped.  A zero beside a busy request is the sign of a helper that stopped.
             {
                 static int64_t prev_rounds = 0, prev_swaps = 0, prev_quality = 0, prev_pred = 0, prev_skip = 0, prev_evict = 0;
+                static int64_t prev_promo = 0, prev_promo_hits = 0;
                 // the GPU look-ahead (STRATA_LOOKAHEAD_GPU, the ring) counts its own picks: the CPU thread's counter stays at 0 then
                 const int64_t la_pred = drive.d.gpu_pred != nullptr ? drive.d.pred_fed
                                       : drive.d.lookahead != nullptr ? drive.d.lookahead->predicted() : 0;
                 const int64_t la_skip = drive.d.lookahead != nullptr ? drive.d.lookahead->skipped() : 0;
                 const int64_t ram_ev = g_ram_evictions.load(std::memory_order_relaxed);
-                std::fprintf(stderr, "strata serve: work done: swap rounds %lld (%lld swaps, %lld quality), ram evictions %lld, look-ahead %lld predicted experts (%lld layers skipped)%s\n",
+                // STRATA_LOOKAHEAD_PROMOTE (RAM overlay only): predictions placed in the RAM tier, and the first demand reads they served
+                const int64_t promo_n = (int64_t) src.promotions(), promo_hit = (int64_t) src.promotion_hits();
+                char promo_txt[96] = "";
+                if (src.lookahead_promote())
+                    std::snprintf(promo_txt, sizeof promo_txt, ", promoted %lld, promotion hits %lld",
+                                  (long long) (promo_n - prev_promo), (long long) (promo_hit - prev_promo_hits));
+                std::fprintf(stderr, "strata serve: work done: swap rounds %lld (%lld swaps, %lld quality), ram evictions %lld, look-ahead %lld predicted experts (%lld layers skipped)%s%s\n",
                              (long long) (life_rounds - prev_rounds), (long long) (life_swaps - prev_swaps), (long long) (life_quality - prev_quality),
                              (long long) (ram_ev - prev_evict),
-                             (long long) (la_pred - prev_pred), (long long) (la_skip - prev_skip), drive.d.lookahead == nullptr ? " [look-ahead off]" : "");
+                             (long long) (la_pred - prev_pred), (long long) (la_skip - prev_skip), promo_txt, drive.d.lookahead == nullptr ? " [look-ahead off]" : "");
                 prev_rounds = life_rounds; prev_swaps = life_swaps; prev_quality = life_quality; prev_pred = la_pred; prev_skip = la_skip;
-                prev_evict = ram_ev;
+                prev_evict = ram_ev; prev_promo = promo_n; prev_promo_hits = promo_hit;
             }
             // a low draft acceptance is a silent slowdown (solid.cpp's page: an MTP head drafting at 0.19 runs about 2x slower): said once, with its numbers and
             // what to check.  Typical here 0.55 to 0.8; 300 drafts offered make the share a fair reading.
@@ -16030,6 +16072,8 @@ int main(int argc, char** argv) {
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // STRATA_LOOKAHEAD_PROMOTE: the io workers read drive.d.usage (a heuristic) from here on - after its last assign above
+        src.set_lookahead_promote(src.io_overlay_active() && lookahead_promote_env(), &drive.d.usage);
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
         // flight - see the serve path); the hook's captures live in this block, so it is taken off the verifier when the
         // block ends

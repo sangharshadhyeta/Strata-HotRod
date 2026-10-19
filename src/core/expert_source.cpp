@@ -828,6 +828,12 @@ void FileExpertSource::io_worker() {
         }
         if (complement_ready_ && resident_blob(index) != nullptr) continue;
         if (!override_.empty() && override_[index] != nullptr) continue;
+        // STRATA_LOOKAHEAD_PROMOTE (RAM overlay): a prediction the RAM tier could take is read into a promotion buffer, not a stage
+        // buffer (the serve thread places it between windows; see drain_promotions)
+        if (!demand && promote_wanted(layer, expert)) {
+            promote_read(layer, expert);
+            continue;
+        }
         if (io_fill_) {   // read what is not cached into a scratch buffer: the pages stay in the page cache for the kernels
 #if defined(__linux__)
             static thread_local std::vector<uint8_t> scratch;
@@ -4103,25 +4109,40 @@ int64_t FileExpertSource::coldest_resident_expert(int64_t layer, const std::vect
 
 bool FileExpertSource::take_resident_place(int64_t layer, int64_t out, const std::vector<float>& usage,
                                            const std::vector<char>& busy, const uint8_t* bytes) {
+    // the victim goes only to a hotter expert: its usage must be below `out`'s (usage is flat-indexed)
+    float limit = std::numeric_limits<float>::infinity();
+    if (layer >= 0 && layer < n_layers_ && out >= 0 && out < n_expert_) {
+        const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
+        if (i_out < usage.size()) limit = usage[i_out];
+    }
+    return place_expert(layer, out, usage, busy, bytes, /*allow_victim=*/true, limit, nullptr);
+}
+
+bool FileExpertSource::place_expert(int64_t layer, int64_t out, const std::vector<float>& usage, const std::vector<char>& busy,
+                                    const uint8_t* bytes, bool allow_victim, float victim_limit, int64_t* victim_out) {
+    if (victim_out != nullptr) *victim_out = -1;
     if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() || bytes == nullptr ||
         layer < 0 || layer >= n_layers_ || out < 0 || out >= n_expert_) return false;
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (i_out >= complement_offsets_.size() || complement_offsets_[i_out] != kNoComplement) return false;   // already held
     // a place release_resident_place gave up in this layer is free: it takes the expert with no victim given up
-    if ((size_t) layer < complement_free_.size() && !complement_free_[(size_t) layer].empty()) {
-        const uint64_t at = complement_free_[(size_t) layer].back(), n = layer_blob_bytes_[(size_t) layer];
-        if (at <= complement_bytes_ && n <= complement_bytes_ - at) {
-            std::memcpy((uint8_t*) complement_host_ + (size_t) at, bytes, (size_t) n);
-            complement_free_[(size_t) layer].pop_back();
-            complement_offsets_[i_out] = at;
-            return true;
+    {
+        std::lock_guard<std::mutex> lk(tier_mu_);
+        if ((size_t) layer < complement_free_.size() && !complement_free_[(size_t) layer].empty()) {
+            const uint64_t at = complement_free_[(size_t) layer].back(), n = layer_blob_bytes_[(size_t) layer];
+            if (at <= complement_bytes_ && n <= complement_bytes_ - at) {
+                std::memcpy((uint8_t*) complement_host_ + (size_t) at, bytes, (size_t) n);
+                complement_free_[(size_t) layer].pop_back();
+                complement_offsets_[i_out] = at;
+                return true;
+            }
         }
     }
+    if (!allow_victim) return false;
     const int64_t victim = coldest_resident_expert(layer, usage, busy);
     if (victim < 0) return false;
     const size_t i_v = (size_t) layer * (size_t) n_expert_ + (size_t) victim;
-    // the same rule as resident_stage_swaps: the victim's RAM place goes only to a hotter expert (usage is flat-indexed)
-    if (!usage.empty() && i_v < usage.size() && i_out < usage.size() && usage[i_v] >= usage[i_out]) return false;
+    if (i_v < usage.size() && usage[i_v] >= victim_limit) return false;
     const uint64_t at = complement_offsets_[i_v], n = layer_blob_bytes_[(size_t) layer];
     if (at > complement_bytes_ || n > complement_bytes_ - at) return false;   // every check before the copy overwrites the victim
     // #2134: a Foresight slot may be copying out of the victim's place right now; it is dropped before the place is rewritten
@@ -4130,7 +4151,104 @@ bool FileExpertSource::take_resident_place(int64_t layer, int64_t out, const std
     std::memcpy((uint8_t*) complement_host_ + (size_t) at, bytes, (size_t) n);
     const bool moved = detail::exchange_cache_complement(complement_offsets_, i_v, i_out);
     if (fs != nullptr) fs->unhold(layer, (int32_t) victim);
+    if (moved && victim_out != nullptr) *victim_out = victim;
     return moved;
+}
+
+// ---- STRATA_LOOKAHEAD_PROMOTE ----------------------------------------------------------------------------------------------
+// Queued promotions are bounded: a burst of predictions past this many drops the newest (the next window's predictions
+// replace them).  The buffers come back through promo_spare_ and are reused.
+static constexpr size_t kPromoQueueMax = 32;
+
+void FileExpertSource::set_lookahead_promote(bool on, const std::vector<float>* usage) {
+    if (on && promo_flag_ == nullptr && n_layers_ > 0 && n_expert_ > 0) {   // allocated before any io worker can see promo_on_
+        const size_t n = (size_t) (n_layers_ * n_expert_);
+        promo_busy_.assign(n, 0);
+        promo_flag_.reset(new std::atomic<uint8_t>[n]());
+    }
+    promo_usage_.store(usage, std::memory_order_release);
+    promo_on_.store(on && promo_flag_ != nullptr, std::memory_order_release);
+}
+
+bool FileExpertSource::promotions_queued() const {
+    std::lock_guard<std::mutex> lk(promo_mu_);
+    return !promo_q_.empty();
+}
+
+bool FileExpertSource::promote_wanted(int64_t layer, int64_t expert) const {
+    if (!promo_on_.load(std::memory_order_acquire) || !io_overlay_active() || layer < 0 || expert < 0 ||
+        layer >= n_layers_ || expert >= n_expert_)
+        return false;
+    {   // a place of the layer that release_resident_place gave up
+        std::lock_guard<std::mutex> lk(tier_mu_);
+        if ((size_t) layer < complement_free_.size() && !complement_free_[(size_t) layer].empty()) return true;
+    }
+    // else a victim: a RAM-held expert of the layer, not read from an exchange buffer, with usage below 1.0 (decayed to
+    // near-unused: the adaptive tier's usage decays x0.7 per window).  Racy reads of the offsets and the usage (heuristic).
+    const std::vector<float>* u = promo_usage_.load(std::memory_order_acquire);
+    if (u == nullptr || u->empty()) return false;
+    for (int64_t e = 0; e < n_expert_; ++e) {
+        const size_t j = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+        if (j >= complement_offsets_.size() || complement_offsets_[j] == kNoComplement) continue;
+        if (!override_.empty() && override_[j] != nullptr) continue;
+        if (j < u->size() && (*u)[j] < 1.0f) return true;
+    }
+    return false;
+}
+
+void FileExpertSource::promote_read(int64_t layer, int64_t expert) {
+    const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    std::vector<uint8_t> buf;
+    {
+        std::lock_guard<std::mutex> lk(promo_mu_);
+        if (promo_busy_[i] || promo_q_.size() >= kPromoQueueMax) return;   // queued or being read, or the queue is full
+        promo_busy_[i] = 1;
+        if (!promo_spare_.empty()) {
+            buf = std::move(promo_spare_.back());
+            promo_spare_.pop_back();
+        }
+    }
+    const uint64_t n = layer_blob_bytes_[(size_t) layer];
+    if (buf.size() < n) buf.resize((size_t) n);
+    const bool ok = copy_from_files(layer, expert, buf.data());   // O_DIRECT under the overlay: the bytes, not a stage buffer
+    io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
+    if (ok) file_read_bytes_.fetch_add(n, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(promo_mu_);
+    if (ok) {
+        promo_q_.push_back(Promo{layer, expert, std::move(buf)});   // promo_busy_ stays set until drain_promotions places it
+    } else {
+        promo_busy_[i] = 0;
+        promo_spare_.push_back(std::move(buf));
+    }
+}
+
+uint64_t FileExpertSource::drain_promotions(const std::vector<float>& usage, const std::vector<char>& busy) {
+    std::deque<Promo> q;
+    {
+        std::lock_guard<std::mutex> lk(promo_mu_);
+        q.swap(promo_q_);
+    }
+    uint64_t placed = 0;
+    const bool victims_ok = !usage.empty();   // no usage, no victim: only free places
+    for (Promo& p : q) {
+        const size_t i = (size_t) p.layer * (size_t) n_expert_ + (size_t) p.expert;
+        const bool on_gpu = i < busy.size() && busy[i];   // an expert the GPU holds needs no RAM place
+        int64_t victim = -1;
+        bool done = false;
+        if (!on_gpu && complement_ready_ && i < complement_offsets_.size() && complement_offsets_[i] == kNoComplement &&
+            (override_.empty() || override_[i] == nullptr))
+            done = place_expert(p.layer, p.expert, usage, busy, p.bytes.data(), victims_ok, 1.0f, &victim);
+        if (done) {
+            ++placed;
+            promo_n_.fetch_add(1, std::memory_order_relaxed);
+            promo_flag_[i].store(1, std::memory_order_relaxed);
+            if (victim >= 0) promo_flag_[(size_t) p.layer * (size_t) n_expert_ + (size_t) victim].store(0, std::memory_order_relaxed);
+        }
+        std::lock_guard<std::mutex> lk(promo_mu_);
+        promo_busy_[i] = 0;
+        if (promo_spare_.size() < kPromoQueueMax) promo_spare_.push_back(std::move(p.bytes));
+    }
+    return placed;
 }
 
 uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float>& usage) {
@@ -4182,6 +4300,8 @@ bool FileExpertSource::release_resident_place(int64_t layer, int64_t expert) {
     const uint64_t at = complement_offsets_[i];
     complement_offsets_[i] = kNoComplement;
     if (fs != nullptr) fs->unhold(layer, (int32_t) expert);
+    if (promo_flag_ != nullptr) promo_flag_[i].store(0, std::memory_order_relaxed);   // no longer a promoted place
+    std::lock_guard<std::mutex> lk(tier_mu_);
     if (complement_free_.size() < (size_t) n_layers_) complement_free_.resize((size_t) n_layers_);
     complement_free_[(size_t) layer].push_back(at);
     return true;
@@ -4245,6 +4365,10 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
         if (result != nullptr) {
             ram_reads_.fetch_add(1, std::memory_order_relaxed);
             from_files = false;
+            // the first demand read of a promoted place (its flag is cleared, so each placement counts once)
+            if (promo_flag_ != nullptr && promo_flag_[index].load(std::memory_order_relaxed) != 0 &&
+                promo_flag_[index].exchange(0, std::memory_order_relaxed) != 0)
+                promo_hits_.fetch_add(1, std::memory_order_relaxed);
         } else if (!override_.empty() && override_[index] != nullptr) {
             result = override_[index];
             from_files = false;
