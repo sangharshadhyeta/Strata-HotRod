@@ -7037,14 +7037,9 @@ def main() -> int:
         # streamed them twice (19 Oct, 2 alternated pairs: 38 -> 24 s to the first word, decode +12%, half the NVMe reads)
         if "--prefill" in args and args[args.index("--prefill") + 1] == "auto":
             args[args.index("--prefill") + 1] = "auto:16384"
-        # a token 1 GiB RAM tier, unpinned (STRATA_RESIDENT_PIN=0: pinning pressed the 30 GB box): the page cache does the
-        # rest - the kernel grows it while RAM is free and gives it back under pressure, and it keeps what was used RECENTLY
-        # (19 Oct trace replay: ~4x fewer reads than a fixed most-used set, which goes stale as a conversation changes topic).
-        # It works now because prompts read with O_DIRECT and no longer flush it; the tier must exist for that reader to
-        # open. (The fixed 10 GiB tier won against no tier before O_DIRECT prompt reads: decode 49.1 / 51.5 -> 55.7 / 53.9.)
-        if "--resident-budget-gib" not in args and "--resident-experts" not in args:
-            args += ["--resident-budget-gib", "1"]
-            cfg["env"]["STRATA_RESIDENT_PIN"] = "0"
+        # No RAM tier: the page cache is the expert tier (the engine warms it with the hot set and reads prompts O_DIRECT
+        # without one since 19 Oct). Without a tier the prompt path borrows more GPU slots, so an 8.5k prompt fits one
+        # chunk: 19 Oct, 2 rounds, 8.5k prompt 24.5 -> 14.8 / 14.9 s, 45k prompt and decode unchanged.
     if hip:
         cfg["backend"] = "hip"
         # the dense prompt GEMMs through hipBLASLt with kernels measured on this GPU generation (tools/hip; +40-60%
