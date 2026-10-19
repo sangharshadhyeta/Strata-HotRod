@@ -756,18 +756,24 @@ void FileExpertSource::io_stop() {
 void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (io_demand_first_ && pos == kPosDemand) {   // a demand read: the workers take it before any guess
-            // a guess already queued for this blob is promoted (taken off the read-ahead queue), not read twice
-            for (auto it = io_q_.begin(); it != io_q_.end(); ++it)
-                if (it->first == (int32_t) layer && (it->second & 0xffff) == (int32_t) (expert & 0xffff)) { io_q_.erase(it); break; }
-            io_dq_.emplace_back((int32_t) layer, (int32_t) (expert & 0xffff));
-        } else {
-            if (io_q_.size() >= 512) {   // the predictions run ahead of the reads: the oldest are the stalest
-                io_q_.pop_front();
-                io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
-            }
-            io_q_.emplace_back((int32_t) layer, (int32_t) expert);
+        if (io_q_.size() >= 512) {   // the predictions run ahead of the reads: the oldest are the stalest
+            io_q_.pop_front();
+            io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
         }
+        io_q_.emplace_back((int32_t) layer, (int32_t) expert);
+    }
+    io_cv_.notify_one();
+}
+
+// STRATA_IO_DEMAND_FIRST (prefetch, below): a demand read the workers take before any guess.  A guess already queued for
+// this blob is promoted (taken off the read-ahead queue), not read twice.  (19 Oct A/B: no gain - the decode waits the same
+// read either way; kept opt-in.)
+void FileExpertSource::io_enqueue_demand(int64_t layer, int64_t expert) {
+    {
+        std::lock_guard<std::mutex> lk(io_mu_);
+        for (auto it = io_q_.begin(); it != io_q_.end(); ++it)
+            if (it->first == (int32_t) layer && it->second == (int32_t) expert) { io_q_.erase(it); break; }
+        io_dq_.emplace_back((int32_t) layer, (int32_t) expert);
     }
     io_cv_.notify_one();
 }
@@ -1611,7 +1617,7 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             }
         }
     }
-    for (const int64_t e : reserved) io_enqueue(layer, e, kPosDemand);
+    for (const int64_t e : reserved) io_enqueue_demand(layer, e);
     const auto tf = tnow();
     fill_many(todo);
     t_pf_fill_us_.fetch_add(us_since(tf), std::memory_order_relaxed);

@@ -1057,6 +1057,7 @@ private:
     uint64_t cached_bytes(int64_t layer, int64_t expert, uint64_t& total, bool exact = true) const;
     void io_worker();
     void io_enqueue(int64_t layer, int64_t expert);
+    void io_enqueue_demand(int64_t layer, int64_t expert);   // STRATA_IO_DEMAND_FIRST: ahead of the guesses
     void io_stop();
     const uint8_t* io_blob(int64_t layer, int64_t expert);
     // ---- STRATA_PAGECACHE_WARM_GIB (opt in, Linux): a SCHED_IDLE thread asks the OS for the experts the resident tier
