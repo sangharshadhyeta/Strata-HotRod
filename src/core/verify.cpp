@@ -92,7 +92,8 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 // STRATA_DECODE_STAGE_TIMERS=1: the decode window's stage boundaries (Verifier::stage_mark); the ids index stage_ms_
 inline bool g_stage_timers() { static const bool on = [] { const char* v = std::getenv("STRATA_DECODE_STAGE_TIMERS"); return v != nullptr && v[0] == '1'; }(); return on; }
-enum StageId : int { kStOther = 0, kStPost, kStHc, kStAttn, kStGdn, kStFfn, kStRouter, kStDoor, kStShared };
+enum StageId : int { kStOther = 0, kStHc, kStAttn, kStGdn, kStFfn, kStRouter, kStDoor, kStShared,
+                     kStPlan, kStVram, kStPcieWait, kStPcieExp, kStCpuWait, kStRows, kStHcWrite };
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
@@ -659,12 +660,15 @@ void Verifier::stage_report() const {
     if (stage_windows_ == 0) return;
     const double w = (double) stage_windows_;
     std::fprintf(stderr,
-                 "strata decode stages (ms/window over %lld windows): post-tail %.3f, hc-read %.3f, attn %.3f, gdn %.3f, "
+                 "strata decode stages (ms/window over %lld windows): plan-wait %.3f, vram-experts %.3f, pcie-wait %.3f, "
+                 "pcie-experts %.3f, cpu-wait %.3f, rows+combine %.3f, hc-write %.3f, hc-read %.3f, attn %.3f, gdn %.3f, "
                  "ffn-read %.3f, router %.3f, doorbell %.3f, shared %.3f, other %.3f; shared stream %.3f (forked, overlaps, "
                  "not in the sum)\n",
-                 (long long) stage_windows_, stage_ms_[kStPost] / w, stage_ms_[kStHc] / w, stage_ms_[kStAttn] / w,
-                 stage_ms_[kStGdn] / w, stage_ms_[kStFfn] / w, stage_ms_[kStRouter] / w, stage_ms_[kStDoor] / w,
-                 stage_ms_[kStShared] / w, stage_ms_[kStOther] / w, stage_shared_ms_ / w);
+                 (long long) stage_windows_, stage_ms_[kStPlan] / w, stage_ms_[kStVram] / w, stage_ms_[kStPcieWait] / w,
+                 stage_ms_[kStPcieExp] / w, stage_ms_[kStCpuWait] / w, stage_ms_[kStRows] / w, stage_ms_[kStHcWrite] / w,
+                 stage_ms_[kStHc] / w, stage_ms_[kStAttn] / w, stage_ms_[kStGdn] / w, stage_ms_[kStFfn] / w,
+                 stage_ms_[kStRouter] / w, stage_ms_[kStDoor] / w, stage_ms_[kStShared] / w, stage_ms_[kStOther] / w,
+                 stage_shared_ms_ / w);
 }
 
 Verifier::~Verifier() {
@@ -2146,9 +2150,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         bool hits_in_combine = false;
         if (ar_on()) {
+            if (!stage_mark(cs, kStPlan, err)) return false;   // no plan wait on this path: plan-wait reads ~0
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
+            if (!stage_mark(cs, kStVram, err)) return false;
         } else {
             if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
@@ -2164,13 +2170,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
                 }
             }
+            if (!stage_mark(cs, kStPlan, err)) return false;   // plan-wait: the GPU plan's flag and its copy
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
+            if (!stage_mark(cs, kStVram, err)) return false;   // vram-experts: the resident groups
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+            if (!stage_mark(cs, kStPcieWait, err)) return false;   // pcie-wait: the PCIe share's flag
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
@@ -2182,8 +2191,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
             stamp(l, 22, grp);
+            if (!stage_mark(cs, kStPcieExp, err)) return false;   // pcie-experts: the fetch and the PCIe groups (no fetch at pcie mode 0)
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+                if (!stage_mark(cs, kStCpuWait, err)) return false;
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
             } else {
@@ -2194,6 +2205,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else
                         wait_flag_ge(m_flag_, ring, cs);           // the CPU's share is in the mapped rows
                 }
+                if (!stage_mark(cs, kStCpuWait, err)) return false;   // cpu-wait: the CPU's rows (~0 when fused into the copy)
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
@@ -2240,6 +2252,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
+        if (!stage_mark(cs, kStRows, err)) return false;   // rows+combine: the copy, the hit add, the shared join, the combine
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
@@ -2250,7 +2263,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
         }
-        if (!stage_mark(cs, kStPost, err)) return false;   // the post-tail: the expert waits, the combine, the write
+        if (!stage_mark(cs, kStHcWrite, err)) return false;   // hc-write: the gr_write (or the cvec apply) that follows the combine
         return true;
     };
 

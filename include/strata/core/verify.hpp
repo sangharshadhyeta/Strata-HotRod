@@ -510,8 +510,8 @@ private:
     // stream as event-record nodes inside each decode window graph, read back after the window's own sync in run().
     // Keyed by the window size and the graph variant (T * 2 + ar_off_).  The times of one window are the intervals
     // between consecutive boundaries in the stream's order; the forked shared-expert stream is a separate pair.
-    static constexpr int kStageN = 9;          // other, post-tail, hc-read, attn, gdn, ffn-read, router, doorbell, shared
-    static constexpr int kStagePerLayer = 10;  // boundaries per layer and token group (incl. the shared stream's pair)
+    static constexpr int kStageN = 15;         // other, hc-read, attn, gdn, ffn-read, router, doorbell, shared, plan-wait, vram-experts, pcie-wait, pcie-experts, cpu-wait, rows+combine, hc-write
+    static constexpr int kStagePerLayer = 16;  // boundaries per layer and token group (7 pre, the shared stream's pair, 7 post)
     struct StageMark { cudaEvent_t ev; int stage; };
     struct StageChain {
         std::vector<cudaEvent_t> owned;   // created before the capture, destroyed with the verifier
