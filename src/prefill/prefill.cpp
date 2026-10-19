@@ -3702,7 +3702,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill: the routed ids' download failed";   // #1996
                             return false;
                         }
-                        // router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens, default 0 = off): an evenly spaced sample of this layer's
+                        // router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens; 512 a layer for a buffered prompt, 0 for an O_DIRECT one -
+                        // every prompt by default - see la_tok above; 0 = off): an evenly spaced sample of this layer's
                         // router input comes to the host behind the ids, on the same stream, and goes to the lookahead after the sync below
                         int64_t la_n = 0;
                         if (lookahead_ != nullptr && la_tok > 0 && !stream_all && l + 1 < g.n_layers) {
@@ -5005,6 +5006,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // the CPU share (small chunks' experts on the pool) does not decide it: a layer-major run simply skips the share
     bool lm = lm_env && n > C && LB == 0 && LE == g.n_layers && hand_in_ == nullptr && next_ == nullptr && !helped &&
               m.pp == nullptr && !kv_staged && !walk_all;
+    if (!lm && lm_env && n > C && hand_in_ == nullptr) {   // a multi-chunk prompt that could have used it: the first condition that failed
+        const char* why = LB != 0 || LE != g.n_layers ? "a layer split"
+                        : next_ != nullptr ? "a pipeline stage"
+                        : helped ? "a helper GPU"
+                        : m.pp != nullptr ? "a peer GPU"
+                        : kv_staged ? "K/V streaming"
+                        : "the routed-stream walk (STRATA_PREFILL_STREAM_MIN)";
+        std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): %s\n",
+                     (long long) n, (long long) C, why);
+    }
     if (lm) {
         const bool ok = cudaHostAlloc((void**) &lmh.R, (size_t) n * D * 4, cudaHostAllocDefault) == cudaSuccess &&
                         cudaHostAlloc((void**) &lmh.grs, (size_t) n * HC * 4, cudaHostAllocDefault) == cudaSuccess &&
@@ -5013,6 +5024,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaEventCreateWithFlags(&lmh.ev, cudaEventDisableTiming) == cudaSuccess;
         if (!ok) {   // no pinned RAM for the residuals: the default path (nothing has run yet)
             (void) cudaGetLastError();
+            std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): pinned host memory "
+                                 "for the residuals not available\n", (long long) n, (long long) C);
             lm = false;
         }
     }
