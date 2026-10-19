@@ -7825,11 +7825,17 @@ int main(int argc, char** argv) {
             // MODEL-UPDATE round 2 (opt-in STRATA_PROMPT_DIRECT=1): the prompt path's batched reads unbuffered while
             // decode keeps the file cache (z440, UD-Q4_K_XL, 39 GiB budget: all-unbuffered doubled the 6K prompt but
             // cost decode 9-13%).  The same bytes either way.
-            if (!ub && [] { const char* v = std::getenv("STRATA_PROMPT_DIRECT"); return v != nullptr && v[0] == '1'; }()) {
+            // Hot Rod (19 Oct): ON by default here (STRATA_PROMPT_DIRECT=0 turns it off) - with layer-major prompt reading and
+            // the full layer map the prompt reads each expert about once, so the page cache gives the prompt little and a
+            // prompt no longer flushes decode's hot experts (45k-token prompt 119 -> 74 s with the rest of the set)
+            if (!ub && [] { const char* v = std::getenv("STRATA_PROMPT_DIRECT"); return v == nullptr || v[0] != '0'; }()) {
                 std::string pw;
                 const bool pd = src.open_prompt_direct(pw);
                 std::fprintf(stderr, "strata generate: the prompt path's expert reads %s\n",
-                             pd ? "go unbuffered (STRATA_PROMPT_DIRECT=1)" : ("stay buffered: " + pw).c_str());
+                             pd ? "go unbuffered (STRATA_PROMPT_DIRECT, on by default)" : ("stay buffered: " + pw).c_str());
+                // the prompt look-ahead only warms the page cache, which unbuffered prompt reads skip: 31 GB of a 45k
+                // prompt's guesses went unused (19 Oct). Off unless STRATA_PREFILL_LOOKAHEAD_TOK is set explicitly.
+                if (pd && std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK") == nullptr) setenv("STRATA_PREFILL_LOOKAHEAD_TOK", "0", 0);
             }
         }
 #endif

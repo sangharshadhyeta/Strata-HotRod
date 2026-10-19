@@ -520,8 +520,8 @@ struct Alloc {
 // bytes_needed counts it and carve takes it from the same loan, so the planner's chunk and the carve agree.
 inline uint64_t lm_map_budget() {
     static const uint64_t bytes = [] {
-        const char* v = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
-        if (v == nullptr || std::atoi(v) == 0) return (uint64_t) 0;
+        const char* v = std::getenv("STRATA_PREFILL_LAYER_MAJOR");   // on by default (19 Oct: 45k prompt 119 -> 74 s); =0 off
+        if (v != nullptr && std::atoi(v) == 0) return (uint64_t) 0;
         const char* mb = std::getenv("STRATA_PREFILL_LM_MAP_MIB");
         const long long mib = mb != nullptr ? std::atoll(mb) : 700;
         return mib > 0 ? (uint64_t) mib << 20 : (uint64_t) 0;
@@ -2578,6 +2578,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         err = std::string("prefill: the layer-major copy failed: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     };
+    bool lm_skip_cpu_share = false;   // set once the layer-major path is taken: its chunks do not hold the CPU pool
     auto run_chunk = [&](int64_t c0, int phase, int64_t lay) -> bool {
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0, ci = c0 / C;
         const int64_t l_from = phase == PH_LAYER ? lay : LB;
@@ -2804,7 +2805,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             bool held = false;
             ~PoolHold() { if (held) g_cpu_pool_busy.store(false, std::memory_order_release); }
         } pool_hold;
-        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all && !pipe_chunked) {
+        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all && !pipe_chunked && !lm_skip_cpu_share) {
             bool expect = false;
             pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
         }
@@ -4882,15 +4883,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // Only the plain path takes it: more than one chunk, this Prefill runs the whole stack, no layer split, no peer or
     // helper, no KV streaming, no CPU share, and not the routed-stream walk (stream_all).  Anything else keeps the default.
     static const bool lm_env = [] {
-        const char* v = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
-        return v != nullptr && std::atoi(v) != 0;
+        const char* v = std::getenv("STRATA_PREFILL_LAYER_MAJOR");   // on by default; =0 keeps the chunk-major loop
+        return v == nullptr || std::atoi(v) != 0;
     }();
     bool kv_staged = false;
     for (int64_t o = 0; o < g.n_qsa_layers(); ++o) kv_staged = kv_staged || ss.qsa_states[o].kv_mode == 1;
     const bool walk_all = m.ring > STAGE && std::min(C, n) >= stream_all_min() && m.src != nullptr;
-    const bool cpu_share_run = cpu_pool_ != nullptr && cpu_share_on() && !walk_all && !pipe_chunked;
+    // the CPU share (small chunks' experts on the pool) does not decide it: a layer-major run simply skips the share
     bool lm = lm_env && n > C && LB == 0 && LE == g.n_layers && hand_in_ == nullptr && next_ == nullptr && !helped &&
-              m.pp == nullptr && !kv_staged && !walk_all && !cpu_share_run;
+              m.pp == nullptr && !kv_staged && !walk_all;
     if (lm) {
         const bool ok = cudaHostAlloc((void**) &lmh.R, (size_t) n * D * 4, cudaHostAllocDefault) == cudaSuccess &&
                         cudaHostAlloc((void**) &lmh.grs, (size_t) n * HC * 4, cudaHostAllocDefault) == cudaSuccess &&
@@ -4925,6 +4926,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         lm_steps.assign((size_t) n * strata::kernels::kStepCount, 0);
         lm_carry.assign((size_t) ((n + C - 1) / C), 0);
         lm_sync.s = m.cs;
+        lm_skip_cpu_share = true;   // the chunks below run without the CPU share (it would hold the pool per chunk)
     }
     const int64_t streamed0 = stats_.experts_streamed;
     if (!lm) {
