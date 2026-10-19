@@ -15109,14 +15109,20 @@ int main(int argc, char** argv) {
                     fb_prev = fb;
                 }
                 {   // read_direct (O_DIRECT): the bytes the batches asked for vs the bytes their requests read, since the previous one
-                    static uint64_t dq_prev = 0, dr_prev = 0;
+                    // (STRATA_PROMPT_DIRECT_CACHED: the prompt's blobs that were in the page cache and went through the mapping instead)
+                    static uint64_t dq_prev = 0, dr_prev = 0, dc_prev = 0;
                     const uint64_t dq = strata::core::FileExpertSource::direct_requested_bytes();
                     const uint64_t dr = strata::core::FileExpertSource::direct_read_bytes();
-                    if (dr != dr_prev)
+                    const uint64_t dc = strata::core::FileExpertSource::prompt_cached_bytes();
+                    if (dc != 0 && dc != dc_prev)   // STRATA_PROMPT_DIRECT_CACHED on: the cached copies, the same line
+                        std::fprintf(stderr, "strata serve: direct reads: %.1f MB requested, %.1f MB read, %.1f MB from the page cache\n",
+                                     (double) (dq - dq_prev) / 1e6, (double) (dr - dr_prev) / 1e6, (double) (dc - dc_prev) / 1e6);
+                    else if (dr != dr_prev)
                         std::fprintf(stderr, "strata serve: direct reads: %.1f MB requested, %.1f MB read\n",
                                      (double) (dq - dq_prev) / 1e6, (double) (dr - dr_prev) / 1e6);
                     dq_prev = dq;
                     dr_prev = dr;
+                    dc_prev = dc;
                 }
             }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start

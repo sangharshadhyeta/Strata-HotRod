@@ -801,6 +801,9 @@ public:
     /// read_direct totals since the start (Linux): bytes the batches asked for, and bytes their requests read.
     static uint64_t direct_requested_bytes();
     static uint64_t direct_read_bytes();
+    /// STRATA_PROMPT_DIRECT_CACHED=1: bytes of the prompt's blobs copied through the mapping because their pages were
+    /// already in the page cache (instead of O_DIRECT reads), counted at each prompt_copies decision.
+    static uint64_t prompt_cached_bytes();
     /// Threads `prefetch` reads the GGUF with (STRATA_FETCH_THREADS, default 8).
     void set_fetch_threads(int n) { fetch_threads_ = n < 1 ? 1 : n; }
     /// #286: read the experts straight from the drive (Windows: FILE_FLAG_NO_BUFFERING, overlapped; Linux: O_DIRECT and
@@ -1026,6 +1029,19 @@ private:
     void io_enqueue(int64_t layer, int64_t expert);
     void io_stop();
     const uint8_t* io_blob(int64_t layer, int64_t expert);
+    // ---- STRATA_PAGECACHE_WARM_GIB (opt in, Linux): a SCHED_IDLE thread asks the OS for the experts the resident tier
+    // left on the files, in the ranking the tier used, so a later read finds them in the page cache.
+    struct PageWarm {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool quit = false;
+    };
+    PageWarm warm_;
+    std::thread warm_thread_;
+    /// Starts the warm over `order` (hottest first, the experts the tier does not hold) until `budget_bytes` of blobs.
+    void start_pagecache_warm(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget_bytes);
+    /// Stops and joins the warm thread (a no-op when none runs); close() calls it first.
+    void stop_pagecache_warm();
     const uint8_t* base_ = nullptr;
     int64_t blobs_ = 0;
     int64_t n_layers_ = 0;

@@ -56,6 +56,7 @@
 #if defined(__linux__)
 #include <cerrno>
 #include <linux/aio_abi.h>   // the kernel's own asynchronous reads (io_submit): no library, allowed by Docker's seccomp
+#include <sched.h>   // STRATA_PAGECACHE_WARM_GIB: SCHED_IDLE for the warm thread
 #include <sys/syscall.h>
 #endif
 
@@ -1002,6 +1003,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    stop_pagecache_warm();
     io_stop();
     inputs_.clear();
     if (complement_arena_ != nullptr) {
@@ -1907,6 +1909,9 @@ bool FileExpertSource::map_view(std::string& why) {
 static std::atomic<uint64_t> g_direct_requested{0}, g_direct_read{0};
 uint64_t FileExpertSource::direct_requested_bytes() { return g_direct_requested.load(std::memory_order_relaxed); }
 uint64_t FileExpertSource::direct_read_bytes() { return g_direct_read.load(std::memory_order_relaxed); }
+// STRATA_PROMPT_DIRECT_CACHED: the prompt's blobs copied through the mapping because their pages were cached (prompt_copies)
+static std::atomic<uint64_t> g_prompt_cached{0};
+uint64_t FileExpertSource::prompt_cached_bytes() { return g_prompt_cached.load(std::memory_order_relaxed); }
 
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 #if defined(_WIN32)
@@ -2554,7 +2559,26 @@ bool FileExpertSource::prompt_copies(int64_t layer, int64_t expert) const {
     if (!prompt_direct_active_.load(std::memory_order_relaxed) || pdirect_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (complement_ready_ && resident_blob(index) != nullptr) return false;
-    return override_.empty() || override_[index] == nullptr;
+    if (!(override_.empty() || override_[index] == nullptr)) return false;
+#if defined(__linux__)
+    // STRATA_PROMPT_DIRECT_CACHED=1: a blob whose pages are all in the page cache is copied through the mapping (no drive
+    // read, no O_DIRECT bypass of the cache).  One mincore per span; a failed or partial answer keeps the O_DIRECT read.
+    static const bool cached_first = [] {
+        const char* v = std::getenv("STRATA_PROMPT_DIRECT_CACHED");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    if (cached_first) {
+        Span sp[3];
+        const int ns = spans(layer, expert, sp);
+        bool all = ns > 0;
+        for (int i = 0; all && i < ns; ++i) all = sp[i].n > 0 && resident_in(sp[i].p, sp[i].n) >= sp[i].n;
+        if (all) {
+            g_prompt_cached.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+            return false;
+        }
+    }
+#endif
+    return true;
 }
 
 double FileExpertSource::cached_share(int64_t samples) const {
@@ -2710,6 +2734,77 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 #endif
 }
 
+void FileExpertSource::start_pagecache_warm(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget_bytes) {
+    stop_pagecache_warm();
+#if defined(__linux__)
+    // The blobs as (file, offset, bytes) ranges, taken now from the mapping: the thread then touches no source state.
+    struct WarmRange { uint64_t off, n; int file; };
+    std::vector<WarmRange> ranges;
+    uint64_t bytes = 0;
+    size_t experts = 0;
+    for (const auto& pr : order) {
+        if (bytes >= budget_bytes) break;
+        Span sp[3];
+        const int ns = spans(pr.first, pr.second, sp);
+        if (ns <= 0) continue;
+        for (int r = 0; r < ns; ++r) {
+            const int file = role_ptr_.empty() ? 0 : role_file_[(size_t) (3 * pr.first + r)];
+            ranges.push_back({sp[r].off, sp[r].n, file});
+            bytes += sp[r].n;
+        }
+        ++experts;
+    }
+    if (ranges.empty()) return;
+    std::vector<std::string> paths = paths_;
+    PageWarm* w = &warm_;
+    {
+        std::lock_guard<std::mutex> lk(w->mu);
+        w->quit = false;
+    }
+    warm_thread_ = std::thread([w, paths, ranges, experts, bytes]() {
+        sched_param none{};
+        (void) sched_setscheduler(0, SCHED_IDLE, &none);   // this thread only (pid 0): runs when nothing else wants the CPU
+        std::vector<int> fds;
+        for (const std::string& p : paths) fds.push_back(::open(p.c_str(), O_RDONLY | O_CLOEXEC));
+        const auto t0 = std::chrono::steady_clock::now();
+        constexpr uint64_t kChunk = 64ull << 20;   // one pause per 64 MiB asked for
+        uint64_t since_pause = 0;
+        bool stopped = false;
+        for (const WarmRange& r : ranges) {
+            {
+                std::lock_guard<std::mutex> lk(w->mu);
+                if (w->quit) { stopped = true; break; }
+            }
+            const int fd = r.file >= 0 && (size_t) r.file < fds.size() ? fds[(size_t) r.file] : -1;
+            if (fd >= 0) (void) posix_fadvise(fd, (off_t) r.off, (off_t) r.n, POSIX_FADV_WILLNEED);
+            since_pause += r.n;
+            if (since_pause < kChunk) continue;
+            since_pause = 0;
+            std::unique_lock<std::mutex> lk(w->mu);
+            w->cv.wait_for(lk, std::chrono::milliseconds(20), [w] { return w->quit; });
+            if (w->quit) { stopped = true; break; }
+        }
+        for (int fd : fds)
+            if (fd >= 0) ::close(fd);
+        if (!stopped)
+            std::fprintf(stderr, "FileExpertSource: page cache warmed with %zu experts (%.2f GiB) in %.1f s\n", experts,
+                         (double) bytes / 1073741824.0,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    });
+#else
+    (void) order; (void) budget_bytes;
+#endif
+}
+
+void FileExpertSource::stop_pagecache_warm() {
+    {
+        std::lock_guard<std::mutex> lk(warm_.mu);
+        warm_.quit = true;
+    }
+    warm_.cv.notify_all();
+    if (warm_thread_.joinable()) warm_thread_.join();
+}
+
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
@@ -2769,6 +2864,14 @@ bool FileExpertSource::pin_cache_complement(
     int64_t budget_lent = 0, budget_lendable = 0;   // the lend region's slots kept by a budget (below), and its size
     uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
+    // STRATA_PAGECACHE_WARM_GIB (opt in): the ranked experts the budget leaves on the files, hottest first (warm_order);
+    // unset, nothing is collected and the warm does not start.
+    const uint64_t warm_bytes = [] {
+        const char* v = std::getenv("STRATA_PAGECACHE_WARM_GIB");
+        const double g = v != nullptr ? std::atof(v) : 0.0;
+        return g > 0 ? (uint64_t) (g * 1073741824.0) : (uint64_t) 0;
+    }();
+    std::vector<std::pair<int32_t, int32_t>> warm_order;
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
         // they fit, the rest left on the mapped files; Windows commit capacity also limits the allocation (#730).
@@ -2798,6 +2901,7 @@ bool FileExpertSource::pin_cache_complement(
             budget_bytes = clamped;
         }
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
+        std::vector<char> warm_seen(warm_bytes > 0 ? offsets.size() : 0, 0);
         uint64_t at = 0;
         int64_t held = 0;
         if (rank != nullptr)
@@ -2805,6 +2909,10 @@ bool FileExpertSource::pin_cache_complement(
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
+                if (warm_bytes > 0 && !warm_seen[i]) {   // a candidate for the warm, if the tier does not end up holding it
+                    warm_seen[i] = 1;
+                    warm_order.push_back(pr);
+                }
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
                 if (b > budget_bytes - at) continue;
                 ranked[i] = at;
@@ -2851,6 +2959,12 @@ bool FileExpertSource::pin_cache_complement(
         offsets.swap(ranked);
         bytes = at;
         lend_from_slot = -1;
+        // the warm keeps only what the tier does not hold after all (the lend region above may have taken some)
+        warm_order.erase(std::remove_if(warm_order.begin(), warm_order.end(),
+                                        [&](const std::pair<int32_t, int32_t>& pr) {
+                                            return offsets[(size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second] != kNoComplement;
+                                        }),
+                         warm_order.end());
     }
 
     const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
@@ -3361,6 +3475,7 @@ bool FileExpertSource::pin_cache_complement(
                      additional_gpu_pairs.size());
     }
     std::fflush(stderr);
+    if (!warm_order.empty()) start_pagecache_warm(warm_order, warm_bytes);
     return true;
 }
 
