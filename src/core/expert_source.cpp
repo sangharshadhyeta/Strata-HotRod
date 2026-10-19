@@ -2652,21 +2652,6 @@ void RouterLookahead::run() {
                 }
             }
         }
-        // Read ahead only the ranks that can become demand reads.  The ranks a stand-in ALWAYS serves (STRATA_ROUTE_RESIDENT with
-        // an unlimited margin over STRATA_ROUTE_RESIDENT_RANKS lo-hi, or STRATA_STANDIN=1) are never read: their non-resident
-        // picks take a resident expert.  19 Oct: with ranks 2-9 stood in, the read-ahead read ~26 GB per request and 88% was
-        // never used, on a drive the decode's own rank 0-1 reads already saturate (3.3 GB/s).
-        static const int standin_from = [] {
-            float margin = 0.0f;
-            int lo = 99, hi = -1;
-            const char* si = std::getenv("STRATA_STANDIN");
-            if (si != nullptr && std::atoi(si) != 0) { margin = 1e30f; lo = 0; hi = 9; }
-            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) margin = (float) std::atof(v);
-            if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &lo, &hi);
-            // a finite margin keeps a pick whose stand-in is too far off: then any rank may still be read
-            return margin >= 1e29f && lo >= 0 && hi >= lo ? lo : 99;
-        }();
-        const int kread = std::min(k_, standin_from);
         const int kmax = stats_on_ ? (int) std::min<int64_t>(k_ + 10, n_expert_) : k_;
         const int ks[3] = {k_, (int) std::min<int64_t>(k_ + 4, n_expert_), kmax};
         std::vector<uint64_t> sm;
@@ -2679,7 +2664,7 @@ void RouterLookahead::run() {
             for (int j = 0; j < kmax; ++j) {
                 const int64_t e = order[(size_t) j];
                 if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;   // on the GPU
-                if (j < kread && std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
+                if (j < k_ && std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
                 if (stats_on_ && dj == 0)
                     for (int s = 0; s < 3; ++s)
                         if (j < ks[s]) sm[(size_t) (s * words_ + (e >> 6))] |= 1ull << (e & 63);
