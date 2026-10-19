@@ -153,7 +153,11 @@ int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std:
 
 }  // namespace detail
 
-
+/// The RAM this process may fill, sized the one way the page-cache warm's auto and `--resident-budget-gib auto` both use:
+/// the smaller of MemAvailable and the engine's memory limit's available, less `reserve` (what the engine allocates later)
+/// and the kernel's high watermarks.  STRATA_PAGECACHE_WARM_HEADROOM_GIB, when set, replaces that sum.  `note` receives
+/// the sizing for a log line.  0 when /proc/meminfo cannot be read.
+uint64_t host_ram_room_bytes(uint64_t reserve, std::string* note = nullptr);
 
 /// Where one routed expert's bytes come from.
 ///
@@ -725,6 +729,19 @@ public:
     /// buffers for the longest prompt --max-context allows).  Set before the warm starts; the kernel's high watermarks are
     /// added to it when the warm is sized.
     void set_warm_reserve(uint64_t bytes) { warm_reserve_ = bytes; }
+    /// `--resident-budget-gib auto`: the budget passed to pin_cache_complement was the host room (host_ram_room_bytes).  The
+    /// page-cache warm is then sized again after the complement is built, so it gets what the complement left.
+    void set_resident_budget_auto(bool on) { budget_auto_ = on; }
+    /// RAM tier: the lowest-usage RAM-held expert of `layer` whose flag in `busy` is clear (busy is indexed layer * n_expert +
+    /// expert; empty = none busy) and that no staged exchange reads.  -1 when there is none.  `usage` is indexed the same
+    /// way (empty: all zero, the lowest index wins).
+    int64_t coldest_resident_expert(int64_t layer, const std::vector<float>& usage, const std::vector<char>& busy) const;
+    /// RAM tier, for an expert that left VRAM without a RAM place (a K/V grow; the swap-in path stages through
+    /// stage_exchange instead): the coldest RAM-held expert of `layer` not flagged in `busy` gives its place to `out`, whose
+    /// blob (the layer's blob size) is copied from `bytes`.  Only with nothing staged and nothing in flight (the caller is
+    /// quiesced).
+    bool take_resident_place(int64_t layer, int64_t out, const std::vector<float>& usage, const std::vector<char>& busy,
+                             const uint8_t* bytes);
     /// The serve loop: a request runs (the warm pauses) / ended.
     void set_request_active(bool on);
     /// The warm again with its last list (after a request: pages a prompt's pinned buffers or reads evicted come back;
@@ -1111,6 +1128,7 @@ private:
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
+    bool budget_auto_ = false;                ///< set_resident_budget_auto
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };

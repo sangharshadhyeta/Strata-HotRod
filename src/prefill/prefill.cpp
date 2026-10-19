@@ -2091,10 +2091,8 @@ int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 
 uint64_t Prefill::layer_major_host_bytes(int64_t n_tokens) {
     if (n_tokens <= 0) return 0;
-    // run_impl's cudaHostAlloc of lmh: R (D floats), grs (HC floats), xn (lm_xs uint16) and xnlo (D uint16, bf16x2 only -
-    // counted always: the warm's reserve may be a little generous, never short)
-    const uint64_t lm_xs = (uint64_t) (D + (hc_pad() ? XN_PAD : 0));
-    return (uint64_t) n_tokens * ((uint64_t) D * 4 + (uint64_t) HC * 4 + lm_xs * 2 + (uint64_t) D * 2);
+    // run_impl's state of a token between layer passes: R (D floats) - the norm the next layer reads is recomputed from it
+    return (uint64_t) n_tokens * (uint64_t) D * 4;
 }
 static std::atomic<uint64_t> g_lm_host_floor{2560ull << 20};
 void Prefill::set_host_floor_bytes(uint64_t bytes) { g_lm_host_floor.store(bytes); }
@@ -2609,8 +2607,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     // ---- the chunks.  A chunk's work runs in one of four phases: FULL (the default: every step of the chunk, in the
     // order it always ran), and the layer-major path (STRATA_PREFILL_LAYER_MAJOR=1, see the driver below): SETUP (the
-    // embeddings, the PLE rows and the QSA step records; the residual goes to the host), LAYER (the residual, the step
-    // records and the norm the layer before left come back from the host; this layer's body runs; the residual goes
+    // embeddings, the PLE rows and the QSA step records; the residual goes to the host), LAYER (the residual and the step
+    // records come back from the host; this layer's body runs; the residual goes
     // back) and TAIL (the residual comes back and the chunk is reported).  Each phase runs the default's statements, in order.
     enum LmPhase : int { PH_FULL = 0, PH_SETUP = 1, PH_LAYER = 2, PH_TAIL = 3 };
     struct LmHost {   // the layer-major path's pinned host copies, its event, and the expert map's device buffer
@@ -2625,6 +2623,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         float* grsd = nullptr;
         uint16_t* xnd = nullptr;
         uint16_t* xnlod = nullptr;
+        // step 2 (LmStage): two staging slots of one chunk's R each, on the GPU (carved from the loan's tail before the
+        // device arrays above; not freed here). Null when the host part is not staged.
+        float* stg[2] = {nullptr, nullptr};
         cudaEvent_t ev = nullptr;  // recorded after a layer's last compute: the map's readers are done
         uint8_t* map = nullptr;    // the expert map: a layer's streamed experts, kept for the chunks after its first
         bool map_shared = false;   // the map is the borrowed loan's slice (Impl::lm_map): owned by the loan, not freed here
@@ -2641,11 +2642,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         cudaStream_t s = nullptr;
         ~LmSync() { if (s) cudaStreamSynchronize(s); }
     } lm_sync;
+    // step 2: the host part's residual copies run on their own stream, through two GPU staging slots (LmHost::stg), so they
+    // overlap the compute on cs. Slot = host chunk index & 1. Each event orders one hand-off; the copy stream's order makes a
+    // slot's next H2D wait for the previous chunk's D2H from it.
+    struct LmStage {
+        cudaStream_t s = nullptr;                  // cudaStreamNonBlocking: the copy stream
+        cudaEvent_t in[2] = {nullptr, nullptr};    // on s, after a slot's H2D: cs waits on it before it reads the slot
+        cudaEvent_t out[2] = {nullptr, nullptr};   // on cs, after a slot's D2D write: s waits on it before the D2H
+        cudaEvent_t ready = nullptr;               // on cs, after the SETUP passes: s waits on it before the first H2D
+        cudaEvent_t done = nullptr;                // on s, after a layer's last D2H: cs waits on it at the layer's end
+        ~LmStage() {   // before lmh's host buffers go (declared after lmh): the copy stream is drained first
+            if (s) cudaStreamSynchronize(s);
+            for (cudaEvent_t e : in) if (e) cudaEventDestroy(e);
+            for (cudaEvent_t e : out) if (e) cudaEventDestroy(e);
+            if (ready) cudaEventDestroy(ready);
+            if (done) cudaEventDestroy(done);
+            if (s) cudaStreamDestroy(s);
+        }
+    } lm_stage;
+    bool lm_stage_on = false;               // the host part goes through lm_stage (set with the carve in the setup below)
     bool lm_on = false, lm_first = false;   // the expert map: this run's layer-major passes, and the layer's first chunk
     size_t lm_cap = 0, lm_used = 0, lm_reused = 0;
     std::vector<int64_t> lm_off;            // per expert: its offset in the map for the current layer, or -1
     std::vector<int32_t> lm_steps;          // every token's QSA step records (a layer's pass uploads its chunk's)
-    std::vector<char> lm_carry;             // per chunk: the next layer's first half finds its norm in grs and xn16
+    std::vector<char> lm_carry;             // per chunk: the layer's last write normed R for the next layer's first half (step 1: recomputed there, not carried)
     const size_t lm_xs = (size_t) (D + (hc_pad() ? XN_PAD : 0));
     // the layer-major passes' residual traffic: bytes, and CUDA event pairs around each pass's copy-in and copy-out groups
     // (on cs, the compute stream: these copies do not overlap compute, so their time adds to the prompt's)
@@ -2673,12 +2693,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         else if (!lm_copy_ev.empty() && lm_copy_ev.back().second == nullptr) lm_copy_ev.back().second = e;
         else cudaEventDestroy(e);
     };
-    auto lm_copy = [&](void* dst, const void* src, size_t bytes, cudaMemcpyKind kind) -> bool {
+    auto lm_copy_s = [&](cudaStream_t st, void* dst, const void* src, size_t bytes, cudaMemcpyKind kind) -> bool {
         if (kind == cudaMemcpyDeviceToDevice) lm_dev_copy_bytes += bytes;
         else lm_copy_bytes += bytes;
-        if (bytes == 0 || cudaMemcpyAsync(dst, src, bytes, kind, cs) == cudaSuccess) return true;
+        if (bytes == 0 || cudaMemcpyAsync(dst, src, bytes, kind, st) == cudaSuccess) return true;
         err = std::string("prefill: the layer-major copy failed: ") + cudaGetErrorString(cudaGetLastError());
         return false;
+    };
+    auto lm_copy = [&](void* dst, const void* src, size_t bytes, cudaMemcpyKind kind) -> bool {
+        return lm_copy_s(cs, dst, src, bytes, kind);
     };
     // a chunk's state at token c0, `w` elements a token: the GPU array for the first lmh.n_dev tokens, else the host array
     // (which starts at token n_dev); and the copy kind for it (device-to-device on the GPU, the given direction otherwise)
@@ -2686,6 +2709,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         return c0 < lmh.n_dev ? dev + (size_t) c0 * w : host + (size_t) (c0 - lmh.n_dev) * w;
     };
     auto lm_kind = [&](int64_t c0, cudaMemcpyKind k) { return c0 < lmh.n_dev ? cudaMemcpyDeviceToDevice : k; };
+    // step 2: a host chunk's R into its staging slot, on the copy stream (the slot's previous D2H is ahead of it there)
+    auto lm_fetch = [&](int64_t c0) -> bool {
+        const int64_t T = std::min(C, n - c0);
+        const int slot = (int) ((c0 / C) & 1);
+        if (!lm_copy_s(lm_stage.s, lmh.stg[slot], lmh.R + (size_t) (c0 - lmh.n_dev) * D, (size_t) T * D * 4, cudaMemcpyHostToDevice))
+            return false;
+        if (cudaEventRecord(lm_stage.in[slot], lm_stage.s) != cudaSuccess) {
+            err = std::string("prefill: the layer-major staging event failed: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        return true;
+    };
     bool lm_skip_cpu_share = false;   // set once the layer-major path is taken: its chunks do not hold the CPU pool
     auto run_chunk = [&](int64_t c0, int phase, int64_t lay) -> bool {
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0, ci = c0 / C;
@@ -2710,23 +2745,32 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             cudaEventRecord(ph_t.pool[i], cs);
             ph_t.marks.push_back({cat, i});
         };
-        if (phase == PH_LAYER || phase == PH_TAIL) {   // this chunk's residual comes back from the host
+        // step 2: a host chunk of a layer's pass comes back through its staging slot. Its H2D was issued on the copy stream
+        // (the pass's first host chunk here, the others by the chunk before); cs waits for it, copies the slot into R, and
+        // issues the next host chunk's H2D so that it overlaps this chunk's compute.
+        const bool staged = lm_stage_on && phase == PH_LAYER && c0 >= lmh.n_dev;
+        if (staged) {
+            const int slot = (int) (ci & 1);
+            if (c0 == lmh.n_dev && !lm_fetch(c0)) return false;
+            if (cudaStreamWaitEvent(cs, lm_stage.in[slot], 0) != cudaSuccess) {
+                err = std::string("prefill: the layer-major staging wait failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            if (!lm_copy(m.R, lmh.stg[slot], (size_t) T * D * 4, cudaMemcpyDeviceToDevice)) return false;
+            if (c0 + C < n && !lm_fetch(c0 + C)) return false;
+        } else if (phase == PH_LAYER || phase == PH_TAIL) {   // this chunk's residual comes back from the host
             if (!lm_copy(m.R, lm_at(lmh.R, lmh.Rd, c0, D), (size_t) T * D * 4, lm_kind(c0, cudaMemcpyHostToDevice))) return false;
         }
-        if (phase == PH_LAYER) {   // its QSA step records, and the norm the layer before left for this half
+        if (phase == PH_LAYER) {   // its QSA step records
             std::copy_n(lm_steps.data() + (size_t) c0 * strata::kernels::kStepCount, (size_t) T * strata::kernels::kStepCount,
                         m.steps_host.data());
             if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
                 err = "prefill: the QSA step records' upload failed";
                 return false;
             }
-            if (lm_carry[(size_t) ci]) {
-                if (!lm_copy(m.grs, lm_at(lmh.grs, lmh.grsd, c0, HC), (size_t) T * HC * 4, lm_kind(c0, cudaMemcpyHostToDevice)) ||
-                    !lm_copy(m.xn16, lm_at(lmh.xn, lmh.xnd, c0, lm_xs), (size_t) T * lm_xs * 2, lm_kind(c0, cudaMemcpyHostToDevice)) ||
-                    (m.xn16_lo && !lm_copy(m.xn16_lo, lm_at(lmh.xnlo, lmh.xnlod, c0, D), (size_t) T * D * 2, lm_kind(c0, cudaMemcpyHostToDevice))))
-                    return false;
-                normed = true;
-            }
+            // Step 1: the norm the layer before left (grs, xn16) is not carried. It is a function of the restored R alone
+            // (gr_norm_rs over R with the first half's norm weights: the same kernel call the half loop makes), so the
+            // first half recomputes it. lm_carry still records where the old path restored it.
             lm_mark(false);
         }
         if (setup) {
@@ -4898,17 +4942,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
         }
-        if (phase == PH_LAYER) {   // the layer-major pass: the residual goes back, and so does the norm the next layer's first half reads
+        if (phase == PH_LAYER) {   // the layer-major pass: the residual goes back (step 1: the norm is recomputed from it, not copied)
             ph(PT_END);
             lm_mark(true);
             struct EndMark { decltype(lm_mark)& f; ~EndMark() { f(false); } } end_mark{lm_mark};
-            if (!lm_copy(lm_at(lmh.R, lmh.Rd, c0, D), m.R, (size_t) T * D * 4, lm_kind(c0, cudaMemcpyDeviceToHost))) return false;
-            lm_carry[(size_t) ci] = normed ? 1 : 0;
-            if (normed &&
-                (!lm_copy(lm_at(lmh.grs, lmh.grsd, c0, HC), m.grs, (size_t) T * HC * 4, lm_kind(c0, cudaMemcpyDeviceToHost)) ||
-                 !lm_copy(lm_at(lmh.xn, lmh.xnd, c0, lm_xs), m.xn16, (size_t) T * lm_xs * 2, lm_kind(c0, cudaMemcpyDeviceToHost)) ||
-                 (m.xn16_lo && !lm_copy(lm_at(lmh.xnlo, lmh.xnlod, c0, D), m.xn16_lo, (size_t) T * D * 2, lm_kind(c0, cudaMemcpyDeviceToHost)))))
+            if (staged) {
+                // step 2: R into the slot on cs, then the slot's D2H on the copy stream (after this write)
+                const int slot = (int) (ci & 1);
+                if (!lm_copy(lmh.stg[slot], m.R, (size_t) T * D * 4, cudaMemcpyDeviceToDevice)) return false;
+                if (cudaEventRecord(lm_stage.out[slot], cs) != cudaSuccess ||
+                    cudaStreamWaitEvent(lm_stage.s, lm_stage.out[slot], 0) != cudaSuccess) {
+                    err = std::string("prefill: the layer-major staging hand-off failed: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (!lm_copy_s(lm_stage.s, lm_at(lmh.R, lmh.Rd, c0, D), lmh.stg[slot], (size_t) T * D * 4, cudaMemcpyDeviceToHost))
+                    return false;
+            } else if (!lm_copy(lm_at(lmh.R, lmh.Rd, c0, D), m.R, (size_t) T * D * 4, lm_kind(c0, cudaMemcpyDeviceToHost))) {
                 return false;
+            }
+            lm_carry[(size_t) ci] = normed ? 1 : 0;   // step 1: the norm itself is recomputed by the next pass, not copied
             return true;
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
@@ -5051,15 +5103,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     static const bool lm_device_env = [] { const char* e = std::getenv("STRATA_LM_DEVICE"); return !(e != nullptr && e[0] == '0' && e[1] == '\0'); }();
     auto lm_gpu_bytes = [&](int64_t t) -> uint64_t {
         auto up = [](uint64_t b) { return (b + 255) & ~(uint64_t) 255; };
-        uint64_t b = up((uint64_t) t * D * 4) + up((uint64_t) t * HC * 4) + up((uint64_t) t * lm_xs * 2);
-        if (m.xn16_lo) b += up((uint64_t) t * D * 2);
-        return b;
+        return up((uint64_t) t * D * 4);   // R only: the norm the next layer reads is recomputed from it (step 1)
     };
+    // step 2: the two staging slots (one chunk of R each) come first from the same tail, so the device part's room is
+    // what is left after them; a tail too small for both keeps the unstaged path and its whole room
+    auto up256 = [](uint64_t b) { return (b + 255) & ~(uint64_t) 255; };
+    const uint64_t stage_bytes = C > 0 ? 2 * up256((uint64_t) C * D * 4) : 0;
+    const bool stage_room = lm && lm_device_env && m.lm_dev != nullptr && C > 0 && m.lm_dev_bytes >= stage_bytes;
     int64_t n_dev = 0;
     if (lm_device_env && m.lm_dev != nullptr && m.lm_dev_bytes > 0 && C > 0) {
+        const uint64_t room = m.lm_dev_bytes - (stage_room ? stage_bytes : 0);
         for (int64_t k = (n + C - 1) / C; k > 0; --k) {
             const int64_t t = std::min(k * C, n);
-            if (lm_gpu_bytes(t) <= m.lm_dev_bytes) { n_dev = t; break; }
+            if (lm_gpu_bytes(t) <= room) { n_dev = t; break; }
         }
     }
     if (lm) {   // the residuals are pinned (they cannot be paged out): refused when they would not leave the memory floor free
@@ -5076,25 +5132,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     if (lm) {
         // the GPU part: carved from the loan's tail in the order R, grs, xn, xnlo (never freed here: the loan owns it)
         lmh.n_dev = n_dev;
+        // step 2: the copy stream and its events (before the carve: the staging slots are taken only if all of them exist)
+        bool stg_ok = stage_room && n_dev < n && cudaStreamCreateWithFlags(&lm_stage.s, cudaStreamNonBlocking) == cudaSuccess;
+        if (stg_ok) {
+            for (cudaEvent_t* e : {&lm_stage.in[0], &lm_stage.in[1], &lm_stage.out[0], &lm_stage.out[1], &lm_stage.ready, &lm_stage.done})
+                if (cudaEventCreateWithFlags(e, cudaEventDisableTiming) != cudaSuccess) { stg_ok = false; break; }
+        }
+        if (!stg_ok) (void) cudaGetLastError();
+        lm_stage_on = stg_ok;
+        uint8_t* p = m.lm_dev;
+        auto take = [&](uint64_t bytes) -> void* {
+            void* q = p;
+            p += (bytes + 255) & ~(uint64_t) 255;
+            return q;
+        };
+        if (lm_stage_on) {
+            lmh.stg[0] = (float*) take((uint64_t) C * D * 4);
+            lmh.stg[1] = (float*) take((uint64_t) C * D * 4);
+        }
         if (n_dev > 0) {
-            uint8_t* p = m.lm_dev;
-            auto take = [&](uint64_t bytes) -> void* {
-                void* q = p;
-                p += (bytes + 255) & ~(uint64_t) 255;
-                return q;
-            };
             lmh.Rd = (float*) take((uint64_t) n_dev * D * 4);
-            lmh.grsd = (float*) take((uint64_t) n_dev * HC * 4);
-            lmh.xnd = (uint16_t*) take((uint64_t) n_dev * lm_xs * 2);
-            if (m.xn16_lo) lmh.xnlod = (uint16_t*) take((uint64_t) n_dev * D * 2);
         }
         // the host part: tokens [n_dev, n) (a zero-size part is not allocated)
         const size_t nh = (size_t) (n - n_dev);
         auto host_arr = [&](void** pp, size_t bytes) { return bytes == 0 || cudaHostAlloc(pp, bytes, cudaHostAllocDefault) == cudaSuccess; };
-        const bool ok = host_arr((void**) &lmh.R, nh * D * 4) &&
-                        host_arr((void**) &lmh.grs, nh * HC * 4) &&
-                        host_arr((void**) &lmh.xn, nh * lm_xs * 2) &&
-                        (!m.xn16_lo || host_arr((void**) &lmh.xnlo, nh * D * 2)) &&
+        const bool ok = host_arr((void**) &lmh.R, nh * D * 4) &&   // R only (step 1: the next layer's norm is recomputed)
                         cudaEventCreateWithFlags(&lmh.ev, cudaEventDisableTiming) == cudaSuccess;
         if (!ok) {   // no pinned RAM for the residuals: the default path (nothing has run yet)
             (void) cudaGetLastError();
@@ -5102,6 +5164,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                  "for the residuals not available\n", (long long) n, (long long) C);
             lm = false;
         }
+        if (!lm) lm_stage_on = false;
         if (lm)
             std::fprintf(stderr, "strata prefill: layer-major state: %lld of %lld tokens on the GPU (%.0f MiB of the loan), the rest in "
                                  "pinned RAM\n", (long long) n_dev, (long long) n, lm_gpu_bytes(n_dev) / 1048576.0);
@@ -5153,6 +5216,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             if (!run_chunk(c0, PH_SETUP, 0)) return false;
         }
+        if (lm_stage_on) {   // step 2: the SETUP passes' residual writes (on cs) land before the copy stream reads them
+            if (cudaEventRecord(lm_stage.ready, cs) != cudaSuccess || cudaStreamWaitEvent(lm_stage.s, lm_stage.ready, 0) != cudaSuccess) {
+                err = std::string("prefill: the layer-major copy stream's start failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
         lm_on = true;
         for (int64_t l = 0; l < g.n_layers; ++l) {
             if (should_stop && should_stop()) { err = "cancelled"; return false; }
@@ -5167,6 +5236,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (cudaEventRecord(lmh.ev, cs) != cudaSuccess) {
                 err = std::string("prefill: the layer-major layer event: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
+            }
+            if (lm_stage_on) {   // step 2: every D2H of this layer is done before the next layer (or TAIL) reads the host state
+                if (cudaEventRecord(lm_stage.done, lm_stage.s) != cudaSuccess || cudaStreamWaitEvent(cs, lm_stage.done, 0) != cudaSuccess) {
+                    err = std::string("prefill: the layer-major copy stream's layer event failed: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
             }
         }
         lm_on = false;

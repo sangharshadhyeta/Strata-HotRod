@@ -3043,6 +3043,49 @@ static uint64_t kernel_high_watermark_bytes() {
 // high watermarks (below them reclaim starts).  STRATA_PAGECACHE_WARM_HEADROOM_GIB, when set, replaces that sum.  `note`
 // receives the sizing for the log line ("" for a fixed count).  19 Oct, 31 GB box: auto measured 15.7 / 16.2 s on an 8.5k prompt
 // against 14.8 s for a 10 GiB warm; the default is auto by the user's choice (the warm follows each machine's free memory).
+namespace {
+// The room both auto sizings use (declared in expert_source.hpp as host_ram_room_bytes): what the RAM may hold beyond
+// `reserve` and the kernel's watermarks.  false: no /proc/meminfo (not Linux).
+struct HostRamRoom {
+    uint64_t total = 0, room = 0, keep = 0, cap = 0;
+    std::string source;
+};
+bool host_ram_room(uint64_t reserve, HostRamRoom& out) {
+    std::ifstream info("/proc/meminfo");
+    std::stringstream text;
+    text << info.rdbuf();
+    const uint64_t total = detail::meminfo_bytes(text.str(), "MemTotal");
+    const uint64_t avail = detail::meminfo_bytes(text.str(), "MemAvailable");
+    if (total == 0) return false;   // no /proc/meminfo (not Linux): the warm is Linux only anyway
+    // The engine's memory limit: the cgroup's (memory.max, minus its usage) when that is lower than MemAvailable.
+    const auto mem = sample_host_memory();
+    const uint64_t room = mem && mem->available > 0 ? std::min<uint64_t>(avail, mem->available) : avail;
+    uint64_t keep = reserve + kernel_high_watermark_bytes();
+    if (const char* h = std::getenv("STRATA_PAGECACHE_WARM_HEADROOM_GIB"))
+        keep = std::atof(h) > 0 ? (uint64_t) (std::atof(h) * 1073741824.0) : (uint64_t) 0;
+    out.total = total;
+    out.room = room;
+    out.keep = keep;
+    out.cap = room > keep ? room - keep : (uint64_t) 0;
+    out.source = mem ? memory_source_name(mem->source) : "meminfo";
+    return true;
+}
+}  // namespace
+
+uint64_t host_ram_room_bytes(uint64_t reserve, std::string* note) {
+    if (note != nullptr) note->clear();
+    HostRamRoom r;
+    if (!host_ram_room(reserve, r)) return 0;
+    if (note != nullptr) {
+        char buf[200];
+        std::snprintf(buf, sizeof buf, " (%.2f GiB of %.2f GiB available (%s), %.2f GiB kept free)", (double) r.cap / 1073741824.0,
+                      (double) r.room / 1073741824.0, r.source.c_str(), (double) r.keep / 1073741824.0);
+        *note = buf;
+    }
+    return r.cap;
+}
+
+// The page-cache warm's budget (see the comment above host_ram_room): auto = the room; third = a third of the RAM, within it.
 static uint64_t pagecache_warm_bytes(uint64_t reserve, std::string* note = nullptr) {
     const char* v = std::getenv("STRATA_PAGECACHE_WARM_GIB");
     if (note != nullptr) note->clear();
@@ -3052,27 +3095,16 @@ static uint64_t pagecache_warm_bytes(uint64_t reserve, std::string* note = nullp
         const double g = std::atof(v);
         return g > 0 ? (uint64_t) (g * 1073741824.0) : (uint64_t) 0;
     }
-    std::ifstream info("/proc/meminfo");
-    std::stringstream text;
-    text << info.rdbuf();
-    const uint64_t total = detail::meminfo_bytes(text.str(), "MemTotal");
-    const uint64_t avail = detail::meminfo_bytes(text.str(), "MemAvailable");
-    if (total == 0) return 0;   // no /proc/meminfo (not Linux): the warm is Linux only anyway
-    // The engine's memory limit: the cgroup's (memory.max, minus its usage) when that is lower than MemAvailable.
-    const auto mem = sample_host_memory();
-    const uint64_t room = mem && mem->available > 0 ? std::min<uint64_t>(avail, mem->available) : avail;
-    uint64_t keep = reserve + kernel_high_watermark_bytes();
-    if (const char* h = std::getenv("STRATA_PAGECACHE_WARM_HEADROOM_GIB"))
-        keep = std::atof(h) > 0 ? (uint64_t) (std::atof(h) * 1073741824.0) : (uint64_t) 0;
-    const uint64_t cap = room > keep ? room - keep : (uint64_t) 0;
-    const uint64_t bytes = is_third ? std::min<uint64_t>(total / 3, cap) : cap;
+    HostRamRoom r;
+    if (!host_ram_room(reserve, r)) return 0;
+    const uint64_t bytes = is_third ? std::min<uint64_t>(r.total / 3, r.cap) : r.cap;
     if (note != nullptr) {
         char buf[260];
         char prompt[64] = "";
         if (reserve > 0) std::snprintf(prompt, sizeof prompt, " and %.2f GiB for the prompt path", (double) reserve / 1073741824.0);
         std::snprintf(buf, sizeof buf, " (%s: %.2f GiB of %.2f GiB available (%s), %.2f GiB kept free (the kernel's reclaim "
                       "watermarks%s))", is_third ? "third" : "auto", (double) bytes / 1073741824.0,
-                      (double) room / 1073741824.0, mem ? memory_source_name(mem->source) : "meminfo", (double) keep / 1073741824.0,
+                      (double) r.room / 1073741824.0, r.source.c_str(), (double) r.keep / 1073741824.0,
                       prompt);
         *note = buf;
     }
@@ -3170,7 +3202,7 @@ bool FileExpertSource::pin_cache_complement(
     // (warm_order), warmed into the page cache by a SCHED_IDLE thread - the fixed tier's hot set, but reclaimable.
     // (A budget of 0 holds every expert: nothing to warm.)
     std::string warm_note;   // how the warm's size was computed (unset or "auto"), for its start line
-    const uint64_t warm_bytes = pagecache_warm_bytes(warm_reserve_, &warm_note);
+    uint64_t warm_bytes = pagecache_warm_bytes(warm_reserve_, &warm_note);   // re-sized after an auto RAM tier is built
     std::vector<std::pair<int32_t, int32_t>> warm_order;
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
@@ -3775,6 +3807,19 @@ bool FileExpertSource::pin_cache_complement(
                      additional_gpu_pairs.size());
     }
     std::fflush(stderr);
+    // the warm never asks for an expert the copy holds: a split's stage regions were added after the budget's filter above
+    warm_order.erase(std::remove_if(warm_order.begin(), warm_order.end(),
+                                    [&](const std::pair<int32_t, int32_t>& pr) {
+                                        return complement_offsets_[(size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second] !=
+                                               kNoComplement;
+                                    }),
+                     warm_order.end());
+    if (budget_auto_ && !warm_order.empty()) {
+        // --resident-budget-gib auto: the warm was sized before the complement took its bytes, so it gets what is left now
+        warm_note.clear();
+        warm_bytes = pagecache_warm_bytes(warm_reserve_, &warm_note);
+        if (warm_bytes == 0) warm_order.clear();
+    }
     if (!warm_order.empty()) {
         if (!warm_note.empty())
             std::fprintf(stderr, "FileExpertSource: page-cache warm starts, up to %.2f GiB%s\n",
@@ -4009,6 +4054,48 @@ int64_t FileExpertSource::commit_flip() {
     staged_.clear();
     exchanges_ += n;
     return n;
+}
+
+int64_t FileExpertSource::coldest_resident_expert(int64_t layer, const std::vector<float>& usage,
+                                                 const std::vector<char>& busy) const {
+    if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || layer >= n_layers_) return -1;
+    int64_t best = -1;
+    float best_u = 0.0f;
+    for (int64_t e = 0; e < n_expert_; ++e) {
+        const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+        if (i >= complement_offsets_.size() || complement_offsets_[i] == kNoComplement) continue;   // not RAM-held
+        if (!override_.empty() && override_[i] != nullptr) continue;                                  // read from an exchange buffer
+        if (i < busy.size() && busy[i]) continue;                                                     // on the GPU, or a swap's `in`
+        bool staged_in = false;
+        for (const Exchange& x : staged_) staged_in = staged_in || x.in == i;
+        if (staged_in) continue;
+        const float u = i < usage.size() ? usage[i] : 0.0f;
+        if (best < 0 || u < best_u) {
+            best = e;
+            best_u = u;
+        }
+    }
+    return best;
+}
+
+bool FileExpertSource::take_resident_place(int64_t layer, int64_t out, const std::vector<float>& usage,
+                                           const std::vector<char>& busy, const uint8_t* bytes) {
+    if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() || bytes == nullptr ||
+        layer < 0 || layer >= n_layers_ || out < 0 || out >= n_expert_) return false;
+    const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
+    if (i_out >= complement_offsets_.size() || complement_offsets_[i_out] != kNoComplement) return false;   // already held
+    const int64_t victim = coldest_resident_expert(layer, usage, busy);
+    if (victim < 0) return false;
+    const size_t i_v = (size_t) layer * (size_t) n_expert_ + (size_t) victim;
+    const uint64_t at = complement_offsets_[i_v], n = layer_blob_bytes_[(size_t) layer];
+    if (at > complement_bytes_ || n > complement_bytes_ - at) return false;   // every check before the copy overwrites the victim
+    // #2134: a Foresight slot may be copying out of the victim's place right now; it is dropped before the place is rewritten
+    ForesightSwap* fs = fs_swap_.load(std::memory_order_acquire);
+    if (fs != nullptr) fs->hold(layer, (int32_t) victim);
+    std::memcpy((uint8_t*) complement_host_ + (size_t) at, bytes, (size_t) n);
+    const bool moved = detail::exchange_cache_complement(complement_offsets_, i_v, i_out);
+    if (fs != nullptr) fs->unhold(layer, (int32_t) victim);
+    return moved;
 }
 
 const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) const {

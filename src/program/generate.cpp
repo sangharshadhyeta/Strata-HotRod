@@ -430,6 +430,10 @@ static const char* pipe_dbg_env(const char* name) {
     return on ? std::getenv(name) : nullptr;
 }
 
+// RAM-tier evictions (--resident-budget-gib with the RAM copy): a RAM place given up for a swap-in read from the files
+// (resident_stage_swaps' victim) or for an expert a K/V grow took out of VRAM (kvg_ensure).  Counted for the work-done line.
+static std::atomic<int64_t> g_ram_evictions{0};
+
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
 // the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
@@ -449,19 +453,34 @@ struct SwapHome {
 };
 template <class Swap, class Locate>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
-                          int64_t n_expert, std::vector<Swap>& swaps, Locate locate) {
+                          int64_t n_expert, const std::vector<float>& usage, std::vector<Swap>& swaps, Locate locate) {
     if (!src.complement_ready() || swaps.empty()) return true;
-    struct Staged { int32_t layer, in, out; int64_t q; };
+    struct Staged { int32_t layer, in, out; int64_t q; bool victim; };
     std::vector<Staged> staged;
     std::vector<SwapHome> used;
     std::vector<Swap> kept;
     kept.reserve(swaps.size());
+    // no victim is an expert on the GPU (the copy holds what the GPU does not), one this round brings in, or a RAM place
+    // already given up (flat index layer * n_expert + expert)
+    std::vector<char> busy(host_res.size(), 0);
+    for (size_t i = 0; i < host_res.size(); ++i) busy[i] = host_res[i] >= 0 ? 1 : 0;
+    for (const Swap& s : swaps) busy[(size_t) s.layer * (size_t) n_expert + (size_t) s.in] = 1;
     for (const Swap& s : swaps) {
-        if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
+        if (src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
+        // `out`'s RAM place: `in`'s own when the copy holds `in`; an `in` read from the files gives up the coldest RAM
+        // place of its layer instead (the victim, evicted from RAM), and the exchange goes on as for an `in` from RAM.
+        // Without a place the swap goes on as it always did, with no exchange.
+        const bool from_ram = src.has_resident(s.layer, s.in);
+        int64_t place = from_ram ? (int64_t) s.in : src.coldest_resident_expert(s.layer, usage, busy);
+        // a victim only when the expert coming down is hotter: a RAM expert used more than `out` stays, `out` goes to the NVMe
+        if (!from_ram && place >= 0 && !usage.empty() &&
+            usage[(size_t) s.layer * (size_t) n_expert + (size_t) place] >= usage[(size_t) s.layer * (size_t) n_expert + (size_t) s.out])
+            place = -1;
+        if (place < 0) { kept.push_back(s); continue; }
         const int64_t q = (int64_t) staged.size();
-        if (q >= src.exchange_capacity()) continue;
+        if (q >= src.exchange_capacity()) { if (!from_ram) kept.push_back(s); continue; }
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
-        if (slot < 0) continue;
+        if (slot < 0) { if (!from_ram) kept.push_back(s); continue; }
         const SwapHome home = locate(s.layer);
         const strata::core::OnDevice on(home.dev);
         if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(q, s.layer), home.cache->device_slot(slot),
@@ -474,7 +493,8 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
         bool seen = false;
         for (const SwapHome& u : used) seen = seen || u.stream == home.stream;
         if (!seen) used.push_back(home);
-        staged.push_back({s.layer, s.in, s.out, q});
+        staged.push_back({s.layer, (int32_t) place, s.out, q, !from_ram});
+        if (!from_ram) busy[(size_t) s.layer * (size_t) n_expert + (size_t) place] = 1;
         kept.push_back(s);
     }
     if (!staged.empty()) {
@@ -491,6 +511,8 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
                              (int) x.in, (int) x.out);
                 return false;
             }
+        for (const Staged& x : staged)
+            if (x.victim) g_ram_evictions.fetch_add(1, std::memory_order_relaxed);
     }
     swaps.swap(kept);
     return true;
@@ -630,6 +652,7 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    bool resident_budget_auto = false;   // --resident-budget-gib auto: resident_budget = the host room, resolved before the file tier is set up
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -2717,9 +2740,13 @@ int main(int argc, char** argv) {
                 o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
         }
         else if (a == "--resident-budget-gib") {
-            const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0\n"); return 2; }
-            o.resident_budget = (uint64_t) (gib * 1073741824.0);
+            // `auto`: the RAM room the page-cache warm's auto uses (host_ram_room_bytes), sized where the file tier is set up
+            const std::string arg = next("--resident-budget-gib");
+            const bool budget_auto = arg == "auto";
+            const double gib = budget_auto ? 0.0 : std::atof(arg.c_str());
+            if (!budget_auto && !(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0 or auto\n"); return 2; }
+            o.resident_budget = budget_auto ? 0 : (uint64_t) (gib * 1073741824.0);
+            o.resident_budget_auto = budget_auto;
             o.mmap_experts = o.resident_cpu_experts = true;
             o.resident_headroom = 4ull << 30;
             // unpinned by default (19 Oct: a pinned 16 GiB tier pressed every other program on a 31 GB box); STRATA_RESIDENT_PIN=1 pins
@@ -5541,6 +5568,23 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (o.resident_budget_auto) {
+        // --resident-budget-gib auto: the room the page-cache warm's auto uses (host_ram_room_bytes, the same sum), or
+        // STRATA_RAM_TIER_GIB=N GiB when that is set.  Taken here, before the file tier reads its budget (set_unbuffered).
+        std::string room_note;
+        uint64_t room = strata::core::host_ram_room_bytes(0, &room_note);
+        if (const char* v = std::getenv("STRATA_RAM_TIER_GIB"); v != nullptr && std::atof(v) > 0) {
+            room = (uint64_t) (std::atof(v) * 1073741824.0);
+            room_note = " (STRATA_RAM_TIER_GIB)";
+        }
+        if (room == 0) {
+            std::fprintf(stderr, "strata generate: --resident-budget-gib auto: no RAM room could be read (/proc/meminfo)\n");
+            return 2;
+        }
+        o.resident_budget = room;
+        std::fprintf(stderr, "strata generate: RAM tier (--resident-budget-gib auto): %.2f GiB%s\n",
+                     (double) room / 1073741824.0, room_note.c_str());
+    }
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     if (o.mmap_experts) {
@@ -7628,7 +7672,24 @@ int main(int argc, char** argv) {
                         ++moved;
                     }
                 }
-                if (vi < 0) host_res[(size_t) oi] = strata::core::kNotResident;
+                if (vi < 0) {
+                    // RAM tier (--resident-budget-gib): the expert leaving VRAM takes a RAM place when the copy does not hold
+                    // it already (the coldest RAM place of its layer gives way).  Copied out of its slot now, before the
+                    // slot's chunk is unmapped below; this loop runs with the device quiesced.
+                    if (src.complement_ready() && !src.has_resident(layer, oi % g.n_expert)) {
+                        std::vector<uint8_t> bytes((size_t) lay.blob_bytes(layer));
+                        if (cudaMemcpy(bytes.data(), xcache.device_slot((int32_t) kvg.lo), bytes.size(),
+                                       cudaMemcpyDeviceToHost) == cudaSuccess) {
+                            std::vector<char> gpu_held(host_res.size(), 0);   // no victim is on the GPU (the table as it stands)
+                            for (size_t k = 0; k < host_res.size(); ++k) gpu_held[k] = host_res[k] >= 0 ? 1 : 0;
+                            if (src.take_resident_place(layer, oi % g.n_expert, drive.d.usage, gpu_held, bytes.data()))
+                                g_ram_evictions.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            (void) cudaGetLastError();
+                        }
+                    }
+                    host_res[(size_t) oi] = strata::core::kNotResident;
+                }
                 ++kvg.evicted;
             }
         }
@@ -7879,6 +7940,7 @@ int main(int argc, char** argv) {
         // kernel drops it) and the warm refills after the request (rewarm)
         strata::prefill::Prefill::set_host_floor_bytes((uint64_t) o.conversation_cache_min_free_mib << 20);
         src.set_warm_reserve(0);
+        src.set_resident_budget_auto(o.resident_budget_auto && o.resident_budget > 0);   // the warm gets what the copy leaves
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);
         std::string whole_err;
@@ -10154,7 +10216,7 @@ int main(int argc, char** argv) {
                 }
                 return {&xcache, adapt_stream, -1};
             };
-            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
+            if (!resident_stage_swaps(src, host_res, g.n_expert, drive.d.usage, swaps, home_of)) return false;
             adapt_nswaps += (int64_t) swaps.size();   // (read after the thread's join)
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
@@ -15210,13 +15272,16 @@ int main(int argc, char** argv) {
             // the work the engine's own helpers did during this request (always on; the differences of lifetime counters): swap rounds and swaps (quality swaps among them),
             // the router look-ahead's predicted experts and the layers it skipped.  A zero beside a busy request is the sign of a helper that stopped.
             {
-                static int64_t prev_rounds = 0, prev_swaps = 0, prev_quality = 0, prev_pred = 0, prev_skip = 0;
+                static int64_t prev_rounds = 0, prev_swaps = 0, prev_quality = 0, prev_pred = 0, prev_skip = 0, prev_evict = 0;
                 const int64_t la_pred = drive.d.lookahead != nullptr ? drive.d.lookahead->predicted() : 0;
                 const int64_t la_skip = drive.d.lookahead != nullptr ? drive.d.lookahead->skipped() : 0;
-                std::fprintf(stderr, "strata serve: work done: swap rounds %lld (%lld swaps, %lld quality), look-ahead %lld predicted experts (%lld layers skipped)%s\n",
+                const int64_t ram_ev = g_ram_evictions.load(std::memory_order_relaxed);
+                std::fprintf(stderr, "strata serve: work done: swap rounds %lld (%lld swaps, %lld quality), ram evictions %lld, look-ahead %lld predicted experts (%lld layers skipped)%s\n",
                              (long long) (life_rounds - prev_rounds), (long long) (life_swaps - prev_swaps), (long long) (life_quality - prev_quality),
+                             (long long) (ram_ev - prev_evict),
                              (long long) (la_pred - prev_pred), (long long) (la_skip - prev_skip), drive.d.lookahead == nullptr ? " [look-ahead off]" : "");
                 prev_rounds = life_rounds; prev_swaps = life_swaps; prev_quality = life_quality; prev_pred = la_pred; prev_skip = la_skip;
+                prev_evict = ram_ev;
             }
             // a low draft acceptance is a silent slowdown (solid.cpp's page: an MTP head drafting at 0.19 runs about 2x slower): said once, with its numbers and
             // what to check.  Typical here 0.55 to 0.8; 300 drafts offered make the share a fair reading.
@@ -16003,7 +16068,7 @@ int main(int argc, char** argv) {
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             // this (non-serve) path refills CUDA0's cache only, so its copies back read CUDA0's cache too
-            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps,
+            if (!resident_stage_swaps(src, host_res, g.n_expert, drive.d.usage, swaps,
                                       [&](int64_t) -> SwapHome { return {&xcache, adapt_stream, -1}; })) {
                 std::fprintf(stderr, "strata generate: an adaptive refill failed (copying evicted experts back)\n");
                 return false;
