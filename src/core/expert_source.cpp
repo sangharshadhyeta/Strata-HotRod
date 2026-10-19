@@ -561,6 +561,11 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
 
 FileExpertSource::~FileExpertSource() { close(); }
 
+// The microseconds since `t0` (the timers below: a clock read and an atomic add each, on paths that run per blob or per window).
+static inline uint64_t us_since(std::chrono::steady_clock::time_point t0) {
+    return (uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+}
+
 #if defined(__linux__)
 namespace {
 /// Bytes of [p, p + n) whose pages are in the page cache (mincore, page-granular); 0 when the call fails.
@@ -655,6 +660,14 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     c.pf_unused = io_pf_unused_.load(std::memory_order_relaxed);
     c.crit_us = io_crit_us_.load(std::memory_order_relaxed);
     c.crit_n = io_crit_n_.load(std::memory_order_relaxed);
+    c.blob_n = n_blob_.load(std::memory_order_relaxed);
+    c.blob_us = t_blob_us_.load(std::memory_order_relaxed);
+    c.blob_lock_us = t_blob_lock_us_.load(std::memory_order_relaxed);
+    c.blob_wait_us = t_blob_wait_us_.load(std::memory_order_relaxed);
+    c.pf_calls = n_pf_calls_.load(std::memory_order_relaxed);
+    c.pf_probe_us = t_pf_probe_us_.load(std::memory_order_relaxed);
+    c.pf_fill_us = t_pf_fill_us_.load(std::memory_order_relaxed);
+    c.pf_thread_us = t_pf_thread_us_.load(std::memory_order_relaxed);
     return c;
 }
 
@@ -681,6 +694,7 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     io_threads_ = threads > 0 ? threads : 8;
     if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::atoi(v) != 0;
+    if (const char* v = std::getenv("STRATA_IO_DEMAND_FIRST")) io_demand_first_ = std::atoi(v) != 0;
     {   // experts.bin: fill the page cache from the workers and let the kernels read the mapping; otherwise stage.
         // solid-wins fork: staging is the DEFAULT (SPEC.md T1 measured the staged variant; the fill variant was not
         // measured on this box). STRATA_IO_PF_STAGE=0 selects the fill variant.
@@ -698,15 +712,29 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
 }
 
 void FileExpertSource::io_stop() {
+    std::deque<std::pair<int32_t, int32_t>> left;   // demand reads no worker took: their reservations are released below
     {
         std::lock_guard<std::mutex> lk(io_mu_);
         io_quit_ = true;
         io_q_.clear();
+        left.swap(io_dq_);
     }
     io_cv_.notify_all();
     for (std::thread& t : io_workers_)
         if (t.joinable()) t.join();
     io_workers_.clear();
+    if (!left.empty()) {
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        for (const auto& d : left) {
+            const auto it = stage_of_.find((int64_t) d.first * n_expert_ + d.second);
+            if (it == stage_of_.end() || !stage_queued_[it->second]) continue;
+            const size_t v = it->second;
+            stage_queued_[v] = 0;
+            stage_busy_[v] = 0;
+            stage_key_[v] = -1;
+            stage_of_.erase(it);
+        }
+    }
 #if defined(__linux__)
     for (int f : io_fds_) ::close(f);
 #endif
@@ -718,11 +746,18 @@ void FileExpertSource::io_stop() {
 void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (io_q_.size() >= 512) {   // the predictions run ahead of the reads: the oldest are the stalest
-            io_q_.pop_front();
-            io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
+        if (io_demand_first_ && pos == kPosDemand) {   // a demand read: the workers take it before any guess
+            // a guess already queued for this blob is promoted (taken off the read-ahead queue), not read twice
+            for (auto it = io_q_.begin(); it != io_q_.end(); ++it)
+                if (it->first == (int32_t) layer && (it->second & 0xffff) == (int32_t) (expert & 0xffff)) { io_q_.erase(it); break; }
+            io_dq_.emplace_back((int32_t) layer, (int32_t) (expert & 0xffff));
+        } else {
+            if (io_q_.size() >= 512) {   // the predictions run ahead of the reads: the oldest are the stalest
+                io_q_.pop_front();
+                io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
+            }
+            io_q_.emplace_back((int32_t) layer, (int32_t) expert);
         }
-        io_q_.emplace_back((int32_t) layer, (int32_t) expert);
     }
     io_cv_.notify_one();
 }
@@ -732,16 +767,44 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
 void FileExpertSource::io_worker() {
     for (;;) {
         int32_t layer, expert;
+        bool demand = false;
         {
             std::unique_lock<std::mutex> lk(io_mu_);
-            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty(); });
+            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty() || !io_dq_.empty(); });
             if (io_quit_) return;
-            layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
-            expert = io_q_.back().second;
-            io_q_.pop_back();
+            demand = !io_dq_.empty();     // STRATA_IO_DEMAND_FIRST: the decode's demand reads first, then the predictions
+            layer = demand ? io_dq_.front().first : io_q_.back().first;   // the newest prediction first: it is the layer that comes next
+            expert = demand ? io_dq_.front().second : io_q_.back().second;
+            if (demand) io_dq_.pop_front();
+            else io_q_.pop_back();
         }
         io_pf_jobs_.fetch_add(1, std::memory_order_relaxed);
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+        if (demand && !io_fill_) {   // a demand read: the buffer prefetch() reserved for it (nothing when the decode read it first)
+            size_t v = 0;
+            uint8_t* dst = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(stage_mu_);
+                const auto it = stage_of_.find((int64_t) layer * n_expert_ + expert);
+                if (it == stage_of_.end() || !stage_queued_[it->second]) continue;
+                v = it->second;
+                stage_queued_[v] = 0;
+                dst = stage_buf_[v].get();
+            }
+            const bool ok = copy_from_files(layer, expert, dst);
+            io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
+            if (ok) file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(stage_mu_);
+                stage_busy_[v] = 0;
+                if (!ok) {
+                    stage_of_.erase(stage_key_[v]);
+                    stage_key_[v] = -1;
+                }
+            }
+            stage_cv_.notify_all();
+            continue;
+        }
         if (complement_ready_ && resident_blob(index) != nullptr) continue;
         if (!override_.empty() && override_[index] != nullptr) continue;
         if (io_fill_) {   // read what is not cached into a scratch buffer: the pages stay in the page cache for the kernels
@@ -814,7 +877,9 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
     }
     bool have;
     {
+        const auto tl = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lk(stage_mu_);
+        t_blob_lock_us_.fetch_add(us_since(tl), std::memory_order_relaxed);
         have = stage_of_.find(key) != stage_of_.end();
     }
     if (!have) {
@@ -832,6 +897,7 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
 
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
+    if (const char* v = std::getenv("STRATA_FILL_POOL")) fill_pool_on_ = std::atoi(v) != 0;
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
     const auto& layout = strata::kernels::cpu::expert_layout();
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
@@ -1005,6 +1071,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 void FileExpertSource::close() {
     stop_pagecache_warm();
     io_stop();
+    stop_fill_pool();
     inputs_.clear();
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
@@ -1075,6 +1142,7 @@ void FileExpertSource::close() {
         stage_used_.clear();
         stage_busy_.clear();
         stage_pf_.clear();
+        stage_queued_.clear();
         stage_of_.clear();
         stage_blob_ = 0;
         stage_seq_ = 0;
@@ -1092,6 +1160,8 @@ void FileExpertSource::close() {
     io_cached_.store(0); io_uncached_.store(0); io_pread_bytes_.store(0); io_pread_us_.store(0); io_pread_n_.store(0);
     io_pf_jobs_.store(0); io_pf_blobs_.store(0); io_pf_skips_.store(0); io_pf_dropped_.store(0);
     io_pf_used_.store(0); io_pf_unused_.store(0); io_crit_us_.store(0); io_crit_n_.store(0);
+    t_blob_us_.store(0); t_blob_lock_us_.store(0); t_blob_wait_us_.store(0); n_blob_.store(0);
+    t_pf_probe_us_.store(0); t_pf_fill_us_.store(0); t_pf_thread_us_.store(0); n_pf_calls_.store(0);
 #if defined(_WIN32)
     if (base_ != nullptr && !unmapped_) UnmapViewOfFile((LPCVOID) base_);
     unmapped_ = false;
@@ -1335,6 +1405,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         stage_used_.push_back(0);
         stage_busy_.push_back(0);
         stage_pf_.push_back(0);
+        stage_queued_.push_back(0);
         if (stage_buf_.size() == 512 && !stage_grew_) {
             stage_grew_ = true;
             std::fprintf(stderr, "FileExpertSource: %zu blobs assembled from the GGUF are in use at once (%.2f GiB)\n",
@@ -1436,13 +1507,24 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
         io_crit_n_.fetch_add(1, std::memory_order_relaxed);
     };
     {
+        const auto tl = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lk(stage_mu_);
+        t_blob_lock_us_.fetch_add(us_since(tl), std::memory_order_relaxed);
         const bool have = claim_stage(key, v, fill);
         if (!have && !fill) return nullptr;
         dst = stage_buf_[v].get();
+        if (have && stage_queued_[v]) {   // reserved for a demand read no worker has started yet: this thread reads it
+            stage_queued_[v] = 0;
+            lk.unlock();
+            const bool ok = fill_stage(v, layer, expert, dst);
+            crit();
+            return ok ? dst : nullptr;
+        }
         if (have) {
             // another thread (a prefetch, the adaptive tier) is filling it: wait for that
+            const auto tw = std::chrono::steady_clock::now();
             stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
+            t_blob_wait_us_.fetch_add(us_since(tw), std::memory_order_relaxed);
             if (stage_key_[v] != key) return nullptr;   // its fill failed
             lk.unlock();
             crit();
@@ -1470,12 +1552,18 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
         }
         return;
     }
+    n_pf_calls_.fetch_add(1, std::memory_order_relaxed);
     std::vector<Fill> todo;
     // experts.bin with io prefetch: a blob whose pages are cached is handed out as the mapping (io_blob); only the
     // uncached ones are read here, together, on the fetch threads
     const bool only_uncached = io_pf_ && role_ptr_.empty() && direct_.empty();
+    // STRATA_IO_DEMAND_FIRST: the uncached ones are reserved here and queued as demand reads for the workers (the decode
+    // waits on them in staged_blob); nothing is read on this thread
+    const bool demand = only_uncached && io_demand_first_;
+    std::vector<int64_t> reserved;
     std::vector<char> cold;
     if (only_uncached) {
+        const auto tp = std::chrono::steady_clock::now();
         cold.assign((size_t) n, 0);
         for (int64_t i = 0; i < n; ++i) {
             const int64_t e = experts[i];
@@ -1483,6 +1571,7 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             uint64_t total = 0;
             cold[(size_t) i] = cached_bytes(layer, e, total, false) < total ? 1 : 0;
         }
+        t_pf_probe_us_.fetch_add(us_since(tp), std::memory_order_relaxed);
     }
     const auto t0 = std::chrono::steady_clock::now();
     {
@@ -1498,7 +1587,13 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             size_t v = 0;
             bool fill = false;
             if (!claim_stage(layer * n_expert_ + e, v, fill) && fill) {
-                todo.push_back({v, layer, e, stage_buf_[v].get()});
+                if (demand) {
+                    stage_queued_[v] = 1;                     // reserved; a worker reads it (or the decode, if it asks first)
+                    reserved.push_back(e);
+                    io_pf_demand_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    todo.push_back({v, layer, e, stage_buf_[v].get()});
+                }
                 if (warm_stamp_) {
                     const uint32_t s = warm_stamp_[index].load(std::memory_order_relaxed);
                     if (s != 0 && (uint64_t) s + 3 >= epoch_ + 1) warm_hits_.fetch_add(1, std::memory_order_relaxed);
@@ -1506,7 +1601,10 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             }
         }
     }
+    for (const int64_t e : reserved) io_enqueue(layer, e, kPosDemand);
+    const auto tf = std::chrono::steady_clock::now();
     fill_many(todo);
+    t_pf_fill_us_.fetch_add(us_since(tf), std::memory_order_relaxed);
     if (io_pf_ && !todo.empty()) {
         io_crit_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                               std::memory_order_relaxed);
@@ -1568,10 +1666,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
             }
         };
         const size_t nt = std::min<size_t>(4, (todo.size() + 15) / 16);
-        std::vector<std::thread> th;
-        for (size_t t = 1; t < nt; ++t) th.emplace_back(work);
-        work();
-        for (auto& t : th) t.join();
+        run_fill(nt, work);
         return;
     }
 #if defined(_WIN32)
@@ -1605,10 +1700,84 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
             (void) fill_stage(todo[i].v, todo[i].layer, todo[i].e, todo[i].dst);
     };
     const size_t nt = std::min<size_t>(todo.size(), (size_t) fetch_threads_);
-    std::vector<std::thread> th;
-    for (size_t t = 1; t < nt; ++t) th.emplace_back(work);
+    run_fill(nt, work);
+}
+
+// `work` on this thread and on nt - 1 helpers, and back only when all of them are done.  The default starts the helpers
+// for this call and joins them (STRATA_FILL_POOL unset: as before this change).  STRATA_FILL_POOL=1: the helpers are the
+// persistent fill_th_ (created by the first call), and this call is one job for them (see FillJob).
+void FileExpertSource::run_fill(size_t nt, const std::function<void()>& work) {
+    if (nt <= 1) {
+        work();
+        return;
+    }
+    if (!fill_pool_on_) {
+        std::vector<std::thread> th;
+        const auto tc = std::chrono::steady_clock::now();
+        for (size_t t = 1; t < nt; ++t) th.emplace_back(work);
+        t_pf_thread_us_.fetch_add(us_since(tc), std::memory_order_relaxed);
+        work();
+        const auto tj = std::chrono::steady_clock::now();
+        for (auto& t : th) t.join();
+        t_pf_thread_us_.fetch_add(us_since(tj), std::memory_order_relaxed);
+        return;
+    }
+    FillJob job;
+    job.fn = &work;
+    {
+        std::lock_guard<std::mutex> lk(fill_mu_);
+        if (fill_th_.empty()) {   // the persistent helpers: fetch_threads_ - 1 of them, made by the first pooled call
+            const size_t n = (size_t) std::max(1, fetch_threads_ - 1);
+            for (size_t i = 0; i < n; ++i) fill_th_.emplace_back([this] { fill_worker(); });
+        }
+        job.want = std::min(nt - 1, fill_th_.size());
+        if (job.want > 0) fill_q_.push_back(&job);
+    }
+    fill_cv_.notify_all();
     work();
-    for (auto& t : th) t.join();
+    const auto tj = std::chrono::steady_clock::now();
+    {
+        std::unique_lock<std::mutex> lk(fill_mu_);
+        const auto it = std::find(fill_q_.begin(), fill_q_.end(), &job);
+        if (it != fill_q_.end()) fill_q_.erase(it);   // slots no helper took: none will come now
+        fill_done_cv_.wait(lk, [&] { return job.finished == job.started; });   // the helpers that took one are still in it
+    }
+    t_pf_thread_us_.fetch_add(us_since(tj), std::memory_order_relaxed);
+}
+
+// A persistent helper of run_fill: takes the front job's next slot, runs it, and counts it finished.
+void FileExpertSource::fill_worker() {
+    for (;;) {
+        FillJob* job = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(fill_mu_);
+            fill_cv_.wait(lk, [&] { return fill_quit_ || !fill_q_.empty(); });
+            if (fill_quit_) return;
+            job = fill_q_.front();
+            if (++job->started >= job->want) fill_q_.pop_front();   // every slot taken: the next job is at the front
+        }
+        (*job->fn)();
+        {
+            std::lock_guard<std::mutex> lk(fill_mu_);
+            ++job->finished;
+        }
+        fill_done_cv_.notify_all();
+    }
+}
+
+// Joins the helpers (close): no run_fill is in flight by then.
+void FileExpertSource::stop_fill_pool() {
+    {
+        std::lock_guard<std::mutex> lk(fill_mu_);
+        fill_quit_ = true;
+    }
+    fill_cv_.notify_all();
+    for (std::thread& t : fill_th_)
+        if (t.joinable()) t.join();
+    fill_th_.clear();
+    std::lock_guard<std::mutex> lk(fill_mu_);
+    fill_quit_ = false;
+    fill_q_.clear();
 }
 
 uint64_t FileExpertSource::expert_bytes() const {
@@ -1864,6 +2033,7 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
         stage_used_.clear();
         stage_busy_.clear();
         stage_pf_.clear();
+        stage_queued_.clear();
         stage_of_.clear();
         stage_blob_ = 0;
     }
@@ -3807,6 +3977,14 @@ int FileExpertSource::blob_parts(int64_t layer, int64_t expert, BlobPart* out) {
 
 const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+    struct Timed {   // the call's wall time (t_blob_us_, n_blob_), whichever way it returns
+        FileExpertSource* s;
+        std::chrono::steady_clock::time_point t0;
+        ~Timed() {
+            s->t_blob_us_.fetch_add(us_since(t0), std::memory_order_relaxed);
+            s->n_blob_.fetch_add(1, std::memory_order_relaxed);
+        }
+    } timed{this, std::chrono::steady_clock::now()};
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint8_t* result = nullptr;
     bool from_files = true;

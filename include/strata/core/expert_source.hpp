@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -919,6 +920,8 @@ public:
         uint64_t pf_used = 0, pf_unused = 0;                 ///< prefetched blobs a layer then used / never used
         uint64_t crit_us = 0;                                ///< wall time the decode waited on file reads (prefetch + staged_blob)
         uint64_t crit_n = 0;
+        uint64_t blob_n = 0, blob_us = 0, blob_lock_us = 0, blob_wait_us = 0;   ///< blob() calls, their wall time, the stage_mu_ wait and the stage_cv_ wait inside
+        uint64_t pf_calls = 0, pf_probe_us = 0, pf_fill_us = 0, pf_thread_us = 0;   ///< prefetch() calls (file tier, io prefetch): residency probes, fills, thread create/join (or pool hand-off) inside the fills
     };
     IoCounters io_counters() const;
 
@@ -935,6 +938,10 @@ private:
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
+    /// Runs `work` on this thread and on nt - 1 helpers: new threads per call, or STRATA_FILL_POOL=1's persistent ones (fill_th_).
+    void run_fill(size_t nt, const std::function<void()>& work);
+    void fill_worker();
+    void stop_fill_pool();
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
@@ -1018,6 +1025,24 @@ private:
     std::deque<std::pair<int32_t, int32_t>> io_q_;   ///< (layer, expert) to read ahead
     bool io_quit_ = false;
     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
+    // STRATA_IO_DEMAND_FIRST=1: prefetch() reserves a stage buffer for each blob the layer needs and does not have, and queues
+    // it in io_dq_; the workers drain io_dq_ before the read-ahead queue.  stage_queued_: the reservation no worker has started
+    // yet (a blob() asking for it reads it itself).  Unset: both stay empty and nothing changes.
+    bool io_demand_first_ = false;
+    std::deque<std::pair<int32_t, int32_t>> io_dq_;   ///< (layer, expert) demand reads, FIFO
+    std::vector<char> stage_queued_;                  ///< per stage buffer: reserved for a demand read no worker has started
+    // STRATA_FILL_POOL=1: fill_many's helper threads, created once and joined at close().  A job is one run_fill call: helpers
+    // take it while it has slots, the caller runs its own share, then waits for the helpers that took a slot.
+    bool fill_pool_on_ = false;
+    struct FillJob { const std::function<void()>* fn = nullptr; size_t want = 0, started = 0, finished = 0; };
+    std::mutex fill_mu_;
+    std::condition_variable fill_cv_, fill_done_cv_;
+    std::deque<FillJob*> fill_q_;
+    std::vector<std::thread> fill_th_;
+    bool fill_quit_ = false;
+    // timers (cumulative, microseconds; io_counters): blob() and prefetch() wall time and the waits inside them
+    std::atomic<uint64_t> t_blob_us_{0}, t_blob_lock_us_{0}, t_blob_wait_us_{0}, n_blob_{0};
+    std::atomic<uint64_t> t_pf_probe_us_{0}, t_pf_fill_us_{0}, t_pf_thread_us_{0}, n_pf_calls_{0};
     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
