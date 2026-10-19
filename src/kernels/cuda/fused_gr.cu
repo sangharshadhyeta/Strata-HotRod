@@ -950,25 +950,29 @@ __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const flo
 }
 
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
-__device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t, int k0 = 0) {
-    for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
+// `nt` is the block's thread count (WPC * 32): the tile is copied by whichever threads the block has.
+__device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t, int nt, int k0 = 0) {
+    for (int i = t; i < T * (H_TILE / 4); i += nt) {
         const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
         const float* src = m.xn + (size_t) (k0 + k) * D + (size_t) h * H_TILE + (size_t) s4 * 4;
         cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
     }
 }
 
-template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+// WPC warps per block (STRATA_GR_DOWN_WPC): one warp per output row as always, so the grid is LR / WPC row blocks
+// plus ceil(HC / WPC) inject blocks (41 / 81 / 162 at WPC 8 / 4 / 2).  The activation tile is per block, not per warp.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, int WPC = WARPS>
 __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
     extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+    constexpr int NT = WPC * 32;                        // threads per block
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = EXACT_T ? MAX_T : m.T;
     // sm_75: a launch of EXACT_T groups of MAX_T tokens, one per blockIdx.y (gridDim.y 1: the whole launch); every
     // (row, token) is summed by one warp exactly as before - only more blocks share the card (#down-tg)
     const int k0 = EXACT_T ? (int) blockIdx.y * MAX_T : 0;
-    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
-    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
-    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const bool inject_block = blockIdx.x >= LR / WPC;
+    const int row = inject_block ? (blockIdx.x - LR / WPC) * WPC + warp : blockIdx.x * WPC + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || row >= HC));
     const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
     const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
     const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
@@ -980,9 +984,9 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
 #pragma unroll
         for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
     }
-    stage_htile(m, T, 0, hbuf, t, k0);
+    stage_htile(m, T, 0, hbuf, t, NT, k0);
     cp_async_commit();
-    stage_htile(m, T, 1, hbuf + buf_f4, t, k0);
+    stage_htile(m, T, 1, hbuf + buf_f4, t, NT, k0);
     cp_async_commit();
 #pragma unroll 1
     for (int h = 0; h < N_HTILES; ++h) {
@@ -1009,7 +1013,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
             }
         }
         __syncthreads();                                // every warp is done with buffer h & 1
-        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, k0);
+        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, NT, k0);
         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
         if (h + 1 < N_HTILES) {
 #pragma unroll
@@ -1115,6 +1119,22 @@ int down_chunk(bool staged, int* tile_out) {
         set_staged_attr(gr_down_staged_kernel<6, true>, 6);
         set_staged_attr(gr_down_staged_kernel<4, false>, 4);
         set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
+        set_staged_attr(gr_down_staged_kernel<1, true, 4>, 1);
+        set_staged_attr(gr_down_staged_kernel<2, true, 4>, 2);
+        set_staged_attr(gr_down_staged_kernel<3, true, 4>, 3);
+        set_staged_attr(gr_down_staged_kernel<4, true, 4>, 4);
+        set_staged_attr(gr_down_staged_kernel<5, true, 4>, 5);
+        set_staged_attr(gr_down_staged_kernel<6, true, 4>, 6);
+        set_staged_attr(gr_down_staged_kernel<4, false, 4>, 4);
+        set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false, 4>, kFusedGrMaxT);
+        set_staged_attr(gr_down_staged_kernel<1, true, 2>, 1);
+        set_staged_attr(gr_down_staged_kernel<2, true, 2>, 2);
+        set_staged_attr(gr_down_staged_kernel<3, true, 2>, 3);
+        set_staged_attr(gr_down_staged_kernel<4, true, 2>, 4);
+        set_staged_attr(gr_down_staged_kernel<5, true, 2>, 5);
+        set_staged_attr(gr_down_staged_kernel<6, true, 2>, 6);
+        set_staged_attr(gr_down_staged_kernel<4, false, 2>, 4);
+        set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false, 2>, kFusedGrMaxT);
         cudaGetLastError();      // drop any error the attempt left behind
         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
@@ -1159,6 +1179,17 @@ bool gr_down_max4() {
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
+}
+
+// STRATA_GR_DOWN_WPC=8 (default: the launch as it was), 4 or 2: warps per block of the staged down kernel. One warp
+// still sums one row, so the bits are the same; only the grid (41 / 81 / 162 blocks) and the warps sharing a tile change.
+int down_wpc() {
+    static const int wpc = [] {
+        const char* v = std::getenv("STRATA_GR_DOWN_WPC");
+        const int w = v != nullptr ? std::atoi(v) : WARPS;
+        return w == 2 || w == 4 || w == 8 ? w : WARPS;
+    }();
+    return wpc;
 }
 
 // the split norm with registers (gr_norm_split_fast_kernel): gfx12 only until another arch is measured;
@@ -1229,6 +1260,29 @@ int down_tg(int ct) {
     return per_dev[dev] == 2 && (ct == 4 || ct == 6) ? 2 : 0;
 #endif
 }
+// The staged down launch of ct tokens with WPC warps per block (gr_down_staged_kernel<..., WPC>); tg > 0 cuts the
+// tokens into tg-token block rows along gridDim.y, as launch_multi always did.
+template <int WPC>
+void launch_down_staged(const GrMulti& c, int ct, size_t per_tok, int tg, bool exact_t, bool max4, size_t smem, cudaStream_t st) {
+    constexpr int NT = WPC * 32;                                          // threads per block
+    constexpr unsigned NB = (unsigned) (LR / WPC + (HC + WPC - 1) / WPC); // the row blocks, then the inject blocks
+    if (exact_t && tg > 0 && tg < ct) {
+        const dim3 grid(NB, (unsigned) (ct / tg));
+        const size_t sm_g = (size_t) tg * per_tok;
+        if (tg == 1) gr_down_staged_kernel<1, true, WPC><<<grid, NT, sm_g, st>>>(c);
+        else if (tg == 2) gr_down_staged_kernel<2, true, WPC><<<grid, NT, sm_g, st>>>(c);
+        else gr_down_staged_kernel<3, true, WPC><<<grid, NT, sm_g, st>>>(c);
+    } else
+    if (exact_t && ct == 1) gr_down_staged_kernel<1, true, WPC><<<NB, NT, smem, st>>>(c);
+    else if (exact_t && ct == 2) gr_down_staged_kernel<2, true, WPC><<<NB, NT, smem, st>>>(c);
+    else if (exact_t && ct == 3) gr_down_staged_kernel<3, true, WPC><<<NB, NT, smem, st>>>(c);
+    else if (exact_t && ct == 4) gr_down_staged_kernel<4, true, WPC><<<NB, NT, smem, st>>>(c);
+    else if (exact_t && ct == 5) gr_down_staged_kernel<5, true, WPC><<<NB, NT, smem, st>>>(c);
+    else if (exact_t && ct == 6) gr_down_staged_kernel<6, true, WPC><<<NB, NT, smem, st>>>(c);
+    else if (max4) gr_down_staged_kernel<4, false, WPC><<<NB, NT, smem, st>>>(c);
+    else gr_down_staged_kernel<kFusedGrMaxT, false, WPC><<<NB, NT, smem, st>>>(c);
+}
+
 void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
     const bool q8w = m.a[0].s_down != nullptr;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
@@ -1277,21 +1331,10 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
             const int tg = down_tg(ct);
-            if (exact_t && tg > 0 && tg < ct) {
-                const dim3 grid(DOWN_BLOCKS + 1, (unsigned) (ct / tg));
-                const size_t sm_g = (size_t) tg * per_tok;
-                if (tg == 1) gr_down_staged_kernel<1, true><<<grid, THREADS, sm_g, st>>>(c);
-                else if (tg == 2) gr_down_staged_kernel<2, true><<<grid, THREADS, sm_g, st>>>(c);
-                else gr_down_staged_kernel<3, true><<<grid, THREADS, sm_g, st>>>(c);
-            } else
-            if (exact_t && ct == 1) gr_down_staged_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else if (exact_t && ct == 2) gr_down_staged_kernel<2, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else if (exact_t && ct == 3) gr_down_staged_kernel<3, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else if (exact_t && ct == 4) gr_down_staged_kernel<4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else if (exact_t && ct == 5) gr_down_staged_kernel<5, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else if (exact_t && ct == 6) gr_down_staged_kernel<6, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else if (max4) gr_down_staged_kernel<4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else gr_down_staged_kernel<><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+            const int wpc = down_wpc();   // STRATA_GR_DOWN_WPC: 8 (default), 4 or 2 warps per block
+            if (wpc == 4) launch_down_staged<4>(c, ct, per_tok, tg, exact_t, max4, smem, st);
+            else if (wpc == 2) launch_down_staged<2>(c, ct, per_tok, tg, exact_t, max4, smem, st);
+            else launch_down_staged<WARPS>(c, ct, per_tok, tg, exact_t, max4, smem, st);
         } else if (tv == 1280) {
             if (q8w) {   // STRATA_HC_REQ8
                 if (max4) gr_down_multi_kernel<1280, 4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
