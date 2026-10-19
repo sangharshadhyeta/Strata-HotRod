@@ -7743,6 +7743,8 @@ int main(int argc, char** argv) {
             src.stage_lend_regions(std::move(stage_lends));
         }
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
+        // the page-cache warm leaves free what the prompt path pins for the longest prompt --max-context allows
+        src.set_warm_reserve(strata::prefill::Prefill::layer_major_host_bytes(o.max_context));
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);
         std::string whole_err;
@@ -7855,10 +7857,13 @@ int main(int argc, char** argv) {
 #endif
     }
     // files mode (no RAM budget, no RAM copy): the file cache is the expert tier, so the page-cache warm asks for the ranked
-    // experts no GPU cache holds, hottest first (STRATA_PAGECACHE_WARM_GIB, opt in).  With --resident-cpu-experts and no
-    // budget the RAM copy holds every expert, so there is nothing to warm then.
-    if (!o.resident_cpu_experts && srcp == &src && o.mmap_experts && xcache.valid())
+    // experts no GPU cache holds, hottest first (STRATA_PAGECACHE_WARM_GIB; default: what is free beyond the prompt path's
+    // pinned buffers for --max-context and the kernel's watermarks).  With --resident-cpu-experts and no budget the RAM copy
+    // holds every expert, so there is nothing to warm then.
+    if (!o.resident_cpu_experts && srcp == &src && o.mmap_experts && xcache.valid()) {
+        src.set_warm_reserve(strata::prefill::Prefill::layer_major_host_bytes(o.max_context));
         src.start_files_pagecache_warm(xcache, profile_all.empty() ? profile : profile_all);
+    }
     // (the arena mode has no RAM copy to exchange with: its experts are always in RAM, the tier only copies them in)
     if (o.adapt_async && !src.complement_ready() && srcp != &arena_src) adapt_async_off("the resident RAM mode is not running");
     // pp-opt: with the file tier unbuffered, the mapped view of experts.bin is only a fallback from here on - and while

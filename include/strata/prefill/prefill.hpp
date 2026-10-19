@@ -86,6 +86,9 @@ public:
     /// stages only the experts it routes to.  1024, or STRATA_PREFILL_STREAM_MIN, or the CPU share's limit once that
     /// is armed (3072 when STRATA_PREFILL_CPU_SHARE is set).
     static int64_t stream_all_min_tokens();
+    /// The pinned host memory a layer-major prompt of `n_tokens` allocates (its residual, row scales and xn16 images, the
+    /// bf16x2 low part counted): what the page-cache warm must leave free for the longest prompt --max-context allows.
+    static uint64_t layer_major_host_bytes(int64_t n_tokens);
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk

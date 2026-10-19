@@ -2074,6 +2074,14 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
 double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 
+uint64_t Prefill::layer_major_host_bytes(int64_t n_tokens) {
+    if (n_tokens <= 0) return 0;
+    // run_impl's cudaHostAlloc of lmh: R (D floats), grs (HC floats), xn (lm_xs uint16) and xnlo (D uint16, bf16x2 only -
+    // counted always: the warm's reserve may be a little generous, never short)
+    const uint64_t lm_xs = (uint64_t) (D + (hc_pad() ? XN_PAD : 0));
+    return (uint64_t) n_tokens * ((uint64_t) D * 4 + (uint64_t) HC * 4 + lm_xs * 2 + (uint64_t) D * 2);
+}
+
 // --prefill-pipe (opt-in; STRATA_PREFILL_PIPE): a layer split reads a prompt as a pipeline - stage s reads chunk c while
 // stage s+1 reads chunk c-1. A stage-chunk costs its layers x (b + a C): a fixed part per chunk (b: the pass over the
 // layer's experts - dequantized, or streamed over PCIe where they are not in VRAM) and a part per token (a). The prompt

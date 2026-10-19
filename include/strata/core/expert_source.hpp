@@ -717,6 +717,10 @@ public:
     /// Files mode (no RAM budget, no RAM copy; generate.cpp): the page-cache warm over `rank` (hottest first), skipping
     /// the experts `cache` holds on a GPU, up to STRATA_PAGECACHE_WARM_GIB (opt in, Linux).  A no-op when that is unset.
     void start_files_pagecache_warm(const ExpertCache& cache, const std::vector<std::pair<int32_t, int32_t>>& rank);
+    /// What the page-cache warm leaves free for the engine's own later allocations (generate.cpp: the prompt path's pinned
+    /// buffers for the longest prompt --max-context allows).  Set before the warm starts; the kernel's high watermarks are
+    /// added to it when the warm is sized.
+    void set_warm_reserve(uint64_t bytes) { warm_reserve_ = bytes; }
     /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
     /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
     /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,
@@ -1069,6 +1073,7 @@ private:
     };
     PageWarm warm_;
     std::thread warm_thread_;
+    uint64_t warm_reserve_ = 0;   // set_warm_reserve
     /// Starts the warm over `order` (hottest first, the experts the tier does not hold) until `budget_bytes` of blobs.
     void start_pagecache_warm(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget_bytes);
     /// Stops and joins the warm thread (a no-op when none runs); close() calls it first.
