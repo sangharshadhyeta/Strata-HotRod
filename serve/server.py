@@ -4737,10 +4737,6 @@ class Service:
                                     print(f"[strata] {note}", flush=True)
                             except Exception as e:
                                 print(f"[strata] prompt cache (after): {e!r}", flush=True)
-                        elif self.pcache is not None and not par and not emb:
-                            # a turn that ended otherwise (cancel, error, recovery) may have changed what the engine
-                            # holds: a pending save-on-switch must not save a state it no longer names
-                            self.pcache.forget()
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
@@ -7182,7 +7178,10 @@ def main() -> int:
                 state_args.append(x)
             fp = hashlib.sha256(json.dumps([cfg.get("model_name"), exe, st_exe.st_size if st_exe else 0, st_exe.st_mtime_ns if st_exe else 0,
                                             state_args], sort_keys=True, default=str).encode()).hexdigest()[:32]
+            # only reads of 16k+ tokens are saved (a re-read of 25 s or more): 19 Oct, 432 saves wrote 369 GB to the expert drive
+            # for 12 restores - the next request almost always continues in RAM.  ("prompt_cache_min_read" overrides.)
             svc.pcache = PromptCache(slot_save_dir(cfg["prompt_cache_path"], cfg.get("cwd")), fp,
+                                     min_read=int(cfg.get("prompt_cache_min_read") or 16384),
                                      limit_bytes=int(cfg["prompt_cache_gib"] * (1 << 30)) if cfg.get("prompt_cache_gib") else None)
         except (ValueError, OSError) as e:
             raise SystemExit(f"[strata] prompt cache: {e}")
@@ -7285,11 +7284,7 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        def flush_prompt_cache():   # save on switch: the conversation the engine still holds is saved before it ends
-            note = svc.pcache.flush(engine) if getattr(svc, "pcache", None) is not None else None
-            if note:
-                print(f"[strata] {note}", flush=True)
-        closers = [httpd.shutdown, flush_prompt_cache, getattr(engine, "close", None), vision.shutdown if vision else None,
+        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:

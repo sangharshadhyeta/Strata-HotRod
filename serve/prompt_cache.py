@@ -31,13 +31,6 @@ class PromptCache:
         self.limit_bytes = limit_bytes    # None: an eighth of the free disk, between 1 GiB and 256 GiB (solid's rule)
         self.held: list[int] | None = None   # what the engine holds now, as far as this server knows (a hint: the engine checks)
         self.held_gen = None                 # ... and the engine process it was true of
-        # Save on switch (19 Oct): a long read is not saved at once - the next request almost always continues the same
-        # conversation, which the engine reuses from RAM (641 of 953 requests in the log), and only 12 of 432 saves (369 GB
-        # written, ~0.65 s each at the end of the response) were ever restored.  `pending` is the conversation the engine holds
-        # that is worth a save; it is saved when a request that does NOT continue it arrives (before() - the engine still
-        # holds it then, checked by `gen`), or by flush() when the service stops.
-        self.pending: list[int] | None = None
-        self.pending_gen = None
         self.entries: dict[str, dict] = {}
         self.stats = {"saves": 0, "restores": 0, "restore_refused": 0, "dropped": 0}
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
@@ -101,12 +94,6 @@ class PromptCache:
         """Restores the longest entry that starts `ids` when it brings at least min_gain tokens the engine does not hold.  Returns
         a line to log, or None.  Called with the service's fifo held, after the engine is loaded."""
         gen = getattr(engine, "gen", None)
-        notes = []
-        # save on switch: this request does not continue the conversation the engine holds - save that one first
-        if self.pending is not None and self._prefix_len(self.pending, ids) < len(self.pending):
-            note = self._save_pending(engine)
-            if note:
-                notes.append(note)
         have = self._engine_reuse(ids, gen)
         best_key, best_len = None, 0
         for key, e in self.entries.items():
@@ -114,7 +101,7 @@ class PromptCache:
             if len(t) < len(ids) and len(t) > best_len and self._prefix_len(t, ids) == len(t):
                 best_key, best_len = key, len(t)
         if best_key is None or best_len - have < self.min_gain:
-            return "; ".join(notes) or None
+            return None
         t0 = time.time()
         try:
             engine.session_file("restore", os.path.join(self.dir, best_key + ".bin"))
@@ -122,22 +109,11 @@ class PromptCache:
             self.stats["restore_refused"] += 1
             self._remove(best_key)
             self.held = None
-            notes.append(f"prompt cache: restore of {best_len} tokens refused ({str(e)[:120]}); entry dropped")
-            return "; ".join(notes)
+            return f"prompt cache: restore of {best_len} tokens refused ({str(e)[:120]}); entry dropped"
         self.held, self.held_gen = list(self.entries[best_key]["tokens"]), gen
         self.entries[best_key]["used"] = time.time()
         self.stats["restores"] += 1
-        notes.append(f"prompt cache: restored {best_len} tokens in {time.time() - t0:.2f} s (the engine held {have})")
-        return "; ".join(notes)
-
-    def forget(self):
-        """A request ended without after() (cancelled, failed, recovered): what the engine holds is no longer known."""
-        self.pending = self.pending_gen = None
-        self.held = None
-
-    def flush(self, engine) -> str | None:
-        """The service is stopping: save the conversation the engine still holds, if it is worth one (save on switch)."""
-        return self._save_pending(engine) if self.pending is not None else None
+        return f"prompt cache: restored {best_len} tokens in {time.time() - t0:.2f} s (the engine held {have})"
 
     # ---- after a request: remember what the engine holds, and save it when the read was long
     def after(self, engine, ids: list[int], generated: list[int], prompt_read: int | None) -> str | None:
@@ -148,19 +124,8 @@ class PromptCache:
         gen = getattr(engine, "gen", None)
         tokens = list(ids) + list(generated)
         self.held, self.held_gen = tokens, gen
-        continues = self.pending is not None and self._prefix_len(self.pending, tokens) == len(self.pending)
-        if (prompt_read and prompt_read >= self.min_read) or continues:
-            # worth a save later (a long read, or the continuation of one): the state now covers all of `tokens`
-            if not any(self._prefix_len(e["tokens"], tokens) == len(tokens) for e in self.entries.values()):
-                self.pending, self.pending_gen = tokens, gen
-        return None
-
-    def _save_pending(self, engine) -> str | None:
-        """Saves `pending` while the engine still holds exactly it (same engine process, nothing run since).  Called with the fifo held."""
-        tokens, gen = self.pending, self.pending_gen
-        self.pending = self.pending_gen = None
-        if tokens is None or gen != getattr(engine, "gen", None) or self.held != tokens:
-            return None                   # the engine moved on (another request, a restart): nothing to save
+        if not prompt_read or prompt_read < self.min_read or any(self._prefix_len(e["tokens"], tokens) == len(tokens) for e in self.entries.values()):
+            return None                   # a short read, or an entry already holds all of it
         key = hashlib.sha1(json.dumps(tokens).encode()).hexdigest()[:24]
         path = os.path.join(self.dir, key + ".bin")
         t0 = time.time()
