@@ -5449,6 +5449,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: the file tier reads through the file cache (STRATA_UNBUFFERED_LOAD=%s "
                                  "ignored: without --resident-budget-gib the file cache holds the experts)\n", env);
         }
+#if defined(__linux__)
+        // files mode (no RAM budget): the prompt path's batched reads unbuffered as well, the same O_DIRECT reader the
+        // budget's path opens below (STRATA_PROMPT_DIRECT, on by default; a budget keeps that path, unchanged)
+        if (o.resident_budget == 0 && [] { const char* v = std::getenv("STRATA_PROMPT_DIRECT"); return v == nullptr || v[0] != '0'; }()) {
+            std::string pw;
+            const bool pd = src.open_prompt_direct(pw);
+            std::fprintf(stderr, "strata generate: the prompt path's expert reads %s (no RAM budget: files mode)\n",
+                         pd ? "may go unbuffered (STRATA_PROMPT_DIRECT, prompts of STRATA_PROMPT_DIRECT_MIN_TOKENS or more)"
+                            : ("stay buffered: " + pw).c_str());
+        }
+#endif
 #if defined(_WIN32)
         // the GPU cache's fill and the RAM copy read unbuffered even so: through the mapping their pages sat in the
         // working set beside the copy (end_startup_unbuffered below, once the copy is built).  Windows, experts.bin
@@ -7843,6 +7854,11 @@ int main(int argc, char** argv) {
         }
 #endif
     }
+    // files mode (no RAM budget, no RAM copy): the file cache is the expert tier, so the page-cache warm asks for the ranked
+    // experts no GPU cache holds, hottest first (STRATA_PAGECACHE_WARM_GIB, opt in).  With --resident-cpu-experts and no
+    // budget the RAM copy holds every expert, so there is nothing to warm then.
+    if (!o.resident_cpu_experts && srcp == &src && o.mmap_experts && xcache.valid())
+        src.start_files_pagecache_warm(xcache, profile_all.empty() ? profile : profile_all);
     // (the arena mode has no RAM copy to exchange with: its experts are always in RAM, the tier only copies them in)
     if (o.adapt_async && !src.complement_ready() && srcp != &arena_src) adapt_async_off("the resident RAM mode is not running");
     // pp-opt: with the file tier unbuffered, the mapped view of experts.bin is only a fallback from here on - and while

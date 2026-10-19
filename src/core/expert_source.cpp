@@ -2806,6 +2806,40 @@ void FileExpertSource::stop_pagecache_warm() {
     if (warm_thread_.joinable()) warm_thread_.join();
 }
 
+// STRATA_PAGECACHE_WARM_GIB (default 10; =0 off): the page-cache warm's budget in bytes
+static uint64_t pagecache_warm_bytes() {
+    const char* v = std::getenv("STRATA_PAGECACHE_WARM_GIB");
+    const double g = v != nullptr ? std::atof(v) : 10.0;
+    return g > 0 ? (uint64_t) (g * 1073741824.0) : (uint64_t) 0;
+}
+
+void FileExpertSource::start_files_pagecache_warm(const ExpertCache& cache,
+                                                  const std::vector<std::pair<int32_t, int32_t>>& rank) {
+    // Files mode (no RAM budget, no RAM copy): the file cache IS the expert tier, so the warm asks for the ranked experts
+    // that no GPU cache holds, hottest first - the same order pin_cache_complement collects for a budget.
+    const uint64_t budget = pagecache_warm_bytes();
+    if (budget == 0 || base_ == nullptr || !cache.valid() || rank.empty()) return;
+#if !defined(__linux__)
+    (void) cache;   // the warm is Linux only (start_pagecache_warm): no log line for a warm that does not run
+    return;
+#endif
+    std::vector<std::pair<int32_t, int32_t>> order;
+    std::vector<char> seen((size_t) n_layers_ * (size_t) n_expert_, 0);
+    for (const auto& pr : rank) {
+        if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
+        const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
+        if (seen[i]) continue;
+        seen[i] = 1;
+        if (cache.slot_of(pr.first, pr.second) != kNotResident) continue;   // on a GPU
+        order.push_back(pr);
+    }
+    if (order.empty()) return;
+    std::fprintf(stderr, "FileExpertSource: page-cache warm, files mode (no RAM budget): up to %.2f GiB of the %zu ranked "
+                         "experts no GPU cache holds, hottest first (STRATA_PAGECACHE_WARM_GIB)\n",
+                 (double) budget / 1073741824.0, order.size());
+    start_pagecache_warm(order, budget);
+}
+
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
@@ -2867,11 +2901,8 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
     // STRATA_PAGECACHE_WARM_GIB (default 10; =0 off): the ranked experts the budget leaves on the files, hottest first
     // (warm_order), warmed into the page cache by a SCHED_IDLE thread - the fixed tier's hot set, but reclaimable.
-    const uint64_t warm_bytes = [] {
-        const char* v = std::getenv("STRATA_PAGECACHE_WARM_GIB");
-        const double g = v != nullptr ? std::atof(v) : 10.0;
-        return g > 0 ? (uint64_t) (g * 1073741824.0) : (uint64_t) 0;
-    }();
+    // (A budget of 0 holds every expert: nothing to warm.)
+    const uint64_t warm_bytes = pagecache_warm_bytes();
     std::vector<std::pair<int32_t, int32_t>> warm_order;
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while

@@ -711,6 +711,9 @@ public:
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+    /// Files mode (no RAM budget, no RAM copy; generate.cpp): the page-cache warm over `rank` (hottest first), skipping
+    /// the experts `cache` holds on a GPU, up to STRATA_PAGECACHE_WARM_GIB (opt in, Linux).  A no-op when that is unset.
+    void start_files_pagecache_warm(const ExpertCache& cache, const std::vector<std::pair<int32_t, int32_t>>& rank);
     /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
     /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
     /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,
