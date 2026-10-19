@@ -2986,9 +2986,10 @@ void FileExpertSource::stop_pagecache_warm() {
     if (warm_thread_.joinable()) warm_thread_.join();
 }
 
-// STRATA_PAGECACHE_WARM_GIB (default 10; =0 off): the page-cache warm's budget in bytes, 0 when not positive.
-// "auto" is sized here, when the warm starts: MemAvailable minus STRATA_PAGECACHE_WARM_HEADROOM_GIB (default 4), floored at 0.
-// `note`, when given, receives the " (auto: X GiB of Y GiB available)" text for the log line ("" for a fixed count).
+// STRATA_PAGECACHE_WARM_GIB (unset: sized from this machine, below; a number = that many GiB; 0 = off; "auto" = everything
+// free): the page-cache warm's budget in bytes.  "auto" and the unset rule are sized here, when the warm starts, from
+// /proc/meminfo, with STRATA_PAGECACHE_WARM_HEADROOM_GIB (default 4) kept free.  `note`, when given, receives the sizing for the
+// log line ("" for a fixed count).
 static uint64_t pagecache_warm_bytes(std::string* note = nullptr) {
     const char* v = std::getenv("STRATA_PAGECACHE_WARM_GIB");
     if (note != nullptr) note->clear();
@@ -3009,7 +3010,31 @@ static uint64_t pagecache_warm_bytes(std::string* note = nullptr) {
         }
         return bytes;
     }
-    const double g = v != nullptr ? std::atof(v) : 10.0;
+    if (v == nullptr) {
+        // Unset: sized from this machine, not a number tuned on one box - a third of the RAM, never more than what is free
+        // beyond the headroom.  19 Oct, 31 GB box: a 10 GiB warm was the measured best (8.5k prompt 14.8 s; "auto", ~23 GiB,
+        // 15.7 s) and a third of 31 GB is 10.3 GiB.  The rest stays for the engine, the OS, other programs and the page cache's
+        // own recency (decode's recently used experts).  No /proc/meminfo (not Linux): 10 GiB as before.
+        std::ifstream info("/proc/meminfo");
+        std::stringstream text;
+        text << info.rdbuf();
+        const uint64_t total = detail::meminfo_bytes(text.str(), "MemTotal");
+        const uint64_t avail = detail::meminfo_bytes(text.str(), "MemAvailable");
+        if (total == 0) return (uint64_t) 10 << 30;
+        const char* h = std::getenv("STRATA_PAGECACHE_WARM_HEADROOM_GIB");
+        const double headroom_gib = h != nullptr ? std::atof(h) : 4.0;
+        const uint64_t headroom = headroom_gib > 0 ? (uint64_t) (headroom_gib * 1073741824.0) : (uint64_t) 0;
+        const uint64_t cap = avail > headroom ? avail - headroom : (uint64_t) 0;
+        const uint64_t bytes = std::min<uint64_t>(total / 3, cap);
+        if (note != nullptr) {
+            char buf[160];
+            std::snprintf(buf, sizeof buf, " (a third of %.1f GiB RAM, capped at %.2f GiB free beyond %.0f GiB headroom: %.2f GiB)",
+                          (double) total / 1073741824.0, (double) cap / 1073741824.0, headroom_gib, (double) bytes / 1073741824.0);
+            *note = buf;
+        }
+        return bytes;
+    }
+    const double g = std::atof(v);
     return g > 0 ? (uint64_t) (g * 1073741824.0) : (uint64_t) 0;
 }
 
@@ -3100,10 +3125,10 @@ bool FileExpertSource::pin_cache_complement(
     int64_t budget_lent = 0, budget_lendable = 0;   // the lend region's slots kept by a budget (below), and its size
     uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
-    // STRATA_PAGECACHE_WARM_GIB (default 10; =0 off): the ranked experts the budget leaves on the files, hottest first
+    // STRATA_PAGECACHE_WARM_GIB (unset: a third of the RAM within what is free; =0 off): the ranked experts the budget leaves on the files, hottest first
     // (warm_order), warmed into the page cache by a SCHED_IDLE thread - the fixed tier's hot set, but reclaimable.
     // (A budget of 0 holds every expert: nothing to warm.)
-    std::string warm_note;   // STRATA_PAGECACHE_WARM_GIB=auto: the size the warm will use, for its start line
+    std::string warm_note;   // how the warm's size was computed (unset or "auto"), for its start line
     const uint64_t warm_bytes = pagecache_warm_bytes(&warm_note);
     std::vector<std::pair<int32_t, int32_t>> warm_order;
     if (budget_bytes > 0) {
