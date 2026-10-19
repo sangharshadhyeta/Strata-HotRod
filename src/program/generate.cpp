@@ -5573,17 +5573,27 @@ int main(int argc, char** argv) {
         // STRATA_RAM_TIER_GIB=N GiB when that is set.  Taken here, before the file tier reads its budget (set_unbuffered).
         std::string room_note;
         uint64_t room = strata::core::host_ram_room_bytes(0, &room_note);
-        if (const char* v = std::getenv("STRATA_RAM_TIER_GIB"); v != nullptr && std::atof(v) > 0) {
-            room = (uint64_t) (std::atof(v) * 1073741824.0);
-            room_note = " (STRATA_RAM_TIER_GIB)";
-        }
         if (room == 0) {
             std::fprintf(stderr, "strata generate: --resident-budget-gib auto: no RAM room could be read (/proc/meminfo)\n");
             return 2;
         }
+        // 20 Oct: the memory floor (--conversation-cache-min-free-mib) stays free - the tier takes only the room above it.
+        // STRATA_RAM_TIER_GIB=N is an explicit size and is taken as it is (nothing kept back).
+        uint64_t floor_kept = 0;
+        if (const char* v = std::getenv("STRATA_RAM_TIER_GIB"); v != nullptr && std::atof(v) > 0) {
+            room = (uint64_t) (std::atof(v) * 1073741824.0);
+            room_note = " (STRATA_RAM_TIER_GIB)";
+        } else {
+            floor_kept = (uint64_t) o.conversation_cache_min_free_mib << 20;
+            room = room > floor_kept ? room - floor_kept : 0;
+            if (room == 0)
+                std::fprintf(stderr, "strata generate: --resident-budget-gib auto: no RAM room above the %lld MiB memory floor "
+                                     "(files mode, no RAM tier)\n", (long long) o.conversation_cache_min_free_mib);
+        }
         o.resident_budget = room;
-        std::fprintf(stderr, "strata generate: RAM tier (--resident-budget-gib auto): %.2f GiB%s\n",
-                     (double) room / 1073741824.0, room_note.c_str());
+        std::fprintf(stderr, "strata generate: RAM tier (--resident-budget-gib auto): %.2f GiB%s, %.2f GiB kept free for the "
+                             "engine's memory floor\n", (double) room / 1073741824.0, room_note.c_str(),
+                     (double) floor_kept / 1073741824.0);
     }
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
@@ -5609,6 +5619,8 @@ int main(int argc, char** argv) {
         // #773: without a RAM budget there is no RAM copy and the file cache IS the expert tier (measured on a
         // 32 GB, 2 x 16 GB rig: forcing unbuffered reads there re-read 163-629 GB from the drive and halved the
         // speed), so STRATA_UNBUFFERED_LOAD=1 is not honoured in that mode
+        // the RAM tier overlays this file tier: its I/O pipeline and look-ahead stay on, see FileExpertSource::set_io_overlay
+        src.set_io_overlay(o.resident_budget > 0);
         if (o.resident_budget > 0) {
             std::string why;
             const bool ub = src.set_unbuffered(o.resident_budget, why);
@@ -6617,55 +6629,62 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
-        [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
-        std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
-        bool ok = true;
-        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
-            ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
-                 w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
-            if (!ok) break;
-            routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
-            ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+    // the look-ahead's start, a lambda: it runs here, and again below once the RAM overlay has turned the file tier's I/O
+    // pipeline on (src.warms() holds then).  la_tried: the start was taken (or refused) once - it is not taken twice.
+    bool la_tried = false;
+    auto start_routing_lookahead = [&]() {
+        if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
+            [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
+            la_tried = true;
+            std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
+            bool ok = true;
+            for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+                const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+                ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
+                     w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
+                if (!ok) break;
+                routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
+                ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+            }
+            // STRATA_LOOKAHEAD_K=<n>: experts predicted per token (default 10); =floor: the first rank the stand-in floor replaces
+            // (STRATA_ROUTE_RESIDENT_RANKS lo): a stand-in covers every pick from there on, so only the picks above it are read ahead
+            const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
+            // default (SPEC 20 9j: 55.0 against 44.8 tok/s, drive 9 against 64 MB a token): "floor" whenever the stand-in floor is on, so only the picks it cannot
+            // replace are read ahead; STRATA_LOOKAHEAD_K=10 restores the earlier breadth.  The look-ahead only moves pages: no output changes.
+            int la_k = 10;
+            if (kv == nullptr) kv = "floor";
+            if (kv != nullptr && std::strcmp(kv, "floor") == 0) {
+                int lo = 6, hi = 9;
+                if (const char* rr = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(rr, "%d-%d", &lo, &hi);
+                const char* rm = std::getenv("STRATA_ROUTE_RESIDENT");
+                la_k = rm != nullptr && std::atof(rm) > 0.0 ? std::max(1, lo) : 10;
+            } else if (kv != nullptr) {
+                la_k = std::atoi(kv);
+            }
+            // the look-ahead ring serves the ranks the floor does not leave to a stand-in when their copy is in time: STRATA_RING_RANKS
+            // (default 2, ranks 0-1) predicted per token, whatever the floor says (with the ring the floor is 0-9)
+            if (ring_on && (std::getenv("STRATA_LOOKAHEAD_K") == nullptr || std::strcmp(std::getenv("STRATA_LOOKAHEAD_K"), "floor") == 0)) {
+                const char* rr = std::getenv("STRATA_RING_RANKS");
+                la_k = std::max(1, std::min(10, rr != nullptr ? std::atoi(rr) : 2));
+            }
+            if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, la_k, srcp, err, fs_ahead || la_stats)) {
+                drive.d.lookahead = &lookahead;
+                if (la_stats) lookahead.enable_stats(g.n_layers);
+                if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
+                    lookahead.set_depth(std::atoi(dv));
+                else if ((srcp == &src && src.io_prefetch()) || ring_on)
+                    lookahead.set_depth(2);   // the ring fills the layer after next: the next one's router may already have run
+                std::fprintf(stderr, "strata generate: routing-aware prefetch on (the next layer's router%s)\n",
+                             fs_ahead ? ", feeding the Foresight swap space" : ", file tier");
+            } else {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
+                             ok ? err.c_str() : "the routers are not BF16 in the arena");
+                err.clear();
+            }
         }
-        // STRATA_LOOKAHEAD_K=<n>: experts predicted per token (default 10); =floor: the first rank the stand-in floor replaces
-        // (STRATA_ROUTE_RESIDENT_RANKS lo): a stand-in covers every pick from there on, so only the picks above it are read ahead
-        const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
-        // default (SPEC 20 9j: 55.0 against 44.8 tok/s, drive 9 against 64 MB a token): "floor" whenever the stand-in floor is on, so only the picks it cannot
-        // replace are read ahead; STRATA_LOOKAHEAD_K=10 restores the earlier breadth.  The look-ahead only moves pages: no output changes.
-        int la_k = 10;
-        if (kv == nullptr) kv = "floor";
-        if (kv != nullptr && std::strcmp(kv, "floor") == 0) {
-            int lo = 6, hi = 9;
-            if (const char* rr = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(rr, "%d-%d", &lo, &hi);
-            const char* rm = std::getenv("STRATA_ROUTE_RESIDENT");
-            la_k = rm != nullptr && std::atof(rm) > 0.0 ? std::max(1, lo) : 10;
-        } else if (kv != nullptr) {
-            la_k = std::atoi(kv);
-        }
-        // the look-ahead ring serves the ranks the floor does not leave to a stand-in when their copy is in time: STRATA_RING_RANKS
-        // (default 2, ranks 0-1) predicted per token, whatever the floor says (with the ring the floor is 0-9)
-        if (ring_on && (std::getenv("STRATA_LOOKAHEAD_K") == nullptr || std::strcmp(std::getenv("STRATA_LOOKAHEAD_K"), "floor") == 0)) {
-            const char* rr = std::getenv("STRATA_RING_RANKS");
-            la_k = std::max(1, std::min(10, rr != nullptr ? std::atoi(rr) : 2));
-        }
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, la_k, srcp, err, fs_ahead || la_stats)) {
-            drive.d.lookahead = &lookahead;
-            if (la_stats) lookahead.enable_stats(g.n_layers);
-            if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
-                lookahead.set_depth(std::atoi(dv));
-            else if ((srcp == &src && src.io_prefetch()) || ring_on)
-                lookahead.set_depth(2);   // the ring fills the layer after next: the next one's router may already have run
-            std::fprintf(stderr, "strata generate: routing-aware prefetch on (the next layer's router%s)\n",
-                         fs_ahead ? ", feeding the Foresight swap space" : ", file tier");
-        } else {
-            (void) cudaGetLastError();
-            std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
-                         ok ? err.c_str() : "the routers are not BF16 in the arena");
-            err.clear();
-        }
-    }
+    };
+    start_routing_lookahead();
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.
@@ -7971,6 +7990,26 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: the startup reads are done: experts.bin mapped again (%.0f ms)\n",
                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - end_t0).count());
         }
+        // RAM overlay (--resident-budget-gib, files mode's I/O pipeline): the pipeline was refused at startup, while the file
+        // tier read unbuffered and the RAM copy did not exist yet.  Now that the copy holds the room it starts, as the
+        // startup call above would have started it without the unbuffered reads (STRATA_IO_PREFETCH / _THREADS as there)
+        if (resident_ok && src.io_overlay_active() && !src.io_prefetch()) {
+            const char* pf_env = std::getenv("STRATA_IO_PREFETCH");
+            const char* th_env = std::getenv("STRATA_IO_PF_THREADS");
+            if (pf_env == nullptr || std::atoi(pf_env) != 0)
+                src.set_io_prefetch(true, th_env != nullptr ? std::atoi(th_env) : 0);
+            std::fprintf(stderr, "strata generate: RAM overlay: file tier io prefetch %s (experts outside the RAM copy: O_DIRECT)\n",
+                         src.io_prefetch() ? "ON" : "off");
+        }
+        // the look-ahead was not taken at its start above while src.warms() was false (the overlay's pipeline was not on yet).
+        // 20 Oct: not taken under the RAM overlay (decode 48.7 tok/s with it against 55.9 without); STRATA_LOOKAHEAD=1 set
+        // explicitly still allows it there (an opt-in to measure)
+        const bool la_explicit = [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v != nullptr && std::atoi(v) != 0; }();
+        if (drive.d.lookahead == nullptr && !la_tried && (!src.io_overlay_active() || la_explicit)) start_routing_lookahead();
+        // the RAM tier gives its coldest places back when a layer-major prompt's residuals do not fit (prefill.cpp run_impl);
+        // the serve thread runs that between decode windows, the place's usage is read then
+        if (resident_ok && src.complement_ready())
+            strata::prefill::Prefill::set_ram_give_back([&](uint64_t bytes) { return src.give_back_ram(bytes, drive.d.usage); });
         // #669 / #765: a big chunk lends many cache slots to the prompt path, and each lent slot's expert is read back
         // from the SSD whenever the RAM could not keep its copy (31 GB: auto:32768 read prompts ~3x slower than auto).
         // Said, never capped: --prefill is the user's, and with the RAM for them it is the faster one (+21-35%).
@@ -13100,6 +13139,13 @@ int main(int argc, char** argv) {
             auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
                 const strata::core::OnDevice on(p.dev);
                 if (!p.cache->sync_queued(e)) return false;
+                // E1 / step 4 (RAM overlay): the copies have landed, so an expert whose bytes came from its RAM place lives in its
+                // VRAM slot only now - its place goes to the layer's free list (no reader is left: the stream was synchronized)
+                if (o.resident_budget > 0 && src.complement_ready())
+                    for (const auto& [i, slot] : p.lent) {
+                        (void) slot;
+                        (void) src.release_resident_place(i / g.n_expert, i % g.n_expert);
+                    }
 #if defined(_WIN32)
                 // The copies have landed: the file pages touched by the loan need not stay in the working set.
                 for (const auto& [i, slot] : p.lent)
@@ -13217,10 +13263,45 @@ int main(int argc, char** argv) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
+                    // E1 (the RAM tier on): each expert this loan takes out of VRAM goes down into the RAM copy first, while its
+                    // slot still holds it, so the refill after the prompt reads it from RAM (blob_stable takes RAM first).  The
+                    // victim's RAM place is given up only to a hotter expert (take_resident_place; the victim test is repeated
+                    // here so a refused expert is not copied).  The copies are synchronous; the device is synchronized once
+                    // before the first one (the relayout above synchronized only its own streams).  Off: nothing changes.
+                    // 20 Oct: OFF by default - 1991 synchronous copies delayed the prompt's start.  STRATA_LOAN_SPILL=1 turns it on.
+                    // The RAM overlay only (not resident modes).
+                    const bool ram_spill = src.complement_ready() && o.resident_budget > 0 &&
+                                           [] { const char* v = std::getenv("STRATA_LOAN_SPILL"); return v != nullptr && std::atoi(v) != 0; }();
+                    std::vector<char> gpu_held;       // built at the first spill: the residency table as it stands
+                    std::vector<uint8_t> spill_buf;
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
                             if (host_res[i] >= first) {
+                                if (ram_spill) {
+                                    if (gpu_held.empty()) {
+                                        gpu_held.assign(host_res.size(), 0);
+                                        for (size_t k = 0; k < host_res.size(); ++k) gpu_held[k] = host_res[k] >= 0 ? 1 : 0;
+                                        cudaDeviceSynchronize();
+                                        (void) cudaGetLastError();
+                                        spill_buf.resize((size_t) strata::kernels::cpu::expert_layout().max_blob);
+                                    }
+                                    const int64_t v = src.coldest_resident_expert(l, drive.d.usage, gpu_held);
+                                    bool hotter = v >= 0;
+                                    if (hotter && !drive.d.usage.empty()) {
+                                        const size_t fv = (size_t) (l * g.n_expert + v);
+                                        hotter = fv < drive.d.usage.size() && i < drive.d.usage.size() &&
+                                                 drive.d.usage[fv] < drive.d.usage[i];
+                                    }
+                                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                                    if (hotter && cudaMemcpy(spill_buf.data(), p.cache->device_slot(host_res[i]), (size_t) nb,
+                                                             cudaMemcpyDeviceToHost) == cudaSuccess) {
+                                        if (src.take_resident_place(l, ex, drive.d.usage, gpu_held, spill_buf.data()))
+                                            g_ram_evictions.fetch_add(1, std::memory_order_relaxed);
+                                    } else {
+                                        (void) cudaGetLastError();
+                                    }
+                                }
                                 p.lent.emplace_back((int32_t) i, host_res[i]);
                                 host_res[i] = strata::core::kNotResident;
                                 any = true;
@@ -13307,7 +13388,19 @@ int main(int argc, char** argv) {
                 sp.set_prompt_total((int64_t) ids.size());   // the whole prompt: STRATA_PROMPT_DIRECT_MIN_TOKENS tests it, not a segment
                 auto run = [&](int64_t q, int64_t r) -> bool {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
-                    return sp.run(ids.data() + q, r - q, q, e);
+                    // a layer-major run reports each layer pass (its chunks report only at the run's tail): the same PP line
+                    // as the chunk reports, so the server's prompt progress moves with the GPU
+                    strata::prefill::Prefill::set_on_layer_pass([&](int64_t done) {
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+                        std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
+                                    ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
+                        strata::core::progress_at("reading the prompt (layer-major), done up to token", done);
+                        strata::core::progress_beat();
+                        std::fflush(stdout);
+                    });
+                    const bool ok = sp.run(ids.data() + q, r - q, q, e);
+                    strata::prefill::Prefill::set_on_layer_pass(nullptr);
+                    return ok;
                 };
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
                 // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
@@ -15268,12 +15361,19 @@ int main(int argc, char** argv) {
             }
             // the request is done: the warm runs again with its list (evicted pages come back; cached ones cost only the hint)
             src.set_request_active(false);
-            if (read_n > 0) src.rewarm();
+            // E2: the warm's list without the experts a GPU holds now or the RAM copy holds (they need no read from the drive)
+            if (read_n > 0)
+                src.rewarm([&](int32_t l, int32_t x) {
+                    const int64_t i = (int64_t) l * g.n_expert + x;
+                    return (i >= 0 && i < (int64_t) host_res.size() && host_res[(size_t) i] >= 0) || src.resident_blob(l, x) != nullptr;
+                });
             // the work the engine's own helpers did during this request (always on; the differences of lifetime counters): swap rounds and swaps (quality swaps among them),
             // the router look-ahead's predicted experts and the layers it skipped.  A zero beside a busy request is the sign of a helper that stopped.
             {
                 static int64_t prev_rounds = 0, prev_swaps = 0, prev_quality = 0, prev_pred = 0, prev_skip = 0, prev_evict = 0;
-                const int64_t la_pred = drive.d.lookahead != nullptr ? drive.d.lookahead->predicted() : 0;
+                // the GPU look-ahead (STRATA_LOOKAHEAD_GPU, the ring) counts its own picks: the CPU thread's counter stays at 0 then
+                const int64_t la_pred = drive.d.gpu_pred != nullptr ? drive.d.pred_fed
+                                      : drive.d.lookahead != nullptr ? drive.d.lookahead->predicted() : 0;
                 const int64_t la_skip = drive.d.lookahead != nullptr ? drive.d.lookahead->skipped() : 0;
                 const int64_t ram_ev = g_ram_evictions.load(std::memory_order_relaxed);
                 std::fprintf(stderr, "strata serve: work done: swap rounds %lld (%lld swaps, %lld quality), ram evictions %lld, look-ahead %lld predicted experts (%lld layers skipped)%s\n",

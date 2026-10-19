@@ -2097,6 +2097,11 @@ uint64_t Prefill::layer_major_host_bytes(int64_t n_tokens) {
 static std::atomic<uint64_t> g_lm_host_floor{2560ull << 20};
 void Prefill::set_host_floor_bytes(uint64_t bytes) { g_lm_host_floor.store(bytes); }
 uint64_t Prefill::host_floor_bytes() { return g_lm_host_floor.load(); }
+// the RAM tier's give-back and the layer-major pass hook: set by generate.cpp on the serve thread, read on that thread
+static std::function<uint64_t(uint64_t)> g_ram_give_back;
+static std::function<void(int64_t)> g_on_layer_pass;
+void Prefill::set_ram_give_back(std::function<uint64_t(uint64_t)> fn) { g_ram_give_back = std::move(fn); }
+void Prefill::set_on_layer_pass(std::function<void(int64_t)> fn) { g_on_layer_pass = std::move(fn); }
 
 // --prefill-pipe (opt-in; STRATA_PREFILL_PIPE): a layer split reads a prompt as a pipeline - stage s reads chunk c while
 // stage s+1 reads chunk c-1. A stage-chunk costs its layers x (b + a C): a fixed part per chunk (b: the pass over the
@@ -5120,12 +5125,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     if (lm) {   // the residuals are pinned (they cannot be paged out): refused when they would not leave the memory floor free
         const uint64_t need = (uint64_t) layer_major_host_bytes(n - n_dev);   // the host part only
-        const auto mem = core::sample_host_memory();
-        if (mem && !core::conversation_memory_admit(mem->available, need, host_floor_bytes())) {
+        const uint64_t floor_bytes = host_floor_bytes();
+        auto above_floor = [&](uint64_t available) -> uint64_t { return available > floor_bytes ? available - floor_bytes : 0; };
+        auto mem = core::sample_host_memory();
+        // no host part (the whole state is on the GPU): nothing is pinned, so there is nothing to admit
+        // the RAM tier (--resident-budget-gib) gives back the room its coldest experts hold, then the check is made again.
+        // The shortfall: the residuals less what is above the floor, plus the deficit when the available RAM is below the
+        // floor itself - need + floor - available - plus a 256 MiB margin; asked again (3 tries at most) while the check
+        // still fails: 20 Oct, one give-back of 3.13 GiB left "need 1.7 GiB, 1.7 GiB available" and the prompt went chunk-major.
+        uint64_t given = 0;
+        for (int attempt = 0; attempt < 3 && need > 0 && mem && g_ram_give_back &&
+                              !core::conversation_memory_admit(mem->available, need, floor_bytes); ++attempt) {
+            const uint64_t above = above_floor(mem->available);
+            const uint64_t deficit = mem->available < floor_bytes ? floor_bytes - mem->available : 0;
+            const uint64_t got = g_ram_give_back((need > above ? need - above : 0) + deficit + (256ull << 20));
+            if (got == 0) break;
+            given += got;
+            mem = core::sample_host_memory();
+        }
+        if (given > 0)
+            std::fprintf(stderr, "strata prefill: the RAM tier gave back %.2f GiB to the prompt's layer-major state\n", given / 1073741824.0);
+        if (need > 0 && mem && !core::conversation_memory_admit(mem->available, need, floor_bytes)) {
             std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): its residuals need "
                                  "%.1f GiB of pinned RAM, %.1f GiB available above the %.1f GiB floor\n", (long long) n, (long long) C,
-                         need / 1073741824.0, (mem->available > host_floor_bytes() ? mem->available - host_floor_bytes() : 0) / 1073741824.0,
-                         host_floor_bytes() / 1073741824.0);
+                         need / 1073741824.0, above_floor(mem->available) / 1073741824.0, floor_bytes / 1073741824.0);
             lm = false;
         }
     }
@@ -5233,6 +5256,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 lm_first = ci == 0;
                 if (!run_chunk(ci * C, PH_LAYER, l)) return false;
             }
+            // the serve's progress moves with the passes (the chunks report only at the tail): the run has reached this far
+            if (g_on_layer_pass) g_on_layer_pass(pos0 + n * (l + 1) / g.n_layers);
             if (cudaEventRecord(lmh.ev, cs) != cudaSuccess) {
                 err = std::string("prefill: the layer-major layer event: ") + cudaGetErrorString(cudaGetLastError());
                 return false;

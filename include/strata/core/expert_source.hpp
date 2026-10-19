@@ -742,11 +742,27 @@ public:
     /// quiesced).
     bool take_resident_place(int64_t layer, int64_t out, const std::vector<float>& usage, const std::vector<char>& busy,
                              const uint8_t* bytes);
+    /// The RAM tier gives up (layer, expert)'s place: the expert lives in VRAM only now (one tier per expert).  The place
+    /// goes on the layer's free list and take_resident_place hands it to the next expert of that layer.  Returns false,
+    /// nothing changed, when the expert holds no place or an exchange / staged state makes the place unsafe to touch.
+    /// Called after the refill copy that read the place has completed (the caller synchronized its stream).
+    bool release_resident_place(int64_t layer, int64_t expert);
+    /// The RAM tier gives back `bytes` of its arena to the OS: the coldest RAM-held places (lowest `usage`, flat-indexed
+    /// layer * n_expert + expert; empty = all zero) are given up through release_resident_place, and each one's whole pages
+    /// are madvise(MADV_DONTNEED)'d so the kernel takes them back (the place stays on complement_free_; take_resident_place
+    /// refills it, the pages fault back in).  Returns the bytes given back (whole pages).  0 - nothing done - when the arena
+    /// is page-locked (cudaHostAlloc or registered: complement_pinned_ / complement_registered_), when the RAM copy is not
+    /// ready, or when release_resident_place refuses (staged state).  Caller: the serve thread between decode windows, with
+    /// no background reader holding a pointer from resident_blob (a read of a madvise'd place returns zeros).
+    uint64_t give_back_ram(uint64_t bytes, const std::vector<float>& usage);
     /// The serve loop: a request runs (the warm pauses) / ended.
     void set_request_active(bool on);
     /// The warm again with its last list (after a request: pages a prompt's pinned buffers or reads evicted come back;
     /// cached ones cost only the hint).
     void rewarm();
+    /// The same with the startup list filtered by `held_now(layer, expert)` (true: on a GPU or in the RAM copy now).
+    /// The startup list itself is kept, so an expert that leaves the GPU is warmed again after a later request.
+    void rewarm(const std::function<bool(int32_t, int32_t)>& held_now);
     /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
     /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
     /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,
@@ -896,7 +912,8 @@ public:
     bool transient(int64_t layer, int64_t expert) const override;
     bool prompt_copies(int64_t layer, int64_t expert, bool count = true) const override;
     void set_prompt_direct_active(bool on) override { prompt_direct_active_.store(on, std::memory_order_relaxed); }
-    bool prompt_direct_on() const override { return prompt_direct_active_.load(std::memory_order_relaxed) && !pdirect_.empty(); }
+    // the prompt's reads are O_DIRECT through the open reader: pdirect_, or direct_ (the RAM overlay's file tier, which copy_blobs uses)
+    bool prompt_direct_on() const override { return prompt_direct_active_.load(std::memory_order_relaxed) && (!pdirect_.empty() || !direct_.empty()); }
     double cached_share(int64_t samples) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// pp-opt, unbuffered: the file-tier blobs of the run in one read_direct batch (neighbours merged into one request)
@@ -909,8 +926,12 @@ public:
     /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
-    bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
+    bool warms() const override { return (!role_ptr_.empty() || io_pf_) && (direct_.empty() || io_overlay_active()); }
     bool page_cached(int64_t layer, int64_t expert) const override {
+        // an expert the RAM tier holds is as cheap to swap in as a cached one (the swap's GreedyDual cost asks this)
+        if (complement_ready_ && !complement_offsets_.empty() &&
+            complement_offsets_[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != kNoComplement)
+            return true;
         uint64_t total = 0;
         const uint64_t got = cached_bytes(layer, expert, total, false);
         return total == 0 || got * 2 >= total;
@@ -937,6 +958,12 @@ public:
     // The bytes are the same bytes, so the output is the same.  `threads` = I/O threads (0: default 4).
     void set_io_prefetch(bool on, int threads);
     bool io_prefetch() const { return io_pf_; }
+    /// The RAM tier overlays this file tier (--resident-budget-gib): the I/O pipeline and the look-ahead run as in files
+    /// mode, the RAM copy answers first, and the experts outside it are read O_DIRECT (one copy each: VRAM, RAM, NVMe).
+    /// Set before set_io_prefetch.  io_overlay_active() is true once the complement is built: only then does the pipeline
+    /// run over the unbuffered reads (set_io_prefetch is refused before it while direct_ is open).
+    void set_io_overlay(bool on) { io_overlay_ = on; }
+    bool io_overlay_active() const { return io_overlay_ && complement_ready_; }
     /// blob() hands out stage buffers it recycles (the GGUF in place, an unbuffered source, the I/O read-ahead): one
     /// thread at a time (STRATA_PIPED_CONCURRENT is off with such a source)
     bool stages_blobs() const { return staged(); }
@@ -1047,7 +1074,8 @@ private:
     std::atomic<uint64_t> file_read_bytes_{0};
     // ---- the Linux I/O path (set_io_prefetch)
     bool io_pf_ = false;
-    bool io_fill_ = false;                            ///< experts.bin: the workers only fill the page cache (large preads), no staging, nothing waits
+    bool io_overlay_ = false;                         ///< the RAM tier overlay requested (set_io_overlay): see io_overlay_active()
+    bool io_fill_ = false;                           ///< experts.bin: the workers only fill the page cache (large preads), no staging, nothing waits
     bool io_ahead_ = true;                            ///< STRATA_IO_PF_AHEAD=0: no read-ahead workers' queue, demand preads only
     bool io_stats_ = false;
     int io_threads_ = 4;
@@ -1119,6 +1147,7 @@ private:
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;
     std::vector<uint64_t> complement_offsets_;
+    std::vector<std::vector<uint64_t>> complement_free_;   ///< per layer: places release_resident_place gave up (free)
     detail::ExchangeStorage exchange_storage_; // authoritative when active; original arenas still own memory
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered

@@ -92,6 +92,14 @@ public:
     /// The RAM the layer-major residuals must leave free (generate sets --conversation-cache-min-free-mib; default 2560 MiB).
     static void set_host_floor_bytes(uint64_t bytes);
     static uint64_t host_floor_bytes();
+    /// The RAM tier's give-back (generate sets it once the tier is built): run_impl asks it for the bytes a layer-major
+    /// prompt's residuals are short above the floor; it returns the bytes it gave back.  Serve thread only, between decode
+    /// windows.  Empty (the default): no give-back.
+    static void set_ram_give_back(std::function<uint64_t(uint64_t)> fn);
+    /// Layer-major progress: called on the thread running run() after each layer's pass over every chunk, with the prompt
+    /// position the run has reached in that layer's pass, pos0 + n * (layer + 1) / n_layers (host-side issue, not a GPU
+    /// wait).  Empty (the default): nothing.  Not on_chunk's semantics (on_chunk still hands rows over at the tail).
+    static void set_on_layer_pass(std::function<void(int64_t)> fn);
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk

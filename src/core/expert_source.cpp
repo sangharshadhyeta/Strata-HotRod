@@ -686,7 +686,9 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     io_stop();
 #if defined(__linux__)
     if (!on) return;
-    if (base_ == nullptr || paths_.empty() || !direct_.empty()) return;   // unbuffered readers batch their own reads
+    // unbuffered readers batch their own reads - except under the RAM overlay once the complement holds the room: then the
+    // pipeline's reads are the O_DIRECT ones (copy_from_files reads direct_ first), so the page cache keeps no copy
+    if (base_ == nullptr || paths_.empty() || (!direct_.empty() && !io_overlay_active())) return;
     std::vector<int> fds;
     for (const std::string& path : paths_) {
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -711,7 +713,7 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
         // measured on this box). STRATA_IO_PF_STAGE=0 selects the fill variant.
         const char* v = std::getenv("STRATA_IO_PF_STAGE");
         const bool stage = v == nullptr || std::atoi(v) != 0;
-        io_fill_ = role_ptr_.empty() && !stage;
+        io_fill_ = role_ptr_.empty() && !stage && direct_.empty();   // the fill variant reads the page cache: never over O_DIRECT
     }
     io_pf_ = true;
     // the page-cache counts of handed-out blobs are statistics only (the request line's "page cache held"): STRATA_IO_STATS=1;
@@ -850,7 +852,7 @@ void FileExpertSource::io_worker() {
             continue;
         }
         uint64_t total = 0;
-        if (cached_bytes(layer, expert, total, false) >= total) {
+        if (direct_.empty() && cached_bytes(layer, expert, total, false) >= total) {   // O_DIRECT: the page cache is not the source
             io_pf_skips_.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -1119,6 +1121,7 @@ void FileExpertSource::close() {
     complement_device_ = nullptr;
     complement_bytes_ = 0;
     complement_offsets_.clear();
+    complement_free_.clear();
     complement_pinned_ = false;
     complement_partial_ = false;
     complement_registered_ = false;
@@ -1575,7 +1578,7 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
     std::vector<Fill> todo;
     // experts.bin with io prefetch: a blob whose pages are cached is handed out as the mapping (io_blob); only the
     // uncached ones are read here, together, on the fetch threads
-    const bool only_uncached = io_pf_ && role_ptr_.empty() && direct_.empty();
+    const bool only_uncached = io_pf_ && role_ptr_.empty() && (direct_.empty() || io_overlay_active());
     // STRATA_IO_DEMAND_FIRST: the uncached ones are reserved here and queued as demand reads for the workers (the decode
     // waits on them in staged_blob); nothing is read on this thread
     const bool demand = only_uncached && io_demand_first_;
@@ -1588,7 +1591,8 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             const int64_t e = experts[i];
             if (e < 0 || e >= n_expert_) continue;
             uint64_t total = 0;
-            cold[(size_t) i] = cached_bytes(layer, e, total, false) < total ? 1 : 0;
+            // O_DIRECT (the RAM overlay): every uncached-by-plan blob is cold - the page cache is not the source
+            cold[(size_t) i] = !direct_.empty() || cached_bytes(layer, e, total, false) < total ? 1 : 0;
         }
         t_pf_probe_us_.fetch_add(us_since(tp), std::memory_order_relaxed);
     }
@@ -1900,6 +1904,12 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
     if (base_ == nullptr || paths_.empty()) {
         why = "no expert files open";
         return false;
+    }
+    // the RAM overlay (the complement holds the room, the I/O pipeline runs - not the fill variant): the experts outside the
+    // copy are read O_DIRECT whatever the file cache could keep, so every expert lives in one tier (VRAM, RAM or the drive)
+    if (io_overlay_active() && !io_fill_ && (!direct_.empty() || open_direct(why))) {
+        why = "RAM tier overlay: the experts outside the RAM copy are read O_DIRECT (no page-cache copy)";
+        return true;
     }
     // #577: the RAM copy is built (and already out of the available RAM), so what the file cache would have to keep
     // is exactly the experts outside it - the GPU cache's (refilled after a prompt borrowed their slots) and the
@@ -2396,7 +2406,7 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
             continue;                                                    // in the RAM copy
         if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
         warm_count_.fetch_add(1, std::memory_order_relaxed);
-        if (io_pf_ && direct_.empty()) {   // read it ahead with pread on the I/O threads (instead of an madvise hint)
+        if (io_pf_ && (direct_.empty() || io_overlay_active())) {   // read it ahead on the I/O threads (pread, or O_DIRECT under the RAM overlay)
             if (io_ahead_) io_enqueue(layer, e);
             continue;
         }
@@ -3020,6 +3030,19 @@ void FileExpertSource::rewarm() {
     const uint64_t budget = warm_last_budget_;
     if (last.empty() || budget == 0) return;
     start_pagecache_warm(last, budget);
+}
+
+void FileExpertSource::rewarm(const std::function<bool(int32_t, int32_t)>& held_now) {
+    const std::vector<std::pair<int32_t, int32_t>> full = warm_last_order_;   // the startup list, kept whole
+    const uint64_t budget = warm_last_budget_;
+    if (full.empty() || budget == 0) return;
+    std::vector<std::pair<int32_t, int32_t>> order;
+    order.reserve(full.size());
+    for (const auto& pr : full)
+        if (!held_now || !held_now(pr.first, pr.second)) order.push_back(pr);   // not on a GPU now, not in the RAM copy now
+    if (order.empty()) return;
+    start_pagecache_warm(order, budget);   // rewrites warm_last_order_ with the filtered list: the startup list goes back below
+    warm_last_order_ = full;
 }
 
 // The kernel's "high" free-memory watermarks summed over the zones (/proc/zoneinfo, pages): below them kswapd and then direct
@@ -4084,9 +4107,21 @@ bool FileExpertSource::take_resident_place(int64_t layer, int64_t out, const std
         layer < 0 || layer >= n_layers_ || out < 0 || out >= n_expert_) return false;
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (i_out >= complement_offsets_.size() || complement_offsets_[i_out] != kNoComplement) return false;   // already held
+    // a place release_resident_place gave up in this layer is free: it takes the expert with no victim given up
+    if ((size_t) layer < complement_free_.size() && !complement_free_[(size_t) layer].empty()) {
+        const uint64_t at = complement_free_[(size_t) layer].back(), n = layer_blob_bytes_[(size_t) layer];
+        if (at <= complement_bytes_ && n <= complement_bytes_ - at) {
+            std::memcpy((uint8_t*) complement_host_ + (size_t) at, bytes, (size_t) n);
+            complement_free_[(size_t) layer].pop_back();
+            complement_offsets_[i_out] = at;
+            return true;
+        }
+    }
     const int64_t victim = coldest_resident_expert(layer, usage, busy);
     if (victim < 0) return false;
     const size_t i_v = (size_t) layer * (size_t) n_expert_ + (size_t) victim;
+    // the same rule as resident_stage_swaps: the victim's RAM place goes only to a hotter expert (usage is flat-indexed)
+    if (!usage.empty() && i_v < usage.size() && i_out < usage.size() && usage[i_v] >= usage[i_out]) return false;
     const uint64_t at = complement_offsets_[i_v], n = layer_blob_bytes_[(size_t) layer];
     if (at > complement_bytes_ || n > complement_bytes_ - at) return false;   // every check before the copy overwrites the victim
     // #2134: a Foresight slot may be copying out of the victim's place right now; it is dropped before the place is rewritten
@@ -4096,6 +4131,60 @@ bool FileExpertSource::take_resident_place(int64_t layer, int64_t out, const std
     const bool moved = detail::exchange_cache_complement(complement_offsets_, i_v, i_out);
     if (fs != nullptr) fs->unhold(layer, (int32_t) victim);
     return moved;
+}
+
+uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float>& usage) {
+#if defined(__linux__)
+    if (bytes == 0 || !complement_ready_ || complement_host_ == nullptr || complement_pinned_ || complement_registered_ ||
+        n_expert_ <= 0 || n_layers_ <= 0)
+        return 0;   // a page-locked arena cannot be madvise'd: its pages are the driver's
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const uint64_t page = page_size > 0 ? (uint64_t) page_size : 4096;
+    // every RAM-held place, coldest first (equal usage: the lower index first)
+    std::vector<std::pair<float, size_t>> held;
+    for (int64_t l = 0; l < n_layers_; ++l)
+        for (int64_t e = 0; e < n_expert_; ++e) {
+            const size_t i = (size_t) l * (size_t) n_expert_ + (size_t) e;
+            if (i >= complement_offsets_.size() || complement_offsets_[i] == kNoComplement) continue;
+            if (!override_.empty() && override_[i] != nullptr) continue;   // read from an exchange buffer
+            held.emplace_back(i < usage.size() ? usage[i] : 0.0f, i);
+        }
+    std::sort(held.begin(), held.end());
+    uint64_t given = 0;
+    for (const auto& [u, i] : held) {
+        (void) u;
+        if (given >= bytes) break;
+        const int64_t layer = (int64_t) (i / (size_t) n_expert_), expert = (int64_t) (i % (size_t) n_expert_);
+        const uint64_t at = complement_offsets_[i], n = layer_blob_bytes_[(size_t) layer];
+        if (!release_resident_place(layer, expert)) break;   // staged state: nothing more may be given up now
+        // the place's whole pages only: a page shared with a neighbouring place stays mapped
+        const uintptr_t lo = (uintptr_t) (complement_host_ + at), hi = lo + (uintptr_t) n;
+        const uintptr_t a = (lo + (uintptr_t) page - 1) & ~((uintptr_t) page - 1), b = hi & ~((uintptr_t) page - 1);
+        if (b > a && madvise((void*) a, (size_t) (b - a), MADV_DONTNEED) == 0) given += (uint64_t) (b - a);
+    }
+    return given;
+#else
+    (void) bytes;
+    (void) usage;
+    return 0;
+#endif
+}
+
+bool FileExpertSource::release_resident_place(int64_t layer, int64_t expert) {
+    if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
+        layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return false;
+    const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (i >= complement_offsets_.size() || complement_offsets_[i] == kNoComplement) return false;   // holds no place
+    if (!override_.empty() && override_[i] != nullptr) return false;                                 // read from an exchange buffer
+    // #2134: a Foresight slot may be copying out of this place right now: held (dropped, never served) while it is given up
+    ForesightSwap* fs = fs_swap_.load(std::memory_order_acquire);
+    if (fs != nullptr) fs->hold(layer, (int32_t) expert);
+    const uint64_t at = complement_offsets_[i];
+    complement_offsets_[i] = kNoComplement;
+    if (fs != nullptr) fs->unhold(layer, (int32_t) expert);
+    if (complement_free_.size() < (size_t) n_layers_) complement_free_.resize((size_t) n_layers_);
+    complement_free_[(size_t) layer].push_back(at);
+    return true;
 }
 
 const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) const {
