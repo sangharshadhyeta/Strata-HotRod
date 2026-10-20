@@ -21,7 +21,7 @@ other model sizes may work in upstream Strata, but we have not run them, so we d
 | **System** | Rocky Linux 9.6, built with gcc-toolset-13 |
 | **Engine** | Strata 0.1.45 (upstream, merged 17 Oct 2026) plus the changes below |
 | **Model** | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) in the IQ3_S size (about 3.5 bits per weight; 78 GB of files), compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
-| **Context** | 128K tokens |
+| **Context** | 262K tokens (the longest prompt served so far: 114K) |
 
 ## How fast is it?
 
@@ -39,8 +39,17 @@ already on the card.
 
 The 128K column is one run; the 32K column is five runs with the same settings, which shows how much one run varies.
 
-**Reading a prompt** (seconds until the first word; a different text each time; one run on 10 Oct 2026, before the
-0.1.45 merge):
+**Long prompts, 262K context** (20 Oct 2026; greedy, 1,000-token answer after the 8.5K prompt, 300 after the 45K one;
+each number is one of two or more runs that agree within about 5%):
+
+| Prompt | Read in | Answer written at |
+| --- | ---: | ---: |
+| 8,554 tokens | 16.9 s | 52 - 54 tokens/s |
+| 45,398 tokens | 67 - 68 s | 38 - 41 tokens/s |
+| The same 45K conversation, next turn | 0.4 - 0.5 s (only the new message is read) | 34 - 45 tokens/s |
+
+**Short prompts** (seconds until the first word; a different text each time; one run on 10 Oct 2026, before the 0.1.45
+merge):
 
 | Prompt | First word after |
 | --- | ---: |
@@ -49,7 +58,9 @@ The 128K column is one run; the 32K column is five runs with the same settings, 
 | 1,600 - 2,100 tokens | 14 - 16 s |
 
 The first message of a chat is the slow part: it is limited by how fast the SSD delivers the model's experts. Follow-up
-messages reuse what was already read and start in a few seconds. Long prompts are read in pieces of up to 8,192 tokens.
+messages reuse what was already read. Where the time goes, and every change measured on this PC, is in
+[docs/perf-ideas.md](docs/perf-ideas.md); it also compares the engine with a week earlier (decode 17 -> 54 tokens/s,
+a 45K prompt 120 -> 68 s, context 32K -> 262K).
 
 **Quality of the answers.** Strata replaces some of a token's experts with similar ones already on the card to stay fast.
 In a small test (50 maths questions, 30 coding questions, answers read by hand): 47 of 50 and 30 of 30 correct, against
@@ -73,7 +84,23 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
   chat asks for onto the card in the background. The install writes these settings for IQ3_S.
 - **Guessing ahead.** A small draft head guesses the next words and the big model checks them together, with
   probabilistic acceptance of the guesses (`--no-spec-prob-accept` turns it off).
+- **Three tiers of experts: card -> RAM -> SSD.** Every expert lives in exactly one place. The hottest are on the card, the
+  next ones in a RAM tier sized from this PC's free memory, the rest on the SSD; swaps exchange experts between the card
+  and RAM, and the look-ahead promotes the experts it predicts from the SSD into RAM.
+- **Reading long prompts layer by layer.** The whole prompt passes one layer at a time, so each layer's experts are read
+  from the SSD once, not once per piece of the prompt; the reads bypass the page cache (O_DIRECT), and the next layer's
+  predicted experts are read ahead while the current one computes.
+- **262K context with the K/V in RAM.** From 64K of context the attention's K/V streams from RAM; 32K tokens of it stay
+  on the card.
+- **Picking up a conversation.** A long conversation's state is saved to the SSD, and its next turn reloads it instead of
+  reading the whole conversation again.
+- **Memory safety.** The engine keeps a floor of RAM free before each request; when something else needs RAM, the RAM
+  tier gives back its least-used experts until there is room again. The amount it keeps in reserve is measured on this
+  PC and learned across restarts (`data/ram-reserve.json`), not a fixed number.
 - **The app:** live speeds while it works, and the experts-on-the-card map in the Monitor.
+- **Experimental, off by default:** `STRATA_GDN_LOOP=1 STRATA_GDN_LOOP_NORM=1` runs the middle linear-attention layers
+  twice per token (a training-free "looped" model) at the same decode speed; whether it improves answers is being
+  measured.
 
 ## Using it
 
@@ -112,6 +139,8 @@ scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build -
 ```
 
 - `--build` matters: without it, setup downloads upstream's ready-made engine, which does not have this fork's changes.
+- The speeds above use a 262K context: after setup, set `--max-context 262144` in the config's `args`. From 64K the K/V
+  streams from RAM by itself.
 - `--model IQ3_S` is the size tested here. Setup says IQ3_S wants a 64 GB PC; naming it explicitly is the consent, and
   it runs on this 30 GB PC.
 - Add `--models-dir /path/on/nvme` to put the model files somewhere other than the default.
@@ -145,8 +174,8 @@ Every option is described in [docs/DETAILS.md](docs/DETAILS.md) (upstream's refe
 - Any other graphics card, any AMD card, Windows, macOS or another Linux.
 - Any other model or size (Q2_0, IQ2_XS, IQ3_XXS, Coder, Swift, Unsloth's files).
 - Several requests at once, or two graphics cards.
-- A prompt that fills the whole 128K window.
-- Accuracy beyond the small test above.
+- A prompt that fills the whole 262K window (the longest served: 114K tokens).
+- Accuracy beyond the small test above (a 210-question MMLU-Pro run is in progress).
 
 ## Credits and license
 
