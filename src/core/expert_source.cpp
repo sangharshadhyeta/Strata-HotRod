@@ -1098,6 +1098,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 void FileExpertSource::close() {
     stop_pagecache_warm();
     io_stop();
+    for (size_t i = 0; i < complement_offsets_.size(); ++i) set_cheap(i, false);   // STRATA_ROUTE_RAM_FLOOR: no RAM tier after close
     stop_fill_pool();
     inputs_.clear();
     if (complement_arena_ != nullptr) {
@@ -3852,6 +3853,10 @@ bool FileExpertSource::pin_cache_complement(
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : budget_lent;   // a budget keeps its own tail of the region
     complement_lent_slots_ += stage_lent;   // and the split stages' regions: pairs the copy kept of them
+    // STRATA_ROUTE_RAM_FLOOR: the table must exist before the complement is ready (the verifier may allocate it only later), so it is
+    // allocated here too; allocation is idempotent
+    if (strata::kernels::route_ram_floor_on()) strata::kernels::route_cheap_alloc((size_t) n_layers_ * (size_t) n_expert_);
+    refresh_cheap();
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
@@ -3910,6 +3915,22 @@ bool FileExpertSource::pin_cache_complement(
         start_pagecache_warm(warm_order, warm_bytes);
     }
     return true;
+}
+
+// STRATA_ROUTE_RAM_FLOOR: the router's copy of the RAM tier.  An expert is in the tier exactly when it has a place (complement_offsets_; the
+// exchange ownership table once STRATA_EXCHANGE_ROTATE has moved it).  The router reads each byte at every decode launch (a non-resident rank 0-1
+// pick in the tier stays exact: no SSD fetch, 26% of decode time on 20 Oct), so every change of the tier writes its byte here.
+bool FileExpertSource::ram_tier(size_t i) const {
+    if (exchange_storage_.active()) return exchange_storage_.resident(i).host != nullptr;
+    return i < complement_offsets_.size() && complement_offsets_[i] != kNoComplement;
+}
+void FileExpertSource::set_cheap(size_t i, bool v) {
+    uint8_t* t = strata::kernels::route_cheap_host();
+    if (t != nullptr) t[i] = v ? 1 : 0;   // the table is n_layers * n_expert, as complement_offsets_
+}
+void FileExpertSource::refresh_cheap() {
+    if (strata::kernels::route_cheap_host() == nullptr) return;
+    for (size_t i = 0; i < complement_offsets_.size(); ++i) set_cheap(i, ram_tier(i));
 }
 
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
@@ -3976,6 +3997,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
                 }
                 if (exchange_storage_.initialize_sized(complement_offsets_, sizes, (uint8_t*)complement_host_, complement_device_,
                         complement_bytes_, xstage_, (const uint8_t*)device, (uint64_t)total, (size_t)n, (size_t)bounce, reason)) {
+                    refresh_cheap();   // STRATA_ROUTE_RAM_FLOOR: from here the ownership table is the tier
                     std::fprintf(stderr, "FileExpertSource: exchange buffer rotation enabled: %lld buffers in %zu block sizes "
                                          "(largest %llu bytes, %.2f GiB page-locked); no host commit memcpy\n",
                                  (long long)n, exchange_storage_.block_sizes(), (unsigned long long)blob,
@@ -4054,6 +4076,8 @@ int64_t FileExpertSource::commit_exchanges() {
                 std::abort();
             }
             ++n;
+            sync_cheap(x.in);   // STRATA_ROUTE_RAM_FLOOR: ownership moved
+            sync_cheap(x.out);
             override_[x.out] = nullptr;
             continue;
         }
@@ -4061,7 +4085,11 @@ int64_t FileExpertSource::commit_exchanges() {
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
             complement_host_ != nullptr) {
             std::memcpy((uint8_t*) complement_host_ + (size_t) at, src, (size_t) x.bytes);
-            if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
+            if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) {
+                ++n;
+                sync_cheap(x.in);
+                sync_cheap(x.out);
+            }
         }
         override_[x.out] = nullptr;
     }
@@ -4095,6 +4123,8 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     std::memcpy((uint8_t*) complement_host_ + (size_t) at, ram_adapt_buf_.data(), (size_t) bytes);
     const bool moved = detail::exchange_cache_complement(complement_offsets_, i_out, i_in);
     if (fs != nullptr) fs->unhold(layer, (int32_t) out);
+    sync_cheap(i_in);   // STRATA_ROUTE_RAM_FLOOR
+    sync_cheap(i_out);
     if (!moved) return false;
     // `out`'s place now holds `in`: a stale promo flag on `out` would count a later demand read as a promotion hit
     if (promo_flag_ != nullptr) promo_flag_[i_out].store(0, std::memory_order_relaxed);
@@ -4125,14 +4155,19 @@ int64_t FileExpertSource::commit_flip() {
                 std::abort();
             }
             ++n;
+            sync_cheap(x.in);   // STRATA_ROUTE_RAM_FLOOR: ownership moved
+            sync_cheap(x.out);
             override_[x.out] = nullptr;
             continue;
         }
         const uint64_t at = complement_offsets_[x.in];
         // the same test as commit_copies: an exchange whose bytes were copied is the one that flips
         if (src != nullptr && at != kNoComplement && at <= complement_bytes_ && x.bytes <= complement_bytes_ - at &&
-            complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out))
+            complement_host_ != nullptr && detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) {
             ++n;
+            sync_cheap(x.in);
+            sync_cheap(x.out);
+        }
         override_[x.out] = nullptr;
     }
     fs_hold_staged(false);
@@ -4190,6 +4225,7 @@ bool FileExpertSource::place_expert(int64_t layer, int64_t out, const std::vecto
                 std::memcpy((uint8_t*) complement_host_ + (size_t) at, bytes, (size_t) n);
                 complement_free_[(size_t) layer].pop_back();
                 complement_offsets_[i_out] = at;
+                sync_cheap(i_out);   // STRATA_ROUTE_RAM_FLOOR
                 return true;
             }
         }
@@ -4207,6 +4243,8 @@ bool FileExpertSource::place_expert(int64_t layer, int64_t out, const std::vecto
     std::memcpy((uint8_t*) complement_host_ + (size_t) at, bytes, (size_t) n);
     const bool moved = detail::exchange_cache_complement(complement_offsets_, i_v, i_out);
     if (fs != nullptr) fs->unhold(layer, (int32_t) victim);
+    sync_cheap(i_v);   // STRATA_ROUTE_RAM_FLOOR
+    sync_cheap(i_out);
     if (moved && victim_out != nullptr) *victim_out = victim;
     // the victim's place now holds `out`: a stale promo flag on the victim would count a later demand read as a promotion hit
     if (moved && promo_flag_ != nullptr) promo_flag_[i_v].store(0, std::memory_order_relaxed);
@@ -4346,6 +4384,7 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
                          (override_.empty() || override_[i] == nullptr);
         if (can) {
             complement_offsets_[i] = p.at;
+            sync_cheap(i);   // STRATA_ROUTE_RAM_FLOOR
             ++published;
             promo_n_.fetch_add(1, std::memory_order_relaxed);
             promo_flag_[i].store(1, std::memory_order_relaxed);
@@ -4504,6 +4543,7 @@ bool FileExpertSource::release_resident_place(int64_t layer, int64_t expert) {
     if (fs != nullptr) fs->hold(layer, (int32_t) expert);
     const uint64_t at = complement_offsets_[i];
     complement_offsets_[i] = kNoComplement;
+    sync_cheap(i);   // STRATA_ROUTE_RAM_FLOOR
     if (fs != nullptr) fs->unhold(layer, (int32_t) expert);
     if (promo_flag_ != nullptr) promo_flag_[i].store(0, std::memory_order_relaxed);   // no longer a promoted place
     std::lock_guard<std::mutex> lk(tier_mu_);

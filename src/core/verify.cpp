@@ -122,8 +122,10 @@ struct RouteResidentCfg {
         unsigned long long* p = nullptr;
         {
             const OnDevice on(dev);
-            if (cudaMalloc((void**) &p, 8 * sizeof(unsigned long long)) != cudaSuccess ||
-                cudaMemset(p, 0, 8 * sizeof(unsigned long long)) != cudaSuccess) {
+            // 9 counters: [0..3] the prompt windows (T>8), [4..7] the decode windows (T<=8), [8] the decode windows' rank 0-1 stand-ins for an
+            // expert outside the RAM tier (STRATA_ROUTE_RAM_FLOOR; the prompt windows never take that path)
+            if (cudaMalloc((void**) &p, 9 * sizeof(unsigned long long)) != cudaSuccess ||
+                cudaMemset(p, 0, 9 * sizeof(unsigned long long)) != cudaSuccess) {
                 (void) cudaGetLastError();
                 if (p != nullptr) cudaFree(p);
                 p = nullptr;
@@ -135,7 +137,7 @@ struct RouteResidentCfg {
                 RouteResidentCfg& c = route_resident_cfg();
                 for (const auto& kv : c.blocks) {
                     if (kv.second == nullptr) continue;
-                    unsigned long long h[8] = {};
+                    unsigned long long h[9] = {};
                     if (cudaSetDevice(kv.first) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess ||
                         cudaMemcpy(h, kv.second, sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) {
                         (void) cudaGetLastError();
@@ -147,6 +149,9 @@ struct RouteResidentCfg {
                                  who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
                     std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
                                  who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
+                    if (strata::kernels::route_ram_floor_on())   // STRATA_ROUTE_RAM_FLOOR: rank 0-1 picks outside the RAM tier that took a stand-in
+                        std::fprintf(stderr, "route-resident%s: ram floor (STRATA_ROUTE_RAM_FLOOR) rank 0-1 stand-ins for an expert not in the RAM tier (decode): %llu\n",
+                                     who, h[8]);
                 }
             });
         }
@@ -819,6 +824,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
         strata::kernels::route_ring_alloc((size_t) (g.n_layers * g.n_expert));
+    // STRATA_ROUTE_RAM_FLOOR=1: the RAM-tier table the router reads (host-mapped; FileExpertSource keeps it equal to the tier)
+    if (route_resident_cfg().margin > 0.0f && strata::kernels::route_ram_floor_on())
+        strata::kernels::route_cheap_alloc((size_t) (g.n_layers * g.n_expert));
     if (route_resident_cfg().margin > 0.0f) {
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
         // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
@@ -2229,7 +2237,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       n <= 8 && !strata::kernels::route_rows_active() ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr,
                                       n <= 8 ? strata::kernels::route_rows_layer(l) : nullptr,
                                       n <= 8 ? strata::kernels::route_repl_layer(l, g.n_expert) : nullptr,
-                                      n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr);
+                                      n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr,
+                                      n <= 8 ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (!stage_mark(cs, kStRouter, err)) return false;

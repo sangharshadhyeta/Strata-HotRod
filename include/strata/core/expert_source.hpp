@@ -1188,6 +1188,12 @@ private:
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;
     std::vector<uint64_t> complement_offsets_;
+    /// STRATA_ROUTE_RAM_FLOOR: the router's copy of the RAM tier (route_cheap_host), written wherever complement_offsets_ changes.
+    /// ram_tier is the tier: complement_offsets_, or the exchange ownership table when STRATA_EXCHANGE_ROTATE moved it.  No table: no-op.
+    bool ram_tier(size_t i) const;
+    void set_cheap(size_t i, bool v);
+    void sync_cheap(size_t i) { set_cheap(i, ram_tier(i)); }
+    void refresh_cheap();
     std::vector<std::vector<uint64_t>> complement_free_;   ///< per layer: places release_resident_place gave up (free)
     std::vector<std::vector<uint64_t>> complement_parked_;   // places give_back_ram gave up: no taker sees them until
                                                              // unpark_ram (under tier_mu_)

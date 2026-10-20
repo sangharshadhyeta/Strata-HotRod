@@ -269,7 +269,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
                                  unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl,
-                                 const uint8_t* __restrict__ ring) {
+                                 const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -344,9 +344,17 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     int swaps = 0, tail = 0, before = 0;
     if (lane == 0)
         for (int r = 0; r < 10; ++r) before += !have(my[r]);
-    for (int r = (edge >= 0.f && lo > 0) ? lo - 1 : lo; r <= hi && r < 10; ++r) {
+    // STRATA_ROUTE_RAM_FLOOR (cheap != nullptr): the loop starts at rank 0, but only ranks 0-1 are new here.  A non-resident rank 0 or 1 pick
+    // whose expert is in the RAM tier stays exact (the CPU computes it from RAM); any other one takes the stand-in like a rank 2-9 pick.
+    // Measured 20 Oct (210 MMLU-Pro questions): 26% of decode time was the CPU path waiting on SSD fetches for such picks.  Ranks 2 and up
+    // below the floor are skipped as before.  `first` is the floor's first rank: the fractional edge rank lo - 1, else lo.
+    const int first = (edge >= 0.f && lo > 0) ? lo - 1 : lo;
+    int cheap_subs = 0;   // lane 0 only: rank 0-1 stand-ins made because the expert was not in the RAM tier
+    for (int r = cheap != nullptr ? 0 : first; r <= hi && r < 10; ++r) {
         const int e = my[r];
         if (have(e)) continue;                          // already resident: uniform across the warp
+        if (r >= 2 && r < first) continue;              // below the floor and not rank 0-1: exact, as before (never reached without `cheap`)
+        if (cheap != nullptr && r < 2 && cheap[e] != 0) continue;   // RAM-tier expert: exact, the CPU computes it from RAM (e is the same for the warp)
         if (wmax > 0.f && weights[(size_t) t * 10 + r] >= wmax) continue;   // a heavy pick stays exact: fetched / computed on the CPU
         if (lane == 0) ++tail;
         float bv = -INFINITY;
@@ -375,8 +383,9 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             for (int off = 16; off > 0; off >>= 1) place += __shfl_xor_sync(0xffffffffu, place, off);
             if (place >= maxrank) bi = -1;
         }
-        // the edge rank (lo - 1, a fractional floor such as 1.5) is replaced only by a close substitute (within `edge`)
-        if (bi >= 0 && l[e] - bv <= (r < lo ? edge : margin)) {
+        // the edge rank (lo - 1, a fractional floor such as 1.5) is replaced only by a close substitute (within `edge`); the other
+        // ranks below it (STRATA_ROUTE_RAM_FLOOR's ranks 0-1) take the margin, as the ranks 2-9 do
+        if (bi >= 0 && l[e] - bv <= ((edge >= 0.f && lo > 0 && r == lo - 1) ? edge : margin)) {
             if (detail != nullptr) {
                 // what was replaced and by what (per replacement): the weight of the replaced pick, the substitute's place in
                 // the router's own ranking of all 512 experts, and the score gap to it
@@ -399,6 +408,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             if (lane == 0 && repl != nullptr && l[e] - bv >= repl_gap) atomicAdd(repl + e, 1.0f);
             my[r] = bi;
             ++swaps;
+            if (lane == 0 && cheap != nullptr && r < 2) ++cheap_subs;
         }
     }
     int after = 0;
@@ -418,6 +428,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             atomicAdd(stats + 1, (unsigned long long) swaps);
             atomicAdd(stats + 2, (unsigned long long) before);
             atomicAdd(stats + 3, (unsigned long long) after);
+            // STRATA_ROUTE_RAM_FLOOR only (the caller's block then has 5+ entries): rank 0-1 stand-ins for an expert not in the RAM tier
+            if (cheap != nullptr) atomicAdd(stats + 4, (unsigned long long) cheap_subs);
         }
     }
 }
@@ -450,11 +462,11 @@ void route_cfg_set_floor(int lo) {
 const RouteCfg* route_cfg_device() { return g_cfg_dev; }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
-                           const uint8_t* ring) {
+                           const uint8_t* ring, const uint8_t* cheap) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
-        n_tok <= 8 ? repl : nullptr, ring);
+        n_tok <= 8 ? repl : nullptr, ring, cheap);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -491,6 +503,30 @@ void route_ring_alloc(size_t n) {
 }
 uint8_t* route_ring_ptr() { return g_ring; }
 const uint8_t* route_ring_layer(int64_t layer, int64_t n_expert) { return g_ring ? g_ring + (size_t) (layer * n_expert) : nullptr; }
+// ---- STRATA_ROUTE_RAM_FLOOR: one byte per (layer, expert), 1 while the expert has a RAM-tier place (the CPU can compute it from RAM).  Host-mapped,
+// not cudaMalloc like the ring above: the host writes it at every change of the tier and the kernel reads it at each launch (as RouteCfg does).
+// Allocated once, outside graph capture; a null table is "off" in the kernel.
+static uint8_t* g_cheap_host = nullptr;
+static uint8_t* g_cheap_dev = nullptr;
+static size_t g_cheap_n = 0;
+void route_cheap_alloc(size_t n) {
+    if (g_cheap_host != nullptr || n == 0) return;
+    if (cudaHostAlloc((void**) &g_cheap_host, n, cudaHostAllocMapped) != cudaSuccess) { cudaGetLastError(); g_cheap_host = nullptr; return; }
+    if (cudaHostGetDevicePointer((void**) &g_cheap_dev, g_cheap_host, 0) != cudaSuccess) {
+        cudaGetLastError();
+        cudaFreeHost(g_cheap_host);
+        g_cheap_host = nullptr;
+        g_cheap_dev = nullptr;
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) g_cheap_host[i] = 0;   // not zeroed by cudaHostAlloc: every expert starts outside the RAM tier
+    g_cheap_n = n;
+}
+uint8_t* route_cheap_host() { return g_cheap_host; }
+const uint8_t* route_cheap_layer(int64_t layer, int64_t n_expert) {
+    if (g_cheap_dev == nullptr || layer < 0 || n_expert <= 0 || (size_t) (layer + 1) * (size_t) n_expert > g_cheap_n) return nullptr;
+    return g_cheap_dev + (size_t) (layer * n_expert);
+}
 static float* g_repl = nullptr;
 static size_t g_repl_n = 0;
 void route_repl_alloc(size_t n) {

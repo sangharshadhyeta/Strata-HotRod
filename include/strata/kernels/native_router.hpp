@@ -44,13 +44,14 @@ const RouteCfg* route_cfg_device();
 bool native_router_topk_supported(int n_expert, int k);
 void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream);
 /// STRATA_ROUTE_RESIDENT: swap non-resident picks of the segment's floor ranks for resident ones within the margin (see the .cu).
-/// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
+/// `stats` is nullptr or device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after; with `cheap` set, [4] the
+/// rank 0-1 stand-ins made for an expert outside the RAM tier (STRATA_ROUTE_RAM_FLOOR), so a block of 5 or more.
 /// `want` is nullptr or the layer's slice of the wanted-expert counter (route_want_layer): the router's own top-10, counted
 /// before any swap. Needs route_cfg_init first.
 /// `rows` is nullptr or the layer's [8 rows][10] slice of the per-row record (route_rows_layer): the same original picks per window row.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr,
-                           const uint8_t* ring = nullptr);
+                           const uint8_t* ring = nullptr, const uint8_t* cheap = nullptr);
 /// STRATA_RING (the look-ahead ring): one byte per (layer, expert) on the device, 1 while a Foresight ring slot holds the expert and
 /// its copy has landed (set on the copy stream after the copy, cleared before the slot is refilled).  The router counts such an
 /// expert as resident: a pick it holds is computed exactly on the GPU from the slot, and it may serve as a stand-in.  Allocated
@@ -89,6 +90,18 @@ void route_rows_alloc(int64_t n_layers);
 int32_t* route_rows_layer(int64_t layer);   ///< nullptr when not allocated
 bool route_rows_active();
 void route_rows_apply(int kept, float* usage, int64_t n_layers, int64_t n_expert);
+/// STRATA_ROUTE_RAM_FLOOR=1 (opt-in, read once): a non-resident rank 0 or 1 pick stays exact only when its expert is in the RAM tier
+/// (`cheap`, below: the CPU computes it from RAM, no SSD fetch).  Any other one takes the stand-in as a rank 2-9 pick does.  Measured
+/// 20 Oct (210 MMLU-Pro questions): 26% of decode time was the CPU path waiting on SSD fetches for such picks.
+inline bool route_ram_floor_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+/// The RAM-tier table of STRATA_ROUTE_RAM_FLOOR: one byte per (layer, expert), 1 while the expert has a RAM-tier place.  Host-mapped
+/// (the host writes it, the router reads it at each launch).  Allocated once, outside graph capture, before the complement is ready.
+void route_cheap_alloc(size_t n);
+uint8_t* route_cheap_host();                                        ///< the host copy (nullptr when not allocated)
+const uint8_t* route_cheap_layer(int64_t layer, int64_t n_expert);  ///< the layer's device slice (nullptr when not allocated)
 /// The wanted-expert counter: what the unmasked router picked, for the swap round (a router confined to resident experts
 /// cannot tell the swap round which expert to bring in). Allocated once (outside graph capture), n_layers * n_expert floats.
 void route_want_alloc(size_t n);
