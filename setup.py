@@ -2362,8 +2362,9 @@ def hotrod_default_env(family: str, model: str, hip: bool) -> dict:
         return {}
     # 20 Oct night: the rank 0-1 stand-in rule (STRATA_ROUTE_RAM_FLOOR) is not written: r01any leaked <|im_start|>user at 94K
     # tokens, and with rank 1 only a pi harness session gave broken answers on a cold card.  Ranks 0-1 stay exact.  Its keys stay
-    # in SETUP_ENV so a setup run again removes them from an older config
-    return {"STRATA_ROUTE_RESIDENT": "1e30", "STRATA_ROUTE_RESIDENT_RANKS": "2-9",
+    # in SETUP_ENV so a setup run again removes them from an older config.  21 Oct (user): rank 2 takes a stand-in only within
+    # 1 logit (the edge rank below 3-9, the mechanism SPEC E1 used for rank 1); ranks 3-9 take any stand-in
+    return {"STRATA_ROUTE_RESIDENT": "1e30", "STRATA_ROUTE_RESIDENT_RANKS": "3-9", "STRATA_ROUTE_RESIDENT_EDGE": "1",
             "STRATA_SWAP2_MAX": "2", "STRATA_SWAP2_GAP": "1", "STRATA_KV_GROW_INIT": "4096"}
 
 
@@ -4541,7 +4542,7 @@ SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", 
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
                        "STRATA_ROUTE_TAIL_SKIP", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_RESIDENT_RANKS", "STRATA_SWAP2_MAX",
-                       "STRATA_SWAP2_GAP", "STRATA_KV_GROW_INIT", "STRATA_ROUTE_RAM_FLOOR",
+                       "STRATA_SWAP2_GAP", "STRATA_KV_GROW_INIT", "STRATA_ROUTE_RESIDENT_EDGE", "STRATA_ROUTE_RAM_FLOOR",
                        "STRATA_ROUTE_RAM_FLOOR_ANYTIER", "STRATA_ROUTE_RAM_FLOOR_RANK0"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there

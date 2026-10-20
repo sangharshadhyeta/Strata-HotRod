@@ -80,10 +80,11 @@ The detail is in [SPEC.md](SPEC.md).
 Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md)):
 
 - **Stand-in experts.** Each token uses ten experts per layer. The two best are always the real experts, computed from RAM
-  or read from the SSD when they are not on the card. Ranks 3 to 10 that are not on the card are replaced by the most
-  similar one that is, so the card does not wait for the SSD. Swap rounds move the experts a chat asks for onto the card in
-  the background. The install writes these settings for IQ3_S (`STRATA_ROUTE_RESIDENT=1e30`,
-  `STRATA_ROUTE_RESIDENT_RANKS=2-9`). Letting the two best take a stand-in that scores within 1 logit
+  or read from the SSD when they are not on the card. The third is replaced by an expert on the card only when that one
+  scores within 1 logit of it. Ranks 4 to 10 that are not on the card are replaced by the most similar one that is, so the
+  card does not wait for the SSD. Swap rounds move the experts a chat asks for onto the card in the background. The install
+  writes these settings for IQ3_S (`STRATA_ROUTE_RESIDENT=1e30`, `STRATA_ROUTE_RESIDENT_RANKS=3-9`,
+  `STRATA_ROUTE_RESIDENT_EDGE=1`). Letting the two best take a stand-in that scores within 1 logit
   (`STRATA_ROUTE_RAM_FLOOR=1`, `STRATA_ROUTE_RAM_FLOOR_RANK0=1` for the best one) was faster (47.4 against 38.6 tokens/s on
   short prompts), but it leaked a turn marker into an answer at 94K tokens and gave broken answers on a cold card, so it is
   off; details in [docs/perf-ideas.md](docs/perf-ideas.md).
