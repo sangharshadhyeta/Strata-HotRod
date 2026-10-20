@@ -104,8 +104,9 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
   same way (`vram-reserve.json`).
 - **The app:** live speeds while it works, and the experts-on-the-card map in the Monitor.
 - **Experimental, off by default:** `STRATA_GDN_LOOP=1 STRATA_GDN_LOOP_NORM=1` runs the middle linear-attention layers
-  twice per token (a training-free "looped" model) at the same decode speed; whether it improves answers is being
-  measured.
+  twice per token (a training-free "looped" model). Measured on 210 MMLU-Pro questions: 180 correct against 175 without
+  it (not significant: only 9 questions differ), and decode 10% slower (38.5 against 42.7 tokens/s). Not worth it on a
+  model that was not trained to loop, so it stays off.
 
 ## Using it
 
