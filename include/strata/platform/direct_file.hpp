@@ -3,7 +3,8 @@
 // The n-gram table (26.8 GiB) stays on the SSD and must never occupy RAM, including the OS file cache. A memory
 // map cannot promise that; an unbuffered read can. On Windows this is FILE_FLAG_NO_BUFFERING | OVERLAPPED with
 // an I/O completion port; on Linux, O_DIRECT preads.  Both issue the reads from a small thread pool (submit only
-// queues), so many reads are in flight: STRATA_IO_THREADS sets its size (default 4 on Windows, 16 on Linux).
+// queues), so many reads are in flight: STRATA_IO_THREADS sets its size (default 4 on Windows, 16 on Linux, 2 on a
+// spinning disk).
 //
 // Contract of every read: offset, length and buffer address are multiples of `alignment()` (4096 here).
 // Reads past end of file return the bytes that exist; `Completion::bytes` says how many.
@@ -56,5 +57,10 @@ private:
 
 /// Monotonic time in microseconds, for latency accounting.
 double now_us();
+
+/// What kind of drive `path` is on. Linux: from sysfs, following a partition to its disk and a device-mapper
+/// (LVM) volume to its first slave. Other systems, and anything that cannot be read, give Unknown. Never throws.
+enum class DriveKind { Nvme, Ssd, Hdd, Unknown };
+DriveKind drive_kind(const std::string& path);
 
 }  // namespace strata::platform

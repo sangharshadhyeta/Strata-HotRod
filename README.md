@@ -202,10 +202,10 @@ scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build -
   it runs on this 30 GB PC.
 - Add `--models-dir /path/on/nvme` to put the model files somewhere other than the default.
 
-**Run** (inside a memory limit; `--host 0.0.0.0` and a key let other devices on your network use it):
+**Run** (inside a memory limit of 94% of the PC's RAM, 29 GB on this 31 GB PC; `--host 0.0.0.0` and a key let other devices on your network use it):
 
 ```bash
-systemd-run --scope -p MemoryMax=29G -p MemorySwapMax=0 \
+systemd-run --scope -p MemoryMax=$(awk '/MemTotal/ {printf "%dK", $2 * 0.94}' /proc/meminfo) -p MemorySwapMax=0 \
   .venv/bin/python serve/server.py --engine strata --config strata-iq3_s.json \
   --port 8095 --host 0.0.0.0 --api-key YOUR_KEY
 ```

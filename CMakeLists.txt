@@ -1981,6 +1981,13 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(aux_cpus_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(aux_cpus_test PRIVATE Threads::Threads)
   add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
+  # drive_kind (direct_file.hpp): the NVMe and LVM-on-SSD paths of this PC; a missing path is skipped
+  if(UNIX AND NOT APPLE)
+    add_executable(drive_kind_test tests/platform/drive_kind_test.cpp src/platform/direct_file.cpp)
+    target_include_directories(drive_kind_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(drive_kind_test PRIVATE Threads::Threads)
+    add_test(NAME drive_kind_test COMMAND drive_kind_test)
+  endif()
 endif()
 
 if(STRATA_BUILD_TESTS)

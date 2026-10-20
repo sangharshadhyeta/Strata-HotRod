@@ -4,11 +4,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -20,6 +25,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/sysmacros.h>
+#endif
 #endif
 
 namespace strata::platform {
@@ -66,6 +74,44 @@ int io_threads(int dflt) {
     return std::clamp(n, 1, 64);
 }
 }  // namespace
+
+DriveKind drive_kind(const std::string& path) {
+#if defined(__linux__)
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) return DriveKind::Unknown;
+    char sys[64];
+    std::snprintf(sys, sizeof sys, "/sys/dev/block/%u:%u", (unsigned) major(st.st_dev), (unsigned) minor(st.st_dev));
+    char real[PATH_MAX];
+    if (realpath(sys, real) == nullptr) return DriveKind::Unknown;
+    std::filesystem::path p(real);
+    std::error_code ec;
+    // a partition has no queue of its own (its disk does); a device-mapper volume (LVM) is read through its first slave
+    for (int level = 0; level < 4; ++level) {
+        if (std::filesystem::exists(p / "partition", ec)) {
+            p = p.parent_path();
+        } else if (p.filename().string().compare(0, 3, "dm-") == 0) {
+            std::filesystem::path slave;
+            for (const auto& e : std::filesystem::directory_iterator(p / "slaves", ec)) {
+                slave = e.path();
+                break;
+            }
+            if (slave.empty()) return DriveKind::Unknown;
+            p = std::filesystem::canonical(slave, ec);
+            if (ec) return DriveKind::Unknown;
+        } else {
+            break;
+        }
+    }
+    if (p.filename().string().compare(0, 4, "nvme") == 0) return DriveKind::Nvme;
+    std::ifstream q(p / "queue" / "rotational");
+    int rotational = -1;
+    if (!(q >> rotational)) return DriveKind::Unknown;
+    return rotational == 1 ? DriveKind::Hdd : rotational == 0 ? DriveKind::Ssd : DriveKind::Unknown;
+#else
+    (void) path;
+    return DriveKind::Unknown;
+#endif
+}
 
 #if defined(_WIN32)
 // ------------------------------------------------------------------------------------------------ Windows
@@ -316,7 +362,16 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
-    const int n = io_threads(16);
+    // a spinning disk is seek-bound: 16 reads in flight only queue seeks, so it gets 2
+    const bool hdd = drive_kind(path) == DriveKind::Hdd;
+    if (hdd) {
+        static std::once_flag once;
+        std::call_once(once, [&path] {
+            std::fprintf(stderr, "DirectFile: %s is on a spinning disk: 2 read threads (STRATA_IO_THREADS overrides)\n",
+                         path.c_str());
+        });
+    }
+    const int n = io_threads(hdd ? 2 : 16);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { strata::aux_cpus::pin_current_thread(); impl_->worker(); });
     return true;
 }

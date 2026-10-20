@@ -587,8 +587,8 @@ struct Options {
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
-    /// KV streaming: resident cells per QSA layer. -1 (default): auto - 32768 from a 65536-token context up when the
-    /// RAM holds the K/V's host copy; 0: all in VRAM; N: N resident cells
+    /// KV streaming: resident cells per QSA layer. -1 (default): auto - 32768 (scaled by the card's VRAM) from twice
+    /// that many tokens of context up when the RAM holds the K/V's host copy; 0: all in VRAM; N: N resident cells
     int64_t kv_resident = -1;
     bool kv_grow = true;               ///< the elastic K/V (kvg_ensure): ON by default since 11 Oct (SPEC 20 9q, 9r, 9s: no loss at 32k, +8% decode and the slots back at 100k tokens of a 131k window); --no-kv-grow / STRATA_KV_GROW=0 turn it off
     bool kv_grow_asked = false;        ///< --kv-grow or STRATA_KV_GROW given: only then does a rig that cannot use it hear why
@@ -831,7 +831,7 @@ struct Options {
     int prompt_cache = 6;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
-    int64_t conversation_cache_min_free_mib = 2560;
+    int64_t conversation_cache_min_free_mib = -1;   // -1: auto, 8% of the RAM in 1-4 GiB (resolved after the arguments)
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
@@ -991,7 +991,7 @@ void usage() {
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
-                 "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
+                 "                       --memory-limit-mib) when parking, saving or restoring a session (default: 8%% of the RAM, 1-4 GiB)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
                  "                       the container cannot see its real limit (also STRATA_MEMORY_LIMIT_MIB; the flag\n"
                  "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
@@ -2882,6 +2882,24 @@ int main(int argc, char** argv) {
         }
         }
     }
+    if (o.conversation_cache_min_free_mib < 0) {   // auto (--conversation-cache-min-free-mib -1 or the default): 8% of MemTotal in 256 MiB steps
+        unsigned long long mem_total_kb = 0;
+        std::ifstream meminfo("/proc/meminfo");
+        for (std::string line; std::getline(meminfo, line);)
+            if (std::sscanf(line.c_str(), "MemTotal: %llu kB", &mem_total_kb) == 1) break;
+        if (mem_total_kb == 0) {
+            o.conversation_cache_min_free_mib = 2560;
+            std::fprintf(stderr, "strata generate: RAM floor auto: 2560 MiB (MemTotal cannot be read; "
+                                 "--conversation-cache-min-free-mib sets it)\n");
+        } else {
+            const int64_t total_mib = (int64_t) (mem_total_kb / 1024);
+            const int64_t steps = (int64_t) std::llround(0.08 * (double) total_mib / 256.0);
+            o.conversation_cache_min_free_mib = std::clamp<int64_t>(steps * 256, 1024, 4096);
+            std::fprintf(stderr, "strata generate: RAM floor auto: %lld MiB (8%% of %lld MiB of RAM; "
+                                 "--conversation-cache-min-free-mib sets it)\n",
+                         (long long) o.conversation_cache_min_free_mib, (long long) total_mib);
+        }
+    }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -3755,9 +3773,10 @@ int main(int argc, char** argv) {
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
-    // K/V streaming, auto (--kv-resident -1, the default): on for a context of 65536 or more when the RAM holds the
-    // K/V's host copy (every QSA layer's pinned copy, carved as qsa_state_init does). Decided here: the geometry is
-    // final, and nothing has read o.kv_resident yet (the session sizing and kv-grow below both see the value).
+    // K/V streaming, auto (--kv-resident -1, the default): on for a context of twice the resident cells (65536 on a
+    // 12 GB card) or more when the RAM holds the K/V's host copy (every QSA layer's pinned copy, carved as
+    // qsa_state_init does). Decided here: the geometry is final, and nothing has read o.kv_resident yet (the session
+    // sizing and kv-grow below both see the value).
     if (o.kv_resident == -1) {
         const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
         const int fmt = strata::core::qsa_kv_hybrid() ? strata::kernels::kKvHybrid
@@ -3769,8 +3788,15 @@ int main(int argc, char** argv) {
         const bool wsl = std::filesystem::exists("/dev/dxg");   // the WSL test layer.cpp's kv_host_alloc makes
         const auto mem = strata::core::sample_host_memory();
         const uint64_t need = host_bytes + ((uint64_t) o.conversation_cache_min_free_mib << 20);
+        // the resident cells scale with the card's total VRAM: 32768 at 12 GiB, 8192 at least; the device in use here
+        size_t vram_free = 0, vram_total = 0;
+        const bool vram_known = cudaMemGetInfo(&vram_free, &vram_total) == cudaSuccess;
+        if (!vram_known) (void) cudaGetLastError();
+        const int64_t resident = vram_known
+            ? std::max<int64_t>(8192, (int64_t) std::llround(32768.0 * (double) vram_total / (12.0 * 1073741824.0) / 4096.0) * 4096)
+            : 32768;
         char why[160] = "";
-        if (o.max_context < 65536) std::snprintf(why, sizeof why, "context below 65536");
+        if (o.max_context < 2 * resident) std::snprintf(why, sizeof why, "context below %lld", (long long) (2 * resident));
         else if (g.n_qsa_layers() == 0) std::snprintf(why, sizeof why, "no QSA layers");
         else if (wsl) std::snprintf(why, sizeof why, "WSL");
         else if (!mem) std::snprintf(why, sizeof why, "RAM cannot be read");
@@ -3778,10 +3804,16 @@ int main(int argc, char** argv) {
             std::snprintf(why, sizeof why, "RAM: need %.2f GiB, %.2f GiB available",
                           (double) need / 1073741824.0, (double) mem->available / 1073741824.0);
         if (why[0] == '\0') {
-            o.kv_resident = 32768;
-            std::fprintf(stderr, "strata generate: K/V streaming auto: on - 32768 resident cells per attention layer in "
-                                 "VRAM, the K/V's %.2f GiB host copy in RAM (--kv-resident 0 keeps it all in VRAM)\n",
-                         (double) host_bytes / 1073741824.0);
+            o.kv_resident = resident;
+            char scale[96];
+            if (vram_known)
+                std::snprintf(scale, sizeof scale, "scaled from 32768 at 12 GiB by this card's %.1f GiB",
+                              (double) vram_total / 1073741824.0);
+            else
+                std::snprintf(scale, sizeof scale, "32768: the card's memory could not be read");
+            std::fprintf(stderr, "strata generate: K/V streaming auto: on - %lld resident cells per attention layer in "
+                                 "VRAM (%s), the K/V's %.2f GiB host copy in RAM (--kv-resident 0 keeps it all in VRAM)\n",
+                         (long long) resident, scale, (double) host_bytes / 1073741824.0);
         } else {
             o.kv_resident = 0;
             std::fprintf(stderr, "strata generate: K/V streaming auto: off (%s)\n", why);
