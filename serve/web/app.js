@@ -992,6 +992,8 @@ async function send() {
   }
   busy = null;
   setBusy(false);
+  // a draft typed while the answer ran was not read (warmDraft skips while busy): read it now, the answer just ended
+  if ($("input").value.trim()) scheduleWarm(0);
   if (frame) cancelAnimationFrame(frame);
   updateAssistant(el, m, false);
   saveChat();
