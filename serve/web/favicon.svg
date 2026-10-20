@@ -10,9 +10,9 @@
     </linearGradient>
   </defs>
   <rect x="0.5" y="0.5" width="31" height="31" rx="7" fill="#14161b"/>
-  <path d="M11.5 8.5 4.5 16 11.5 23.5" fill="none" stroke="url(#fire)" stroke-width="3.6"
+  <path d="M10 9 3.6 16 10 23" fill="none" stroke="url(#fire)" stroke-width="3.6"
         stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M18.2 6.5 13.8 25.5" fill="none" stroke="#f0ecd8" stroke-width="3" stroke-linecap="round"/>
-  <path d="M20.5 8.5 27.5 16 20.5 23.5" fill="none" stroke="url(#ice)" stroke-width="3.6"
+  <path d="M18.8 4 13.2 28" fill="none" stroke="#f0ecd8" stroke-width="3.6" stroke-linecap="round"/>
+  <path d="M22 9 28.4 16 22 23" fill="none" stroke="url(#ice)" stroke-width="3.6"
         stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
