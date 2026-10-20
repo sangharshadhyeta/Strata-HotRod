@@ -123,6 +123,12 @@ curl http://127.0.0.1:8095/v1/chat/completions \
 - **Sampling:** a request that sets no temperature is decoded greedily. The model's card
   ([Best Practices](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#best-practices)) recommends temperature 1.0, top-p 0.95
   and top-k 20 with thinking on, and temperature 0.7, top-p 0.8 and top-k 20 with thinking off. Set them in your client.
+- **Reading while you type.** The chat page sends your draft while you pause typing, so the engine reads it before you
+  press Send; Send then reads only what changed. Your own programs and agent harnesses can do the same through the
+  endpoint they already use: send the request so far with `"strata_prefill": true` in the body or the header
+  `X-Strata-Prefill: 1` (or POST it to `/v1/prefill`); the answer is a small JSON (`prompt_tokens`, `reused`, `seconds`)
+  instead of a completion. An agent can send its growing context, a tool's output included, while the tool still runs.
+  Answers do not change: the real request is read exactly as sent. `"prefill_warm": false` in the config turns it off.
 - **One request at a time.** While one request runs, the others wait.
 - **Run it inside a memory limit.** Two uncapped runs once froze this 30 GB PC; the run command below sets one.
 

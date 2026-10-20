@@ -2117,21 +2117,20 @@ class StrataEngine:
             except Exception:  # noqa: BLE001 - any failure: the kill below ends it
                 pass
 
-        ended = False
+        # QUIT gives a responsive engine a few seconds to save its profile; the kill then always follows (harmless on one that
+        # already exited), so a silent engine is ended for certain - the #481 contract the SilentEngine/Slots tests hold
         try:
             writer = threading.Thread(target=quit_line, daemon=True)   # a full pipe must not hold this up: a short join only
             writer.start()
             writer.join(2.0)
             proc.wait(timeout=5)
-            ended = True
-        except Exception:  # noqa: BLE001 - not ended in time (or no process): it is killed below
+        except Exception:  # noqa: BLE001 - not ended in time (or no process): the kill below ends it
             pass
-        if not ended:
-            try:
-                proc.kill()
-                proc.wait(timeout=20)                   # restart() -> close() handles one that is still exiting
-            except (OSError, AttributeError, subprocess.TimeoutExpired):
-                pass
+        try:
+            proc.kill()
+            proc.wait(timeout=20)                       # restart() -> close() handles one that is still exiting
+        except (OSError, AttributeError, subprocess.TimeoutExpired):
+            pass
         return EngineSilent(f"{what}; the server ended the engine")
 
     def session_file(self, action: str, path: str) -> dict:
@@ -3208,6 +3207,11 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        # 20 Oct: the warm reads of POST /v1/prefill (and /v1/messages/prefill): the config's "prefill_warm" turns them off; the live
+        # ones are kept in self.warms (guarded by warm_lock) so a real request can cancel the ones it does not continue (Service.warm)
+        self.prefill_warm = True
+        self.warms: list[dict] = []
+        self.warm_lock = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.pcache = None                            # the prompt cache on disk (config "prompt_cache_path"; off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -3793,6 +3797,68 @@ class Service:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
+    def _supersede(self, ids):
+        """20 Oct: the live warm reads that a request with these ids does not continue are cancelled.  A running one that the ids
+        start with goes on (its read is kept, the request reads the rest); a queued one, or one the ids do not start with, is
+        cancelled.  A cancelled engine read stops at its next chunk (generate.cpp, q36_engine.cu) and keeps what it read."""
+        with self.warm_lock:
+            for w in self.warms:
+                if not (w["running"] and ids[:len(w["ids"])] == w["ids"]):
+                    w["cancel"].set()
+
+    def warm_pin_into(self, req, messages, tools, kwargs, ids, force=None) -> None:
+        """20 Oct (review): the warm's checkpoint goes where the draft's stable text ends.  Qwen3.8 is a hybrid: its recurrent state
+        cannot be rewound to the middle of what the engine holds, so a warm of "... draft <|im_end|> ... assistant" that the user
+        keeps typing would leave a checkpoint the real prompt does not continue.  So the warm also renders the same request with
+        " the" appended to the last user message: the two renderings part where that text ends.  The common start, less one token
+        (the last word may re-tokenize), is pinned through the existing "strata_prefix" ({"tokens": N}: the engine's pin=N, one pin
+        at a time, replacing the last).  Real requests are not changed: they resume from the pin when their ids extend it.  No pin
+        when the request has pictures (prepare would encode them again) or the common start is not usable."""
+        probe = probe_messages(messages)
+        if probe is None:
+            return
+        try:
+            probe_ids, _, _ = self.prepare(probe, tools, dict(kwargs), 1, force=force, req=None)
+        except ValueError:
+            return
+        n = 0
+        for x, y in zip(ids, probe_ids):
+            if x != y:
+                break
+            n += 1
+        n -= 1
+        if n < 1 or n >= len(ids) - 1:
+            return
+        req["strata_prefix"] = {"tokens": n}
+
+    def warm(self, ids, thinking, tools, req, cancel, force=None) -> dict:
+        """POST /v1/prefill (20 Oct, Stream2LLM): the engine reads a draft conversation while the user types, so the real request
+        reads only what changed.  Answers are unchanged: the real request is read as sent, a warm only pre-reads a prefix.  The
+        read is max_new 1, writes nothing to the prompt cache on disk, and is not recorded in the history or the totals.  A warm
+        that gets the turn while a real request waits, or that was cancelled, is skipped (see _run)."""
+        if getattr(self.engine, "batch", 0):
+            return {"object": "prefill", "skipped": True, "reason": "parallel"}
+        ids = list(ids)
+        if self.pcache is not None and self.pcache.covers(ids, getattr(self.engine, "gen", None)):
+            return {"object": "prefill", "skipped": True, "reason": "held"}      # the engine holds all of it: nothing to read
+        rec = {"ids": ids, "cancel": cancel, "running": False}
+        self._supersede(ids)
+        with self.warm_lock:
+            self.warms.append(rec)
+        t0, done = time.perf_counter(), None
+        try:
+            for kind, x in self.run(ids, thinking, tools, 1, dict(req, _strata_warm=rec), cancel, force=force):
+                if kind == "done":
+                    done = x
+        finally:
+            with self.warm_lock:
+                self.warms = [w for w in self.warms if w is not rec]
+        if done is None or done.get("finish") in ("skipped", "cancel"):
+            return {"object": "prefill", "skipped": True,
+                    "reason": "cancelled" if done is None or done.get("finish") == "cancel" else "a request is waiting"}
+        return {"object": "prefill", "prompt_tokens": len(ids), "reused": done.get("reused", 0),
+                "seconds": round(time.perf_counter() - t0, 3)}
+
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
         if not self.api_monitor:
@@ -4277,6 +4343,13 @@ class Service:
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        # 20 Oct: a warm read (Service.warm) carries its record under "_strata_warm"; the engine never sees that key.  A real request
+        # first cancels the warm reads it does not continue
+        warm = sampling.get("_strata_warm") if isinstance(sampling, dict) else None
+        if warm is not None:
+            sampling = {k: v for k, v in sampling.items() if k != "_strata_warm"}
+        else:
+            self._supersede(ids)
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -4383,6 +4456,15 @@ class Service:
                                    "reasoning_tokens": 0, "reasoning_recoveries": 0}
                     return
             with turn:
+                if warm is not None:
+                    # 20 Oct: a warm that gets the turn while a real request waits, or after its cancel, gives the turn up unread
+                    if cancel.is_set() or self.status["queued"] > 1:
+                        with self.status_lock:
+                            self.status["queued"] -= 1
+                        yield "done", {"finish": "cancel" if cancel.is_set() else "skipped", "completion_tokens": 0,
+                                       "reused": 0, "timings": None, "reasoning_tokens": 0, "reasoning_recoveries": 0}
+                        return
+                    warm["running"] = True
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -4695,36 +4777,37 @@ class Service:
                                 if last.get("offloaded") is not None and routed else None
                             pc_read = last.get("prompt_read")
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
-                            self.history.append({
-                                "projection": (sampling or {}).get("experimental_speed_projection") is not False
-                                if loaded else None,
-                                "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
-                                "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
-                                # the request's whole prompt, and the tokens read of it (None: an older engine)
-                                "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
-                                "reasoning_recoveries": recovery_count,
-                                "reasoning_repeat_coverage": round(repeat_coverage, 3),
-                                "engine_generated": last.get("generated"),
-                                "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
-                                "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
-                                if n and last.get("generated") and last.get("decode_ms") else None,
-                                "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
-                                "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
-                                # #457: the speculative drafts from the DONE line (None: the engine did not say)
-                                "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
-                            t = self.totals
-                            t["requests"] += 1
-                            t["prompt_tokens"] += seen
-                            t["reused"] += last.get("reused") or 0
-                            t["output_tokens"] += n
-                            t["prompt_ms"] += last.get("prompt_ms") or 0.0
-                            t["decode_ms"] += last.get("decode_ms") or 0.0
-                            t["drafts_offered"] += last.get("drafts_offered") or 0
-                            t["drafts_accepted"] += last.get("drafts_accepted") or 0
-                            ft0 = st.get("first_token")             # this request's own (#465: one per request)
-                            self.latencies.observe(ft0 - started if ft0 else None, n,
-                                                   (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
+                            if not warm:                    # 20 Oct: a warm read is not a request for the history, the totals or the latencies
+                                self.history.append({
+                                    "projection": (sampling or {}).get("experimental_speed_projection") is not False
+                                    if loaded else None,
+                                    "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                    "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
+                                    # the request's whole prompt, and the tokens read of it (None: an older engine)
+                                    "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                    "reasoning_recoveries": recovery_count,
+                                    "reasoning_repeat_coverage": round(repeat_coverage, 3),
+                                    "engine_generated": last.get("generated"),
+                                    "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                                    "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
+                                    if n and last.get("generated") and last.get("decode_ms") else None,
+                                    "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
+                                    "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
+                                    # #457: the speculative drafts from the DONE line (None: the engine did not say)
+                                    "drafts_offered": last.get("drafts_offered"),
+                                    "drafts_accepted": last.get("drafts_accepted")})
+                                t = self.totals
+                                t["requests"] += 1
+                                t["prompt_tokens"] += seen
+                                t["reused"] += last.get("reused") or 0
+                                t["output_tokens"] += n
+                                t["prompt_ms"] += last.get("prompt_ms") or 0.0
+                                t["decode_ms"] += last.get("decode_ms") or 0.0
+                                t["drafts_offered"] += last.get("drafts_offered") or 0
+                                t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                                ft0 = st.get("first_token")             # this request's own (#465: one per request)
+                                self.latencies.observe(ft0 - started if ft0 else None, n,
+                                                       (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                                 timings = request_timings(seen, n, last)
@@ -4761,7 +4844,7 @@ class Service:
                                     and len(segments) == 1 and not recovery_count):
                                 # one plain pass: the engine holds the prompt and what it wrote; a long read is saved while the fifo is held
                                 try:
-                                    note = self.pcache.after(self.engine, ids, raw_ids, pc_read)
+                                    note = self.pcache.after(self.engine, ids, raw_ids, pc_read, save=not warm)   # a warm saves nothing
                                     if note:
                                         print(f"[strata] {note}", flush=True)
                                 except Exception as e:
@@ -4788,6 +4871,50 @@ class Service:
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
+
+
+IMAGE_BLOCKS = ("image", "image_url", "input_image")
+
+
+def probe_messages(messages):
+    """20 Oct (review): the messages with " the" appended to the last user message's last text part (None when there is no such
+    text, or a picture anywhere: prepare() would encode it again).  See Service.warm_pin_into."""
+    for m in messages:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") in IMAGE_BLOCKS for b in c):
+            return None
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return messages[:i] + [{**m, "content": c + " the"}] + messages[i + 1:]
+        if isinstance(c, list):
+            j = next((k for k in range(len(c) - 1, -1, -1)
+                      if isinstance(c[k], dict) and c[k].get("type", "text") == "text" and isinstance(c[k].get("text"), str)), None)
+            if j is None:
+                return None
+            blocks = list(c)
+            blocks[j] = {**blocks[j], "text": blocks[j]["text"] + " the"}
+            return messages[:i] + [{**m, "content": blocks}] + messages[i + 1:]
+        return None
+    return None
+
+
+def is_anthropic_body(req: dict) -> bool:
+    """20 Oct: POST /v1/prefill takes either dialect.  Anthropic's body has a top-level "system" or "thinking", or content blocks of
+    its own types (OpenAI's content parts are text and image_url, and its system text is a message)."""
+    if "system" in req or "thinking" in req:
+        return True
+    for m in req.get("messages") or []:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") in ANTHROPIC_BLOCKS for b in content):
+            return True
+    return False
+
+
+ANTHROPIC_BLOCKS = ("tool_use", "tool_result", "image", "thinking", "redacted_thinking")
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -5726,6 +5853,7 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                req.pop("_strata_warm", None)                # only Service.warm sets it: a client's body cannot make a warm
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -5767,9 +5895,27 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                # 20 Oct: the warm reads (Service.warm) - a prompt read that makes no completion and is not recorded as a request.
+                # Any harness can warm through its usual endpoint, in either dialect, in one of these ways:
+                #   POST /v1/prefill or /v1/messages/prefill (the body is a chat body; the dialect is read from it: a top-level
+                #     "system" or "thinking", or content blocks typed tool_use / tool_result / image / thinking, is Anthropic's),
+                #   the usual /v1/chat/completions or /v1/messages with "strata_prefill": true, or the header X-Strata-Prefill: 1.
+                # Not max_tokens 0: that already means "the rest of the context" (MaxTokens tests), and a client relying on it
+                # must keep getting an answer.
+                # The answer is the prefill JSON (object "prefill") whatever "stream" says: a warm has no completion to stream.
+                # Service.warm takes care of the coalescing (a draft the user keeps typing), the skips and "prefill_warm".
+                anthropic = path in ("/v1/messages", "/v1/messages/prefill") or (path == "/v1/prefill" and is_anthropic_body(req))
+                warm = path in ("/v1/prefill", "/v1/messages/prefill") or (
+                    path in ("/v1/chat/completions", "/v1/messages") and (
+                        req.get("strata_prefill") is True or self.headers.get("X-Strata-Prefill") == "1"))
+                if warm:
+                    self.record = None                       # not in the request monitor
+                    (self._anthropic if anthropic else self._openai)(req, warm=True)
+                elif path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
-                if path == "/v1/responses":
+                if warm:
+                    pass
+                elif path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
                     query = parse_qs(self.path.partition("?")[2])
@@ -6069,7 +6215,9 @@ def make_handler(svc: Service):
             finally:
                 items.close()
 
-        def _openai(self, req):
+        def _openai(self, req, warm=False):
+            if warm and not svc.prefill_warm:            # 20 Oct: the config's "prefill_warm": false (see the routing in _post)
+                return self._json(200, {"object": "prefill", "skipped": True, "reason": "disabled"})
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
@@ -6082,6 +6230,8 @@ def make_handler(svc: Service):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            if warm:
+                max_new = 1                                   # 20 Oct: a warm reads the prompt and stops after one token
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
@@ -6098,8 +6248,13 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            if not warm:
+                self._watch_client(cancel)                   # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            if warm:                                         # 20 Oct: not watched - a warm goes on when its client aborts (Service.warm)
+                if req.get("strata_prefix") is None:         # the checkpoint where the draft's stable text ends (Service.warm_pin)
+                    svc.warm_pin_into(req, messages, tools, kw, ids, force)
+                return self._json(200, svc.warm(ids, thinking, tools, req, cancel, force=force))
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
@@ -6312,7 +6467,9 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
 
-        def _anthropic(self, req):
+        def _anthropic(self, req, warm=False):
+            if warm and not svc.prefill_warm:            # 20 Oct: as _openai
+                return self._json(200, {"object": "prefill", "skipped": True, "reason": "disabled"})
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
@@ -6321,12 +6478,19 @@ def make_handler(svc: Service):
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            if warm:
+                max_new = 1                                   # 20 Oct: a warm reads the prompt and stops after one token
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            if not warm:
+                self._watch_client(cancel)                   # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            if warm:                                         # 20 Oct: the same preparation as a message; the reply is the prefill JSON
+                if req.get("strata_prefix") is None:         # the checkpoint where the draft's stable text ends (Service.warm_pin)
+                    svc.warm_pin_into(req, messages, tools, kw, ids, force)
+                return self._json(200, svc.warm(ids, thinking, tools, req, cancel, force=force))
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
@@ -7096,6 +7260,7 @@ def main() -> int:
         svc.model_arch = cfg.get("arch") or "qwen4exp"
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.prefill_warm = cfg.get("prefill_warm") is not False     # 20 Oct: the web page reads the draft while it is typed (POST /v1/prefill); false turns it off
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)

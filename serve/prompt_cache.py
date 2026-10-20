@@ -92,6 +92,10 @@ class PromptCache:
             return 0
         return len(self.held) if self._prefix_len(self.held, ids) == len(self.held) else 0
 
+    def covers(self, ids: list[int], gen) -> bool:
+        """True when the engine holds all of `ids` (a hint, as _engine_reuse): a warm read of such a prompt has nothing to read."""
+        return self.held is not None and self.held_gen == gen and self._prefix_len(self.held, ids) == len(ids)
+
     # ---- before a request: bring in the best entry, when it saves a read
     def before(self, engine, ids: list[int]) -> str | None:
         """Restores the longest entry that starts `ids` when it brings at least min_gain tokens the engine does not hold.  Returns
@@ -133,15 +137,16 @@ class PromptCache:
         return f"prompt cache: restored {best_len} tokens in {time.time() - t0:.2f} s (the engine held {have})"
 
     # ---- after a request: remember what the engine holds, and save it when the read was long
-    def after(self, engine, ids: list[int], generated: list[int], prompt_read: int | None) -> str | None:
+    def after(self, engine, ids: list[int], generated: list[int], prompt_read: int | None, save: bool = True) -> str | None:
         """`generated`: every token the engine produced, the stop token included.  MEASURED (10 Oct 2026, 3 saves): the engine holds the
         prompt, all of those, and ONE more (the token after the stop token, which this server is not told: the template's newline
         in the cases seen).  The entry records the tokens this server knows; the extra one is the engine's own and is checked by the
-        engine against the next prompt.  Called with the fifo held.  Returns a line to log, or None."""
+        engine against the next prompt.  Called with the fifo held.  Returns a line to log, or None.
+        save=False (20 Oct: a warm read, POST /v1/prefill) records what the engine holds and writes nothing to disk."""
         gen = getattr(engine, "gen", None)
         tokens = list(ids) + list(generated)
         self.held, self.held_gen = tokens, gen
-        if not prompt_read or prompt_read < self.min_read or any(self._prefix_len(e["tokens"], tokens) == len(tokens) for e in self.entries.values()):
+        if not save or not prompt_read or prompt_read < self.min_read or any(self._prefix_len(e["tokens"], tokens) == len(tokens) for e in self.entries.values()):
             return None                   # a short read, or an entry already holds all of it
         key = hashlib.sha1(json.dumps(tokens).encode()).hexdigest()[:24]
         path = os.path.join(self.dir, key + ".bin")

@@ -774,9 +774,9 @@ $("chat").addEventListener("toggle", (e) => {
   if (d.open && body.dataset.pending) { body.textContent = messages[+d.closest(".st-msg").dataset.i].reasoning; delete body.dataset.pending; }
 }, true);
 
-function apiMessages() {
+function apiMessages(draft) {       // draft (20 Oct): a user message not sent yet, read as the last one (the draft warm)
   const out = [];
-  for (const m of messages) {
+  for (const m of draft ? [...messages, draft] : messages) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
       const text = userText(m);
@@ -821,9 +821,61 @@ function setBusy(on) {
   $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
 }
 
+// The body Send posts for the conversation (draft: a user message not sent yet). One function, so a warm (POST /v1/prefill)
+// reads the same prompt prefix as the real request.
+function requestBody(draft) {
+  const body = {model: health.model, messages: apiMessages(draft), stream: true,
+                reasoning_effort: settings.thinking};
+  if (!(settings.temperature > 0)) {
+    body.temperature = 0;
+  } else if (!samplingUntouched(settings)) {
+    Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
+  }
+  if (settings.seed) body.seed = +settings.seed;
+  if (settings.max) body.max_tokens = +settings.max;
+  if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
+  if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  return body;
+}
+
+// ------------------------------------------------------------------ reading the draft while you type (POST /v1/prefill)
+// The engine reads the conversation with the draft while you type, so Send reads only what changed. Nothing is shown:
+// the answer and the errors of a warm go to the console only.
+let warmTimer = null, warmCtl = null, warmKey = null, warmPasted = false;
+function cancelWarm() {
+  clearTimeout(warmTimer);
+  warmTimer = null;
+  if (warmCtl) warmCtl.abort();
+  warmCtl = null;
+}
+function warmDraft() {
+  warmTimer = null;
+  const text = $("input").value.trim();
+  if (!text || busy || attachments.some((a) => a.kind !== "file")) return;   // pictures are not warmed: vision encodes are not prefix-reusable
+  const files = attachments.filter((a) => a.kind === "file");
+  const key = JSON.stringify([text, files.map((f) => f.name)]);
+  if (key === warmKey) return;
+  warmKey = key;
+  if (warmCtl) warmCtl.abort();
+  const controller = new AbortController();
+  warmCtl = controller;
+  const draft = {role: "user", text, images: [], files, time: Date.now()};
+  fetch("v1/prefill", {method: "POST", headers: headers(true), body: JSON.stringify(requestBody(draft)), signal: controller.signal})
+    .then((r) => r.json())
+    .then((j) => console.debug("prefill", j))
+    .catch((e) => console.debug("prefill", e && e.name))
+    .finally(() => { if (warmCtl === controller) warmCtl = null; });
+}
+function scheduleWarm(ms) {
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(warmDraft, ms);
+}
+
 async function send() {
   const text = $("input").value.trim();
   if ((!text && !attachments.length) || busy) return;
+  cancelWarm();                    // the server keeps a warm read that the request continues (Service.warm)
+  warmKey = null;
   messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
                  files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
   attachments = [];
@@ -857,17 +909,7 @@ async function send() {
       if (ae && !m.meta) ae.textContent = m.liveMeta;
     }
   }, 400);
-  const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
-  if (!(settings.temperature > 0)) {
-    body.temperature = 0;
-  } else if (!samplingUntouched(settings)) {
-    Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
-  }
-  if (settings.seed) body.seed = +settings.seed;
-  if (settings.max) body.max_tokens = +settings.max;
-  if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
-  if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  const body = requestBody();
 
   let firstAt = null, thinkStart = null, usage = null, timings = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -963,6 +1005,14 @@ $("input").addEventListener("keydown", (e) => {
 });
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
 $("input").addEventListener("input", autosize);
+// the draft is read while it is typed: 1.2 s after the last keystroke, 0.3 s after a paste (its input event comes in the same task,
+// so it does not restart the timer)
+$("input").addEventListener("input", () => { if (!warmPasted) scheduleWarm(1200); });
+$("input").addEventListener("paste", () => {
+  warmPasted = true;
+  setTimeout(() => { warmPasted = false; }, 0);
+  scheduleWarm(300);
+});
 
 $("new-btn").onclick = () => {
   if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
