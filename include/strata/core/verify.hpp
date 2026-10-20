@@ -625,6 +625,10 @@ private:
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
     float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
+    // STRATA_GDN_LOOP scratch (zero-sized when the loop is off): the looped passes 1..K-1 of a GDN layer
+    float *loop_f_ = nullptr, *loop_xm_ = nullptr, *loop_lo_ = nullptr, *loop_rs_ = nullptr, *loop_inj_ = nullptr;
+    float *loop_R_ = nullptr, *loop_R2_ = nullptr, *loop_qkv_ = nullptr, *loop_h_ = nullptr, *loop_gate_ = nullptr;
+    float *loop_beta_ = nullptr, *loop_z_ = nullptr, *loop_y_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer

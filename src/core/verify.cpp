@@ -254,6 +254,35 @@ bool one_row_per_slot(const int* rows, int S) {
 }
 bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && one_row_per_slot(rows, S); }
 
+// STRATA_GDN_LOOP=1 (opt-in; changes the outputs by design): in a decode window, the GDN mixers of a range of middle layers
+// run as K damped passes (Training-Free Looped Transformers, arXiv 2605.23872): x_{p+1} = x_p + F_p(x_p) / K, the
+// deferred write adds acc = sum_p F_p / K.  Pass 0 is the canonical mixer (its per-layer buffers feed the commit); the
+// passes 1..K-1 read the stream x + w * acc and run the recurrence from the untouched state (no n_keep: no state write).
+// A one-token window then keeps nothing itself (its commit graph advances the state from the canonical pass, cache=first).
+// STRATA_GDN_LOOP_K (default 2, 2..8); STRATA_GDN_LOOP_LAYERS="a-b" (inclusive layer indices, default 45%..60% of depth).
+int gdn_loop_k() {
+    static const int k = [] {
+        if (!env_on("STRATA_GDN_LOOP")) return 1;
+        const char* e = std::getenv("STRATA_GDN_LOOP_K");
+        const int v = e != nullptr ? std::atoi(e) : 2;
+        return v < 2 ? 1 : (v > 8 ? 8 : v);
+    }();
+    return k;
+}
+bool gdn_loop_enabled() { return gdn_loop_k() > 1; }
+bool gdn_loop_layer(const ModelGeometry& g, int64_t l) {
+    if (!gdn_loop_enabled() || is_qsa_layer(g, l)) return false;
+    static const std::pair<long long, long long> env_range = [] {   // parsed once; malformed = the default range
+        long long a = 0, b = -1;
+        const char* e = std::getenv("STRATA_GDN_LOOP_LAYERS");
+        if (e == nullptr || std::sscanf(e, "%lld-%lld", &a, &b) != 2) return std::make_pair(0LL, -1LL);
+        return std::make_pair(a, b);
+    }();
+    if (env_range.first <= env_range.second) return l >= env_range.first && l <= env_range.second;
+    const int64_t n = g.n_layers;
+    return l * 100 >= 45 * n && l * 100 <= 60 * n;
+}
+
 // The shared expert runs on its own stream, forked off and joined back per layer (`sh_fork` in record_window).  The
 // overlap pays off on CUDA, where it was added (cfd3b72).  On HIP a cross-stream event dependency costs more than the
 // shared expert takes to run, so there the fork starts off: same binary, same 48,067-token prompt, three runs each on a
@@ -928,6 +957,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
+        {   // STRATA_GDN_LOOP: the looped passes' scratch; zero-sized when the loop is off (the arena is unchanged then)
+            const uint64_t lp = gdn_loop_enabled() ? (uint64_t) T : 0;
+            loop_f_ = b.take<float>(lp * N); loop_xm_ = b.take<float>(lp * N); loop_lo_ = b.take<float>(lp * g.hc_lr);
+            loop_rs_ = b.take<float>(lp * HC); loop_inj_ = b.take<float>(lp * HC);
+            loop_R_ = b.take<float>(lp * HC * N); loop_R2_ = b.take<float>(lp * HC * N);
+            loop_qkv_ = b.take<float>(lp * C); loop_h_ = b.take<float>(lp * C);
+            loop_gate_ = b.take<float>(lp * HV); loop_beta_ = b.take<float>(lp * HV);
+            loop_z_ = b.take<float>(lp * ZV); loop_y_ = b.take<float>(lp * ZV);
+        }
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
@@ -1167,7 +1205,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
-    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    // (STRATA_GDN_LOOP: the window keeps nothing itself; the commit graph advances the state from the canonical pass)
+    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit() &&
+                             !gdn_loop_enabled();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
     const int side_mixer_mode = g_side_mixer();
@@ -1480,6 +1520,59 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* hb = h_L_ + (size_t) gi * MT * C;
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
+                const bool loop_here = !batch_rec_ && G == 1 && gdn_loop_layer(g, l);
+                if (loop_here) {
+                    // STRATA_GDN_LOOP: this layer's mixer as K damped passes (gdn_loop_k).  Pass 0 is the canonical mixer on the
+                    // stream x: its projections, conv and recurrence land in the layer's own buffers, which the commit replays.
+                    // Passes 1..K-1 read x + w * acc (w: this layer's write weight, from the canonical inject) and run from the
+                    // untouched state: no pass writes the state or the conv history (n_keep and commit are off).  acc = sum of
+                    // F_p / K is the deferred write's block output (bo_), so the MoE reads the looped update.
+                    const int loop_k = gdn_loop_k();
+                    const float inv_k = 1.0f / (float) loop_k;
+                    const int64_t nN = (int64_t) n * N;
+                    auto mixer = [&](const float* xsrc, float* qkv_o, float* hb_o, float* gate_o, float* beta_o, float* z_o,
+                                     float* y_o, float* F_o) {
+                        quant_in(xsrc, (int) N);
+                        mm(wqkv, qkv_o + (size_t) tb * C, (int) N, (int) C);
+                        gdn_conv_l2_multi(conv, qkv_o, (const float*) wc->data, hb_o, (int) C, (int) (2 * HK), EPS, n, cs, tb,
+                                          false);
+                        gdn_ab_multi(xsrc, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                     (const float*) wsa->data, gate_o + (size_t) tb * HV, beta_o + (size_t) tb * HV, (int) N,
+                                     (int) HV, n, cs);
+                        mm(wg, z_o + (size_t) tb * ZV, (int) N, (int) ZV);
+                        gdn_step_norm_multi(state, hb_o, (int) C, gate_o, beta_o, z_o, (const float*) wnm->data, EPS, y_o,
+                                            (int) HK, (int) HV, te, nullptr, cs, tb, nullptr);
+                        quant_in(y_o + (size_t) tb * ZV, (int) ZV);
+                        mm(wout, F_o + (size_t) tb * N, (int) ZV, (int) N);
+                    };
+                    // the attention half's hyper-connection read of R_in into R_out (no pending write), the mixer's input
+                    auto attn_read = [&](float* Rin, float* Rout) {
+                        FusedGrArgs fa[kFusedGrMaxT];
+                        for (int t = tb; t < te; ++t) {
+                            FusedGrArgs& a = fa[t - tb];
+                            a.R = Rin + (size_t) t * HC * N; a.R_out = Rout + (size_t) t * HC * N; a.apply = false;
+                            a.w_norm = (const float*) wn[0]->data; a.w_down = (const uint16_t*) wd[0]->data;
+                            a.w_up = (const uint16_t*) wu[0]->data; a.w_inject = (const uint16_t*) wi[0]->data;
+                            a.q8_down = (const uint8_t*) wd[0]->hc_q8; a.q8_up = (const uint8_t*) wu[0]->hc_q8;
+                            a.q8_inject = (const uint8_t*) wi[0]->hc_q8;
+                            a.s_down = wd[0]->q8_scale; a.s_up = wu[0]->q8_scale;
+                            a.eps = EPS; a.lo = loop_lo_ + (size_t) t * g.hc_lr; a.rs = loop_rs_ + (size_t) t * HC;
+                            a.inject_out = loop_inj_ + (size_t) t * HC; a.mixed = loop_xm_ + (size_t) t * N;
+                        }
+                        if (!fused_gr_read_persist(fa, n, cs)) fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, nullptr, 0);
+                    };
+                    // pass 0 (canonical): acc = F_0 / K
+                    mixer(xm, qkv, hb, gate, beta, z_, y_, loop_f_);
+                    axpby(bo_ + (size_t) tb * N, loop_f_ + (size_t) tb * N, inv_k, loop_f_ + (size_t) tb * N, 0.0f, nN, cs);
+                    // passes 1..K-1: x_p = x + w * acc, F_p = mixer(x_p), acc += F_p / K
+                    for (int p = 1; p < loop_k; ++p) {
+                        gr_write_multi(Rt(tb), bo_ + (size_t) tb * N, inj_ + (size_t) tb * HC, gs, loop_R_ + (size_t) tb * HC * N,
+                                       n, cs);
+                        attn_read(loop_R_, loop_R2_);
+                        mixer(loop_xm_ + (size_t) tb * N, loop_qkv_, loop_h_, loop_gate_, loop_beta_, loop_z_, loop_y_, loop_f_);
+                        axpby(bo_ + (size_t) tb * N, bo_ + (size_t) tb * N, 1.0f, loop_f_ + (size_t) tb * N, inv_k, nN, cs);
+                    }
+                } else {
                 if (sidem) {   // the gates (a few blocks, latency-bound) beside the projections, joined below
                     if (!branch(mfork_, cs, side_, "fork")) return false;
                     gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
@@ -1597,6 +1690,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                }   // not loop_here
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -3431,7 +3525,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
+    if (last_t_ == 1 && !always_publish_ && one_token_self_commit() && !gdn_loop_enabled()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);

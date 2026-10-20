@@ -428,6 +428,38 @@ static int64_t pf_switch_min_t() {   // S23: STRATA_PF_SWITCH_MIN_T=N - the roun
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
     return v;
 }
+// STRATA_PF_GROUP_OVERLAP=1 (default off, for the A/B): the staged walk's expert groups alternate between two streams,
+// each with its own set of group buffers and MMQ context (see GroupLive).  A group writes only its own rows of GU, H,
+// Dm and row_sd (bounds_host), so the groups' order of writes is free; the combine joins them back.
+inline bool pf_group_overlap() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_GROUP_OVERLAP"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+// While expert group `parity`'s products are queued, m.cs is that group's stream and the m.grp_*, Hq, Hscale and
+// mmq_ctx names point at its buffer set (parity 1 swaps the second set in).  Restored on scope exit.  `on` false: no-op.
+template <class M> struct GroupLive {
+    M& m;
+    cudaStream_t main_cs;
+    bool on, alt;
+    GroupLive(M& mm, int parity, bool active) : m(mm), main_cs(mm.cs), on(active), alt(active && parity == 1) {
+        if (!on) return;
+        m.cs = m.gs[parity];
+        if (alt) swap_sets();
+    }
+    ~GroupLive() {
+        if (!on) return;
+        if (alt) swap_sets();
+        m.cs = main_cs;
+    }
+    void swap_sets() {
+        std::swap(m.grp_gu, m.grp_gu2);
+        std::swap(m.grp_d, m.grp_d2);
+        std::swap(m.grp_tail, m.grp_tail2);
+        std::swap(m.Hq, m.Hq2);
+        std::swap(m.Hscale, m.Hscale2);
+        std::swap(m.mmq_ctx, m.mmq_ctx2);
+    }
+};
 inline bool hc_upmix() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HC_UPMIX"); return e != nullptr && e[0] == '1'; }();
     return v;
@@ -924,6 +956,14 @@ struct Prefill::Impl {
     float* row_sd = nullptr;          // NVFP4 in MMQ: each Dm row's s_down, applied by the combine as it reads the row
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
+    // STRATA_PF_GROUP_OVERLAP: the two expert-group streams, their fork/join events, the second group buffer set
+    // (grp_*2, Hq2, Hscale2, grp_tail2) and MMQ context.  The names above are the parity-0 set (see GroupLive).
+    cudaStream_t gs[2] = {nullptr, nullptr};
+    cudaEvent_t gs_fork = nullptr, gs_ev[2] = {nullptr, nullptr};
+    uint8_t *grp_gu2 = nullptr, *grp_d2 = nullptr;
+    float *grp_tail2 = nullptr, *Hscale2 = nullptr;
+    void* Hq2 = nullptr;
+    std::unique_ptr<mmq::Context> mmq_ctx2;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // set_cpu_pool: a small chunk's CPU experts. The layer's MoE input (T x N, from `mixed`), the rows the pool writes
     // (Dm's tail, in Dm's row order), ones for row_sd (the CPU's rows carry s_down already), all pinned; and the
@@ -1085,6 +1125,8 @@ void Prefill::release() {
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
+    for (cudaStream_t s : impl_->gs) if (s) { cudaStreamSynchronize(s); cudaStreamDestroy(s); }
+    for (cudaEvent_t e : {impl_->gs_fork, impl_->gs_ev[0], impl_->gs_ev[1]}) if (e) cudaEventDestroy(e);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
@@ -1248,6 +1290,7 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
         a.take<float>(mb.h, ok);
         a.take<uint8_t>(mb.hq, ok);
         a.take<float>(T * K, ok); a.take<float>(T * K, ok); a.take<float>(MMQ_GROUP * 4, ok);
+        if (pf_group_overlap()) { a.take<uint8_t>(mb.hq, ok); a.take<float>(T * K, ok); a.take<float>(MMQ_GROUP * 4, ok); }
         a.take<float>(T * K, ok);
     }
     return a.used;
@@ -1302,6 +1345,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_up.init((size_t) chunk);
     }
     if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+    if (pf_group_overlap()) {   // STRATA_PF_GROUP_OVERLAP: the two expert-group streams and their events
+        for (int p = 0; p < 2; ++p)
+            if (cudaStreamCreateWithFlags(&m.gs[p], cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: group stream"; return false; }
+        for (cudaEvent_t* e : {&m.gs_fork, &m.gs_ev[0], &m.gs_ev[1]})
+            if (cudaEventCreateWithFlags(e, cudaEventDisableTiming) != cudaSuccess) { err = "prefill: group event"; return false; }
+    }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
@@ -1502,6 +1551,10 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.Hq = c.take<uint8_t>(mb.hq, ok);
             m.Xscale = c.take<float>(T * K, ok); m.Hscale = c.take<float>(T * K, ok);
             m.grp_tail = c.take<float>(MMQ_GROUP * 4, ok);
+            if (pf_group_overlap()) {   // the second group set's Hq, Hscale, tails (moe_set_bytes counts them)
+                m.Hq2 = c.take<uint8_t>(mb.hq, ok); m.Hscale2 = c.take<float>(T * K, ok);
+                m.grp_tail2 = c.take<float>(MMQ_GROUP * 4, ok);
+            }
             m.row_sd = c.take<float>(T * K, ok);
         }
         if (base == nullptr) ok = false;
@@ -1513,6 +1566,11 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        if (pf_group_overlap()) {   // the second group set (GroupLive) and its MMQ context
+            m.grp_gu2 = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+            m.grp_d2 = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+            if (!m.mmq_ctx2) m.mmq_ctx2 = std::make_unique<mmq::Context>();
+        }
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
@@ -2255,6 +2313,10 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        if (pf_group_overlap()) {   // STRATA_PF_GROUP_OVERLAP's second group set
+            o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+            o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        }
     }
     if (owned_pages) {
         if (stage_slots(T) > 0) o.take<uint8_t>((size_t) stage_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
@@ -4504,6 +4566,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                     MMQ_GROUP <= mmq::kGatherGroupMax;
                         const bool gg_now = group_gather || group_resident;
                         const int stage_n = group_resident ? STAGE_GRP : STAGE;
+                        // STRATA_PF_GROUP_OVERLAP: this layer's MMQ groups run on m.gs[parity] (GroupLive), forked from
+                        // m.cs before the walk and joined back to it after the walk, before the combine
+                        const bool gov = group_resident && pf_group_overlap() && m.gs[0] != nullptr && m.gs[1] != nullptr &&
+                                         m.grp_gu2 != nullptr && m.mmq_ctx2 != nullptr;
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                         int stage_next = 0;
                         std::vector<int> stage_of(order.size(), -1);
@@ -4630,6 +4696,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = order[j];
                             pt.mark(kPfDequant, cs);
                             if (use_mmq) {
+                                // this expert's group (j / MMQ_GROUP) runs on its stream and buffer set while in scope
+                                GroupLive live(m, (int) ((j / MMQ_GROUP) & 1), gov);
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                                 const size_t q = j % MMQ_GROUP;
                                 // the group's last expert also zeroes the MMQ tail after its slot (see MMQ_TAIL)
@@ -4756,6 +4824,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                             return true;
                         };
+                        if (gov) {   // fork: the groups' streams wait for everything queued on m.cs so far (this layer's inputs)
+                            cudaEventRecord(m.gs_fork, m.cs);
+                            for (cudaStream_t s : m.gs) cudaStreamWaitEvent(s, m.gs_fork, 0);
+                        }
+                        // the join: the groups' streams join the main stream before anything reads Dm, GU, H or row_sd - on every
+                        // exit of this block, an error return included (work queued on a group stream is then ordered before m.cs's)
+                        struct GroupJoin {
+                            Impl& m; bool on;
+                            ~GroupJoin() {
+                                if (!on) return;
+                                for (int p = 0; p < 2; ++p) {
+                                    cudaEventRecord(m.gs_ev[p], m.gs[p]);
+                                    cudaStreamWaitEvent(m.cs, m.gs_ev[p], 0);
+                                }
+                            }
+                        } group_join{m, gov};
                         if (!stream_all) {
                             size_t staged = 0;
                             size_t pending = 0;
@@ -5150,11 +5234,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // still fails: 20 Oct, one give-back of 3.13 GiB left "need 1.7 GiB, 1.7 GiB available" and the prompt went chunk-major.
         uint64_t given = 0;
         const uint64_t avail_before = mem ? mem->available : 0;
-        for (int attempt = 0; attempt < 3 && need > 0 && mem && g_ram_give_back &&
+        for (int attempt = 0; attempt < 6 && need > 0 && mem && g_ram_give_back &&
                               !core::conversation_memory_admit(mem->available, need, floor_bytes); ++attempt) {
             const uint64_t above = above_floor(mem->available);
             const uint64_t deficit = mem->available < floor_bytes ? floor_bytes - mem->available : 0;
-            const uint64_t got = g_ram_give_back((need > above ? need - above : 0) + deficit + (256ull << 20));
+            const uint64_t got = g_ram_give_back((need > above ? need - above : 0) + deficit + (1024ull << 20));   // 20 Oct: 256 MiB left a 45k prompt 0.1 GiB short when another program took part of what was freed
             if (got == 0) break;
             given += got;
             mem = core::sample_host_memory();

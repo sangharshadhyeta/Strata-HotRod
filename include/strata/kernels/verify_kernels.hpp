@@ -55,6 +55,8 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+/// STRATA_GDN_LOOP: out[i] = alpha * a[i] + beta * b[i] for i < n (FP32, elementwise; out may alias a or b).
+void axpby(float* out, const float* a, float alpha, const float* b, float beta, int64_t n, void* stream);
 /// The commit of `n_layers` GDN layers in two launches (engine-latency): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as
