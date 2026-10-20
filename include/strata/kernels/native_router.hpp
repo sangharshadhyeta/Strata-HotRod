@@ -90,11 +90,11 @@ void route_rows_alloc(int64_t n_layers);
 int32_t* route_rows_layer(int64_t layer);   ///< nullptr when not allocated
 bool route_rows_active();
 void route_rows_apply(int kept, float* usage, int64_t n_layers, int64_t n_expert);
-/// STRATA_ROUTE_RAM_FLOOR=1 (opt-in, read once): a non-resident rank 0 or 1 pick stays exact only when its expert is in the RAM tier
-/// (`cheap`, below: the CPU computes it from RAM, no SSD fetch).  Any other one takes the stand-in as a rank 2-9 pick does.  Measured
-/// 20 Oct (210 MMLU-Pro questions): 26% of decode time was the CPU path waiting on SSD fetches for such picks.
+/// STRATA_ROUTE_RAM_FLOOR (default ON since 20 Oct, =0 turns it off; read once): a non-resident rank 1 pick (rank 0 too with
+/// STRATA_ROUTE_RAM_FLOOR_RANK0=1) may take a stand-in within STRATA_ROUTE_RAM_FLOOR_MARGIN logits (`cheap`, below, marks the RAM
+/// tier).  Measured 20 Oct (210 MMLU-Pro questions): 26% of decode time was the CPU path waiting on SSD fetches for such picks.
 inline bool route_ram_floor_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR"); return v == nullptr || std::atoi(v) != 0; }();
     return on;
 }
 /// The RAM-tier table of STRATA_ROUTE_RAM_FLOOR: one byte per (layer, expert), 1 while the expert has a RAM-tier place.  Host-mapped
