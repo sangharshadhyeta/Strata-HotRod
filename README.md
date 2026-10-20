@@ -79,23 +79,14 @@ The detail is in [SPEC.md](SPEC.md).
 
 Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md)):
 
-- **Stand-in experts.** Each token uses ten experts per layer. The best one is always the real expert. The second is
-  replaced by an expert that is on the card only when that one scores within 1 logit of it (close enough that answers
-  stay the same: 49 of 50 maths answers right, the same as with no stand-ins); otherwise it is the real expert, computed
-  from RAM or read from the SSD. Ranks 3 to 10 that are not on the card are replaced by the most similar one that is, so
-  the card does not wait for the SSD. Swap rounds move the experts a chat asks for onto the card in the background. The
-  install writes these settings for IQ3_S. Measured: a wider margin than 1 logit drops tokens (2 logits) or makes answers
-  collapse into loops (3 and more); letting the best expert take a close stand-in too was faster on short prompts (47.4
-  against 38.6 tokens/s) but leaked a turn marker into an answer in a 94K-token conversation, so it is off; details in
-  [docs/perf-ideas.md](docs/perf-ideas.md). The settings, in the config's `env`:
-
-  | Setting | What it does | Install value |
-  | --- | --- | --- |
-  | `STRATA_ROUTE_RESIDENT_RANKS` | the ranks that always take a stand-in when not on the card | `2-9` |
-  | `STRATA_ROUTE_RAM_FLOOR` | the second-best expert may take a close stand-in (`0`: always the real one) | `1` |
-  | `STRATA_ROUTE_RAM_FLOOR_MARGIN` | how close that stand-in must score, in logits | `1` (default) |
-  | `STRATA_ROUTE_RAM_FLOOR_ANYTIER` | also when the expert is in RAM (`0`: only when it would come from the SSD) | `1` |
-  | `STRATA_ROUTE_RAM_FLOOR_RANK0` | the best expert too (faster on short prompts; leaked a turn marker at 94K tokens) | `0` |
+- **Stand-in experts.** Each token uses ten experts per layer. The two best are always the real experts, computed from RAM
+  or read from the SSD when they are not on the card. Ranks 3 to 10 that are not on the card are replaced by the most
+  similar one that is, so the card does not wait for the SSD. Swap rounds move the experts a chat asks for onto the card in
+  the background. The install writes these settings for IQ3_S (`STRATA_ROUTE_RESIDENT=1e30`,
+  `STRATA_ROUTE_RESIDENT_RANKS=2-9`). Letting the two best take a stand-in that scores within 1 logit
+  (`STRATA_ROUTE_RAM_FLOOR=1`, `STRATA_ROUTE_RAM_FLOOR_RANK0=1` for the best one) was faster (47.4 against 38.6 tokens/s on
+  short prompts), but it leaked a turn marker into an answer at 94K tokens and gave broken answers on a cold card, so it is
+  off; details in [docs/perf-ideas.md](docs/perf-ideas.md).
 - **Guessing ahead.** A small draft head guesses the next words and the big model checks them together, with
   probabilistic acceptance of the guesses (`--no-spec-prob-accept` turns it off).
 - **Three tiers of experts: card -> RAM -> SSD.** Every expert lives in exactly one place. The hottest are on the card, the

@@ -2360,13 +2360,11 @@ def hotrod_default_env(family: str, model: str, hip: bool) -> dict:
     tokens.  Written for the CUDA IQ3_S config only; any other model's config is left as upstream writes it."""
     if family != "qwen" or model != "IQ3_S" or hip:
         return {}
-    # 20 Oct (E1): rank 1 may take a stand-in too, but only one within 1 logit (STRATA_ROUTE_RAM_FLOOR_MARGIN, default 1),
-    # whether or not the expert is in RAM (ANYTIER); rank 0 is always the real expert.  SPEC E1: 49/50 sums, 29/30 code; margin
-    # 2 dropped tokens, 3 and more collapsed (20 Oct ladder).  Rank-0 stand-ins (r01any, STRATA_ROUTE_RAM_FLOOR_RANK0=1) were
-    # faster on short prompts (47.4 vs 38.6 tok/s) but leaked <|im_start|>user into an answer in a 94K-token conversation
+    # 20 Oct night: the rank 0-1 stand-in rule (STRATA_ROUTE_RAM_FLOOR) is not written: r01any leaked <|im_start|>user at 94K
+    # tokens, and with rank 1 only a pi harness session gave broken answers on a cold card.  Ranks 0-1 stay exact.  Its keys stay
+    # in SETUP_ENV so a setup run again removes them from an older config
     return {"STRATA_ROUTE_RESIDENT": "1e30", "STRATA_ROUTE_RESIDENT_RANKS": "2-9",
-            "STRATA_SWAP2_MAX": "2", "STRATA_SWAP2_GAP": "1", "STRATA_KV_GROW_INIT": "4096",
-            "STRATA_ROUTE_RAM_FLOOR": "1", "STRATA_ROUTE_RAM_FLOOR_ANYTIER": "1", "STRATA_ROUTE_RAM_FLOOR_RANK0": "0"}
+            "STRATA_SWAP2_MAX": "2", "STRATA_SWAP2_GAP": "1", "STRATA_KV_GROW_INIT": "4096"}
 
 
 def menu_families(hip: bool) -> list:
