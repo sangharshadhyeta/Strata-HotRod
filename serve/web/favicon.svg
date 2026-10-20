@@ -1,9 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <!-- The tab icon: the layer stack the app's panels use (serve/web/sprite.svg, i-layers),
-       drawn bold enough to stay readable at 16 px. -->
-  <path d="M16 2.38 28.42 9.08 16 15.78 3.58 9.08Z" fill="#10b981"/>
-  <path d="M3.58 14.8 16 21.5 28.42 14.8" fill="none" stroke="#10b981" stroke-width="3.67"
-        stroke-linecap="round" stroke-linejoin="round" opacity="0.92"/>
-  <path d="M3.58 21.28 16 27.98 28.42 21.28" fill="none" stroke="#10b981" stroke-width="3.67"
-        stroke-linecap="round" stroke-linejoin="round" opacity="0.78"/>
+  <!-- The tab icon: the Hot Rod logo's </> (docs/media/hotrod-hero.gif) - a burning < , a pale /, an icy > - drawn as
+       strokes on a dark tile so it reads at 16 px on light and dark tabs alike. -->
+  <defs>
+    <linearGradient id="fire" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb020"/><stop offset=".5" stop-color="#ff6a00"/><stop offset="1" stop-color="#e01800"/>
+    </linearGradient>
+    <linearGradient id="ice" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#40d8ff"/><stop offset=".5" stop-color="#0a8af0"/><stop offset="1" stop-color="#0040e0"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="31" height="31" rx="7" fill="#14161b"/>
+  <path d="M11.5 8.5 4.5 16 11.5 23.5" fill="none" stroke="url(#fire)" stroke-width="3.6"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M18.2 6.5 13.8 25.5" fill="none" stroke="#f0ecd8" stroke-width="3" stroke-linecap="round"/>
+  <path d="M20.5 8.5 27.5 16 20.5 23.5" fill="none" stroke="url(#ice)" stroke-width="3.6"
+        stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
