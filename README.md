@@ -2,14 +2,24 @@
 
 <h1 align="center">Strata-HotRod</h1>
 
-<p align="center"><b>Qwen3.8-Flash-Next, a 125-billion-parameter model, on one RTX 3060 (12 GB) with 30 GB of RAM</b><br>
-Linux · NVMe SSD · nothing leaves your PC</p>
+<p align="center"><b>A 125-billion-parameter model on a 12 GB gaming card.</b><br>
+Qwen3.8-Flash-Next on one RTX 3060 with 30 GB of RAM: 40-54 tokens/s, 262K tokens of context, nothing leaves your PC.</p>
 
 This is a fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). Strata runs a model that
 normally needs a server by keeping the most-used parts on the graphics card and streaming the rest from the SSD.
 
 **Everything in this README was tested on one machine, with one model.** Other graphics cards, AMD, Windows, macOS and
 other model sizes may work in upstream Strata, but we have not run them, so we do not describe them here.
+
+**At a glance**
+
+- **Fast where it counts:** 52-54 tokens/s after an 8.5K-token prompt, 38-45 tokens/s deep into a 45K-token conversation.
+- **Long memory:** 262K tokens of context on a 12 GB card; the K/V streams from RAM past 64K.
+- **Quick follow-ups:** the next turn of a 45K conversation is read in half a second; your draft is read while you type.
+- **Careful shortcuts:** experts that are not on the card are swapped for close stand-ins only where measured safe; the two
+  most important ones per token are always real ([how far each rank may be swapped](#stand-in-experts-rank-by-rank)).
+- **Every number measured, every answer read:** the changes and their A/B results are in
+  [docs/perf-ideas.md](docs/perf-ideas.md).
 
 ## What was tested
 
@@ -79,15 +89,9 @@ The detail is in [SPEC.md](SPEC.md).
 
 Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md)):
 
-- **Stand-in experts.** Each token uses ten experts per layer. The two best are always the real experts, computed from RAM
-  or read from the SSD when they are not on the card. The third is replaced by an expert on the card only when that one
-  scores within 1 logit of it. Ranks 4 to 10 that are not on the card are replaced by the most similar one that is, so the
-  card does not wait for the SSD. Swap rounds move the experts a chat asks for onto the card in the background. The install
-  writes these settings for IQ3_S (`STRATA_ROUTE_RESIDENT=1e30`, `STRATA_ROUTE_RESIDENT_RANKS=3-9`,
-  `STRATA_ROUTE_RESIDENT_EDGE=1`). Letting the two best take a stand-in that scores within 1 logit
-  (`STRATA_ROUTE_RAM_FLOOR=1`, `STRATA_ROUTE_RAM_FLOOR_RANK0=1` for the best one) was faster (47.4 against 38.6 tokens/s on
-  short prompts), but it leaked a turn marker into an answer at 94K tokens and gave broken answers on a cold card, so it is
-  off; details in [docs/perf-ideas.md](docs/perf-ideas.md).
+- **Stand-in experts.** An expert that is not on the card can be replaced by a close one that is, so the card does not wait
+  for the SSD; how far each rank may be swapped is in [the next section](#stand-in-experts-rank-by-rank). Swap rounds move
+  the experts a chat asks for onto the card in the background.
 - **Guessing ahead.** A small draft head guesses the next words and the big model checks them together, with
   probabilistic acceptance of the guesses (`--no-spec-prob-accept` turns it off).
 - **Three tiers of experts: card -> RAM -> SSD.** Every expert lives in exactly one place. The hottest are on the card, the
@@ -113,6 +117,41 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
   twice per token (a training-free "looped" model). Measured on 210 MMLU-Pro questions: 180 correct against 175 without
   it (not significant: only 9 questions differ), and decode 10% slower (38.5 against 42.7 tokens/s). Not worth it on a
   model that was not trained to loop, so it stays off.
+
+## Stand-in experts, rank by rank
+
+For every token, each layer's router picks 10 of 512 experts and ranks them, rank 0 the most important. The ones on the
+card run at full speed; one that is not there has to come from RAM or the SSD, and that wait is what limits decode. A
+**stand-in** is an expert already on the card that the router scored close to the missing one; using it skips the wait.
+How close is measured in **logits**, the router's score: a stand-in "within 1 logit" scores at most 1 below the expert it
+replaces.
+
+What the install writes for IQ3_S (21 Oct 2026):
+
+| Rank | Not on the card | Why |
+| --- | --- | --- |
+| **0, 1** (the two most important) | always the real expert, computed by the CPU from RAM, or read from the SSD first | swapping these broke answers (below) |
+| **2** | a stand-in only when one scores **within 1 logit**, else the real expert | the closest margin that was safe for rank 1 in the maths test |
+| **3 - 9** | the best stand-in on the card, at any distance | these carry little weight; the 50-question maths and 30-question coding test held up |
+
+The settings, in the config's `env`: `STRATA_ROUTE_RESIDENT=1e30` (stand-ins on, any distance),
+`STRATA_ROUTE_RESIDENT_RANKS=3-9` (the ranks that take any stand-in) and `STRATA_ROUTE_RESIDENT_EDGE=1` (the rank just above
+them, rank 2, only within 1 logit). The speed tables above were measured with ranks 2-9 taking any stand-in; rank 2 within
+1 logit is new and not yet measured.
+
+What we found on the way (20 Oct 2026, every answer read by hand):
+
+| Swapping the top two ranks | Result |
+| --- | --- |
+| at any distance | answers collapse: empty replies and loops |
+| within 3, 5 or 8 logits | collapse: "Let's solve step-by step." repeated, "salt, salt, salt ..." |
+| within 2 logits | dropped tokens (a missing `]` in code), broken words, and wrong sums in maths |
+| within 1 logit, rank 1 only | 49 of 50 maths answers right, the same as with nothing swapped |
+| within 1 logit, ranks 0 and 1 | faster (47.4 against 38.6 tokens/s on short prompts), but leaked a turn marker into an answer at 94K tokens |
+| rank 1 within 1 logit, on a card just after a restart | broken answers in an agent session, so the top two are now always real |
+
+The opt-in switches for the top two ranks stay in the engine for testing: `STRATA_ROUTE_RAM_FLOOR=1` (rank 1 within
+`STRATA_ROUTE_RAM_FLOOR_MARGIN` logits, default 1) and `STRATA_ROUTE_RAM_FLOOR_RANK0=1` (rank 0 too).
 
 ## Using it
 
