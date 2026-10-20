@@ -829,7 +829,7 @@ void FileExpertSource::io_worker() {
         if (complement_ready_ && resident_blob(index) != nullptr) continue;
         if (!override_.empty() && override_[index] != nullptr) continue;
         // STRATA_LOOKAHEAD_PROMOTE (RAM overlay): a prediction the RAM tier could take is read into a promotion buffer, not a stage
-        // buffer (the serve thread places it between windows; see drain_promotions)
+        // buffer, and copied into a free place of the RAM tier here (the serve thread publishes it between windows; see publish_promotions)
         if (!demand && promote_wanted(layer, expert)) {
             promote_read(layer, expert);
             continue;
@@ -4165,14 +4165,21 @@ void FileExpertSource::set_lookahead_promote(bool on, const std::vector<float>* 
         const size_t n = (size_t) (n_layers_ * n_expert_);
         promo_busy_.assign(n, 0);
         promo_flag_.reset(new std::atomic<uint8_t>[n]());
+        promo_starved_.reset(new std::atomic<int>[(size_t) n_layers_]());
     }
     promo_usage_.store(usage, std::memory_order_release);
     promo_on_.store(on && promo_flag_ != nullptr, std::memory_order_release);
 }
 
-bool FileExpertSource::promotions_queued() const {
-    std::lock_guard<std::mutex> lk(promo_mu_);
-    return !promo_q_.empty();
+bool FileExpertSource::promotions_pending() const {
+    {
+        std::lock_guard<std::mutex> lk(promo_mu_);
+        if (!promo_q_.empty()) return true;
+    }
+    if (promo_starved_ == nullptr) return false;
+    for (int64_t l = 0; l < n_layers_; ++l)
+        if (promo_starved_[(size_t) l].load(std::memory_order_relaxed) > 0) return true;
+    return false;
 }
 
 bool FileExpertSource::promote_wanted(int64_t layer, int64_t expert) const {
@@ -4198,6 +4205,7 @@ bool FileExpertSource::promote_wanted(int64_t layer, int64_t expert) const {
 
 void FileExpertSource::promote_read(int64_t layer, int64_t expert) {
     const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    const uint64_t n = layer_blob_bytes_[(size_t) layer];
     std::vector<uint8_t> buf;
     {
         std::lock_guard<std::mutex> lk(promo_mu_);
@@ -4208,47 +4216,111 @@ void FileExpertSource::promote_read(int64_t layer, int64_t expert) {
             promo_spare_.pop_back();
         }
     }
-    const uint64_t n = layer_blob_bytes_[(size_t) layer];
+    // a free place of the layer, taken here (complement_free_ is under tier_mu_: no other thread can take the same place).
+    // Nothing is published, so no reader can name it.  An exchange rotation owns the copy: no promotions then.
+    if (exchange_storage_.active() || complement_host_ == nullptr) {
+        std::lock_guard<std::mutex> lk(promo_mu_);
+        promo_busy_[i] = 0;
+        promo_spare_.push_back(std::move(buf));
+        return;
+    }
+    uint64_t at = 0;
+    bool have = false;
+    {
+        std::lock_guard<std::mutex> lk(tier_mu_);
+        // give_back_ram releases places and then madvise's them: a place taken in between would be zeroed under the copy
+        if (!promo_pause_.load() && (size_t) layer < complement_free_.size() && !complement_free_[(size_t) layer].empty()) {
+            const uint64_t a = complement_free_[(size_t) layer].back();
+            if (a <= complement_bytes_ && n <= complement_bytes_ - a) {
+                at = a;
+                have = true;
+                complement_free_[(size_t) layer].pop_back();
+            }
+        }
+    }
+    if (!have) {   // wanted, no place: counted for publish_promotions to make one, and nothing is read now
+        promo_skips_.fetch_add(1, std::memory_order_relaxed);
+        promo_starved_[(size_t) layer].fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(promo_mu_);
+        promo_busy_[i] = 0;
+        promo_spare_.push_back(std::move(buf));
+        return;
+    }
     if (buf.size() < n) buf.resize((size_t) n);
     const bool ok = copy_from_files(layer, expert, buf.data());   // O_DIRECT under the overlay: the bytes, not a stage buffer
     io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
-    if (ok) file_read_bytes_.fetch_add(n, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lk(promo_mu_);
     if (ok) {
-        promo_q_.push_back(Promo{layer, expert, std::move(buf)});   // promo_busy_ stays set until drain_promotions places it
+        file_read_bytes_.fetch_add(n, std::memory_order_relaxed);
+        // the copy into the place happens here, on the io thread, between windows' publishes: the place is written before the
+        // entry is queued under promo_mu_ (publish_promotions takes the queue under the same mutex, so it orders this write)
+        std::memcpy((uint8_t*) complement_host_ + (size_t) at, buf.data(), (size_t) n);
     } else {
-        promo_busy_[i] = 0;
-        promo_spare_.push_back(std::move(buf));
+        std::lock_guard<std::mutex> lk(tier_mu_);   // the read failed: the place is free again
+        complement_free_[(size_t) layer].push_back(at);
     }
+    std::lock_guard<std::mutex> lk(promo_mu_);
+    if (ok) promo_q_.push_back(Promo{layer, expert, at});   // promo_busy_ stays set until publish_promotions takes it
+    else promo_busy_[i] = 0;
+    promo_spare_.push_back(std::move(buf));
 }
 
-uint64_t FileExpertSource::drain_promotions(const std::vector<float>& usage, const std::vector<char>& busy) {
+// SAFETY (serve thread, between windows): a pool job and the PCIe lane take RAM-tier pointers only inside a decode window, and
+// this runs between windows, so no reader is left in a place given back here.  The io thread writes a free place only inside
+// a window, and complement_offsets_ names a place only after this publishes it, so no reader can see a place being written.
+// The publish is one offset write (the same convention as the exchanges: a plain write on the serve thread, ordered for the
+// next window's readers by the window's start); no copy happens on this thread.
+uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, const std::vector<char>& busy) {
     std::deque<Promo> q;
     {
         std::lock_guard<std::mutex> lk(promo_mu_);
         q.swap(promo_q_);
     }
-    uint64_t placed = 0;
-    const bool victims_ok = !usage.empty();   // no usage, no victim: only free places
-    for (Promo& p : q) {
+    uint64_t published = 0;
+    for (const Promo& p : q) {
         const size_t i = (size_t) p.layer * (size_t) n_expert_ + (size_t) p.expert;
         const bool on_gpu = i < busy.size() && busy[i];   // an expert the GPU holds needs no RAM place
-        int64_t victim = -1;
-        bool done = false;
-        if (!on_gpu && complement_ready_ && i < complement_offsets_.size() && complement_offsets_[i] == kNoComplement &&
-            (override_.empty() || override_[i] == nullptr))
-            done = place_expert(p.layer, p.expert, usage, busy, p.bytes.data(), victims_ok, 1.0f, &victim);
-        if (done) {
-            ++placed;
+        const bool can = !on_gpu && complement_ready_ && !exchange_storage_.active() && staged_.empty() &&
+                         i < complement_offsets_.size() && complement_offsets_[i] == kNoComplement &&
+                         (override_.empty() || override_[i] == nullptr);
+        if (can) {
+            complement_offsets_[i] = p.at;
+            ++published;
             promo_n_.fetch_add(1, std::memory_order_relaxed);
             promo_flag_[i].store(1, std::memory_order_relaxed);
-            if (victim >= 0) promo_flag_[(size_t) p.layer * (size_t) n_expert_ + (size_t) victim].store(0, std::memory_order_relaxed);
+        } else {   // no longer wanted (GPU-held, or RAM-held meanwhile): the place is free again
+            std::lock_guard<std::mutex> lk(tier_mu_);
+            complement_free_[(size_t) p.layer].push_back(p.at);
         }
         std::lock_guard<std::mutex> lk(promo_mu_);
         promo_busy_[i] = 0;
-        if (promo_spare_.size() < kPromoQueueMax) promo_spare_.push_back(std::move(p.bytes));
     }
-    return placed;
+    // refill: a layer that wanted a place and had none gives up up to 4 of its coldest RAM-held experts (usage below 1.0, not
+    // on the GPU, not a promotion not yet used).  release_resident_place only moves the place to complement_free_: no copy.
+    if (promo_starved_ != nullptr) {
+        for (int64_t l = 0; l < n_layers_; ++l) {
+            const int starved = promo_starved_[(size_t) l].exchange(0, std::memory_order_relaxed);
+            if (starved <= 0 || usage.empty()) continue;
+            std::vector<std::pair<float, int64_t>> cold;
+            for (int64_t e = 0; e < n_expert_; ++e) {
+                const size_t j = (size_t) l * (size_t) n_expert_ + (size_t) e;
+                if (j >= complement_offsets_.size() || complement_offsets_[j] == kNoComplement) continue;
+                if (j < busy.size() && busy[j]) continue;
+                if (!override_.empty() && override_[j] != nullptr) continue;
+                if (promo_flag_[j].load(std::memory_order_relaxed) != 0) continue;
+                if (j >= usage.size() || usage[j] >= 1.0f) continue;
+                cold.emplace_back(usage[j], e);
+            }
+            std::sort(cold.begin(), cold.end());
+            int left = std::min(starved, 4);
+            for (const auto& [u, e] : cold) {
+                (void) u;
+                if (left <= 0) break;
+                if (!release_resident_place(l, e)) break;   // staged state: nothing more may be given up now
+                --left;
+            }
+        }
+    }
+    return published;
 }
 
 uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float>& usage) {
@@ -4268,6 +4340,13 @@ uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float
             held.emplace_back(i < usage.size() ? usage[i] : 0.0f, i);
         }
     std::sort(held.begin(), held.end());
+    // the promotions take no free place while places are released and madvise'd here (the io thread checks this under
+    // tier_mu_ when it takes one): a place it took between the release and the madvise would be zeroed under its copy
+    {
+        std::lock_guard<std::mutex> lk(tier_mu_);
+        promo_pause_.store(true);
+    }
+    struct Unpause { std::atomic<bool>& p; ~Unpause() { p.store(false); } } unpause{promo_pause_};
     uint64_t given = 0;
     for (const auto& [u, i] : held) {
         (void) u;

@@ -14890,13 +14890,14 @@ int main(int argc, char** argv) {
                     }
                 }
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
-                // STRATA_LOOKAHEAD_PROMOTE: the predictions the io workers read take RAM places here - between windows, with the same
-                // guards as the RAM_ADAPT swaps below (no adaptive round in flight, nothing pending, no pool job reading the copy)
-                if (src.promotions_queued() && pending.empty() && (!ajob || astate == AState::Idle) && !multi_gpu && !peer.valid() &&
+                // STRATA_LOOKAHEAD_PROMOTE: the predictions the io workers copied into free RAM places are published here (an offset
+                // write, no copy), and the layers that wanted a place get one back - between windows, with the same guards as the
+                // RAM_ADAPT swaps below (no adaptive round in flight, nothing pending, no pool job reading the copy)
+                if (src.promotions_pending() && pending.empty() && (!ajob || astate == AState::Idle) && !multi_gpu && !peer.valid() &&
                     !remote_opt && o.batch == 0) {
                     std::vector<char> gpu_busy(host_res.size());
                     for (size_t k = 0; k < gpu_busy.size(); ++k) gpu_busy[k] = host_res[k] >= 0;
-                    src.drain_promotions(drive.d.usage, gpu_busy);
+                    src.publish_promotions(drive.d.usage, gpu_busy);
                 }
                 // STRATA_RAM_ADAPT=<n> (opt-in, the resident RAM mode on one GPU): the RAM copy is chosen once, at
                 // start, so an expert it does not hold is read from the file every time the conversation routes to
@@ -15406,24 +15407,27 @@ int main(int argc, char** argv) {
             // the router look-ahead's predicted experts and the layers it skipped.  A zero beside a busy request is the sign of a helper that stopped.
             {
                 static int64_t prev_rounds = 0, prev_swaps = 0, prev_quality = 0, prev_pred = 0, prev_skip = 0, prev_evict = 0;
-                static int64_t prev_promo = 0, prev_promo_hits = 0;
+                static int64_t prev_promo = 0, prev_promo_hits = 0, prev_promo_skips = 0;
                 // the GPU look-ahead (STRATA_LOOKAHEAD_GPU, the ring) counts its own picks: the CPU thread's counter stays at 0 then
                 const int64_t la_pred = drive.d.gpu_pred != nullptr ? drive.d.pred_fed
                                       : drive.d.lookahead != nullptr ? drive.d.lookahead->predicted() : 0;
                 const int64_t la_skip = drive.d.lookahead != nullptr ? drive.d.lookahead->skipped() : 0;
                 const int64_t ram_ev = g_ram_evictions.load(std::memory_order_relaxed);
-                // STRATA_LOOKAHEAD_PROMOTE (RAM overlay only): predictions placed in the RAM tier, and the first demand reads they served
+                // STRATA_LOOKAHEAD_PROMOTE (RAM overlay only): predictions published into the RAM tier, the first demand reads they
+                // served, and the predictions that had no free place (not read)
                 const int64_t promo_n = (int64_t) src.promotions(), promo_hit = (int64_t) src.promotion_hits();
-                char promo_txt[96] = "";
+                const int64_t promo_skip = (int64_t) src.promotion_skips();
+                char promo_txt[160] = "";
                 if (src.lookahead_promote())
-                    std::snprintf(promo_txt, sizeof promo_txt, ", promoted %lld, promotion hits %lld",
-                                  (long long) (promo_n - prev_promo), (long long) (promo_hit - prev_promo_hits));
+                    std::snprintf(promo_txt, sizeof promo_txt, ", promoted %lld, promotion hits %lld, promotion skips (no place) %lld",
+                                  (long long) (promo_n - prev_promo), (long long) (promo_hit - prev_promo_hits),
+                                  (long long) (promo_skip - prev_promo_skips));
                 std::fprintf(stderr, "strata serve: work done: swap rounds %lld (%lld swaps, %lld quality), ram evictions %lld, look-ahead %lld predicted experts (%lld layers skipped)%s%s\n",
                              (long long) (life_rounds - prev_rounds), (long long) (life_swaps - prev_swaps), (long long) (life_quality - prev_quality),
                              (long long) (ram_ev - prev_evict),
                              (long long) (la_pred - prev_pred), (long long) (la_skip - prev_skip), promo_txt, drive.d.lookahead == nullptr ? " [look-ahead off]" : "");
                 prev_rounds = life_rounds; prev_swaps = life_swaps; prev_quality = life_quality; prev_pred = la_pred; prev_skip = la_skip;
-                prev_evict = ram_ev; prev_promo = promo_n; prev_promo_hits = promo_hit;
+                prev_evict = ram_ev; prev_promo = promo_n; prev_promo_hits = promo_hit; prev_promo_skips = promo_skip;
             }
             // a low draft acceptance is a silent slowdown (solid.cpp's page: an MTP head drafting at 0.19 runs about 2x slower): said once, with its numbers and
             // what to check.  Typical here 0.55 to 0.8; 300 drafts offered make the share a fair reading.
