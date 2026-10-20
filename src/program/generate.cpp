@@ -11992,8 +11992,13 @@ int main(int argc, char** argv) {
         uint64_t ram_prev_free = 0;   // the free (unparked) places' bytes at the same reference point
         // G1: the guard runs unless STRATA_RAM_GUARD=0 (read once); 0 restores the previous behaviour (no guard)
         static const bool ram_guard_on = [] { const char* v = std::getenv("STRATA_RAM_GUARD"); return !(v != nullptr && std::string(v) == "0"); }();
-        // G7: this start's largest drop (the file keeps this one, not the learned max: a spike is forgotten after a quiet start)
-        uint64_t ram_margin_seen = 0;
+        // G7: the margin this start has seen (the file keeps it, not the learned max: a spike is forgotten after a quiet start).
+        // It is the SECOND-largest drop of this start: a drop has to recur to count.  20 Oct, 210-question run: the first
+        // request's one-time warm-up (graphs and buffers made on first use) dropped 1.77 GiB, became the margin, held the tier
+        // 8.5 GiB parked (unpark needs floor + 2 margins) while later requests moved available RAM by ~5 MB: decode 47.8 ->
+        // 37.5 tok/s.  The one-time part belongs to the gap (learned from the first request), not to the per-request margin.
+        uint64_t ram_margin_seen = 0, ram_drop1 = 0, ram_drop2 = 0;
+        int ram_measured = 0;   // requests whose drop was measured this start
         // G5: what the last give-back released (the unpark band's second term, measured); 0 once nothing is parked
         uint64_t ram_last_given = 0;
         // G6: the bytes the last pass unparked (the places madvised back); a refill of them is the tier's own RAM
@@ -12127,7 +12132,7 @@ int main(int argc, char** argv) {
                 // G6: the unparked bytes of the last pass (ram_unparked, set by its unpark below); this pass starts from 0
                 const uint64_t ram_unparked_prev = ram_unparked;
                 ram_unparked = 0;
-                if (mem && ram_prev_after > 0 && mem->available < ram_prev_after) {
+                if (mem && ram_prev_after > 0) {   // every request after the first is a measurement (a rise is a drop of 0)
                     // growth over one request (another program, the prompt's state, the server's own allocations): the
                     // largest such drop becomes the margin.  Free places taken over the request are the tier refilling
                     // itself (unparked places, promotions): RAM it gives back on demand, not growth the margin must cover;
@@ -12136,34 +12141,45 @@ int main(int argc, char** argv) {
                     // into ordinary free places (evicted, never given back) cost no new RAM and stay counted as drop
                     const uint64_t free_now = src.free_place_bytes();
                     const uint64_t refill = std::min(ram_prev_free > free_now ? ram_prev_free - free_now : 0, ram_unparked_prev);
-                    const uint64_t raw = ram_prev_after - mem->available;
+                    const uint64_t raw = mem->available < ram_prev_after ? ram_prev_after - mem->available : 0;
                     const uint64_t drop = raw > refill ? raw - refill : 0;
-                    // G7: the margin of this run is the larger of the learned one and this start's drop; the file keeps this
-                    // start's largest drop (not the max with the learned one), so a one-off spike from another program is
-                    // forgotten after a start that did not see one
-                    if (drop > ram_margin_seen) {
-                        ram_margin_seen = drop;
-                        ram_margin = std::max(ram_margin, drop);
+                    // G7: automatic, both ways.  The learned margin (last start's) stands only until this start has two
+                    // measurements; from then on the margin is this start's own second-largest drop, which can go DOWN as
+                    // well as up - a wrong learned value corrects itself within two requests, no file to edit.  The file
+                    // keeps this start's value, so a one-off spike is forgotten after a start that did not see one.
+                    if (drop > ram_drop1) { ram_drop2 = ram_drop1; ram_drop1 = drop; }
+                    else if (drop > ram_drop2) ram_drop2 = drop;
+                    const bool own = ++ram_measured >= 2;
+                    if (own && ram_margin != ram_drop2) {
+                        const uint64_t was = ram_margin;
+                        ram_margin = ram_drop2;
                         strata::prefill::Prefill::set_ram_margin_bytes(ram_margin);
+                        if (ram_measured == 2 || (was > ram_margin ? was - ram_margin : ram_margin - was) > (64ull << 20))
+                            std::fprintf(stderr, "strata serve: RAM margin %.2f -> %.2f GiB (this start's second-largest drop in "
+                                                 "available RAM over one request, %d measured)\n", was / 1073741824.0,
+                                         ram_margin / 1073741824.0, ram_measured);
+                    }
+                    if (own && ram_drop2 > ram_margin_seen) {
+                        ram_margin_seen = ram_drop2;
                         ram_learn(" margin", (int64_t) ((ram_margin_seen + (1ull << 20) - 1) >> 20));
-                        std::fprintf(stderr, "strata serve: RAM margin %.2f GiB (this start's largest drop in available RAM "
-                                             "over one request; %.2f GiB for this run)\n", ram_margin_seen / 1073741824.0,
-                                     ram_margin / 1073741824.0);
                     }
                 }
                 // G5: the unpark band is measured: the larger of the margin and what the last give-back had to release, so a
                 // margin of 0 does not flap (give back below floor + margin, unpark only above floor + margin + band)
                 // once a margin is measured it is the band; the last give-back only stands in before that (20 Oct: the
                 // larger of the two kept a 3.35 GiB give-back as the band, and 7.4 GiB of the tier came back ~0.9 GiB a request)
-                const uint64_t band = ram_margin > 0 ? ram_margin : ram_last_given;
+                // once this start has measured its own margin (two requests), the band is that margin even at 0 (no drop
+                // recurs: nothing to hold back for); before that the last give-back stands in
+                const uint64_t band = (ram_measured >= 2 || ram_margin > 0) ? ram_margin : ram_last_given;
                 if (mem && mem->available < floor + ram_margin) {
                     adapt_quiesce();   // staged swaps keep the tier from releasing places: they land first
                     const uint64_t got = src.give_back_ram(floor + ram_margin - mem->available, drive.d.usage);
                     ram_last_given = got;
                     auto after = strata::core::sample_host_memory();
-                    std::fprintf(stderr, "strata serve: RAM below the memory floor (%.2f of %.2f GiB available): "
-                                         "the RAM tier gave back %.2f GiB (%.2f GiB available now, %s)\n",
-                                 mem->available / 1073741824.0, floor / 1073741824.0, got / 1073741824.0,
+                    std::fprintf(stderr, "strata serve: RAM below the floor plus margin (%.2f GiB available, floor %.2f + margin "
+                                         "%.2f): the RAM tier gave back %.2f GiB (%.2f GiB available now, %s)\n",
+                                 mem->available / 1073741824.0, floor / 1073741824.0, ram_margin / 1073741824.0,
+                                 got / 1073741824.0,
                                  after ? after->available / 1073741824.0 : 0.0,
                                  after ? strata::core::memory_source_name(after->source) : "?");
                 } else if (mem && mem->available > floor + ram_margin + band && src.parked_ram_bytes() > 0) {
