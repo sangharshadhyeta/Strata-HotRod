@@ -81,7 +81,8 @@ header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:36rem;margin
 .measured .hp-row span.hot{color:var(--fire);font-weight:700;}
 .measured .first-group{margin-top:0;padding-top:0;border-top:none;}
 .hp-cols{display:grid;grid-template-columns:1fr 1fr;gap:0 2rem;}
-@media (max-width:600px){.hp-cols{grid-template-columns:1fr;}}
+@media (max-width:600px){.hp-cols{grid-template-columns:1fr;}
+  .measured .hp-cols > div + div .first-group{margin-top:.7rem;padding-top:.55rem;border-top:1px solid var(--border);}}
 .measured .hp-note{color:var(--muted-2);font-size:.7rem;margin:.7rem 0 0;padding-top:.6rem;border-top:1px solid var(--border);line-height:1.5;}
 .measured .hp-note strong{color:var(--muted);}
 </style>
@@ -158,7 +159,7 @@ header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:36rem;margin
 
 <section class="measured" id="speed">
   <h4>Qwen3.8-Flash-Next, on one RTX 3060 (12 GB)</h4>
-  <p class="hp-sub">IQ3_S · 128K context · measured 10 and 17 Oct 2026 · “–” means not measured</p>
+  <p class="hp-sub">IQ3_S · 262K context · measured 20 Oct 2026 · “–” means not measured</p>
   <div class="hp-cols">
     <div>
       <div class="hp-group first-group">
@@ -170,21 +171,25 @@ header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:36rem;margin
       </div>
       <div class="hp-group">
         <div class="hp-group-label">Throughput</div>
-        <div class="hp-row"><span>prompt (2K tokens)</span><span>14 – 16 s to first word</span></div>
+        <div class="hp-row"><span>prompt 8.5K tokens</span><span>16.9 s</span></div>
+        <div class="hp-row"><span>prompt 45K tokens</span><span>67 – 68 s</span></div>
+        <div class="hp-row"><span>next turn of a 45K chat</span><span>0.4 s</span></div>
         <div class="hp-row"><span>generation</span><span class="hot">~54 tok/s</span></div>
+        <div class="hp-row"><span>generation after 45K</span><span>38 – 41 tok/s</span></div>
       </div>
     </div>
     <div>
       <div class="hp-group first-group">
         <div class="hp-group-label">Placement</div>
-        <div class="hp-row"><span>experts on CPU</span><span>–</span></div>
-        <div class="hp-row"><span>context · slots</span><span>128K tok · 1</span></div>
+        <div class="hp-row"><span>experts on CPU</span><span>~2.6 a layer per step (misses)</span></div>
+        <div class="hp-row"><span>context · slots</span><span>262K tok · 1</span></div>
+        <div class="hp-row"><span>K/V</span><span>32K on card, rest in RAM</span></div>
       </div>
       <div class="hp-group">
         <div class="hp-group-label">Brain / expert cache</div>
         <div class="hp-row"><span>positioned</span><span>–</span></div>
-        <div class="hp-row"><span>hot / warm / cold</span><span>–</span></div>
-        <div class="hp-row"><span>hit rate</span><span>89 – 94%</span></div>
+        <div class="hp-row"><span>card / RAM / SSD</span><span>2,472 experts · 20 GB · rest</span></div>
+        <div class="hp-row"><span>hit rate</span><span>90 – 93%</span></div>
         <div class="hp-row"><span>substitute rate</span><span>–</span></div>
       </div>
     </div>

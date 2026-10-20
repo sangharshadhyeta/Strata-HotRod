@@ -92,11 +92,16 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
   predicted experts are read ahead while the current one computes.
 - **262K context with the K/V in RAM.** From 64K of context the attention's K/V streams from RAM; 32K tokens of it stay
   on the card.
+- **Look-ahead on the card.** The next layers' experts are predicted on the graphics card (not recomputed by the CPU)
+  while the current layer runs, and the predictions start their reads early.
+- **Starting the answer warm.** The experts the end of the prompt used most are put on the card before the first word
+  of the answer, so decode does not start cold.
 - **Picking up a conversation.** A long conversation's state is saved to the SSD, and its next turn reloads it instead of
   reading the whole conversation again.
 - **Memory safety.** The engine keeps a floor of RAM free before each request; when something else needs RAM, the RAM
   tier gives back its least-used experts until there is room again. The amount it keeps in reserve is measured on this
-  PC and learned across restarts (`data/ram-reserve.json`), not a fixed number.
+  PC and learned across restarts (`data/ram-reserve.json`), not a fixed number; the video-memory reserve is learned the
+  same way (`vram-reserve.json`).
 - **The app:** live speeds while it works, and the experts-on-the-card map in the Monitor.
 - **Experimental, off by default:** `STRATA_GDN_LOOP=1 STRATA_GDN_LOOP_NORM=1` runs the middle linear-attention layers
   twice per token (a training-free "looped" model) at the same decode speed; whether it improves answers is being
