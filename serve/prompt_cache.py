@@ -34,6 +34,7 @@ class PromptCache:
         self.held: list[int] | None = None   # what the engine holds now, as far as this server knows (a hint: the engine checks)
         self.held_gen = None                 # ... and the engine process it was true of
         self.entries: dict[str, dict] = {}
+        self.foreign: dict[str, dict] = {}   # entries another engine build or setting wrote: counted against the limit, dropped first
         self.stats = {"saves": 0, "restores": 0, "restore_refused": 0, "dropped": 0}
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
         # owner-only, as solid.cpp's cache is: the entries hold the prompts (the sidecar lists their token ids).  makedirs does not change a directory
@@ -62,10 +63,27 @@ class PromptCache:
             if meta.get("fingerprint") == self.fingerprint and isinstance(meta.get("tokens"), list):
                 self.entries[key] = {"tokens": meta["tokens"], "bytes": size, "used": meta.get("used", 0),
                                      "prompt_len": int(meta.get("prompt_len") or 0)}
+            else:   # another engine build or setting wrote it: never restored here, but it takes disk space (21 Oct: 83 GB of them)
+                self.foreign[key] = {"bytes": size, "used": meta.get("used", 0)}
+        self._trim()
+
+    def _trim(self, keep: str | None = None):
+        """Under the limit: the entries other engine builds or settings wrote go first (oldest first: this engine never restores
+        them, but a rollback to the build that wrote them can while they are kept), then this engine's own, least recently
+        used first; `keep` (the entry just saved) and the last own entry stay."""
+        limit = self._limit()
+        own = lambda: sum(e["bytes"] for e in self.entries.values())   # noqa: E731
+        while self.foreign and own() + sum(e["bytes"] for e in self.foreign.values()) > limit:
+            self._remove(min(self.foreign, key=lambda k: self.foreign[k]["used"]))
+            self.stats["dropped"] += 1
+        while own() > limit and len(self.entries) > 1:
+            self._remove(min((k for k in self.entries if k != keep), key=lambda k: self.entries[k]["used"]))
+            self.stats["dropped"] += 1
 
     def _remove(self, key: str):
         self.entries.pop(key, None)
-        for ext in (".json", ".bin"):
+        self.foreign.pop(key, None)
+        for ext in (".json", ".bin", ".bin.conv"):
             try:
                 os.remove(os.path.join(self.dir, key + ext))
             except OSError:
@@ -74,7 +92,8 @@ class PromptCache:
     def _limit(self) -> int:
         if self.limit_bytes:
             return self.limit_bytes
-        free = shutil.disk_usage(self.dir).free + sum(e["bytes"] for e in self.entries.values())
+        free = (shutil.disk_usage(self.dir).free + sum(e["bytes"] for e in self.entries.values())
+                + sum(e["bytes"] for e in self.foreign.values()))
         return max(1 << 30, min(256 << 30, free // 8))
 
     @staticmethod
@@ -175,9 +194,5 @@ class PromptCache:
         for k in [k for k, e in self.entries.items() if k != key and self._prefix_len(e["tokens"], tokens) == len(e["tokens"])]:
             self._remove(k)               # a shorter entry that this one continues is no longer needed
             self.stats["dropped"] += 1
-        limit = self._limit()
-        while sum(e["bytes"] for e in self.entries.values()) > limit and len(self.entries) > 1:
-            oldest = min((k for k in self.entries if k != key), key=lambda k: self.entries[k]["used"])
-            self._remove(oldest)
-            self.stats["dropped"] += 1
+        self._trim(keep=key)
         return f"prompt cache: saved {len(tokens)} tokens in {time.time() - t0:.2f} s ({self.entries[key]['bytes'] >> 20} MiB, {len(self.entries)} entries)"
