@@ -684,6 +684,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (la_cs_) cudaStreamSynchronize(la_cs_);
     stage_report();   // STRATA_DECODE_STAGE_TIMERS: the cumulative per-window averages, if any window was timed
     for (auto& kv : stage_chains_)
         for (cudaEvent_t e : kv.second.owned) cudaEventDestroy(e);
@@ -703,6 +704,7 @@ Verifier::~Verifier() {
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (la_cs_) cudaStreamDestroy(la_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
     if (side2_) cudaStreamDestroy(side2_);
@@ -715,6 +717,8 @@ Verifier::~Verifier() {
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_q8_) cudaEventDestroy(ev_q8_);
     if (ev_join_) cudaEventDestroy(ev_join_);
+    for (cudaEvent_t e : {ev_la_fork_, ev_la_read_done_, ev_la_done_})
+        if (e) cudaEventDestroy(e);
     for (cudaStream_t s : df_side_)
         if (s) cudaStreamDestroy(s);
     if (df_fork_) cudaEventDestroy(df_fork_);
@@ -1042,6 +1046,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: event create failed";
         return false;
     }
+#if !defined(STRATA_USE_HIP)
+    // the look-ahead node's own stream (record_window, STRATA_LOOKAHEAD_GPU_STREAM), made like sh_cs_.  Optional: on any
+    // failure it is left off (nullptr) and the node stays on cs
+    if (make_stream(&la_cs_) != cudaSuccess) la_cs_ = nullptr;
+    if (la_cs_ != nullptr &&
+        (cudaEventCreateWithFlags(&ev_la_fork_, cudaEventDisableTiming) != cudaSuccess ||
+         cudaEventCreateWithFlags(&ev_la_read_done_, cudaEventDisableTiming) != cudaSuccess ||
+         cudaEventCreateWithFlags(&ev_la_done_, cudaEventDisableTiming) != cudaSuccess)) {
+        cudaStreamDestroy(la_cs_);   // the events created so far are freed with the rest in the destructor
+        la_cs_ = nullptr;
+    }
+    (void) cudaGetLastError();
+#endif
     {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
         // stage's window with the branches stopped inside its graph when an NVML query (nvidia-smi) came between
         // requests (2x RTX 3090 and 2x RTX 2080 Ti, #905); never seen on Windows.  0 / unset: one stream, as before
@@ -1259,10 +1276,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
     }
 
+    // STRATA_LOOKAHEAD_GPU_STREAM: set once this window has recorded a look-ahead node on la_cs_ (the join and the wait below)
+    bool la_stream_used = false;
+
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
+        // the previous layer's look-ahead node reads mixed_ (its MoE input); this layer's gr_read_group writes mixed_ on cs.
+        // One wait per layer, on grp 0: the latest record on la_cs_ is the previous layer's last group's node, and la_cs_ runs
+        // in order, so it covers both groups.  The node was forked a whole post() earlier, so the wait is normally free.
+        if (la_stream_used && grp == 0) cudaStreamWaitEvent(cs, ev_la_read_done_, 0);
         const LayerView v(wt, l);
         const char* pfx[2] = {"hc_attn_", "hc_ffn_"};
         const WeightRef *wn[2], *wd[2], *wu[2], *wi[2];
@@ -1967,6 +1991,58 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
             if (stage_cur_ != nullptr && (sh_fk = stage_event(cs, err)) == nullptr) return false;
         }
+        // STRATA_RING_GPU: the look-ahead as a graph node.  Layers l+1 and l+2's routers on THIS layer's MoE input (the residual stream
+        // changes little from one layer to the next), their top-10 into host-mapped memory before the doorbell below.
+        // STRATA_LOOKAHEAD_GPU_STREAM=1 (opt-in; default off: the node on cs).  20 Oct A/B: router stage 4.21 -> 3.55 ms, read wait
+        // unchanged (9.30 / 9.29: the hints keep their lead time), but cpu-wait +0.5 ms and decode 52.2 / 52.3, 40.1 / 40.0 tok/s:
+        // neutral - decode waits on the CPU miss path, so GPU time saved before the doorbell becomes cpu-wait.  The node runs on its own stream la_cs_, forked
+        // here, after gr_read_group(1) has completed mixed_ and before cs's router, so it runs beside the router and is done about
+        // when it was on cs, before the doorbell.  It joins back into cs only at the window's end (after the layer loop).
+        // STRATA_LOOKAHEAD_GPU_FORK=1 (opt-in; the node on the shared stream sh_cs_, after its fork): the shared stream forks after
+        // the doorbell by default, so the hints land later (20 Oct A/B: read wait 9.0 -> 11.4 ms, decode 52.1 -> 51.5 tok/s).
+        // With sh_fork the node on sh_cs_ is the opt-in path; with neither, the node stays on cs.
+        // The node reads only mixed_ (complete here) and writes only route_pred_logits/dev/weights, which nothing else touches.
+        // Host reads of route_pred_host(): each slot is one int32 stored by a single 32-bit kernel store, so the host never sees a
+        // torn id; a reader may see the old or the new value of a slot, each a valid expert id or -1, and the readers range-check both.
+        // A table that lands later on another stream only makes a hint later.
+        static const bool la_gpu_fork_env = [] {
+            const char* e = std::getenv("STRATA_LOOKAHEAD_GPU_FORK");
+            return e != nullptr && e[0] == '1';
+        }();
+        static const bool la_gpu_stream_env = [] {
+            const char* e = std::getenv("STRATA_LOOKAHEAD_GPU_STREAM");
+            return e != nullptr && e[0] == '1';
+        }();
+        const bool la_gpu = strata::kernels::route_pred_active() && n <= 8 && NE == 512 && K == 10 && native_router_enabled();
+        const bool la_on_sh = la_gpu && sh_fork && la_gpu_fork_env;
+#if !defined(STRATA_USE_HIP)
+        const bool la_on_stream = la_gpu && !la_gpu_fork_env && la_gpu_stream_env && la_cs_ != nullptr && ev_la_fork_ != nullptr &&
+                                  ev_la_read_done_ != nullptr && ev_la_done_ != nullptr;
+#else
+        const bool la_on_stream = false;   // HIP: the node stays on cs (the shared stream's cross-stream cost, as sh_stream_on)
+#endif
+        auto lookahead_node = [&](cudaStream_t s) -> bool {
+            try {
+                for (int dist = 1; dist <= 2; ++dist) {
+                    if (l + dist >= g.n_layers) break;
+                    const LayerView vt(wt, l + dist);
+                    const WeightRef* w_next = vt.get("ffn_gate_inp.weight");
+                    if (w_next == nullptr || w_next->kind != WeightKind::Bf16InF32) continue;
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_next->data, strata::kernels::route_pred_logits(), NE, N,
+                                              NE, n, s);
+                    native_router_top10_multi(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
+                                              strata::kernels::route_pred_weights(), n, s);
+                }
+            } catch (const std::exception& e) { err = "verify look-ahead node: " + std::string(e.what()); return false; }
+            return true;
+        };
+        if (la_on_stream) {
+            cudaEventRecord(ev_la_fork_, cs);
+            cudaStreamWaitEvent(la_cs_, ev_la_fork_, 0);
+            if (!lookahead_node(la_cs_)) return false;
+            cudaEventRecord(ev_la_read_done_, la_cs_);
+            la_stream_used = true;
+        }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
@@ -2000,22 +2076,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        // STRATA_RING_GPU: the look-ahead as a graph node.  Layers l+1 and l+2's routers on THIS layer's MoE input (the residual stream
-        // changes little from one layer to the next), their top-10 into host-mapped memory before the doorbell below.
-        if (strata::kernels::route_pred_active() && n <= 8 && NE == 512 && K == 10 && native_router_enabled()) {
-            try {
-                for (int dist = 1; dist <= 2; ++dist) {
-                    if (l + dist >= g.n_layers) break;
-                    const LayerView vt(wt, l + dist);
-                    const WeightRef* w_next = vt.get("ffn_gate_inp.weight");
-                    if (w_next == nullptr || w_next->kind != WeightKind::Bf16InF32) continue;
-                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_next->data, strata::kernels::route_pred_logits(), NE, N,
-                                              NE, n, cs);
-                    native_router_top10_multi(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
-                                              strata::kernels::route_pred_weights(), n, cs);
-                }
-            } catch (const std::exception& e) { err = "verify look-ahead node: " + std::string(e.what()); return false; }
-        }
+        // the look-ahead node: on la_cs_ (above) or the shared stream (STRATA_LOOKAHEAD_GPU_FORK=1), else here on cs
+        if (la_gpu && !la_on_sh && !la_on_stream && !lookahead_node(cs)) return false;
         // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
         // resident experts; the weights stay the router's (route_prior.cu)
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
@@ -2081,6 +2143,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
+            // STRATA_LOOKAHEAD_GPU_FORK: the look-ahead node first on the shared stream (after the fork, before ev_join_)
+            if (la_on_sh && !lookahead_node(sh_stream)) return false;
             // STRATA_VERIFY_QDEDUP=1 (not with the forked shared-expert stream, which quantizes into its own buffer): the
             // experts' q8_1 image of xm is made first and the shared expert's gate/up read it (quantize_q8_1_rows and
             // native_quantize_q8_1 write the same bytes)
@@ -2288,6 +2352,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!post(l, grp)) return false;
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
+    // STRATA_LOOKAHEAD_GPU_STREAM: the look-ahead stream joins back into cs once per window, after the last layer's node.
+    // Before the layer-split return too: graph capture needs every forked stream joined to the origin stream.
+    if (la_stream_used) {
+        cudaEventRecord(ev_la_done_, la_cs_);
+        cudaStreamWaitEvent(cs, ev_la_done_, 0);
+    }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         if (hflag_out_d_ != nullptr && !batch_rec_) {   // the overlapped split: payload + the next stage's flag
