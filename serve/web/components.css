@@ -20,14 +20,6 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
   -webkit-background-clip:text;background-clip:text}
 :root[data-theme="dark"] .st-header__brand-rod{background:linear-gradient(180deg,#90e8ff 0%,#20c0f0 50%,#1070ff 100%);
   -webkit-background-clip:text;background-clip:text}
-/* the logo's </> between the words: a red <, a pale /, a blue > */
-.st-header__brand-tag{margin:0 .18em;font-weight:800;letter-spacing:-.04em}
-.st-header__brand-lt{color:#e8400c}
-.st-header__brand-sl{color:#9aa4b0}
-.st-header__brand-gt{color:#0a6fd8}
-:root[data-theme="dark"] .st-header__brand-lt{color:#ff6a20}
-:root[data-theme="dark"] .st-header__brand-sl{color:#f0ecd0}
-:root[data-theme="dark"] .st-header__brand-gt{color:#20c0f0}
 .st-header__spacer{flex:1}
 
 /* status pill */
