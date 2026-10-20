@@ -1516,6 +1516,89 @@ constexpr int64_t kVramSafeMib =
     512;
 #endif
 
+/// The VRAM reserve this machine and setup learned: `vram-reserve.json` beside the expert profile (or the profile
+/// this run saves), `{ "<key>": reserve_mib, ... }`.  A missing file is nothing learned; a file error is said once and
+/// never fails the engine.  The auto cache reads it at its sizing; the serve path writes it when a start ends low.
+constexpr int64_t kVramReserveFloorMib = 700;   ///< the default --vram-reserve-mib: a learned value never goes below it
+static void vram_reserve_note_once(const char* what, const std::string& path) {
+    static bool said = false;
+    if (said) return;
+    said = true;
+    std::fprintf(stderr, "strata generate: VRAM reserve file %s: %s (no learned reserve; the engine goes on)\n",
+                 path.c_str(), what);
+}
+static std::string vram_reserve_path(const Options& o) {
+    const std::string& p = !o.expert_profile.empty() ? o.expert_profile : o.expert_profile_save;
+    if (p.empty()) return "";
+    const std::filesystem::path dir = std::filesystem::path(p).parent_path();
+    return ((dir.empty() ? std::filesystem::path(".") : dir) / "vram-reserve.json").string();
+}
+/// GPU name, total VRAM, context, K/V mode and format, batch and whether a draft is loaded: a short string
+static std::string vram_reserve_key(const Options& o) {
+    cudaDeviceProp p{};
+    std::string name = "unknown";
+    unsigned long long total_mib = 0;
+    if (cudaGetDeviceProperties(&p, 0) == cudaSuccess) {
+        name = p.name;
+        total_mib = (unsigned long long) (p.totalGlobalMem >> 20);
+    }
+    for (char& c : name)
+        if (c == '"' || c == '\\') c = '_';   // the file is read back by its quotes: a key keeps none
+    return name + " " + std::to_string(total_mib) + "MiB ctx" + std::to_string((long long) o.max_context) + " kv" +
+           std::to_string((long long) o.kv_resident) + "/" + o.kv + " b" + std::to_string(o.batch) +
+           (o.mtp.empty() ? " nodraft" : " draft");
+}
+static std::map<std::string, int64_t> vram_reserve_read(const std::string& path) {
+    std::map<std::string, int64_t> m;
+    if (path.empty()) return m;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) vram_reserve_note_once("cannot be read", path);
+        return m;
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string s = ss.str();
+    size_t i = 0;
+    while (i < s.size()) {
+        const size_t q1 = s.find('"', i);
+        if (q1 == std::string::npos) break;
+        const size_t q2 = s.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        const size_t c = s.find(':', q2 + 1);
+        if (c == std::string::npos) break;
+        const char* vb = s.c_str() + c + 1;
+        char* ve = nullptr;
+        const long long v = std::strtoll(vb, &ve, 10);
+        if (ve == vb) { i = q2 + 1; continue; }
+        m[s.substr(q1 + 1, q2 - q1 - 1)] = (int64_t) v;
+        i = (size_t) (ve - s.c_str());
+    }
+    return m;
+}
+static void vram_reserve_write(const std::string& path, const std::map<std::string, int64_t>& m) {
+    if (path.empty()) return;
+    const std::string tmp = path + ".tmp";
+    bool ok = false;
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (f) {
+            f << "{\n";
+            size_t n = 0;
+            for (const auto& kv : m) f << "  \"" << kv.first << "\": " << kv.second << (++n < m.size() ? ",\n" : "\n");
+            f << "}\n";
+            ok = (bool) f;
+        }
+    }
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        vram_reserve_note_once("cannot be written", path);
+    }
+}
+
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
@@ -5964,6 +6047,18 @@ int main(int argc, char** argv) {
                 o.vram_reserve_mib = kWddmAutoReserveMib;
             }
 #endif
+        }
+        // the reserve this machine and setup learned on an earlier start (vram-reserve.json, see the serve path): the
+        // sizing below cannot see what is allocated after the cache, so a start that ended low raised it there
+        if (!o.vram_reserve_given) {
+            const auto learned = vram_reserve_read(vram_reserve_path(o));
+            const auto it = learned.find(vram_reserve_key(o));
+            if (it != learned.end()) {
+                o.vram_reserve_mib = (int) std::max<int64_t>(o.vram_reserve_mib, it->second);
+                std::fprintf(stderr, "strata generate: VRAM reserve %d MiB (learned on this machine and setup: the last "
+                                     "start ended below the %lld MiB line; --vram-reserve-mib N sets it)\n",
+                             o.vram_reserve_mib, (long long) kVramSafeMib);
+            }
         }
         const int64_t prefill_mib = owned_prefill_mib();
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
@@ -10928,6 +11023,34 @@ int main(int argc, char** argv) {
             // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
             // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
+            // the reserve for the next start (vram-reserve.json): a start that ends below the safe line records the
+            // reserve the warning below suggests; one that ends well above it lowers a learned value again (not below
+            // the default), so the learned value can come down as well as go up
+            if (free_b != 0 && !o.vram_reserve_given) {
+                const std::string rfile = vram_reserve_path(o);
+                const std::string key = vram_reserve_key(o);
+                if (free_mib < kVramSafeMib) {
+                    const int64_t suggest = (o.vram_reserve_mib + (kVramSafeMib - free_mib) + 63) / 64 * 64;
+                    auto learned = vram_reserve_read(rfile);
+                    learned[key] = suggest;
+                    vram_reserve_write(rfile, learned);
+                    std::fprintf(stderr, "strata serve: VRAM reserve %lld MiB learned for the next start (this one ended "
+                                         "at %lld MiB free)\n", (long long) suggest, (long long) free_mib);
+                } else if (free_mib >= kVramSafeMib + 256) {
+                    auto learned = vram_reserve_read(rfile);
+                    const auto it = learned.find(key);
+                    if (it != learned.end() && it->second > kVramReserveFloorMib) {
+                        const int64_t lower = (free_mib - kVramSafeMib - 128) / 64 * 64;
+                        const int64_t next = std::max<int64_t>(kVramReserveFloorMib, it->second - lower);
+                        if (next < it->second) {
+                            it->second = next;
+                            vram_reserve_write(rfile, learned);
+                            std::fprintf(stderr, "strata serve: VRAM reserve %lld MiB learned for the next start (lowered: "
+                                                 "this one ended at %lld MiB free)\n", (long long) next, (long long) free_mib);
+                        }
+                    }
+                }
+            }
             if (free_mib >= 256) {
                 std::fprintf(stderr, "strata serve: %lld MiB of VRAM free with everything loaded\n", (long long) free_mib);
 #ifdef _WIN32
@@ -12045,9 +12168,23 @@ int main(int argc, char** argv) {
                             }
                         }
                         auto admit = [&](uint64_t need, std::string& why) {
-                            const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                            auto mem = strata::core::sample_host_memory();
+                            std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            // the RAM tier gives back its coldest experts for the save, as it does for a prompt's layer-major
+                            // state (20 Oct: a 45k session's save was refused at 2.8 GiB available against 0.35 + 2.5 needed)
+                            if (mem && need != UINT64_MAX && src.complement_ready()) {
+                                // staged swaps keep the tier from releasing places (release_resident_place refuses): they land first
+                                adapt_quiesce();
+                                const uint64_t want = need + floor + (256ull << 20) - std::min<uint64_t>(mem->available, need + floor);
+                                const uint64_t got = src.give_back_ram(want, drive.d.usage);
+                                mem = strata::core::sample_host_memory();
+                                avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                                std::fprintf(stderr, "strata serve: the RAM tier gave back %.2f GiB for the session save (%.2f GiB "
+                                                     "available now)\n", got / 1073741824.0,
+                                             mem ? mem->available / 1073741824.0 : 0.0);
+                                if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            }
                             why = "not enough RAM to save the session (" +
                                   (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
                                   " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) +
@@ -13213,6 +13350,66 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
+            // STRATA_PROMPT_TAIL (default on; 0: the refill of today): the prompt's last chunk routed its tokens to experts that
+            // are not in VRAM now.  Before the loan goes back, the hottest of those take the lent slots: a lent pair's index
+            // becomes the tail expert's, so refill_issue / refill_wait / host_res / res_upload need no change - host_res of the
+            // tail expert is set by the refill, the old expert's stays kNotResident (its bytes stay in the RAM tier or on the
+            // NVMe).  An expert already in the loan keeps its own pair.  A pair takes a tail expert only when its slot holds that
+            // expert's blob (slot bytes from slot_offsets; uniform slots hold any layer).  Once per prompt (tail_planned).
+            static const bool prompt_tail_env = strata::prefill::Prefill::prompt_tail_on();
+            int64_t tail_cand_n = 0, tail_in_vram = 0;   // the tail-hot experts not in VRAM, and those the refill now holds
+            bool tail_planned = false;
+            auto tail_refill_plan = [&]() {
+                if (!prompt_tail_env || tail_planned) return;
+                tail_planned = true;
+                for (PfPart& p : pf_parts) {
+                    if (p.sp == nullptr || p.lent.empty()) continue;
+                    const std::vector<float>& tc = p.sp->tail_counts();
+                    if (tc.empty() || p.sp->tail_tokens() <= 0) continue;
+                    std::vector<std::pair<float, int64_t>> cand;   // (-count, index): the tail-hot ones not in VRAM
+                    for (int64_t l = p.lb; l < p.le; ++l)
+                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                            const int64_t j = l * g.n_expert + ex;
+                            if (tc[(size_t) j] > 0.0f && host_res[(size_t) j] < 0) cand.emplace_back(-tc[(size_t) j], j);
+                        }
+                    std::sort(cand.begin(), cand.end());   // hottest first, ties by the lower index
+                    tail_cand_n += (int64_t) cand.size();
+                    std::vector<int32_t> pair_of(host_res.size(), -1);
+                    for (size_t q = 0; q < p.lent.size(); ++q) pair_of[(size_t) p.lent[q].first] = (int32_t) q;
+                    std::vector<char> taken(p.lent.size(), 0);
+                    std::vector<int64_t> rest;
+                    for (const auto& c : cand) {
+                        const int32_t q = pair_of[(size_t) c.second];
+                        if (q >= 0) { taken[(size_t) q] = 1; ++tail_in_vram; }   // already in the loan: keeps its own slot
+                        else rest.push_back(c.second);
+                    }
+                    // the loan's other pairs, the coldest expert in the tail first, take the rest hottest first
+                    std::vector<size_t> free_q;
+                    for (size_t q = 0; q < p.lent.size(); ++q) if (!taken[q]) free_q.push_back(q);
+                    std::stable_sort(free_q.begin(), free_q.end(), [&](size_t a, size_t b) {
+                        return tc[(size_t) p.lent[a].first] < tc[(size_t) p.lent[b].first];
+                    });
+                    const uint64_t* off = p.cache->slot_offsets();
+                    auto slot_cap = [&](int32_t slot) -> int64_t {
+                        if (off == nullptr) return (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+                        const int64_t end = slot + 1 < p.cache->full_slots() ? (int64_t) off[slot + 1] : p.cache->full_bytes();
+                        return end - (int64_t) off[slot];
+                    };
+                    std::vector<char> used(free_q.size(), 0);
+                    for (const int64_t j : rest) {
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(j / g.n_expert);
+                        for (size_t f = 0; f < free_q.size(); ++f) {
+                            if (used[f]) continue;
+                            std::pair<int32_t, int32_t>& pr = p.lent[free_q[f]];
+                            if (slot_cap(pr.second) < nb) continue;
+                            pr.first = (int32_t) j;   // refill_issue reads this index: the tail expert's blob goes into this slot
+                            used[f] = 1;
+                            ++tail_in_vram;
+                            break;
+                        }
+                    }
+                }
+            };
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
@@ -13984,6 +14181,7 @@ int main(int argc, char** argv) {
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
+            for (PfPart& p : pf_parts) if (p.sp != nullptr) p.sp->clear_tail();   // STRATA_PROMPT_TAIL: this prompt's routing only
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
             // holds the last prompt token alone).  Only where every window row is the same in any window: a batch
@@ -14010,6 +14208,7 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
+                if (win && to == cuts.back()) tail_refill_plan();   // the windows read the prompt's last tokens: the tail's loan is planned
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
@@ -14076,9 +14275,37 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
+            tail_refill_plan();   // (the last read's tail when it was not planned at the windows above)
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
+            }
+            // STRATA_PROMPT_TAIL: the decode's adaptive usage starts from this prompt's last chunk's routing.  Per expert, the
+            // steady state of its routing rate: usage = (count / tail tokens) x the decode's tokens per window / (1 - decay).
+            // 3.3 tokens per window: the decode's measured average (the decode timing's avg T), not yet a running one.
+            if (prompt_tail_env) {
+                int64_t seed_parts = 0, tail_toks = 0;
+                for (PfPart& p : pf_parts) {
+                    if (p.sp == nullptr || p.sp->tail_tokens() <= 0 || p.sp->tail_counts().empty()) continue;
+                    tail_toks = std::max(tail_toks, p.sp->tail_tokens());
+                    const double decay = 1.0 - (double) o.adapt_decay;
+                    if (cancelled || decay <= 1e-3 || drive.d.usage.size() != (size_t) (g.n_layers * g.n_expert)) continue;
+                    const std::vector<float>& tc = p.sp->tail_counts();
+                    const double s = 3.3 / (double) p.sp->tail_tokens() / decay;
+                    for (int64_t l = p.lb; l < p.le; ++l)
+                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                            const size_t j = (size_t) (l * g.n_expert + ex);
+                            drive.d.usage[j] += (float) (tc[j] * s);
+                        }
+                    ++seed_parts;
+                }
+                if (tail_toks > 0)
+                    std::fprintf(stderr, "strata serve: prompt tail: %lld tokens, %lld experts not in VRAM among its hottest; the refill "
+                                         "took %lld of them (the rest of the loan back as before)%s\n",
+                                 (long long) tail_toks, (long long) tail_cand_n, (long long) tail_in_vram,
+                                 seed_parts > 0 ? ", usage seeded" : "");
+                else
+                    std::fprintf(stderr, "strata serve: prompt tail: none (the prompt's last chunk was not read on the prefill path)\n");
             }
             if (o.prefill_head_alias) {
                 sp.reset();

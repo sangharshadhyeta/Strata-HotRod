@@ -21,14 +21,14 @@
 // STRATA_FS_VERIFY=1 (test mode: every slot is read back and compared with its source the first time it is used).
 //
 // STRATA_RING=2 is the hybrid: the same ring, but an expert whose predicted copy has not landed at the plan is computed by the CPU as
-// without the ring (the GPU never waits).  STRATA_RING=1 (below) waits for it instead, so the CPU computes nothing.
+// without the ring (the GPU never waits).  STRATA_RING=1 (below) takes it only if its copy has already landed (no wait either).
 // STRATA_RING=1 (the look-ahead ring, after solid.cpp's lookahead admission; opt-in): the swap space becomes the GPU-only path for
 // the ranks the stand-in floor would otherwise replace (STRATA_RING_RANKS, default 2: ranks 0-1).  The router look-ahead predicts
 // those ranks for the next TWO layers; filler threads (STRATA_RING_THREADS, default 4) read each predicted expert from the file tier
 // (page cache or drive) into a small pinned buffer and copy it into a slot of its layer; after the copy the expert's byte in the
 // router's ring table (route_ring_alloc) is set on the same stream.  The router counts a landed ring expert as resident, so a
 // rank 0-1 pick it holds is computed exactly on the GPU, and a pick whose copy has not landed is replaced by a resident stand-in
-// (STRATA_ROUTE_RESIDENT_RANKS=0-9): the GPU never waits for a copy and the CPU computes nothing.  A slot of layer T is refilled
+// (STRATA_ROUTE_RESIDENT_RANKS=0-9): the GPU never waits for a copy.  At the plan a copy that has not landed is a CPU miss.  A slot of layer T is refilled
 // only while the pool works on a layer before T - 1 (the router of T cannot have read its flag yet), or when the cache already
 // holds its expert; its flag is cleared on the copy stream before the new copy.  STRATA_FS_SLOTS defaults to 8 with the ring.
 #include <atomic>
@@ -78,7 +78,7 @@ struct ForesightSwap {
     bool verify = false;                     ///< STRATA_FS_VERIFY=1: read every landed slot back and compare (slow, tests)
     // STRATA_RING
     bool ring = false;
-    bool ring_wait = true;                   ///< STRATA_RING=1: a late expert is fetched and waited for; STRATA_RING=2: it is left to the CPU (no GPU wait)
+    bool ring_wait = true;                   ///< STRATA_RING=1: fetch_now is tried at the plan (never waits: a copy not landed is a CPU miss); STRATA_RING=2: not tried
     int ring_threads = 4;
     uint8_t* ready_dev = nullptr;            ///< the router's ring table (route_ring_ptr), n_layers x n_expert bytes
     const int32_t* host_res = nullptr;       ///< the cache's residency (n_layers x n_expert, slot or -1): a ring slot whose expert it holds is free
@@ -86,6 +86,7 @@ struct ForesightSwap {
     std::atomic<uint64_t> ring_reads{0}, ring_read_fail{0};
     uint64_t ring_too_late = 0, ring_guarded = 0, ring_all_fresh = 0;   // (under smu_)
     uint64_t now_hits = 0, now_waited = 0, now_none = 0, now_timeout = 0, now_wait_us = 0;   // fetch_now (dispatch thread)
+    uint64_t ring_taken = 0, ring_skipped = 0;   // STRATA_RING at the plan (under smu_): landed copies used / plan misses with no landed copy
     uint64_t verify_ok = 0, verify_bad = 0;
     uint64_t dropped = 0;                    ///< slots dropped because an exchange moved their expert's bytes (under smu_)
     static constexpr int16_t kHeld = -2;     ///< `where`: an exchange is moving this expert's bytes, no copy now (#2134)
@@ -100,10 +101,12 @@ struct ForesightSwap {
     bool take(int64_t layer, int32_t expert, unsigned long long& ptr);
     /// The pool, for an expert the CPU computes now: maybe copy it into a slot of its layer for the next windows.
     void note_miss(ExpertSource* src, int64_t layer, int32_t expert);
-    /// STRATA_RING, the pool, for an expert no cache and no landed slot holds (its predicted copy was late or never made): the GPU
-    /// still computes it exactly - it is read into a slot of its layer NOW (or the in-flight copy is waited for) and its address
-    /// returned once it has landed.  False only when no slot is free or the read fails: then (and only then) the CPU computes it.
+    /// STRATA_RING, the pool, for an expert no cache and no landed slot holds: it is queued into a slot of its layer (if one is
+    /// free) and true with its address only if that copy has ALREADY landed (cudaEventQuery).  Never waits: false otherwise, and the
+    /// copy is left in its slot to serve a later window.  The caller computes a false expert on the CPU as without the ring.
     bool fetch_now(ExpertSource* src, int64_t layer, int32_t expert, unsigned long long& ptr);
+    /// STRATA_RING, the plan: counts one expert of this plan that the ring did not serve landed (-> "skipped" in report()).
+    void ring_skip_plan();
     /// The router look-ahead (any thread), for an expert the next layer's router predicts and no cache holds: maybe copy
     /// it into a slot of that layer now, so that the copy has landed when the layer's plan is made.  One prefetch design
     /// with note_miss (the same slots, budget and reuse rule); a prediction only ever moves bytes, the plan is still made

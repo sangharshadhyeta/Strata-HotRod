@@ -183,6 +183,16 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
+    /// STRATA_PROMPT_TAIL (default on; 0: off, the vectors stay empty).  The routing of the last chunk of the last run
+    /// (the chunk that ends at the run's end): per layer, the router's top-K expert ids of its tokens, expert e counted
+    /// once per rank 0..K-1 it takes, ranks 0-1 twice (decode computes those on the CPU when missed).  Layout
+    /// `layer * n_expert + expert`.  Reset at the start of every run; `tail_tokens()` is 0 when the chunk's routing
+    /// was not read on the host (the stream-walk path), so the caller takes nothing from it.
+    static bool prompt_tail_on();
+    const std::vector<float>& tail_counts() const { return tail_counts_; }
+    int64_t tail_tokens() const { return tail_tokens_; }
+    void clear_tail() { tail_counts_.clear(); tail_tokens_ = 0; }
+
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
@@ -261,6 +271,8 @@ public:
 private:
     core::RouterLookahead* lookahead_ = nullptr;     ///< set_lookahead
     int64_t prompt_total_ = 0;                       ///< set_prompt_total
+    std::vector<float> tail_counts_;                 ///< STRATA_PROMPT_TAIL: the last chunk's routing per (layer, expert); empty when off
+    int64_t tail_tokens_ = 0;                        ///< ... the tokens of that chunk
     std::vector<uint16_t> la_bf_;                    ///< the sampled router-input rows (bf16), host
     std::vector<float> la_x_;                        ///< ... as floats, what the lookahead takes
     int64_t la_s_[12] = {};                          ///< STRATA_PREFILL_LOOKAHEAD_STATS: layers, then per prediction (+1, +2, either) layers / experts / hits

@@ -2459,6 +2459,11 @@ static int prompt_lookahead_env_tokens() {
     return v;
 }
 
+bool Prefill::prompt_tail_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PROMPT_TAIL"); return !(v != nullptr && v[0] == '0' && v[1] == '\0'); }();
+    return on;
+}
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     // solid.cpp's silent-corruption bug class (a failed prefill copy still published its slot): a copy call that RETURNS an error (an argument error is not
     // a stream error, so the stream check at the end of the chunk does not see it) is recorded here and fails the request, loudly
@@ -2484,6 +2489,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
+    // STRATA_PROMPT_TAIL: this run's last chunk's routing starts from zero (see prompt_tail_on)
+    tail_tokens_ = 0;
+    tail_counts_.assign(prompt_tail_on() ? (size_t) g.n_layers * (size_t) g.n_expert : 0, 0.0f);
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
@@ -3922,6 +3930,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
                         }
+                        // STRATA_PROMPT_TAIL: the last chunk's routing, on the host already (these ids are the ones the dispatch uses).
+                        // Ranks are weight-sorted (router_top10's stable top-k), so ranks 0-1 count twice.  Host work only.
+                        if (!tail_counts_.empty() && c0 + T >= n) {
+                            float* tc = tail_counts_.data() + (size_t) l * (size_t) m.g->n_expert;
+                            for (int64_t i = 0; i < T * K; ++i) tc[ids_h[(size_t) i]] += (i % K) < 2 ? 2.0f : 1.0f;
+                            tail_tokens_ = T;
+                        }
                         // STRATA_PREFILL_LOOKAHEAD_STATS=1 (measurement): of the experts this layer routed to that were not on the GPU, how many
                         // the prediction made one layer back (+1) and two layers back (+2) held, over the layers that got one
                         if (static const bool la_stats = std::getenv("STRATA_PREFILL_LOOKAHEAD_STATS") != nullptr;
@@ -5134,6 +5149,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // floor itself - need + floor - available - plus a 256 MiB margin; asked again (3 tries at most) while the check
         // still fails: 20 Oct, one give-back of 3.13 GiB left "need 1.7 GiB, 1.7 GiB available" and the prompt went chunk-major.
         uint64_t given = 0;
+        const uint64_t avail_before = mem ? mem->available : 0;
         for (int attempt = 0; attempt < 3 && need > 0 && mem && g_ram_give_back &&
                               !core::conversation_memory_admit(mem->available, need, floor_bytes); ++attempt) {
             const uint64_t above = above_floor(mem->available);
@@ -5143,8 +5159,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             given += got;
             mem = core::sample_host_memory();
         }
-        if (given > 0)
-            std::fprintf(stderr, "strata prefill: the RAM tier gave back %.2f GiB to the prompt's layer-major state\n", given / 1073741824.0);
+        if (given > 0)   // the reading before and after (and its source) show whether the given-back RAM became available
+            std::fprintf(stderr, "strata prefill: the RAM tier gave back %.2f GiB to the prompt's layer-major state (available %.2f -> "
+                                 "%.2f GiB, %s)\n", given / 1073741824.0, avail_before / 1073741824.0,
+                         mem ? mem->available / 1073741824.0 : 0.0, mem ? core::memory_source_name(mem->source) : "?");
         if (need > 0 && mem && !core::conversation_memory_admit(mem->available, need, floor_bytes)) {
             std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): its residuals need "
                                  "%.1f GiB of pinned RAM, %.1f GiB available above the %.1f GiB floor\n", (long long) n, (long long) C,

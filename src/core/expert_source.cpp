@@ -4877,9 +4877,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
                 } else if (d.fs != nullptr && (d.fs->take(d.layers, e, ptr) || (d.fs->ring && d.fs->ring_wait && d.fs->fetch_now(d.src, d.layers, e, ptr)))) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
-                                                   // (STRATA_RING: or it was read into a slot just now: the CPU computes nothing)
+                                                   // (STRATA_RING: or its copy has landed by now (fetch_now never waits; a copy not landed is a CPU miss))
                 } else {
-                    if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
+                    if (d.fs != nullptr) {
+                        d.fs->note_miss(d.src, d.layers, e);
+                        if (d.fs->ring) d.fs->ring_skip_plan();   // STRATA_RING: no landed copy at this plan -> the CPU (or PCIe) computes it
+                    }
                     if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
@@ -6239,17 +6242,20 @@ bool ForesightSwap::fetch_now(ExpertSource* src, int64_t layer, int32_t expert, 
         }
     }
     Slot& sl = slot[(size_t) (layer * slots + s)];
-    // the filler reads the file and queues the copy (issued), then the copy finishes on the card's stream
-    const auto deadline = t0 + std::chrono::milliseconds(200);
-    while (!sl.issued.load(std::memory_order_acquire)) {
-        {
-            std::lock_guard<std::mutex> smu_lk(smu_);
-            if (sl.expert != expert || failed.load(std::memory_order_relaxed)) { ++now_none; return false; }   // the filler gave the slot back
-        }
-        if (std::chrono::steady_clock::now() > deadline) { ++now_timeout; return false; }
-        std::this_thread::yield();
+    // No wait at the plan: the filler reads the file and queues the copy, the copy finishes on the card's stream.  A copy that has not
+    // landed is left alone (it may serve a later window) and this expert is a CPU miss for this plan, exactly as without the ring.
+    if (!sl.issued.load(std::memory_order_acquire)) {   // the filler has not queued it yet
+        std::lock_guard<std::mutex> smu_lk(smu_);
+        if (sl.expert != expert || failed.load(std::memory_order_relaxed)) ++now_none;   // (the filler gave the slot back)
+        return false;
     }
-    if (cudaEventSynchronize((cudaEvent_t) sl.ev) != cudaSuccess) { cudaGetLastError(); ++now_timeout; return false; }
+    const cudaError_t qe = cudaEventQuery((cudaEvent_t) sl.ev);
+    if (qe != cudaSuccess) {   // cudaErrorNotReady: in flight.  Any other error: also "not landed" (the sticky error is cleared)
+        if (qe != cudaErrorNotReady) cudaGetLastError();
+        std::lock_guard<std::mutex> smu_lk(smu_);
+        if (sl.expert != expert) ++now_none;
+        return false;
+    }
     {
         std::lock_guard<std::mutex> smu_lk(smu_);
         if (sl.expert != expert) { ++now_none; return false; }
@@ -6259,10 +6265,16 @@ bool ForesightSwap::fetch_now(ExpertSource* src, int64_t layer, int32_t expert, 
         ptr = sl.dptr;
         ++hits;
         ++now_hits;
+        ++ring_taken;
         if (!queued_now) ++now_waited;
         now_wait_us += (uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     }
     return true;
+}
+
+void ForesightSwap::ring_skip_plan() {
+    std::lock_guard<std::mutex> smu_lk(smu_);
+    ++ring_skipped;
 }
 
 bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr) {
@@ -6305,6 +6317,7 @@ bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr)
     sl.last_ref = completed.load(std::memory_order_acquire);
     ptr = sl.dptr;
     ++hits;
+    if (ring) ++ring_taken;
     return true;
 }
 
@@ -6341,6 +6354,12 @@ void ForesightSwap::predict(ExpertSource* src, int64_t layer, int32_t expert) {
 
 void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t expert, bool predicted_copy) {
     if (failed.load(std::memory_order_relaxed)) return;
+    // With the RAM tier the ring copies only experts the tier holds (RAM -> VRAM); one that is not in RAM is left to the
+    // look-ahead's promotion (NVMe -> RAM), so the drive never reads the same expert twice.  STRATA_RING_RAM_ONLY=0: any.
+    static const bool ram_only = [] { const char* v = std::getenv("STRATA_RING_RAM_ONLY"); return v == nullptr || v[0] != '0'; }();
+    if (ram_only)
+        if (auto* fsrc = dynamic_cast<FileExpertSource*>(src); fsrc != nullptr && fsrc->complement_ready() && !fsrc->has_resident(layer, expert))
+            return;
     const size_t key = (size_t) (layer * n_expert + expert);
     if (where[key] != -1) return;                       // already on its way, or held by an exchange (#2134)
     const uint64_t now = completed.load(std::memory_order_acquire);
@@ -6466,11 +6485,9 @@ std::string ForesightSwap::report() const {
                       (unsigned long long) ring_reads.load(), (unsigned long long) ring_read_fail.load(),
                       (unsigned long long) ring_too_late, (unsigned long long) ring_guarded, (unsigned long long) ring_all_fresh);
         r += buf;
-        std::snprintf(buf, sizeof buf, "; exact on the GPU at the plan: %llu fetched now (%llu of them an in-flight copy waited for), "
-                                       "%.0f us each on average, %llu no slot, %llu timed out",
-                      (unsigned long long) now_hits, (unsigned long long) now_waited,
-                      now_hits ? (double) now_wait_us / (double) now_hits : 0.0, (unsigned long long) now_none,
-                      (unsigned long long) now_timeout);
+        std::snprintf(buf, sizeof buf, "; ring: taken %llu (landed), skipped %llu (not landed at plan, CPU), %llu no slot "
+                                       "(cumulative since start; the plan never waits)",
+                      (unsigned long long) ring_taken, (unsigned long long) ring_skipped, (unsigned long long) now_none);
         r += buf;
     }
     if (dropped > 0) r += ", " + std::to_string(dropped) + " dropped by exchanges";
