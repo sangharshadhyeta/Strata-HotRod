@@ -23,12 +23,14 @@ import time
 
 
 class PromptCache:
-    def __init__(self, directory: str, fingerprint: str, min_read: int = 256, min_gain: int = 256, limit_bytes: int | None = None):
+    def __init__(self, directory: str, fingerprint: str, min_read: int = 256, min_gain: int = 256, limit_bytes: int | None = None,
+                 turn_id: int | None = None):
         self.dir = directory
         self.fingerprint = fingerprint
         self.min_read = min_read          # a request that read fewer prompt tokens than this is not worth a save
         self.min_gain = min_gain          # a restore must bring at least this many tokens the engine does not hold
         self.limit_bytes = limit_bytes    # None: an eighth of the free disk, between 1 GiB and 256 GiB (solid's rule)
+        self.turn_id = turn_id            # <|im_start|>: the engine's turn checkpoint sits at an entry's last one (None: whole entries only)
         self.held: list[int] | None = None   # what the engine holds now, as far as this server knows (a hint: the engine checks)
         self.held_gen = None                 # ... and the engine process it was true of
         self.entries: dict[str, dict] = {}
@@ -58,7 +60,8 @@ class PromptCache:
                 self._remove(key)         # a sidecar without its state, or an unreadable one
                 continue
             if meta.get("fingerprint") == self.fingerprint and isinstance(meta.get("tokens"), list):
-                self.entries[key] = {"tokens": meta["tokens"], "bytes": size, "used": meta.get("used", 0)}
+                self.entries[key] = {"tokens": meta["tokens"], "bytes": size, "used": meta.get("used", 0),
+                                     "prompt_len": int(meta.get("prompt_len") or 0)}
 
     def _remove(self, key: str):
         self.entries.pop(key, None)
@@ -100,6 +103,15 @@ class PromptCache:
             t = e["tokens"]
             if len(t) < len(ids) and len(t) > best_len and self._prefix_len(t, ids) == len(t):
                 best_key, best_len = key, len(t)
+            # 20 Oct: a reasoning model's next turn does not repeat the reasoning the engine generated (the template drops it
+            # from the history), so a whole entry is never the start of it - but its turn is, and the saved session carries
+            # the engine's turn checkpoint, which the engine rewinds to.  A wrong guess is a refused or partial
+            # reuse (the engine checks the tokens itself), never a wrong answer.
+            # the engine's turn checkpoint holds the tokens before the entry's last <|im_start|> (the end of the user's turn;
+            # server.py pick_slot's held_prefix uses the same rule) - an id-equality on the model's own control token
+            k = (len(t) - 1 - t[::-1].index(self.turn_id)) if self.turn_id is not None and self.turn_id in t else 0
+            if 0 < k < len(ids) and k > best_len and self._prefix_len(t[:k], ids) == k:
+                best_key, best_len = key, k
         if best_key is None or best_len - have < self.min_gain:
             return None
         t0 = time.time()
@@ -135,15 +147,20 @@ class PromptCache:
             self._remove(key)
             return f"prompt cache: save refused ({str(e)[:120]})"
         saved = int((r or {}).get("tokens", -1))
+        # 20 Oct: an answer that ended on max_tokens (no stop token) leaves the engine one token SHORT of this list - the
+        # last sampled token was never fed back - so the entry records the tokens the engine holds (the engine checks the
+        # next prompt against its own copy: a wrong guess is a refused restore, never a wrong answer)
+        if saved == len(tokens) - 1:
+            tokens = tokens[:saved]
         if not 0 <= saved - len(tokens) <= 2:   # a count further off than the engine's one extra token: the lists no longer agree
             self._remove(key)
             return f"prompt cache: the engine saved {saved} tokens, this server expected {len(tokens)} to {len(tokens) + 2}; entry dropped"
-        meta = {"fingerprint": self.fingerprint, "tokens": tokens, "used": time.time()}
+        meta = {"fingerprint": self.fingerprint, "tokens": tokens, "used": time.time(), "prompt_len": len(ids)}
         tmp = os.path.join(self.dir, key + ".json.tmp")
         with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
             json.dump(meta, f)
         os.replace(tmp, os.path.join(self.dir, key + ".json"))   # the sidecar last and whole: an entry exists only with both
-        self.entries[key] = {"tokens": tokens, "bytes": os.path.getsize(path), "used": meta["used"]}
+        self.entries[key] = {"tokens": tokens, "bytes": os.path.getsize(path), "used": meta["used"], "prompt_len": len(ids)}
         self.stats["saves"] += 1
         for k in [k for k, e in self.entries.items() if k != key and self._prefix_len(e["tokens"], tokens) == len(e["tokens"])]:
             self._remove(k)               # a shorter entry that this one continues is no longer needed

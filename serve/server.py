@@ -7182,7 +7182,8 @@ def main() -> int:
             # for 12 restores - the next request almost always continues in RAM.  ("prompt_cache_min_read" overrides.)
             svc.pcache = PromptCache(slot_save_dir(cfg["prompt_cache_path"], cfg.get("cwd")), fp,
                                      min_read=int(cfg.get("prompt_cache_min_read") or 16384),
-                                     limit_bytes=int(cfg["prompt_cache_gib"] * (1 << 30)) if cfg.get("prompt_cache_gib") else None)
+                                     limit_bytes=int(cfg["prompt_cache_gib"] * (1 << 30)) if cfg.get("prompt_cache_gib") else None,
+                                     turn_id=StrataEngine.TURN_ID)
         except (ValueError, OSError) as e:
             raise SystemExit(f"[strata] prompt cache: {e}")
         print(f"[strata] prompt cache on: {svc.pcache.dir} ({len(svc.pcache.entries)} entries kept from earlier)", flush=True)
