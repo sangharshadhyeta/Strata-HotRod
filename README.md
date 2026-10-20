@@ -79,9 +79,20 @@ The detail is in [SPEC.md](SPEC.md).
 
 Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md)):
 
-- **Stand-in experts.** For each token the two best experts are always the real ones. Lower-ranked experts that are not on
-  the card are replaced by a similar one that is, so the card does not wait for the SSD. Swap rounds move the experts a
-  chat asks for onto the card in the background. The install writes these settings for IQ3_S.
+- **Stand-in experts.** Each token uses ten experts per layer. The best one is always the real expert. The second is
+  replaced by an expert that is on the card only when that one scores within 1 logit of it (close enough that answers
+  stay the same); ranks 3 to 10 that are not on the card are replaced by the most similar one that is, so the card does not
+  wait for the SSD. Swap rounds move the experts a chat asks for onto the card in the background. The install writes
+  these settings for IQ3_S. Measured: a wider margin than 1 logit drops tokens (2 logits) or makes answers collapse into
+  loops (3 and more); details in [docs/perf-ideas.md](docs/perf-ideas.md). The settings, in the config's `env`:
+
+  | Setting | What it does | Install value |
+  | --- | --- | --- |
+  | `STRATA_ROUTE_RESIDENT_RANKS` | the ranks that always take a stand-in when not on the card | `2-9` |
+  | `STRATA_ROUTE_RAM_FLOOR` | rank 1 (and rank 0 if allowed) may take a close stand-in | `1` |
+  | `STRATA_ROUTE_RAM_FLOOR_MARGIN` | how close that stand-in must score, in logits | `1` (default) |
+  | `STRATA_ROUTE_RAM_FLOOR_ANYTIER` | also when the expert is in RAM (`0`: only when it would come from the SSD) | `1` |
+  | `STRATA_ROUTE_RAM_FLOOR_RANK0` | let rank 0 take a close stand-in too (faster; not yet checked on maths) | off |
 - **Guessing ahead.** A small draft head guesses the next words and the big model checks them together, with
   probabilistic acceptance of the guesses (`--no-spec-prob-accept` turns it off).
 - **Three tiers of experts: card -> RAM -> SSD.** Every expert lives in exactly one place. The hottest are on the card, the

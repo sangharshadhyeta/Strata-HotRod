@@ -2360,8 +2360,12 @@ def hotrod_default_env(family: str, model: str, hip: bool) -> dict:
     tokens.  Written for the CUDA IQ3_S config only; any other model's config is left as upstream writes it."""
     if family != "qwen" or model != "IQ3_S" or hip:
         return {}
+    # 20 Oct: rank 1 may take a stand-in too, but only one within 1 logit (STRATA_ROUTE_RAM_FLOOR_MARGIN, default 1), whether
+    # or not the expert is in RAM (ANYTIER); rank 0 stays exact.  SPEC E1 (49/50 sums, 29/30 code); 20 Oct ladder: margin 2
+    # dropped tokens, 3 and more collapsed; rank-0 stand-ins are opt-in (STRATA_ROUTE_RAM_FLOOR_RANK0=1)
     return {"STRATA_ROUTE_RESIDENT": "1e30", "STRATA_ROUTE_RESIDENT_RANKS": "2-9",
-            "STRATA_SWAP2_MAX": "2", "STRATA_SWAP2_GAP": "1", "STRATA_KV_GROW_INIT": "4096"}
+            "STRATA_SWAP2_MAX": "2", "STRATA_SWAP2_GAP": "1", "STRATA_KV_GROW_INIT": "4096",
+            "STRATA_ROUTE_RAM_FLOOR": "1", "STRATA_ROUTE_RAM_FLOOR_ANYTIER": "1"}
 
 
 def menu_families(hip: bool) -> list:
@@ -4538,7 +4542,8 @@ SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", 
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
                        "STRATA_ROUTE_TAIL_SKIP", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_RESIDENT_RANKS", "STRATA_SWAP2_MAX",
-                       "STRATA_SWAP2_GAP", "STRATA_KV_GROW_INIT"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
+                       "STRATA_SWAP2_GAP", "STRATA_KV_GROW_INIT", "STRATA_ROUTE_RAM_FLOOR",
+                       "STRATA_ROUTE_RAM_FLOOR_ANYTIER"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
 # (0.1.44 dropped them with the rest of SETUP_ENV).
