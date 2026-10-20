@@ -11,10 +11,15 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
 /* header */
 .st-header{display:flex;align-items:center;gap:var(--st-s-4);height:60px;padding:0 var(--st-s-6);background:var(--st-surface);border-bottom:1px solid var(--st-line)}
 .st-header__brand{font-weight:900;font-size:var(--st-fs-lg);letter-spacing:-.01em}
-.st-header__brand-hot{color:#e0283f}
-.st-header__brand-rod{color:#2f6fed}
-:root[data-theme="dark"] .st-header__brand-hot{color:#ff5a6e}
-:root[data-theme="dark"] .st-header__brand-rod{color:#5b93ff}
+/* the README logo's fire and ice (docs/media/hotrod-hero.gif): HOT burns yellow -> orange -> red, ROD runs cyan -> blue */
+.st-header__brand-hot{color:#e8400c;background:linear-gradient(180deg,#ffb020 0%,#ff6a00 45%,#e01800 100%);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.st-header__brand-rod{color:#0a6fd8;background:linear-gradient(180deg,#10c8f0 0%,#0a7ae0 50%,#0038d0 100%);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+:root[data-theme="dark"] .st-header__brand-hot{background:linear-gradient(180deg,#ffe050 0%,#ff8a10 45%,#ff2a00 100%);
+  -webkit-background-clip:text;background-clip:text}
+:root[data-theme="dark"] .st-header__brand-rod{background:linear-gradient(180deg,#90e8ff 0%,#20c0f0 50%,#1070ff 100%);
+  -webkit-background-clip:text;background-clip:text}
 .st-header__spacer{flex:1}
 
 /* status pill */
