@@ -240,5 +240,28 @@ The model is Qwen3.8-Flash-Next by the Qwen team, compressed by ISTA-DASLab. Str
 this fork keeps its [MIT License](LICENSE) and copyright notice. The engine uses parts of
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp), and the picture encoder uses llama.cpp's `mtmd`. A few parts
 and every model have their own licenses: see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#license). Security problems:
-[SECURITY.md](SECURITY.md). The Hot Rod emblem and landing page (`docs/index.html`) are from
-[AAO-IS2/Strata-HotRod](https://github.com/aao-is2/Strata-HotRod) under their MIT license.
+[SECURITY.md](SECURITY.md).
+
+**Ideas this fork builds on.** Several of the changes above were first built and measured in
+[solid.cpp](https://github.com/sangharshadhyeta/solid.cpp), a llama.cpp fork for MoE expert caching, and ported here one
+concept at a time (the K/V streaming, the RAM tier, the look-ahead). solid.cpp credits the prior art behind them, and so
+do we:
+
+- [leloch/llama.cpp](https://github.com/leloch/llama.cpp) (moe-cache-pr branch): the original GPU-resident MoE expert
+  cache design.
+- [thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) (prefetch-experts branch, from the
+  [Codacus](https://www.youtube.com/@Codacus) channel): expert prefetch overlapped with compute.
+- [JustVugg/colibri](https://github.com/JustVugg/colibri): LFRU eviction and the Expert Atlas measurement method; its
+  [router-prediction experiment](https://github.com/JustVugg/colibri/issues/200) showed where a predictor stops paying.
+- [FlashML-org/FreeToken](https://github.com/FlashML-org/FreeToken): the hit/miss split for expert uploads (copy on the
+  card for experts already there, one batched transfer for the rest).
+- [antirez/ds4](https://github.com/antirez/ds4): the three-tier layout (resident weights, a budgeted expert cache, the
+  file on the SSD for misses) and explicit reads instead of mmap.
+- [vLLM](https://github.com/vllm-project/vllm): a reference for the model's code, and the idea of not reserving memory for
+  context nobody uses.
+- Papers: FlexGen ([2303.06865](https://arxiv.org/abs/2303.06865)) and MoE-Lightning
+  ([2411.11217](https://arxiv.org/abs/2411.11217)) for reading long prompts layer by layer; Stream2LLM for reading the
+  prompt while it is still being written; the expert-prefetch literature (Speculating Experts
+  [2603.19289](https://arxiv.org/abs/2603.19289), PILOT / Fate [2502.12224](https://arxiv.org/abs/2502.12224), FineMoE,
+  SP-MoE [2510.10302](https://arxiv.org/abs/2510.10302), ProMoE, PowerInfer-2) for the look-ahead and what to expect
+  from it.
