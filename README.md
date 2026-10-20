@@ -107,7 +107,12 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
 - **Starting the answer warm.** The experts the end of the prompt used most are put on the card before the first word
   of the answer, so decode does not start cold.
 - **Picking up a conversation.** A long conversation's state is saved to the SSD, and its next turn reloads it instead of
-  reading the whole conversation again.
+  reading the whole conversation again: a 19.5K-token conversation comes back in 0.34 s after another one ran in between.
+  The RAM tier first gives back memory for it (in whole huge pages, which Linux frees at once); before that fix 3 of 4
+  returns to a 45K conversation were refused for ~100 MiB and read again from the start (68 s). The first answer after
+  such a return warms the card with the experts this conversation used (the counts are saved next to it); a conversation
+  that stays loaded is left to the swap rounds, which already fit the card to it. The saved conversations are kept to an
+  eighth of the free disk; ones an older engine build wrote count against that and go first.
 - **Memory safety.** The engine keeps a floor of RAM free before each request; when something else needs RAM, the RAM
   tier gives back its least-used experts until there is room again. The amount it keeps in reserve is measured on this
   PC and learned across restarts (`data/ram-reserve.json`), not a fixed number; the video-memory reserve is learned the
@@ -136,8 +141,20 @@ What the install writes for IQ3_S (21 Oct 2026):
 
 The settings, in the config's `env`: `STRATA_ROUTE_RESIDENT=1e30` (stand-ins on, any distance),
 `STRATA_ROUTE_RESIDENT_RANKS=3-9` (the ranks that take any stand-in) and `STRATA_ROUTE_RESIDENT_EDGE=1` (the rank just above
-them, rank 2, only within 1 logit). The speed tables above were measured with ranks 2-9 taking any stand-in; rank 2 within
-1 logit is new and not yet measured.
+them, rank 2, only within 1 logit). Measured with this rule (21 Oct, 131K context): 53.6 tokens/s on the 8.5K-prompt run,
+the same as with ranks 2-9 taking any stand-in.
+
+The same rule also works in two more places (both on by default since 21 Oct):
+
+- **The look-ahead skips what a stand-in will cover.** The look-ahead reads ahead the experts the next layers will want.
+  A predicted rank-2 expert with a stand-in already on the card within 1 logit is no longer read: the router will take
+  the stand-in. On the 8.5K run that skipped about 47,000 reads, cut the experts read ahead from 16,968 to 12,009 and the
+  decode's wait for the SSD from 4.7 to 4.0 s: 56.4 against 53.6 tokens/s, and 9 to 13% faster on short prompts.
+  `STRATA_LA_EDGE_SKIP=0` turns it off. It only changes what is read ahead, never the answer.
+- **Reading the prompt uses stand-ins too.** The prompt is read with the same rule, so a short prompt reads far fewer
+  experts from the SSD: 76 to 118-token prompts are read in 1.3 to 1.8 s instead of 2.3 to 2.8 s (35 to 45% faster); an
+  8.5K prompt 15.1 against 15.8 s. This changes what the model computes from the prompt; the answers checked (code, a
+  maths problem, prose, an 8.5K summary) read clean. `STRATA_PREFILL_STANDIN=0` turns it off.
 
 What we found on the way (20 Oct 2026, every answer read by hand):
 

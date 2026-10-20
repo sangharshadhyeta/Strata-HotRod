@@ -2540,6 +2540,105 @@ bool Prefill::prompt_tail_on() {
     return on;
 }
 
+bool Prefill::conv_fill_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_CONV_FILL"); return v != nullptr && v[0] != '\0' && std::atoi(v) != 0; }();
+    return on;
+}
+
+bool Prefill::conv_counts_on() {
+    static const bool on = [] {
+        // STRATA_CONV_PRELOAD is on unless set to 0 (or empty); STRATA_CONV_FILL is opt-in
+        const char* f = std::getenv("STRATA_CONV_FILL"), *p = std::getenv("STRATA_CONV_PRELOAD");
+        return (f != nullptr && f[0] != '\0' && std::atoi(f) != 0) || p == nullptr || p[0] == '\0' || std::atoi(p) != 0;
+    }();
+    return on;
+}
+
+namespace {
+// STRATA_PREFILL_STANDIN (default on with decode's stand-ins, =0 off; changes the output): the decode stand-in rule (STRATA_ROUTE_RESIDENT, route_resident_k) applied to
+// every prompt chunk's router top-10 before the picks are counted, grouped and dispatched, so the prompt reads fewer non-resident experts.
+// The same environment as decode: STRATA_STANDIN (margin 1e30, ranks 0-9), STRATA_ROUTE_RESIDENT=<margin> (required; 0 or unset = off),
+// STRATA_ROUTE_RESIDENT_RANKS=lo-hi (default 6-9), STRATA_ROUTE_RESIDENT_EDGE=<logits> (default off).  Unset: nothing here runs.
+// Owned here, not in the borrowed loan: the residency row and the router's picks are small device buffers of their own (n_layers x
+// n_expert int32, T x 10 int32), freed when the run ends.
+struct PrefillStandin {
+    bool on = false;
+    float margin = 0.0f, edge = -1.0f;
+    int lo = 6, hi = 9;
+    int64_t n_expert = 0;
+    int64_t picks = 0, reads_saved = 0;   // the run's totals: picks replaced; distinct (layer, expert) reads avoided
+    int32_t* res = nullptr;               // device: the residency rows, one layer's row uploaded before its stand-ins
+    int32_t* pre = nullptr;               // device: the router's own top-10 of the chunk (before the stand-ins)
+    std::vector<int32_t> pre_h;           // host: `pre` after the layer's sync (the router's picks, the counts' "wanted")
+    std::vector<char> before, after;      // host: distinct experts of one layer, the router's picks and the dispatched ones
+
+    PrefillStandin(int64_t n_layers, int64_t ne, int64_t T, bool residency) {
+        // default on since 21 Oct (=0 off): short prompts read 35-45% faster (81-118 tokens: 2.3-2.8 s -> 1.3-1.8 s), answers read
+        // clean (code, maths, prose, an 8.5k summary).  Unset, it follows decode: on exactly when decode's stand-ins are on.
+        const char* si = std::getenv("STRATA_PREFILL_STANDIN");
+        if (si != nullptr && std::atoi(si) == 0) return;
+        if (si == nullptr) {
+            const char* rr = std::getenv("STRATA_ROUTE_RESIDENT");
+            const char* sa = std::getenv("STRATA_STANDIN");
+            if (!((rr != nullptr && std::atof(rr) > 0.0) || (sa != nullptr && std::atoi(sa) != 0))) return;   // decode's stand-ins off: so is this
+        }
+        // decode's own parse (verify.cpp route_resident_cfg), so prefill and decode follow one configuration
+        if (const char* v = std::getenv("STRATA_STANDIN"); v != nullptr && std::atoi(v) != 0) { margin = 1e30f; lo = 0; hi = 9; }
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) margin = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &lo, &hi);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) edge = (float) std::atof(v);
+        if (!residency || margin <= 0.0f) {
+            std::fprintf(stderr, "strata prefill: STRATA_PREFILL_STANDIN needs the expert cache and STRATA_ROUTE_RESIDENT=<margin> "
+                                 "(> 0): off for this run\n");
+            return;
+        }
+        if (cudaMalloc((void**) &res, (size_t) n_layers * (size_t) ne * sizeof(int32_t)) != cudaSuccess ||
+            cudaMalloc((void**) &pre, (size_t) T * K * sizeof(int32_t)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata prefill: STRATA_PREFILL_STANDIN: the residency buffers could not be allocated; off for this run\n");
+            if (res != nullptr) cudaFree(res);
+            res = nullptr;
+            return;
+        }
+        n_expert = ne;
+        pre_h.resize((size_t) T * K);
+        before.resize((size_t) ne);
+        after.resize((size_t) ne);
+        on = true;
+    }
+    ~PrefillStandin() {
+        if (res != nullptr) cudaFree(res);
+        if (pre != nullptr) cudaFree(pre);
+    }
+    PrefillStandin(const PrefillStandin&) = delete;
+    PrefillStandin& operator=(const PrefillStandin&) = delete;
+
+    // one layer's tally, after the dispatch's counts: `post` are the ids the prompt dispatches (the stand-ins applied), `pre_ids` the
+    // router's own.  Picks replaced, and the distinct non-resident experts the layer reads before and after.
+    void tally(int64_t n, const int32_t* post, const int32_t* pre_ids, const int32_t* res_row) {
+        std::fill(before.begin(), before.end(), 0);
+        std::fill(after.begin(), after.end(), 0);
+        for (int64_t i = 0; i < n; ++i) {
+            if (pre_ids[i] != post[i]) ++picks;
+            if (pre_ids[i] >= 0 && pre_ids[i] < n_expert) before[(size_t) pre_ids[i]] = 1;
+            if (post[i] >= 0 && post[i] < n_expert) after[(size_t) post[i]] = 1;
+        }
+        int64_t nb = 0, na = 0;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (res_row[e] >= 0) continue;   // resident: no read either way
+            nb += before[(size_t) e];
+            na += after[(size_t) e];
+        }
+        reads_saved += nb - na;
+    }
+    void report() const {
+        if (on)
+            std::fprintf(stderr, "strata prefill: stand-ins: %lld picks replaced, %lld expert reads saved (STRATA_PREFILL_STANDIN)\n",
+                         (long long) picks, (long long) reads_saved);
+    }
+};
+}  // namespace
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     // solid.cpp's silent-corruption bug class (a failed prefill copy still published its slot): a copy call that RETURNS an error (an argument error is not
     // a stream error, so the stream check at the end of the chunk does not see it) is recorded here and fails the request, loudly
@@ -2638,6 +2737,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const cudaStream_t cs = (cudaStream_t) m.cs;
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
+    // STRATA_PREFILL_STANDIN (opt-in; off = nothing below runs): the stand-ins of each MoE layer's chunk, see PrefillStandin
+    PrefillStandin sa(g.n_layers, g.n_expert, m.T, m.host_res != nullptr && m.cache != nullptr);
     if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
@@ -3750,6 +3851,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     }
+                    // STRATA_PREFILL_STANDIN: the decode stand-in rule on this chunk's top-10, before anything counts or groups the picks
+                    // (after the debug hook above, so its dumps are the router's own picks).  The residency row is this layer's host_res:
+                    // a slot is usable only where it holds a number >= 0 - the test the dispatch below makes, and the lent slots are -1
+                    // for the prompt (generate.cpp sets them kNotResident when it lends them).  The router's own picks stay in sa.pre.
+                    bool sa_now = false;   // this layer's stand-ins ran: the host copy of the picks and the tallies below apply
+                    if (sa.on) {
+                        cudaMemcpyAsync(sa.res + (size_t) l * (size_t) g.n_expert, m.host_res + (size_t) l * (size_t) g.n_expert,
+                                        (size_t) g.n_expert * sizeof(int32_t), cudaMemcpyHostToDevice, cs);
+                        standin_route(m.logits, m.ids, m.w, T, g.n_expert, sa.res + (size_t) l * (size_t) g.n_expert, sa.lo, sa.hi,
+                                      sa.margin, sa.edge, sa.pre, cs);
+                        sa_now = true;
+                    }
                     // the shared expert and its scalar gate
                     auto shared_expert = [&]() -> bool {
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
@@ -3948,6 +4061,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           l, p0);
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
+                        if (sa_now) {   // the stream is idle now: the router's own picks, before the stand-ins, to the host
+                            cudaMemcpy(sa.pre_h.data(), sa.pre, (size_t) T * K * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                        }
                         if (la_n > 0) {   // the sample is on the host: predict the next layers' experts and warm their pages now
                             la_x_.resize(la_bf_.size());
                             for (size_t i = 0; i < la_bf_.size(); ++i) {
@@ -4024,12 +4140,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
                         }
-                        // STRATA_PROMPT_TAIL: the last chunk's routing, on the host already (these ids are the ones the dispatch uses).
+                        // STRATA_PREFILL_STANDIN: the picks replaced and the reads avoided, against the router's own picks (sa.pre_h).
+                        // The dispatch (m.cnt) reads the stand-ins; the wanted counts below read the router's picks, as decode's
+                        // `want` counts them before its swap (else the residency would follow the stand-ins and never see what the
+                        // model asked for).  With the switch off want_h is ids_h and nothing changes.
+                        const int32_t* want_h = sa_now ? sa.pre_h.data() : ids_h;
+                        if (sa_now) sa.tally(T * K, ids_h, sa.pre_h.data(), m.host_res + (size_t) l * (size_t) m.g->n_expert);
+                        // STRATA_PROMPT_TAIL: the last chunk's routing, on the host already (the router's picks: see want_h).
                         // Ranks are weight-sorted (router_top10's stable top-k), so ranks 0-1 count twice.  Host work only.
                         if (!tail_counts_.empty() && c0 + T >= n) {
                             float* tc = tail_counts_.data() + (size_t) l * (size_t) m.g->n_expert;
-                            for (int64_t i = 0; i < T * K; ++i) tc[ids_h[(size_t) i]] += (i % K) < 2 ? 2.0f : 1.0f;
+                            for (int64_t i = 0; i < T * K; ++i) tc[want_h[(size_t) i]] += (i % K) < 2 ? 2.0f : 1.0f;
                             tail_tokens_ = T;
+                        }
+                        // STRATA_CONV_FILL / STRATA_CONV_PRELOAD: every chunk's routing, ranks 0-2, for the conversation (the serve loop reads it at decode)
+                        if (conv_counts_on()) {
+                            if (conv_counts_.empty()) conv_counts_.assign((size_t) m.g->n_layers * (size_t) m.g->n_expert, 0.0f);
+                            float* cc = conv_counts_.data() + (size_t) l * (size_t) m.g->n_expert;
+                            for (int64_t i = 0; i < T * K; ++i) if ((i % K) < 3) cc[want_h[(size_t) i]] += 1.0f;
+                            if (l == LB) conv_tokens_ += T;   // once per chunk: the chunk's first layer of this part
                         }
                         // STRATA_PREFILL_LOOKAHEAD_STATS=1 (measurement): of the experts this layer routed to that were not on the GPU, how many
                         // the prediction made one layer back (+1) and two layers back (+2) held, over the layers that got one
@@ -5558,6 +5687,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
     }
+    sa.report();   // STRATA_PREFILL_STANDIN only
     return true;
 }
 

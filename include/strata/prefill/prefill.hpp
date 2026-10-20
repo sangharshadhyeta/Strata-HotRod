@@ -197,6 +197,20 @@ public:
     int64_t tail_tokens() const { return tail_tokens_; }
     void clear_tail() { tail_counts_.clear(); tail_tokens_ = 0; }
 
+    /// STRATA_CONV_FILL (opt-in; unset or 0: off, no work and no allocation).  Every prompt chunk's routing, per (layer,
+    /// expert): expert e counted once per rank 0..2 it takes in the chunk's routing (ranks are weight-sorted).  Kept across
+    /// the runs of one conversation (not reset by run); the serve loop resets it when a request starts a new conversation.
+    /// Layout `layer * n_expert + expert`; empty until the first chunk with the switch on.
+    static bool conv_fill_on();
+    /// STRATA_CONV_PRELOAD (default on; =0 off) or STRATA_CONV_FILL (opt-in): the conversation's counts are kept (see conv_fill_on
+    /// for the layout).  Host work only: the counts come from the chunk's routing ids already on the host.
+    static bool conv_counts_on();
+    const std::vector<float>& conv_counts() const { return conv_counts_; }
+    int64_t conv_tokens() const { return conv_tokens_; }   ///< the prompt tokens those counts cover
+    void reset_conv() { conv_counts_.clear(); conv_tokens_ = 0; }
+    /// the counts of a restored conversation (the session file's sidecar, see generate.cpp)
+    void set_conv(std::vector<float> counts, int64_t tokens) { conv_counts_ = std::move(counts); conv_tokens_ = tokens; }
+
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
@@ -277,6 +291,8 @@ private:
     int64_t prompt_total_ = 0;                       ///< set_prompt_total
     std::vector<float> tail_counts_;                 ///< STRATA_PROMPT_TAIL: the last chunk's routing per (layer, expert); empty when off
     int64_t tail_tokens_ = 0;                        ///< ... the tokens of that chunk
+    std::vector<float> conv_counts_;                 ///< STRATA_CONV_FILL: the routing of every chunk of the conversation (ranks 0-2); empty when off
+    int64_t conv_tokens_ = 0;                        ///< STRATA_CONV_FILL / _PRELOAD: the tokens of the chunks counted in conv_counts_
     std::vector<uint16_t> la_bf_;                    ///< the sampled router-input rows (bf16), host
     std::vector<float> la_x_;                        ///< ... as floats, what the lookahead takes
     int64_t la_s_[12] = {};                          ///< STRATA_PREFILL_LOOKAHEAD_STATS: layers, then per prediction (+1, +2, either) layers / experts / hits

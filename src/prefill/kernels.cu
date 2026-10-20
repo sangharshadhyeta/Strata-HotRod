@@ -1890,6 +1890,58 @@ __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restri
     selected_sum = fmaxf(warp_sum(selected_sum), 6.103515625e-5f);
     if (lane < 10) wout[t * 10 + lane] = selected / selected_sum;
 }
+// STRATA_PREFILL_STANDIN (opt-in): the decode stand-in rule (native_router.cu route_resident_k) on a prompt chunk's top-10, one warp per
+// token, in place.  A pick at rank r in [lo, hi] that is not resident (res < 0) is replaced by the best-scoring resident expert not already
+// among the ten, when its logit is within `margin` of the pick's; the edge rank lo - 1 (when edge >= 0 and lo > 0) only within `edge`.
+// Ranks are visited in order (a swap changes the set already picked).  A token with a swap gets its ten weights again as the softmax of the
+// chosen logits, as route_resident_k does; a token without one keeps the router's weights.  `pre` (T x 10) keeps the router's own ten.
+__global__ void standin_route_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                const int32_t* __restrict__ res, int n_expert, int lo, int hi, float margin, float edge,
+                                int32_t* __restrict__ pre) {
+    const int t = blockIdx.x;
+    const int lane = threadIdx.x;   // one warp
+    const float* l = logits + (size_t) t * n_expert;
+    int32_t* id = ids + (size_t) t * 10;
+    int32_t my[10];
+    for (int r = 0; r < 10; ++r) my[r] = id[r];
+    __syncwarp();   // every lane has read the router's ids before lane 0 writes them below
+    if (lane == 0)
+        for (int r = 0; r < 10; ++r) pre[t * 10 + r] = my[r];
+    const int first = (edge >= 0.f && lo > 0) ? lo - 1 : lo;
+    int swaps = 0;
+    for (int r = first; r <= hi && r < 10; ++r) {
+        const int e = my[r];
+        if (res[e] >= 0) continue;   // resident: uniform across the warp
+        float bv = -INFINITY;
+        int bi = -1;
+        for (int f = lane; f < n_expert; f += 32) {
+            if (res[f] < 0) continue;
+            bool used = false;
+            for (int q = 0; q < 10; ++q) used |= my[q] == f;
+            if (!used && l[f] > bv) { bv = l[f]; bi = f; }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) { bv = ov; bi = oi; }
+        }
+        bv = __shfl_sync(0xffffffffu, bv, 0);   // every lane decides the same way from here
+        bi = __shfl_sync(0xffffffffu, bi, 0);
+        const float thr = (edge >= 0.f && lo > 0 && r == lo - 1) ? edge : margin;
+        if (bi >= 0 && l[e] - bv <= thr) { my[r] = bi; ++swaps; }
+    }
+    if (lane == 0) {
+        if (swaps) {
+            float m = -INFINITY;
+            for (int r = 0; r < 10; ++r) m = fmaxf(m, l[my[r]]);
+            float ex[10], sum = 0.0f;
+            for (int r = 0; r < 10; ++r) { ex[r] = expf(l[my[r]] - m); sum += ex[r]; }
+            for (int r = 0; r < 10; ++r) weights[t * 10 + r] = ex[r] / sum;
+        }
+        for (int r = 0; r < 10; ++r) id[r] = my[r];
+    }
+}
 // Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales [2560][10] f16
 template <bool HALF>
 __global__ void blob_dequant_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict__ gu16,
@@ -2568,6 +2620,12 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
     else
         strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
+}
+void standin_route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, const int32_t* res, int lo,
+                   int hi, float margin, float edge, int32_t* pre, void* stream) {
+    standin_route_k<<<(unsigned) T, 32, 0, (cudaStream_t) stream>>>(logits, ids, weights, res, (int) n_expert, lo, hi, margin,
+                                                                   edge, pre);
+    check("standin_route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     blob_dequant_kernel<false><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);

@@ -821,6 +821,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
           (std::getenv("STRATA_RING_GPU") == nullptr || std::atoi(std::getenv("STRATA_RING_GPU")) != 0)) ||
          (std::getenv("STRATA_LOOKAHEAD_GPU") == nullptr || std::atoi(std::getenv("STRATA_LOOKAHEAD_GPU")) != 0)))
         strata::kernels::route_pred_alloc(g.n_layers);
+    // STRATA_LA_EDGE_SKIP (default on since 21 Oct, =0 off): the look-ahead's edge-skip counter, allocated before any graph capture
+    if ((std::getenv("STRATA_LA_EDGE_SKIP") == nullptr || std::atoi(std::getenv("STRATA_LA_EDGE_SKIP")) != 0) && strata::kernels::route_pred_active())
+        strata::kernels::route_pred_edge_skip_alloc();
     // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
         strata::kernels::route_ring_alloc((size_t) (g.n_layers * g.n_expert));
@@ -2167,6 +2170,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #else
         const bool la_on_stream = false;   // HIP: the node stays on cs (the shared stream's cross-stream cost, as sh_stream_on)
 #endif
+        static const bool la_edge_skip = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e == nullptr || std::atoi(e) != 0; }();
         auto lookahead_node = [&](cudaStream_t s) -> bool {
             try {
                 for (int dist = 1; dist <= 2; ++dist) {
@@ -2178,6 +2182,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               NE, n, s);
                     native_router_top10_multi(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
                                               strata::kernels::route_pred_weights(), n, s);
+                    // STRATA_LA_EDGE_SKIP (decode windows: this node runs only for n <= 8): a predicted rank lo-1 pick that a resident
+                    // stand-in within the edge would replace is not read ahead (its id becomes -1; route_pred_edge_skip)
+                    if (la_edge_skip && hits_.d_res != nullptr)
+                        strata::kernels::route_pred_edge_skip(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
+                                                              hits_.d_res + (l + dist) * g.n_expert, n, s);
                 }
             } catch (const std::exception& e) { err = "verify look-ahead node: " + std::string(e.what()); return false; }
             return true;

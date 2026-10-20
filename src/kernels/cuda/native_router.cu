@@ -510,6 +510,62 @@ const int32_t* route_pred_host() { return g_pred_host; }
 int32_t* route_pred_dev(int64_t target_layer, int dist) { return g_pred_dev ? g_pred_dev + ((size_t) target_layer * 2 + (size_t) (dist - 1)) * 80 : nullptr; }
 float* route_pred_logits() { return g_pred_logits; }
 float* route_pred_weights() { return g_pred_w; }
+// STRATA_LA_EDGE_SKIP (default on since 21 Oct, =0 off; decode look-ahead only: verify.cpp lookahead_node): the predicted rank lo-1 pick (the edge rank of the
+// floor, route_resident_k's `edge`) is not read ahead when a resident expert outside the predicted ten scores within `edge` logits of it
+// in the predicted logits: the router takes that stand-in, so the read would be wasted.  Its slot is set to -1 (the host's warm path skips
+// a negative id) and counted.  One warp per token; the reads of ids finish before lane 0 writes (the shuffle is a warp barrier).
+// Approximation: the router also refuses a stand-in past its maxrank or a heavy pick (wmax) and counts ring-landed experts as resident;
+// neither is seen here.
+__global__ void pred_edge_skip_k(const float* __restrict__ logits, int32_t* __restrict__ ids, const int32_t* __restrict__ res,
+                                 const RouteCfg* cfg, unsigned long long* __restrict__ skipped, int n_tok) {
+    const int t = blockIdx.x;
+    if (t >= n_tok) return;
+    const int lane = (int) threadIdx.x;
+    const int lo = ((const volatile RouteCfg*) cfg)->lo;
+    const float edge = ((const volatile RouteCfg*) cfg)->edge;
+    if (edge < 0.f || lo <= 0 || lo - 1 >= 10) return;   // uniform across the warp
+    const int r = lo - 1;
+    const int32_t* id = ids + (size_t) t * 10;
+    const int e = id[r];
+    if (e < 0 || e >= 512 || res[e] >= 0) return;   // uniform: no pick, or already resident (not read ahead anyway)
+    const float* l = logits + (size_t) t * 512;
+    float bv = -INFINITY;
+    for (int f = lane; f < 512; f += 32) {
+        if (res[f] < 0) continue;   // not resident (the router's stand-in candidates are the resident experts)
+        bool used = false;
+        for (int q = 0; q < 10; ++q) used |= id[q] == f;   // the router's stand-in is not one of the ten picks
+        if (!used && l[f] > bv) bv = l[f];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) bv = fmaxf(bv, __shfl_xor_sync(0xffffffffu, bv, off));
+    if (lane == 0 && bv > -INFINITY && l[e] - bv <= edge) {
+        ids[(size_t) t * 10 + r] = -1;
+        atomicAdd(skipped, 1ull);
+    }
+}
+static unsigned long long* g_pred_skip = nullptr;   // device counter: skipped predictions since the last take
+void route_pred_edge_skip_alloc() {
+    if (g_pred_skip != nullptr) return;
+    if (cudaMalloc((void**) &g_pred_skip, sizeof(unsigned long long)) != cudaSuccess) { cudaGetLastError(); g_pred_skip = nullptr; return; }
+    cudaMemset(g_pred_skip, 0, sizeof(unsigned long long));
+}
+void route_pred_edge_skip(const float* pred_logits, int32_t* pred_ids, const int32_t* res_layer, int n_tok, void* stream) {
+    const RouteCfg* cfg = route_cfg_device();
+    if (cfg == nullptr || g_pred_skip == nullptr || pred_logits == nullptr || pred_ids == nullptr || res_layer == nullptr || !stream || n_tok < 1)
+        return;
+    pred_edge_skip_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(pred_logits, pred_ids, res_layer, cfg, g_pred_skip, n_tok);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+// the skips counted since the last take (the request's stats line), then the counter is zeroed.  Called between requests, when the
+// decode's stream is idle.
+unsigned long long route_pred_edge_skips_take() {
+    if (g_pred_skip == nullptr) return 0;
+    unsigned long long v = 0;
+    if (cudaMemcpy(&v, g_pred_skip, sizeof v, cudaMemcpyDeviceToHost) != cudaSuccess) { cudaGetLastError(); return 0; }
+    cudaMemset(g_pred_skip, 0, sizeof v);
+    return v;
+}
 static uint8_t* g_ring = nullptr;
 static size_t g_ring_n = 0;
 void route_ring_alloc(size_t n) {

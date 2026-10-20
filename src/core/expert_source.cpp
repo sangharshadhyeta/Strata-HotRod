@@ -667,6 +667,7 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     c.pf_read_blobs = io_pf_blobs_.load(std::memory_order_relaxed);
     c.pf_resident_skips = io_pf_skips_.load(std::memory_order_relaxed);
     c.pf_dropped = io_pf_dropped_.load(std::memory_order_relaxed);
+    c.pf_stale = io_pf_stale_.load(std::memory_order_relaxed);
     c.pf_used = io_pf_used_.load(std::memory_order_relaxed);
     c.pf_unused = io_pf_unused_.load(std::memory_order_relaxed);
     c.crit_us = io_crit_us_.load(std::memory_order_relaxed);
@@ -1096,6 +1097,7 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
+    conv_fill_stop();   // STRATA_CONV_FILL: its thread reads into the RAM tier, so it stops before any of it is torn down
     stop_pagecache_warm();
     io_stop();
     for (size_t i = 0; i < complement_offsets_.size(); ++i) set_cheap(i, false);   // STRATA_ROUTE_RAM_FLOOR: no RAM tier after close
@@ -1578,7 +1580,8 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             uint64_t total = 0;
             if (cached_bytes(layer, e, total, false) >= total) continue;
             io_pf_demand_.fetch_add(1, std::memory_order_relaxed);
-            io_enqueue(layer, e);
+            if (io_demand_first_) io_enqueue_demand(layer, e);   // STRATA_IO_DEMAND_FIRST: the layer's own misses, ahead of the guesses (not purged as stale)
+            else io_enqueue(layer, e);
         }
         return;
     }
@@ -2740,6 +2743,17 @@ void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
     (void) ids;
     (void) k;
     if (!staged()) return;
+    // STRATA_IO_DEMAND_FIRST: a queued read-ahead for this layer or an earlier one is stale - its routing is decided now, so it is
+    // removed unread (the decode's own misses are the demand reads).  The later layers' read-aheads stay queued.  io_mu_ is released
+    // before stage_mu_ is taken.
+    if (io_demand_first_ && io_pf_) {
+        std::lock_guard<std::mutex> lk(io_mu_);
+        const size_t before = io_q_.size();
+        io_q_.erase(std::remove_if(io_q_.begin(), io_q_.end(),
+                                   [&](const std::pair<int32_t, int32_t>& p) { return p.first <= (int32_t) layer; }),
+                    io_q_.end());
+        if (io_q_.size() != before) io_pf_stale_.fetch_add(before - io_q_.size(), std::memory_order_relaxed);
+    }
     std::lock_guard<std::mutex> lk(stage_mu_);
     if (layer != last_layer_) {
         ++epoch_;
@@ -4364,6 +4378,63 @@ void FileExpertSource::promote_read(int64_t layer, int64_t expert) {
     promo_spare_.push_back(std::move(buf));
 }
 
+// ---- STRATA_CONV_FILL ------------------------------------------------------------------------------------------------------
+// The conversation's experts (generate.cpp) go into the RAM tier before its decode starts: one background thread walks the
+// candidates in order and calls promote_read on each, the io workers' own promotion.  promote_read takes a free place (or
+// counts the layer as starved, and publish_promotions releases up to 4 cold experts of that layer per window); nothing else
+// is evicted here.  promo_mu_ and tier_mu_ guard its state, the same as for the io workers.
+bool FileExpertSource::in_ram_tier(int64_t layer, int64_t expert) const {
+    if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    return ram_tier((size_t) (layer * n_expert_ + expert));
+}
+
+bool FileExpertSource::promo_queue_full() const {
+    std::lock_guard<std::mutex> lk(promo_mu_);
+    return promo_q_.size() >= kPromoQueueMax;
+}
+
+void FileExpertSource::conv_fill_stop() {
+    conv_stop_.store(true, std::memory_order_release);
+    if (conv_th_.joinable()) conv_th_.join();
+}
+
+void FileExpertSource::conv_fill(std::vector<std::pair<int64_t, int64_t>> list) {
+    conv_fill_stop();
+    conv_stop_.store(false, std::memory_order_release);
+    conv_fill_queued_.store((int64_t) list.size());
+    conv_fill_done_.store(0);
+    if (list.empty() || !promo_on_.load(std::memory_order_acquire)) return;
+    conv_th_ = std::thread([this, list = std::move(list)]() { conv_fill_run(list); });
+}
+
+void FileExpertSource::conv_fill_run(std::vector<std::pair<int64_t, int64_t>> list) {
+    constexpr int kConvRetriesMax = 2000;
+    int64_t done = 0;
+    for (const auto& [layer, expert] : list) {
+        if (conv_stop_.load(std::memory_order_acquire)) break;
+        bool give_up = false;
+        for (int retries = 0; promo_queue_full(); ++retries) {   // the queue is full: the same candidate again, later
+            if (retries >= kConvRetriesMax || conv_stop_.load(std::memory_order_acquire)) { give_up = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (give_up) break;
+        if (!promote_wanted(layer, expert)) continue;
+        promote_read(layer, expert);
+        // a place was taken and the entry queued: promo_busy_ stays set until publish_promotions takes it (a failed or starved
+        // read clears it)
+        const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+        bool queued = false;
+        {
+            std::lock_guard<std::mutex> lk(promo_mu_);
+            queued = i < promo_busy_.size() && promo_busy_[i] != 0;
+        }
+        if (queued) ++done;
+    }
+    conv_fill_done_.store(done);
+    std::fprintf(stderr, "strata serve: conversation fill: %lld of %lld candidates promoted into the RAM tier\n",
+                 (long long) done, (long long) conv_fill_queued_.load());
+}
+
 // SAFETY (serve thread, between windows): a pool job and the PCIe lane take RAM-tier pointers only inside a decode window, and
 // this runs between windows, so no reader is left in a place given back here.  The io thread writes a free place only inside
 // a window, and complement_offsets_ names a place only after this publishes it, so no reader can see a place being written.
@@ -4424,8 +4495,21 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
     return published;
 }
 
+// The transparent huge page size (hpage_pmd_size), read once; 2 MiB when the file is absent or unusable.
+static uintptr_t huge_page_bytes() {
+    static const uintptr_t v = [] {
+        uintptr_t h = (uintptr_t) 2 << 20;
+        std::ifstream f("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size");
+        unsigned long long x = 0;
+        if (f && (f >> x) && x > 0 && (x & (x - 1)) == 0) h = (uintptr_t) x;
+        return h;
+    }();
+    return v;
+}
+
 uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float>& usage) {
 #if defined(__linux__)
+    last_union_freed_bytes_ = 0;
     if (bytes == 0 || !can_give_back() || n_expert_ <= 0 || n_layers_ <= 0)
         return 0;   // a page-locked arena cannot be madvise'd: its pages are the driver's
     const long page_size = sysconf(_SC_PAGESIZE);
@@ -4480,6 +4564,38 @@ uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float
                 complement_parked_[(size_t) layer].push_back(at);
                 break;
             }
+        }
+    }
+    // the union of every PARKED place's byte range (all layers), merged where they overlap or touch.  A place is not
+    // huge-page sized: on a THP host a 2 MiB page it only partly covers is queued for a deferred split by the madvise
+    // above and stays charged.  A whole huge page inside the union holds parked bytes only, so it is given back whole;
+    // the 4 KiB remainder at each end of a merged range is given back as well.  Only parked ranges are read here, under
+    // tier_mu_; promo_pause_ (set above) keeps the io thread from taking a place meanwhile.
+    std::vector<std::pair<uintptr_t, uintptr_t>> spans;
+    {
+        std::lock_guard<std::mutex> lk(tier_mu_);
+        for (size_t l = 0; l < complement_parked_.size() && l < layer_blob_bytes_.size(); ++l)
+            for (const uint64_t at : complement_parked_[l]) {
+                const uintptr_t lo = (uintptr_t) (complement_host_ + at);
+                spans.emplace_back(lo, lo + (uintptr_t) layer_blob_bytes_[l]);
+            }
+    }
+    std::sort(spans.begin(), spans.end());
+    const uintptr_t huge = huge_page_bytes();
+    for (size_t k = 0; k < spans.size();) {
+        const uintptr_t lo = spans[k].first;
+        uintptr_t hi = spans[k].second;
+        size_t m = k + 1;
+        for (; m < spans.size() && spans[m].first <= hi; ++m) hi = std::max(hi, spans[m].second);
+        k = m;
+        const uintptr_t a4 = (lo + page - 1) & ~(page - 1), b4 = hi & ~(page - 1);
+        const uintptr_t a2 = (lo + huge - 1) & ~(huge - 1), b2 = hi & ~(huge - 1);
+        if (a2 < b2) {
+            if (a4 < a2) (void) madvise((void*) a4, (size_t) (a2 - a4), MADV_DONTNEED);
+            if (madvise((void*) a2, (size_t) (b2 - a2), MADV_DONTNEED) == 0) last_union_freed_bytes_ += (uint64_t) (b2 - a2);
+            if (b2 < b4) (void) madvise((void*) b2, (size_t) (b4 - b2), MADV_DONTNEED);
+        } else if (b4 > a4) {
+            (void) madvise((void*) a4, (size_t) (b4 - a4), MADV_DONTNEED);
         }
     }
     return given;

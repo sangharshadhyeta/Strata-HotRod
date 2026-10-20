@@ -140,6 +140,51 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <vector>
 
 namespace {
+// STRATA_CONV_PRELOAD: the conversation's routing counts travel with its session file, as `<path>.conv` beside it: written after a
+// SAVE, read after a RESTORE.  Layout (host byte order): "CNV1", i64 n_parts, then per part i64 conv_tokens, i64 size and size
+// floats (the part's conv_counts; size 0 when it kept none).  A stale sidecar is removed by every SAVE that does not write one.
+struct ConvSide { int64_t tokens = 0; std::vector<float> counts; };
+// tmp file, then rename; false with why set on any failure (the file is then absent)
+bool conv_sidecar_write(const std::string& path, const std::vector<ConvSide>& parts, std::string& why) {
+    const std::string file = path + ".conv", tmp = file + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { why = "cannot create " + tmp; return false; }
+    const int64_t n = (int64_t) parts.size();
+    bool ok = std::fwrite("CNV1", 1, 4, f) == 4 && std::fwrite(&n, sizeof n, 1, f) == 1;
+    for (const ConvSide& p : parts) {
+        const int64_t size = (int64_t) p.counts.size();
+        ok = ok && std::fwrite(&p.tokens, sizeof p.tokens, 1, f) == 1 && std::fwrite(&size, sizeof size, 1, f) == 1;
+        if (ok && size > 0) ok = std::fwrite(p.counts.data(), sizeof(float), p.counts.size(), f) == p.counts.size();
+    }
+    ok = std::fclose(f) == 0 && ok;
+    if (!ok) { std::remove(tmp.c_str()); why = "cannot write " + tmp; return false; }
+    if (std::rename(tmp.c_str(), file.c_str()) != 0) { std::remove(tmp.c_str()); why = "cannot rename it to " + file; return false; }
+    return true;
+}
+// false (parts unusable): no sidecar, another magic, another part count, a size that is neither 0 nor n_flat, or a short or
+// long file; the caller then drops the counts in memory
+bool conv_sidecar_read(const std::string& path, size_t n_parts, size_t n_flat, std::vector<ConvSide>& parts) {
+    std::FILE* f = std::fopen((path + ".conv").c_str(), "rb");
+    if (f == nullptr) return false;
+    char magic[4] = {};
+    int64_t n = -1;
+    bool ok = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "CNV1", 4) == 0 && std::fread(&n, sizeof n, 1, f) == 1 &&
+              n == (int64_t) n_parts;
+    parts.assign(ok ? n_parts : 0, ConvSide{});
+    for (size_t i = 0; ok && i < n_parts; ++i) {
+        int64_t tokens = -1, size = -1;
+        ok = std::fread(&tokens, sizeof tokens, 1, f) == 1 && std::fread(&size, sizeof size, 1, f) == 1 && tokens >= 0 &&
+             (size == 0 || size == (int64_t) n_flat);
+        if (!ok) break;
+        parts[i].tokens = tokens;
+        parts[i].counts.resize((size_t) size);
+        if (size > 0) ok = std::fread(parts[i].counts.data(), sizeof(float), (size_t) size, f) == (size_t) size;
+    }
+    ok = ok && std::fgetc(f) == EOF;
+    std::fclose(f);
+    return ok;
+}
+
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -8443,6 +8488,9 @@ int main(int argc, char** argv) {
         // (decided above, before the lend regions were sized: a no-op here unless the resident RAM mode skipped it)
         decide_split_ring();
         std::vector<PfPart> pf_parts;
+        // STRATA_CONV_PRELOAD: set by a successful RESTORE (its counts came from the file, or were dropped), read by the first
+        // request after it (conv_restored_req) - the conversation preload runs only then
+        bool conv_restored = false;
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
@@ -12207,11 +12255,13 @@ int main(int argc, char** argv) {
                     adapt_quiesce();   // staged swaps keep the tier from releasing places: they land first
                     const uint64_t got = src.give_back_ram(floor + ram_margin - mem->available, drive.d.usage);
                     ram_last_given = got;
+                    const uint64_t whole = src.last_union_freed_bytes();
                     auto after = strata::core::sample_host_memory();
                     std::fprintf(stderr, "strata serve: RAM below the floor plus margin (%.2f GiB available, floor %.2f + margin "
-                                         "%.2f): the RAM tier gave back %.2f GiB (%.2f GiB available now, %s)\n",
+                                         "%.2f): the RAM tier gave back %.2f GiB (%.2f GiB in whole huge pages, %.2f GiB "
+                                         "available now, %s)\n",
                                  mem->available / 1073741824.0, floor / 1073741824.0, ram_margin / 1073741824.0,
-                                 got / 1073741824.0,
+                                 got / 1073741824.0, whole / 1073741824.0,
                                  after ? after->available / 1073741824.0 : 0.0,
                                  after ? strata::core::memory_source_name(after->source) : "?");
                 } else if (mem && mem->available > floor + ram_margin + band && src.parked_ram_bytes() > 0) {
@@ -12386,14 +12436,21 @@ int main(int argc, char** argv) {
                             if (mem && need != UINT64_MAX && src.complement_ready()) {
                                 // staged swaps keep the tier from releasing places (release_resident_place refuses): they land first
                                 adapt_quiesce();
-                                const uint64_t want = need + floor + (256ull << 20) - std::min<uint64_t>(mem->available, need + floor);
-                                const uint64_t got = src.give_back_ram(want, drive.d.usage);
-                                mem = strata::core::sample_host_memory();
-                                avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
-                                std::fprintf(stderr, "strata serve: the RAM tier gave back %.2f GiB for the session save (%.2f GiB "
-                                                     "available now)\n", got / 1073741824.0,
-                                             mem ? mem->available / 1073741824.0 : 0.0);
-                                if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                                uint64_t want = need + floor + (256ull << 20) - std::min<uint64_t>(mem->available, need + floor);
+                                // up to three more rounds, each asking for what is still short, while a round gives something back
+                                for (int round = 0; round < 4; ++round) {
+                                    const uint64_t got = src.give_back_ram(want, drive.d.usage);
+                                    const uint64_t whole = src.last_union_freed_bytes();
+                                    mem = strata::core::sample_host_memory();
+                                    avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                                    std::fprintf(stderr, "strata serve: the RAM tier gave back %.2f GiB (%.2f GiB in whole huge "
+                                                         "pages) for the session save (%.2f GiB available now)\n",
+                                                 got / 1073741824.0, whole / 1073741824.0,
+                                                 mem ? mem->available / 1073741824.0 : 0.0);
+                                    if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                                    if (got == 0 || !mem) break;
+                                    want = need + floor + (256ull << 20) - std::min<uint64_t>(mem->available, need + floor);
+                                }
                             }
                             why = "not enough RAM to save the session (" +
                                   (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
@@ -12435,6 +12492,20 @@ int main(int argc, char** argv) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
                         continue;
                     }
+                    // STRATA_CONV_PRELOAD: the conversation's counts beside the file; a failure only warns (the save stands)
+                    std::remove((path + ".conv").c_str());
+                    if (strata::prefill::Prefill::conv_counts_on()) {
+                        std::vector<ConvSide> sides(pf_parts.size());
+                        for (size_t i = 0; i < pf_parts.size(); ++i)
+                            if (pf_parts[i].sp != nullptr) {
+                                sides[i].tokens = pf_parts[i].sp->conv_tokens();
+                                sides[i].counts = pf_parts[i].sp->conv_counts();
+                            }
+                        std::string why_conv;
+                        if (!conv_sidecar_write(path, sides, why_conv))
+                            std::fprintf(stderr, "strata serve: warning: the conversation's routing counts were not saved (%s)\n",
+                                         why_conv.c_str());
+                    }
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
                                  "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
                                  path.c_str(), ms(), capture_ms);
@@ -12449,10 +12520,31 @@ int main(int argc, char** argv) {
                         strata::core::SessionReadLimits limits;
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                        limits.admit = [floor, &o](uint64_t need, std::string& why) {
-                            const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                        limits.admit = [&, floor](uint64_t need, std::string& why) {
+                            auto mem = strata::core::sample_host_memory();
+                            std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            // the RAM tier gives back its coldest experts for the restore, as it does for a save (21 Oct: a 45k
+                            // session's restore was refused at 3361 MiB available against 914 + 2560 needed, and the
+                            // conversation was read again from token 0: 68 s instead of 0.7 s)
+                            if (mem && need != UINT64_MAX && src.complement_ready()) {
+                                adapt_quiesce();   // staged swaps keep the tier from releasing places: they land first
+                                uint64_t want = need + floor + (256ull << 20) - std::min<uint64_t>(mem->available, need + floor);
+                                // up to three more rounds, each asking for what is still short, while a round gives something back
+                                for (int round = 0; round < 4; ++round) {
+                                    const uint64_t got = src.give_back_ram(want, drive.d.usage);
+                                    const uint64_t whole = src.last_union_freed_bytes();
+                                    mem = strata::core::sample_host_memory();
+                                    avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+                                    std::fprintf(stderr, "strata serve: the RAM tier gave back %.2f GiB (%.2f GiB in whole huge "
+                                                         "pages) for the session restore (%.2f GiB available now)\n",
+                                                 got / 1073741824.0, whole / 1073741824.0,
+                                                 mem ? mem->available / 1073741824.0 : 0.0);
+                                    if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                                    if (got == 0 || !mem) break;
+                                    want = need + floor + (256ull << 20) - std::min<uint64_t>(mem->available, need + floor);
+                                }
+                            }
                             why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
                                   std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
                                   ram_note(mem) + ")";
@@ -12516,6 +12608,18 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
                                  ms(), read_ms);
+                    // STRATA_CONV_PRELOAD: the counts that were saved beside the file come back with it; without a usable sidecar
+                    // the counts in memory (another conversation's, or none) are dropped
+                    if (strata::prefill::Prefill::conv_counts_on()) {
+                        std::vector<ConvSide> sides;
+                        const bool got = conv_sidecar_read(path, pf_parts.size(), (size_t) g.n_layers * (size_t) g.n_expert, sides);
+                        for (size_t i = 0; i < pf_parts.size(); ++i) {
+                            if (pf_parts[i].sp == nullptr) continue;
+                            if (got) pf_parts[i].sp->set_conv(std::move(sides[i].counts), sides[i].tokens);
+                            else pf_parts[i].sp->reset_conv();
+                        }
+                    }
+                    conv_restored = true;
                     std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
                 }
                 std::fflush(stdout);
@@ -13272,6 +13376,15 @@ int main(int argc, char** argv) {
             if (use_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             conversations.limit_reuse(read_from);
+            // STRATA_CONV_FILL / STRATA_CONV_PRELOAD (opt-in): a request that reuses none of the held conversation starts its routing
+            // counts anew; a continued conversation keeps them (every prompt chunk adds to them, see Prefill::conv_counts_on)
+            static const bool conv_fill_env = strata::prefill::Prefill::conv_fill_on();
+            static const bool conv_counts_env = strata::prefill::Prefill::conv_counts_on();
+            if (conv_counts_env && resume == 0)
+                for (PfPart& p : pf_parts) if (p.sp != nullptr) p.sp->reset_conv();
+            // the flag belongs to the first request after a RESTORE only: taken here, so no later request sees it
+            const bool conv_restored_req = conv_restored;
+            conv_restored = false;
             pp_total = n;
             pp_from = read_from;
             pp_reached = read_from;
@@ -14516,6 +14629,83 @@ int main(int argc, char** argv) {
                                  seed_parts > 0 ? ", usage seeded" : "");
                 else
                     std::fprintf(stderr, "strata serve: prompt tail: none (the prompt's last chunk was not read on the prefill path)\n");
+            }
+            // STRATA_CONV_PRELOAD (default on; =0 off): the first request after a RESTORE of a conversation (the card was not serving it:
+            // another conversation ran, or a restart) whose prompt tail did not run (only the new message was read) seeds the decode's
+            // usage from the conversation's counts, with the tail's formula, then runs swap rounds before decode so the seeded experts
+            // reach the card.  A conversation that stayed loaded is not preloaded: its previous answer's swaps already fit the card.
+            // Rounds: STRATA_CONV_PRELOAD_ROUNDS (default 4); each is the adapt() of the decode
+            // loop (blocking, no window in flight here: refill() has returned the lent slots), its copies waited for by apply_pending.
+            static const bool conv_preload_env = [] { const char* v = std::getenv("STRATA_CONV_PRELOAD"); return v == nullptr || v[0] == '\0' || std::atoi(v) != 0; }();
+            if (conv_preload_env && conv_restored_req && resume > 0 && !cancelled) {
+                // (21 Oct) not skipped when the prompt tail ran: after a restore the request reads the turn's last ~150 tokens on the
+                // prefill path, so the tail always runs then - on 150 tokens it says little, the conversation's counts say much more
+                const double decay = 1.0 - (double) o.adapt_decay;
+                if (decay > 1e-3 && !drive.d.usage.empty() && drive.d.usage.size() == (size_t) (g.n_layers * g.n_expert)) {
+                    int64_t conv_toks = 0, parts_seeded = 0, n_seeded = 0, n_missing = 0;
+                    for (PfPart& p : pf_parts) {
+                        if (p.sp == nullptr || p.sp->conv_tokens() <= 0 || p.sp->conv_counts().size() != drive.d.usage.size()) continue;
+                        conv_toks = std::max(conv_toks, p.sp->conv_tokens());
+                        const std::vector<float>& cc = p.sp->conv_counts();
+                        const double s = 3.3 / (double) p.sp->conv_tokens() / decay;
+                        for (int64_t l = p.lb; l < p.le; ++l)
+                            for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                                const size_t j = (size_t) (l * g.n_expert + ex);
+                                if (cc[j] <= 0.0f) continue;
+                                drive.d.usage[j] += (float) (cc[j] * s);
+                                ++n_seeded;
+                                if (host_res[j] < 0) ++n_missing;
+                            }
+                        ++parts_seeded;
+                    }
+                    if (parts_seeded > 0) {
+                        std::fprintf(stderr, "strata serve: conversation preload: usage seeded from %lld conversation tokens (%lld experts, %lld of them not in VRAM) (restored conversation)\n",
+                                     (long long) conv_toks, (long long) n_seeded, (long long) n_missing);
+                        static const int64_t preload_rounds = [] { const char* v = std::getenv("STRATA_CONV_PRELOAD_ROUNDS"); return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 4; }();
+                        int64_t pre_swaps = 0;
+                        if (ajob) {
+                            std::fprintf(stderr, "strata serve: conversation preload: the asynchronous tier (--adapt-async 1) is on; no swap round before decode\n");
+                        } else {
+                            for (int64_t r = 0; r < preload_rounds && pending.empty(); ++r) {
+                                if (!adapt()) { std::printf("ERR the conversation preload's swap round failed\n"); return 1; }
+                                const size_t before = pending.size();
+                                apply_pending(true);   // the copies land and the tables follow
+                                pre_swaps += (int64_t) before;
+                            }
+                        }
+                        std::fprintf(stderr, "strata serve: conversation preload: %lld swaps before decode (restored conversation)\n", (long long) pre_swaps);
+                    }
+                }
+            }
+            // STRATA_CONV_FILL (opt-in): the conversation's experts of ranks 0-2 that are neither in VRAM nor in the RAM tier go
+            // into the RAM tier now, in the background (FileExpertSource::conv_fill), so the decode finds them there.  The most
+            // used first, at most STRATA_CONV_FILL_MAX (default 768).  Nothing is evicted here (promote_read's own rule).
+            if (conv_fill_env && srcp == &src && src.io_overlay_active() && src.lookahead_promote() &&
+                host_res.size() == (size_t) g.n_layers * (size_t) g.n_expert) {
+                static const int64_t conv_fill_max = [] {
+                    const char* e = std::getenv("STRATA_CONV_FILL_MAX");
+                    return e != nullptr ? (int64_t) std::max(0, std::atoi(e)) : (int64_t) 768;
+                }();
+                std::vector<float> conv_sum((size_t) g.n_layers * (size_t) g.n_expert, 0.0f);
+                for (const PfPart& p : pf_parts) {
+                    if (p.sp == nullptr || p.sp->conv_counts().size() != conv_sum.size()) continue;
+                    const std::vector<float>& cc = p.sp->conv_counts();
+                    for (size_t j = 0; j < conv_sum.size(); ++j) conv_sum[j] += cc[j];
+                }
+                struct ConvCand { float count; int64_t layer, expert; };
+                std::vector<ConvCand> cands;
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        const size_t j = (size_t) (l * g.n_expert + e);
+                        if (conv_sum[j] <= 0.0f || host_res[j] >= 0 || src.in_ram_tier(l, e)) continue;   // on the GPU / in the RAM tier
+                        cands.push_back({conv_sum[j], l, e});
+                    }
+                std::stable_sort(cands.begin(), cands.end(), [](const ConvCand& a, const ConvCand& b) { return a.count > b.count; });
+                if ((int64_t) cands.size() > conv_fill_max) cands.resize((size_t) conv_fill_max);
+                std::vector<std::pair<int64_t, int64_t>> list;
+                list.reserve(cands.size());
+                for (const ConvCand& c : cands) list.emplace_back(c.layer, c.expert);
+                src.conv_fill(std::move(list));
             }
             if (o.prefill_head_alias) {
                 sp.reset();
@@ -15960,15 +16150,19 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "; page cache held %.1f MB at the read, not %.1f MB",
                                      (double) (ic.cached_bytes - ic_prev.cached_bytes) / 1e6,
                                      (double) (ic.uncached_bytes - ic_prev.uncached_bytes) / 1e6);
+                    // STRATA_IO_DEMAND_FIRST: the read-aheads dropped as stale (their layer's routing decided) since the previous request
+                    char stale_txt[48] = "";
+                    if (src.io_demand_first())
+                        std::snprintf(stale_txt, sizeof stale_txt, ", %llu dropped (stale)", (unsigned long long) (ic.pf_stale - ic_prev.pf_stale));
                     if (src.io_prefetch())
                         std::fprintf(stderr, "; io prefetch: %llu read ahead (%.1f MB by pread), %llu used, %llu unused, %llu skipped "
-                                             "(cached), %llu dropped; decode waited %.1f ms in %llu fetches",
+                                             "(cached), %llu dropped%s; decode waited %.1f ms in %llu fetches",
                                      (unsigned long long) (ic.pf_read_blobs - ic_prev.pf_read_blobs),
                                      (double) (ic.pread_bytes - ic_prev.pread_bytes) / 1e6,
                                      (unsigned long long) (ic.pf_used - ic_prev.pf_used),
                                      (unsigned long long) (ic.pf_unused - ic_prev.pf_unused),
                                      (unsigned long long) (ic.pf_resident_skips - ic_prev.pf_resident_skips),
-                                     (unsigned long long) (ic.pf_dropped - ic_prev.pf_dropped),
+                                     (unsigned long long) (ic.pf_dropped - ic_prev.pf_dropped), stale_txt,
                                      (double) (ic.crit_us - ic_prev.crit_us) / 1e3,
                                      (unsigned long long) (ic.crit_n - ic_prev.crit_n));
                     // STRATA_IO_TIMERS=1: where the host's fetch time went this request (totals; divide by the decode windows of the timing line)
@@ -16001,6 +16195,11 @@ int main(int argc, char** argv) {
                     dc_prev = dc;
                 }
             }
+            // STRATA_LA_EDGE_SKIP (default on since 21 Oct, =0 off): the decode look-ahead's rank lo-1 predictions that a resident stand-in
+            // within the edge covers, not read ahead, since the previous request (the device counter is taken and zeroed here)
+            if (static const bool la_edge_skip_on = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e == nullptr || std::atoi(e) != 0; }(); la_edge_skip_on)
+                std::fprintf(stderr, "strata serve: look-ahead edge skip: %llu rank-2 predictions had a resident stand-in within the edge\n",
+                             (unsigned long long) strata::kernels::route_pred_edge_skips_take());
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
             if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)

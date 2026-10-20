@@ -66,6 +66,12 @@ const int32_t* route_pred_host();                                   ///< the tab
 int32_t* route_pred_dev(int64_t target_layer, int dist);            ///< dist 1 or 2: the slab of 8 x 10 ids, device alias
 float* route_pred_logits();                                          ///< scratch, 8 x 512 floats
 float* route_pred_weights();                                         ///< scratch, 8 x 10 floats
+/// STRATA_LA_EDGE_SKIP (default on, =0 off): route_pred_edge_skip_alloc once before graph capture; route_pred_edge_skip after the look-ahead's top-10
+/// writes a predicted rank lo-1 id as -1 when a resident stand-in is within the edge (the floor's config); skips are counted on the
+/// device, and route_pred_edge_skips_take returns the count since the last take and zeroes it.
+void route_pred_edge_skip_alloc();
+void route_pred_edge_skip(const float* pred_logits, int32_t* pred_ids, const int32_t* res_layer, int n_tok, void* stream);
+unsigned long long route_pred_edge_skips_take();
 void route_ring_alloc(size_t n);
 uint8_t* route_ring_ptr();                                   ///< the whole table (nullptr when not allocated)
 const uint8_t* route_ring_layer(int64_t layer, int64_t n_expert);   ///< the layer's slice, nullptr when not allocated

@@ -762,6 +762,12 @@ public:
     uint64_t publish_promotions(const std::vector<float>& usage, const std::vector<char>& busy);
     /// True when publish_promotions has work: queued entries, or a layer wanted a place it did not have.
     bool promotions_pending() const;
+    /// True when (layer, expert) is held by the RAM tier now (a place, or the exchange ownership table; see ram_tier).
+    bool in_ram_tier(int64_t layer, int64_t expert) const;
+    /// STRATA_CONV_FILL: promotes the candidates, in order, on ONE background thread (the look-ahead promotion, promote_read,
+    /// with the same free-place rule; a full queue waits 2 ms and retries the same candidate, 2000 times at most).  A new call
+    /// stops and joins the previous thread first; close() does the same.  Prints one line when the thread ends.
+    void conv_fill(std::vector<std::pair<int64_t, int64_t>> list);
     /// Experts published by promotion / the first demand read of a published place (its flag is cleared by that read).
     uint64_t promotions() const { return promo_n_.load(std::memory_order_relaxed); }
     uint64_t promotion_hits() const { return promo_hits_.load(std::memory_order_relaxed); }
@@ -777,6 +783,8 @@ public:
     /// Caller: the serve thread between decode windows, with no background reader holding a pointer from resident_blob
     /// (a read of a madvise'd place returns zeros).
     uint64_t give_back_ram(uint64_t bytes, const std::vector<float>& usage);
+    /// Bytes the last give_back_ram madvise'd in whole transparent huge pages (its union pass over every parked place).
+    uint64_t last_union_freed_bytes() const { return last_union_freed_bytes_; }
     /// Whether give_back_ram can give anything back now (a page-locked arena cannot be madvise'd: the guard skips it).
     bool can_give_back() const {
         return complement_ready_ && complement_host_ != nullptr && !complement_pinned_ && !complement_registered_;
@@ -995,6 +1003,7 @@ public:
     // The bytes are the same bytes, so the output is the same.  `threads` = I/O threads (0: default 4).
     void set_io_prefetch(bool on, int threads);
     bool io_prefetch() const { return io_pf_; }
+    bool io_demand_first() const { return io_pf_ && io_demand_first_; }   ///< STRATA_IO_DEMAND_FIRST on, with io prefetch
     /// The RAM tier overlays this file tier (--resident-budget-gib): the I/O pipeline and the look-ahead run as in files
     /// mode, the RAM copy answers first, and the experts outside it are read O_DIRECT (one copy each: VRAM, RAM, NVMe).
     /// Set before set_io_prefetch.  io_overlay_active() is true once the complement is built: only then does the pipeline
@@ -1014,6 +1023,7 @@ public:
         uint64_t pf_demand = 0;                              ///< blobs the layer asked for that the workers were handed
         uint64_t pf_jobs = 0, pf_read_blobs = 0, pf_resident_skips = 0, pf_dropped = 0;   ///< prefetch workers
         uint64_t pf_used = 0, pf_unused = 0;                 ///< prefetched blobs a layer then used / never used
+        uint64_t pf_stale = 0;                               ///< STRATA_IO_DEMAND_FIRST: read-aheads dropped unread, their layer's routing already decided
         uint64_t crit_us = 0;                                ///< wall time the decode waited on file reads (prefetch + staged_blob)
         uint64_t crit_n = 0;
         uint64_t blob_n = 0, blob_us = 0, blob_lock_us = 0, blob_wait_us = 0;   ///< blob() calls, their wall time, the stage_mu_ wait and the stage_cv_ wait inside
@@ -1146,6 +1156,7 @@ private:
     std::atomic<uint64_t> t_pf_probe_us_{0}, t_pf_fill_us_{0}, t_pf_thread_us_{0}, n_pf_calls_{0};
     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
+    std::atomic<uint64_t> io_pf_stale_{0};   ///< STRATA_IO_DEMAND_FIRST: queued read-aheads of a layer already routed, removed in begin_layer
     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
         io_crit_us_{0}, io_crit_n_{0};
     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
@@ -1197,6 +1208,7 @@ private:
     std::vector<std::vector<uint64_t>> complement_free_;   ///< per layer: places release_resident_place gave up (free)
     std::vector<std::vector<uint64_t>> complement_parked_;   // places give_back_ram gave up: no taker sees them until
                                                              // unpark_ram (under tier_mu_)
+    uint64_t last_union_freed_bytes_ = 0;   // give_back_ram's union pass: bytes madvise'd in whole huge pages
     mutable std::mutex tier_mu_;                      ///< complement_free_ / complement_parked_: the io workers' promotion
                                                       ///< check vs the serve thread's release / take
     /// place_expert: the one place rule of take_resident_place and the promotions.  A free place of the layer first; else
@@ -1213,6 +1225,13 @@ private:
     /// io worker: takes a free place of the layer (none: counted in promo_starved_, nothing read), reads the blob into a
     /// promotion buffer, copies it into the place and queues it (no stage buffer is used)
     void promote_read(int64_t layer, int64_t expert);
+    bool promo_queue_full() const;
+    /// STRATA_CONV_FILL: the thread's body, and the stop + join (close(), conv_fill).
+    void conv_fill_run(std::vector<std::pair<int64_t, int64_t>> list);
+    void conv_fill_stop();
+    std::thread conv_th_;                        ///< conv_fill's thread (joined by conv_fill_stop)
+    std::atomic<bool> conv_stop_{false};         ///< conv_fill_stop: the thread stops at its next candidate
+    std::atomic<int64_t> conv_fill_queued_{0}, conv_fill_done_{0};   ///< candidates handed in / promoted into a place (queued for publish)
     std::atomic<bool> promo_on_{false};
     std::atomic<const std::vector<float>*> promo_usage_{nullptr};
     mutable std::mutex promo_mu_;
