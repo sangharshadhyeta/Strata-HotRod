@@ -269,7 +269,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
                                  unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl,
-                                 const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap) {
+                                 const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap, float cheap_margin,
+                                 int cheap_rank0, int cheap_anytier) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -354,7 +355,12 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         const int e = my[r];
         if (have(e)) continue;                          // already resident: uniform across the warp
         if (r >= 2 && r < first) continue;              // below the floor and not rank 0-1: exact, as before (never reached without `cheap`)
-        if (cheap != nullptr && r < 2 && cheap[e] != 0) continue;   // RAM-tier expert: exact, the CPU computes it from RAM (e is the same for the warp)
+        // RAM-tier expert: exact, the CPU computes it from RAM (e is the same for the warp); STRATA_ROUTE_RAM_FLOOR_ANYTIER=1 lets a close
+        // stand-in (within the margin) replace it too, so the CPU skips it as well
+        if (cheap != nullptr && r < 2 && cheap[e] != 0 && cheap_anytier == 0) continue;
+        // the safety margin (SPEC E1, 10 Oct: rank 1 replaced only by a stand-in within 1 logit stayed sound, 49/50 maths, 29/30 code;
+        // an unlimited margin on ranks 0-1 collapsed the answers, T22/T27/9v): rank 0 stays exact unless STRATA_ROUTE_RAM_FLOOR_RANK0=1
+        if (cheap != nullptr && r == 0 && cheap_rank0 == 0) continue;
         if (wmax > 0.f && weights[(size_t) t * 10 + r] >= wmax) continue;   // a heavy pick stays exact: fetched / computed on the CPU
         if (lane == 0) ++tail;
         float bv = -INFINITY;
@@ -385,7 +391,10 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         }
         // the edge rank (lo - 1, a fractional floor such as 1.5) is replaced only by a close substitute (within `edge`); the other
         // ranks below it (STRATA_ROUTE_RAM_FLOOR's ranks 0-1) take the margin, as the ranks 2-9 do
-        if (bi >= 0 && l[e] - bv <= ((edge >= 0.f && lo > 0 && r == lo - 1) ? edge : margin)) {
+        // STRATA_ROUTE_RAM_FLOOR's ranks 0-1 take its own safety margin (STRATA_ROUTE_RAM_FLOOR_MARGIN, default 1 logit): no stand-in
+        // that close = the exact expert, computed on the CPU after its fetch as before
+        if (bi >= 0 && l[e] - bv <= ((cheap != nullptr && r < 2) ? cheap_margin
+                                     : (edge >= 0.f && lo > 0 && r == lo - 1) ? edge : margin)) {
             if (detail != nullptr) {
                 // what was replaced and by what (per replacement): the weight of the replaced pick, the substitute's place in
                 // the router's own ranking of all 512 experts, and the score gap to it
@@ -464,9 +473,15 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
+    // STRATA_ROUTE_RAM_FLOOR's safety: the stand-in for a rank 0-1 pick must be within STRATA_ROUTE_RAM_FLOOR_MARGIN logits (default 1,
+    // the margin SPEC E1 found sound for rank 1), and rank 0 is replaced only with STRATA_ROUTE_RAM_FLOOR_RANK0=1 (never tested: off)
+    static const float cheap_margin = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_MARGIN"); return v ? (float) std::atof(v) : 1.0f; }();
+    static const int cheap_rank0 = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_RANK0"); return v != nullptr && std::atoi(v) != 0 ? 1 : 0; }();
+    // STRATA_ROUTE_RAM_FLOOR_ANYTIER=1: a close stand-in replaces a rank 0-1 pick in the RAM tier too (opt-in, under test)
+    static const int cheap_anytier = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_ANYTIER"); return v != nullptr && std::atoi(v) != 0 ? 1 : 0; }();
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
-        n_tok <= 8 ? repl : nullptr, ring, cheap);
+        n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
