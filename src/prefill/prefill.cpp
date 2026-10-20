@@ -2155,6 +2155,11 @@ uint64_t Prefill::layer_major_host_bytes(int64_t n_tokens) {
 static std::atomic<uint64_t> g_lm_host_floor{2560ull << 20};
 void Prefill::set_host_floor_bytes(uint64_t bytes) { g_lm_host_floor.store(bytes); }
 uint64_t Prefill::host_floor_bytes() { return g_lm_host_floor.load(); }
+// the measured RAM margin (serve loop, generate.cpp): 0 until a request has measured one, so a run before that gives back
+// only what it needs plus the deficit
+static std::atomic<uint64_t> g_ram_margin{0};
+void Prefill::set_ram_margin_bytes(uint64_t bytes) { g_ram_margin.store(bytes); }
+uint64_t Prefill::ram_margin_bytes() { return g_ram_margin.load(); }
 // the RAM tier's give-back and the layer-major pass hook: set by generate.cpp on the serve thread, read on that thread
 static std::function<uint64_t(uint64_t)> g_ram_give_back;
 static std::function<void(int64_t)> g_on_layer_pass;
@@ -2515,10 +2520,19 @@ static int64_t prompt_direct_min_tokens() {
     return v;
 }
 // STRATA_PREFILL_LOOKAHEAD_TOK: the look-ahead's tokens a layer. An explicit value always wins; otherwise 512, or 0 for a run
-// whose prompt reads are O_DIRECT (the look-ahead only warms the page cache, which those reads skip).  -1: not set.
+// whose prompt reads are O_DIRECT (the look-ahead only warms the page cache, which those reads skip), unless
+// STRATA_PROMPT_LOOKAHEAD_IO=1 and the source warms (see below).  -1: not set.
 static int prompt_lookahead_env_tokens() {
     static const int v = [] { const char* e = std::getenv("STRATA_PREFILL_LOOKAHEAD_TOK"); return e ? std::max(0, std::atoi(e)) : -1; }();
     return v;
+}
+// STRATA_PROMPT_LOOKAHEAD_IO=1 (opt-in, measured before it becomes a default): under the RAM-tier overlay warm() reads the
+// predicted blobs ahead into the source's stage buffers (I/O threads), and with this switch the prompt's O_DIRECT copies take
+// them from there (FileExpertSource::take_read_ahead), so the look-ahead keeps its 512 tokens on O_DIRECT reads too.  Read once.
+static bool prompt_lookahead_io() {
+    // on by default since 20 Oct (measured: see expert_source.cpp's prompt_lookahead_io); STRATA_PROMPT_LOOKAHEAD_IO=0 is off
+    static const bool on = [] { const char* e = std::getenv("STRATA_PROMPT_LOOKAHEAD_IO"); return !(e != nullptr && e[0] == '0'); }();
+    return on;
 }
 
 bool Prefill::prompt_tail_on() {
@@ -2676,7 +2690,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                 : ("a prompt under STRATA_PROMPT_DIRECT_MIN_TOKENS=" + std::to_string((long long) min_tok) + ", its pages stay cached for decode").c_str());
             }
         }
-        la_tok = prompt_lookahead_env_tokens() >= 0 ? prompt_lookahead_env_tokens() : (m.src->prompt_direct_on() ? 0 : 512);
+        // O_DIRECT prompt reads: 0 (the look-ahead only warms the page cache, which they skip), unless the switch is on and the
+        // source warms (warm() reads the predicted blobs into the stage buffers, and the prompt's copies take them from there).
+        la_tok = prompt_lookahead_env_tokens() >= 0 ? prompt_lookahead_env_tokens()
+                 : (m.src->prompt_direct_on() && !(prompt_lookahead_io() && m.src->warms()) ? 0 : 512);
     } else if (prompt_lookahead_env_tokens() >= 0) {
         la_tok = prompt_lookahead_env_tokens();
     }
@@ -2752,6 +2769,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // (PT_END closes a pass).  The events are read once, after the layer loop; the passes add no sync.
     enum : int { PT_OTHER = 0, PT_ATTN, PT_GDN, PT_ROUTER, PT_WAIT, PT_EXPERTS, PT_SHARED, PT_END = -1 };
     static const bool phase_timers = [] { const char* e = std::getenv("STRATA_PREFILL_PHASE_TIMERS"); return e != nullptr && e[0] == '1'; }();
+    // the copy issuer's waits, timed only under phase_timers (no clock reads otherwise): the ring-full spin (the issuer is
+    // ahead of the compute by a whole ring) and the host staging wait (the blob is not yet read from the drive).  Which of
+    // the two the issuer waits on decides the fix for the prompt's GPU idle (nsys 20 Oct: 4.46 s idle of 15.08 s on the
+    // 8.5k prompt, mostly before the expert H2D copies): a deeper ring if it is the ring, faster staging if it is the host.
+    std::atomic<int64_t> iss_ring_us{0}, iss_stage_us{0};
+    // the layer-major staging wait, timed only under phase_timers: stage_one's unpinned branch waits for the stager on the
+    // thread that launches the kernels, so it is GPU idle directly (the nsys gaps before the H2D copies, 20 Oct).  The
+    // counts: experts staged through the host, DMA'd from the pinned arena, and resident or reused (no copy at all).
+    std::atomic<int64_t> iss_lm_stage_us{0}, lm_staged_n{0}, lm_dma_n{0}, lm_skip_n{0};
     struct PhTimers {
         std::vector<cudaEvent_t> pool;              // the events, grown as marks need them; destroyed on exit
         std::vector<std::pair<int, size_t>> marks;  // (category, pool index), in order over all passes
@@ -3142,7 +3168,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     xcopy(m.stage_dev[sl], en.blob, bytes, m.copy);
                     ++stats_.experts_dma;
                 } else {
+                    const auto tw = phase_timers ? Clock::now() : Clock::time_point{};
                     const uint8_t* hb = m.stager->wait(en.job);
+                    if (phase_timers) iss_stage_us.fetch_add((int64_t) (ms_since(tw) * 1000.0));
                     xcopy(m.stage_dev[sl], hb, bytes, m.copy);
                     m.stager->issued_one(en.job, m.copy);
                 }
@@ -3177,10 +3205,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 strata::aux_cpus::pin_current_thread();
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
+                    const auto tr = phase_timers ? Clock::now() : Clock::time_point{};
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
                         if (a_stop.load(std::memory_order_acquire)) return;
                         std::this_thread::yield();
                     }
+                    if (phase_timers) iss_ring_us.fetch_add((int64_t) (ms_since(tr) * 1000.0));
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
@@ -3190,7 +3220,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         xcopy(m.stage_dev[sl], en.blob, bytes, m.copy);
                         ++iss_dma;
                     } else {
+                        const auto tw = phase_timers ? Clock::now() : Clock::time_point{};
                         const uint8_t* hb = m.stager->wait(en.job);
+                        if (phase_timers) iss_stage_us.fetch_add((int64_t) (ms_since(tw) * 1000.0));
                         xcopy(m.stage_dev[sl], hb, bytes, m.copy);
                         m.stager->issued_one(en.job, m.copy);
                     }
@@ -4597,10 +4629,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                            if (resident) return true;
+                            if (resident) { if (phase_timers) lm_skip_n.fetch_add(1); return true; }
                             if (lm_on && !lm_first && lm_off[(size_t) e] >= 0) {   // layer-major: the layer's map has it
                                 stage_of[j] = -2;
                                 ++lm_reused;
+                                if (phase_timers) lm_skip_n.fetch_add(1);
                                 return true;
                             }
                             const int sl = stage_next;
@@ -4614,9 +4647,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                                 xcopy(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), m.copy);
                                 ++stats_.experts_dma;
+                                if (phase_timers) lm_dma_n.fetch_add(1);
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
+                                const auto tw = phase_timers ? Clock::now() : Clock::time_point{};
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
+                                if (phase_timers) iss_lm_stage_us.fetch_add((int64_t) (ms_since(tw) * 1000.0));
+                                if (phase_timers) lm_staged_n.fetch_add(1);
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                                 xcopy(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), m.copy);
                                 m.stager->issued_one(job_of[j], m.copy);
@@ -5238,7 +5275,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                               !core::conversation_memory_admit(mem->available, need, floor_bytes); ++attempt) {
             const uint64_t above = above_floor(mem->available);
             const uint64_t deficit = mem->available < floor_bytes ? floor_bytes - mem->available : 0;
-            const uint64_t got = g_ram_give_back((need > above ? need - above : 0) + deficit + (1024ull << 20));   // 20 Oct: 256 MiB left a 45k prompt 0.1 GiB short when another program took part of what was freed
+            // the margin on top is the measured one (set by the serve loop from the largest one-request drop in available RAM),
+            // not a fixed 1 GiB; 20 Oct: a fixed 256 MiB left a 45k prompt 0.1 GiB short when another program took part of
+            // what was freed, which is why the margin is measured and learned rather than guessed.  Added on the first
+            // attempt only: a retry asks for what is still short, the margin is not added again on every try
+            const uint64_t got = g_ram_give_back((need > above ? need - above : 0) + deficit +
+                                                 (attempt == 0 ? ram_margin_bytes() : 0));
             if (got == 0) break;
             given += got;
             mem = core::sample_host_memory();
@@ -5401,10 +5443,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (cat >= 0 && cudaEventElapsedTime(&t, ph_t.pool[ph_t.marks[i].second], ph_t.pool[ph_t.marks[i + 1].second]) == cudaSuccess)
                     ms[cat] += t;
             }
+            // STRATA_PROMPT_LOOKAHEAD_IO=1 only: the prompt's blobs taken from the read-ahead's stage buffers, and those read
+            std::string ra_note;
+            if (prompt_lookahead_io()) {
+                if (auto* fs = dynamic_cast<core::FileExpertSource*>(m.src); fs != nullptr)
+                    ra_note = "; prompt read-ahead: " + std::to_string((unsigned long long) fs->prompt_ra_hits()) + " taken, " +
+                              std::to_string((unsigned long long) fs->prompt_ra_misses()) + " read";
+            }
             std::fprintf(stderr, "strata prefill: layer-major compute: attn %.2f s, gdn %.2f s, router %.2f s, expert-wait %.2f s, "
-                                 "experts %.2f s, shared %.2f s, other %.2f s (passes %lld)\n",
+                                 "experts %.2f s, shared %.2f s, other %.2f s (passes %lld); copy issuer waited: ring full %.2f s, "
+                                 "host staging %.2f s; layer-major staging: the launching thread waited %.2f s on host staging "
+                                 "(%lld staged, %lld DMA, %lld resident or reused)%s\n",
                          ms[PT_ATTN] / 1000.0, ms[PT_GDN] / 1000.0, ms[PT_ROUTER] / 1000.0, ms[PT_WAIT] / 1000.0,
-                         ms[PT_EXPERTS] / 1000.0, ms[PT_SHARED] / 1000.0, ms[PT_OTHER] / 1000.0, (long long) ph_t.passes);
+                         ms[PT_EXPERTS] / 1000.0, ms[PT_SHARED] / 1000.0, ms[PT_OTHER] / 1000.0, (long long) ph_t.passes,
+                         iss_ring_us.load() / 1e6, iss_stage_us.load() / 1e6, iss_lm_stage_us.load() / 1e6,
+                         (long long) lm_staged_n.load(), (long long) lm_dma_n.load(), (long long) lm_skip_n.load(), ra_note.c_str());
         }
     }
     // Do not drain the successor here. This is the overlap: an intermediate

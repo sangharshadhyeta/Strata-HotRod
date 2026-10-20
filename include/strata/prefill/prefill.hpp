@@ -92,6 +92,10 @@ public:
     /// The RAM the layer-major residuals must leave free (generate sets --conversation-cache-min-free-mib; default 2560 MiB).
     static void set_host_floor_bytes(uint64_t bytes);
     static uint64_t host_floor_bytes();
+    /// The RAM margin the layer-major give-back adds on top of what a pass needs (generate's serve loop sets it: the largest
+    /// one-request drop in available RAM it has measured, learned across starts in ram-reserve.json; 0 until one is measured).
+    static void set_ram_margin_bytes(uint64_t bytes);
+    static uint64_t ram_margin_bytes();
     /// The RAM tier's give-back (generate sets it once the tier is built): run_impl asks it for the bytes a layer-major
     /// prompt's residuals are short above the floor; it returns the bytes it gave back.  Serve thread only, between decode
     /// windows.  Empty (the default): no give-back.

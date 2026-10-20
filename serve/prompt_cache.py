@@ -117,11 +117,16 @@ class PromptCache:
         t0 = time.time()
         try:
             engine.session_file("restore", os.path.join(self.dir, best_key + ".bin"))
-        except ValueError as e:           # SessionRefused is a ValueError: the engine is in step, the entry is no good
+        except ValueError as e:           # SessionRefused is a ValueError: the engine is in step, the refusal's kind says what is wrong
             self.stats["restore_refused"] += 1
-            self._remove(best_key)
+            # "invalid" is the engine's kind for a file that fails its checks (a mismatch); memory, storage and io are about the
+            # machine, not the file, so the entry is kept for them.  (The engine also uses "invalid" for a few refusals of its
+            # own settings, which this cannot tell apart: those drop the entry too.)
+            bad = getattr(e, "kind", None) == "invalid"
+            if bad:
+                self._remove(best_key)
             self.held = None
-            return f"prompt cache: restore of {best_len} tokens refused ({str(e)[:120]}); entry dropped"
+            return f"prompt cache: restore of {best_len} tokens refused ({str(e)[:120]}); entry {'dropped' if bad else 'kept'}"
         self.held, self.held_gen = list(self.entries[best_key]["tokens"]), gen
         self.entries[best_key]["used"] = time.time()
         self.stats["restores"] += 1

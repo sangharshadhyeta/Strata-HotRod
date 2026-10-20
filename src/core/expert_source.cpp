@@ -1128,6 +1128,7 @@ void FileExpertSource::close() {
     complement_bytes_ = 0;
     complement_offsets_.clear();
     complement_free_.clear();
+    complement_parked_.clear();
     complement_pinned_ = false;
     complement_partial_ = false;
     complement_registered_ = false;
@@ -2844,8 +2845,54 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 // neighbouring blobs of experts.bin.  One read_direct batch merges them into requests of up to 32 MiB (kMerge) where
 // copy_blob made one ~2 MB request each - and NTFS serves the unbuffered reads of a mapped file one at a time, so the
 // request size is what sets the rate (see read_direct).  The blobs the RAM copy holds are copied as before.
+// STRATA_PROMPT_LOOKAHEAD_IO=1 (opt-in, measured before it becomes a default): the prompt's copies take a blob the I/O
+// read-ahead already staged (warm -> io_enqueue) instead of reading the drive again, so the drive's reads overlap the compute.
+// Read once.  On by default since 20 Oct (two rounds: 8.5k prompt 18.1 -> 16.9 s, the staging wait 7.0 -> 4.4 s; 45k
+// 67.1 -> 67.8 s, the drive already saturated there); STRATA_PROMPT_LOOKAHEAD_IO=0: copy_blobs as before.
+static bool prompt_lookahead_io() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PROMPT_LOOKAHEAD_IO"); return !(e != nullptr && e[0] == '0'); }();
+    return on;
+}
+
+// take_read_ahead: true and `dst` filled only when stage_of_ holds (layer, expert) and its buffer is filled, i.e. not
+// stage_busy_ (claim_stage sets it at a reservation, the demand reservation stage_queued_ keeps it, and publish_stage or the
+// read-ahead worker clears it once the blob is in).  A busy buffer or a miss returns false with nothing read or reserved.
+// Under stage_mu_ the buffer is marked busy for the copy, so claim_stage cannot recycle it meanwhile; then it is released.
+bool FileExpertSource::take_read_ahead(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (dst == nullptr || stage_blob_ == 0 || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    const int64_t key = layer * n_expert_ + expert;
+    size_t v = 0;
+    {
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        const auto it = stage_of_.find(key);
+        if (it == stage_of_.end()) return false;
+        v = it->second;
+        if (stage_busy_[v] || stage_key_[v] != key) return false;   // still being read or queued: not taken, nothing reserved
+        stage_busy_[v] = 1;                                         // held for this copy (a victim is never a busy buffer)
+        stage_epoch_[v] = epoch_;
+        stage_used_[v] = ++stage_seq_;
+        if (stage_pf_[v]) { stage_pf_[v] = 0; io_pf_used_.fetch_add(1, std::memory_order_relaxed); }   // a layer asked for what was read ahead
+    }
+    std::memcpy(dst, stage_buf_[v].get(), (size_t) layer_blob_bytes_[(size_t) layer]);
+    {
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        stage_busy_[v] = 0;
+    }
+    stage_cv_.notify_all();
+    return true;
+}
+
 bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
-    if ((direct_.empty() && pdirect_.empty()) || n <= 1) return ExpertSource::copy_blobs(layers, experts, dst, n);
+    if ((direct_.empty() && pdirect_.empty()) || n <= 1) {
+        if (prompt_lookahead_io() && n == 1) {   // one blob: the read-ahead's stage buffer first; a miss takes the base path as before
+            if (take_read_ahead(layers[0], experts[0], dst[0])) {
+                prompt_ra_hits_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            if (!direct_.empty() || !pdirect_.empty()) prompt_ra_miss_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return ExpertSource::copy_blobs(layers, experts, dst, n);
+    }
     thread_local std::vector<Fill> fills;
     fills.clear();
     uint64_t bytes = 0;
@@ -2857,6 +2904,13 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
             (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr))) {
             if (!copy_blob(l, e, dst[i])) return false;
             continue;
+        }
+        if (prompt_lookahead_io()) {
+            if (take_read_ahead(l, e, dst[i])) {   // staged by the read-ahead: no drive read for this blob
+                prompt_ra_hits_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            prompt_ra_miss_.fetch_add(1, std::memory_order_relaxed);
         }
         fills.push_back({0, l, e, dst[i]});
         bytes += layer_blob_bytes_[(size_t) l];
@@ -4042,6 +4096,8 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     const bool moved = detail::exchange_cache_complement(complement_offsets_, i_out, i_in);
     if (fs != nullptr) fs->unhold(layer, (int32_t) out);
     if (!moved) return false;
+    // `out`'s place now holds `in`: a stale promo flag on `out` would count a later demand read as a promotion hit
+    if (promo_flag_ != nullptr) promo_flag_[i_out].store(0, std::memory_order_relaxed);
     ++ram_adapts_;
     return true;
 }
@@ -4152,6 +4208,8 @@ bool FileExpertSource::place_expert(int64_t layer, int64_t out, const std::vecto
     const bool moved = detail::exchange_cache_complement(complement_offsets_, i_v, i_out);
     if (fs != nullptr) fs->unhold(layer, (int32_t) victim);
     if (moved && victim_out != nullptr) *victim_out = victim;
+    // the victim's place now holds `out`: a stale promo flag on the victim would count a later demand read as a promotion hit
+    if (moved && promo_flag_ != nullptr) promo_flag_[i_v].store(0, std::memory_order_relaxed);
     return moved;
 }
 
@@ -4225,11 +4283,12 @@ void FileExpertSource::promote_read(int64_t layer, int64_t expert) {
         return;
     }
     uint64_t at = 0;
-    bool have = false;
+    bool have = false, paused = false;
     {
         std::lock_guard<std::mutex> lk(tier_mu_);
         // give_back_ram releases places and then madvise's them: a place taken in between would be zeroed under the copy
-        if (!promo_pause_.load() && (size_t) layer < complement_free_.size() && !complement_free_[(size_t) layer].empty()) {
+        paused = promo_pause_.load();
+        if (!paused && (size_t) layer < complement_free_.size() && !complement_free_[(size_t) layer].empty()) {
             const uint64_t a = complement_free_[(size_t) layer].back();
             if (a <= complement_bytes_ && n <= complement_bytes_ - a) {
                 at = a;
@@ -4239,21 +4298,24 @@ void FileExpertSource::promote_read(int64_t layer, int64_t expert) {
         }
     }
     if (!have) {   // wanted, no place: counted for publish_promotions to make one, and nothing is read now
-        promo_skips_.fetch_add(1, std::memory_order_relaxed);
-        promo_starved_[(size_t) layer].fetch_add(1, std::memory_order_relaxed);
+        // not while give_back_ram is releasing places: that is no shortage, and a starved count would make publish_promotions
+        // release the tier's coldest experts one window later, undoing the give-back
+        if (!paused) {
+            promo_skips_.fetch_add(1, std::memory_order_relaxed);
+            promo_starved_[(size_t) layer].fetch_add(1, std::memory_order_relaxed);
+        }
         std::lock_guard<std::mutex> lk(promo_mu_);
         promo_busy_[i] = 0;
         promo_spare_.push_back(std::move(buf));
         return;
     }
-    if (buf.size() < n) buf.resize((size_t) n);
-    const bool ok = copy_from_files(layer, expert, buf.data());   // O_DIRECT under the overlay: the bytes, not a stage buffer
+    // read straight into the place (taken above; nothing names it until publish_promotions): copy_from_files reads O_DIRECT into
+    // its own aligned staging buffer and copies out, so the place needs no alignment.  The place is written before the entry
+    // is queued under promo_mu_ (publish_promotions takes the queue under the same mutex, so it orders this write)
+    const bool ok = copy_from_files(layer, expert, (uint8_t*) complement_host_ + (size_t) at);
     io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
     if (ok) {
         file_read_bytes_.fetch_add(n, std::memory_order_relaxed);
-        // the copy into the place happens here, on the io thread, between windows' publishes: the place is written before the
-        // entry is queued under promo_mu_ (publish_promotions takes the queue under the same mutex, so it orders this write)
-        std::memcpy((uint8_t*) complement_host_ + (size_t) at, buf.data(), (size_t) n);
     } else {
         std::lock_guard<std::mutex> lk(tier_mu_);   // the read failed: the place is free again
         complement_free_[(size_t) layer].push_back(at);
@@ -4325,21 +4387,25 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
 
 uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float>& usage) {
 #if defined(__linux__)
-    if (bytes == 0 || !complement_ready_ || complement_host_ == nullptr || complement_pinned_ || complement_registered_ ||
-        n_expert_ <= 0 || n_layers_ <= 0)
+    if (bytes == 0 || !can_give_back() || n_expert_ <= 0 || n_layers_ <= 0)
         return 0;   // a page-locked arena cannot be madvise'd: its pages are the driver's
     const long page_size = sysconf(_SC_PAGESIZE);
     const uint64_t page = page_size > 0 ? (uint64_t) page_size : 4096;
     // every RAM-held place, coldest first (equal usage: the lower index first)
-    std::vector<std::pair<float, size_t>> held;
+    std::vector<std::pair<float, size_t>> held, held_promo;
     for (int64_t l = 0; l < n_layers_; ++l)
         for (int64_t e = 0; e < n_expert_; ++e) {
             const size_t i = (size_t) l * (size_t) n_expert_ + (size_t) e;
             if (i >= complement_offsets_.size() || complement_offsets_[i] == kNoComplement) continue;
             if (!override_.empty() && override_[i] != nullptr) continue;   // read from an exchange buffer
-            held.emplace_back(i < usage.size() ? usage[i] : 0.0f, i);
+            const float u = i < usage.size() ? usage[i] : 0.0f;
+            // a promotion just read from the drive (promo_flag_ set, not yet routed) is given up after every other place
+            if (promo_flag_ != nullptr && promo_flag_[i].load(std::memory_order_relaxed) != 0) held_promo.emplace_back(u, i);
+            else held.emplace_back(u, i);
         }
     std::sort(held.begin(), held.end());
+    std::sort(held_promo.begin(), held_promo.end());
+    held.insert(held.end(), held_promo.begin(), held_promo.end());
     // the promotions take no free place while places are released and madvise'd here (the io thread checks this under
     // tier_mu_ when it takes one): a place it took between the release and the madvise would be zeroed under its copy
     {
@@ -4357,7 +4423,25 @@ uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float
         // the place's whole pages only: a page shared with a neighbouring place stays mapped
         const uintptr_t lo = (uintptr_t) (complement_host_ + at), hi = lo + (uintptr_t) n;
         const uintptr_t a = (lo + (uintptr_t) page - 1) & ~((uintptr_t) page - 1), b = hi & ~((uintptr_t) page - 1);
-        if (b > a && madvise((void*) a, (size_t) (b - a), MADV_DONTNEED) == 0) given += (uint64_t) (b - a);
+        // only a place whose whole pages were given back is PARKED: one whose madvise failed stays free (it still holds its RAM)
+        if (b <= a || madvise((void*) a, (size_t) (b - a), MADV_DONTNEED) != 0) continue;
+        given += (uint64_t) (b - a);
+        // the place is PARKED, not free: place_expert and the look-ahead promotions took freed places straight back, so
+        // the tier refilled the RAM just given back within the request (20 Oct: a 0.71 GiB give-back left available
+        // RAM unchanged).  Parked only once its madvise succeeded (above).  It is searched from the back
+        // (release_resident_place just pushed it there; no assumption that it is the last element).
+        {
+            std::lock_guard<std::mutex> lk(tier_mu_);
+            if (complement_free_.size() < (size_t) n_layers_) complement_free_.resize((size_t) n_layers_);
+            if (complement_parked_.size() < (size_t) n_layers_) complement_parked_.resize((size_t) n_layers_);
+            std::vector<uint64_t>& fr = complement_free_[(size_t) layer];
+            for (size_t k = fr.size(); k-- > 0;) {
+                if (fr[k] != at) continue;
+                fr.erase(fr.begin() + (std::ptrdiff_t) k);
+                complement_parked_[(size_t) layer].push_back(at);
+                break;
+            }
+        }
     }
     return given;
 #else
@@ -4365,6 +4449,48 @@ uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float
     (void) usage;
     return 0;
 #endif
+}
+
+uint64_t FileExpertSource::unpark_ram(uint64_t bytes) {
+#if defined(__linux__)
+    // parked places back to the free lists, one place per layer per round (layer 0 first), so no layer is emptied
+    // first; a place moves back whole, its blob size counted, and the loop stops once `bytes` is reached or every
+    // list is empty
+    std::lock_guard<std::mutex> lk(tier_mu_);
+    if (bytes == 0 || complement_parked_.empty()) return 0;
+    if (complement_free_.size() < (size_t) n_layers_) complement_free_.resize((size_t) n_layers_);
+    uint64_t moved = 0;
+    for (bool any = true; any && moved < bytes;) {
+        any = false;
+        for (int64_t l = 0; l < n_layers_ && moved < bytes; ++l) {
+            if ((size_t) l >= complement_parked_.size() || complement_parked_[(size_t) l].empty()) continue;
+            complement_free_[(size_t) l].push_back(complement_parked_[(size_t) l].back());
+            complement_parked_[(size_t) l].pop_back();
+            moved += layer_blob_bytes_[(size_t) l];
+            any = true;
+        }
+    }
+    return moved;
+#else
+    (void) bytes;
+    return 0;
+#endif
+}
+
+uint64_t FileExpertSource::parked_ram_bytes() const {
+    std::lock_guard<std::mutex> lk(tier_mu_);
+    uint64_t total = 0;
+    for (size_t l = 0; l < complement_parked_.size() && l < layer_blob_bytes_.size(); ++l)
+        total += (uint64_t) complement_parked_[l].size() * layer_blob_bytes_[l];
+    return total;
+}
+
+uint64_t FileExpertSource::free_place_bytes() const {
+    std::lock_guard<std::mutex> lk(tier_mu_);
+    uint64_t total = 0;
+    for (size_t l = 0; l < complement_free_.size() && l < layer_blob_bytes_.size(); ++l)
+        total += (uint64_t) complement_free_[l].size() * layer_blob_bytes_[l];
+    return total;
 }
 
 bool FileExpertSource::release_resident_place(int64_t layer, int64_t expert) {

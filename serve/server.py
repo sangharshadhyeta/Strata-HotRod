@@ -2032,15 +2032,25 @@ class StrataEngine:
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
                 # chunk is seen after it); an older one runs on to max_new, so each line only has to come in time.
                 heard = time.monotonic()
+                seen = heard                                # the last line from the engine (the stall watchdog's clock here)
+                drain_stall: dict = {}
                 while True:
                     left = allow - (time.monotonic() - heard) if allow > 0 else None
                     try:
                         if left is not None and left <= 0:
                             raise queue.Empty
-                        line = self.lines.get(timeout=left)
+                        if left is None and stall_s > 0:
+                            # no allowance (engine_silence_s 0): polled, so the stall watchdog below still ends a frozen engine
+                            line = self.lines.get(timeout=min(0.5, stall_s))
+                        else:
+                            line = self.lines.get(timeout=left)
                     except queue.Empty:
+                        if left is None and stall_s > 0:
+                            self._stall_check(seen, drain_stall, stall_s)   # raises EngineSilent when the engine is frozen
+                            continue
                         raise self._silent("the engine did not finish the request after it was stopped (STOP) "
                                            f"within {allow:.0f} s") from None
+                    seen = time.monotonic()
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
@@ -2099,11 +2109,29 @@ class StrataEngine:
                             "the end of the engine log to github.com/Niko1221/Strata/issues/481.")
         self.ended = True                               # not alive from now: the next request restarts it
         proc = self.proc
+
+        def quit_line():                                # QUIT first, as close() sends it: the engine saves its expert profile on QUIT
+            try:
+                proc.stdin.write("QUIT\n")
+                proc.stdin.flush()
+            except Exception:  # noqa: BLE001 - any failure: the kill below ends it
+                pass
+
+        ended = False
         try:
-            proc.kill()
-            proc.wait(timeout=20)                       # restart() -> close() handles one that is still exiting
-        except (OSError, AttributeError, subprocess.TimeoutExpired):
+            writer = threading.Thread(target=quit_line, daemon=True)   # a full pipe must not hold this up: a short join only
+            writer.start()
+            writer.join(2.0)
+            proc.wait(timeout=5)
+            ended = True
+        except Exception:  # noqa: BLE001 - not ended in time (or no process): it is killed below
             pass
+        if not ended:
+            try:
+                proc.kill()
+                proc.wait(timeout=20)                   # restart() -> close() handles one that is still exiting
+            except (OSError, AttributeError, subprocess.TimeoutExpired):
+                pass
         return EngineSilent(f"{what}; the server ended the engine")
 
     def session_file(self, action: str, path: str) -> dict:
@@ -4728,15 +4756,21 @@ class Service:
                                 self.status.update(busy=False)
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
-                        if (self.pcache is not None and not par and not emb and finish in ("stop", "length") and not cancel.is_set()
-                                and len(segments) == 1 and not recovery_count):
-                            # one plain pass: the engine holds the prompt and what it wrote; a long read is saved while the fifo is held
-                            try:
-                                note = self.pcache.after(self.engine, ids, raw_ids, pc_read)
-                                if note:
-                                    print(f"[strata] {note}", flush=True)
-                            except Exception as e:
-                                print(f"[strata] prompt cache (after): {e!r}", flush=True)
+                        if self.pcache is not None and not par:
+                            if (not emb and finish in ("stop", "length") and not cancel.is_set()
+                                    and len(segments) == 1 and not recovery_count):
+                                # one plain pass: the engine holds the prompt and what it wrote; a long read is saved while the fifo is held
+                                try:
+                                    note = self.pcache.after(self.engine, ids, raw_ids, pc_read)
+                                    if note:
+                                        print(f"[strata] {note}", flush=True)
+                                except Exception as e:
+                                    print(f"[strata] prompt cache (after): {e!r}", flush=True)
+                            else:
+                                # several passes (a thinking budget's wrap-up), a recovery, a cancel or an error: the engine holds a
+                                # sequence this server does not keep exactly (the last pass's prompt and its generated ids are not the
+                                # entry's list), so the holding recorded before is no longer true and is not trusted by the next request
+                                self.pcache.held = None
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)

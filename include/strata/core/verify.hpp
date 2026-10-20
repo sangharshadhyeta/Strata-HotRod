@@ -493,6 +493,8 @@ private:
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
+    /// The one-token self-commit for a window of T tokens: the window advances its own state (see verify.cpp).
+    bool window_self_commits(int T) const;
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)
     void trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const;
@@ -627,8 +629,11 @@ private:
     float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
     // STRATA_GDN_LOOP scratch (zero-sized when the loop is off): the looped passes 1..K-1 of a GDN layer
     float *loop_f_ = nullptr, *loop_xm_ = nullptr, *loop_lo_ = nullptr, *loop_rs_ = nullptr, *loop_inj_ = nullptr;
+    float* loop_f0_ = nullptr;   // STRATA_GDN_LOOP_NORM: pass 0's F_0 (the norm target); zero-sized otherwise
     float *loop_R_ = nullptr, *loop_R2_ = nullptr, *loop_qkv_ = nullptr, *loop_h_ = nullptr, *loop_gate_ = nullptr;
     float *loop_beta_ = nullptr, *loop_z_ = nullptr, *loop_y_ = nullptr;
+    float *loop_st_ = nullptr;   // one GDN layer's state + conv history before a one-token window's pass 0 (the looped passes
+                                 // read it; pass 0 self-commits); one buffer: the looped layers are recorded one after another
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer

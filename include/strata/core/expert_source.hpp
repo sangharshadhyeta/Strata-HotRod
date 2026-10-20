@@ -769,12 +769,25 @@ public:
     uint64_t promotion_skips() const { return promo_skips_.load(std::memory_order_relaxed); }
     /// The RAM tier gives back `bytes` of its arena to the OS: the coldest RAM-held places (lowest `usage`, flat-indexed
     /// layer * n_expert + expert; empty = all zero) are given up through release_resident_place, and each one's whole pages
-    /// are madvise(MADV_DONTNEED)'d so the kernel takes them back (the place stays on complement_free_; take_resident_place
-    /// refills it, the pages fault back in).  Returns the bytes given back (whole pages).  0 - nothing done - when the arena
-    /// is page-locked (cudaHostAlloc or registered: complement_pinned_ / complement_registered_), when the RAM copy is not
-    /// ready, or when release_resident_place refuses (staged state).  Caller: the serve thread between decode windows, with
-    /// no background reader holding a pointer from resident_blob (a read of a madvise'd place returns zeros).
+    /// are madvise(MADV_DONTNEED)'d so the kernel takes them back (the place is then PARKED on complement_parked_: no
+    /// taker sees it until unpark_ram, so the tier does not refill the RAM just given back).  Returns the bytes given
+    /// back (whole pages).  0 - nothing done - when the arena is page-locked (cudaHostAlloc or registered:
+    /// complement_pinned_ / complement_registered_), when the RAM copy is not ready, or when release_resident_place
+    /// refuses (staged state).
+    /// Caller: the serve thread between decode windows, with no background reader holding a pointer from resident_blob
+    /// (a read of a madvise'd place returns zeros).
     uint64_t give_back_ram(uint64_t bytes, const std::vector<float>& usage);
+    /// Whether give_back_ram can give anything back now (a page-locked arena cannot be madvise'd: the guard skips it).
+    bool can_give_back() const {
+        return complement_ready_ && complement_host_ != nullptr && !complement_pinned_ && !complement_registered_;
+    }
+    /// Parked places back to the free list (per layer, round-robin, up to `bytes`), for the tier to refill.  Returns
+    /// the bytes moved (whole places).  Caller: the serve thread, when RAM is back above the memory floor.
+    uint64_t unpark_ram(uint64_t bytes);
+    /// The bytes of the parked places (given-back RAM the tier does not take until unpark_ram).
+    uint64_t parked_ram_bytes() const;
+    /// The bytes of the free (unparked) places: room the tier refills by itself.
+    uint64_t free_place_bytes() const;
     /// The serve loop: a request runs (the warm pauses) / ended.
     void set_request_active(bool on);
     /// The warm again with its last list (after a request: pages a prompt's pinned buffers or reads evicted come back;
@@ -938,6 +951,10 @@ public:
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// pp-opt, unbuffered: the file-tier blobs of the run in one read_direct batch (neighbours merged into one request)
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
+    /// STRATA_PROMPT_LOOKAHEAD_IO=1 (opt-in, measured before it becomes a default): fills `dst` with the blob of (layer, expert)
+    /// when a stage buffer already holds it in full (the I/O read-ahead of warm()), and returns true. Otherwise returns false
+    /// without reading anything or reserving a buffer. Lets the prompt's copies overlap the drive's reads with compute.
+    bool take_read_ahead(int64_t layer, int64_t expert, uint8_t* dst);
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
@@ -949,8 +966,8 @@ public:
     bool warms() const override { return (!role_ptr_.empty() || io_pf_) && (direct_.empty() || io_overlay_active()); }
     bool page_cached(int64_t layer, int64_t expert) const override {
         // an expert the RAM tier holds is as cheap to swap in as a cached one (the swap's GreedyDual cost asks this)
-        if (complement_ready_ && !complement_offsets_.empty() &&
-            complement_offsets_[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != kNoComplement)
+        if (complement_ready_ && !complement_offsets_.empty() && layer >= 0 && expert >= 0 && layer < n_layers_ &&
+            expert < n_expert_ && complement_offsets_[(size_t) layer * (size_t) n_expert_ + (size_t) expert] != kNoComplement)
             return true;
         uint64_t total = 0;
         const uint64_t got = cached_bytes(layer, expert, total, false);
@@ -1003,6 +1020,9 @@ public:
         uint64_t pf_calls = 0, pf_probe_us = 0, pf_fill_us = 0, pf_thread_us = 0;   ///< prefetch() calls (file tier, io prefetch): residency probes, fills, thread create/join (or pool hand-off) inside the fills
     };
     IoCounters io_counters() const;
+    /// STRATA_PROMPT_LOOKAHEAD_IO: the prompt's blobs taken from a read-ahead stage buffer (take_read_ahead) and those read from the drive.
+    uint64_t prompt_ra_hits() const { return prompt_ra_hits_.load(std::memory_order_relaxed); }
+    uint64_t prompt_ra_misses() const { return prompt_ra_miss_.load(std::memory_order_relaxed); }
 
 private:
     const uint8_t* resident_blob(size_t index) const;
@@ -1092,6 +1112,7 @@ private:
     std::atomic<uint64_t> stage_fence_waits_{0};      ///< refills that had to wait for a queued copy
     std::atomic<int64_t> ram_reads_{0};
     std::atomic<uint64_t> file_read_bytes_{0};
+    std::atomic<uint64_t> prompt_ra_hits_{0}, prompt_ra_miss_{0};   ///< STRATA_PROMPT_LOOKAHEAD_IO: copy_blobs taken from a stage buffer / read
     // ---- the Linux I/O path (set_io_prefetch)
     bool io_pf_ = false;
     bool io_overlay_ = false;                         ///< the RAM tier overlay requested (set_io_overlay): see io_overlay_active()
@@ -1168,7 +1189,10 @@ private:
     uint64_t complement_bytes_ = 0;
     std::vector<uint64_t> complement_offsets_;
     std::vector<std::vector<uint64_t>> complement_free_;   ///< per layer: places release_resident_place gave up (free)
-    mutable std::mutex tier_mu_;                      ///< complement_free_: the io workers' promotion check vs the serve thread's release / take
+    std::vector<std::vector<uint64_t>> complement_parked_;   // places give_back_ram gave up: no taker sees them until
+                                                             // unpark_ram (under tier_mu_)
+    mutable std::mutex tier_mu_;                      ///< complement_free_ / complement_parked_: the io workers' promotion
+                                                      ///< check vs the serve thread's release / take
     /// place_expert: the one place rule of take_resident_place and the promotions.  A free place of the layer first; else
     /// (allow_victim) the coldest RAM-held expert of the layer not flagged in busy gives its place to `out`, when its usage is
     /// below `victim_limit`.  `victim_out` (may be null) gets the victim's index (-1: none).  Serve thread only.

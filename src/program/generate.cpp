@@ -1533,6 +1533,16 @@ static std::string vram_reserve_path(const Options& o) {
     const std::filesystem::path dir = std::filesystem::path(p).parent_path();
     return ((dir.empty() ? std::filesystem::path(".") : dir) / "vram-reserve.json").string();
 }
+/// The RAM side of the same learning, beside vram-reserve.json (same key, same file format): two entries per key, in MiB.
+/// "<key> gap" is what the engine allocates after the auto RAM tier is sized (learned from the first request's available
+/// RAM against the floor); "<key> margin" is the largest measured one-request drop in available RAM.  Neither is a fixed
+/// constant: the tier leaves gap + margin + the configured floor free, and the serve loop's guard uses the margin.
+static std::string ram_reserve_path(const Options& o) {
+    const std::string& p = !o.expert_profile.empty() ? o.expert_profile : o.expert_profile_save;
+    if (p.empty()) return "";
+    const std::filesystem::path dir = std::filesystem::path(p).parent_path();
+    return ((dir.empty() ? std::filesystem::path(".") : dir) / "ram-reserve.json").string();
+}
 /// GPU name, total VRAM, context, K/V mode and format, batch and whether a draft is loaded: a short string
 static std::string vram_reserve_key(const Options& o) {
     cudaDeviceProp p{};
@@ -1547,6 +1557,11 @@ static std::string vram_reserve_key(const Options& o) {
     return name + " " + std::to_string(total_mib) + "MiB ctx" + std::to_string((long long) o.max_context) + " kv" +
            std::to_string((long long) o.kv_resident) + "/" + o.kv + " b" + std::to_string(o.batch) +
            (o.mtp.empty() ? " nodraft" : " draft");
+}
+/// The key of the RAM entries (ram-reserve.json): the VRAM key, the vision path (--vision: its embeddings and image buffers
+/// are RAM the gap and margin measure), and the memory floor the tier is sized above.  --vision is o.vision.
+static std::string ram_reserve_key(const Options& o) {
+    return vram_reserve_key(o) + (o.vision ? " vision" : "") + " floor" + std::to_string((long long) o.conversation_cache_min_free_mib);
 }
 static std::map<std::string, int64_t> vram_reserve_read(const std::string& path) {
     std::map<std::string, int64_t> m;
@@ -1579,7 +1594,7 @@ static std::map<std::string, int64_t> vram_reserve_read(const std::string& path)
 }
 static void vram_reserve_write(const std::string& path, const std::map<std::string, int64_t>& m) {
     if (path.empty()) return;
-    const std::string tmp = path + ".tmp";
+    const std::string tmp = path + "." + std::to_string((long long) getpid()) + ".tmp";   // pid: two writers never share a temp file
     bool ok = false;
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -5674,6 +5689,9 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // G2: set in the sizing block's auto branch only (the floor subtracted, the learned gap and margin read); the serve
+    // loop learns the gap from its first request only when the tier was sized that way
+    bool ram_tier_auto_sized = false;
     if (o.resident_budget_auto) {
         // --resident-budget-gib auto: the room the page-cache warm's auto uses (host_ram_room_bytes, the same sum), or
         // STRATA_RAM_TIER_GIB=N GiB when that is set.  Taken here, before the file tier reads its budget (set_unbuffered).
@@ -5686,20 +5704,41 @@ int main(int argc, char** argv) {
         // 20 Oct: the memory floor (--conversation-cache-min-free-mib) stays free - the tier takes only the room above it.
         // STRATA_RAM_TIER_GIB=N is an explicit size and is taken as it is (nothing kept back).
         uint64_t floor_kept = 0;
+        std::string learned_note;
         if (const char* v = std::getenv("STRATA_RAM_TIER_GIB"); v != nullptr && std::atof(v) > 0) {
             room = (uint64_t) (std::atof(v) * 1073741824.0);
             room_note = " (STRATA_RAM_TIER_GIB)";
         } else {
             floor_kept = (uint64_t) o.conversation_cache_min_free_mib << 20;
+            ram_tier_auto_sized = true;
+            // the learned RAM margins (ram-reserve.json): what the engine allocates after this sizing ("gap") and the
+            // largest measured one-request drop ("margin"), both in MiB, 0 when no start has learned them yet
+            const std::string rkey = ram_reserve_key(o);
+            const auto learned = vram_reserve_read(ram_reserve_path(o));
+            const auto kg = learned.find(rkey + " gap");
+            const auto km = learned.find(rkey + " margin");
+            // the 4 GiB headroom is the first start's safe guess only.  Once a gap is learned, the tier's sizing above
+            // already keeps the gap and the margin free, so the headroom is not applied on top of them (read after this
+            // block); an explicit STRATA_RESIDENT_HEADROOM_GIB is the operator's and stays
+            if (kg != learned.end() && std::getenv("STRATA_RESIDENT_HEADROOM_GIB") == nullptr) o.resident_headroom = 0;
+            const uint64_t learned_b = ((uint64_t) std::max<int64_t>(0, kg != learned.end() ? kg->second : 0) +
+                                        (uint64_t) std::max<int64_t>(0, km != learned.end() ? km->second : 0)) << 20;
+            floor_kept += learned_b;
             room = room > floor_kept ? room - floor_kept : 0;
             if (room == 0)
                 std::fprintf(stderr, "strata generate: --resident-budget-gib auto: no RAM room above the %lld MiB memory floor "
                                      "(files mode, no RAM tier)\n", (long long) o.conversation_cache_min_free_mib);
+            if (learned_b > 0) {
+                char lb[256];
+                std::snprintf(lb, sizeof lb, ", of which %.2f GiB learned (ram-reserve.json: what the engine allocates after "
+                                             "this sizing, and the largest drop a request made)", (double) learned_b / 1073741824.0);
+                learned_note = lb;   // printed after the floor's amount below
+            }
         }
         o.resident_budget = room;
         std::fprintf(stderr, "strata generate: RAM tier (--resident-budget-gib auto): %.2f GiB%s, %.2f GiB kept free for the "
-                             "engine's memory floor\n", (double) room / 1073741824.0, room_note.c_str(),
-                     (double) floor_kept / 1073741824.0);
+                             "engine's memory floor%s\n", (double) room / 1073741824.0, room_note.c_str(),
+                     (double) floor_kept / 1073741824.0, learned_note.c_str());
     }
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
@@ -10202,7 +10241,7 @@ int main(int argc, char** argv) {
                     js += '"';
                 }
                 js += "],\"resident\":" + std::to_string((long long) n_res) + "}";
-                const std::string tmp = std::string(res_file) + ".tmp";
+                const std::string tmp = std::string(res_file) + "." + std::to_string((long long) getpid()) + ".tmp";
                 {
                     std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
                     f << js;
@@ -11943,6 +11982,35 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        // the RAM side of the floor guard below (ram-reserve.json, the same key as the VRAM reserve): no fixed amounts.
+        // ram_margin = the largest one-request drop in available RAM measured so far (learned across starts: a start
+        // begins with the last one's); ram_prev_after = the available RAM after the guard's last adjustment, the reference
+        // the next request's drop is measured against; ram_first = the first request of this start learns the gap.
+        uint64_t ram_margin = 0;
+        bool ram_first = true;
+        uint64_t ram_prev_after = 0;
+        uint64_t ram_prev_free = 0;   // the free (unparked) places' bytes at the same reference point
+        // G1: the guard runs unless STRATA_RAM_GUARD=0 (read once); 0 restores the previous behaviour (no guard)
+        static const bool ram_guard_on = [] { const char* v = std::getenv("STRATA_RAM_GUARD"); return !(v != nullptr && std::string(v) == "0"); }();
+        // G7: this start's largest drop (the file keeps this one, not the learned max: a spike is forgotten after a quiet start)
+        uint64_t ram_margin_seen = 0;
+        // G5: what the last give-back released (the unpark band's second term, measured); 0 once nothing is parked
+        uint64_t ram_last_given = 0;
+        // G6: the bytes the last pass unparked (the places madvised back); a refill of them is the tier's own RAM
+        uint64_t ram_unparked = 0;
+        const std::string ram_rkey = ram_reserve_key(o);
+        {
+            const auto learned = vram_reserve_read(ram_reserve_path(o));
+            const auto it = learned.find(ram_rkey + " margin");
+            if (it != learned.end() && it->second > 0) ram_margin = (uint64_t) it->second << 20;
+        }
+        strata::prefill::Prefill::set_ram_margin_bytes(ram_margin);
+        // writes one learned RAM value (MiB) under this key, keeping the file's other entries
+        auto ram_learn = [&](const char* what, int64_t mib) {
+            auto learned = vram_reserve_read(ram_reserve_path(o));
+            learned[ram_rkey + what] = mib;
+            vram_reserve_write(ram_reserve_path(o), learned);
+        };
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -12020,6 +12088,100 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") break;
+            // 20 Oct: the memory floor is held between requests, not only for a prompt or a save.  8095 was OOM-killed
+            // (cgroup MemoryMax 29G) at an 81k turn: what is allocated after the auto tier is sized (vision, pinned
+            // buffers, the server's own process in the same group) left 1.2 GiB available at the first request, the floor
+            // (2.5 GiB) was never free, and ~1 GiB of growth over the session left 0.5 GiB - the file tier then thrashed
+            // and the next allocation was killed.  No fixed amounts here (the rule: margins come from measurement):
+            // the floor (--conversation-cache-min-free-mib) is the configured setting; the margin is the largest drop in
+            // available RAM that one request caused, measured here and learned across starts in ram-reserve.json; the gap
+            // (what the engine allocates after the auto tier is sized) is learned from the first request of a start.
+            // When available RAM is below floor + margin, the RAM tier gives back its coldest experts until that is free.
+            // given-back places stay parked (no promotion or eviction refills them) until RAM is above floor + margin + band.
+            // G1: STRATA_RAM_GUARD=0 turns the guard off (the previous behaviour); can_give_back implies complement_ready
+            if (ram_guard_on && src.can_give_back()) {
+                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                auto mem = strata::core::sample_host_memory();
+                if (mem && ram_first) {
+                    // the first request: how far the available RAM was from floor + margin when it started.  Short by
+                    // `over` means the gap grows by that; room to spare means it comes down (never below 0)
+                    ram_first = false;
+                    // this start's margin is written from its own drops only (ram_margin_seen): 0 until it sees one, so
+                    // a spike another program caused in an earlier start is forgotten after a start without one
+                    ram_learn(" margin", 0);
+                    const int64_t over = (int64_t) (floor + ram_margin) - (int64_t) mem->available;
+                    const int64_t over_mib = over >= 0 ? (over + (1ll << 20) - 1) >> 20 : over / (1ll << 20);
+                    const auto learned = vram_reserve_read(ram_reserve_path(o));
+                    const auto gi = learned.find(ram_rkey + " gap");
+                    const int64_t old_gap = gi != learned.end() ? gi->second : 0;
+                    const int64_t new_gap = std::max<int64_t>(0, old_gap + over_mib);
+                    // G2: only a tier sized by the auto rule has a gap to learn (a STRATA_RAM_TIER_GIB size does not)
+                    if (ram_tier_auto_sized) {
+                        ram_learn(" gap", new_gap);
+                        std::fprintf(stderr, "strata serve: RAM sizing gap %lld MiB learned for the next start (first request: "
+                                             "%.2f GiB available against a floor of %.2f GiB plus a margin of %.2f GiB)\n",
+                                     (long long) new_gap, mem->available / 1073741824.0, floor / 1073741824.0,
+                                     ram_margin / 1073741824.0);
+                    }
+                }
+                // G6: the unparked bytes of the last pass (ram_unparked, set by its unpark below); this pass starts from 0
+                const uint64_t ram_unparked_prev = ram_unparked;
+                ram_unparked = 0;
+                if (mem && ram_prev_after > 0 && mem->available < ram_prev_after) {
+                    // growth over one request (another program, the prompt's state, the server's own allocations): the
+                    // largest such drop becomes the margin.  Free places taken over the request are the tier refilling
+                    // itself (unparked places, promotions): RAM it gives back on demand, not growth the margin must cover;
+                    // counted, the margin would chase the tier (unpark -> refill -> bigger margin -> ...).  Only the places
+                    // unparked by the last pass were madvised back, so only their refill is the tier's own RAM: promotions
+                    // into ordinary free places (evicted, never given back) cost no new RAM and stay counted as drop
+                    const uint64_t free_now = src.free_place_bytes();
+                    const uint64_t refill = std::min(ram_prev_free > free_now ? ram_prev_free - free_now : 0, ram_unparked_prev);
+                    const uint64_t raw = ram_prev_after - mem->available;
+                    const uint64_t drop = raw > refill ? raw - refill : 0;
+                    // G7: the margin of this run is the larger of the learned one and this start's drop; the file keeps this
+                    // start's largest drop (not the max with the learned one), so a one-off spike from another program is
+                    // forgotten after a start that did not see one
+                    if (drop > ram_margin_seen) {
+                        ram_margin_seen = drop;
+                        ram_margin = std::max(ram_margin, drop);
+                        strata::prefill::Prefill::set_ram_margin_bytes(ram_margin);
+                        ram_learn(" margin", (int64_t) ((ram_margin_seen + (1ull << 20) - 1) >> 20));
+                        std::fprintf(stderr, "strata serve: RAM margin %.2f GiB (this start's largest drop in available RAM "
+                                             "over one request; %.2f GiB for this run)\n", ram_margin_seen / 1073741824.0,
+                                     ram_margin / 1073741824.0);
+                    }
+                }
+                // G5: the unpark band is measured: the larger of the margin and what the last give-back had to release, so a
+                // margin of 0 does not flap (give back below floor + margin, unpark only above floor + margin + band)
+                // once a margin is measured it is the band; the last give-back only stands in before that (20 Oct: the
+                // larger of the two kept a 3.35 GiB give-back as the band, and 7.4 GiB of the tier came back ~0.9 GiB a request)
+                const uint64_t band = ram_margin > 0 ? ram_margin : ram_last_given;
+                if (mem && mem->available < floor + ram_margin) {
+                    adapt_quiesce();   // staged swaps keep the tier from releasing places: they land first
+                    const uint64_t got = src.give_back_ram(floor + ram_margin - mem->available, drive.d.usage);
+                    ram_last_given = got;
+                    auto after = strata::core::sample_host_memory();
+                    std::fprintf(stderr, "strata serve: RAM below the memory floor (%.2f of %.2f GiB available): "
+                                         "the RAM tier gave back %.2f GiB (%.2f GiB available now, %s)\n",
+                                 mem->available / 1073741824.0, floor / 1073741824.0, got / 1073741824.0,
+                                 after ? after->available / 1073741824.0 : 0.0,
+                                 after ? strata::core::memory_source_name(after->source) : "?");
+                } else if (mem && mem->available > floor + ram_margin + band && src.parked_ram_bytes() > 0) {
+                    // RAM is back (a long prompt's state freed, another program ended): the parked places return to the
+                    // tier, leaving the floor plus the margin plus the band free (the give-back above starts only below
+                    // floor + margin, so the tier does not oscillate); promotions and evictions refill them from there
+                    const uint64_t got = src.unpark_ram(mem->available - (floor + ram_margin + band));
+                    ram_unparked = got;
+                    if (src.parked_ram_bytes() == 0) ram_last_given = 0;   // nothing parked: the band is measured again
+                    std::fprintf(stderr, "strata serve: RAM above the memory floor (%.2f GiB available): %.2f GiB of "
+                                         "parked RAM tier places back to the tier (%.2f GiB still parked)\n",
+                                 mem->available / 1073741824.0, got / 1073741824.0,
+                                 src.parked_ram_bytes() / 1073741824.0);
+                }
+                // the reference for the next request's drop: the available RAM after this guard's adjustment
+                if (const auto now = strata::core::sample_host_memory(); now) ram_prev_after = now->available;
+                ram_prev_free = src.free_place_bytes();
+            }
             // STRATA_RAM_TRACE=1: the host's memory counters at the start of this iteration (the RAM trace line follows the request's prompt line)
             RamSnap ram_a;
             if (ram_trace) ram_snap(ram_a);

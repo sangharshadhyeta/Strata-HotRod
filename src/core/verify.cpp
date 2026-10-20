@@ -254,15 +254,21 @@ bool one_row_per_slot(const int* rows, int S) {
 }
 bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && one_row_per_slot(rows, S); }
 
-// STRATA_GDN_LOOP=1 (opt-in; changes the outputs by design): in a decode window, the GDN mixers of a range of middle layers
+// STRATA_GDN_LOOP=1 (opt-in; changes the outputs by design; measured 20 Oct: 40 MMLU-Pro questions at T=0 40/40 with the
+// loop vs 38/40 without (2 differing answers: noise-level), but 8.5k decode 55.2 -> 47.7 tok/s: each window is faster, yet
+// the draft head's guesses are accepted less (3.32 -> 2.69 tokens a window).  Off until the per-token snapshot below makes
+// draft windows and one-token decode agree):
+// in a decode window, the GDN mixers of a range of middle layers
 // run as K damped passes (Training-Free Looped Transformers, arXiv 2605.23872): x_{p+1} = x_p + F_p(x_p) / K, the
 // deferred write adds acc = sum_p F_p / K.  Pass 0 is the canonical mixer (its per-layer buffers feed the commit); the
-// passes 1..K-1 read the stream x + w * acc and run the recurrence from the untouched state (no n_keep: no state write).
-// A one-token window then keeps nothing itself (its commit graph advances the state from the canonical pass, cache=first).
+// passes 1..K-1 read the stream x + w * acc and run the recurrence from the state as it was before the window (a snapshot
+// taken before pass 0 when pass 0 self-commits: no n_keep and no state write in the passes themselves).
+// A one-token window's pass 0 self-commits as without the loop: state and conv history advance in place, and the commit
+// graph is skipped (Verifier::commit); the passes 1..K-1 then read the snapshot, so the state they see is the untouched one.
 // STRATA_GDN_LOOP_K (default 2, 2..8); STRATA_GDN_LOOP_LAYERS="a-b" (inclusive layer indices, default 45%..60% of depth).
 int gdn_loop_k() {
     static const int k = [] {
-        if (!env_on("STRATA_GDN_LOOP")) return 1;
+        if (!env_on("STRATA_GDN_LOOP")) return 1;   // opt-in: unset, empty or '0...' is off
         const char* e = std::getenv("STRATA_GDN_LOOP_K");
         const int v = e != nullptr ? std::atoi(e) : 2;
         return v < 2 ? 1 : (v > 8 ? 8 : v);
@@ -270,6 +276,15 @@ int gdn_loop_k() {
     return k;
 }
 bool gdn_loop_enabled() { return gdn_loop_k() > 1; }
+
+// STRATA_GDN_LOOP_NORM=1 (opt-in; only with the loop on): after the passes are summed, each token's update is rescaled to
+// the norm of the canonical pass's F_0 (row_norm_match): the loop's systematic magnitude shift is removed at the source
+// (the part that moved the MTP drafter's input statistics: 20 Oct), and its direction change, the part meant to change
+// the answers, is kept. Read once. Off until measured.
+bool gdn_loop_norm() {
+    static const bool on = gdn_loop_enabled() && env_on("STRATA_GDN_LOOP_NORM");
+    return on;
+}
 bool gdn_loop_layer(const ModelGeometry& g, int64_t l) {
     if (!gdn_loop_enabled() || is_qsa_layer(g, l)) return false;
     static const std::pair<long long, long long> env_range = [] {   // parsed once; malformed = the default range
@@ -960,11 +975,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         {   // STRATA_GDN_LOOP: the looped passes' scratch; zero-sized when the loop is off (the arena is unchanged then)
             const uint64_t lp = gdn_loop_enabled() ? (uint64_t) T : 0;
             loop_f_ = b.take<float>(lp * N); loop_xm_ = b.take<float>(lp * N); loop_lo_ = b.take<float>(lp * g.hc_lr);
+            loop_f0_ = b.take<float>(gdn_loop_norm() ? (uint64_t) T * N : 0);
             loop_rs_ = b.take<float>(lp * HC); loop_inj_ = b.take<float>(lp * HC);
             loop_R_ = b.take<float>(lp * HC * N); loop_R2_ = b.take<float>(lp * HC * N);
             loop_qkv_ = b.take<float>(lp * C); loop_h_ = b.take<float>(lp * C);
             loop_gate_ = b.take<float>(lp * HV); loop_beta_ = b.take<float>(lp * HV);
             loop_z_ = b.take<float>(lp * ZV); loop_y_ = b.take<float>(lp * ZV);
+            // one GDN layer's state + conv history (the record_window gdn_floats): the snapshot before a one-token pass 0
+            const uint64_t gdn_state_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                              (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+            loop_st_ = b.take<float>(gdn_loop_enabled() ? gdn_state_floats : 0);
         }
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
@@ -1177,6 +1197,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
 
+// The one-token self-commit: record_window advances the window's own state, and Verifier::commit then skips the commit graph.
+// Keep the two in step: batch_rec_ is true only while a batch window is recorded, so commit() (where it reads false) does
+// not share that term; a QFUSE window (g_qfuse) must not self-commit on either side.
+bool Verifier::window_self_commits(int T) const {
+    return T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();
+}
+
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
 // Plan v0.3 P6 (split window): with `groups_ == 2` the window's tokens are cut into two groups A = [0, T/2 up) and
@@ -1205,9 +1232,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
-    // (STRATA_GDN_LOOP: the window keeps nothing itself; the commit graph advances the state from the canonical pass)
-    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit() &&
-                             !gdn_loop_enabled();   // see Verifier::commit
+    // (a one-token window advances its state in place in pass 0 (window_self_commits); Verifier::commit then skips the commit graph)
+    const bool self_commit = window_self_commits(T);   // with the GDN loop too (see the snapshot before pass 0)
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
     const int side_mixer_mode = g_side_mixer();
@@ -1524,24 +1550,28 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (loop_here) {
                     // STRATA_GDN_LOOP: this layer's mixer as K damped passes (gdn_loop_k).  Pass 0 is the canonical mixer on the
                     // stream x: its projections, conv and recurrence land in the layer's own buffers, which the commit replays.
-                    // Passes 1..K-1 read x + w * acc (w: this layer's write weight, from the canonical inject) and run from the
-                    // untouched state: no pass writes the state or the conv history (n_keep and commit are off).  acc = sum of
-                    // F_p / K is the deferred write's block output (bo_), so the MoE reads the looped update.
+                    // A one-token window's pass 0 self-commits (state + conv advance in place, as without the loop); the state
+                    // and conv history before it are copied to loop_st_ first.  Passes 1..K-1 read x + w * acc (w: this layer's
+                    // write weight, from the canonical inject) and run from the state as it was before the window (the snapshot
+                    // when pass 0 self-committed, else the untouched state): no pass writes the state or the conv history.
+                    // acc = sum of F_p / K is the deferred write's block output (bo_), so the MoE reads the looped update.
                     const int loop_k = gdn_loop_k();
                     const float inv_k = 1.0f / (float) loop_k;
                     const int64_t nN = (int64_t) n * N;
-                    auto mixer = [&](const float* xsrc, float* qkv_o, float* hb_o, float* gate_o, float* beta_o, float* z_o,
-                                     float* y_o, float* F_o) {
+                    // st: the layer's state with its conv history after it (as in `state`); keep: write it (the one-token commit)
+                    auto mixer = [&](float* st, bool keep, const float* xsrc, float* qkv_o, float* hb_o, float* gate_o,
+                                     float* beta_o, float* z_o, float* y_o, float* F_o) {
+                        float* cv = st + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;   // as `conv` above
                         quant_in(xsrc, (int) N);
                         mm(wqkv, qkv_o + (size_t) tb * C, (int) N, (int) C);
-                        gdn_conv_l2_multi(conv, qkv_o, (const float*) wc->data, hb_o, (int) C, (int) (2 * HK), EPS, n, cs, tb,
-                                          false);
+                        gdn_conv_l2_multi(cv, qkv_o, (const float*) wc->data, hb_o, (int) C, (int) (2 * HK), EPS, n, cs, tb,
+                                          keep);
                         gdn_ab_multi(xsrc, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                                      (const float*) wsa->data, gate_o + (size_t) tb * HV, beta_o + (size_t) tb * HV, (int) N,
                                      (int) HV, n, cs);
                         mm(wg, z_o + (size_t) tb * ZV, (int) N, (int) ZV);
-                        gdn_step_norm_multi(state, hb_o, (int) C, gate_o, beta_o, z_o, (const float*) wnm->data, EPS, y_o,
-                                            (int) HK, (int) HV, te, nullptr, cs, tb, nullptr);
+                        gdn_step_norm_multi(st, hb_o, (int) C, gate_o, beta_o, z_o, (const float*) wnm->data, EPS, y_o,
+                                            (int) HK, (int) HV, te, keep ? one_ : nullptr, cs, tb, nullptr);
                         quant_in(y_o + (size_t) tb * ZV, (int) ZV);
                         mm(wout, F_o + (size_t) tb * N, (int) ZV, (int) N);
                     };
@@ -1561,17 +1591,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         }
                         if (!fused_gr_read_persist(fa, n, cs)) fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, nullptr, 0);
                     };
-                    // pass 0 (canonical): acc = F_0 / K
-                    mixer(xm, qkv, hb, gate, beta, z_, y_, loop_f_);
-                    axpby(bo_ + (size_t) tb * N, loop_f_ + (size_t) tb * N, inv_k, loop_f_ + (size_t) tb * N, 0.0f, nN, cs);
+                    // the snapshot before pass 0 self-commits: passes 1..K-1 run from the state as it was before the window
+                    // Known limit: in a T>1 window, passes 1..K-1 run the recurrence across the window's rows from the pre-window
+                    // state with their own inputs, so a token's looped output depends on the window size (a one-token window's
+                    // passes start from the canonical state after the previous token).  A per-token snapshot inside the window
+                    // would remove that.
+                    if (self_commit &&
+                        cudaMemcpyAsync(loop_st_, state, gdn_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                        err = "verify: the GDN loop's state snapshot could not be recorded";
+                        return false;
+                    }
+                    // pass 0 (canonical): acc = F_0 / K; with STRATA_GDN_LOOP_NORM its F_0 stays in loop_f0_ (the norm target)
+                    float* f0 = gdn_loop_norm() ? loop_f0_ : loop_f_;
+                    mixer(state, self_commit, xm, qkv, hb, gate, beta, z_, y_, f0);
+                    axpby(bo_ + (size_t) tb * N, f0 + (size_t) tb * N, inv_k, f0 + (size_t) tb * N, 0.0f, nN, cs);
                     // passes 1..K-1: x_p = x + w * acc, F_p = mixer(x_p), acc += F_p / K
                     for (int p = 1; p < loop_k; ++p) {
                         gr_write_multi(Rt(tb), bo_ + (size_t) tb * N, inj_ + (size_t) tb * HC, gs, loop_R_ + (size_t) tb * HC * N,
                                        n, cs);
                         attn_read(loop_R_, loop_R2_);
-                        mixer(loop_xm_ + (size_t) tb * N, loop_qkv_, loop_h_, loop_gate_, loop_beta_, loop_z_, loop_y_, loop_f_);
+                        mixer(self_commit ? loop_st_ : state, false, loop_xm_ + (size_t) tb * N, loop_qkv_, loop_h_, loop_gate_,
+                              loop_beta_, loop_z_, loop_y_, loop_f_);
                         axpby(bo_ + (size_t) tb * N, bo_ + (size_t) tb * N, 1.0f, loop_f_ + (size_t) tb * N, inv_k, nN, cs);
                     }
+                    // STRATA_GDN_LOOP_NORM: the summed update's rows back to the canonical F_0's norm (direction kept)
+                    if (gdn_loop_norm()) row_norm_match(bo_ + (size_t) tb * N, loop_f0_ + (size_t) tb * N, (int) n, (int) N, cs);
                 } else {
                 if (sidem) {   // the gates (a few blocks, latency-bound) beside the projections, joined below
                     if (!branch(mfork_, cs, side_, "fork")) return false;
@@ -3525,7 +3569,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit() && !gdn_loop_enabled()) {
+    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
