@@ -176,6 +176,13 @@ void full_session(int fmt, int mode, int experts) {
         check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
         std::error_code ec;
         fs::remove_all(dir,ec);
+        // no drafter (a server without --mtp): the main layers only, and read limits without a draft layer
+        check(conversation_snapshot_sources(meta,sources,view,ss,g,nullptr,err) && sources.size()+1==b.kv.size(),
+              "no-draft sources");
+        SessionReadLimits nl_limits;
+        check(conversation_session_read_limits(nl_limits,ss,g,nullptr,1u<<20,4,err) &&
+              nl_limits.max_kv_layers==sources.size() && nl_limits.max_kv_bytes.size()==sources.size(),
+              "no-draft read limits");
         auto empty_ids=std::vector<int32_t>{};
         const ConversationView none{empty_ids,images,checkpoints,true};
         check(!conversation_snapshot_sources(meta,sources,none,ss,g,draft.state,err),"empty session refused");

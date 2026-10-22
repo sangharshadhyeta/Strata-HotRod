@@ -635,7 +635,8 @@ struct Options {
     /// KV streaming: resident cells per QSA layer. -1 (default): auto - 32768 (scaled by the card's VRAM) from twice
     /// that many tokens of context up when the RAM holds the K/V's host copy; 0: all in VRAM; N: N resident cells
     int64_t kv_resident = -1;
-    bool kv_grow = true;               ///< the elastic K/V (kvg_ensure): ON by default since 11 Oct (SPEC 20 9q, 9r, 9s: no loss at 32k, +8% decode and the slots back at 100k tokens of a 131k window); --no-kv-grow / STRATA_KV_GROW=0 turn it off
+    int64_t kv_resident_asked = -1;    ///< --kv-resident as given (-1 auto), before auto resolves it: the session config fingerprint
+    bool kv_grow = true;              ///< the elastic K/V (kvg_ensure): ON by default since 11 Oct (SPEC 20 9q, 9r, 9s: no loss at 32k, +8% decode and the slots back at 100k tokens of a 131k window); --no-kv-grow / STRATA_KV_GROW=0 turn it off
     bool kv_grow_asked = false;        ///< --kv-grow or STRATA_KV_GROW given: only then does a rig that cannot use it hear why
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
@@ -3830,6 +3831,7 @@ int main(int argc, char** argv) {
     // 12 GB card) or more when the RAM holds the K/V's host copy (every QSA layer's pinned copy, carved as
     // qsa_state_init does). Decided here: the geometry is final, and nothing has read o.kv_resident yet (the session
     // sizing and kv-grow below both see the value).
+    o.kv_resident_asked = o.kv_resident;
     if (o.kv_resident == -1) {
         const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
         const int fmt = strata::core::qsa_kv_hybrid() ? strata::kernels::kKvHybrid
@@ -9406,7 +9408,9 @@ int main(int argc, char** argv) {
 #endif
                 c.kv = o.kv;
                 c.max_context = o.max_context;
-                c.kv_resident = o.kv_resident;
+                // as given, not as auto resolved it: auto follows the RAM free at start, and the saved K/V bytes are
+                // the same streamed or not (identity-layout host copy or device pool, one format)
+                c.kv_resident = o.kv_resident_asked;
                 c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
                 const char* rot = std::getenv("STRATA_KV_ROT");
                 c.kv_rot = rot != nullptr && rot[0] == '1';
@@ -12620,7 +12624,7 @@ int main(int argc, char** argv) {
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -12701,7 +12705,7 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                limits, ss, g, use_mtp ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -12718,7 +12722,7 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g, use_mtp ? &mtp.kv_state() : nullptr, err)) {
                         refuse(err);
                         continue;
                     }
@@ -12731,7 +12735,7 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if (strata::core::conversation_snapshot_restore(image, ss, g, use_mtp ? &mtp.kv_state() : nullptr, err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
