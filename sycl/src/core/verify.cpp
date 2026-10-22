@@ -419,6 +419,16 @@ Verifier::~Verifier() try {
         Verifier* me = this;
         slot.compare_exchange_strong(me, nullptr);
     }
+    // a window left spinning on a flag (an error path that returned without serving it) would make the waits below wait forever,
+    // and the watchdog no longer sees this verifier: release its waits first - only when work is still queued (released_ is
+    // sticky, and a normal shutdown leaves the flags as they are)
+    {
+        const OnDevice on_device(device_);
+        bool busy = false;
+        for (dpct::queue_ptr q : {cs_, copy_})
+            if (q != nullptr && !q->ext_oneapi_empty()) busy = true;
+        if (busy) (void) release_gpu_waits(5000);
+    }
     if (cs_) cs_->wait();
     if (sh_cs_) sh_cs_->wait();
     for (auto& e : exec_)
@@ -544,7 +554,8 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         const int64_t cap = (int64_t) (T * K);
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
-        plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
+        // even: the second group's plan starts plan_i32_ + 16 words in, and its u64 pointers must stay 8-byte aligned
+        plan_i32_ = (ptr_off + 4 * cap + (cap + 1) + 1 + 1) & ~1ll;
         if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
             err = "verify: mapped plan allocation failed";
             return false;
@@ -2191,7 +2202,10 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     } else if (ar_on() && !test_stall) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
-            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) {
+                (void) release_gpu_waits(5000);   // the window is launched and spins on *flag: let it finish, or nothing ever will
+                return false;
+            }
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             *flag = 1;
@@ -2291,7 +2305,10 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         // MtpDrafter::draft and Layer 0's attention + router + expert execution!
         if (k == 0 && do_ple) {
             const Clock::time_point tp = Clock::now();
-            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) {
+                (void) release_gpu_waits(5000);   // layer 0's flags are up, *flag is not: the launched window would spin forever
+                return false;
+            }
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             ms_host += ms_since(tp);

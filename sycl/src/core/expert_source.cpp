@@ -899,7 +899,15 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
         if (have) {
             // another thread (a prefetch, the adaptive tier) is filling it: wait for that
             stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
-            if (stage_key_[v] != key) return nullptr;   // its fill failed
+            if (stage_key_[v] != key) {   // its fill failed: read it on this thread, once (a failed guess is no reason to fail a window)
+                bool again = false;
+                if (!claim_stage(key, v, again) && again) {
+                    dst = stage_buf_[v].get();
+                    lk.unlock();
+                    return fill_stage(v, layer, expert, dst) ? dst : nullptr;
+                }
+                return nullptr;
+            }
             return dst;
         }
     }

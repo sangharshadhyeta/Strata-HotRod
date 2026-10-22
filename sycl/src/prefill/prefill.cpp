@@ -2103,6 +2103,17 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // a run that ends early (an error or a cancel: `err` is set, it was cleared above) waits for its queues before the caller
+    // moves on: copies into the lent slots still queued would land on the experts the caller refills into those slots right after
+    struct DrainOnError {
+        Impl& m;
+        const std::string& err;
+        ~DrainOnError() {
+            if (err.empty()) return;
+            for (dpct::queue_ptr q : {m.cs, m.copy})
+                if (q != nullptr) try { q->wait(); } catch (...) {}
+        }
+    } drain_on_error{m, err};
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();

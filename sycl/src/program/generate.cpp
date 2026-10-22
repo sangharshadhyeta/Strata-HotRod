@@ -9522,6 +9522,7 @@ int main(int argc, char **argv) try {
                     live = std::move(image.live.ids);
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
+                    tail_ckpt_len = -1;   // the flag described the old list: a restored checkpoint of that length is no tail
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
@@ -9729,7 +9730,7 @@ int main(int argc, char **argv) try {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
+            if (max_new < 0 || max_new > o.max_context - n - 8) {   // (not n + max_new + 8: a huge max_new overflows and passes)
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
                             (long long) max_new, (long long) o.max_context);
                 continue;
@@ -9855,6 +9856,9 @@ int main(int argc, char **argv) try {
             }
             if (slot_source >= 0) {
                 const auto t0 = Clock::now();
+                // the retained K/V (a whole restore's, kept for the next park) described the session these cells held; the slot's
+                // overwrites them, and a park that trusted the old "unchanged" count would save that session's K/V under this one's tokens
+                conversations.take_reuse();
                 if (!copy_from_slot(slot_source, slot_ck, err)) {
                     // the main session may be half written: read this prompt from the start
                     std::fprintf(stderr, "strata batch: restoring slot %d failed (%s); reading the prompt\n",
@@ -9867,6 +9871,7 @@ int main(int argc, char **argv) try {
                     from_live = false;
                 } else {
                     checks.clear();   // the main session's checkpoints were of the conversation it held before
+                    tail_ckpt_len = -1;   // ... and so was its tail flag
                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
                     // checkpoints as if it had not stopped
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
@@ -9935,6 +9940,7 @@ int main(int argc, char **argv) try {
                 }
                 live = std::move(incoming->live.ids);
                 live_imgs = std::move(incoming->live.imgs);
+                tail_ckpt_len = -1;   // the list is replaced below: the old tail flag described the outgoing one
                 if (stages.empty()) {
                     checks = std::move(incoming->checkpoints);
                 } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
@@ -10552,6 +10558,9 @@ int main(int argc, char **argv) try {
                         }
                         return 1;
                     }
+                    // a STOP was pending (often the server's, sent because the engine went silent - a hang is what fails a read):
+                    // a real failure is still said
+                    if (!err.empty()) std::fprintf(stderr, "strata serve: the prompt read failed with a STOP pending: %s\n", err.c_str());
                     cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
                     break;
                 }
@@ -11198,9 +11207,10 @@ int main(int argc, char **argv) try {
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
                     }
                     std::fflush(stdout);
+                    const bool stopping = stop_req.load();   // once: a STOP between two loads ended the request as "length"
                     if (eos) finish = "stop";
-                    else if (stop_req.load()) finish = "cancel";
-                    const bool last = eos || produced_n >= max_new || stop_req.load();
+                    else if (stopping) finish = "cancel";
+                    const bool last = eos || produced_n >= max_new || stopping;
                     const bool on = B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
