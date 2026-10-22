@@ -1787,15 +1787,18 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     return f"{folder} has no {fam['title']} {model} file", hint
 
 
-def verify_sha256(s: Path, size: int, sha: str) -> None:
+def verify_sha256(s: Path, size: int, sha: str, own: bool = False) -> None:
     """A shard's size and SHA-256 against the pinned values (the Unsloth file); the result is kept in its finish mark,
-    so the ~5 minutes of hashing 111 GB happen once.  A wrong file is deleted, so the next run downloads it again."""
+    so the ~5 minutes of hashing 111 GB happen once.  A wrong file is deleted, so the next run downloads it again -
+    unless `own` (the user's own copy, --gguf-dir): nothing is downloaded then, so it is never deleted; setup stops."""
     m = s.with_name(s.name + ".done")
     if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
         return
     have = s.stat().st_size if s.exists() else -1
     if have != size:
-        fail(f"{s.name} is {have:,} bytes, not {size:,}", "delete it and run setup again (the download restarts)")
+        fail(f"{s.name} is {have:,} bytes, not {size:,}",
+             "check that copy, or leave out --gguf-dir to download it" if own
+             else "delete it and run setup again (the download restarts)")
     say(f"  checking {s.name} (SHA-256, {size / 1e9:.1f} GB) ...")
     h = hashlib.sha256()
     with open(s, "rb") as f:
@@ -1805,6 +1808,9 @@ def verify_sha256(s: Path, size: int, sha: str) -> None:
                 break
             h.update(b)
     if h.hexdigest() != sha:
+        if own:                                        # the user's file, outside Strata: kept as it is
+            fail(f"{s.name} in {s.parent} has the wrong SHA-256 ({h.hexdigest()}, expected {sha}); it was not changed",
+                 "check that copy (another upload of the same size, or a damaged one), or leave out --gguf-dir to download it")
         s.unlink(missing_ok=True)
         m.unlink(missing_ok=True)
         fail(f"{s.name} has the wrong SHA-256 ({h.hexdigest()}, expected {sha}): deleted",
@@ -2943,8 +2949,12 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
         return None
     tmp = eng / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
+    try:
+        with zipfile.ZipFile(z) as f:
+            f.extractall(tmp)
+    except zipfile.BadZipFile:
+        drop_archive(z)                                # (as get_prebuilt: a damaged archive and its mark go, else every
+        raise                                          # later run said "already downloaded" and failed again)
     try:
         meta = json.loads((tmp / "BUILD.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -3800,8 +3810,8 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                 gpu = {**gpu, "archs": [x for x in (int(a) for a in meta.get("archs", [])) if x < CUDA13_MIN_ARCH]
                        or [int(gpu["arch"])]}
             new = get_prebuilt(url_base, gpu, "gpu", updating=True, toolkit=toolkit)
-        except Exception as e:                         # a failed download must not stop the model from starting
-            warn(f"updating the engine failed ({e})")
+        except (Exception, SystemExit) as e:           # a failed download must not stop the model from starting (fail()
+            warn(f"updating the engine failed ({e})")  # raises SystemExit: it went past this and left BUILD.json gone)
     if new is None:
         if not info.exists():
             info.write_text(meta_text)                 # get_prebuilt drops it before downloading: put it back
@@ -3960,8 +3970,9 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
             fail("the Visual Studio C++ build tools were not found",
                  "install them (Visual Studio 2019 or 2022, workload 'Desktop development with C++') and run setup again")
         bat = ROOT / bat_name
-        q = lambda c: " ".join(f'"{x}"' if " " in str(x) else str(x) for x in c)  # noqa: E731
-        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{q(conf)} || exit /b 1\r\n{q(build)} && exit /b 0\r\n'
+        q = lambda c: " ".join(f'"{x}"' if any(ch in str(x) for ch in " &()^") else str(x) for x in c)  # noqa: E731
+        # chcp 65001: UTF-8 file, read by cmd in the OEM code page otherwise (a non-ASCII folder broke every path in it)
+        bat.write_text(f'@echo off\r\nchcp 65001 >nul\r\ncall "{vcvars}" >nul\r\n{q(conf)} || exit /b 1\r\n{q(build)} && exit /b 0\r\n'
                        f'echo   (the build stopped - trying it once more)\r\n{q(build)} || exit /b 1\r\n',
                        encoding="utf-8")
         run(["cmd", "/c", str(bat)])
@@ -4428,6 +4439,11 @@ def same_drive(a: Path, b: Path) -> bool:
 def move_into(src: Path, dst: Path) -> None:
     """A rename into the data folder (same drive: instant); a folder merges into one already there, keeping what the
     destination has.  Whatever cannot be moved (a file in use) stays where it is."""
+    try:   # a destination inside the source (--data-dir <folder>\models) cannot hold it: the merge recursed into its own child
+        if dst.resolve() == src.resolve() or dst.resolve().is_relative_to(src.resolve()):
+            return
+    except OSError:
+        return
     if not dst.exists():
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -4480,11 +4496,13 @@ def data_folder(requested: str | None) -> tuple:
     settings = load_settings()
     dest = Path(requested).expanduser().resolve() if requested else \
         Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / "Strata-data"
+    fell_back = False
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:                                # e.g. no write access next to the Strata folder
         warn(f"cannot use {dest} for the model files ({e}): keeping them in {ROOT}")
         dest = ROOT
+        fell_back = True
     elsewhere = []
     # #198: the data folder remembered before (a --data-dir to a new place) is a source too, and so is a Strata-data
     # folder nested in any of them (an install that kept its models one level down)
@@ -4524,7 +4542,10 @@ def data_folder(requested: str | None) -> tuple:
         else:
             ok(f"model files from {folder} moved to {dest} (a new copy of Strata finds them there)")
     installs = [str(ROOT)] + [p for p in settings.get("installs", []) if p != str(ROOT) and Path(p).is_dir()]
-    save_settings({**settings, "data_dir": str(dest), "installs": installs[:20]})
+    # a fallback for this run only (the remembered folder's drive unplugged, say) keeps the remembered folder: saving ROOT
+    # forgot it for good, and a later --setup downloaded 66-188 GB again
+    data_dir = settings.get("data_dir", str(dest)) if fell_back and not requested else str(dest)
+    save_settings({**settings, "data_dir": data_dir, "installs": installs[:20]})
     return dest, elsewhere
 
 
@@ -5525,7 +5546,8 @@ def write_run_script(model, cfg_path, port, open_browser=True):
              "--port", str(port)] + (["--open"] if open_browser else [])
     if WIN:
         script = ROOT / f"run-{model.lower()}.bat"
-        script.write_text("@echo off\r\ntitle Strata " + model + "\r\ncd /d \"" + str(ROOT) + "\"\r\n" +
+        # chcp 65001: the file is UTF-8 and cmd reads a .bat in the OEM code page - a folder like C:\Users\Müller\... failed `cd`
+        script.write_text("@echo off\r\nchcp 65001 >nul\r\ntitle Strata " + model + "\r\ncd /d \"" + str(ROOT) + "\"\r\n" +
                           " ".join(f'"{x}"' for x in serve) + "\r\nif errorlevel 1 pause\r\n", encoding="utf-8")
     else:
         script = ROOT / f"run-{model.lower()}.sh"
@@ -5870,7 +5892,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         if a.gguf_dir:
             fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
         download(fam["hf"] + gguf.name, gguf)
-    verify_sha256(gguf, *fam["sha256"][gguf.name])
+    verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir))   # (--gguf-dir: the user's file, never deleted)
     ok(f"model file: {gguf}")
     mmproj = folder / fam["mmproj"]
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
@@ -5880,7 +5902,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             if a.gguf_dir:
                 fail(f"{mmproj} is missing", f"put {mmproj.name} in {folder}, or drop --gguf-dir to download it")
             download(fam["mmproj_hf"] + mmproj.name, mmproj, "vision encoder")
-        verify_sha256(mmproj, *fam["sha256"][mmproj.name])
+        verify_sha256(mmproj, *fam["sha256"][mmproj.name], own=bool(a.gguf_dir))
         ok(f"vision encoder: {mmproj}")
 
     step(6, "preparing the model for Strata")
@@ -6791,7 +6813,7 @@ def main() -> int:
         check_shards(shards)
     for s in ([] if ready else shards):                # the Unsloth files: pinned sizes and SHA-256
         if s.name in fam.get("sha256", {}):
-            verify_sha256(s, *fam["sha256"][s.name])
+            verify_sha256(s, *fam["sha256"][s.name], own=bool(a.gguf_dir))   # (--gguf-dir: the user's own copies)
     ok("model files present")
     mmproj = Path(a.models_dir) / fam.get("mmproj", MMPROJ)
     if not mmproj.exists():                            # an earlier install's copy (the same file for every family)
@@ -6802,7 +6824,8 @@ def main() -> int:
         else:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
         if fam.get("mmproj_sha256"):                   # the NVFP4 family pins it by size and SHA-256 too
-            verify_sha256(mmproj, *fam["mmproj_sha256"])
+            verify_sha256(mmproj, *fam["mmproj_sha256"],
+                          own=bool(a.gguf_dir) and mmproj.parent.resolve() == Path(a.gguf_dir).resolve())
         ok(f"vision encoder: {mmproj}")
         if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
@@ -7057,8 +7080,8 @@ def main() -> int:
         # prompt speed on the 7900 XTX): only a table for this card's arch AND the installed hipBLASLt version (the
         # engine refuses any other one and falls back to plain hipBLAS)
         table = hipblaslt_table(gpu["arch"], lib_dirs, meta.get("hipblaslt_version"))
-        if table:
-            cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
+        if table:   # added to the env, not replacing it (the Unsloth defaults written above - tail skip off, MMQ_KQ - stay)
+            cfg.setdefault("env", {})["STRATA_HIPBLASLT_TUNING"] = str(table)
         if GFX1103_OPT_IN and gfx_arch_is(gpu["arch"], "gfx1103") and not WIN:
             # the 780M's KFD queues are evicted (a GPU reset) while transparent huge pages move the pinned expert arena
             cfg.setdefault("env", {})["STRATA_NO_ARENA_THP"] = "1"
