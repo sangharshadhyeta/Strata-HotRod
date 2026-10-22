@@ -8872,6 +8872,113 @@ int main(int argc, char **argv) try {
             in_lines.pop_front();
             return true;
         };
+        // --batch without --batch-mtp: the slot's draft K/V, kept for the solo path (as the CUDA engine: see there)
+        struct SlotDraft {
+            bool on = false;
+            strata::core::ConversationKv image;
+            int64_t upto = 0;
+            int64_t cell0 = 0, head = 0, n = 0;
+            std::vector<float> rows;
+            std::vector<int32_t> next;
+        };
+        static const int64_t slot_draft_cap = [] {
+            const char* v = std::getenv("STRATA_SLOT_DRAFT_ROWS");
+            return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 1024;
+        }();
+        static const bool slot_draft_env = [] {
+            const char* v = std::getenv("STRATA_SLOT_DRAFT_KEEP");
+            return v == nullptr || v[0] != '0';
+        }();
+        const size_t slot_hcn = (size_t) g.hc * (size_t) g.n_embd;
+        const bool slot_draft_keep = use_mtp && !batch_mtp && slot_draft_env && slot_hcn > 0;
+        std::vector<SlotDraft> slot_draft(bs.size());
+        auto slot_draft_take = [&](int b, int64_t upto) {
+            SlotDraft& d = slot_draft[(size_t) b];
+            d.on = false;
+            d.n = d.head = 0;
+            std::string de;
+            try {
+                if (mtp.idle(de) &&
+                    strata::core::conversation_kv_save(d.image, mtp.kv_state(), draft_geometry, upto, false, de)) {
+                    d.on = true;
+                    d.upto = upto;
+                    return;
+                }
+            } catch (const std::bad_alloc&) {
+                de = "not enough RAM";
+            }
+            std::fprintf(stderr, "strata batch: slot %d keeps no draft K/V (%s); back on the solo path it drafts from the "
+                                 "main drafter's\n", b, de.c_str());
+        };
+        auto slot_draft_log = [&](int b, const float* R_rows, int row, int64_t cell, int32_t next_tok) {
+            SlotDraft& d = slot_draft[(size_t) b];
+            if (!d.on || slot_draft_cap <= 0) return;
+            if (d.n > 0 && cell != d.cell0 + d.n) d.n = d.head = 0;
+            if (d.n == 0) d.cell0 = cell;
+            if (d.rows.empty()) {
+                try {
+                    d.rows.resize((size_t) slot_draft_cap * slot_hcn);
+                    d.next.resize((size_t) slot_draft_cap);
+                } catch (const std::bad_alloc&) {
+                    d.rows.clear();
+                    d.on = false;
+                    return;
+                }
+            }
+            int64_t at = 0;
+            if (d.n < slot_draft_cap) {
+                at = (d.head + d.n++) % slot_draft_cap;
+            } else {
+                at = d.head;
+                d.head = (d.head + 1) % slot_draft_cap;
+                ++d.cell0;
+            }
+            if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
+                    d.rows.data() + (size_t) at * slot_hcn, R_rows + (size_t) row * slot_hcn,
+                    slot_hcn * sizeof(float)).wait()) != 0) {
+                d.on = false;
+                return;
+            }
+            d.next[(size_t) at] = next_tok;
+        };
+        auto slot_draft_restore = [&](int b, int64_t upto, std::string& e) -> bool {
+            SlotDraft& d = slot_draft[(size_t) b];
+            if (!d.on) return true;
+            if (!mtp.idle(e) ||
+                !strata::core::conversation_kv_restore(d.image, mtp.kv_state(), draft_geometry, d.upto, false, e) ||
+                DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) != 0)
+                return false;
+            mtp.set_prompt_len(upto);
+            const int64_t end = std::min(d.cell0 + d.n, upto);
+            if (end <= d.cell0) return true;
+            constexpr int64_t kChunk = 64;
+            float* rows = nullptr;
+            try {
+                rows = sycl::malloc_device<float>((size_t) kChunk * slot_hcn, dpct::get_in_order_queue());
+            } catch (const sycl::exception&) {
+                rows = nullptr;
+            }
+            if (rows == nullptr) {
+                std::fprintf(stderr, "strata batch: slot %d: no VRAM to replay its draft rows (the image alone)\n", b);
+                return true;
+            }
+            std::vector<int32_t> nx((size_t) kChunk);
+            bool ok = true;
+            for (int64_t c = d.cell0; ok && c < end; c += kChunk) {
+                const int64_t T = std::min<int64_t>(kChunk, end - c);
+                for (int64_t i = 0; ok && i < T; ++i) {
+                    const int64_t at = (d.head + (c - d.cell0) + i) % slot_draft_cap;
+                    nx[(size_t) i] = d.next[(size_t) at];
+                    ok = DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
+                             rows + (size_t) i * slot_hcn, d.rows.data() + (size_t) at * slot_hcn,
+                             slot_hcn * sizeof(float)).wait()) == 0;
+                }
+                if (!ok) e = "slot draft rows: upload failed";
+                ok = ok && mtp.prefill(rows, nx.data(), T, c, e);
+            }
+            sycl::free(rows, dpct::get_in_order_queue());
+            return ok;
+        };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         auto copy_to_slot = [&](int b, const std::vector<int32_t> &ids,
                                 std::string &e) -> bool {
@@ -8923,6 +9030,8 @@ int main(int argc, char **argv) try {
                         0)
                     return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
+            } else if (slot_draft_keep) {
+                slot_draft_take(b, upto);
             }
             return true;
         }
@@ -8993,6 +9102,8 @@ int main(int argc, char **argv) try {
                         0)
                     return false;
                 mtp.set_prompt_len(upto);
+            } else if (slot_draft_keep && !slot_draft_restore(b, upto, e)) {
+                return false;
             }
             return true;
         }
@@ -9075,6 +9186,7 @@ int main(int argc, char **argv) try {
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
+                if (slot_draft_keep) slot_draft_log(b, ver.final_R_all(), first[t], pos[first[t]], outb[first[t]]);
                 for (int j = 0; j < keep[b]; ++j) {
                     const int32_t y = outb[first[t] + j];
                     sl.ids.push_back(tok[first[t] + j]);
@@ -9175,6 +9287,7 @@ int main(int argc, char **argv) try {
                     BSlot& sl = bs[(size_t) (gi * GS + t)];
                     if (!sl.active) continue;
                     const int32_t y = outb[t];
+                    if (slot_draft_keep) slot_draft_log(gi * GS + t, vk.final_R_all(), t, sl.p, y);
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
                     ++sl.produced;
                     ++bt_rows;
@@ -11711,6 +11824,8 @@ int main(int argc, char **argv) try {
                             return 1;
                         }
                         sl.draft_ready = true;
+                    } else if (slot_draft_keep) {
+                        slot_draft_log(admit_slot, ver.final_R_all(), 0, sl.p - 1, sl.x);   // the prompt's last cell and the first token
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached

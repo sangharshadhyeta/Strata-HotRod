@@ -11574,6 +11574,120 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
+        // --batch without --batch-mtp: a request decoding in a slot has no drafter of its own, and the main drafter goes on to
+        // other conversations, so back on the solo path (left alone, or its next turn) it drafted against another
+        // conversation's draft K/V and few drafts were accepted.  Kept per slot instead: the main drafter's K/V image when the
+        // conversation enters the slot, then each batch window's final residual row and the token after it (the drafter's
+        // prompt-pass inputs); copy_from_slot restores the image and replays the rows.  The latest STRATA_SLOT_DRAFT_ROWS rows
+        // (default 1024, hc x n_embd floats each: 40 KiB here) per slot; STRATA_SLOT_DRAFT_KEEP=0 turns it off.  Drafts are
+        // verified, so only the acceptance changes, never the tokens.
+        struct SlotDraft {
+            bool on = false;                   // the image holds this slot's conversation
+            strata::core::ConversationKv image;
+            int64_t upto = 0;                  // the image's cells
+            int64_t cell0 = 0, head = 0, n = 0;   // the oldest row's cell and place in the ring, the rows held
+            std::vector<float> rows;
+            std::vector<int32_t> next;
+        };
+        static const int64_t slot_draft_cap = [] {
+            const char* v = std::getenv("STRATA_SLOT_DRAFT_ROWS");
+            return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 1024;
+        }();
+        static const bool slot_draft_env = [] {
+            const char* v = std::getenv("STRATA_SLOT_DRAFT_KEEP");
+            return v == nullptr || v[0] != '0';
+        }();
+        const size_t slot_hcn = (size_t) g.hc * (size_t) g.n_embd;
+        const bool slot_draft_keep = use_mtp && !batch_mtp && slot_draft_env && slot_hcn > 0;
+        std::vector<SlotDraft> slot_draft(bs.size());
+        // the main drafter's K/V of the conversation entering slot b (it just read that prompt)
+        auto slot_draft_take = [&](int b, int64_t upto) {
+            SlotDraft& d = slot_draft[(size_t) b];
+            d.on = false;
+            d.n = d.head = 0;
+            std::string de;
+            try {
+                const strata::core::OnDevice on_mtp(mtp.device());
+                if (mtp.idle(de) &&
+                    strata::core::conversation_kv_save(d.image, mtp.kv_state(), draft_geometry, upto, false, de)) {
+                    d.on = true;
+                    d.upto = upto;
+                    return;
+                }
+            } catch (const std::bad_alloc&) {
+                de = "not enough RAM";
+            }
+            std::fprintf(stderr, "strata batch: slot %d keeps no draft K/V (%s); back on the solo path it drafts from the "
+                                 "main drafter's\n", b, de.c_str());
+        };
+        // cell `cell` of slot b: its final residual (row `row` of the last stage's window just run) and the token after it
+        auto slot_draft_log = [&](int b, const float* R_rows, int row, int64_t cell, int32_t next_tok) {
+            SlotDraft& d = slot_draft[(size_t) b];
+            if (!d.on || slot_draft_cap <= 0) return;
+            if (d.n > 0 && cell != d.cell0 + d.n) d.n = d.head = 0;   // not the next cell: the log starts again there
+            if (d.n == 0) d.cell0 = cell;
+            if (d.rows.empty()) {
+                try {
+                    d.rows.resize((size_t) slot_draft_cap * slot_hcn);
+                    d.next.resize((size_t) slot_draft_cap);
+                } catch (const std::bad_alloc&) {
+                    d.rows.clear();
+                    d.on = false;
+                    return;
+                }
+            }
+            int64_t at = 0;
+            if (d.n < slot_draft_cap) {
+                at = (d.head + d.n++) % slot_draft_cap;
+            } else {   // full: the oldest row goes
+                at = d.head;
+                d.head = (d.head + 1) % slot_draft_cap;
+                ++d.cell0;
+            }
+            const strata::core::OnDevice on_mtp(mtp.device());
+            if (cudaMemcpy(d.rows.data() + (size_t) at * slot_hcn, R_rows + (size_t) row * slot_hcn,
+                           slot_hcn * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                (void) cudaGetLastError();
+                d.on = false;
+                return;
+            }
+            d.next[(size_t) at] = next_tok;
+        };
+        // copy_from_slot's drafter: slot b's image, then its logged cells below `upto` through the prompt pass
+        auto slot_draft_restore = [&](int b, int64_t upto, std::string& e) -> bool {
+            SlotDraft& d = slot_draft[(size_t) b];
+            if (!d.on) return true;   // nothing kept: the main drafter's K/V, as before
+            const strata::core::OnDevice on_mtp(mtp.device());
+            if (!mtp.idle(e) ||
+                !strata::core::conversation_kv_restore(d.image, mtp.kv_state(), draft_geometry, d.upto, false, e) ||
+                cudaDeviceSynchronize() != cudaSuccess)
+                return false;
+            mtp.set_prompt_len(upto);
+            const int64_t end = std::min(d.cell0 + d.n, upto);
+            if (end <= d.cell0) return true;
+            constexpr int64_t kChunk = 64;
+            float* rows = nullptr;
+            if (cudaMalloc((void**) &rows, (size_t) kChunk * slot_hcn * sizeof(float)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata batch: slot %d: no VRAM to replay its draft rows (the image alone)\n", b);
+                return true;
+            }
+            std::vector<int32_t> nx((size_t) kChunk);
+            bool ok = true;
+            for (int64_t c = d.cell0; ok && c < end; c += kChunk) {
+                const int64_t T = std::min<int64_t>(kChunk, end - c);
+                for (int64_t i = 0; ok && i < T; ++i) {
+                    const int64_t at = (d.head + (c - d.cell0) + i) % slot_draft_cap;
+                    nx[(size_t) i] = d.next[(size_t) at];
+                    ok = cudaMemcpy(rows + (size_t) i * slot_hcn, d.rows.data() + (size_t) at * slot_hcn,
+                                    slot_hcn * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+                }
+                if (!ok) e = "slot draft rows: upload failed";
+                ok = ok && mtp.prefill(rows, nx.data(), T, c, e);
+            }
+            (void) cudaFree(rows);
+            return ok;
+        };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             if (slot_copy_direct) {
@@ -11612,6 +11726,8 @@ int main(int argc, char** argv) {
                     cudaDeviceSynchronize() != cudaSuccess)
                     return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
+            } else if (slot_draft_keep) {
+                slot_draft_take(b, upto);
             }
             return true;
         };
@@ -11660,6 +11776,8 @@ int main(int argc, char** argv) {
                     cudaDeviceSynchronize() != cudaSuccess)
                     return false;
                 mtp.set_prompt_len(upto);
+            } else if (slot_draft_keep && !slot_draft_restore(b, upto, e)) {
+                return false;
             }
             return true;
         };
@@ -11788,6 +11906,7 @@ int main(int argc, char** argv) {
                     nan_flush = true;
                     continue;
                 }
+                if (slot_draft_keep) slot_draft_log(b, ver.final_R_all(), first[t], pos[first[t]], outb[first[t]]);
                 for (int j = 0; j < keep[b]; ++j) {
                     const int32_t y = outb[first[t] + j];
                     sl.ids.push_back(tok[first[t] + j]);
@@ -11966,6 +12085,7 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     const int32_t y = outb[t];
+                    if (slot_draft_keep) slot_draft_log(gi * GS + t, vk.final_R_all(), t, sl.p, y);
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
                     ++sl.produced;
                     ++bt_rows;
@@ -16008,6 +16128,8 @@ int main(int argc, char** argv) {
                             return 1;
                         }
                         sl.draft_ready = true;
+                    } else if (slot_draft_keep) {
+                        slot_draft_log(admit_slot, ver.final_R_all(), 0, sl.p - 1, sl.x);   // the prompt's last cell and the first token
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached

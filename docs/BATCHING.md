@@ -30,6 +30,15 @@ engine's free-memory log before using it on a smaller card. If it cannot run (on
 GPU) the engine says so and batches as usual. RTX PRO 5000 owners measured +31% to +39% total throughput with 2 to 4
 clients on one GPU (a RX R9700 run too).
 
+Without `--batch-mtp`, the slots do not draft, and the solo drafter goes on to other conversations. A request left alone
+in its slot goes back to the solo path with its drafts (#857), and before this change it drafted from another
+conversation's draft K/V there, so fewer drafts were accepted. The engine now keeps, per slot, the solo drafter's K/V
+from when the conversation entered the slot plus each batch window's final residual row and next token. On the way back
+it restores the K/V and replays the rows through the drafter's prompt pass. At most `STRATA_SLOT_DRAFT_ROWS` rows per slot
+are kept (default 1024, the latest; 40 KiB each on this model, so 40 MiB of RAM per slot). `STRATA_SLOT_DRAFT_KEEP=0` turns
+it off. Drafts are verified, so the tokens are the same either way; only the acceptance changes. Not measured yet: compare
+the solo path's `draft_accepted / draft_offered` (the DONE line) after a hand-back, with and without it.
+
 **With a layer split** (e.g. `"layer_split": "24"` on two GPUs, `"parallel": 2`, `--spec 4 --mtp ...`) it works the
 same way, with the slot drafters on the **last stage's GPU** (where the solo drafter and the head are): each slot gets a
 drafter that shares the solo drafter's weights and owns only its K/V ring and buffers (the engine logs `--batch-mtp: N
