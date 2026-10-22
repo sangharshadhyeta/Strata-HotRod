@@ -788,7 +788,7 @@ void FileExpertSource::io_enqueue_demand(int64_t layer, int64_t expert) {
 // staged, and otherwise reads the whole blob into a staging buffer (copy_from_files preads what is not cached).
 void FileExpertSource::io_worker() {
     for (;;) {
-        int32_t layer, expert;
+        int32_t layer = 0, expert = 0;   // (set by the pick below; initialised for -Wmaybe-uninitialized)
         bool demand = false;
         {
             std::unique_lock<std::mutex> lk(io_mu_);

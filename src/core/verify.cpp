@@ -871,8 +871,16 @@ Verifier::~Verifier() {
         slot.compare_exchange_strong(me, nullptr);
     }
     // a window left spinning on a flag (an error path that returned without serving it) would make the syncs below wait forever,
-    // and the watchdog no longer sees this verifier: release its waits first (idle streams: returns at once)
-    (void) release_gpu_waits(5000);
+    // and the watchdog no longer sees this verifier: release its waits first - only when work is still in flight on its streams
+    // (a normal shutdown leaves the flags, a split's hand-off flag among them, as they are)
+    {
+        const OnDevice on_device(device_);
+        bool busy = false;
+        for (cudaStream_t s : {cs_, copy_})
+            if (s != nullptr && cudaStreamQuery(s) == cudaErrorNotReady) busy = true;
+        (void) cudaGetLastError();
+        if (busy) (void) release_gpu_waits(5000);
+    }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (la_cs_) cudaStreamSynchronize(la_cs_);
