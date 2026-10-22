@@ -558,7 +558,10 @@ FIXES = [
     ("STRATA_IO_PF_THREADS=1 (existing)", dict(io_threads=1)),
     ("+ STRATA_IO_PF_YIELD=1", dict(yield_=1)),
     ("+ STRATA_IO_EDF=1", dict(edf=1)),
-    ("+ STRATA_LA_MODEL (trained predictor)", dict(recall1=0.69, wrong_per_right=0.75 * (1 - 0.69) / (1 - 0.553))),
+    # the trained predictor makes more of the next layer's guesses right, with ~1.1 ms of lead: one guess-read thread
+    # queues them (16 seeds: 78.1 +- 1.7 tok/s at 1 thread, 81.6 +- 1.9 at 3, 82.3 +- 1.9 at 6 - model)
+    ("+ STRATA_LA_MODEL (trained predictor), STRATA_IO_PF_THREADS=3",
+     dict(recall1=0.69, wrong_per_right=0.75 * (1 - 0.69) / (1 - 0.553), io_threads=3)),
     ("+ zero-copy O_DIRECT reads (not built)", dict(zero_copy=1)),
     # GPU side, from the kernel review (estimates: measure with STRATA_DECODE_STAGE_TIMERS first)
     ("+ router/look-ahead fused, HC norm folded, hit-add fused (-12 nodes a layer)", dict(gpu_pre_nodes=14, gpu_post_nodes=8)),
@@ -699,6 +702,8 @@ def main():
     ap.add_argument("--profile", default="rtx3060")
     ap.add_argument("--windows", type=int, default=60)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--seeds", type=int, default=12, help="--waterfall: seeds per step (3 was too few: one seed's spread is "
+                                                          "~7 tok/s, so steps a few %% apart swapped order)")
     ap.add_argument("--set", nargs="*", default=[], help="key=value overrides (see --list)")
     ap.add_argument("--html")
     ap.add_argument("--trace")
@@ -717,9 +722,10 @@ def main():
             sys.exit(f"unknown parameter {k}")
         p[k] = type(p[k])(float(v)) if not isinstance(p[k], int) else int(float(v))
     if a.waterfall:
-        seeds = [a.seed, a.seed + 1, a.seed + 2]
+        seeds = [a.seed + i for i in range(max(1, a.seeds))]
         rows, fixes, fixed = waterfall(p, a.windows, seeds)
-        print(f"profile {a.profile}: from the ideal machine to today, one real constraint at a time (tokens/s, model, mean of 3 seeds)\n")
+        print(f"profile {a.profile}: from the ideal machine to today, one real constraint at a time (tokens/s, model, mean of "
+              f"{len(seeds)} seeds)\n")
         prev = rows[0][1]
         print(f"  {rows[0][0]:62s} {prev:6.1f}")
         for label, v in rows[1:]:
