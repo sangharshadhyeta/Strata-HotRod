@@ -590,6 +590,7 @@ struct Stager {
     // previous layer can never take a job of this one - the expert pool's issue #29 lesson)
     std::atomic<uint64_t> head{0};
     std::atomic<int> issued{0}, active{0};
+    std::atomic<bool> failed{false};   // a copy of this layer's jobs failed (work): wait() answers null, the run stops
     uint32_t gen = 0;
     bool quit = false;
     std::mutex mu;
@@ -683,8 +684,11 @@ struct Stager {
                     rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
                 }
                 if (nr > 0 && !from->copy_blobs(rl, re, rd, nr)) {
-                    std::fprintf(stderr, "prefill: the expert source could not copy experts %d.. of layer %d\n", re[0], rl[0]);
-                    std::abort();
+                    // a read the drive (and the mapping) refused: the request fails (wait() answers null, the run's copy check
+                    // stops it) - it used to abort the whole engine.  The jobs are still marked ready so no waiter hangs.
+                    std::fprintf(stderr, "prefill: the expert source could not copy experts %d.. of layer %d (the request stops)\n",
+                                 re[0], rl[0]);
+                    failed.store(true, std::memory_order_release);
                 }
                 for (int i = j; i < j + k; ++i) ready[(size_t) i].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
@@ -712,15 +716,16 @@ struct Stager {
             ready.reset(new std::atomic<int>[ready_cap]);
         }
         for (size_t i = 0; i < jobs.size(); ++i) ready[i].store(0, std::memory_order_relaxed);
+        failed.store(false, std::memory_order_relaxed);   // (a failure was seen by the previous layer's waiters: its run stops)
         issued.store(0);
         ++gen;
         head.store((uint64_t) gen << 32 | (uint64_t) jobs.size() << 16, std::memory_order_release);
         cv.notify_all();
     }
-    /// Job j's bytes, in a pinned buffer (waits for the copy).
+    /// Job j's bytes, in a pinned buffer (waits for the copy); null when a copy of this layer's jobs failed.
     const uint8_t* wait(int j) {
         while (!ready[(size_t) j].load(std::memory_order_acquire)) std::this_thread::yield();
-        return buf[j % kRing];
+        return failed.load(std::memory_order_acquire) ? nullptr : buf[j % kRing];
     }
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     void issued_one(int j, cudaStream_t copy) {
@@ -3282,7 +3287,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const auto tw = phase_timers ? Clock::now() : Clock::time_point{};
                     const uint8_t* hb = m.stager->wait(en.job);
                     if (phase_timers) iss_stage_us.fetch_add((int64_t) (ms_since(tw) * 1000.0));
-                    xcopy(m.stage_dev[sl], hb, bytes, m.copy);
+                    if (hb == nullptr) note_copy(cudaErrorUnknown);   // the stager could not read it: the run's copy check stops it
+                    else xcopy(m.stage_dev[sl], hb, bytes, m.copy);
                     m.stager->issued_one(en.job, m.copy);
                 }
                 cudaEventRecord(m.copied[sl], m.copy);
@@ -3334,7 +3340,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const auto tw = phase_timers ? Clock::now() : Clock::time_point{};
                         const uint8_t* hb = m.stager->wait(en.job);
                         if (phase_timers) iss_stage_us.fetch_add((int64_t) (ms_since(tw) * 1000.0));
-                        xcopy(m.stage_dev[sl], hb, bytes, m.copy);
+                        if (hb == nullptr) note_copy(cudaErrorUnknown);   // the stager could not read it: the run stops (copy check)
+                        else xcopy(m.stage_dev[sl], hb, bytes, m.copy);
                         m.stager->issued_one(en.job, m.copy);
                     }
                     cudaEventRecord(m.copied[sl], m.copy);
@@ -4794,7 +4801,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (phase_timers) iss_lm_stage_us.fetch_add((int64_t) (ms_since(tw) * 1000.0));
                                 if (phase_timers) lm_staged_n.fetch_add(1);
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                xcopy(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), m.copy);
+                                if (hb == nullptr) note_copy(cudaErrorUnknown);   // the stager could not read it: stopped just below
+                                else xcopy(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), m.copy);
                                 m.stager->issued_one(job_of[j], m.copy);
                             }
                             if (const int cb = copy_bad.load(); cb != 0) {
