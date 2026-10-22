@@ -3877,9 +3877,20 @@ class Service:
         self.request_trace.record = record
         return record
 
+    @staticmethod
+    def _join_record(record):
+        """The monitor record's streamed pieces into its output / reasoning strings (called with status_lock held)."""
+        for name in ("output", "reasoning"):
+            parts = record.get("_" + name)
+            if parts:
+                record[name] += "".join(parts)
+                parts.clear()
+
     def request_records(self, request_id=None):
         with self.status_lock:
             records = list(self.api_requests)
+            for r in records:
+                self._join_record(r)
             if request_id:
                 record = next((r for r in records if r["id"] == request_id), None)
                 if record is None:
@@ -6004,6 +6015,7 @@ def make_handler(svc: Service):
                         record["wallclock_s"] = round(time.perf_counter() - record["_clock"], 3)
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
+                        svc._join_record(record)                 # a finished record holds whole strings
                     svc.request_trace.record = None
 
         def _images(self, req):
@@ -6221,10 +6233,13 @@ def make_handler(svc: Service):
                             usage, timings = event.get("usage"), None
                         with svc.status_lock:
                             for name, value in (("output", content), ("reasoning", reasoning)):
-                                if value:
-                                    combined = self.record[name] + value
-                                    self.record[name] = combined[:262144]
-                                    self.record[name + "_truncated"] |= len(combined) > 262144
+                                if value and not self.record[name + "_truncated"]:
+                                    # pieces, joined when the record is read (request_records): a string grown by
+                                    # += per token was copied whole each time, under the status lock
+                                    room = 262144 - self.record.get("_n_" + name, 0)
+                                    self.record.setdefault("_" + name, []).append(value[:room])
+                                    self.record["_n_" + name] = self.record.get("_n_" + name, 0) + min(len(value), room)
+                                    self.record[name + "_truncated"] = len(value) > room
                             if usage:
                                 self.record["usage"] = usage
                             if timings:

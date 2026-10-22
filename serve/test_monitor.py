@@ -149,9 +149,13 @@ class Monitor(unittest.TestCase):
         handler.record = self.svc.api_requests[-1]
         chunk = {"choices": [{"delta": {"content": huge, "reasoning_content": huge}}]}
         list(handler._capture((item for item in [chunk]), "openai"))
+        record = self.svc.request_records(handler.record["id"])        # the monitor's reader joins the streamed pieces
         for field in ("output", "reasoning"):
-            self.assertEqual(len(handler.record[field]), 262144)
-            self.assertTrue(handler.record[field + "_truncated"])
+            self.assertEqual(len(record[field]), 262144)
+            self.assertTrue(record[field + "_truncated"])
+        # pieces after the cap are not kept (they were copied under the status lock on every token before)
+        list(handler._capture((item for item in [{"choices": [{"delta": {"content": "more"}}]}]), "openai"))
+        self.assertEqual(len(self.svc.request_records(handler.record["id"])["output"]), 262144)
 
     def test_queue_wait_and_loading_are_attributed_separately(self):
         self.engine.unload()
