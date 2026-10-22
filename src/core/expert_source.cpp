@@ -1557,7 +1557,17 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
             const auto tw = tnow();
             stage_cv_.wait(lk, [&] { return !stage_busy_[v] || stage_key_[v] != key; });
             t_blob_wait_us_.fetch_add(us_since(tw), std::memory_order_relaxed);
-            if (stage_key_[v] != key) return nullptr;   // its fill failed
+            if (stage_key_[v] != key) {   // its fill failed: read it on this thread, once (a failed guess is no reason to fail a window)
+                bool again = false;
+                if (!claim_stage(key, v, again) && again) {
+                    dst = stage_buf_[v].get();
+                    lk.unlock();
+                    const bool ok = fill_stage(v, layer, expert, dst);
+                    crit();
+                    return ok ? dst : nullptr;
+                }
+                return nullptr;
+            }
             lk.unlock();
             crit();
             return dst;
@@ -2067,6 +2077,11 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
     direct_.clear();
     {   // the mapped tier hands out the mapping: the startup's stage buffers go
         std::lock_guard<std::mutex> lk(stage_mu_);
+        // and with them their events and the address index (note_async_read looks buffers up by address: a freed one's entry would
+        // index a buffer that is gone, and a later buffer would take a stale event slot); a copy still reading one is waited for
+        for (size_t v = 0; v < stage_ev_.size(); ++v)
+            if (v < stage_ev_live_.size() && stage_ev_live_[v] && stage_ev_[v] != nullptr) (void) cudaEventSynchronize((cudaEvent_t) stage_ev_[v]);
+        stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
         stage_epoch_.clear();

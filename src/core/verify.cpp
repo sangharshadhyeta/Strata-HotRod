@@ -870,6 +870,9 @@ Verifier::~Verifier() {
         Verifier* me = this;
         slot.compare_exchange_strong(me, nullptr);
     }
+    // a window left spinning on a flag (an error path that returned without serving it) would make the syncs below wait forever,
+    // and the watchdog no longer sees this verifier: release its waits first (idle streams: returns at once)
+    (void) release_gpu_waits(5000);
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (la_cs_) cudaStreamSynchronize(la_cs_);
@@ -3333,7 +3336,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (ar_on() && !test_stall) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
-            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) {
+                (void) release_gpu_waits(5000);   // the graph is launched and spins on *flag: let it finish, or nothing ever will
+                return false;
+            }
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             *flag = 1;
@@ -3431,7 +3437,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // MtpDrafter::draft and Layer 0's attention + router + expert execution!
         if (k == 0 && do_ple) {
             const Clock::time_point tp = Clock::now();
-            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) {
+                (void) release_gpu_waits(5000);   // layer 0's flags are up, *flag is not: the launched graph would spin forever
+                return false;
+            }
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             ms_host += ms_since(tp);
@@ -4761,6 +4770,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
         if (ar_on() || k >= b_steps_) break;
         const uint32_t want = (uint32_t) (k + 1);
         if (*seq < want) return 0;
+        if (released_.load()) return 1;   // the poll gave this window up (release_gpu_waits): serve nothing more
         const int S = last_t_;
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
@@ -4768,6 +4778,9 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + k);
         if (remote_opt_) remote_opt_->end();
+        // with external serving the poll may have released the GPU's waits (flags at UINT32_MAX) while this layer's pool ran: the
+        // plain stores below would lower them again and block the GPU at the next layer with nobody serving it
+        if (released_.load()) return 1;
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();

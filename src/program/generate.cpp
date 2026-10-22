@@ -16928,6 +16928,12 @@ int main(int argc, char** argv) {
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         // STRATA_LOOKAHEAD_PROMOTE: the io workers read drive.d.usage (a heuristic) from here on - after its last assign above
         src.set_lookahead_promote(src.io_overlay_active() && lookahead_promote_env(), &drive.d.usage);
+        // ... and stop when this block ends: `drive` is destroyed before `src` in main, and the io workers (joined only by src's
+        // close) would otherwise read the freed usage vector at exit
+        struct PromoteOff {
+            strata::core::FileExpertSource& s;
+            ~PromoteOff() { s.set_lookahead_promote(false, nullptr); }
+        } promote_off{src};
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
         // flight - see the serve path); the hook's captures live in this block, so it is taken off the verifier when the
         // block ends
