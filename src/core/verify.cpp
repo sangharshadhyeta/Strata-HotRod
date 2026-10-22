@@ -446,6 +446,46 @@ int gdn_loop_k() {
 }
 bool gdn_loop_enabled() { return gdn_loop_k() > 1; }
 
+// STRATA_DRAFT_TRACE=<file> (measurement only, off by default): for every single-GPU, single-sequence verify window, its rows' tokens, the
+// model's picks and the residual after each layer of STRATA_DRAFT_TRACE_LAYERS (default 5,15,25,35,45: the layers the DFlash 2 drafter
+// for this model reads, incoai/Qwen3.8-Flash-Next-DFlash2), averaged over the hyper-connection streams as that drafter was trained.
+// tools/drafter/dflash_offline.py replays the drafter on it.  The capture is a device copy per traced layer inside the window graph;
+// the host writes the window once it has finished.  File: u32 "DFT1", u32 L, u32 n_embd, u32 hc, i32 layer[L]; then per window
+// i64 pos0 | i32 T | i32 tokens[T] | i32 picks[T] | u16 bf16 [T][L][n_embd].  Later windows rewrite a position its rejected drafts held.
+struct DraftTrace {
+    std::mutex mu;
+    FILE* f = nullptr;
+    bool header = false;
+    std::vector<int> layers;
+};
+DraftTrace& draft_trace() {
+    static DraftTrace d;   // (a mutex: filled in place, once)
+    static const bool opened = [] {
+        const char* p = std::getenv("STRATA_DRAFT_TRACE");
+        if (p == nullptr || *p == 0) return false;
+        const char* lv = std::getenv("STRATA_DRAFT_TRACE_LAYERS");
+        std::string ls = lv != nullptr && *lv != 0 ? lv : "5,15,25,35,45";
+        for (size_t i = 0; i < ls.size();) {
+            const size_t j = ls.find(',', i);
+            d.layers.push_back(std::atoi(ls.substr(i, j == std::string::npos ? std::string::npos : j - i).c_str()));
+            i = j == std::string::npos ? ls.size() : j + 1;
+        }
+        d.f = std::fopen(p, "wb");
+        if (d.f == nullptr) std::fprintf(stderr, "strata: STRATA_DRAFT_TRACE: cannot open %s\n", p);
+        else std::fprintf(stderr, "strata: STRATA_DRAFT_TRACE=%s (measurement: the residual after layers %s of every verify window)\n", p, ls.c_str());
+        return d.f != nullptr;
+    }();
+    (void) opened;
+    return d;
+}
+bool draft_trace_on() { return draft_trace().f != nullptr; }
+int draft_trace_slot(int64_t l) {
+    const std::vector<int>& ls = draft_trace().layers;
+    for (size_t i = 0; i < ls.size(); ++i)
+        if (ls[i] == l) return (int) i;
+    return -1;
+}
+
 // STRATA_GDN_LOOP_NORM=1 (opt-in; only with the loop on): after the passes are summed, each token's update is rescaled to
 // the norm of the canonical pass's F_0 (row_norm_match): the loop's systematic magnitude shift is removed at the source
 // (the part that moved the MTP drafter's input statistics: 20 Oct), and its direction change, the part meant to change
@@ -1183,6 +1223,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                                               (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
             loop_st_ = b.take<float>(gdn_loop_enabled() ? gdn_state_floats : 0);
         }
+        // STRATA_DRAFT_TRACE (one GPU, the whole model): nothing is taken otherwise, so the arena is unchanged and dtr_ stays null
+        dtr_ = draft_trace_on() && lb_ == 0 && le_ >= g.n_layers ? b.take<float>((uint64_t) draft_trace().layers.size() * T * HC * N)
+                                                                 : nullptr;
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
@@ -2704,6 +2747,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     for (int64_t l = lb_; l < le_; ++l)
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
+            // STRATA_DRAFT_TRACE: this group's rows of the residual after layer l (single-sequence windows; read once the window is done)
+            if (dtr_ != nullptr && !batch_rec_)
+                if (const int slot = draft_trace_slot(l); slot >= 0 &&
+                    cudaMemcpyAsync(dtr_ + ((size_t) slot * MT + tb_[grp]) * HC * N, Rt(tb_[grp]),
+                                    (size_t) (te_[grp] - tb_[grp]) * HC * N * sizeof(float), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                    err = "verify: the draft trace's copy failed";
+                    return false;
+                }
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
     // STRATA_LOOKAHEAD_GPU_STREAM: the look-ahead stream joins back into cs once per window, after the last layer's node.
@@ -3288,6 +3339,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    if (lb_ == 0) router_trace_tokens(tokens, T);   // STRATA_ROUTER_TRACE (measurement): the window's tokens beside its routing
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -3602,6 +3654,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     note_nonfinite(T, nullptr);
+    if (dtr_ != nullptr) draft_trace_write(T, tokens, pos0, out);   // STRATA_DRAFT_TRACE (measurement)
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
@@ -4713,6 +4766,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    if (lb_ == 0) router_trace_tokens(tokens, S);   // STRATA_ROUTER_TRACE (measurement)
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
@@ -4881,6 +4935,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    if (lb_ == 0) router_trace_tokens(tokens, S);   // STRATA_ROUTER_TRACE (measurement)
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
     if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
@@ -5172,6 +5227,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
         return false;
     }
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    if (lb_ == 0) router_trace_tokens(tokens, T);   // STRATA_ROUTER_TRACE (measurement)
     const Clock::time_point t0 = Clock::now();
     last_batch_ = false;
     bool staged = pl_prestaged_ && last_t_ == T && last_pos0_ == pos0;
@@ -5336,8 +5392,52 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     if (out != nullptr)
         for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     note_nonfinite(T, nullptr);
+    if (dtr_ != nullptr && T == last_t_)   // STRATA_DRAFT_TRACE (measurement): the window pl_launch staged
+        draft_trace_write(T, last_tokens_, last_pos0_, h_out_);
     progress_beat();
     return true;
+}
+
+void Verifier::draft_trace_write(int T, const int32_t* tokens, int64_t pos0, const int32_t* out) {
+    DraftTrace& d = draft_trace();
+    const int64_t N = g_->n_embd, HC = g_->hc, L = (int64_t) d.layers.size();
+    std::vector<float> res((size_t) (L * max_t_ * HC * N));
+    if (cudaMemcpy(res.data(), dtr_, res.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    std::vector<uint16_t> row((size_t) (T * L * N));
+    for (int t = 0; t < T; ++t)
+        for (int64_t s = 0; s < L; ++s) {
+            const float* r = res.data() + ((size_t) s * max_t_ + t) * HC * N;   // HC streams of N, stream-major
+            uint16_t* o = row.data() + ((size_t) t * L + s) * N;
+            for (int64_t i = 0; i < N; ++i) {
+                float m = 0.0f;
+                for (int64_t h = 0; h < HC; ++h) m += r[h * N + i];
+                m /= (float) HC;
+                uint32_t b;
+                std::memcpy(&b, &m, 4);
+                b += 0x7fffu + ((b >> 16) & 1u);   // bf16, round to nearest even (the values are finite: the NaN guard reports otherwise)
+                o[i] = (uint16_t) (b >> 16);
+            }
+        }
+    std::vector<int32_t> picks((size_t) T);
+    for (int t = 0; t < T; ++t) picks[(size_t) t] = ((const volatile int32_t*) out)[t];
+    std::lock_guard<std::mutex> lk(d.mu);
+    if (d.f == nullptr) return;
+    if (!d.header) {
+        const uint32_t hdr[4] = {0x31544644u /* "DFT1" */, (uint32_t) L, (uint32_t) N, (uint32_t) HC};
+        std::fwrite(hdr, 4, 4, d.f);
+        std::fwrite(d.layers.data(), 4, d.layers.size(), d.f);
+        d.header = true;
+    }
+    const int32_t t32 = T;
+    std::fwrite(&pos0, 8, 1, d.f);
+    std::fwrite(&t32, 4, 1, d.f);
+    std::fwrite(tokens, 4, (size_t) T, d.f);
+    std::fwrite(picks.data(), 4, (size_t) T, d.f);
+    std::fwrite(row.data(), 2, row.size(), d.f);
+    std::fflush(d.f);
 }
 
 bool Verifier::pl_commit_async(int n_keep, std::string& err) {

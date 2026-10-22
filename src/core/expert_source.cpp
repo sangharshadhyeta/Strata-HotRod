@@ -2783,6 +2783,50 @@ void RouterLookahead::set_foresight(ForesightSwap* fs) {
     }
 }
 
+bool load_la_model_host(const char* path, int64_t n_layers, int64_t n_embd, std::vector<std::vector<uint16_t>>& w,
+                        std::vector<std::vector<float>>& b, std::string& msg) {
+    w.clear();
+    b.clear();
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) { msg = std::string("cannot open ") + path; return false; }
+    uint32_t hdr[4] = {0, 0, 0, 0};
+    if (std::fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != 0x314D414Cu /* "LAM1" */ || (int64_t) hdr[1] != n_layers ||
+        hdr[2] != 512u || (int64_t) hdr[3] != n_embd) {
+        std::fclose(f);
+        msg = "not an LAM1 file for this model (layers, 512 experts, hidden size)";
+        return false;
+    }
+    const size_t per_w = (size_t) 512 * (size_t) n_embd;
+    w.resize((size_t) n_layers);
+    b.resize((size_t) n_layers);
+    bool ok = true;
+    int64_t n = 0;
+    for (int64_t l = 0; l < n_layers && ok; ++l) {
+        uint8_t present = 0;
+        ok = std::fread(&present, 1, 1, f) == 1;
+        if (!ok || present == 0) continue;
+        w[(size_t) l].resize(per_w);
+        b[(size_t) l].resize(512);
+        ok = std::fread(w[(size_t) l].data(), sizeof(uint16_t), per_w, f) == per_w &&
+             std::fread(b[(size_t) l].data(), sizeof(float), 512, f) == 512;
+        n += ok ? 1 : 0;
+    }
+    std::fclose(f);
+    if (!ok) {
+        w.clear();
+        b.clear();
+        msg = "the file is cut short";
+        return false;
+    }
+    msg = std::to_string(n) + " layers, " + std::to_string((uint64_t) n * (per_w * 2 + 512 * 4) >> 20) + " MiB of RAM";
+    return true;
+}
+
+void RouterLookahead::set_model(std::vector<std::vector<uint16_t>> w, std::vector<std::vector<float>> b) {
+    model_w_ = std::move(w);
+    model_b_ = std::move(b);
+}
+
 bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k,
                             ExpertSource* src, std::string& err, bool allow_cold_source) {
     if (src == nullptr || (!allow_cold_source && !src->warms())) { err = "RouterLookahead: the expert source does not warm"; return false; }
@@ -2798,6 +2842,11 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     for (int j = 0; j < 2; ++j) {
         pred_[j].assign(routers_.size() * (size_t) n_expert, 0);
         pred_valid_[j].assign(routers_.size(), 0);
+    }
+    // set_model's predictors are 512 x n_embd per layer (load_la_model_host checked n_embd): another shape keeps the routers
+    if (!model_w_.empty() && (model_w_.size() != routers_.size() || model_b_.size() != routers_.size() || n_expert != 512)) {
+        model_w_.clear();
+        model_b_.clear();
     }
     thread_ = std::thread([this] {
         strata::aux_cpus::pin_current_thread();
@@ -2964,20 +3013,22 @@ void RouterLookahead::run() {
         // AVX-only Xeon E5-2687W died here (vpmovzxwd) on its first request.  An estimate only (which experts to
         // prefetch); the order of the additions differs between the three, the output does not depend on it.
         // (the multi-token dots take at most 8 tokens a call: more tokens, as the prompt path sends, go in runs of 8)
+        // STRATA_LA_MODEL (set_model): the next layer's guess from its trained predictor and bias, on this input as it was trained
+        const bool use_model = dj == 0 && !model_w_.empty() && !model_w_[(size_t) layer].empty();
+        const uint16_t* rw = use_model ? model_w_[(size_t) layer].data() : routers_[(size_t) layer].data();
         if (strata::kernels::cpu::cpu_avx2_ok()) {
             for (int64_t t0 = 0; t0 < nt; t0 += 8)
-                strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
+                strata::kernels::cpu::bf16_rows_dot_multi(rw, (int) n_expert_, (int) n_embd_,
                                                           x_.data() + (size_t) t0 * (size_t) n_embd_, (int) std::min<int64_t>(8, nt - t0),
                                                           logits.data() + (size_t) t0 * (size_t) n_expert_);
         } else if (strata::kernels::cpu::cpu_avx1_ok()) {
             for (int64_t t0 = 0; t0 < nt; t0 += 8)
-                strata::kernels::cpu::bf16_rows_dot_multi_avx1(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
+                strata::kernels::cpu::bf16_rows_dot_multi_avx1(rw, (int) n_expert_, (int) n_embd_,
                                                                x_.data() + (size_t) t0 * (size_t) n_embd_, (int) std::min<int64_t>(8, nt - t0),
                                                                logits.data() + (size_t) t0 * (size_t) n_expert_);
         } else {
             // a mul and an add, not std::fma: without an FMA instruction that is a libm call per element (74x
             // slower on a Xeon E5-2665, measured by the fork)
-            const uint16_t* rw = routers_[(size_t) layer].data();
             for (int64_t r = 0; r < n_expert_; ++r) {
                 const uint16_t* wr = rw + (size_t) r * (size_t) n_embd_;
                 for (int64_t t = 0; t < nt; ++t) {
@@ -2992,6 +3043,11 @@ void RouterLookahead::run() {
                     logits[(size_t) t * (size_t) n_expert_ + (size_t) r] = acc;
                 }
             }
+        }
+        if (use_model) {
+            const float* bias = model_b_[(size_t) layer].data();
+            for (int64_t t = 0; t < nt; ++t)
+                for (int64_t e = 0; e < n_expert_; ++e) logits[(size_t) (t * n_expert_ + e)] += bias[e];
         }
         const int kmax = stats_on_ ? (int) std::min<int64_t>(k_ + 10, n_expert_) : k_;
         const int ks[3] = {k_, (int) std::min<int64_t>(k_ + 4, n_expert_), kmax};
@@ -5268,6 +5324,8 @@ namespace {
 // decode window, the layer's router input (bf16) and the experts the router chose.  It is the training and scoring data for expert predictors
 // (tools/predictor/).  File: u32 "RTR1", then records  u32 step | u16 layer | u8 n_tok | u8 k | per token: u16[H] bf16 input, i16[k] ids (rank order).
 // `step` counts windows (it advances at layer 0).  Run with the stand-ins OFF (no STRATA_ROUTE_RESIDENT) so `ids` are the model's own top-k.
+// Token records (router_trace_tokens, written when the verifier launches a window, so before that window's layer-0 record):
+// u32 0 | u16 0xFFFF | u8 n_tok | u8 0 | i32[n_tok] token ids.  Readers that predate them stop at the first one (its size differs).
 struct RouterTrace {
     std::mutex mu;
     FILE* f = nullptr;
@@ -5322,6 +5380,21 @@ void router_trace_write(int64_t layer, const float* x_f, const int32_t* ids, int
     if ((++t.calls & 0x3ffu) == 0) std::fflush(t.f);
 }
 }  // namespace
+
+void router_trace_tokens(const int32_t* tokens, int64_t n_tok) {
+    if (!router_trace_on() || tokens == nullptr || n_tok < 1 || n_tok > 255) return;
+    RouterTrace& t = router_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    if (t.f == nullptr) return;
+    const uint32_t zero = 0;
+    const uint16_t marker = 0xFFFFu;
+    const uint8_t nt = (uint8_t) n_tok, kk = 0;
+    std::fwrite(&zero, 4, 1, t.f);
+    std::fwrite(&marker, 2, 1, t.f);
+    std::fwrite(&nt, 1, 1, t.f);
+    std::fwrite(&kk, 1, 1, t.f);
+    std::fwrite(tokens, 4, (size_t) n_tok, t.f);
+}
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {

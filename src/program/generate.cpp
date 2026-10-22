@@ -6911,6 +6911,18 @@ int main(int argc, char** argv) {
                 const char* rr = std::getenv("STRATA_RING_RANKS");
                 la_k = std::max(1, std::min(10, rr != nullptr ? std::atoi(rr) : 2));
             }
+            // STRATA_LA_MODEL (opt-in) on this look-ahead too: the prompt path's guesses (and the CPU decode path's) come from the same
+            // trained next-layer predictors as the GPU look-ahead's; STRATA_LA_MODEL_CPU=0 keeps the routers here (the A/B arm)
+            if (const char* lam = std::getenv("STRATA_LA_MODEL"); ok && lam != nullptr && lam[0] != '\0' &&
+                [] { const char* v = std::getenv("STRATA_LA_MODEL_CPU"); return v == nullptr || std::atoi(v) != 0; }()) {
+                std::vector<std::vector<uint16_t>> lam_w;
+                std::vector<std::vector<float>> lam_b;
+                std::string msg;
+                const bool lam_ok = strata::core::load_la_model_host(lam, g.n_layers, g.n_embd, lam_w, lam_b, msg);
+                if (lam_ok) lookahead.set_model(std::move(lam_w), std::move(lam_b));
+                std::fprintf(stderr, "strata generate: STRATA_LA_MODEL %s on the CPU look-ahead (prompt path): %s%s\n", lam,
+                             lam_ok ? "loaded, " : "NOT loaded (the routers stay its guess): ", msg.c_str());
+            }
             if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, la_k, srcp, err, fs_ahead || la_stats)) {
                 drive.d.lookahead = &lookahead;
                 if (la_stats) lookahead.enable_stats(g.n_layers);
@@ -6918,7 +6930,8 @@ int main(int argc, char** argv) {
                     lookahead.set_depth(std::atoi(dv));
                 else if ((srcp == &src && src.io_prefetch()) || ring_on)
                     lookahead.set_depth(2);   // the ring fills the layer after next: the next one's router may already have run
-                std::fprintf(stderr, "strata generate: routing-aware prefetch on (the next layer's router%s)\n",
+                std::fprintf(stderr, "strata generate: routing-aware prefetch on (%s%s)\n",
+                             lookahead.has_model() ? "the next layer's trained predictor, STRATA_LA_MODEL" : "the next layer's router",
                              fs_ahead ? ", feeding the Foresight swap space" : ", file tier");
             } else {
                 (void) cudaGetLastError();

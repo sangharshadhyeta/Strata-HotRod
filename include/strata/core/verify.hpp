@@ -672,6 +672,9 @@ private:
     float* loop_f0_ = nullptr;   // STRATA_GDN_LOOP_NORM: pass 0's F_0 (the norm target); zero-sized otherwise
     float *loop_R_ = nullptr, *loop_R2_ = nullptr, *loop_qkv_ = nullptr, *loop_h_ = nullptr, *loop_gate_ = nullptr;
     float *loop_beta_ = nullptr, *loop_z_ = nullptr, *loop_y_ = nullptr;
+    // STRATA_DRAFT_TRACE (measurement only; zero-sized when off): the window's residual after each traced layer, [layer][max_t][hc * n_embd]
+    float* dtr_ = nullptr;
+    void draft_trace_write(int T, const int32_t* tokens, int64_t pos0, const int32_t* out);
     float *loop_st_ = nullptr;   // one GDN layer's state + conv history before a one-token window's pass 0 (the looped passes
                                  // read it; pass 0 self-commits); one buffer: the looped layers are recorded one after another
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;

@@ -284,6 +284,12 @@ public:
     /// (ForesightSwap::predict), which copies them to VRAM ahead of the layer.  nullptr detaches it (waits for a
     /// prediction in progress), so the swap space can be destroyed first.
     void set_foresight(ForesightSwap* fs);
+    /// STRATA_LA_MODEL on the CPU look-ahead (the prompt path's and the CPU decode path's): `w[l]` (bf16, n_expert rows of n_embd)
+    /// and `b[l]` (n_expert floats) are the trained predictor of layer l from layer l - 1's MoE input (load_la_model_host).  The
+    /// next-layer guess (depth 0) then takes them instead of layer l's router; an empty `w[l]` keeps the router, as do the deeper
+    /// guesses (the predictors look one layer ahead).  Call before start(): the thread reads them without a lock.
+    void set_model(std::vector<std::vector<uint16_t>> w, std::vector<std::vector<float>> b);
+    bool has_model() const { return !model_w_.empty(); }
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
     void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
@@ -316,6 +322,8 @@ private:
     std::vector<uint8_t> pred_[2];                  ///< [j][layer * n_expert + e]
     std::vector<uint8_t> pred_valid_[2];            ///< [j][layer]
     std::vector<std::vector<uint16_t>> routers_;
+    std::vector<std::vector<uint16_t>> model_w_;   ///< set_model: [layer] bf16 n_expert x n_embd, empty = the router
+    std::vector<std::vector<float>> model_b_;      ///< set_model: [layer] n_expert floats
     int64_t n_embd_ = 0, n_expert_ = 0;
     int k_ = 10;
     int depth_ = 1;
@@ -345,6 +353,13 @@ private:
     uint64_t st_vhit_[3] = {0, 0, 0}, st_vpred_[3] = {0, 0, 0}, st_pch_ = 0, st_pcov_[3] = {0, 0, 0};
     static constexpr int kVoteN = 16;
 };
+
+/// STRATA_LA_MODEL's file (tools/predictor/export_la_model.py, "LAM1") read into host memory for RouterLookahead::set_model:
+/// `w[l]` empty where the file has no predictor for layer l (layer 0 never has one).  False, with the reason in `msg`, for a file
+/// of another model (layers, 512 experts, hidden size) or one cut short.  The GPU look-ahead loads the same file on the device
+/// (kernels::route_pred_model_load).
+bool load_la_model_host(const char* path, int64_t n_layers, int64_t n_embd, std::vector<std::vector<uint16_t>>& w,
+                        std::vector<std::vector<float>>& b, std::string& msg);
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
 /// after the ring and published before the CPU starts its own share.  Groups of entries that share a blob; the
@@ -650,6 +665,10 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
+/// STRATA_ROUTER_TRACE (measurement only): the window's token ids, written as their own record before the window's layer-0 record
+/// (tools/predictor/trace_reader.py pairs them in order and checks the row count).  The verifier calls it as it launches a window;
+/// a no-op when the trace is off.
+void router_trace_tokens(const int32_t* tokens, int64_t n_tok);
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);

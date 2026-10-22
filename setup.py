@@ -26,7 +26,7 @@ at least 1 - an explicit --rope-scaling none is refused for such a context), --v
 8080, --yes (recommended
 answers, no questions), --setup (install another model / change settings instead of starting), --no-start,
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
-(EXPERIMENTAL, off by default),
+(EXPERIMENTAL, off by default), --expert-predictor on|off (the published expert predictors for the look-ahead; off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
 engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM),
 --kv-streaming on|off|auto.
@@ -2374,6 +2374,54 @@ def hotrod_default_env(family: str, model: str, hip: bool) -> dict:
             "STRATA_SWAP2_MAX": "2", "STRATA_SWAP2_GAP": "1", "STRATA_KV_GROW_INIT": "4096"}
 
 
+# --expert-predictor on (opt-in, off by default; NOT measured on the engine yet): the published per-layer linear expert
+# predictors (aswinkumar99/qwen3.8-flash-next-expert-traces, CC-BY-4.0; tools/predictor/README.md: the true rank 0-1 experts in the
+# top 4 for 89.4% of tokens, against 74.4% for the next layer's router) as the engine's STRATA_LA_MODEL file.  The look-ahead then
+# guesses the next layer's experts with them, in decode and while a prompt is read; the router still decides every expert, so only
+# the speed can change.  Trained on the original Qwen3.8-Flash-Next (its NVFP4 checkpoint), so offered for the families that are it.
+LA_MODEL = ROOT / "data" / "expert-predictor" / "la_model.bin"
+LA_MODEL_REPO, LA_MODEL_REV = "aswinkumar99/qwen3.8-flash-next-expert-traces", "13969e686ba033c9222e2696c59b0cf091297ad9"   # 2026-10-23
+LA_MODEL_TAR = "compact/heads/197/197_models_d48_linear.tar"
+LA_MODEL_SHA = "92d8a164c134950154939715443648d1cbef9efcfa074f2af5b644241d3046d2"
+LA_MODEL_FAMILIES = ("qwen", "unsloth", "nvfp4")
+
+
+def expert_predictor_choice(flag: str | None, cfg_path: Path) -> str:
+    """'off', 'on' or a path: --expert-predictor as given, else what this model's config chose before (a setup run again keeps it)."""
+    if flag:
+        v = flag.strip()
+        return "off" if v.lower() in ("off", "no", "n", "0") else "on" if v.lower() in ("on", "yes", "y", "1") else v
+    try:
+        old = (json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("env") or {}).get("STRATA_LA_MODEL")
+    except (OSError, ValueError, AttributeError):
+        old = None
+    if not old:
+        return "off"
+    return "on" if Path(old) == LA_MODEL else old
+
+
+def fetch_expert_predictor(env) -> Path:
+    """data/expert-predictor/la_model.bin, made once: the published tar (774 MB, SHA-256 checked) converted by
+    tools/predictor/export_la_model.py (no torch needed), then the tar is deleted."""
+    if LA_MODEL.is_file() and done(LA_MODEL):
+        ok("expert predictor already prepared")
+        return LA_MODEL
+    tar = LA_MODEL.parent / Path(LA_MODEL_TAR).name
+    say("  The expert predictor (aswinkumar99's published per-layer predictors, CC-BY-4.0): a 774 MB download, once.")
+    download(f"{hf_endpoint()}/datasets/{LA_MODEL_REPO}/resolve/{LA_MODEL_REV}/{LA_MODEL_TAR}", tar, "expert predictor")
+    h = hashlib.sha256()
+    with open(tar, "rb") as f:
+        while b := f.read(16 << 20):
+            h.update(b)
+    if h.hexdigest() != LA_MODEL_SHA:
+        drop_archive(tar)
+        fail(f"the expert predictor's download has the wrong SHA-256 ({h.hexdigest()})", "run setup again (the download restarts)")
+    run([sys.executable, str(ROOT / "tools" / "predictor" / "export_la_model.py"), str(tar), str(LA_MODEL)], env=env)
+    mark(LA_MODEL)
+    drop_archive(tar)
+    return LA_MODEL
+
+
 def menu_families(hip: bool) -> list:
     """The families the model menu lists, in menu order.  The NVFP4 packs run on NVIDIA cards only (the AMD and Intel
     engines have no NVFP4 kernels), so on those the menu does not offer them; `--family nvfp4` still says why not."""
@@ -4564,7 +4612,7 @@ SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", 
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
                        "STRATA_ROUTE_TAIL_SKIP", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_RESIDENT_RANKS", "STRATA_SWAP2_MAX",
                        "STRATA_SWAP2_GAP", "STRATA_KV_GROW_INIT", "STRATA_ROUTE_RESIDENT_EDGE", "STRATA_ROUTE_RAM_FLOOR",
-                       "STRATA_ROUTE_RAM_FLOOR_ANYTIER", "STRATA_ROUTE_RAM_FLOOR_RANK0"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
+                       "STRATA_ROUTE_RAM_FLOOR_ANYTIER", "STRATA_ROUTE_RAM_FLOOR_RANK0", "STRATA_LA_MODEL"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
 # (0.1.44 dropped them with the rest of SETUP_ENV).
@@ -6060,6 +6108,10 @@ def main() -> int:
     ap.add_argument("--experimental-speed-projection", metavar="on|off|GGUF",
                     help="EXPERIMENTAL, off by default: the control vector in data/experimental-speed-projection "
                          "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
+    ap.add_argument("--expert-predictor", metavar="on|off|FILE",
+                    help="off by default (not measured yet): the published expert predictors as the look-ahead's next-layer "
+                         "guess (STRATA_LA_MODEL; a 774 MB download, once); a FILE is an export_la_model.py output. "
+                         "A setup run again without it keeps the earlier choice")
     ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8080 for a new one)")
     ap.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (AMD: as setup lists them) (default: asked when several can be "
                                   "used; with --setup it is saved, when starting it is for that start only)")
@@ -6878,6 +6930,18 @@ def main() -> int:
     ok(f"MTP draft layer: {rt}")
     for line in draft_vocab_note(gpu.get("vram_gb", 0.0), draft_vocab):   # #474: a recommendation, nothing changes
         say("  " + line)
+    # --expert-predictor (opt-in): the look-ahead's next-layer guess from the published predictors (LA_MODEL above)
+    la_model = None
+    la_choice = expert_predictor_choice(a.expert_predictor, ROOT / f"strata-{tag.lower()}.json")
+    if la_choice != "off" and family not in LA_MODEL_FAMILIES:
+        warn(f"the expert predictor was trained on the original Qwen3.8-Flash-Next, not {fam['title']}: left off")
+    elif la_choice == "on":
+        la_model = fetch_expert_predictor(env)
+    elif la_choice != "off":
+        la_model = Path(la_choice).expanduser().resolve()
+        if not la_model.is_file():
+            fail(f"the expert predictor file is missing: {la_model}")
+    ok("expert predictor: " + (f"ON, {la_model} (not measured yet)" if la_model else "off"))
 
     # ---- 7. the start script
     step(7, "writing the start script")
@@ -7063,6 +7127,8 @@ def main() -> int:
         cfg["cuda"] = 12
     if (uenv := unsloth_default_env(family, model, hip, in_budget)):
         cfg["env"] = uenv
+    if la_model is not None:                           # --expert-predictor
+        cfg.setdefault("env", {})["STRATA_LA_MODEL"] = str(la_model)
     if (henv := hotrod_default_env(family, model, hip)):
         cfg["env"] = {**(cfg.get("env") or {}), **henv}
         # the measured setup's PCIe share: none (the engine's 0.55 default for a native pack was not what was measured)
