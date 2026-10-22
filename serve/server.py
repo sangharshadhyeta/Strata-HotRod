@@ -4465,6 +4465,8 @@ class Service:
                                        "reused": 0, "timings": None, "reasoning_tokens": 0, "reasoning_recoveries": 0}
                         return
                     warm["running"] = True
+                body_ok = False                          # the generation below ran to its end (no exception)
+                save_later = None                        # the prompt cache's save, run after the reply's end is out
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -4757,6 +4759,7 @@ class Service:
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
+                    body_ok = True
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -4843,17 +4846,31 @@ class Service:
                             if (not emb and finish in ("stop", "length") and not cancel.is_set()
                                     and len(segments) == 1 and not recovery_count):
                                 # one plain pass: the engine holds the prompt and what it wrote; a long read is saved while the fifo is held
-                                try:
-                                    note = self.pcache.after(self.engine, ids, raw_ids, pc_read, save=not warm)   # a warm saves nothing
-                                    if note:
-                                        print(f"[strata] {note}", flush=True)
-                                except Exception as e:
-                                    print(f"[strata] prompt cache (after): {e!r}", flush=True)
+                                def pcache_after():
+                                    try:
+                                        note = self.pcache.after(self.engine, ids, raw_ids, pc_read, save=not warm)   # a warm saves nothing
+                                        if note:
+                                            print(f"[strata] {note}", flush=True)
+                                    except Exception as e:
+                                        print(f"[strata] prompt cache (after): {e!r}", flush=True)
+                                if body_ok and not warm:
+                                    save_later = pcache_after   # a save writes 0.5-1+ GB: after the reply's end (below)
+                                else:
+                                    pcache_after()
                             else:
                                 # several passes (a thinking budget's wrap-up), a recovery, a cancel or an error: the engine holds a
                                 # sequence this server does not keep exactly (the last pass's prompt and its generated ids are not the
                                 # entry's list), so the holding recorded before is no longer true and is not trusted by the next request
                                 self.pcache.held = None
+                if save_later is not None:
+                    # the save goes to a thread that keeps the turn: the reply's end (finish, usage, [DONE] /
+                    # message_stop) goes out now instead of after a 0.5-3 s write, and the next request still waits for it
+                    held = turn.pop_all()
+
+                    def save_then_release():
+                        with held:
+                            save_later()
+                    threading.Thread(target=save_then_release, name="prompt-cache-save", daemon=True).start()
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
@@ -5385,6 +5402,7 @@ class BadBody(Exception):
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
+        disable_nagle_algorithm = True                      # each SSE chunk is a small write: send it now, not after the last ACK
 
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher

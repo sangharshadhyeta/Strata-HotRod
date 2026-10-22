@@ -98,11 +98,38 @@ class PromptCache:
 
     @staticmethod
     def _prefix_len(a: list[int], b: list[int]) -> int:
+        """Length of the longest common prefix, by slices (C speed) rather than a loop over tokens (strata_tokenizer's
+        common_prefix_len, for lists): a 60K-token compare 2.1 ms -> under 1 ms, and it runs per entry on every request."""
         n = min(len(a), len(b))
-        i = 0
-        while i < n and a[i] == b[i]:
-            i += 1
-        return i
+        lo, step = 0, 4096
+        while lo < n:                                       # whole chunks first, doubling
+            hi = min(n, lo + step)
+            if a[lo:hi] != b[lo:hi]:
+                break
+            lo, step = hi, min(step * 2, 1 << 20)
+        else:
+            return n
+        while hi - lo > 1:                                  # the first difference is in [lo, hi): bisect it
+            mid = (lo + hi) // 2
+            if a[lo:mid] == b[lo:mid]:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def _turn_at(self, e: dict) -> int:
+        """The position of an entry's last turn token (0: none, or whole entries only), found once per entry."""
+        k = e.get("turn_at")
+        if k is None:
+            t = e["tokens"]
+            k = 0
+            if self.turn_id is not None:
+                try:
+                    k = len(t) - 1 - t[::-1].index(self.turn_id)
+                except ValueError:
+                    pass
+            e["turn_at"] = k
+        return k
 
     def _engine_reuse(self, ids: list[int], gen) -> int:
         """How many tokens of `ids` the engine already holds (a hint): all of what it holds when that starts the prompt, else none
@@ -124,7 +151,10 @@ class PromptCache:
         best_key, best_len = None, 0
         for key, e in self.entries.items():
             t = e["tokens"]
-            if len(t) < len(ids) and len(t) > best_len and self._prefix_len(t, ids) == len(t):
+            if len(t) <= best_len:        # neither the whole entry nor its turn (shorter) can beat the best
+                continue
+            p = self._prefix_len(t, ids)   # once per entry: both checks below read it
+            if len(t) < len(ids) and p == len(t):
                 best_key, best_len = key, len(t)
             # 20 Oct: a reasoning model's next turn does not repeat the reasoning the engine generated (the template drops it
             # from the history), so a whole entry is never the start of it - but its turn is, and the saved session carries
@@ -132,8 +162,8 @@ class PromptCache:
             # reuse (the engine checks the tokens itself), never a wrong answer.
             # the engine's turn checkpoint holds the tokens before the entry's last <|im_start|> (the end of the user's turn;
             # server.py pick_slot's held_prefix uses the same rule) - an id-equality on the model's own control token
-            k = (len(t) - 1 - t[::-1].index(self.turn_id)) if self.turn_id is not None and self.turn_id in t else 0
-            if 0 < k < len(ids) and k > best_len and self._prefix_len(t[:k], ids) == k:
+            k = self._turn_at(e)
+            if 0 < k < len(ids) and k > best_len and p >= k:
                 best_key, best_len = key, k
         if best_key is None or best_len - have < self.min_gain:
             return None
