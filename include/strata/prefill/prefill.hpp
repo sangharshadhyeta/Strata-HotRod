@@ -104,6 +104,9 @@ public:
     /// position the run has reached in that layer's pass, pos0 + n * (layer + 1) / n_layers (host-side issue, not a GPU
     /// wait).  Empty (the default): nothing.  Not on_chunk's semantics (on_chunk still hands rows over at the tail).
     static void set_on_layer_pass(std::function<void(int64_t)> fn);
+    /// True while a layer-major run reports its chunks (on this thread): every layer has read EVERY chunk by then, so the
+    /// session state belongs to the end of the run, not to the reported chunk - no checkpoint may be labelled with a chunk's end.
+    static bool reporting_after_layers();
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk

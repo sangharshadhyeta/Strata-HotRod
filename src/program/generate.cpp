@@ -9870,10 +9870,14 @@ int main(int argc, char** argv) {
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
-            const bool periodic_checkpoint = o.prompt_cache_every > 0 && done >= pp_next_check;
+            // a layer-major run reports its chunks after every layer read every chunk: the session holds the whole run's state
+            // then, so a checkpoint here would label it with this chunk's tokens (a later prompt sharing only that prefix would
+            // continue from state that already read the rest - wrong tokens).  None then; the run's own cuts still get theirs.
+            const bool after_layers = strata::prefill::Prefill::reporting_after_layers();
+            const bool periodic_checkpoint = !after_layers && o.prompt_cache_every > 0 && done >= pp_next_check;
             // Keep the prefill's existing chunk geometry. One extra near-tail checkpoint
             // can serve a branch whose shared prefix ends before the final cached state.
-            const bool tail_checkpoint = o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 &&
+            const bool tail_checkpoint = !after_layers && o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 &&
                 !multi_gpu && !pp_tail_saved && pp_total - done > std::max<int64_t>(1, o.short_read) &&
                 pp_total - done <= T;   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
             if (periodic_checkpoint || tail_checkpoint) {

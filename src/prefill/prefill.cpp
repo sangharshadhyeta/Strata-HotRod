@@ -2170,6 +2170,8 @@ static std::function<uint64_t(uint64_t)> g_ram_give_back;
 static std::function<void(int64_t)> g_on_layer_pass;
 void Prefill::set_ram_give_back(std::function<uint64_t(uint64_t)> fn) { g_ram_give_back = std::move(fn); }
 void Prefill::set_on_layer_pass(std::function<void(int64_t)> fn) { g_on_layer_pass = std::move(fn); }
+static thread_local bool t_reporting_after_layers = false;
+bool Prefill::reporting_after_layers() { return t_reporting_after_layers; }
 
 // --prefill-pipe (opt-in; STRATA_PREFILL_PIPE): a layer split reads a prompt as a pipeline - stage s reads chunk c while
 // stage s+1 reads chunk c-1. A stage-chunk costs its layers x (b + a C): a fixed part per chunk (b: the pass over the
@@ -2678,6 +2680,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const bool forced_single = force_single_, forced_planned = force_planned_;
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // a run that ends early (an error or a cancel: `err` is set, it was cleared above) waits for its queued GPU work before the
+    // caller moves on: copies into the lent slots or writes of the loan's buffers still queued would land on the experts the
+    // caller refills into those slots right after.  A run that succeeds keeps its overlap (destroyed before on_device: the
+    // device is still current)
+    struct DrainOnError {
+        Impl& m;
+        const std::string& err;
+        ~DrainOnError() {
+            if (err.empty()) return;
+            for (cudaStream_t s : {m.cs, m.copy, m.gs[0], m.gs[1]})
+                if (s != nullptr) (void) cudaStreamSynchronize(s);
+        }
+    } drain_on_error{m, err};
     const core::ModelGeometry& g = *m.g;
     // STRATA_PROMPT_TAIL: this run's last chunk's routing starts from zero (see prompt_tail_on)
     tail_tokens_ = 0;
@@ -5491,9 +5506,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             lmh.map_shared = true;
             lm_cap = (size_t) m.lm_map_bytes;
             lm_map_src = "borrowed";
-        } else {
-            // the expert map: as much of the device as the first try gets (a layer's experts that do not fit stream as before)
-            for (const size_t want : {(size_t) 700 << 20, (size_t) 256 << 20}) {
+        } else if (const size_t budget = (size_t) lm_map_budget(); budget != 0) {
+            // the expert map: as much of the device as the first try gets (a layer's experts that do not fit stream as before),
+            // sized from STRATA_PREFILL_LM_MAP_MIB (=0: no map at all - it used to mean a fixed 700 MiB cudaMalloc here instead)
+            for (const size_t want : {budget, std::min(budget, (size_t) 256 << 20)}) {
                 if (cudaMalloc((void**) &lmh.map, want) == cudaSuccess) {
                     lm_cap = want;
                     lm_map_src = "cudaMalloc";
@@ -5561,8 +5577,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
         }
         lm_on = false;
-        for (int64_t ci = 0; ci < nch; ++ci)
-            if (!run_chunk(ci * C, PH_TAIL, 0)) return false;
+        {
+            // the chunks report now, after every layer read every chunk: the caller's mid-run checkpoints would save the state
+            // of the whole run under a chunk's tokens (reporting_after_layers tells it; reset however the loop ends)
+            struct AfterLayers {
+                AfterLayers() { t_reporting_after_layers = true; }
+                ~AfterLayers() { t_reporting_after_layers = false; }
+            } after_layers;
+            for (int64_t ci = 0; ci < nch; ++ci)
+                if (!run_chunk(ci * C, PH_TAIL, 0)) return false;
+        }
         std::fprintf(stderr, "strata prefill: layer-major: %lld chunks, %lld layers, %lld experts streamed, %lld reused from "
                              "the layer map (%.0f MB, %s)\n", (long long) nch, (long long) g.n_layers,
                      (long long) (stats_.experts_streamed - streamed0), (long long) lm_reused, lm_cap / 1048576.0,
