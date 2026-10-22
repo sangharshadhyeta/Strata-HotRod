@@ -408,6 +408,9 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         for (int i = 0; i < n_keep; ++i)
             if (sel_logit[i] < thresh) { n_keep = i; break; }
     }
+    // a +inf logit (a logit_bias that forces a token) is the pick: inf - inf is NaN, every probability would be NaN and the
+    // draw would fall through to the LAST kept candidate.  With one kept, the draw below can only take it.
+    if (isinf(sel_logit[0]) && sel_logit[0] > 0.0f) n_keep = 1;
     // temperature only: the penalties were applied once, before the selection (issue #53: they were applied a
     // second time here, after the temperature scaling - llama.cpp's chain has one penalties stage)
     auto scaled = [&](int i) { return sel_logit[i] * inv_t; };
@@ -516,6 +519,9 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
         for (int i = 0; i < n_keep; ++i)
             if (sel_logit[i] < thresh) { n_keep = i; break; }
     }
+    // a +inf logit forces its token (see sampler_kernel): one kept, probability 1 (the same for every lane: warp-uniform)
+    const bool forced = isinf(sel_logit[0]) && sel_logit[0] > 0.0f;
+    if (forced) n_keep = 1;
     // temperature, then one Philox draw
     float smx = sel_logit[0] * inv_t;
     for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i] * inv_t);
@@ -527,6 +533,8 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
     sum = __shfl_sync(kFullMask, sum, 0);
     __syncwarp();
     for (int i = lane; i < n_keep; i += 32) ex[i] = ex[i] / sum;
+    __syncwarp();
+    if (forced && lane == 0) ex[0] = 1.0;
     __syncwarp();
     if (lane == 0) {
         int pi = n_keep > 0 ? n_keep - 1 : 0;
@@ -920,6 +928,9 @@ __device__ int sampled_probs_warp(const float* sel_logit, int k, const SamplerPa
         for (int i = 0; i < n_keep; ++i)
             if (sel_logit[i] < thresh) { n_keep = i; break; }
     }
+    // a +inf logit forces its token (see sampler_kernel): one kept, probability 1, not NaN
+    const bool forced = isinf(sel_logit[0]) && sel_logit[0] > 0.0f;
+    if (forced) n_keep = 1;
     float smx = sel_logit[0] * inv_t;
     for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i] * inv_t);
     for (int i = lane; i < n_keep; i += 32) ex[i] = exp((double) (sel_logit[i] * inv_t) - (double) smx);
@@ -930,6 +941,8 @@ __device__ int sampled_probs_warp(const float* sel_logit, int k, const SamplerPa
     sum = __shfl_sync(kFullMask, sum, 0);
     __syncwarp();
     for (int i = lane; i < n_keep; i += 32) ex[i] = ex[i] / sum;
+    __syncwarp();
+    if (forced && lane == 0) ex[0] = 1.0;
     __syncwarp();
     return n_keep;
 }

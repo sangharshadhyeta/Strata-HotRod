@@ -258,6 +258,20 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 // logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
 // stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
 static unsigned long long* g_detail = nullptr;   // the decode rows' detail counters (route_detail_alloc), see below
+// The router's device scratch (the look-ahead's logits and weights, its skip counter, the ring flags, and the want / rows / repl /
+// detail counters) is allocated once, on the GPU of the first verifier that asks.  A multi-GPU layer split's other stages run on
+// other GPUs: there these buffers are another device's memory (an illegal address without peer access, a shared scratch with it),
+// so their accessors answer null on any other GPU and the stage runs without them (as with the features off).
+static int g_scratch_dev = -1;
+static void note_scratch_dev() {
+    if (g_scratch_dev < 0 && cudaGetDevice(&g_scratch_dev) != cudaSuccess) { (void) cudaGetLastError(); g_scratch_dev = -1; }
+}
+static bool scratch_here() {
+    if (g_scratch_dev < 0) return true;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    return dev == g_scratch_dev;
+}
 //
 // One warp per token (upstream 0.1.45's form).  This was one THREAD per token scanning all 512 experts for every rank (4 ranks x 512 x 12 scalar
 // ops on up to 6 threads, on the critical stream, once per layer): upstream measured the swap at 2.2-2.75 ms of a 19-22 ms window and 0.33 ms in
@@ -329,7 +343,9 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                     bool used = false;
                     for (int q = 0; q < r; ++q) used |= pick[q] == f;
                     const float s = l[f] + (res[f] >= 0 ? bias : 0.f);
-                    if (!used && s > bs) { bs = s; best = f; }
+                    // (best < 0: the first unused expert is taken even when every score is NaN or -inf - else best stayed -1
+                    // and l[-1] / res[-1] were read)
+                    if (!used && (best < 0 || s > bs)) { bs = s; best = f; }
                 }
                 pick[r] = best;
             }
@@ -542,6 +558,7 @@ void route_pred_alloc(int64_t n_layers) {
         return;
     }
     for (size_t i = 0; i < n; ++i) g_pred_host[i] = -1;
+    note_scratch_dev();
 }
 bool route_pred_active() { return g_pred_host != nullptr; }
 const int32_t* route_pred_host() { return g_pred_host; }
@@ -586,10 +603,11 @@ void route_pred_edge_skip_alloc() {
     if (g_pred_skip != nullptr) return;
     if (cudaMalloc((void**) &g_pred_skip, sizeof(unsigned long long)) != cudaSuccess) { cudaGetLastError(); g_pred_skip = nullptr; return; }
     cudaMemset(g_pred_skip, 0, sizeof(unsigned long long));
+    note_scratch_dev();
 }
 void route_pred_edge_skip(const float* pred_logits, int32_t* pred_ids, const int32_t* res_layer, int n_tok, void* stream) {
     const RouteCfg* cfg = route_cfg_device();
-    if (cfg == nullptr || g_pred_skip == nullptr || pred_logits == nullptr || pred_ids == nullptr || res_layer == nullptr || !stream || n_tok < 1)
+    if (cfg == nullptr || g_pred_skip == nullptr || !scratch_here() || pred_logits == nullptr || pred_ids == nullptr || res_layer == nullptr || !stream || n_tok < 1)
         return;
     pred_edge_skip_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(pred_logits, pred_ids, res_layer, cfg, g_pred_skip, n_tok);
     const auto error = cudaGetLastError();
@@ -611,9 +629,10 @@ void route_ring_alloc(size_t n) {
     if (cudaMalloc((void**) &g_ring, n) != cudaSuccess) { cudaGetLastError(); g_ring = nullptr; return; }
     cudaMemset(g_ring, 0, n);
     g_ring_n = n;
+    note_scratch_dev();
 }
 uint8_t* route_ring_ptr() { return g_ring; }
-const uint8_t* route_ring_layer(int64_t layer, int64_t n_expert) { return g_ring ? g_ring + (size_t) (layer * n_expert) : nullptr; }
+const uint8_t* route_ring_layer(int64_t layer, int64_t n_expert) { return g_ring && scratch_here() ? g_ring + (size_t) (layer * n_expert) : nullptr; }
 // ---- STRATA_ROUTE_RAM_FLOOR: one byte per (layer, expert), 1 while the expert has a RAM-tier place (the CPU can compute it from RAM).  Host-mapped,
 // not cudaMalloc like the ring above: the host writes it at every change of the tier and the kernel reads it at each launch (as RouteCfg does).
 // Allocated once, outside graph capture; a null table is "off" in the kernel.
@@ -645,8 +664,9 @@ void route_repl_alloc(size_t n) {
     if (cudaMalloc((void**) &g_repl, n * sizeof(float)) != cudaSuccess) { g_repl = nullptr; return; }
     cudaMemset(g_repl, 0, n * sizeof(float));
     g_repl_n = n;
+    note_scratch_dev();
 }
-float* route_repl_layer(int64_t layer, int64_t n_expert) { return g_repl ? g_repl + (size_t) (layer * n_expert) : nullptr; }
+float* route_repl_layer(int64_t layer, int64_t n_expert) { return g_repl && scratch_here() ? g_repl + (size_t) (layer * n_expert) : nullptr; }
 bool route_repl_active() { return g_repl != nullptr; }
 void route_repl_drain(float* usage2, size_t n) {
     if (g_repl == nullptr || usage2 == nullptr || n < g_repl_n) return;
@@ -659,6 +679,7 @@ void route_detail_alloc() {
     if (g_detail != nullptr) return;
     if (cudaMalloc((void**) &g_detail, 48 * sizeof(unsigned long long)) != cudaSuccess) { g_detail = nullptr; return; }
     cudaMemset(g_detail, 0, 48 * sizeof(unsigned long long));
+    note_scratch_dev();
 }
 void route_detail_read(unsigned long long* out16) {
     if (g_detail == nullptr) { for (int i = 0; i < 48; ++i) out16[i] = 0; return; }
@@ -674,8 +695,9 @@ void route_want_alloc(size_t n) {
     if (cudaMalloc((void**) &g_want, n * sizeof(float)) != cudaSuccess) { g_want = nullptr; return; }
     cudaMemset(g_want, 0, n * sizeof(float));
     g_want_n = n;
+    note_scratch_dev();
 }
-float* route_want_layer(int64_t layer, int64_t n_expert) { return g_want ? g_want + (size_t) (layer * n_expert) : nullptr; }
+float* route_want_layer(int64_t layer, int64_t n_expert) { return g_want && scratch_here() ? g_want + (size_t) (layer * n_expert) : nullptr; }
 bool route_want_active() { return g_want != nullptr; }
 // A pick counted between the copy and the clear is lost: the counts are approximate by nature.
 void route_want_drain(float* usage, size_t n) {
@@ -694,8 +716,9 @@ void route_rows_alloc(int64_t n_layers) {
     if (cudaMalloc((void**) &g_rows, (size_t) n_layers * 8 * 10 * sizeof(int32_t)) != cudaSuccess) { g_rows = nullptr; return; }
     cudaMemset(g_rows, 0xff, (size_t) n_layers * 8 * 10 * sizeof(int32_t));   // -1 everywhere
     g_rows_layers = n_layers;
+    note_scratch_dev();
 }
-int32_t* route_rows_layer(int64_t layer) { return g_rows ? g_rows + (size_t) layer * 80 : nullptr; }
+int32_t* route_rows_layer(int64_t layer) { return g_rows && scratch_here() ? g_rows + (size_t) layer * 80 : nullptr; }
 bool route_rows_active() { return g_rows != nullptr; }
 void route_rows_apply(int kept, float* usage, int64_t n_layers, int64_t n_expert) {
     if (g_rows == nullptr || usage == nullptr || kept < 1 || n_layers > g_rows_layers) return;

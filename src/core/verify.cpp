@@ -1095,7 +1095,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const int64_t cap = (int64_t) (T * K);
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
-        plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
+        // even: the second group's plan starts plan_i32_ + 16 words in, and its u64 pointers must stay 8-byte aligned (T*K odd -
+        // an odd K - made the stride odd: a misaligned-address fault)
+        plan_i32_ = (ptr_off + 4 * cap + (cap + 1) + 1 + 1) & ~1ll;
         if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
             err = "verify: mapped plan allocation failed";
             return false;
@@ -1864,7 +1866,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
                     return v != nullptr && std::atoi(v) != 0;
                 }();
-                if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
+                // (not when the window self-commits: the groups kernel never stores the state, and no commit graph replays it then -
+                // the conv history would advance while the recurrent state stayed frozen; the per-slot branch commits it)
+                if (batch_rec_ && gdn_groups_on && te - tb <= 8 && !keep_rows) {
                     strata::kernels::GdnGroups gg;
                     for (int t = tb; t < te;) {
                         const int first = t;
@@ -2315,7 +2319,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const char* e = std::getenv("STRATA_LOOKAHEAD_GPU_STREAM");
             return e != nullptr && e[0] == '1';
         }();
-        const bool la_gpu = strata::kernels::route_pred_active() && n <= 8 && NE == 512 && K == 10 && native_router_enabled();
+        // (route_pred_logits is null on a GPU other than the scratch's - a layer split's later stage: no look-ahead node there)
+        const bool la_gpu = strata::kernels::route_pred_active() && strata::kernels::route_pred_logits() != nullptr && n <= 8 &&
+                            NE == 512 && K == 10 && native_router_enabled();
         const bool la_on_sh = la_gpu && sh_fork && la_gpu_fork_env;
 #if !defined(STRATA_USE_HIP)
         const bool la_on_stream = la_gpu && !la_gpu_fork_env && la_gpu_stream_env && la_cs_ != nullptr && ev_la_fork_ != nullptr &&
