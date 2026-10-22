@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace strata::kernels {
 // Configure before session capture. Existing graphs retain their selected kernels.
@@ -73,6 +74,14 @@ const int32_t* route_pred_host();                                   ///< the tab
 int32_t* route_pred_dev(int64_t target_layer, int dist);            ///< dist 1 or 2: the slab of 8 x 10 ids, device alias
 float* route_pred_logits();                                          ///< scratch, 8 x 512 floats
 float* route_pred_weights();                                         ///< scratch, 8 x 10 floats
+/// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear expert predictors, folded into one bf16 [512 x n_embd]
+/// matrix and a bias per target layer (tools/predictor/export_la_model.py writes the file).  Loaded once before graph capture;
+/// false (with the reason in `msg`) leaves the look-ahead on the routers.  The decode look-ahead's next-layer guess then applies
+/// the target layer's matrix and bias instead of that layer's router.
+bool route_pred_model_load(const char* path, int64_t n_layers, int64_t n_embd, std::string& msg);
+const uint16_t* route_pred_model_w(int64_t target_layer);           ///< null: no predictor for this layer (the router is used)
+const float* route_pred_model_b(int64_t target_layer);
+void route_pred_bias_add(float* logits, const float* bias, int n_tok, void* stream);   ///< logits [n_tok x 512] += bias
 /// STRATA_LA_EDGE_SKIP (default on, =0 off): route_pred_edge_skip_alloc once before graph capture; route_pred_edge_skip after the look-ahead's top-10
 /// writes a predicted rank lo-1 id as -1 when a resident stand-in is within the edge (the floor's config); skips are counted on the
 /// device, and route_pred_edge_skips_take returns the count since the last take and zeroes it.

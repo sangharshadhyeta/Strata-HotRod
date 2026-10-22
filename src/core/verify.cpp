@@ -980,6 +980,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
           (std::getenv("STRATA_RING_GPU") == nullptr || std::atoi(std::getenv("STRATA_RING_GPU")) != 0)) ||
          (std::getenv("STRATA_LOOKAHEAD_GPU") == nullptr || std::atoi(std::getenv("STRATA_LOOKAHEAD_GPU")) != 0)))
         strata::kernels::route_pred_alloc(g.n_layers);
+    // STRATA_LA_MODEL=<file> (opt-in): the next-layer guess from the published linear predictors instead of the next layer's router
+    // (tools/predictor: rank 0-1 found in the top 2 on 71.7% of tokens against 55.3%, in the top 4 on 89.4% against 74.4%)
+    if (const char* lam = std::getenv("STRATA_LA_MODEL"); lam != nullptr && lam[0] != '\0' && strata::kernels::route_pred_active()) {
+        std::string msg;
+        const bool ok = strata::kernels::route_pred_model_load(lam, g.n_layers, g.n_embd, msg);
+        std::fprintf(stderr, "strata verify: STRATA_LA_MODEL %s: %s%s\n", lam, ok ? "loaded, " : "NOT loaded (the routers stay the look-ahead): ",
+                     msg.c_str());
+    }
     // STRATA_LA_EDGE_SKIP (default on since 21 Oct, =0 off): the look-ahead's edge-skip counter, allocated before any graph capture
     if ((std::getenv("STRATA_LA_EDGE_SKIP") == nullptr || std::atoi(std::getenv("STRATA_LA_EDGE_SKIP")) != 0) && strata::kernels::route_pred_active())
         strata::kernels::route_pred_edge_skip_alloc();
@@ -2346,8 +2354,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const LayerView vt(wt, l + dist);
                     const WeightRef* w_next = vt.get("ffn_gate_inp.weight");
                     if (w_next == nullptr || w_next->kind != WeightKind::Bf16InF32) continue;
-                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_next->data, strata::kernels::route_pred_logits(), NE, N,
-                                              NE, n, s);
+                    // STRATA_LA_MODEL: the next layer's guess from its trained predictor (on this layer's router input, as it was trained)
+                    const uint16_t* w_lam = dist == 1 ? strata::kernels::route_pred_model_w(l + 1) : nullptr;
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, w_lam != nullptr ? w_lam : (const uint16_t*) w_next->data,
+                                              strata::kernels::route_pred_logits(), NE, N, NE, n, s);
+                    if (w_lam != nullptr)
+                        strata::kernels::route_pred_bias_add(strata::kernels::route_pred_logits(), strata::kernels::route_pred_model_b(l + 1), n, s);
                     native_router_top10_multi(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
                                               strata::kernels::route_pred_weights(), n, s);
                     // STRATA_LA_EDGE_SKIP (decode windows: this node runs only for n <= 8): a predicted rank lo-1 pick that a resident

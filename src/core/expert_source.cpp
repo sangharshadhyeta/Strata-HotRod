@@ -680,6 +680,8 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     c.pf_probe_us = t_pf_probe_us_.load(std::memory_order_relaxed);
     c.pf_fill_us = t_pf_fill_us_.load(std::memory_order_relaxed);
     c.pf_thread_us = t_pf_thread_us_.load(std::memory_order_relaxed);
+    for (int b = 0; b < 2; ++b)
+        for (int a = 0; a < 6; ++a) c.arr[b][a] = io_arr_[b][a].load(std::memory_order_relaxed);
     return c;
 }
 
@@ -709,6 +711,12 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     io_threads_ = threads > 0 ? threads : 8;
     if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::atoi(v) != 0;
     if (const char* v = std::getenv("STRATA_IO_DEMAND_FIRST")) io_demand_first_ = std::atoi(v) != 0;
+    if (const char* v = std::getenv("STRATA_IO_EDF")) io_edf_ = std::atoi(v) != 0;
+    if (const char* v = std::getenv("STRATA_IO_PF_YIELD")) io_yield_ = std::atoi(v) != 0;
+    if (const char* v = std::getenv("STRATA_IO_ARRIVAL")) io_arrival_ = std::atoi(v) != 0;
+    if (io_edf_ || io_yield_)
+        std::fprintf(stderr, "FileExpertSource: read-ahead order %s%s\n", io_edf_ ? "next layer first (STRATA_IO_EDF)" : "newest first",
+                     io_yield_ ? ", no guess started while the decode's own reads run (STRATA_IO_PF_YIELD)" : "");
     {   // experts.bin: fill the page cache from the workers and let the kernels read the mapping; otherwise stage.
         // solid-wins fork: staging is the DEFAULT (SPEC.md T1 measured the staged variant; the fill variant was not
         // measured on this box). STRATA_IO_PF_STAGE=0 selects the fill variant.
@@ -759,6 +767,12 @@ void FileExpertSource::io_stop() {
     io_quit_ = false;
 }
 
+namespace {
+// set while the decode's dispatch queues its look-ahead guesses (the only guesses with a deadline: STRATA_IO_EDF); the prompt's
+// look-ahead thread and the CPU look-ahead queue theirs untagged
+thread_local bool t_decode_guess = false;
+}
+
 void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
     {
         std::lock_guard<std::mutex> lk(io_mu_);
@@ -766,7 +780,8 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
             io_q_.pop_front();
             io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
         }
-        io_q_.emplace_back((int32_t) layer, (int32_t) expert);
+        io_q_.push_back({(int32_t) layer, (int32_t) expert, t_decode_guess ? io_win_.load(std::memory_order_relaxed) : kNoWin,
+                         io_cur_layer_.load(std::memory_order_relaxed)});
     }
     io_cv_.notify_one();
 }
@@ -792,13 +807,51 @@ void FileExpertSource::io_worker() {
         bool demand = false;
         {
             std::unique_lock<std::mutex> lk(io_mu_);
-            io_cv_.wait(lk, [&] { return io_quit_ || !io_q_.empty() || !io_dq_.empty(); });
-            if (io_quit_) return;
-            demand = !io_dq_.empty();     // STRATA_IO_DEMAND_FIRST: the decode's demand reads first, then the predictions
-            layer = demand ? io_dq_.front().first : io_q_.back().first;   // the newest prediction first: it is the layer that comes next
-            expert = demand ? io_dq_.front().second : io_q_.back().second;
-            if (demand) io_dq_.pop_front();
-            else io_q_.pop_back();
+            // a guess may start: one is queued and (STRATA_IO_PF_YIELD) the decode is not reading its own blobs right now
+            auto guess_ok = [&] {
+                return !io_q_.empty() && !(io_yield_ && io_demand_active_.load(std::memory_order_relaxed) > 0);
+            };
+            bool picked = false;
+            while (!picked) {
+                io_cv_.wait(lk, [&] { return io_quit_ || !io_dq_.empty() || guess_ok(); });
+                if (io_quit_) return;
+                demand = !io_dq_.empty();     // STRATA_IO_DEMAND_FIRST: the decode's demand reads first, then the predictions
+                if (demand) {
+                    layer = io_dq_.front().first;
+                    expert = io_dq_.front().second;
+                    io_dq_.pop_front();
+                    picked = true;
+                } else if (io_edf_) {
+                    // the decode's guess whose layer comes next; within that layer the freshest look-ahead's (dist 1 before dist 2),
+                    // and within one look-ahead the first queued (it queues rank 0 before rank 1).  A decode guess for a layer already
+                    // routed, or from an earlier window, can no longer arrive in time: dropped unread.  Untagged guesses (the prompt's) are never dropped and go after them, newest first as before.
+                    const int32_t cur = io_cur_layer_.load(std::memory_order_relaxed);
+                    const uint32_t win = io_win_.load(std::memory_order_relaxed);
+                    const size_t before = io_q_.size();
+                    io_q_.erase(std::remove_if(io_q_.begin(), io_q_.end(),
+                                               [&](const IoReq& q) { return q.win != kNoWin && (q.win != win || q.first <= cur); }),
+                                io_q_.end());
+                    if (io_q_.size() != before) io_pf_stale_.fetch_add(before - io_q_.size(), std::memory_order_relaxed);
+                    if (io_q_.empty()) continue;
+                    size_t best = SIZE_MAX;
+                    for (size_t i = 0; i < io_q_.size(); ++i) {
+                        const IoReq& q = io_q_[i];
+                        if (q.win == kNoWin) continue;
+                        if (best == SIZE_MAX || q.first < io_q_[best].first || (q.first == io_q_[best].first && q.from > io_q_[best].from))
+                            best = i;
+                    }
+                    if (best == SIZE_MAX) best = io_q_.size() - 1;   // only untagged guesses: the newest, as before
+                    layer = io_q_[best].first;
+                    expert = io_q_[best].second;
+                    io_q_.erase(io_q_.begin() + (std::ptrdiff_t) best);
+                    picked = true;
+                } else {
+                    layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
+                    expert = io_q_.back().second;
+                    io_q_.pop_back();
+                    picked = true;
+                }
+            }
         }
         io_pf_jobs_.fetch_add(1, std::memory_order_relaxed);
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -1617,6 +1670,16 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
         }
         t_pf_probe_us_.fetch_add(us_since(tp), std::memory_order_relaxed);
     }
+    // STRATA_IO_ARRIVAL: which of these blobs a guess still has queued (read before stage_mu_ is taken: the two locks never nest)
+    std::vector<char> queued_guess;
+    if (io_arrival_ && io_pf_) {
+        queued_guess.assign((size_t) n, 0);
+        std::lock_guard<std::mutex> lk(io_mu_);
+        for (const IoReq& q : io_q_)
+            if (q.first == (int32_t) layer)
+                for (int64_t i = 0; i < n; ++i)
+                    if (experts[i] == (int64_t) q.second) queued_guess[(size_t) i] = 1;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -1628,6 +1691,19 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
                 continue;                                     // in the RAM copy
             if (!override_.empty() && override_[index] != nullptr) continue;
             if (only_uncached && !cold[(size_t) i] && stage_of_.find(layer * n_expert_ + e) == stage_of_.end()) continue;
+            if (!queued_guess.empty()) {   // what the read-ahead had done for this blob, before this claim changes it
+                const auto it = stage_of_.find(layer * n_expert_ + e);
+                int c;
+                if (it != stage_of_.end())   // (a busy buffer that is no guess is a demand read of this blob already started)
+                    c = stage_pf_[it->second] ? (stage_busy_[it->second] ? kArrInFlight : kArrLanded) : kArrStagedDemand;
+                else if (queued_guess[(size_t) i])
+                    c = kArrQueued;
+                else {
+                    const uint32_t s = warm_stamp_ ? warm_stamp_[index].load(std::memory_order_relaxed) : 0;
+                    c = s != 0 && (uint64_t) s + 3 >= epoch_ + 1 ? kArrLost : kArrUnpredicted;
+                }
+                io_arr_[layer < 2 ? 0 : 1][c].fetch_add(1, std::memory_order_relaxed);
+            }
             size_t v = 0;
             bool fill = false;
             if (!claim_stage(layer * n_expert_ + e, v, fill) && fill) {
@@ -1647,7 +1723,21 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
     }
     for (const int64_t e : reserved) io_enqueue_demand(layer, e);
     const auto tf = tnow();
-    fill_many(todo);
+    {
+        // STRATA_IO_PF_YIELD: no guess starts while these are read (released however fill_many ends)
+        struct DemandActive {
+            FileExpertSource* s;
+            bool on;
+            ~DemandActive() {
+                if (!on) return;
+                s->io_demand_active_.fetch_sub(1, std::memory_order_relaxed);
+                { std::lock_guard<std::mutex> lk(s->io_mu_); }   // a worker between its check and its wait sees the new count
+                s->io_cv_.notify_all();
+            }
+        } active{this, io_yield_ && io_pf_ && !todo.empty()};
+        if (active.on) io_demand_active_.fetch_add(1, std::memory_order_relaxed);
+        fill_many(todo);
+    }
     t_pf_fill_us_.fetch_add(us_since(tf), std::memory_order_relaxed);
     if (io_pf_ && !todo.empty()) {
         io_crit_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
@@ -2754,6 +2844,12 @@ void RouterLookahead::run() {
     }
 }
 
+void FileExpertSource::route_layer(int64_t layer) {
+    // a layer at or below the last one starts the next decode window (the guesses an earlier window queued are then stale)
+    const int32_t prev = io_cur_layer_.exchange((int32_t) layer, std::memory_order_relaxed);
+    if ((int32_t) layer <= prev) io_win_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
     (void) ids;
     (void) k;
@@ -2765,7 +2861,7 @@ void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
         std::lock_guard<std::mutex> lk(io_mu_);
         const size_t before = io_q_.size();
         io_q_.erase(std::remove_if(io_q_.begin(), io_q_.end(),
-                                   [&](const std::pair<int32_t, int32_t>& p) { return p.first <= (int32_t) layer; }),
+                                   [&](const IoReq& p) { return p.first <= (int32_t) layer; }),
                     io_q_.end());
         if (io_q_.size() != before) io_pf_stale_.fetch_add(before - io_q_.size(), std::memory_order_relaxed);
     }
@@ -5024,6 +5120,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (router_trace_on() && x_f != nullptr && ids != nullptr && k >= 1 && k <= 16) router_trace_write(d.layers, x_f, ids, n_tok, k);
+    if (d.src != nullptr) d.src->route_layer(d.layers);   // before the look-ahead below queues this layer's guesses
     if (d.fs != nullptr) d.fs->at_layer.store(d.layers, std::memory_order_release);   // STRATA_RING's refill guard
     if (d.gpu_pred != nullptr && d.fs != nullptr && d.fs->ring && d.host_res != nullptr && n_tok <= 8) {
         // the GPU look-ahead's picks for the next two layers (computed on this layer's input, before the doorbell this dispatch followed)
@@ -5047,13 +5144,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (target >= d.n_layers) break;
             int64_t want[8 * 10];
             int64_t nw = 0;
-            for (int64_t t = 0; t < n_tok; ++t)
-                for (int r = 0; r < d.gpu_pred_ranks && r < 10; ++r) {
+            // STRATA_IO_EDF: every token's rank 0 guess before any rank 1 guess (the workers then read a layer's guesses in this order)
+            static const bool rank_major = [] { const char* v = std::getenv("STRATA_IO_EDF"); return v != nullptr && std::atoi(v) != 0; }();
+            const int64_t outer = rank_major ? std::min(d.gpu_pred_ranks, 10) : n_tok, inner = rank_major ? n_tok : std::min(d.gpu_pred_ranks, 10);
+            for (int64_t a = 0; a < outer; ++a)
+                for (int64_t b = 0; b < inner; ++b) {
+                    const int64_t t = rank_major ? b : a, r = rank_major ? a : b;
                     const int32_t e = d.gpu_pred[(((size_t) target * 2 + (size_t) (dist - 1)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
                     if (std::find(want, want + nw, (int64_t) e) == want + nw) want[nw++] = e;
                 }
+            t_decode_guess = true;
             if (nw > 0) d.src->warm(target, want, nw);
+            t_decode_guess = false;
             d.pred_fed += nw;
         }
     }

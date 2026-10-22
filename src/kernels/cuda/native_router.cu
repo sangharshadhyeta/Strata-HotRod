@@ -27,7 +27,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace strata::kernels {
@@ -565,6 +567,84 @@ const int32_t* route_pred_host() { return g_pred_host; }
 int32_t* route_pred_dev(int64_t target_layer, int dist) { return g_pred_dev ? g_pred_dev + ((size_t) target_layer * 2 + (size_t) (dist - 1)) * 80 : nullptr; }
 float* route_pred_logits() { return g_pred_logits; }
 float* route_pred_weights() { return g_pred_w; }
+// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear predictors (tools/predictor/export_la_model.py folds their
+// standardisation in): for each target layer a bf16 [512 x H] matrix and a float bias, applied to the previous layer's router input.
+static uint16_t* g_lam_w = nullptr;
+static float* g_lam_b = nullptr;
+static std::vector<char> g_lam_has;
+static int64_t g_lam_h = 0;
+bool route_pred_model_load(const char* path, int64_t n_layers, int64_t n_embd, std::string& msg) {
+    if (g_lam_w != nullptr) {
+        msg = "already loaded";
+        return g_lam_h == n_embd && (int64_t) g_lam_has.size() == n_layers;
+    }
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) { msg = std::string("cannot open ") + path; return false; }
+    uint32_t hdr[4] = {0, 0, 0, 0};
+    const bool hdr_ok = std::fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x314D414Cu /* "LAM1" */ &&
+                        (int64_t) hdr[1] == n_layers && hdr[2] == 512u && (int64_t) hdr[3] == n_embd;
+    if (!hdr_ok) {
+        std::fclose(f);
+        msg = "not an LAM1 file for this model (layers, 512 experts, hidden size)";
+        return false;
+    }
+    const size_t per_w = (size_t) 512 * (size_t) n_embd;
+    std::vector<uint16_t> w((size_t) n_layers * per_w);
+    std::vector<float> b((size_t) n_layers * 512, 0.0f);
+    std::vector<char> has((size_t) n_layers, 0);
+    bool ok = true;
+    for (int64_t l = 0; l < n_layers && ok; ++l) {
+        uint8_t present = 0;
+        ok = std::fread(&present, 1, 1, f) == 1;
+        if (!ok || present == 0) continue;
+        ok = std::fread(w.data() + (size_t) l * per_w, sizeof(uint16_t), per_w, f) == per_w &&
+             std::fread(b.data() + (size_t) l * 512, sizeof(float), 512, f) == 512;
+        has[(size_t) l] = ok ? 1 : 0;
+    }
+    std::fclose(f);
+    if (!ok) { msg = "the file is cut short"; return false; }
+    if (cudaMalloc((void**) &g_lam_w, w.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc((void**) &g_lam_b, b.size() * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        if (g_lam_w != nullptr) cudaFree(g_lam_w);
+        g_lam_w = nullptr;
+        g_lam_b = nullptr;
+        msg = "no room on the GPU for it";
+        return false;
+    }
+    if (cudaMemcpy(g_lam_w, w.data(), w.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(g_lam_b, b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaGetLastError();
+        cudaFree(g_lam_w);
+        cudaFree(g_lam_b);
+        g_lam_w = nullptr;
+        g_lam_b = nullptr;
+        msg = "the copy to the GPU failed";
+        return false;
+    }
+    g_lam_has = std::move(has);
+    g_lam_h = n_embd;
+    int64_t n = 0;
+    for (char c : g_lam_has) n += c;
+    msg = std::to_string(n) + " layers, " + std::to_string((w.size() * 2 + b.size() * 4) >> 20) + " MiB of VRAM";
+    return true;
+}
+const uint16_t* route_pred_model_w(int64_t target_layer) {
+    if (g_lam_w == nullptr || target_layer < 0 || target_layer >= (int64_t) g_lam_has.size() || !g_lam_has[(size_t) target_layer]) return nullptr;
+    return g_lam_w + (size_t) target_layer * 512 * (size_t) g_lam_h;
+}
+const float* route_pred_model_b(int64_t target_layer) {
+    return route_pred_model_w(target_layer) != nullptr ? g_lam_b + (size_t) target_layer * 512 : nullptr;
+}
+__global__ void pred_bias_add_k(float* __restrict__ logits, const float* __restrict__ bias, int n_tok) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_tok * 512) logits[i] += bias[i % 512];
+}
+void route_pred_bias_add(float* logits, const float* bias, int n_tok, void* stream) {
+    pred_bias_add_k<<<(n_tok * 512 + 255) / 256, 256, 0, (cudaStream_t) stream>>>(logits, bias, n_tok);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
 // STRATA_LA_EDGE_SKIP (default on since 21 Oct, =0 off; decode look-ahead only: verify.cpp lookahead_node): the predicted rank lo-1 pick (the edge rank of the
 // floor, route_resident_k's `edge`) is not read ahead when a resident expert outside the predicted ten scores within `edge` logits of it
 // in the predicted logits: the router takes that stand-in, so the read would be wasted.  Its slot is set to -1 (the host's warm path skips

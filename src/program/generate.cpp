@@ -16375,7 +16375,7 @@ int main(int argc, char** argv) {
                                      (double) (ic.uncached_bytes - ic_prev.uncached_bytes) / 1e6);
                     // STRATA_IO_DEMAND_FIRST: the read-aheads dropped as stale (their layer's routing decided) since the previous request
                     char stale_txt[48] = "";
-                    if (src.io_demand_first())
+                    if (src.io_demand_first() || src.io_edf())   // (STRATA_IO_EDF drops stale guesses too)
                         std::snprintf(stale_txt, sizeof stale_txt, ", %llu dropped (stale)", (unsigned long long) (ic.pf_stale - ic_prev.pf_stale));
                     if (src.io_prefetch())
                         std::fprintf(stderr, "; io prefetch: %llu read ahead (%.1f MB by pread), %llu used, %llu unused, %llu skipped "
@@ -16396,6 +16396,17 @@ int main(int argc, char** argv) {
                                      (double) (ic.blob_lock_us - ic_prev.blob_lock_us) / 1e3, (double) (ic.blob_wait_us - ic_prev.blob_wait_us) / 1e3,
                                      (unsigned long long) (ic.pf_calls - ic_prev.pf_calls), (double) (ic.pf_probe_us - ic_prev.pf_probe_us) / 1e3,
                                      (double) (ic.pf_fill_us - ic_prev.pf_fill_us) / 1e3, (double) (ic.pf_thread_us - ic_prev.pf_thread_us) / 1e3);
+                    // STRATA_IO_ARRIVAL=1: the decode's file-tier blobs by what the read-ahead had done for each when its layer asked
+                    if (src.io_arrival()) {
+                        using FS = strata::core::FileExpertSource;
+                        for (int b = 0; b < 2; ++b) {
+                            auto dn = [&](int a) { return (unsigned long long) (ic.arr[b][a] - ic_prev.arr[b][a]); };
+                            std::fprintf(stderr, "; arrival (%s): %llu landed in time, %llu still being read, %llu still queued, %llu "
+                                                 "predicted but not kept, %llu never predicted, %llu staged by an earlier demand read",
+                                         b == 0 ? "layers 0-1" : "layers 2+", dn(FS::kArrLanded), dn(FS::kArrInFlight), dn(FS::kArrQueued),
+                                         dn(FS::kArrLost), dn(FS::kArrUnpredicted), dn(FS::kArrStagedDemand));
+                        }
+                    }
                     std::fprintf(stderr, "\n");
                     io_prev = io_now;
                     ic_prev = ic;

@@ -198,6 +198,9 @@ public:
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
+    /// The decode routes `layer` now: called first in a layer's dispatch, before its look-ahead queues the next layers' guesses
+    /// (the read-ahead queue's deadlines, STRATA_IO_EDF).
+    virtual void route_layer(int64_t layer) { (void) layer; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
     /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
@@ -965,6 +968,7 @@ public:
     bool take_read_ahead(int64_t layer, int64_t expert, uint8_t* dst);
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    void route_layer(int64_t layer) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
@@ -1004,6 +1008,7 @@ public:
     void set_io_prefetch(bool on, int threads);
     bool io_prefetch() const { return io_pf_; }
     bool io_demand_first() const { return io_pf_ && io_demand_first_; }   ///< STRATA_IO_DEMAND_FIRST on, with io prefetch
+    bool io_edf() const { return io_pf_ && io_edf_; }                     ///< STRATA_IO_EDF on, with io prefetch
     /// The RAM tier overlays this file tier (--resident-budget-gib): the I/O pipeline and the look-ahead run as in files
     /// mode, the RAM copy answers first, and the experts outside it are read O_DIRECT (one copy each: VRAM, RAM, NVMe).
     /// Set before set_io_prefetch.  io_overlay_active() is true once the complement is built: only then does the pipeline
@@ -1028,7 +1033,11 @@ public:
         uint64_t crit_n = 0;
         uint64_t blob_n = 0, blob_us = 0, blob_lock_us = 0, blob_wait_us = 0;   ///< blob() calls, their wall time, the stage_mu_ wait and the stage_cv_ wait inside
         uint64_t pf_calls = 0, pf_probe_us = 0, pf_fill_us = 0, pf_thread_us = 0;   ///< prefetch() calls (file tier, io prefetch): residency probes, fills, thread create/join (or pool hand-off) inside the fills
+        uint64_t arr[2][6] = {};                             ///< STRATA_IO_ARRIVAL: [layers 0-1 | the rest][IoArrival]
     };
+    /// STRATA_IO_ARRIVAL: what the read-ahead had done for a blob when its decode layer asked for it
+    enum IoArrival { kArrLanded = 0, kArrInFlight, kArrQueued, kArrLost, kArrUnpredicted, kArrStagedDemand };
+    bool io_arrival() const { return io_pf_ && io_arrival_; }
     IoCounters io_counters() const;
     /// STRATA_PROMPT_LOOKAHEAD_IO: the prompt's blobs taken from a read-ahead stage buffer (take_read_ahead) and those read from the drive.
     uint64_t prompt_ra_hits() const { return prompt_ra_hits_.load(std::memory_order_relaxed); }
@@ -1133,8 +1142,25 @@ private:
     std::vector<std::thread> io_workers_;
     std::mutex io_mu_;
     std::condition_variable io_cv_;
-    std::deque<std::pair<int32_t, int32_t>> io_q_;   ///< (layer, expert) to read ahead
+    /// (layer, expert) to read ahead; win: the decode window that predicted it; from: the layer whose look-ahead queued it
+    struct IoReq { int32_t first, second; uint32_t win; int32_t from; };
+    static constexpr uint32_t kNoWin = 0xFFFFFFFFu;   ///< IoReq::win of a guess the decode's dispatch did not queue (the prompt's)
+    std::deque<IoReq> io_q_;                          ///< the read-ahead queue
     bool io_quit_ = false;
+    // STRATA_IO_EDF=1: a worker takes the queued guess whose layer comes NEXT (earliest deadline; the order the look-ahead queued
+    // them within a layer), and drops the guesses of a layer already routed or of an earlier window.  Unset: the newest guess
+    // first (a look-ahead's dist-2 guesses, queued after its dist-1 ones, are then read first).
+    bool io_edf_ = false;
+    // (how many guesses are read at once is STRATA_IO_PF_THREADS: one per worker, the demand reads on the decode's thread)
+    // STRATA_IO_PF_YIELD=1: no guess starts while the decode's own demand reads (prefetch) are in flight
+    bool io_yield_ = false;
+    std::atomic<int> io_demand_active_{0};
+    std::atomic<int32_t> io_cur_layer_{-1};           ///< the layer the decode routes now (route_layer)
+    std::atomic<uint32_t> io_win_{0};                 ///< counts decode windows (a layer below the previous one starts one)
+    // STRATA_IO_ARRIVAL=1: each blob a decode layer reads from the file tier, by what the read-ahead had done for it
+    // ([0] layers 0-1 of a window, [1] the rest); see IoArrival
+    bool io_arrival_ = false;
+    std::atomic<uint64_t> io_arr_[2][6] = {};
     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
     // STRATA_IO_DEMAND_FIRST=1: prefetch() reserves a stage buffer for each blob the layer needs and does not have, and queues
     // it in io_dq_; the workers drain io_dq_ before the read-ahead queue.  stage_queued_: the reservation no worker has started
