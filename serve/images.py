@@ -362,6 +362,18 @@ def _client_gone(svc) -> Exception:
     return getattr(sys.modules.get(type(svc).__module__), "ClientGone", RuntimeError)()
 
 
+def _slots_idle(svc) -> bool:
+    """No parallel request generating: the engine's slot table when it has one (a request only waiting to be admitted holds no
+    slot and queues behind the image job), else no request running at all."""
+    eng = svc.engine
+    busy = getattr(eng, "slot_busy", None)
+    if busy is None:
+        return not getattr(svc, "live_reqs", None)
+    cv = eng.__dict__.get("slot_cv")
+    with cv if cv is not None else contextlib.nullcontext():
+        return not any(busy) and not getattr(eng, "slot_releasing", None)
+
+
 @contextlib.contextmanager
 def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
@@ -376,15 +388,20 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
             queued = False
             ctl = getattr(svc.engine, "ctl", None) if getattr(svc.engine, "batch", 0) else None
             if ctl is not None:
-                while not ctl.acquire(timeout=0.25):
-                    if cancel is not None and cancel.is_set():
-                        raise _client_gone(svc)
-            try:
-                if ctl is not None:                   # running parallel requests finish first
-                    while getattr(svc, "live_reqs", None):
+                # running parallel requests finish first.  The control lines are given back between the checks: a text
+                # request admitted after this job took them waits for them (_take_control) while it is already counted
+                # as running, so holding them through the wait never ended (both clients hung until one disconnected)
+                while True:
+                    while not ctl.acquire(timeout=0.25):
                         if cancel is not None and cancel.is_set():
                             raise _client_gone(svc)
-                        time.sleep(0.25)
+                    if _slots_idle(svc):
+                        break
+                    ctl.release()
+                    if cancel is not None and cancel.is_set():
+                        raise _client_gone(svc)
+                    time.sleep(0.25)
+            try:
                 need = need_mib(gen.cfg, job["width"], job["height"])
                 policy = resolve_policy(svc, gen, need)
                 with svc.status_lock:
@@ -460,6 +477,8 @@ def restore_session(svc) -> None:
     if not path:
         return
     svc.restore_after_load = None
+    if getattr(svc, "pcache", None) is not None:
+        svc.pcache.held = None                       # a fresh engine, then (maybe) a restored session: not what the cache recorded
     try:
         r = svc.engine.session_file("restore", path)
         print(f"[strata] the conversation from before the image job is back ({r.get('tokens')} tokens)", flush=True)

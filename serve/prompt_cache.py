@@ -65,6 +65,20 @@ class PromptCache:
                                      "prompt_len": int(meta.get("prompt_len") or 0)}
             else:   # another engine build or setting wrote it: never restored here, but it takes disk space (21 Oct: 83 GB of them)
                 self.foreign[key] = {"bytes": size, "used": meta.get("used", 0)}
+        # a state file with no sidecar: a save the engine or this process did not finish (it died, or the user closed the server
+        # right after an answer while the save ran).  Nothing names it, nothing counts it against the limit: removed - once it is
+        # an hour old, so a save another server is writing into the same folder right now is left alone
+        known = set(self.entries) | set(self.foreign)
+        for name in os.listdir(self.dir):
+            key = next((name[:-len(x)] for x in (".bin.conv", ".bin", ".json.tmp") if name.endswith(x)), None)
+            if key is None or key in known:
+                continue
+            path = os.path.join(self.dir, name)
+            try:
+                if time.time() - os.path.getmtime(path) > 3600:
+                    os.remove(path)
+            except OSError:
+                pass
         self._trim()
 
     def _trim(self, keep: str | None = None):
@@ -205,6 +219,9 @@ class PromptCache:
         except ValueError as e:
             self._remove(key)
             return f"prompt cache: save refused ({str(e)[:120]})"
+        except BaseException:
+            self._remove(key)             # the engine died mid-save (or the server is stopping): no half-written state is kept
+            raise
         saved = int((r or {}).get("tokens", -1))
         # 20 Oct: an answer that ended on max_tokens (no stop token) leaves the engine one token SHORT of this list - the
         # last sampled token was never fed back - so the entry records the tokens the engine holds (the engine checks the

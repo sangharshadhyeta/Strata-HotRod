@@ -671,6 +671,7 @@ class ConvCacheLog:
 
     def __init__(self):
         self.key, self.pos = None, 0
+        self.lock = threading.Lock()                     # two Monitor tabs' /metrics read the same span once, not twice
         self.reset()
 
     def reset(self):
@@ -679,6 +680,10 @@ class ConvCacheLog:
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
+        with self.lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
         if not path or start is None:
             return dict(self.state)
         if self.key != (path, start):                   # another start of the engine: its cache starts empty
@@ -2906,15 +2911,40 @@ def _drop_stale_residency_files():
         pid = name[len("strata-residency-"):-len(".json")]
         if not pid.isdigit() or int(pid) == os.getpid():
             continue
-        try:
-            os.kill(int(pid), 0)          # the process still runs (or is another user's): leave its file
-        except ProcessLookupError:
+        # this process's own: left by an earlier process with the same id (Windows reuses ids) - a stale "1" switch would start
+        # the timeline unasked.  Another's: only when that process no longer runs.
+        if int(pid) == os.getpid() or not _pid_alive(int(pid)):
             try:
                 os.remove(os.path.join(tmp, name))
             except OSError:
                 pass
-        except PermissionError:
-            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this id runs (True when unsure: its files are kept).  Not os.kill(pid, 0): on Windows that sends a
+    console Ctrl+C event, never reports a dead process, and may interrupt a process sharing the console."""
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+    if os.name == "nt":
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.GetLastError() == 5   # access denied: it runs (another user's); invalid parameter: gone
+        try:
+            code = ctypes.c_ulong()
+            return not k32.GetExitCodeProcess(h, ctypes.byref(code)) or code.value == 259   # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 try:
@@ -3341,6 +3371,8 @@ class Service:
                         r = session_file(self, action, path, SessionRefused)
                     else:
                         r = self.engine.session_file(action, path)
+                    if action == "restore" and self.pcache is not None:
+                        self.pcache.held = None         # the engine holds the restored session now, not what the cache recorded
                 except SessionRefused as e:
                     body = error(e.status, str(e))
                     body[1]["error"]["kind"] = e.kind
@@ -4520,7 +4552,9 @@ class Service:
                             note = self.pcache.before(self.engine, ids)
                             if note:
                                 print(f"[strata] {note}", flush=True)
-                        except (EngineDied, EngineSilent):
+                        except (EngineDied, EngineSilent) as e:
+                            finish = "error"            # (not the "length" it starts as: the history and totals say so)
+                            self._say_died(e)
                             raise
                         except Exception as e:          # the cache is an extra: its failure never fails a request
                             print(f"[strata] prompt cache (before): {e!r}", flush=True)
@@ -5425,6 +5459,7 @@ def make_handler(svc: Service):
 
         def handle_one_request(self):
             self.answer_started = False
+            self.sse_started = False
             super().handle_one_request()
             self._drain_body()
 
@@ -5639,6 +5674,11 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None):
+            if getattr(self, "answer_started", False):
+                # the answer is already on the wire (a stream that began, or an earlier response): a second HTTP response
+                # written into its body corrupts it.  A stream ends with its API's own error event instead.
+                self._stream_error(code, obj)
+                return
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -5673,7 +5713,9 @@ def make_handler(svc: Service):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
                 f = ROOT / "serve" / "web" / "fonts" / name
-                if "/" in name or "\\" in name or not name.endswith(".woff2") or not f.is_file():
+                # (":" - a drive-relative name, "D:x.woff2", is a path on another drive on Windows, not a file in this folder)
+                if "/" in name or "\\" in name or ":" in name or not name.endswith(".woff2") or not f.is_file() \
+                        or f.resolve().parent != (ROOT / "serve" / "web" / "fonts").resolve():
                     self._json(404, {"error": {"message": "not found"}})
                     return
                 body = f.read_bytes()
@@ -5691,7 +5733,9 @@ def make_handler(svc: Service):
                          ".svg": "image/svg+xml"}
                 f = ROOT / "serve" / "web" / name
                 ext = os.path.splitext(name)[1]
-                if "/" in name or "\\" in name or ext not in types or not f.is_file():
+                # (":" - "D:secret.js" is a drive-relative path on Windows: a file outside this folder, served without the key)
+                if "/" in name or "\\" in name or ":" in name or ext not in types or not f.is_file() \
+                        or f.resolve().parent != (ROOT / "serve" / "web").resolve():
                     self._json(404, {"error": {"message": "not found"}})
                     return
                 body = f.read_bytes()
@@ -6197,8 +6241,37 @@ def make_handler(svc: Service):
                   if shared else "[strata] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
+        def _stream_error(self, code, obj):
+            """An error after the answer began (_json): a stream gets its API's closing error event - OpenAI an error chunk and
+            [DONE], Anthropic `event: error`, Responses `event: error` - and anything else is only logged."""
+            err = obj.get("error") if isinstance(obj, dict) else None
+            if not isinstance(err, dict):
+                err = {"type": "server_error", "message": str(obj)}
+            message = str(err.get("message") or "")
+            print(f"[strata] {code} after the answer began: {message}", flush=True)
+            self._note(error=err)
+            if not getattr(self, "sse_started", False):
+                return
+            path = self.path.split("?")[0].rstrip("/")
+            if path == "/v1/messages":
+                frame = b"event: error\ndata: " + json.dumps(
+                    {"type": "error", "error": {"type": "overloaded_error" if code in (409, 503) else "api_error",
+                                                "message": message}}).encode() + b"\n\n"
+            elif path == "/v1/responses":
+                frame = b"event: error\ndata: " + json.dumps(
+                    {"type": "error", "code": str(err.get("code") or err.get("type") or "server_error"), "message": message,
+                     "param": None}).encode() + b"\n\n"
+            else:
+                frame = b"data: " + json.dumps({"error": err}).encode() + b"\n\ndata: [DONE]\n\n"
+            try:
+                self.wfile.write(frame)
+                self.wfile.flush()
+            except OSError:
+                pass
+
         def _sse(self):
             self._note(http_status=200)
+            self.sse_started = True                         # an error from here on ends the stream (_json), not a new response
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -6445,10 +6518,13 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
-            if set(skipped) - noted:
-                print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
+            # the names are the client's: only the known hosted tools are remembered, and an unknown one is shown short - a client
+            # sending new type strings on every request would otherwise grow the set (and the log) for the life of the process
+            new = {t if t in responses_api.HOSTED_TOOLS else str(t)[:40] for t in skipped} - noted
+            if new:
+                print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(new))} "
                       f"(this server cannot run them)", flush=True)
-                noted.update(skipped)
+                noted.update(t for t in new if t in responses_api.HOSTED_TOOLS)
             if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
                 req = {**req, "max_output_tokens": svc.shared["max_tokens"]}
             try:
