@@ -20,6 +20,10 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
   -webkit-background-clip:text;background-clip:text}
 :root[data-theme="dark"] .st-header__brand-rod{background:linear-gradient(180deg,#90e8ff 0%,#20c0f0 50%,#1070ff 100%);
   -webkit-background-clip:text;background-clip:text}
+/* the white / between them, as on the tab icon; on the light header a thin dark edge keeps it visible */
+.st-header__brand-slash{color:#fff;margin:0 .06em;-webkit-text-stroke:1px #1a1f2b;paint-order:stroke fill}
+:root[data-theme="dark"] .st-header__brand-slash{-webkit-text-stroke:0}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .st-header__brand-slash{-webkit-text-stroke:0}}
 .st-header__spacer{flex:1}
 
 /* status pill */
