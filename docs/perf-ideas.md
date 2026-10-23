@@ -181,3 +181,105 @@ the GPU cache at that moment), so live-run answer equality cannot show a change 
 | Rank 2 within 1 logit (21 Oct, user: "for rank 2 also logit 1") | the user saw issues with ranks 2-9 taking any stand-in (cold card after restarts) | install default: STRATA_ROUTE_RESIDENT_RANKS=3-9 + STRATA_ROUTE_RESIDENT_EDGE=1 (rank 2 replaced only by a stand-in within 1 logit, ranks 0-1 exact, 3-9 any); live on 8095 with the request monitor; not yet measured |
 | Conversation fill / preload / read-ahead depth (21 Oct, 45K document + follow-ups, 700 tokens a turn, rank 0-1 exact + rank 2 edge) | baseline decode waits 41% on rank 0-2 fetches (19.5 a token). **Read-ahead depth 1** (STRATA_IO_PREFETCH_DEPTH=1, 1 round): follow-ups 31.1 vs 31.3 tok/s, no change (82% of read-ahead is never used at either depth). **RAM fill** (STRATA_CONV_FILL, conversation's rank 0-2 experts into the RAM tier in the background): 29.4 vs 31.3, **lost**; it promoted only 3-349 of 768 (no free places, 4 a layer a window) and its reads added ~15 GB a turn on the drive decode waits on. **Follow-up preload** (STRATA_CONV_PRELOAD: decode usage seeded from every chunk the conversation read, then 4 swap rounds before decode, ~136 swaps): 2 rounds, follow-ups 30.2 vs 31.2 tok/s, first follow-up waits 13.1-14.7 vs 10.7-11.7 s, **lost**. Why: in a conversation that stays loaded the previous answer's swap rounds already fitted the card to what it uses NOW; whole-conversation counts displace recent-hot experts (recency predicts best, 20 Oct SeqMoE test), and the early swaps cost reads. Also found: the prompt-tail preload never runs on follow-ups ("prompt tail: none": the new message is read on the window path) | both stay opt-in, off. Next: the narrower variant - preload only when the card was NOT serving this conversation (restored from the prompt cache / after another conversation / after a restart), with the counts saved alongside the conversation |
 | 21 Oct, built and measured tonight (131K speed run: 8.5K prompt + 1000 tokens, then code / reasoning / prose; one run each, spread ~3 tok/s) | **look-ahead edge skip** (STRATA_LA_EDGE_SKIP, with STRATA_IO_DEMAND_FIRST): 56.4 / 34.8 / 39.4 / 31.3 vs 53.6 / 31.9 / 34.9 / 28.8 tok/s; read-ahead 16,968 -> 12,009 (used 32 -> 41%), decode SSD wait 4.68 -> 4.00 s, 46,667 rank-2 reads skipped; stale drops 12 (demand-first adds little). **Prefill stand-ins** (STRATA_PREFILL_STANDIN): 76-118-token prompts read 1.3-1.8 vs 2.3-2.8 s, 8.5K 15.1 vs 15.8 s, decode within noise, answers read clean (code, maths 11:36 / 156 km, prose, the 8.5K summary's thinking). **Restore**: restores were refused for RAM (3 of 4 returns to a 45K conversation, ~113 MiB short): the restore path now has the save path's give-back, and give-back frees the merged parked ranges in whole huge pages (THP=always: a partial-huge-page MADV_DONTNEED only defers the split; 0.73 GiB released, 1.41 GiB freed in whole huge pages, restore in 0.34 s). **Narrow preload** (after a restore only, counts saved as <session>.bin.conv): fired after the tail fix, return turn 12.7 s vs 20.3 s in an earlier restored return (one turn each). 50 -> 30 tok/s question: no regression - the 8.5K run is 53.6 tok/s at 131K (54.4 on 20 Oct); ~30 tok/s was short answers on fresh engines | DEFAULT ON: STRATA_LA_EDGE_SKIP, STRATA_PREFILL_STANDIN (with decode's stand-ins), STRATA_CONV_PRELOAD (after a restore). Opt-in: STRATA_IO_DEMAND_FIRST stale drop, STRATA_CONV_FILL (lost) |
+
+## 22 Oct: why the predicted rank 0-1 experts arrive late (code audit; built opt-in, NOT yet measured)
+
+The look-ahead's guesses are made one or two layers ahead (~1.1 ms a layer) and one 2.33 MB expert needs >= 0.7 ms of the drive.
+What the code does with a layer's guesses (expert_source.cpp, io_worker / expert_pool_dispatch_multi / prefetch):
+
+| Finding | Where | Effect |
+| --- | --- | --- |
+| The workers read the NEWEST guess first (`io_q_.back()`), and the dispatch queues dist 1 (the next layer) before dist 2 | io_worker; the warm loop over dist 1, 2 | when the queue is longer than the idle workers, the layer after next is read before the next layer |
+| Up to 8 guesses (one per worker, STRATA_IO_PF_THREADS default 8) are read at once, beside the decode's own demand reads; fewer threads were never tested (SPEC T16, 10 Oct, page-fault path: 16 threads, no better) | io_worker, set_io_prefetch | the drive shares its bandwidth: a right guess issued with two wrong ones lands after ~3 x 0.7 ms, past its layer; the current layer's demand read is slowed the same way (the "blob() waits on in-flight guesses" row). Precision sets arrival time, not only bytes |
+| Stale guesses are dropped only with STRATA_IO_DEMAND_FIRST | begin_layer | (21 Oct: only 12 stale drops - the queue is short; the in-flight sharing above is the main cost) |
+| Layer 0 of a window has no guess, layer 1 one layer of lead | the dist loop starts at the current layer | unmeasured share of the wait |
+| The published d=1 predictor (tools/predictor: rank 0-1 in the top 2 on 71.7% vs 55.3%, top 4 89.4% vs 74.4%) was never wired in | verify.cpp lookahead_node | more right guesses AND fewer wrong ones sharing the drive |
+
+Built, all opt-in (unset = as before):
+
+| Switch | What it does |
+| --- | --- |
+| STRATA_IO_ARRIVAL=1 | the request line gets, for layers 0-1 and 2+, each file-tier blob of the decode by what the read-ahead had done: landed in time / still being read / still queued / predicted but not kept / never predicted / staged by an earlier demand read. Measure this FIRST: it says which fix can help |
+| STRATA_IO_EDF=1 | decode guesses read next layer first (rank 0 before rank 1), stale ones (layer routed, or an older window) dropped unread; the prompt's guesses untouched |
+| STRATA_IO_PF_THREADS=1 or 2 (EXISTING setting, not new code) | at most that many guesses read at once (the demand reads stay on the decode's thread unless STRATA_IO_DEMAND_FIRST) |
+| STRATA_IO_PF_YIELD=1 | no guess starts while the decode's own demand reads run (no effect with STRATA_IO_DEMAND_FIRST, whose demand reads go through the workers) |
+| STRATA_LA_MODEL=<file> | the next-layer guess from the published predictor (export_la_model.py folds it into bf16 + bias; ~123 MiB of VRAM, allocated after the cache is sized: check the start log and the VRAM headroom; ~50 fewer cache slots if the budget is cut to make room) |
+
+A/B plan (alternated pairs on one binary, the 8.5K speed run and the 45K conversation, STRATA_DECODE_TIMING=1 for the read wait a window):
+1. Baseline vs baseline + STRATA_IO_ARRIVAL=1 (the counters cost a lock per demand read: check they change nothing).
+2. STRATA_IO_PF_THREADS=2, then =1 (existing setting); then + YIELD; then + EDF. Watch "still being read" fall and "landed in time" rise.
+3. The best of 2 + STRATA_LA_MODEL. Watch read-ahead used / unused and "never predicted".
+The switches change only which bytes are read when, never the routing; but greedy answers already differ between two default arms (stand-in choices follow the cache at that moment, see the note above), so read the answers rather than diff them.
+
+Simulated (tools/predictor/sim_readahead.py, 22 Oct; a model of the queue and a drive that shares 3.3 GB/s among the reads in flight,
+calibrated to the measured read wait ~8-11 ms a window and read-ahead use ~27%; NOT a measurement), two seeds agree within 0.5 points:
+
+| Arm | 13 cold misses a window (short context) | 29 a window (long conversation) |
+| --- | ---: | ---: |
+| EDF alone | +0.0% | +0.1% (the queue is rarely longer than the workers, as the 12 stale drops of 21 Oct said) |
+| STRATA_IO_PF_THREADS=2 (existing) | +1.5 to +1.8% | +9% |
+| STRATA_IO_PF_THREADS=1 (existing) | +3.1 to +3.3% | +17% |
+| PF_THREADS=1 + YIELD | +5.1 to +5.4% | +23% |
+| PF_THREADS=1 + EDF + YIELD | +5.4 to +5.8% | +24% |
+| LA_MODEL alone | +3.9 to +4.2% | +7 to +8.5% |
+| PF_THREADS=1 + EDF + YIELD + LA_MODEL | +9.3 to +9.7% | +31 to +32% |
+| bound: every miss predicted, no wrong guess | +17% | +40% |
+
+The model's risk: it assumes one 2.33 MB read gets the whole drive alone. If this NVMe needs several reads in flight to reach 3.3 GB/s,
+PF_THREADS=1 loses that and PF_THREADS=2 is the arm to keep: measure both.
+
+## 22 Oct: system trace simulator and five borrowed ideas (tools/sysim; a model, NOT measured)
+
+`tools/sysim/sysim.py` traces every decode task (kernels, expert reads, copies, host hand-offs, CPU expert jobs) on a generic machine
+whose links (VRAM, PCIe, RAM, NVMe) are shared max-min fairly; it reports the critical path, who waited on whom, sharing losses,
+utilisation and the gain from a 1.5x faster resource, and writes a Perfetto trace and an HTML timeline. Calibrated: 44-46 ms a window
+against 47.2 ms measured (20 Oct). `--waterfall` goes from the ideal machine to today one constraint at a time. Its two largest GPU
+terms (kernels at 0.70 of VRAM bandwidth, 3 us a graph node) are ASSUMED: only their sum (~25 ms a window) is measured - measure the
+split with STRATA_DECODE_STAGE_TIMERS=1 before acting on it.
+
+`tools/sysim/ideas.py`, mean of 3 seeds, 40 windows (tok/s change; "fixes" = PF_THREADS=1 + YIELD + EDF + LA_MODEL + zero-copy):
+
+| Idea | short, on today | short, on fixes | long, on today | long, on fixes |
+| --- | ---: | ---: | ---: | ---: |
+| 1 cost-aware prefetch (Cao et al.): read a guess only at confidence >= 0.6 | +18% | +10% | +29% | +15% |
+| 1 the same if confidence separates poorly (sep 0.1) | +14% | +8% | +21% | +11% |
+| 2 multi-history predictor: 3-ahead guesses at recall 0.3 | 0% | +4% | 0% | -4% |
+| 3 better caching: 25% fewer cold misses | +13% | +12% | +38% | +25% |
+| 4 pacing guess starts (Kingman) | 0% | 0% | +1% | +1% |
+| 5 row-chunk streaming of cold reads, 4 chunks (#19; bit-planes do not apply to IQ3_S's grid codes) | +7% | +4% | +10% | +4% |
+| 1 + 4 + 5 | +27% | +12% | +41% | +18% |
+| 1 + 2 + 3 + 4 + 5 | +37% | +19% | +68% | +32% |
+
+CAUTION on idea 1: a confidence gate on the read-ahead was measured with no net gain (Tested - keep out: 49.0 vs 49.6 tok/s, the
+CPU look-ahead's gate). The simulated gain needs confidence that separates right from wrong guesses; check that on traces (the GPU
+look-ahead's route_pred_weights against the routed experts) before building it. Idea 3 is the cache policy (trace replay #13: a fast
+LFU doubled rank 0-1 hits against a fixed set; LFRU lost live) - its value here says the RAM tier's policy is worth a trace study.
+Ideas 2 and 4 do not pay in the model: more lead costs more wrong guesses than it saves; with fair sharing, bursts are not the cost.
+
+Idle time as waste (tools/sysim/idle.py; model). Per decode window today / with the read-ahead fixes: GPU idle 14.2 / 8.3 ms (32 / 22%;
+~2 ms of it in ~40 gaps under 50 us = the per-layer host hand-off, the rest mostly gaps over 0.5 ms waiting on demand reads); drive idle
+10.8 / 15.7 ms (25 / 41%, while the GPU computes); CPU pool 69 / 65%, host 88 / 91%, copy engine 95 / 94% idle (cheap resources: their
+idle is spare, not waste). Theory of Constraints: keep the constraint (the GPU) busy; use the drive's idle time for work that lowers
+FUTURE GPU waits. Simulated filler: RAM-tier promotions read only while the drive is otherwise idle, one thread, lowest priority:
+
+| promotion pieces | share of promotions that save a later cold read | short, on today / on fixes | long, on today / on fixes |
+| --- | ---: | ---: | ---: |
+| whole blobs (2.33 MB) | 10% | +1% / +1% | -1% / -3% |
+| whole blobs | 30% | +13% / +16% | +12% / +7% |
+| whole blobs | 50% | +23% / +20% | +23% / +19% |
+| 0.29 MB pieces (steps aside sooner) | 10% | +3% / +4% | +4% / +3% |
+| 0.29 MB pieces | 30% | +8% / +13% | +11% / +10% |
+| 0.29 MB pieces | 50% | +12% / +19% | +17% / +17% |
+
+Not modelled: a promotion into a FULL tier evicts an expert that may be needed (STRATA_CONV_FILL lost partly for that: "no free
+places", and its reads were not idle-gated). The usefulness share is the open number: measure it on trace1 (which experts a recency /
+frequency rule would promote, and how many of them a later window then misses cold), before building.
+
+The usefulness check, built: `tools/predictor/promote_check.py <trace>` replays a STRATA_ROUTER_TRACE window by window (VRAM and RAM
+tiers seeded from the first 20% as the profile ranks them, VRAM swap rounds with decay 0.7 / 12 swaps / gain 1.5) and, for recency,
+frequency and recency+frequency rules at 5-22 promotions a window, reports the useful share (the sysim fill_useful), cold reads saved,
+cold reads CAUSED by the evictions a full tier needs, and the net change; it prints the matching sysim --set line. Checked only on a
+synthetic RTR1 trace (--synthetic): useful share falls with the budget (31% at 5, 11% at 22), evictions cause more cold reads as the
+budget grows, and with a tier that has room nothing is caused (29% fewer cold reads). On this box (trace1, ~8,500 windows, ~10 min):
+  python tools/predictor/promote_check.py /mnt/nvme/strata-data/traces/trace1.bin --ram 450     (the 1 GiB tier)
+  python tools/predictor/promote_check.py /mnt/nvme/strata-data/traces/trace1.bin --ram 4400    (a 10 GiB tier)
