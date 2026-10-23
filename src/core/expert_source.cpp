@@ -717,6 +717,10 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     if (io_edf_ || io_yield_)
         std::fprintf(stderr, "FileExpertSource: read-ahead order %s%s\n", io_edf_ ? "next layer first (STRATA_IO_EDF)" : "newest first",
                      io_yield_ ? ", no guess started while the decode's own reads run (STRATA_IO_PF_YIELD)" : "");
+    // a switch that does nothing in this combination: said, rather than measured as an arm that is the control
+    if (io_yield_ && io_demand_first_)
+        std::fprintf(stderr, "FileExpertSource: STRATA_IO_PF_YIELD has no effect with STRATA_IO_DEMAND_FIRST (its demand reads go "
+                             "through the I/O threads, not the decode's own reads)\n");
     {   // experts.bin: fill the page cache from the workers and let the kernels read the mapping; otherwise stage.
         // solid-wins fork: staging is the DEFAULT (SPEC.md T1 measured the staged variant; the fill variant was not
         // measured on this box). STRATA_IO_PF_STAGE=0 selects the fill variant.
@@ -2847,7 +2851,7 @@ void RouterLookahead::run() {
 void FileExpertSource::route_layer(int64_t layer) {
     // a layer at or below the last one starts the next decode window (the guesses an earlier window queued are then stale)
     const int32_t prev = io_cur_layer_.exchange((int32_t) layer, std::memory_order_relaxed);
-    if ((int32_t) layer <= prev) io_win_.fetch_add(1, std::memory_order_relaxed);
+    if ((int32_t) layer < prev) io_win_.fetch_add(1, std::memory_order_relaxed);   // the same layer again: its second group (--spec-split)
 }
 
 void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {

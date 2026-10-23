@@ -606,7 +606,7 @@ bool route_pred_model_load(const char* path, int64_t n_layers, int64_t n_embd, s
     if (cudaMalloc((void**) &g_lam_w, w.size() * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc((void**) &g_lam_b, b.size() * sizeof(float)) != cudaSuccess) {
         cudaGetLastError();
-        if (g_lam_w != nullptr) cudaFree(g_lam_w);
+        if (g_lam_w != nullptr) (void) cudaFree(g_lam_w);
         g_lam_w = nullptr;
         g_lam_b = nullptr;
         msg = "no room on the GPU for it";
@@ -615,8 +615,8 @@ bool route_pred_model_load(const char* path, int64_t n_layers, int64_t n_embd, s
     if (cudaMemcpy(g_lam_w, w.data(), w.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(g_lam_b, b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaGetLastError();
-        cudaFree(g_lam_w);
-        cudaFree(g_lam_b);
+        (void) cudaFree(g_lam_w);
+        (void) cudaFree(g_lam_b);
         g_lam_w = nullptr;
         g_lam_b = nullptr;
         msg = "the copy to the GPU failed";
