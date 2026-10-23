@@ -195,10 +195,12 @@ struct RouteResidentCfg {
     int auto_last_win = 0;                    ///< the direction of the last win (0: no win yet)
     // STRATA_FRAGILE_BRAKE (default on, =0 off; with FRAGILE and AUTO): each request has its own decode budget req_b, used for its decode
     // windows instead of auto_b.  route_budget_begin sets req_b = 0.5 * auto_b.  The AUTO arms scale it: base req_b, candidate req_b * s^d.
-    // A settled re-check of the request counts into req_rc / req_fl; with >= 5 re-checks and flips / rechecks > 0.2, req_b halves (below
-    // 0.01 it is 0) and the counts reset, so it takes 5 more re-checks to act again.  Every 64 decode windows of the request with >= 5
-    // re-checks and flips / rechecks <= 0.1, req_b grows by 1.25 (never above auto_b).  The search (auto_b) is unchanged by the brake.
-    enum { kBrakeMin = 5, kBrakeWindows = 64, kAutoQuality = 10 };
+    // A settled re-check of the request counts into req_rc / req_fl.  Evidence (route_wilson90, z = 1.645): the brake acts only with >= 15
+    // re-checks and a Wilson 90% lower bound of flips / rechecks above 0.2; then req_b halves (below 0.01 it is 0) and the counts reset,
+    // so it takes 15 more re-checks to act again.  Every 64 decode windows of the request with >= 15 re-checks and a Wilson 90% upper
+    // bound <= 0.2, req_b grows by 1.25 (never above auto_b; from 0 it becomes 0.25 * auto_b).  The request's first grow check (window 64)
+    // sets req_b = auto_b at once when that holds.  The search (auto_b) is unchanged by the brake.
+    enum { kBrakeMin = 15, kBrakeWindows = 64, kAutoQualityMin = 20 };
     bool brake_on = true;                     ///< STRATA_FRAGILE_BRAKE: the per-request brake (off: req_b is auto_b for every request)
     float req_b = 0.1f;                       ///< this request's decode budget
     long long req_rc = 0, req_fl = 0;         ///< this request's re-checks and flips since its last brake
@@ -3876,12 +3878,34 @@ namespace {
 void route_auto_schedule(RouteResidentCfg& c);   // defined with the test helpers below route_auto_window
 float route_auto_arm_b(const RouteResidentCfg& c, int arm);   // defined with the test helpers below route_auto_window
 
-// STRATA_FRAGILE_BRAKE: every kBrakeWindows decode windows of the request, the request's budget grows by 1.25 (never above auto_b)
-// when it has >= kBrakeMin re-checks and its flip rate is at most 0.1.  The counts are kept (only a brake resets them).
+// Wilson score interval at 90% (z = 1.645) for f flips in n re-checks: the flip rate's lower and upper bounds (0 and 1 when n is 0).
+void route_wilson90(long long f, long long n, double& lo, double& hi) {
+    if (n <= 0) {
+        lo = 0.0;
+        hi = 1.0;
+        return;
+    }
+    const double z = 1.645, z2 = z * z, nn = (double) n, p = (double) f / nn;
+    const double centre = p + z2 / (2.0 * nn);
+    const double half = z * std::sqrt(p * (1.0 - p) / nn + z2 / (4.0 * nn * nn));
+    const double den = 1.0 + z2 / nn;
+    lo = (centre - half) / den;
+    hi = (centre + half) / den;
+}
+
+// STRATA_FRAGILE_BRAKE: every kBrakeWindows decode windows of the request, the request's budget grows when it has >= kBrakeMin re-checks
+// and the Wilson 90% upper bound of its flip rate is at most 0.2: req_b * 1.25 (never above auto_b; from 0, 0.25 * auto_b).  The request's
+// first grow check (window kBrakeWindows) sets req_b = auto_b at once when that holds.  The counts are kept (only a brake resets them).
 void route_brake_grow(RouteResidentCfg& c) {
     if (c.req_rc < RouteResidentCfg::kBrakeMin) return;
-    if ((double) c.req_fl / (double) c.req_rc > 0.1) return;
-    c.req_b = std::min(c.auto_b, c.req_b * 1.25f);
+    double lo = 0.0, hi = 0.0;
+    route_wilson90(c.req_fl, c.req_rc, lo, hi);
+    if (hi > 0.2) return;
+    if (c.req_wins == RouteResidentCfg::kBrakeWindows) {
+        c.req_b = c.auto_b;
+        return;
+    }
+    c.req_b = c.req_b <= 0.0f ? 0.25f * c.auto_b : std::min(c.auto_b, c.req_b * 1.25f);
 }
 }  // namespace
 
@@ -4062,7 +4086,9 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
         ++c.req_fl;
         ++c.auto_fl[c.auto_cut_arm];
     }
-    if (c.brake_on && c.req_b > 0.0f && c.req_rc >= RouteResidentCfg::kBrakeMin && (double) c.req_fl / (double) c.req_rc > 0.2) {
+    double flip_lo = 0.0, flip_hi = 0.0;
+    route_wilson90(c.req_fl, c.req_rc, flip_lo, flip_hi);
+    if (c.brake_on && c.req_b > 0.0f && c.req_rc >= RouteResidentCfg::kBrakeMin && flip_lo > 0.2) {
         const float old = c.req_b;
         const float cut = old * 0.5f;
         c.req_b = cut < 0.01f ? 0.0f : cut;
@@ -4218,15 +4244,20 @@ void route_auto_schedule(RouteResidentCfg& c) {
     c.auto_win_sched = true;
 }
 
-// Both arms have kAutoMin scheduled windows: the candidate wins when its speed is at least 1.02 times the base's and its flip rate
-// (flips / re-checks of its arm) is at most the base's + 0.05.  A candidate with fewer than kAutoQuality re-checks counts as equal on quality.
+// Both arms have kAutoMin scheduled windows: the candidate wins when its speed is at least 1.02 times the base's, unless quality is lost.
+// Quality is lost only when both arms have >= kAutoQualityMin re-checks and the candidate's Wilson 90% lower flip-rate bound exceeds
+// the base's Wilson 90% upper bound (a real difference).  Otherwise speed decides.
 void route_auto_test_done(RouteResidentCfg& c) {
     const int d = c.auto_dir;
     const double sb = c.auto_secs[0] > 0.0 ? (double) c.auto_tok[0] / c.auto_secs[0] : 0.0;
     const double sc = c.auto_secs[1] > 0.0 ? (double) c.auto_tok[1] / c.auto_secs[1] : 0.0;
     const double fb = c.auto_rc[0] > 0 ? (double) c.auto_fl[0] / (double) c.auto_rc[0] : 0.0;
     const double fc = c.auto_rc[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_rc[1] : 0.0;
-    const bool quality = c.auto_rc[1] < RouteResidentCfg::kAutoQuality || fc <= fb + 0.05;
+    double base_lo = 0.0, base_hi = 0.0, cand_lo = 0.0, cand_hi = 0.0;
+    route_wilson90(c.auto_fl[0], c.auto_rc[0], base_lo, base_hi);
+    route_wilson90(c.auto_fl[1], c.auto_rc[1], cand_lo, cand_hi);
+    const bool quality = !(c.auto_rc[0] >= RouteResidentCfg::kAutoQualityMin && c.auto_rc[1] >= RouteResidentCfg::kAutoQualityMin
+                           && cand_lo > base_hi);
     const bool won = sc >= sb * 1.02 && quality;
     const float b_old = c.auto_b, cand = c.auto_cand_b, step = c.auto_step;   // step: the factor this test's candidate used
     // the step: a win in the same direction as the last win grows it (to 2); a loss shrinks it toward 1.1 (sqrt, floor 1.1)
