@@ -1150,7 +1150,7 @@ private:
     // STRATA_IO_EDF=1: a worker takes the queued guess whose layer comes NEXT (earliest deadline; the order the look-ahead queued
     // them within a layer), and drops the guesses of a layer already routed or of an earlier window.  Unset: the newest guess
     // first (a look-ahead's dist-2 guesses, queued after its dist-1 ones, are then read first).
-    bool io_edf_ = false;
+    bool io_edf_ = true;   // default on since 24 Oct (with 2 threads; STRATA_IO_EDF=0 off)
     // (how many guesses are read at once is STRATA_IO_PF_THREADS: one per worker, the demand reads on the decode's thread)
     // STRATA_IO_PF_YIELD=1: no guess starts while the decode's own demand reads (prefetch) are in flight
     bool io_yield_ = false;

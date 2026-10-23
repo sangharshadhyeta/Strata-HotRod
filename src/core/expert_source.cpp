@@ -708,7 +708,10 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
         for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
     }
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
-    io_threads_ = threads > 0 ? threads : 8;
+    // default 2 since 24 Oct (was 8): of ~25,000 guesses read ahead only ~3,000 were used, and 8 threads' wasted reads queued in
+    // front of the decode's own reads on the drive; 2 threads: +8% code, +15% reasoning, +8% prose, drive wait 3.8-4.7 -> 2.5-3.3 s
+    // (two runs each, IQ3_S on the 3060 box's NVMe).  STRATA_IO_PF_THREADS=<n> sets it
+    io_threads_ = threads > 0 ? threads : 2;
     if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::atoi(v) != 0;
     if (const char* v = std::getenv("STRATA_IO_DEMAND_FIRST")) io_demand_first_ = std::atoi(v) != 0;
     if (const char* v = std::getenv("STRATA_IO_EDF")) io_edf_ = std::atoi(v) != 0;
@@ -5149,7 +5152,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int64_t want[8 * 10];
             int64_t nw = 0;
             // STRATA_IO_EDF: every token's rank 0 guess before any rank 1 guess (the workers then read a layer's guesses in this order)
-            static const bool rank_major = [] { const char* v = std::getenv("STRATA_IO_EDF"); return v != nullptr && std::atoi(v) != 0; }();
+            static const bool rank_major = [] { const char* v = std::getenv("STRATA_IO_EDF"); return v == nullptr || std::atoi(v) != 0; }();
             const int64_t outer = rank_major ? std::min(d.gpu_pred_ranks, 10) : n_tok, inner = rank_major ? n_tok : std::min(d.gpu_pred_ranks, 10);
             for (int64_t a = 0; a < outer; ++a)
                 for (int64_t b = 0; b < inner; ++b) {
