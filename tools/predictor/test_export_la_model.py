@@ -64,6 +64,33 @@ def test_reader_refuses_other_globals():
             pass
 
 
+def tensor_pt(path, size, stride, offset=0, numel=4):
+    """A torch.save zip by hand (no torch): one float tensor of `size` / `stride` / `offset` over a storage of `numel` floats."""
+    s = lambda t: b"X" + struct.pack("<I", len(t)) + t.encode()          # BINUNICODE
+    i = lambda v: b"J" + struct.pack("<i", v)                              # BININT
+    tup = lambda vals: b"(" + b"".join(i(v) for v in vals) + b"t"          # MARK ... TUPLE
+    pkl = (b"\x80\x02" + b"ctorch._utils\n_rebuild_tensor_v2\n" + b"("
+           + b"(" + s("storage") + b"ctorch\nFloatStorage\n" + s("0") + s("cpu") + i(numel) + b"tQ"   # BINPERSID
+           + i(offset) + tup(size) + tup(stride) + b"\x89" + b"tR.")      # requires_grad False, REDUCE, STOP
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("archive/data.pkl", pkl)
+        z.writestr("archive/data/0", np.arange(numel, dtype=np.float32).tobytes())
+
+
+def test_reader_refuses_a_tensor_past_its_storage():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "ok.pt")
+        tensor_pt(p, (2, 2), (2, 1))
+        assert np.array_equal(pt_reader.load(p), np.arange(4, dtype=np.float32).reshape(2, 2))
+        for size, stride, offset in (((100,), (1,), 0), ((2, 2), (2, 1), 1), ((4,), (-1,), 0)):
+            tensor_pt(p, size, stride, offset)
+            try:
+                pt_reader.load(p)
+                raise AssertionError(f"a tensor {size} / {stride} past its storage was read")
+            except pickle.UnpicklingError:
+                pass
+
+
 def check_out(path, states, layers):
     with open(path, "rb") as f:
         assert f.read(4) == b"LAM1" and struct.unpack("<III", f.read(12)) == (layers, E, H)
@@ -114,7 +141,7 @@ def test_export_from_folder_and_tar():
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
-            if torch is None and name != "test_reader_refuses_other_globals":
+            if torch is None and name not in ("test_reader_refuses_other_globals", "test_reader_refuses_a_tensor_past_its_storage"):
                 print("skipped (no torch)", name)
                 continue
             fn()
