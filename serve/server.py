@@ -2899,6 +2899,9 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None) -> list[int]:
 
 
 RESIDENCY_FILE = os.path.join(tempfile.gettempdir(), f"strata-residency-{os.getpid()}.json")
+# the Monitor's decode timeline: the engine writes the last decode windows' host times to TIMELINE_FILE while TIMELINE_CTL holds "1"
+TIMELINE_FILE = os.path.join(tempfile.gettempdir(), f"strata-timeline-{os.getpid()}.json")
+TIMELINE_CTL = os.path.join(tempfile.gettempdir(), f"strata-timeline-{os.getpid()}.ctl")
 
 
 def _drop_stale_residency_files():
@@ -2906,9 +2909,11 @@ def _drop_stale_residency_files():
     the files of servers that no longer run are deleted; this server's own file goes when it ends."""
     tmp = tempfile.gettempdir()
     for name in os.listdir(tmp):
-        if not (name.startswith("strata-residency-") and name.endswith(".json")):
+        pre = next((x for x in ("strata-residency-", "strata-timeline-") if name.startswith(x)), None)
+        ext = next((x for x in (".json.tmp", ".json", ".ctl") if name.endswith(x)), None)   # (.tmp: an engine ended mid-write)
+        if pre is None or ext is None:
             continue
-        pid = name[len("strata-residency-"):-len(".json")]
+        pid = name[len(pre):-len(ext)]
         if not pid.isdigit() or int(pid) == os.getpid():
             continue
         # this process's own: left by an earlier process with the same id (Windows reuses ids) - a stale "1" switch would start
@@ -2952,7 +2957,47 @@ try:
 except OSError:
     pass
 import atexit as _atexit  # noqa: E402
-_atexit.register(lambda: os.path.exists(RESIDENCY_FILE) and os.remove(RESIDENCY_FILE))
+_atexit.register(lambda: [os.remove(f) for f in (RESIDENCY_FILE, TIMELINE_FILE, TIMELINE_CTL) if os.path.exists(f)])
+
+
+def timeline_on() -> bool:
+    try:
+        with open(TIMELINE_CTL, "rb") as f:
+            return f.read(1) == b"1"
+    except OSError:
+        return False
+
+
+def set_timeline(on: bool) -> None:
+    """The Monitor's switch: the engine reads it at most every 2 s (between decode windows) and records host times only while on."""
+    tmp = TIMELINE_CTL + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(b"1" if on else b"0")
+    os.replace(tmp, TIMELINE_CTL)
+    if not on:
+        try:
+            os.remove(TIMELINE_FILE)
+        except OSError:
+            pass
+
+
+def timeline_view(max_age_s: float = 10.0) -> dict:
+    """/metrics: {"on": the switch, "data": the engine's last snapshot or None} - layers [window, layer, tokens, demand reads, CPU
+    jobs, then 7 host times in us: doorbell, plan published, quantise, reads start, reads done, jobs ready, CPU done], reads
+    [I/O thread, layer, demand, start us, end us].  None while off, before the first decode, or when stale."""
+    on = timeline_on()
+    data = None
+    if on:
+        try:
+            st = os.stat(TIMELINE_FILE)
+            if time.time() - st.st_mtime <= max_age_s:
+                with open(TIMELINE_FILE, "rb") as f:
+                    d = json.loads(f.read())
+                if isinstance(d, dict) and d.get("v") == 1 and isinstance(d.get("layers"), list):
+                    data = d
+        except (OSError, ValueError):
+            pass
+    return {"on": on, "data": data}
 
 
 def residency_view(max_age_s: float = 30.0) -> dict | None:
@@ -2982,6 +3027,8 @@ def child_env(cfg: dict) -> dict:
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
     env.setdefault("STRATA_RESIDENCY_FILE", RESIDENCY_FILE)   # the engine's expert map for the Monitor (residency_view)
+    env.setdefault("STRATA_TIMELINE_FILE", TIMELINE_FILE)     # the Monitor's decode timeline (timeline_view), off until switched on
+    env.setdefault("STRATA_TIMELINE_CTL", TIMELINE_CTL)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -3983,6 +4030,7 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked), "residency": residency_view(),
+                "timeline": timeline_view(),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -5956,6 +6004,15 @@ def make_handler(svc: Service):
                             svc.fifo.release()
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
+                    return
+                if path == "/v1/monitor/timeline":           # the Monitor's decode timeline: on / off (host times only)
+                    if not self._own_page("the timeline can be switched on or off"):
+                        return
+                    on = req.get("on")
+                    if not isinstance(on, bool):
+                        raise ValueError("on: true or false")
+                    set_timeline(on)
+                    self._json(200, {"on": on})
                     return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
                     if not self._own_page("the VRAM reserve can be changed"):

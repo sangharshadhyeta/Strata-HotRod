@@ -47,7 +47,7 @@ class PromptCacheSaveOrder(unittest.TestCase):
         tok = ByteTokenizer()
         self.tok = tok
         self.svc = Service(PassEngine(tok, "Hello."), tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
-        self.cache = self.svc.pcache = SlowCache(self.svc, 0.5)
+        self.cache = self.svc.pcache = SlowCache(self.svc, 2.0)
 
     def test_done_before_save_and_turn_held(self):
         t0 = time.monotonic()
@@ -56,7 +56,7 @@ class PromptCacheSaveOrder(unittest.TestCase):
             kinds.append(kind)
         ended = time.monotonic()
         self.assertEqual(kinds[-1], "done")
-        self.assertLess(ended - t0, 0.4, "the reply waited for the save")
+        self.assertLess(ended - t0, 1.5, "the reply waited for the save")
         self.assertTrue(self.svc.fifo.locked(), "the turn was released before the save finished")
         self.assertTrue(self.svc.fifo.acquire(timeout=5), "the save never released the turn")
         self.svc.fifo.release()

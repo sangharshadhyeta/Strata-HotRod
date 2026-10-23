@@ -573,10 +573,13 @@ static uint16_t* g_lam_w = nullptr;
 static float* g_lam_b = nullptr;
 static std::vector<char> g_lam_has;
 static int64_t g_lam_h = 0;
+static int g_lam_dev = -1;   // the GPU the matrices live on: another GPU's look-ahead keeps its router
 bool route_pred_model_load(const char* path, int64_t n_layers, int64_t n_embd, std::string& msg) {
     if (g_lam_w != nullptr) {
-        msg = "already loaded";
-        return g_lam_h == n_embd && (int64_t) g_lam_has.size() == n_layers;
+        int dev = -1;
+        const bool same = cudaGetDevice(&dev) == cudaSuccess && dev == g_lam_dev;
+        msg = same ? "already loaded" : "loaded on another GPU only (this GPU's look-ahead keeps the router)";
+        return same && g_lam_h == n_embd && (int64_t) g_lam_has.size() == n_layers;
     }
     FILE* f = std::fopen(path, "rb");
     if (f == nullptr) { msg = std::string("cannot open ") + path; return false; }
@@ -624,6 +627,7 @@ bool route_pred_model_load(const char* path, int64_t n_layers, int64_t n_embd, s
     }
     g_lam_has = std::move(has);
     g_lam_h = n_embd;
+    if (cudaGetDevice(&g_lam_dev) != cudaSuccess) g_lam_dev = -1;
     int64_t n = 0;
     for (char c : g_lam_has) n += c;
     msg = std::to_string(n) + " layers, " + std::to_string((w.size() * 2 + b.size() * 4) >> 20) + " MiB of VRAM";
@@ -631,6 +635,8 @@ bool route_pred_model_load(const char* path, int64_t n_layers, int64_t n_embd, s
 }
 const uint16_t* route_pred_model_w(int64_t target_layer) {
     if (g_lam_w == nullptr || target_layer < 0 || target_layer >= (int64_t) g_lam_has.size() || !g_lam_has[(size_t) target_layer]) return nullptr;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev != g_lam_dev) return nullptr;   // recorded for another GPU
     return g_lam_w + (size_t) target_layer * 512 * (size_t) g_lam_h;
 }
 const float* route_pred_model_b(int64_t target_layer) {

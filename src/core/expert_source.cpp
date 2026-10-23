@@ -27,6 +27,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <filesystem>
@@ -778,6 +780,147 @@ namespace {
 // set while the decode's dispatch queues its look-ahead guesses (the only guesses with a deadline: STRATA_IO_EDF); the prompt's
 // look-ahead thread and the CPU look-ahead queue theirs untagged
 thread_local bool t_decode_guess = false;
+// the blobs the last prefetch() on this thread read from the files itself or handed to the I/O threads as demand reads (the timeline's
+// "demand reads": the RAM tier's and the landed guesses' blobs are not reads)
+thread_local int32_t t_pf_reads = 0;
+
+// ---- the decode timeline (STRATA_TIMELINE_FILE + STRATA_TIMELINE_CTL; the server sets both for the Monitor).  HOST times only:
+// each MoE layer's dispatch (the doorbell, the plan published, the demand reads, the CPU pool) and each file-tier read the I/O
+// threads make are stamped into fixed rings while the switch is on.  The GPU's graph is not touched - its work shows as the time
+// between the host's hand-offs - so the GPU runs the same with the timeline on or off.  Off: one relaxed load per layer and per
+// read.  The switch is the CTL file ("1": on); timeline_tick() reads it and writes the snapshot at most every 2 s, from the
+// adaptive tier's round (between windows, not on the decode thread).  Each ring entry carries a sequence number written last, so a
+// snapshot skips an entry a writer is still filling.
+struct TlLayer { std::atomic<uint64_t> seq{0}; int64_t t[7]; int32_t layer, n_tok, misses, jobs; uint32_t win; };
+struct TlRead { std::atomic<uint64_t> seq{0}; int64_t t0, t1; int32_t layer, worker; uint32_t win; uint8_t demand; };
+constexpr uint64_t kTlLayers = 48 * 16;   // 16 windows of 48 layers
+constexpr uint64_t kTlReads = 4096;
+TlLayer g_tl_layers[kTlLayers];
+TlRead g_tl_reads[kTlReads];
+std::atomic<uint64_t> g_tl_layer_next{0}, g_tl_read_next{0};
+std::atomic<bool> g_tl_on{false};
+std::atomic<uint32_t> g_tl_win{0};
+std::atomic<int32_t> g_tl_last_layer{-1};
+std::atomic<int> g_tl_workers{0};
+int64_t tl_ns(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+}
+int64_t tl_ns() { return tl_ns(std::chrono::steady_clock::now()); }
+// the decode thread, at the end of a layer's dispatch
+void tl_layer(int32_t layer, int32_t n_tok, int32_t misses, int32_t jobs, const int64_t* t) {
+    if (layer < g_tl_last_layer.exchange(layer, std::memory_order_relaxed)) g_tl_win.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t i = g_tl_layer_next.fetch_add(1, std::memory_order_relaxed);
+    TlLayer& e = g_tl_layers[i % kTlLayers];
+    e.seq.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    for (int j = 0; j < 7; ++j) e.t[j] = t[j];
+    e.layer = layer;
+    e.n_tok = n_tok;
+    e.misses = misses;
+    e.jobs = jobs;
+    e.win = g_tl_win.load(std::memory_order_relaxed);
+    e.seq.store(i + 1, std::memory_order_release);
+}
+// an I/O thread, after a file-tier read (a guess, or a demand read the decode handed it)
+void tl_read(int32_t layer, bool demand, int64_t t0) {
+    static thread_local int worker = -1;
+    if (worker < 0) worker = g_tl_workers.fetch_add(1, std::memory_order_relaxed);
+    const int64_t t1 = tl_ns();
+    const uint64_t i = g_tl_read_next.fetch_add(1, std::memory_order_relaxed);
+    TlRead& e = g_tl_reads[i % kTlReads];
+    e.seq.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    e.t0 = t0;
+    e.t1 = t1;
+    e.layer = layer;
+    e.worker = worker;
+    e.win = g_tl_win.load(std::memory_order_relaxed);
+    e.demand = demand ? 1 : 0;
+    e.seq.store(i + 1, std::memory_order_release);
+}
+}  // namespace
+
+bool timeline_on() { return g_tl_on.load(std::memory_order_relaxed); }
+
+void timeline_tick() {
+    static const char* ctl = std::getenv("STRATA_TIMELINE_CTL");
+    static const char* out = std::getenv("STRATA_TIMELINE_FILE");
+    if (ctl == nullptr || out == nullptr || ctl[0] == '\0' || out[0] == '\0') return;
+    static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now() - std::chrono::hours(1);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(2)) return;
+    last = now;
+    char c = '0';
+    if (FILE* f = std::fopen(ctl, "rb")) {
+        if (std::fread(&c, 1, 1, f) != 1) c = '0';
+        std::fclose(f);
+    }
+    const bool want = c == '1';
+    if (want != g_tl_on.load(std::memory_order_relaxed)) {
+        g_tl_on.store(want, std::memory_order_relaxed);
+        if (!want) {
+            std::error_code ec;
+            std::filesystem::remove(out, ec);
+        }
+        return;                              // just switched on: nothing recorded yet
+    }
+    if (!want) return;
+    // the last 4 windows the rings hold whole
+    struct L { int64_t t[7]; int32_t layer, n_tok, misses, jobs; uint32_t win; };
+    std::vector<L> ls;
+    const uint64_t ln = g_tl_layer_next.load(std::memory_order_acquire);
+    for (uint64_t i = ln > kTlLayers ? ln - kTlLayers : 0; i < ln; ++i) {
+        const TlLayer& e = g_tl_layers[i % kTlLayers];
+        if (e.seq.load(std::memory_order_acquire) != i + 1) continue;
+        L x;
+        for (int j = 0; j < 7; ++j) x.t[j] = e.t[j];
+        x.layer = e.layer; x.n_tok = e.n_tok; x.misses = e.misses; x.jobs = e.jobs; x.win = e.win;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (e.seq.load(std::memory_order_relaxed) != i + 1) continue;   // overwritten while copied
+        ls.push_back(x);
+    }
+    if (ls.empty()) return;
+    const uint32_t wmax = ls.back().win;
+    const uint32_t wmin = wmax >= 3 ? wmax - 3 : 0;
+    int64_t t_lo = INT64_MAX, t_hi = 0;
+    for (const L& x : ls)
+        if (x.win >= wmin) { t_lo = std::min(t_lo, x.t[0]); t_hi = std::max(t_hi, x.t[6]); }
+    if (t_lo == INT64_MAX) return;
+    auto us = [&](int64_t t) { return (double) (t - t_lo) / 1000.0; };
+    std::string js = "{\"v\":1,\"time\":" + std::to_string((long long) std::time(nullptr)) + ",\"span_us\":" +
+                     std::to_string((long long) ((t_hi - t_lo) / 1000)) + ",\"layers\":[";
+    char buf[256];
+    bool first = true;
+    for (const L& x : ls) {
+        if (x.win < wmin) continue;
+        std::snprintf(buf, sizeof buf, "%s[%u,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f]", first ? "" : ",", (unsigned) (x.win - wmin),
+                      x.layer, x.n_tok, x.misses, x.jobs, us(x.t[0]), us(x.t[1]), us(x.t[2]), us(x.t[3]), us(x.t[4]), us(x.t[5]), us(x.t[6]));
+        js += buf;
+        first = false;
+    }
+    js += "],\"reads\":[";
+    first = true;
+    const uint64_t rn = g_tl_read_next.load(std::memory_order_acquire);
+    for (uint64_t i = rn > kTlReads ? rn - kTlReads : 0; i < rn; ++i) {
+        const TlRead& e = g_tl_reads[i % kTlReads];
+        if (e.seq.load(std::memory_order_acquire) != i + 1) continue;
+        const int64_t t0 = e.t0, t1 = e.t1;
+        const int32_t layer = e.layer, worker = e.worker;
+        const uint8_t demand = e.demand;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (e.seq.load(std::memory_order_relaxed) != i + 1 || t1 < t_lo || t0 > t_hi) continue;
+        std::snprintf(buf, sizeof buf, "%s[%d,%d,%d,%.1f,%.1f]", first ? "" : ",", worker, layer, (int) demand, us(t0), us(t1));
+        js += buf;
+        first = false;
+    }
+    js += "]}";
+    const std::string tmp = std::string(out) + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f << js;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, out, ec);
 }
 
 void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
@@ -873,7 +1016,9 @@ void FileExpertSource::io_worker() {
                 stage_queued_[v] = 0;
                 dst = stage_buf_[v].get();
             }
+            const int64_t tl0 = timeline_on() ? tl_ns() : 0;
             const bool ok = copy_from_files(layer, expert, dst);
+            if (tl0 != 0) tl_read(layer, true, tl0);
             io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
             if (ok) file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
             {
@@ -934,7 +1079,9 @@ void FileExpertSource::io_worker() {
             stage_pf_[v] = 1;
             dst = stage_buf_[v].get();
         }
+        const int64_t tl0 = timeline_on() ? tl_ns() : 0;
         const bool ok = copy_from_files(layer, expert, dst);
+        if (tl0 != 0) tl_read(layer, false, tl0);
         io_pf_blobs_.fetch_add(1, std::memory_order_relaxed);
         if (ok) file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
         {
@@ -1729,6 +1876,7 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
         }
     }
     for (const int64_t e : reserved) io_enqueue_demand(layer, e);
+    t_pf_reads = (int32_t) (todo.size() + reserved.size());
     const auto tf = tnow();
     {
         // STRATA_IO_PF_YIELD: no guess starts while these are read (released however fill_many ends)
@@ -5191,6 +5339,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
     const auto c0 = std::chrono::steady_clock::now();
+    const bool tl = timeline_on();             // the Monitor's timeline: host times of this layer (no effect on the work)
+    int64_t tl_pub = 0, tl_pf = 0;
+    int32_t tl_misses = 0;
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
@@ -5337,6 +5488,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
+        if (tl) tl_pub = tl_ns();
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
@@ -5403,7 +5555,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
+        t_pf_reads = 0;                        // (a source that reads nothing leaves it at 0)
         d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+        if (tl) { tl_pf = tl_ns(); tl_misses = t_pf_reads; }
     }
     int njobs = 0;
     for (int64_t t = 0; t < n_tok; ++t)
@@ -5504,6 +5658,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.multi_misses += njobs;
     ++d.layers;
     d.experts += n_tok * k;
+    if (tl) {
+        const int64_t t1 = tl_ns(c1), t2 = tl_ns(c2);
+        const int64_t t[7] = {tl_ns(c0), tl_pub ? tl_pub : t1, t1, t2, tl_pf ? tl_pf : t2, tl_ns(c3), tl_ns(c4)};
+        tl_layer((int32_t) (d.layers - 1), (int32_t) n_tok, tl_misses, (int32_t) njobs, t);
+    }
 }
 
 void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids, int64_t k) {
