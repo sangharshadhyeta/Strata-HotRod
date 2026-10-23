@@ -104,7 +104,10 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
 - **262K context with the K/V in RAM.** From 64K of context the attention's K/V streams from RAM; 32K tokens of it stay
   on the card.
 - **Look-ahead on the card.** The next layers' experts are predicted on the graphics card (not recomputed by the CPU)
-  while the current layer runs, and the predictions start their reads early.
+  while the current layer runs, and the predictions start their reads early. Since 24 Oct the reads ahead use **2 I/O
+  threads, the next layer's first** (`STRATA_IO_PF_THREADS`, `STRATA_IO_EDF=0` for the old way): only about 3,000 of
+  25,000 experts read ahead per answer were used, and 8 threads' wasted reads queued in front of the decode's own.
+  +8% code, +15% reasoning, +8% prose, drive wait 3.8-4.7 s down to 2.8-3.0 s (two runs each, all answers right).
 - **Starting the answer warm.** The experts the end of the prompt used most are put on the card before the first word
   of the answer, so decode does not start cold.
 - **Picking up a conversation.** A long conversation's state is saved to the SSD, and its next turn reloads it instead of
@@ -118,7 +121,8 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
   tier gives back its least-used experts until there is room again. The amount it keeps in reserve is measured on this
   PC and learned across restarts (`data/ram-reserve.json`), not a fixed number; the video-memory reserve is learned the
   same way (`vram-reserve.json`).
-- **The app:** live speeds while it works, and the experts-on-the-card map in the Monitor.
+- **The app:** live speeds while it works, the experts-on-the-card map in the Monitor, and below it the decode timeline
+  (Record; double-click or wheel to zoom, drag to pan): each layer's hand-offs and every SSD read, host times only.
 - **Experimental, off by default:** `STRATA_GDN_LOOP=1 STRATA_GDN_LOOP_NORM=1` runs the middle linear-attention layers
   twice per token (a training-free "looped" model). Measured on 210 MMLU-Pro questions: 180 correct against 175 without
   it (not significant: only 9 questions differ), and decode 10% slower (38.5 against 42.7 tokens/s). Not worth it on a
@@ -135,11 +139,17 @@ Default since 24 Oct 2026. Nothing in it is set by hand: the budget, the close-c
   how far stand-ins moved it (weight x gap of every replaced pick, all layers). When the token's lead over the runner-up is
   below `k` times that move, the window is cut just before it and the next window decides it with the top ranks exact.
   `k` is learned: the 10th percentile of lead/move on the first 64 windows, then just above the largest move that actually
-  flipped a token. On the 24 Oct tests it settled near 0.04; about 1 re-check in 5 had flipped (the "bobed", "howed" kind of
-  broken word), and only 1-3% of windows were cut.
+  flipped a token. One window in 16 also re-checks a token just above `k` (an explore cut), so a flip above the line is seen
+  and `k` rises; `k` never falls without a flip seen in this run. On the 24 Oct tests it settled at 0.03-0.05; about 1
+  re-check in 5 had flipped (the "bobed", "howed" kind of broken word), and only 1-3% of windows were cut.
 - **The budget searches itself** (`STRATA_ROUTE_BUDGET_AUTO`, default on, `=0` off). Windows alternate in runs of 8 between
   budget `b` and `b x step`, so both see the same text; the faster one by 2% over 96 windows each wins, re-check costs
-  included. The step grows while it keeps winning and shrinks after a loss.
+  included, **unless its flip rate is really higher**: with 20+ re-checks on each side, a candidate whose 90% lower bound
+  on flips lies above the base's 90% upper bound loses however fast it is. Speed alone once took the budget to 0.95, and
+  the text fell apart; the guard stops that climb where stand-ins start changing words.
+- **Each request brakes itself** (`STRATA_FRAGILE_BRAKE`, default on, `=0` off). A request starts at half the learned budget.
+  When at least 15 of its re-checks show a flip rate above 20% at 90% confidence, its budget halves; after 64 clean windows
+  a long answer goes to the full learned budget. Short chats, where stand-ins move tokens about twice as much, stay low.
 - **It remembers.** `data/standin-tune.txt` keeps the budget, `k` and the step, tied to the model's fingerprint, and is
   loaded at the next start (`stand-in tuning loaded: ...` in the log).
 
@@ -149,7 +159,8 @@ Measured 24 Oct (131K context; code / reasoning / prose tokens/s, every answer r
 | --- | --- | --- | --- | --- |
 | the rank rule below (until 23 Oct) | 31.8 | 39.8 | 30.9 | clean |
 | fixed budget 0.25, no re-check | 45-51 | 55-57 | 40-41 | broken words in 2 of 3 prose answers |
-| self-tuning + re-check, learned budget 0.183 | 43.4 | 52.6 | 36.6 | 21 of 21 clean |
+| self-tuning + re-check, speed-only search, budget 0.29 | 42.8 | 57.0 | 36.8 | clean; at 0.95 later: broken prose, a looping thought in a short chat |
+| self-tuning + re-check + guard + brake, fresh start, 3rd round | 37.3 | 48.0 | 29.1 | 27 of 27 clean, a 6-turn short chat included |
 
 Prompt reading keeps the rank rule below (the re-check is decode only).
 
