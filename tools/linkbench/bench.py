@@ -28,8 +28,10 @@ def ask(prompt, max_tokens=None):
     body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": NO_CAP, "temperature": 0, "stream": False}
     if not THINK:
         body.update({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}})
-    req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("BENCH_API_KEY"):   # a server started with --api-key (21 Oct: the benchmark on the LAN server itself)
+        headers["Authorization"] = "Bearer " + os.environ["BENCH_API_KEY"]
+    req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(), headers=headers)
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=3600) as r:
         d = json.loads(r.read())

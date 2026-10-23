@@ -195,6 +195,42 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// STRATA_ROUTE_BUDGET_DYN (decode only; verify.cpp): the route budget of the next window.  The serve decode loop calls
+    /// route_budget_begin at a request's first window, route_budget_window before each window (decode or prompt), and
+    /// route_budget_after after a decode window's sync and before its commit.  Off (no calls change anything) when unset.
+    static void route_budget_begin();
+    /// `auto_ok` = false (a decode-loop window that holds prompt tokens, a merged one): the decode budget stays the static one, not the AUTO search's
+    void route_budget_window(bool decode, bool auto_ok = true);
+    void route_budget_after(int n_keep);
+    /// STRATA_ROUTE_BUDGET_AUTO (decode loop only; verify.cpp): one budget b for all ranks, chosen by the measured decode speed.  route_auto_on
+    /// is the switch; route_auto_window after each non-merged decode window's commit (its start = the window's ver.run start, its end = the
+    /// commit's end); route_auto_take gives the AUTO budget and the tests finished since the last call (false when off).
+    static bool route_auto_on();
+    static void route_auto_window(int n_keep, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end);
+    static bool route_auto_take(float& budget, long long& tests);
+    /// The decode windows run at b_hi and at b_lo since the last call, with the switch's values (false when the switch is off);
+    /// resets both counts.
+    static bool route_budget_take(long long& n_hi, long long& n_lo, float& b_hi, float& b_lo, float& gap_min);
+    /// STRATA_FRAGILE_RECHECK (decode loop only; verify.cpp).  Before a decode run: route_budget_window zeroes each stage's row_shift
+    /// (the stand-ins' moves per row).  After it: route_fragile_settle(outv[0]) (a cut's exact row), then, when route_fragile_wants(), the
+    /// gaps of rows 0..n-1 (route_fragile_gaps), the moves (route_fragile_shifts, summed over the stages) and route_fragile_first.  A cut
+    /// row r >= 1 is kept out of the commit and the next window runs exact (route_fragile_cut).  A cut at row 0 is not made: that
+    /// window's rows stand (a re-run would step the state twice, see verify.cpp).
+    static bool route_fragile_wants();
+    bool route_fragile_gaps(int n, float* out);
+    bool route_fragile_shifts(int n, float* out);   ///< adds each stage's row_shift for rows 0..n-1 into out (zeroed by the caller)
+    void route_fragile_zero_shift();
+    static int route_fragile_first(const float* gap, const float* shift, int n);
+    static void route_fragile_cut(float ratio, int32_t stand_tok);
+    static void route_fragile_settle(int32_t exact_tok);
+    /// This request's cuts, rows moved by stand-ins and flipped re-decisions, the current k, and the medians of the moved rows' shift and gap
+    /// (false when the switch is off); resets the counts.
+    static bool route_fragile_take(long long& cuts, long long& moved, long long& flips, float& k, float& med_shift, float& med_gap);
+    /// The FRAGILE switch (STRATA_FRAGILE_RECHECK).  route_tune_open(path, model_fp), once at serve start before the first decode window
+    /// (FRAGILE on): loads the learned b, k, step and counts from `path` when its fingerprint is model_fp, and keeps writing that file
+    /// after each finished AUTO test and each k update.  An empty path keeps nothing.
+    static bool route_fragile_on();
+    static void route_tune_open(const std::string& path, uint64_t model_fp);
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -651,6 +687,8 @@ private:
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
+    float* dyn_gap_ = nullptr;         ///< STRATA_ROUTE_BUDGET_DYN: the head's top-1 minus top-2 raw logit per row (T floats; off: none)
+    float* row_shift_ = nullptr;       ///< STRATA_FRAGILE_RECHECK: per row, the stand-ins' moves this stage's layers made (T floats; off: none)
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

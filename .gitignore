@@ -68,3 +68,4 @@ dist-hip/
 # learned per machine (RAM/VRAM reserve): never shipped
 data/ram-reserve.json
 data/vram-reserve.json
+data/standin-tune.txt

@@ -56,6 +56,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <string>
@@ -107,7 +109,82 @@ struct RouteResidentCfg {
     int maxrank = 0;      ///< STRATA_ROUTE_MAXRANK=<n>: a stand-in must be within the router's first n places of all 512 (0: any)
     float bias = 0.0f;    ///< STRATA_ROUTE_BIAS=<beta>: the CCE bias, ln(1 + beta) added to a resident expert's logit before the top-10
     float wmax = 0.0f;    ///< STRATA_ROUTE_WMAX=<w>: a missed pick is replaced only when the router's weight on it is below w (0: off)
+    float budget = 0.0f;  ///< STRATA_ROUTE_BUDGET=<b>: a missed pick of rank < lo is replaced only when w * gap <= b (w: its weight, gap: its logit minus the stand-in's); 0: off
+    float budget_tail = 0.0f;  ///< STRATA_ROUTE_BUDGET_TAIL=<b>: a missed pick of rank >= lo is replaced only when w * gap <= b (the margin does not apply); 0: off
     float edge = -1.0f;   ///< STRATA_ROUTE_RESIDENT_EDGE=<logits>: the rank below `lo` is replaced only by a close substitute
+    // STRATA_ROUTE_BUDGET_DYN=<b_hi>,<gap_min>[,<b_lo>]: decode only, and it overrides `budget` there.  The next decode window runs at
+    // b_lo when the smallest top-1 minus top-2 raw-logit gap over the rows the last window kept is below gap_min (a NaN counts as
+    // below), else at b_hi.  A request's first decode window runs at b_lo.  Prompt windows keep `budget`, or b_lo when that is 0.
+    bool dyn_on = false;
+    float dyn_hi = 0.0f, dyn_gap = 0.0f, dyn_lo = 0.0f;
+    bool dyn_cur_hi = false;                  ///< the next decode window runs at b_hi
+    long long dyn_n_hi = 0, dyn_n_lo = 0;     ///< decode windows run at b_hi / at b_lo since the stats line last took them
+    // STRATA_FRAGILE_RECHECK=1 (decode only; the serial decode loop): a row r of a window with stand-ins is a close call when a stand-in
+    // moved it (row_shift[r] > 0, route_resident_k) and gap[r] < fragile_k * row_shift[r] (gap: its top-1 minus top-2 raw logit).
+    // The window is cut before its first close call: rows before it are kept, and the close-call row is decided exactly by the next
+    // window (ranks < lo with no stand-in).  A close call at row 0 makes no cut: a re-run would step the GDN/PLE state twice.
+    // fragile_k is learned: from the first 64 decode windows (route_fragile_first: the 10th percentile of the moved rows' gap / shift, no
+    // cut meanwhile), then by the re-checks (route_fragile_settle).  STRATA_FRAGILE_K0=<k> is an explicit override: it sets k and skips the learning.
+    bool fragile_on = false;
+    float fragile_k = 4.0f;                   ///< the close-call factor (set by the learning below, or STRATA_FRAGILE_K0)
+    bool fragile_k_set = false;               ///< k is set: STRATA_FRAGILE_K0, or learned from the first kFragileLearn windows (no cut before)
+    enum { kFragileLearn = 64, kFragileSamples = 20000 };
+    int fr_learn_windows = 0;                 ///< the learning windows counted so far
+    std::vector<float> fr_learn_ratio;        ///< the learning windows' gap / shift of their moved rows 1.. (cleared when k is set)
+    std::vector<float> fr_samp_shift, fr_samp_gap;   ///< this request's moved rows: stand-in shift and gap (medians on the stats line)
+    enum { kFragileRing = 200 };              ///< the re-checks kept for the k update
+    float fr_ratio[kFragileRing] = {};        ///< per re-check (ring): gap / row_shift of the cut row
+    bool fr_flip[kFragileRing] = {};          ///< per re-check (ring): the exact row differed from the stand-in's token
+    int fr_pos = 0, fr_n = 0;                 ///< the ring's next slot and its filled count
+    long long fragile_rechecks = 0, fragile_flips = 0;   ///< all re-checks and flips
+    float fragile_pend_ratio = 0.0f;          ///< the pending cut's gap / row_shift
+    bool fragile_exact = false;               ///< the next decode window runs ranks < lo exact (after a cut)
+    bool fragile_pend = false;                ///< a cut's row is waiting for the exact window that re-decides it
+    int32_t fragile_pend_tok = 0;             ///< the stand-in window's token at the cut row
+    float win_low = 0.0f, win_tail = 0.0f;   ///< the budgets (ranks < lo, ranks >= lo) the last window ran with
+    long long fr_cuts = 0, fr_moved = 0, fr_flips = 0;   ///< this request's cuts, rows moved by stand-ins, flipped re-decisions (the stats line takes them)
+    // STRATA_ROUTE_BUDGET_AUTO=1 (needs fragile_on; decode loop only): the engine chooses ONE budget b for ranks < lo and ranks >= lo alike.
+    // Process-wide (kept across requests).  An INTERLEAVED test compares two arms over the same stretch of decode, so content drift cancels:
+    // the base arm at b and the candidate arm at b * s^d (s: auto_step, 1.25 at the start; auto_dir d: +1 up, -1 down).  Runs of kAutoRun non-merged decode windows
+    // alternate between the arms; the first run of each pair alternates: arm of run r = (r % 2) ^ ((r / 2) % 2) (base, cand, cand, base, ...).
+    // A test ends when both arms have kAutoMin scheduled windows (deferred while a cut is pending, so the exact successor is charged first).
+    // An arm's speed = its committed tokens / its wall seconds: each window adds end - max(start, the previous window's end) when the previous
+    // window was the same request, else end - start.  A cut window's exact successor is charged to the cut window's arm (its re-checks
+    // cost that arm) but is not a scheduled window.
+    // State machine: a round tests auto_first (stage 0).  A win (candidate speed >= 1.02 times the base's) moves b to the candidate and the
+    // next round starts with that direction.  A loss starts the other direction (stage 1) against the same base; a loss there keeps b, and
+    // the next round starts with the other direction.  b is clamped to [0.02, 4].
+    // The static STRATA_ROUTE_BUDGET / _TAIL / _DYN are ignored for decode (DYN is switched off); a prompt window keeps them.
+    enum { kAutoRun = 8, kAutoMin = 96 };
+    bool auto_on = false;
+    float auto_b = 0.1f, auto_b0 = 0.1f;      ///< the base budget of ranks < lo and of ranks >= lo; the start (STRATA_ROUTE_BUDGET_AUTO_B0)
+    bool auto_testing = false;                ///< a test is running (its arms below)
+    float auto_cand_b = 0.1f;                 ///< the running test's candidate budget (b * s^d, clamped)
+    int auto_dir = 1;                         ///< the running test's candidate direction
+    int auto_first = 1;                       ///< the direction the next round tests first
+    int auto_stage = 0;                       ///< 0: the round tests auto_first; 1: the other direction
+    long long auto_n[2] = {0, 0};             ///< the running test's scheduled windows per arm (0 base, 1 candidate)
+    long long auto_tok[2] = {0, 0};           ///< its committed tokens per arm (scheduled and exact windows)
+    double auto_secs[2] = {0.0, 0.0};         ///< its wall seconds per arm
+    long long auto_runs = 0;                  ///< the running test's runs started
+    int auto_run_left = 0;                    ///< windows left in the current run
+    int auto_run_arm = 0;                     ///< the current run's arm
+    int auto_win_arm = 0;                     ///< the arm of the window being run (set before its run)
+    bool auto_win_sched = false;              ///< that window is a scheduled one (counts toward kAutoMin)
+    int auto_cut_arm = 0;                     ///< the arm of the last cut window (its exact successor runs at this arm's budget)
+    long long auto_req = 0;                   ///< the request counter (route_budget_begin)
+    bool auto_have_last = false;              ///< a window of the search ran before (auto_last_end / auto_last_req are its)
+    std::chrono::steady_clock::time_point auto_last_end{};
+    long long auto_last_req = -1;
+    long long auto_tests = 0, auto_tests_take = 0;   ///< tests finished; tests since the stats line took them
+    // Learned state across restarts (route_tune_open): standin-tune.txt beside the expert profile, keyed to the model fingerprint.
+    // Written after each finished test and each k update; read once at serve start (AUTO / FRAGILE on).
+    bool tune_open = false;                   ///< the file is kept (a model fingerprint and a path are known)
+    uint64_t tune_fp = 0;                     ///< the model fingerprint the file is keyed to
+    std::string tune_path;                    ///< the file
+    bool auto_b0_env = false;                 ///< STRATA_ROUTE_BUDGET_AUTO_B0 is set: it overrides the file's b
+    float auto_step = 1.25f;                  ///< the candidate's step factor s: candidate = b * s^d (saved; after a win in the same direction as the last win s grows to 2, after a loss it shrinks toward 1.1)
+    int auto_last_win = 0;                    ///< the direction of the last win (0: no win yet)
     // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
     // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
     // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
@@ -123,9 +200,11 @@ struct RouteResidentCfg {
         {
             const OnDevice on(dev);
             // 9 counters: [0..3] the prompt windows (T>8), [4..7] the decode windows (T<=8), [8] the decode windows' rank 0-1 stand-ins for an
-            // expert outside the RAM tier (STRATA_ROUTE_RAM_FLOOR; the prompt windows never take that path)
-            if (cudaMalloc((void**) &p, 9 * sizeof(unsigned long long)) != cudaSuccess ||
-                cudaMemset(p, 0, 9 * sizeof(unsigned long long)) != cudaSuccess) {
+            // expert outside the RAM tier (STRATA_ROUTE_RAM_FLOOR; the prompt windows never take that path), [9..11] the STRATA_ROUTE_BUDGET
+            // replacements of ranks 0, 1 and 2 (both kinds of window), [12] the STRATA_ROUTE_BUDGET_TAIL replacements of ranks >= lo and
+            // [13] the tail picks the bound kept exact (a stand-in existed); the kernel's bstats pointer is this block + 9
+            if (cudaMalloc((void**) &p, 14 * sizeof(unsigned long long)) != cudaSuccess ||
+                cudaMemset(p, 0, 14 * sizeof(unsigned long long)) != cudaSuccess) {
                 (void) cudaGetLastError();
                 if (p != nullptr) cudaFree(p);
                 p = nullptr;
@@ -137,7 +216,7 @@ struct RouteResidentCfg {
                 RouteResidentCfg& c = route_resident_cfg();
                 for (const auto& kv : c.blocks) {
                     if (kv.second == nullptr) continue;
-                    unsigned long long h[9] = {};
+                    unsigned long long h[14] = {};
                     if (cudaSetDevice(kv.first) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess ||
                         cudaMemcpy(h, kv.second, sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) {
                         (void) cudaGetLastError();
@@ -152,6 +231,10 @@ struct RouteResidentCfg {
                     if (strata::kernels::route_ram_floor_on())   // STRATA_ROUTE_RAM_FLOOR: rank 0-1 picks outside the RAM tier that took a stand-in
                         std::fprintf(stderr, "route-resident%s: ram floor (STRATA_ROUTE_RAM_FLOOR) rank 0-1 stand-ins for an expert not in the RAM tier (decode): %llu\n",
                                      who, h[8]);
+                    if (c.budget > 0.0f)   // STRATA_ROUTE_BUDGET: the replacements of ranks 0, 1, 2 (prompt and decode windows together)
+                        std::fprintf(stderr, "route-resident: budget %g: rank0 %llu rank1 %llu rank2 %llu replaced\n", c.budget, h[9], h[10], h[11]);
+                    if (c.budget_tail > 0.0f)   // STRATA_ROUTE_BUDGET_TAIL: the ranks >= lo replaced by the bound, and the picks it kept exact
+                        std::fprintf(stderr, "route-resident: tail budget %g: %llu replaced, %llu kept exact\n", c.budget_tail, h[12], h[13]);
                 }
             });
         }
@@ -178,6 +261,62 @@ RouteResidentCfg& route_resident_cfg() {
         if (const char* v = std::getenv("STRATA_WANT_LOW")) r.want_lo = std::max(0.0f, (float) std::atof(v));
         if (const char* v = std::getenv("STRATA_ROUTE_MAXRANK")) r.maxrank = std::max(0, std::atoi(v));
         if (const char* v = std::getenv("STRATA_ROUTE_WMAX")) r.wmax = std::max(0.0f, (float) std::atof(v));
+        // STRATA_ROUTE_BUDGET=<b> (> 0): the ranks below lo replace a missed pick only when w * gap <= b (see route_resident_k); off when unset or <= 0
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET")) r.budget = std::max(0.0f, (float) std::atof(v));
+        // STRATA_ROUTE_BUDGET_TAIL=<b> (> 0): the ranks lo and up replace a missed pick only when w * max(gap, 0) <= b; off when unset or <= 0
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET_TAIL")) r.budget_tail = std::max(0.0f, (float) std::atof(v));
+        // STRATA_ROUTE_BUDGET_DYN=<b_hi>,<gap_min>[,<b_lo>] (see RouteResidentCfg); off when unset or malformed
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET_DYN")) {
+            float hi = 0.0f, gap = 0.0f, lo = 0.0f;
+            const int n = std::sscanf(v, "%f,%f,%f", &hi, &gap, &lo);
+            if (n >= 2 && hi >= 0.0f && gap > 0.0f) {
+                r.dyn_on = true;
+                r.dyn_hi = hi;
+                r.dyn_gap = gap;
+                r.dyn_lo = n >= 3 ? std::max(0.0f, lo) : 0.0f;
+            } else {
+                std::fprintf(stderr, "strata: STRATA_ROUTE_BUDGET_DYN=%s: want <b_hi>,<gap_min>[,<b_lo>] (b_hi >= 0, gap_min > 0); off\n", v);
+            }
+        }
+        // STRATA_FRAGILE_RECHECK (default on, =0 off): close calls of a stand-in window are decided exactly (see RouteResidentCfg);
+        // STRATA_FRAGILE_K0 its start.  Default since 24 Oct: with AUTO, 21 of 21 answers clean where a fixed 0.25 budget broke words
+        { const char* v = std::getenv("STRATA_FRAGILE_RECHECK"); r.fragile_on = v == nullptr || std::atoi(v) != 0; }
+        if (const char* v = std::getenv("STRATA_FRAGILE_K0")) {
+            const float k0 = (float) std::atof(v);
+            if (k0 > 0.0f) {
+                r.fragile_k = k0;
+                r.fragile_k_set = true;
+            }
+        }
+        // STRATA_ROUTE_BUDGET_AUTO (default on, =0 off): one decode budget for all ranks, searched by the measured speed (see
+        // RouteResidentCfg).  It needs the FRAGILE re-check (the quality guard); it replaces DYN for decode.
+        // STRATA_ROUTE_BUDGET_AUTO_B0=<b> starts the search (0.1, or the saved standin-tune.txt)
+        {
+            const char* v = std::getenv("STRATA_ROUTE_BUDGET_AUTO");
+            if (v == nullptr) v = "1";
+            if (std::atoi(v) != 0) {
+                if (!r.fragile_on) {
+                    if (std::getenv("STRATA_ROUTE_BUDGET_AUTO") != nullptr)
+                        std::fprintf(stderr, "strata: STRATA_ROUTE_BUDGET_AUTO=%s needs STRATA_FRAGILE_RECHECK=1; off\n", v);
+                } else {
+                    r.auto_on = true;
+                    if (r.dyn_on) {
+                        std::fprintf(stderr, "strata: STRATA_ROUTE_BUDGET_AUTO: STRATA_ROUTE_BUDGET_DYN is ignored (decode) and off\n");
+                        r.dyn_on = false;
+                    }
+                    if (r.budget > 0.0f || r.budget_tail > 0.0f)
+                        std::fprintf(stderr, "strata: STRATA_ROUTE_BUDGET_AUTO: STRATA_ROUTE_BUDGET / _TAIL are ignored for decode (prompt windows keep them)\n");
+                }
+            }
+        }
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET_AUTO_B0")) {
+            const float b0 = (float) std::atof(v);
+            if (b0 > 0.0f) {
+                r.auto_b0 = std::min(4.0f, std::max(0.02f, b0));
+                r.auto_b0_env = true;
+            }
+        }
+        r.auto_b = r.auto_b0;
         // STRATA_ROUTE_BIAS=<beta>: the CCE bias.  (v0.1.42 has the same idea as STRATA_ROUTE_PRIOR, route_prior.cu: to be merged into one)
         if (const char* v = std::getenv("STRATA_ROUTE_BIAS")) { const double b = std::atof(v); r.bias = b > 0.0 ? (float) std::log1p(b) : 0.0f; }
         return true;
@@ -834,7 +973,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
         // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
         strata::kernels::route_cfg_init(route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().margin,
-                                        route_resident_cfg().edge, route_resident_cfg().bias, route_resident_cfg().maxrank, route_resident_cfg().want_lo, route_resident_cfg().repl_gap, route_resident_cfg().wmax);
+                                        route_resident_cfg().edge, route_resident_cfg().bias, route_resident_cfg().maxrank, route_resident_cfg().want_lo, route_resident_cfg().repl_gap, route_resident_cfg().wmax,
+                                        route_resident_cfg().budget, route_resident_cfg().budget_tail);
     }
     if (route_resident_cfg().margin > 0.0f)
         std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, edge %g, router bias ln(1+beta) %g, stand-in within the router's first %d places, decode windows %s)\n",
@@ -1011,6 +1151,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+        dyn_gap_ = b.take<float>(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on ? T : 0);   // STRATA_ROUTE_BUDGET_DYN, STRATA_FRAGILE_RECHECK
+        row_shift_ = b.take<float>(route_resident_cfg().fragile_on ? T : 0);   // STRATA_FRAGILE_RECHECK: the stand-ins' moves per row (decode windows)
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
@@ -2247,7 +2389,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       n <= 8 ? strata::kernels::route_rows_layer(l) : nullptr,
                                       n <= 8 ? strata::kernels::route_repl_layer(l, g.n_expert) : nullptr,
                                       n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr,
-                                      n <= 8 ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr);
+                                      n <= 8 ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr,
+                                      rr_stats_ != nullptr ? rr_stats_ + 9 : nullptr,   // STRATA_ROUTE_BUDGET counters [9..11], STRATA_ROUTE_BUDGET_TAIL [12..13]
+                                      n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr);   // STRATA_FRAGILE_RECHECK: this group's rows
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (!stage_mark(cs, kStRouter, err)) return false;
@@ -2620,6 +2764,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        // STRATA_ROUTE_BUDGET_DYN: each row's top-1 minus top-2 raw logit (read by route_budget_after, after the window's sync)
+        if ((route_resident_cfg().dyn_on || route_resident_cfg().fragile_on) && dyn_gap_ != nullptr) strata::kernels::logits_margin_rows(head_logits_, T, (int) n_vocab_, dyn_gap_, cs);
     }
     if (!stage_mark(cs, kStOther, err)) return false;   // the head
     stamp(g.n_layers, 1, 0);
@@ -3576,6 +3722,435 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
 
 namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+
+// STRATA_ROUTE_BUDGET_AUTO / STRATA_FRAGILE_RECHECK: the learned state across restarts.  standin-tune.txt (beside the expert profile)
+// holds "key value" lines: fingerprint (the model's, hex; a file keyed to another model is ignored), budget, step, k, tests, rechecks,
+// flips.  Written to a temp name and renamed, after each finished test and each k update; read once at serve start (route_tune_open).
+namespace {
+void route_tune_write(const RouteResidentCfg& c) {
+    if (!c.tune_open || c.tune_path.empty()) return;
+    const std::string tmp = c.tune_path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (f == nullptr) {
+        std::fprintf(stderr, "strata serve: stand-in tuning: cannot write %s (errno %d)\n", tmp.c_str(), errno);
+        return;
+    }
+    bool ok = std::fprintf(f, "fingerprint %016llx\n", (unsigned long long) c.tune_fp) > 0;
+    ok = ok && std::fprintf(f, "budget %.9g\n", (double) c.auto_b) > 0;
+    ok = ok && std::fprintf(f, "step %.9g\n", (double) c.auto_step) > 0;
+    if (c.fragile_k_set) ok = ok && std::fprintf(f, "k %.9g\n", (double) c.fragile_k) > 0;
+    ok = ok && std::fprintf(f, "tests %lld\n", c.auto_tests) > 0;
+    ok = ok && std::fprintf(f, "rechecks %lld\n", c.fragile_rechecks) > 0;
+    ok = ok && std::fprintf(f, "flips %lld\n", c.fragile_flips) > 0;
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, c.tune_path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        std::fprintf(stderr, "strata serve: stand-in tuning: cannot write %s\n", c.tune_path.c_str());
+    }
+}
+
+// Reads the file into c when its fingerprint is the model's; false otherwise (missing, unreadable, another model, no fingerprint line).
+// b is kept unless STRATA_ROUTE_BUDGET_AUTO_B0 is set, k unless STRATA_FRAGILE_K0 is (fragile_k_set); a saved k skips the learning.
+bool route_tune_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) return false;
+    char line[256];
+    bool fp_ok = false;
+    double budget = -1.0, step = -1.0, k = -1.0;
+    long long tests = -1, rechecks = -1, flips = -1;
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+        char key[32] = "";
+        char val[64] = "";
+        if (std::sscanf(line, "%31s %63s", key, val) != 2) continue;
+        if (std::strcmp(key, "fingerprint") == 0) fp_ok = std::strtoull(val, nullptr, 16) == (unsigned long long) fp;
+        else if (std::strcmp(key, "budget") == 0) budget = std::atof(val);
+        else if (std::strcmp(key, "step") == 0) step = std::atof(val);
+        else if (std::strcmp(key, "k") == 0) k = std::atof(val);
+        else if (std::strcmp(key, "tests") == 0) tests = std::atoll(val);
+        else if (std::strcmp(key, "rechecks") == 0) rechecks = std::atoll(val);
+        else if (std::strcmp(key, "flips") == 0) flips = std::atoll(val);
+    }
+    std::fclose(f);
+    if (!fp_ok) return false;
+    if (budget > 0.0 && !c.auto_b0_env) c.auto_b = std::min(4.0f, std::max(0.02f, (float) budget));
+    if (step > 0.0) c.auto_step = std::min(2.0f, std::max(1.1f, (float) step));
+    if (k > 0.0 && !c.fragile_k_set) {
+        c.fragile_k = std::min(50.0f, std::max(0.005f, (float) k));
+        c.fragile_k_set = true;
+        c.fr_learn_ratio.clear();
+    }
+    if (tests >= 0) c.auto_tests = tests;
+    if (rechecks >= 0) c.fragile_rechecks = rechecks;
+    if (flips >= 0) c.fragile_flips = flips;
+    return true;
+}
+}  // namespace
+
+// The model's fingerprint and the file's path, given once at serve start (before the first decode window).  Only with FRAGILE on.
+void Verifier::route_tune_open(const std::string& path, uint64_t model_fp) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.fragile_on || path.empty()) return;
+    c.tune_open = true;
+    c.tune_fp = model_fp;
+    c.tune_path = path;
+    if (!std::filesystem::exists(path)) return;
+    if (!route_tune_read(path, model_fp, c)) {
+        std::fprintf(stderr, "strata serve: stand-in tuning in %s ignored (its model fingerprint differs or it has none)\n", path.c_str());
+        return;
+    }
+    std::fprintf(stderr, "strata serve: stand-in tuning loaded: budget %.3f, k %.4f (%lld tests) from %s\n",
+                 (double) c.auto_b, (double) c.fragile_k, (long long) c.auto_tests, path.c_str());
+}
+
+bool Verifier::route_fragile_on() { return route_resident_cfg().fragile_on; }
+
+// STRATA_ROUTE_BUDGET_DYN (decode only).  route_budget_window sets the budget before a window: a decode window at the current
+// decode budget, a prompt window at STRATA_ROUTE_BUDGET or b_lo.  route_budget_after runs after a decode window's sync and before
+// its commit: it reads the gaps of the rows the window kept (0..n_keep-1, the bonus row among them) and sets the next decode
+// window's budget.  Both write the host-mapped RouteCfg between windows only, as route_cfg_set_floor does.
+namespace {
+void route_auto_schedule(RouteResidentCfg& c);   // defined with the test helpers below route_auto_window
+}  // namespace
+
+void Verifier::route_budget_begin() {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (c.dyn_on) c.dyn_cur_hi = false;   // a request's first decode window starts at b_lo
+    c.fragile_exact = false;              // STRATA_FRAGILE_RECHECK: a request starts with no pending cut
+    c.fragile_pend = false;
+    if (c.auto_on) ++c.auto_req;          // STRATA_ROUTE_BUDGET_AUTO: the request whose windows the next arm time counts
+}
+
+// STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
+// STRATA_ROUTE_BUDGET_AUTO: a decode window (auto_ok) takes the search's b for both ranks; a cut's next window is exact for ranks < lo only.
+void Verifier::route_budget_window(bool decode, bool auto_ok) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.dyn_on && !c.fragile_on) return;
+    if (decode && c.fragile_on) route_fragile_zero_shift();   // STRATA_FRAGILE_RECHECK: this window's stand-in moves start at zero
+    float b = c.budget;
+    float tail = c.budget_tail;
+    if (c.dyn_on) {
+        if (decode) {
+            ++(c.dyn_cur_hi ? c.dyn_n_hi : c.dyn_n_lo);
+            b = c.dyn_cur_hi ? c.dyn_hi : c.dyn_lo;
+        } else {
+            b = c.budget > 0.0f ? c.budget : c.dyn_lo;
+        }
+    }
+    if (decode && c.auto_on && auto_ok) {
+        if (c.fragile_exact) {
+            c.auto_win_arm = c.auto_cut_arm;   // the exact successor of a cut: its cut window's arm, not a scheduled window
+            c.auto_win_sched = false;
+        } else {
+            route_auto_schedule(c);
+        }
+        b = c.auto_win_arm == 0 ? c.auto_b : c.auto_cand_b;
+        tail = b;
+    }
+    if (decode && c.fragile_exact) {
+        b = 0.0f;
+        c.fragile_exact = false;
+    }
+    c.win_low = b;
+    c.win_tail = tail;
+    strata::kernels::route_cfg_set_budgets(b, tail);
+}
+
+// STRATA_FRAGILE_RECHECK.  route_fragile_wants: the window that just ran had a stand-in budget (ranks < lo or the tail).
+bool Verifier::route_fragile_wants() {
+    const RouteResidentCfg& c = route_resident_cfg();
+    return c.fragile_on && (c.win_low > 0.0f || c.win_tail > 0.0f);
+}
+
+// The top-1 minus top-2 gaps of the last window's rows 0..n-1 (the last stage holds the head's logits).
+bool Verifier::route_fragile_gaps(int n, float* out) {
+    if (next_ != nullptr) return next_->route_fragile_gaps(n, out);
+    if (dyn_gap_ == nullptr || n < 1 || n > max_t_) return false;
+    const OnDevice on(device_);
+    if (cudaMemcpy(out, dyn_gap_, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+// The stand-ins' moves on rows 0..n-1, each stage's own layers summed over the chain (out is zeroed by the caller).
+bool Verifier::route_fragile_shifts(int n, float* out) {
+    if (n < 1 || n > max_t_) return false;
+    std::vector<float> s((size_t) n);
+    for (Verifier* v = this; v != nullptr; v = v->next_) {
+        if (v->row_shift_ == nullptr) return false;
+        const OnDevice on(v->device_);
+        if (cudaMemcpy(s.data(), v->row_shift_, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        for (int i = 0; i < n; ++i) out[i] += s[(size_t) i];
+    }
+    return true;
+}
+
+// Before a decode window: every stage's stand-in moves start at zero (the previous window was synced).
+void Verifier::route_fragile_zero_shift() {
+    for (Verifier* v = this; v != nullptr; v = v->next_) {
+        if (v->row_shift_ == nullptr) continue;
+        const OnDevice on(v->device_);
+        if (cudaMemset(v->row_shift_, 0, (size_t) v->max_t_ * sizeof(float)) != cudaSuccess) (void) cudaGetLastError();
+    }
+}
+
+// The first close call among rows 0..n-1, or -1.  A row is a close call when a stand-in moved it (shift > 0) and its gap is below
+// fragile_k * shift (a NaN gap counts as one).  Also counts this request's rows that a stand-in moved.
+// Row 0 is never cut (a re-run would step the state twice), so the search is over rows 1..n-1.  Until k is set (STRATA_FRAGILE_K0, or learned
+// from the first kFragileLearn windows: the ratios gap / shift of their moved rows 1.., k = their 10th percentile, no cut meanwhile) it
+// returns -1.  The moved rows' shift and gap are sampled for the request's medians (route_fragile_take).
+int Verifier::route_fragile_first(const float* gap, const float* shift, int n) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.fragile_k_set) {
+        for (int r = 1; r < n; ++r)
+            if (shift[r] > 0.0f && gap[r] == gap[r]) c.fr_learn_ratio.push_back(gap[r] / shift[r]);
+        if (++c.fr_learn_windows >= RouteResidentCfg::kFragileLearn) {
+            std::vector<float> v = c.fr_learn_ratio;
+            c.fr_learn_ratio.clear();
+            c.fr_learn_ratio.shrink_to_fit();
+            c.fragile_k_set = true;
+            if (v.empty()) {
+                std::fprintf(stderr, "strata serve: fragile recheck: k %.4f (no moved rows in the first %d windows: default kept)\n",
+                             (double) c.fragile_k, RouteResidentCfg::kFragileLearn);
+            } else {
+                std::sort(v.begin(), v.end());
+                const float p10 = v[v.size() / 10], p50 = v[v.size() / 2];
+                c.fragile_k = std::min(50.0f, std::max(0.005f, p10));
+                std::fprintf(stderr, "strata serve: fragile recheck: k from %lld rows: %.4f (ratio p10; p50 %.4f)\n",
+                             (long long) v.size(), (double) c.fragile_k, (double) p50);
+            }
+            route_tune_write(c);   // the learned k is kept from now on (a restart skips the learning)
+        }
+    }
+    int first = -1;
+    for (int r = 0; r < n; ++r) {
+        if (!(shift[r] > 0.0f)) continue;
+        ++c.fr_moved;
+        if (c.fr_samp_shift.size() < RouteResidentCfg::kFragileSamples && gap[r] == gap[r]) {
+            c.fr_samp_shift.push_back(shift[r]);
+            c.fr_samp_gap.push_back(gap[r]);
+        }
+        if (first < 0 && r >= 1 && c.fragile_k_set && !(gap[r] >= c.fragile_k * shift[r])) first = r;
+    }
+    return first;
+}
+
+// A window is cut at its row r >= 1 (the caller keeps rows 0..r-1).  The row's stand-in token and its gap / shift wait for the exact
+// decision of the same position: the next window's row 0, which runs with ranks < lo exact.
+void Verifier::route_fragile_cut(float ratio, int32_t stand_tok) {
+    RouteResidentCfg& c = route_resident_cfg();
+    ++c.fr_cuts;
+    c.auto_cut_arm = c.auto_win_arm;   // STRATA_ROUTE_BUDGET_AUTO: the cut window's arm; its exact successor is charged to it
+    c.fragile_pend = true;
+    c.fragile_pend_ratio = ratio;
+    c.fragile_pend_tok = stand_tok;
+    c.fragile_exact = true;
+}
+
+// The exact decision of a pending cut row (the first output of the exact window that follows it): a flip is a changed token.
+// Every 50 re-checks k moves: no flip in the ring (the last 200 re-checks) makes k 0.8 times (floor 0.005); else k is 1.25 times the
+// largest ratio of the flipped re-checks in the ring, clamped to [0.005, 50].
+void Verifier::route_fragile_settle(int32_t exact_tok) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.fragile_pend) return;
+    c.fragile_pend = false;
+    const bool flipped = exact_tok != c.fragile_pend_tok;
+    ++c.fragile_rechecks;
+    if (flipped) {
+        ++c.fragile_flips;
+        ++c.fr_flips;
+    }
+    c.fr_ratio[c.fr_pos] = c.fragile_pend_ratio;
+    c.fr_flip[c.fr_pos] = flipped;
+    c.fr_pos = (c.fr_pos + 1) % RouteResidentCfg::kFragileRing;
+    if (c.fr_n < RouteResidentCfg::kFragileRing) ++c.fr_n;
+    if (c.fragile_rechecks % 50 != 0) return;
+    bool any_flip = false;
+    float largest = 0.0f;
+    for (int i = 0; i < c.fr_n; ++i)
+        if (c.fr_flip[i]) {
+            any_flip = true;
+            if (c.fr_ratio[i] > largest) largest = c.fr_ratio[i];
+        }
+    const float old = c.fragile_k;
+    if (!any_flip) c.fragile_k = std::max(0.005f, c.fragile_k * 0.8f);
+    else c.fragile_k = std::min(50.0f, std::max(0.005f, 1.25f * largest));
+    if (c.fragile_k != old) {
+        std::fprintf(stderr, "strata serve: fragile recheck: k %.3f (%lld rechecks, %lld flips, largest flipped ratio %.3f)\n",
+                     (double) c.fragile_k, c.fragile_rechecks, c.fragile_flips, (double) largest);
+        route_tune_write(c);
+    }
+}
+
+// This request's cuts, rows moved by stand-ins, flipped re-decisions and k; false when the switch is off.  Takes and resets the counts.
+bool Verifier::route_fragile_take(long long& cuts, long long& moved, long long& flips, float& k, float& med_shift, float& med_gap) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.fragile_on) return false;
+    cuts = c.fr_cuts;
+    moved = c.fr_moved;
+    flips = c.fr_flips;
+    k = c.fragile_k;
+    // the medians of the moved rows' stand-in shift and gap (this request's samples; diagnosis)
+    auto median = [](std::vector<float>& v) -> float {
+        if (v.empty()) return 0.0f;
+        std::nth_element(v.begin(), v.begin() + (long) v.size() / 2, v.end());
+        return v[v.size() / 2];
+    };
+    med_shift = median(c.fr_samp_shift);
+    med_gap = median(c.fr_samp_gap);
+    c.fr_samp_shift.clear();
+    c.fr_samp_gap.clear();
+    c.fr_cuts = 0;
+    c.fr_moved = 0;
+    c.fr_flips = 0;
+    return true;
+}
+
+void Verifier::route_budget_after(int n_keep) {
+    if (next_ != nullptr) return next_->route_budget_after(n_keep);   // the last stage holds the head's logits
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.dyn_on) return;
+    bool close = false;   // any kept row with gap < gap_min (or NaN: no comparison holds) makes the next window a close one
+    if (dyn_gap_ == nullptr || n_keep < 1 || n_keep > max_t_) {
+        close = true;
+    } else {
+        std::vector<float> gap((size_t) n_keep);
+        const OnDevice on(device_);
+        if (cudaMemcpy(gap.data(), dyn_gap_, (size_t) n_keep * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            close = true;
+        } else {
+            for (const float g : gap)
+                if (!(g >= c.dyn_gap)) close = true;
+        }
+    }
+    c.dyn_cur_hi = !close;
+    strata::kernels::route_cfg_set_budget(c.dyn_cur_hi ? c.dyn_hi : c.dyn_lo);
+}
+
+bool Verifier::route_budget_take(long long& n_hi, long long& n_lo, float& b_hi, float& b_lo, float& gap_min) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.dyn_on) return false;
+    n_hi = c.dyn_n_hi;
+    n_lo = c.dyn_n_lo;
+    b_hi = c.dyn_hi;
+    b_lo = c.dyn_lo;
+    gap_min = c.dyn_gap;
+    c.dyn_n_hi = 0;
+    c.dyn_n_lo = 0;
+    return true;
+}
+
+// STRATA_ROUTE_BUDGET_AUTO (see RouteResidentCfg): the interleaved test.  The helpers below run between windows, under the decode loop.
+namespace {
+float auto_clamp_b(double b) { return std::min(4.0f, std::max(0.02f, (float) b)); }
+
+// Starts a test of direction d at the base b (its arms' counts and times are cleared).
+void auto_begin_test(RouteResidentCfg& c, int d) {
+    c.auto_dir = d;
+    c.auto_cand_b = auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d));
+    c.auto_n[0] = c.auto_n[1] = 0;
+    c.auto_tok[0] = c.auto_tok[1] = 0;
+    c.auto_secs[0] = c.auto_secs[1] = 0.0;
+    c.auto_runs = 0;
+    c.auto_run_left = 0;
+    c.auto_testing = true;
+}
+
+// A direction whose candidate clamps to the base (b at a bound) is not tested: it counts as a loss at once.
+void auto_next_stage(RouteResidentCfg& c, bool won, int d) {
+    if (won) {
+        c.auto_b = c.auto_cand_b;
+        c.auto_first = d;   // the winning direction is tested first next round
+        c.auto_stage = 0;
+    } else if (c.auto_stage == 0) {
+        c.auto_stage = 1;   // the other direction against the same base
+    } else {
+        c.auto_first = -c.auto_first;   // both lost: keep b, the other direction first next round
+        c.auto_stage = 0;
+    }
+}
+
+// The next scheduled window's arm: runs of kAutoRun windows; run r is arm (r % 2) ^ ((r / 2) % 2), so each pair of runs alternates which arm is first.
+void route_auto_schedule(RouteResidentCfg& c) {
+    while (!c.auto_testing) {
+        const int d = c.auto_stage == 0 ? c.auto_first : -c.auto_first;
+        if (auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d)) != c.auto_b) {
+            auto_begin_test(c, d);
+        } else {
+            auto_next_stage(c, false, d);   // clamped to the base: nothing to test
+        }
+    }
+    if (c.auto_run_left == 0) {
+        c.auto_run_arm = (int) ((c.auto_runs % 2) ^ ((c.auto_runs / 2) % 2));
+        ++c.auto_runs;
+        c.auto_run_left = RouteResidentCfg::kAutoRun;
+    }
+    --c.auto_run_left;
+    c.auto_win_arm = c.auto_run_arm;
+    c.auto_win_sched = true;
+}
+
+// Both arms have kAutoMin scheduled windows: the candidate wins when its speed is at least 1.02 times the base's.
+void route_auto_test_done(RouteResidentCfg& c) {
+    const int d = c.auto_dir;
+    const double sb = c.auto_secs[0] > 0.0 ? (double) c.auto_tok[0] / c.auto_secs[0] : 0.0;
+    const double sc = c.auto_secs[1] > 0.0 ? (double) c.auto_tok[1] / c.auto_secs[1] : 0.0;
+    const bool won = sc >= sb * 1.02;
+    const float b_old = c.auto_b, cand = c.auto_cand_b, step = c.auto_step;   // step: the factor this test's candidate used
+    // the step: a win in the same direction as the last win grows it (to 2); a loss shrinks it toward 1.1 (sqrt, floor 1.1)
+    if (won) {
+        if (d == c.auto_last_win) c.auto_step = std::min(c.auto_step * 1.25f, 2.0f);
+        c.auto_last_win = d;
+    } else {
+        c.auto_step = std::max(std::sqrt(c.auto_step), 1.1f);
+    }
+    auto_next_stage(c, won, d);
+    std::fprintf(stderr, "strata serve: auto budget test %.3f vs %.3f: %.1f vs %.1f tok/s over %d+%d windows step %.2f -> %.3f\n",
+                 (double) cand, (double) b_old, sc, sb, (int) c.auto_n[1], (int) c.auto_n[0], (double) step, (double) c.auto_b);
+    c.auto_testing = false;
+    ++c.auto_tests;
+    ++c.auto_tests_take;
+    route_tune_write(c);
+}
+}  // namespace
+
+bool Verifier::route_auto_on() { return route_resident_cfg().auto_on; }
+
+// One non-merged decode window's commit.  Its wall time: from its ver.run start, or, when the previous window was the same request, from
+// that window's end (the loop's own work between the windows counts; the gap between two requests does not).  The window's time and
+// tokens go to the arm that ran it (auto_win_arm).  A test that reached kAutoMin is decided once no cut is pending.
+void Verifier::route_auto_window(int n_keep, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.auto_on) return;
+    const bool same = c.auto_have_last && c.auto_last_req == c.auto_req;
+    const std::chrono::steady_clock::time_point seg = same ? c.auto_last_end : start;
+    const int arm = c.auto_win_arm;
+    if (end > seg) c.auto_secs[arm] += std::chrono::duration<double>(end - seg).count();
+    c.auto_last_end = end;
+    c.auto_last_req = c.auto_req;
+    c.auto_have_last = true;
+    c.auto_tok[arm] += n_keep;
+    if (c.auto_win_sched) ++c.auto_n[arm];
+    if (c.auto_testing && c.auto_n[0] >= RouteResidentCfg::kAutoMin && c.auto_n[1] >= RouteResidentCfg::kAutoMin && !c.fragile_exact)
+        route_auto_test_done(c);
+}
+
+// The AUTO budget and the tests finished since the last call (false when the switch is off).
+bool Verifier::route_auto_take(float& budget, long long& tests) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.auto_on) return false;
+    budget = c.auto_b;
+    tests = c.auto_tests_take;
+    c.auto_tests_take = 0;
+    return true;
+}
 
 bool Verifier::commit(int n_keep, std::string& err) {
 #if defined(STRATA_GPU_METAL)

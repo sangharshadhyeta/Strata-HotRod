@@ -1897,7 +1897,7 @@ __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restri
 // chosen logits, as route_resident_k does; a token without one keeps the router's weights.  `pre` (T x 10) keeps the router's own ten.
 __global__ void standin_route_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                 const int32_t* __restrict__ res, int n_expert, int lo, int hi, float margin, float edge,
-                                int32_t* __restrict__ pre) {
+                                int32_t* __restrict__ pre, float budget, float budget_tail) {
     const int t = blockIdx.x;
     const int lane = threadIdx.x;   // one warp
     const float* l = logits + (size_t) t * n_expert;
@@ -1908,10 +1908,16 @@ __global__ void standin_route_k(const float* __restrict__ logits, int32_t* __res
     if (lane == 0)
         for (int r = 0; r < 10; ++r) pre[t * 10 + r] = my[r];
     const int first = (edge >= 0.f && lo > 0) ? lo - 1 : lo;
+    // STRATA_ROUTE_BUDGET (budget > 0, as decode's route_resident_k): the loop starts at rank 0; a rank below lo takes the budget test
+    // (w * gap <= budget, w = the router's renormalised weight on the pick, read before any swap) instead of the margin / edge
+    const bool bud = budget > 0.f;
     int swaps = 0;
-    for (int r = first; r <= hi && r < 10; ++r) {
+    // STRATA_ROUTE_BUDGET_TAIL (budget_tail > 0, as decode's route_resident_k): a rank at or above lo takes the tail test instead of the margin
+    for (int r = bud ? 0 : first; r <= hi && r < 10; ++r) {
         const int e = my[r];
         if (res[e] >= 0) continue;   // resident: uniform across the warp
+        const bool brank = bud && r < lo;   // uniform across the warp
+        const bool trank = budget_tail > 0.f && r >= lo;   // uniform across the warp
         float bv = -INFINITY;
         int bi = -1;
         for (int f = lane; f < n_expert; f += 32) {
@@ -1928,8 +1934,11 @@ __global__ void standin_route_k(const float* __restrict__ logits, int32_t* __res
         }
         bv = __shfl_sync(0xffffffffu, bv, 0);   // every lane decides the same way from here
         bi = __shfl_sync(0xffffffffu, bi, 0);
+        const float gap = l[e] - bv;
         const float thr = (edge >= 0.f && lo > 0 && r == lo - 1) ? edge : margin;
-        if (bi >= 0 && l[e] - bv <= thr) { my[r] = bi; ++swaps; }
+        const bool take = brank ? weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) <= budget
+                        : trank ? weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) <= budget_tail : gap <= thr;
+        if (bi >= 0 && take) { my[r] = bi; ++swaps; }
     }
     if (lane == 0) {
         if (swaps) {
@@ -2622,9 +2631,9 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
     check("route");
 }
 void standin_route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, const int32_t* res, int lo,
-                   int hi, float margin, float edge, int32_t* pre, void* stream) {
+                   int hi, float margin, float edge, int32_t* pre, void* stream, float budget, float budget_tail) {
     standin_route_k<<<(unsigned) T, 32, 0, (cudaStream_t) stream>>>(logits, ids, weights, res, (int) n_expert, lo, hi, margin,
-                                                                   edge, pre);
+                                                                   edge, pre, budget, budget_tail);
     check("standin_route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {

@@ -270,7 +270,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
                                  unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl,
                                  const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap, float cheap_margin,
-                                 int cheap_rank0, int cheap_anytier) {
+                                 int cheap_rank0, int cheap_anytier, unsigned long long* __restrict__ bstats,
+                                 float* __restrict__ row_shift) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -285,6 +286,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     const float want_lo = ((const volatile RouteCfg*) cfg)->want_lo;
     const float repl_gap = ((const volatile RouteCfg*) cfg)->repl_gap;
     const float wmax = ((const volatile RouteCfg*) cfg)->wmax;
+    const float budget = ((const volatile RouteCfg*) cfg)->budget;
+    const float budget_tail = ((const volatile RouteCfg*) cfg)->budget_tail;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
     if (lane == 0) {
@@ -351,16 +354,23 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     // below the floor are skipped as before.  `first` is the floor's first rank: the fractional edge rank lo - 1, else lo.
     const int first = (edge >= 0.f && lo > 0) ? lo - 1 : lo;
     int cheap_subs = 0;   // lane 0 only: rank 0-1 stand-ins made because the expert was not in the RAM tier
-    for (int r = cheap != nullptr ? 0 : first; r <= hi && r < 10; ++r) {
+    // STRATA_ROUTE_BUDGET (budget > 0): the loop starts at rank 0, as with `cheap`.  A rank below lo (`brank`) takes the budget test below
+    // instead of the margin / edge, and skips none of the RAM floor's rules (the budget wins for those ranks); ranks lo and up are as before.
+    const bool bud = budget > 0.f;
+    for (int r = (cheap != nullptr || bud) ? 0 : first; r <= hi && r < 10; ++r) {
         const int e = my[r];
         if (have(e)) continue;                          // already resident: uniform across the warp
-        if (r >= 2 && r < first) continue;              // below the floor and not rank 0-1: exact, as before (never reached without `cheap`)
-        // RAM-tier expert: exact, the CPU computes it from RAM (e is the same for the warp); STRATA_ROUTE_RAM_FLOOR_ANYTIER=1 lets a close
-        // stand-in (within the margin) replace it too, so the CPU skips it as well
-        if (cheap != nullptr && r < 2 && cheap[e] != 0 && cheap_anytier == 0) continue;
-        // the safety margin (SPEC E1, 10 Oct: rank 1 replaced only by a stand-in within 1 logit stayed sound, 49/50 maths, 29/30 code;
-        // an unlimited margin on ranks 0-1 collapsed the answers, T22/T27/9v): rank 0 stays exact unless STRATA_ROUTE_RAM_FLOOR_RANK0=1
-        if (cheap != nullptr && r == 0 && cheap_rank0 == 0) continue;
+        const bool brank = bud && r < lo;               // STRATA_ROUTE_BUDGET: this rank takes the budget test (uniform across the warp)
+        const bool trank = budget_tail > 0.f && r >= lo;   // STRATA_ROUTE_BUDGET_TAIL: this rank (at or above lo) takes the tail test (uniform across the warp)
+        if (!brank) {
+            if (r >= 2 && r < first) continue;          // below the floor and not rank 0-1: exact, as before (never reached without `cheap`)
+            // RAM-tier expert: exact, the CPU computes it from RAM (e is the same for the warp); STRATA_ROUTE_RAM_FLOOR_ANYTIER=1 lets a close
+            // stand-in (within the margin) replace it too, so the CPU skips it as well
+            if (cheap != nullptr && r < 2 && cheap[e] != 0 && cheap_anytier == 0) continue;
+            // the safety margin (SPEC E1, 10 Oct: rank 1 replaced only by a stand-in within 1 logit stayed sound, 49/50 maths, 29/30 code;
+            // an unlimited margin on ranks 0-1 collapsed the answers, T22/T27/9v): rank 0 stays exact unless STRATA_ROUTE_RAM_FLOOR_RANK0=1
+            if (cheap != nullptr && r == 0 && cheap_rank0 == 0) continue;
+        }
         if (wmax > 0.f && weights[(size_t) t * 10 + r] >= wmax) continue;   // a heavy pick stays exact: fetched / computed on the CPU
         if (lane == 0) ++tail;
         float bv = -INFINITY;
@@ -393,8 +403,17 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         // ranks below it (STRATA_ROUTE_RAM_FLOOR's ranks 0-1) take the margin, as the ranks 2-9 do
         // STRATA_ROUTE_RAM_FLOOR's ranks 0-1 take its own safety margin (STRATA_ROUTE_RAM_FLOOR_MARGIN, default 1 logit): no stand-in
         // that close = the exact expert, computed on the CPU after its fetch as before
-        if (bi >= 0 && l[e] - bv <= ((cheap != nullptr && r < 2) ? cheap_margin
-                                     : (edge >= 0.f && lo > 0 && r == lo - 1) ? edge : margin)) {
+        // STRATA_ROUTE_BUDGET: a rank below lo is replaced when w * gap <= budget, w = the pick's routing weight (the router's renormalised
+        // softmax over the ten, read here before any swap changes the weights), gap = the pick's logit minus the stand-in's (>= 0; clamped)
+        const float gap = l[e] - bv;
+        // STRATA_ROUTE_BUDGET_TAIL: a rank at or above lo is replaced when w * max(gap, 0) <= budget_tail (the same rule, its own bound); the
+        // margin does not apply to it.  A tail pick that the bound refuses stays exact (counted below when a stand-in was there)
+        const bool take = brank ? weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) <= budget
+                        : trank ? weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) <= budget_tail
+                        : gap <= ((cheap != nullptr && r < 2) ? cheap_margin
+                                  : (edge >= 0.f && lo > 0 && r == lo - 1) ? edge : margin);
+        if (bi >= 0 && trank && bstats != nullptr && lane == 0) atomicAdd(bstats + (take ? 3 : 4), 1ull);   // bstats [3] tail replaced, [4] tail kept exact by the bound
+        if (bi >= 0 && take) {
             if (detail != nullptr) {
                 // what was replaced and by what (per replacement): the weight of the replaced pick, the substitute's place in
                 // the router's own ranking of all 512 experts, and the score gap to it
@@ -415,6 +434,10 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             }
             // SWAP2: this expert was wanted and a stand-in served it; counted for a quality swap only when the stand-in is poor (STRATA_SWAP2_GAP logits)
             if (lane == 0 && repl != nullptr && l[e] - bv >= repl_gap) atomicAdd(repl + e, 1.0f);
+            if (lane == 0 && brank && bstats != nullptr && r < 3) atomicAdd(bstats + r, 1ull);   // budget replacements per rank 0-2
+            // STRATA_FRAGILE_RECHECK: how far this row's picks moved (any rule): the replaced pick's router weight times its score gap to
+            // the stand-in (the quantity the budget test uses), summed over the layers and the picks of the row (read by the host)
+            if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f));
             my[r] = bi;
             ++swaps;
             if (lane == 0 && cheap != nullptr && r < 2) ++cheap_subs;
@@ -447,7 +470,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
 // floors (thinking / answer / code, a fence tracker) lived here and were removed after the benchmark showed no gain (SPEC 18.1).
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
-void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank, float want_lo, float repl_gap, float wmax) {
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank, float want_lo, float repl_gap, float wmax, float budget, float budget_tail) {
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
@@ -461,6 +484,8 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
     g_cfg_host->want_lo = want_lo;
     g_cfg_host->repl_gap = repl_gap;
     g_cfg_host->wmax = wmax;
+    g_cfg_host->budget = budget;
+    g_cfg_host->budget_tail = budget_tail;
     __sync_synchronize();
 }
 void route_cfg_set_floor(int lo) {
@@ -468,10 +493,23 @@ void route_cfg_set_floor(int lo) {
     g_cfg_host->lo = lo;
     __sync_synchronize();
 }
+// STRATA_ROUTE_BUDGET_DYN: the verifier moves the budget between windows (after a window's sync, before the next launch).
+void route_cfg_set_budget(float budget) {
+    if (g_cfg_host == nullptr) return;
+    g_cfg_host->budget = budget;
+    __sync_synchronize();
+}
+// STRATA_ROUTE_BUDGET_AUTO: both budgets together, between windows (as route_cfg_set_budget)
+void route_cfg_set_budgets(float budget, float budget_tail) {
+    if (g_cfg_host == nullptr) return;
+    g_cfg_host->budget = budget;
+    g_cfg_host->budget_tail = budget_tail;
+    __sync_synchronize();
+}
 const RouteCfg* route_cfg_device() { return g_cfg_dev; }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
-                           const uint8_t* ring, const uint8_t* cheap) {
+                           const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     // STRATA_ROUTE_RAM_FLOOR's safety: the stand-in for a rank 0-1 pick must be within STRATA_ROUTE_RAM_FLOOR_MARGIN logits (default 1,
     // the margin SPEC E1 found sound for rank 1), and rank 0 is replaced only with STRATA_ROUTE_RAM_FLOOR_RANK0=1 (off: it leaked
@@ -483,7 +521,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     static const int cheap_anytier = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_ANYTIER"); return v == nullptr || std::atoi(v) != 0 ? 1 : 0; }();
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
-        n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier);
+        n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier, bstats, row_shift);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

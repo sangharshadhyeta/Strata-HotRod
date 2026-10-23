@@ -81,9 +81,11 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
 /// STRATA_PREFILL_STANDIN: the decode stand-in rule (route_resident_k) on the top-10 in place, ranks lo..hi, `margin` logits (`edge` for the
 /// rank lo - 1 when >= 0).  `res` is the layer's residency row (slot or -1, the experts the GPU holds now); `pre` (T x 10) receives the
-/// router's own picks before any swap.  Tokens without a swap keep the router's weights.
+/// router's own picks before any swap.  Tokens without a swap keep the router's weights.  `budget` > 0 (STRATA_ROUTE_BUDGET): ranks below
+/// lo are replaced only when w * gap <= budget (route_resident_k's rule), and the loop starts at rank 0.  `budget_tail` > 0
+/// (STRATA_ROUTE_BUDGET_TAIL): ranks at or above lo are replaced only when w * max(gap, 0) <= budget_tail, instead of the margin.
 void standin_route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, const int32_t* res, int lo,
-                   int hi, float margin, float edge, int32_t* pre, void* stream);
+                   int hi, float margin, float edge, int32_t* pre, void* stream, float budget = 0.f, float budget_tail = 0.f);
 /// Expert blob (Strata pack layout, Q2_0) -> BF16 matrices: gate/up interleaved [1280, 2560], down [2560, 640].
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)

@@ -180,6 +180,9 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 /// be mapped host memory read after the window's own sync.  Graph-capturable; CUDA and HIP.
 inline constexpr int kNonfiniteBlocks = 16;
 void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream);
+/// STRATA_ROUTE_BUDGET_DYN: gap[t] = the top-1 minus the top-2 RAW logit of row t (n floats a row) for n_rows rows, one block a
+/// row.  A row whose logits hold a NaN gives a NaN or a non-finite gap (the host treats those as close).  CUDA and HIP.
+void logits_margin_rows(const float* logits, int n_rows, int n, float* gap, void* stream);
 /// True where row_top_prob_split runs as its own kernel (CUDA; AMD keeps the one-block row_top_prob, so it calls
 /// that).  STRATA_MULTI_BLOCK_ARGMAX=0: off.
 bool multi_block_head_ops();

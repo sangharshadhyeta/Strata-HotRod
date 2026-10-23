@@ -35,9 +35,13 @@ struct RouteCfg {
     int32_t maxrank;   ///< a stand-in must sit within this many places of the router's own ranking of all 512 experts (0 = any)
     float bias;   ///< CCE router bias: ln(1 + beta) added to a resident expert's logit before the top-10 (0 = off)
     float wmax;   ///< HOBBIT-style weight floor (STRATA_ROUTE_WMAX): a missed pick is replaced only when the router's own weight on it is below this (0 = off, the rank floor alone decides)
+    float budget; ///< STRATA_ROUTE_BUDGET=<b>: ranks below `lo` take the budget test w * gap <= b instead of the margin / edge (0 = off)
+    float budget_tail; ///< STRATA_ROUTE_BUDGET_TAIL=<b>: ranks at or above `lo` take a resident stand-in only when w * max(gap, 0) <= b (0 = off: any, as the margin says)
 };
-void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, int maxrank = 0, float want_lo = 1.f, float repl_gap = 0.f, float wmax = 0.f);   ///< before graph capture
+void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, int maxrank = 0, float want_lo = 1.f, float repl_gap = 0.f, float wmax = 0.f, float budget = 0.f, float budget_tail = 0.f);   ///< before graph capture
 void route_cfg_set_floor(int lo);                                ///< between windows
+void route_cfg_set_budget(float budget);                         ///< between windows (STRATA_ROUTE_BUDGET_DYN)
+void route_cfg_set_budgets(float budget, float budget_tail);     ///< between windows (STRATA_ROUTE_BUDGET_AUTO): both budgets at once
 const RouteCfg* route_cfg_device();
 /// The same contract for a model family's (experts, top-k): 512 / 10 (Flash-Next: the two calls above, unchanged) and
 /// 256 / 8 (Qwen3.6-35B-A3B).  logits [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
@@ -51,7 +55,10 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 /// `rows` is nullptr or the layer's [8 rows][10] slice of the per-row record (route_rows_layer): the same original picks per window row.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr,
-                           const uint8_t* ring = nullptr, const uint8_t* cheap = nullptr);
+                           const uint8_t* ring = nullptr, const uint8_t* cheap = nullptr, unsigned long long* bstats = nullptr,
+                           float* row_shift = nullptr);
+/// STRATA_FRAGILE_RECHECK: nullptr or n_tok floats, zeroed by the caller before the window; each replaced pick adds its router
+/// weight times max(gap, 0) to its row (gap: the pick's logit minus the stand-in's).  Off: nullptr, and the kernel adds nothing.
 /// STRATA_RING (the look-ahead ring): one byte per (layer, expert) on the device, 1 while a Foresight ring slot holds the expert and
 /// its copy has landed (set on the copy stream after the copy, cleared before the slot is refilled).  The router counts such an
 /// expert as resident: a pick it holds is computed exactly on the GPU from the slot, and it may serve as a stand-in.  Allocated

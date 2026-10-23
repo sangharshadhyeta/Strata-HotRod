@@ -2563,7 +2563,8 @@ namespace {
 // n_expert int32, T x 10 int32), freed when the run ends.
 struct PrefillStandin {
     bool on = false;
-    float margin = 0.0f, edge = -1.0f;
+    float margin = 0.0f, edge = -1.0f, budget = 0.0f;   // budget: STRATA_ROUTE_BUDGET (ranks below lo; 0 = off)
+    float budget_tail = 0.0f;   // STRATA_ROUTE_BUDGET_TAIL (ranks at or above lo; 0 = off)
     int lo = 6, hi = 9;
     int64_t n_expert = 0;
     int64_t picks = 0, reads_saved = 0;   // the run's totals: picks replaced; distinct (layer, expert) reads avoided
@@ -2587,6 +2588,15 @@ struct PrefillStandin {
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) margin = (float) std::atof(v);
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &lo, &hi);
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) edge = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET")) budget = std::max(0.0f, (float) std::atof(v));   // as decode's route_resident_cfg
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET_TAIL")) budget_tail = std::max(0.0f, (float) std::atof(v));   // as decode's
+        // STRATA_ROUTE_BUDGET_DYN: prompt reading keeps STRATA_ROUTE_BUDGET when set, else its b_lo (the decode rule is not used here)
+        if (std::getenv("STRATA_ROUTE_BUDGET") == nullptr) {
+            if (const char* d = std::getenv("STRATA_ROUTE_BUDGET_DYN")) {
+                float hi = 0.0f, gap = 0.0f, lo = 0.0f;
+                if (std::sscanf(d, "%f,%f,%f", &hi, &gap, &lo) >= 3) budget = std::max(0.0f, lo);
+            }
+        }
         if (!residency || margin <= 0.0f) {
             std::fprintf(stderr, "strata prefill: STRATA_PREFILL_STANDIN needs the expert cache and STRATA_ROUTE_RESIDENT=<margin> "
                                  "(> 0): off for this run\n");
@@ -3860,7 +3870,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaMemcpyAsync(sa.res + (size_t) l * (size_t) g.n_expert, m.host_res + (size_t) l * (size_t) g.n_expert,
                                         (size_t) g.n_expert * sizeof(int32_t), cudaMemcpyHostToDevice, cs);
                         standin_route(m.logits, m.ids, m.w, T, g.n_expert, sa.res + (size_t) l * (size_t) g.n_expert, sa.lo, sa.hi,
-                                      sa.margin, sa.edge, sa.pre, cs);
+                                      sa.margin, sa.edge, sa.pre, cs, sa.budget, sa.budget_tail);
                         sa_now = true;
                     }
                     // the shared expert and its scalar gate

@@ -16,8 +16,9 @@ other model sizes may work in upstream Strata, but we have not run them, so we d
 - **Fast where it counts:** 52-54 tokens/s after an 8.5K-token prompt, 38-45 tokens/s deep into a 45K-token conversation.
 - **Long memory:** 262K tokens of context on a 12 GB card; the K/V streams from RAM past 64K.
 - **Quick follow-ups:** the next turn of a 45K conversation is read in half a second; your draft is read while you type.
-- **Careful shortcuts:** experts that are not on the card are swapped for close stand-ins only where measured safe; the two
-  most important ones per token are always real ([how far each rank may be swapped](#stand-in-experts-rank-by-rank)).
+- **Careful shortcuts that tune themselves:** an expert that is not on the card is swapped for a close stand-in only when
+  the router's confidence says it is cheap, and any token a stand-in could have flipped is decided again exactly. The engine
+  finds its own budget by measured speed and keeps what it learned ([how it works](#stand-in-experts-confidence-not-rank)).
 - **Every number measured, every answer read:** the changes and their A/B results are in
   [docs/perf-ideas.md](docs/perf-ideas.md).
 
@@ -90,7 +91,7 @@ The detail is in [SPEC.md](SPEC.md).
 Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md)):
 
 - **Stand-in experts.** An expert that is not on the card can be replaced by a close one that is, so the card does not wait
-  for the SSD; how far each rank may be swapped is in [the next section](#stand-in-experts-rank-by-rank). Swap rounds move
+  for the SSD; how far each rank may be swapped is in [the next section](#stand-in-experts-confidence-not-rank). Swap rounds move
   the experts a chat asks for onto the card in the background.
 - **Guessing ahead.** A small draft head guesses the next words and the big model checks them together, with
   probabilistic acceptance of the guesses (`--no-spec-prob-accept` turns it off).
@@ -123,7 +124,36 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
   it (not significant: only 9 questions differ), and decode 10% slower (38.5 against 42.7 tokens/s). Not worth it on a
   model that was not trained to loop, so it stays off.
 
-## Stand-in experts, rank by rank
+## Stand-in experts: confidence, not rank
+
+Default since 24 Oct 2026. Nothing in it is set by hand: the budget, the close-call line and when to re-check are measured.
+
+- **One rule for every rank.** A missing pick takes the best stand-in on the card only when
+  `router weight x logit gap <= budget`. A heavy pick (usually rank 0 or 1) needs a stand-in within about a logit; a light one
+  (ranks 3-9) can take one much further away; a rank-0 pick in a flat routing is treated as lightly as its weight says.
+- **Fragile tokens are decided exactly** (`STRATA_FRAGILE_RECHECK`, default on, `=0` off). For each token the engine adds up
+  how far stand-ins moved it (weight x gap of every replaced pick, all layers). When the token's lead over the runner-up is
+  below `k` times that move, the window is cut just before it and the next window decides it with the top ranks exact.
+  `k` is learned: the 10th percentile of lead/move on the first 64 windows, then just above the largest move that actually
+  flipped a token. On the 24 Oct tests it settled near 0.04; about 1 re-check in 5 had flipped (the "bobed", "howed" kind of
+  broken word), and only 1-3% of windows were cut.
+- **The budget searches itself** (`STRATA_ROUTE_BUDGET_AUTO`, default on, `=0` off). Windows alternate in runs of 8 between
+  budget `b` and `b x step`, so both see the same text; the faster one by 2% over 96 windows each wins, re-check costs
+  included. The step grows while it keeps winning and shrinks after a loss.
+- **It remembers.** `data/standin-tune.txt` keeps the budget, `k` and the step, tied to the model's fingerprint, and is
+  loaded at the next start (`stand-in tuning loaded: ...` in the log).
+
+Measured 24 Oct (131K context; code / reasoning / prose tokens/s, every answer read):
+
+| Setting | Code | Reasoning | Prose | Answers |
+| --- | --- | --- | --- | --- |
+| the rank rule below (until 23 Oct) | 31.8 | 39.8 | 30.9 | clean |
+| fixed budget 0.25, no re-check | 45-51 | 55-57 | 40-41 | broken words in 2 of 3 prose answers |
+| self-tuning + re-check, learned budget 0.183 | 43.4 | 52.6 | 36.6 | 21 of 21 clean |
+
+Prompt reading keeps the rank rule below (the re-check is decode only).
+
+## Stand-in experts, rank by rank (the rule until 23 Oct; prompt reading still uses it)
 
 For every token, each layer's router picks 10 of 512 experts and ranks them, rank 0 the most important. The ones on the
 card run at full speed; one that is not there has to come from RAM or the SSD, and that wait is what limits decode. A

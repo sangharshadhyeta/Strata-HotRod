@@ -1588,6 +1588,14 @@ static std::string ram_reserve_path(const Options& o) {
     const std::filesystem::path dir = std::filesystem::path(p).parent_path();
     return ((dir.empty() ? std::filesystem::path(".") : dir) / "ram-reserve.json").string();
 }
+/// The stand-in tuning of this model (STRATA_ROUTE_BUDGET_AUTO / STRATA_FRAGILE_RECHECK: budget, k, step, counts), beside the expert
+/// profile like the reserve files.  It is keyed to the model fingerprint inside (Verifier::route_tune_open).
+static std::string standin_tune_path(const Options& o) {
+    const std::string& p = !o.expert_profile.empty() ? o.expert_profile : o.expert_profile_save;
+    if (p.empty()) return "";
+    const std::filesystem::path dir = std::filesystem::path(p).parent_path();
+    return ((dir.empty() ? std::filesystem::path(".") : dir) / "standin-tune.txt").string();
+}
 /// GPU name, total VRAM, context, K/V mode and format, batch and whether a draft is loaded: a short string
 static std::string vram_reserve_key(const Options& o) {
     cudaDeviceProp p{};
@@ -11722,6 +11730,7 @@ int main(int argc, char** argv) {
                 bt_a_rounds0 = a_rounds; bt_a_swapped0 = a_swapped;
             }
             const Clock::time_point w0 = Clock::now();
+            ver.route_budget_window(false);   // STRATA_ROUTE_BUDGET_DYN: the batch windows are not the decode loop (static budget, else b_lo)
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
@@ -12096,6 +12105,23 @@ int main(int argc, char** argv) {
             learned[ram_rkey + what] = mib;
             vram_reserve_write(ram_reserve_path(o), learned);
         };
+        // STRATA_FRAGILE_RECHECK / STRATA_ROUTE_BUDGET_AUTO: the learned stand-in tuning of this model is loaded before the first
+        // request.  The model fingerprint is the session files' (session_identity: read once here, not per request).
+        if (strata::core::Verifier::route_fragile_on()) {
+            const std::string tune = standin_tune_path(o);
+            if (!tune.empty()) {
+                strata::core::SessionFileIdentity tid;
+                std::string te;
+                try {
+                    if (session_identity(tid, te, {}))
+                        strata::core::Verifier::route_tune_open(tune, tid.model);
+                    else
+                        std::fprintf(stderr, "strata serve: stand-in tuning not kept (%s)\n", te.c_str());
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "strata serve: stand-in tuning not kept (%s)\n", e.what());
+                }
+            }
+        }
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -13556,6 +13582,7 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
+                    ver.route_budget_window(false);   // STRATA_ROUTE_BUDGET_DYN: a prompt window keeps the static budget (else b_lo)
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -14752,6 +14779,7 @@ int main(int argc, char** argv) {
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
             }
             bool first_window = true;
+            strata::core::Verifier::route_budget_begin();   // STRATA_ROUTE_BUDGET_DYN: this request's first decode window runs at b_lo
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
@@ -15588,11 +15616,30 @@ int main(int argc, char** argv) {
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
                 if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                ver.route_budget_window(true, !merged);   // STRATA_ROUTE_BUDGET_DYN: the decode budget of this window (no-op when off); AUTO: not a merged window
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
                 if (aflipped) apply_pending(true);   // 0.1.43: every layer's copies were waited for in the window; the bookkeeping now
+                // STRATA_FRAGILE_RECHECK (serial decode loop; merged windows are not cut): a window that ran with stand-ins is cut before its
+                // first close call: row r >= 1 that a stand-in moved (route_fragile_shifts) with a top-1 minus top-2 gap below k times the move.
+                // Rows 0..r-1 are kept (a = r - 1 below), and the next window runs ranks < lo exact and re-decides row r (its row 0).  A close
+                // call at row 0 makes no cut and no re-run (a re-run would step the GDN/PLE state twice): the rows stand.
+                int fr_cut = -1;
+                if (!merged) strata::core::Verifier::route_fragile_settle(outv[0]);   // the previous cut's row, decided exactly by this window
+                if (!merged && strata::core::Verifier::route_fragile_wants()) {
+                    int a0 = 0;
+                    while (a0 < T - 1 && window[(size_t) a0 + 1] == outv[(size_t) a0]) ++a0;
+                    std::vector<float> fr_gap((size_t) a0 + 1), fr_shift((size_t) a0 + 1, 0.0f);
+                    if (ver.route_fragile_gaps(a0 + 1, fr_gap.data()) && ver.route_fragile_shifts(a0 + 1, fr_shift.data())) {
+                        const int r = strata::core::Verifier::route_fragile_first(fr_gap.data(), fr_shift.data(), a0 + 1);
+                        if (r >= 1) {
+                            strata::core::Verifier::route_fragile_cut(fr_gap[(size_t) r] / fr_shift[(size_t) r], outv[(size_t) r]);
+                            fr_cut = r;
+                        }
+                    }
+                }
                 // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
                 // window to <path>.<n>, so the prompt paths (a peer card's share, a split) can be compared by KL
                 if (first_window) {
@@ -15609,6 +15656,7 @@ int main(int argc, char** argv) {
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (fr_cut >= 1) a = std::min(a, fr_cut - 1);   // STRATA_FRAGILE_RECHECK: rows fr_cut.. are re-decided, not kept
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
@@ -15623,11 +15671,15 @@ int main(int argc, char** argv) {
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
+                ver.route_budget_after(a + 1);   // STRATA_ROUTE_BUDGET_DYN: the next decode window's budget from the kept rows' gaps
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                // STRATA_ROUTE_BUDGET_AUTO: this window's speed sample (ver.run start to this commit's end; one bool check when off)
+                if (strata::core::Verifier::route_auto_on() && !merged)
+                    strata::core::Verifier::route_auto_window(a + 1, tw0, Clock::now());
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
@@ -16099,6 +16151,27 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
+            }
+            {   // STRATA_FRAGILE_RECHECK: this request's cuts, rows moved by stand-ins, flipped re-decisions and k (takes and resets the counts)
+                long long fr_cuts = 0, fr_moved = 0, fr_flips = 0;
+                float fr_k = 0.0f, fr_med_shift = 0.0f, fr_med_gap = 0.0f;
+                if (strata::core::Verifier::route_fragile_take(fr_cuts, fr_moved, fr_flips, fr_k, fr_med_shift, fr_med_gap))
+                    std::fprintf(stderr, "strata serve: fragile recheck: %lld windows cut, %lld rows moved by stand-ins, %lld flipped (k %.3f; "
+                                 "median row_shift %.4f, median gap %.4f of the moved rows)\n",
+                                 fr_cuts, fr_moved, fr_flips, (double) fr_k, (double) fr_med_shift, (double) fr_med_gap);
+            }
+            {   // STRATA_ROUTE_BUDGET_AUTO: the base budget the search ends this request at, and the tests it finished since the last line
+                float auto_b = 0.0f;
+                long long auto_tests = 0;
+                if (strata::core::Verifier::route_auto_take(auto_b, auto_tests))
+                    std::fprintf(stderr, "strata serve: auto budget: %.3f at end (%lld tests)\n", (double) auto_b, auto_tests);
+            }
+            {   // STRATA_ROUTE_BUDGET_DYN: this request's decode windows at each budget (takes and resets the counts)
+                long long dyn_hi = 0, dyn_lo = 0;
+                float dyn_b_hi = 0.0f, dyn_b_lo = 0.0f, dyn_gap = 0.0f;
+                if (strata::core::Verifier::route_budget_take(dyn_hi, dyn_lo, dyn_b_hi, dyn_b_lo, dyn_gap))
+                    std::fprintf(stderr, "strata serve: dynamic budget: %lld windows at %g, %lld at %g (gap_min %g)\n",
+                                 dyn_hi, (double) dyn_b_hi, dyn_lo, (double) dyn_b_lo, (double) dyn_gap);
             }
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
@@ -17017,6 +17090,7 @@ int main(int argc, char** argv) {
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            ver.route_budget_window(false);   // STRATA_ROUTE_BUDGET_DYN: the one-shot generate path is not the serve decode loop
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
