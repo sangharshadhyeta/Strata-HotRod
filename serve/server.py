@@ -2970,10 +2970,18 @@ def timeline_on() -> bool:
 
 def set_timeline(on: bool) -> None:
     """The Monitor's switch: the engine reads it at most every 2 s (between decode windows) and records host times only while on."""
-    tmp = TIMELINE_CTL + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(b"1" if on else b"0")
-    os.replace(tmp, TIMELINE_CTL)
+    # one byte, written in place: no rename (Windows refuses to replace a file the Monitor's poll or the engine has open) and no
+    # truncation (a reader in between would see an empty file, read as off).  A busy file is tried again for a moment.
+    for attempt in range(20):
+        try:
+            with open(TIMELINE_CTL, "r+b" if os.path.exists(TIMELINE_CTL) else "wb") as f:
+                f.seek(0)
+                f.write(b"1" if on else b"0")
+            break
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
     if not on:
         try:
             os.remove(TIMELINE_FILE)
@@ -6011,7 +6019,11 @@ def make_handler(svc: Service):
                     on = req.get("on")
                     if not isinstance(on, bool):
                         raise ValueError("on: true or false")
-                    set_timeline(on)
+                    try:
+                        set_timeline(on)
+                    except OSError as e:                     # (not the client's connection: an answer, not a dropped one)
+                        self._json(503, {"error": {"type": "server_error", "message": f"the timeline switch could not be written: {e}"}})
+                        return
                     self._json(200, {"on": on})
                     return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
