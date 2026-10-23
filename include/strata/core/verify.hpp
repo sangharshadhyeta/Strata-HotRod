@@ -225,8 +225,11 @@ public:
     static void route_fragile_cut(float ratio, int32_t stand_tok, bool explore = false);
     static void route_fragile_settle(int32_t exact_tok);
     /// This request's cuts, rows moved by stand-ins and flipped re-decisions, the current k, and the medians of the moved rows' shift and gap
-    /// (false when the switch is off); resets the counts.
-    static bool route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift, float& med_gap);
+    /// (false when the switch is off); resets the counts.  Also this request's decode budget at its end (req_b) and its brakes.
+    static bool route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift, float& med_gap,
+                                   float& req_b, long long& brakes);
+    /// STRATA_FRAGILE_BRAKE (default on): the per-request decode budget brake (route_fragile_take's req_b and brakes are its).
+    static bool route_brake_on();
     /// The FRAGILE switch (STRATA_FRAGILE_RECHECK).  route_tune_open(path, model_fp), once at serve start before the first decode window
     /// (FRAGILE on): loads the learned b, k, step and counts from `path` when its fingerprint is model_fp, and keeps writing that file
     /// after each finished AUTO test and each k update.  An empty path keeps nothing.

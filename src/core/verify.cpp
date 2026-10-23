@@ -193,6 +193,18 @@ struct RouteResidentCfg {
     bool auto_b0_env = false;                 ///< STRATA_ROUTE_BUDGET_AUTO_B0 is set: it overrides the file's b
     float auto_step = 1.25f;                  ///< the candidate's step factor s: candidate = b * s^d (saved; after a win in the same direction as the last win s grows to 2, after a loss it shrinks toward 1.1)
     int auto_last_win = 0;                    ///< the direction of the last win (0: no win yet)
+    // STRATA_FRAGILE_BRAKE (default on, =0 off; with FRAGILE and AUTO): each request has its own decode budget req_b, used for its decode
+    // windows instead of auto_b.  route_budget_begin sets req_b = 0.5 * auto_b.  The AUTO arms scale it: base req_b, candidate req_b * s^d.
+    // A settled re-check of the request counts into req_rc / req_fl; with >= 5 re-checks and flips / rechecks > 0.2, req_b halves (below
+    // 0.01 it is 0) and the counts reset, so it takes 5 more re-checks to act again.  Every 64 decode windows of the request with >= 5
+    // re-checks and flips / rechecks <= 0.1, req_b grows by 1.25 (never above auto_b).  The search (auto_b) is unchanged by the brake.
+    enum { kBrakeMin = 5, kBrakeWindows = 64, kAutoQuality = 10 };
+    bool brake_on = true;                     ///< STRATA_FRAGILE_BRAKE: the per-request brake (off: req_b is auto_b for every request)
+    float req_b = 0.1f;                       ///< this request's decode budget
+    long long req_rc = 0, req_fl = 0;         ///< this request's re-checks and flips since its last brake
+    long long req_wins = 0;                   ///< this request's decode windows (the grow check every kBrakeWindows)
+    long long req_brakes = 0;                 ///< this request's brakes (the stats line takes it at the end)
+    long long auto_rc[2] = {0, 0}, auto_fl[2] = {0, 0};   ///< the running test's re-checks and flips per arm (of the cut window's arm)
     // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
     // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
     // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
@@ -289,6 +301,8 @@ RouteResidentCfg& route_resident_cfg() {
         // STRATA_FRAGILE_RECHECK (default on, =0 off): close calls of a stand-in window are decided exactly (see RouteResidentCfg);
         // STRATA_FRAGILE_K0 its start.  Default since 24 Oct: with AUTO, 21 of 21 answers clean where a fixed 0.25 budget broke words
         { const char* v = std::getenv("STRATA_FRAGILE_RECHECK"); r.fragile_on = v == nullptr || std::atoi(v) != 0; }
+        // STRATA_FRAGILE_BRAKE (default on, =0 off): the per-request decode budget brake (see RouteResidentCfg)
+        { const char* v = std::getenv("STRATA_FRAGILE_BRAKE"); r.brake_on = v == nullptr || std::atoi(v) != 0; }
         if (const char* v = std::getenv("STRATA_FRAGILE_K0")) {
             const float k0 = (float) std::atof(v);
             if (k0 > 0.0f) {
@@ -3852,6 +3866,7 @@ void Verifier::route_tune_open(const std::string& path, uint64_t model_fp) {
 }
 
 bool Verifier::route_fragile_on() { return route_resident_cfg().fragile_on; }
+bool Verifier::route_brake_on() { return route_resident_cfg().brake_on; }
 
 // STRATA_ROUTE_BUDGET_DYN (decode only).  route_budget_window sets the budget before a window: a decode window at the current
 // decode budget, a prompt window at STRATA_ROUTE_BUDGET or b_lo.  route_budget_after runs after a decode window's sync and before
@@ -3859,6 +3874,15 @@ bool Verifier::route_fragile_on() { return route_resident_cfg().fragile_on; }
 // window's budget.  Both write the host-mapped RouteCfg between windows only, as route_cfg_set_floor does.
 namespace {
 void route_auto_schedule(RouteResidentCfg& c);   // defined with the test helpers below route_auto_window
+float route_auto_arm_b(const RouteResidentCfg& c, int arm);   // defined with the test helpers below route_auto_window
+
+// STRATA_FRAGILE_BRAKE: every kBrakeWindows decode windows of the request, the request's budget grows by 1.25 (never above auto_b)
+// when it has >= kBrakeMin re-checks and its flip rate is at most 0.1.  The counts are kept (only a brake resets them).
+void route_brake_grow(RouteResidentCfg& c) {
+    if (c.req_rc < RouteResidentCfg::kBrakeMin) return;
+    if ((double) c.req_fl / (double) c.req_rc > 0.1) return;
+    c.req_b = std::min(c.auto_b, c.req_b * 1.25f);
+}
 }  // namespace
 
 void Verifier::route_budget_begin() {
@@ -3867,6 +3891,9 @@ void Verifier::route_budget_begin() {
     c.fragile_exact = false;              // STRATA_FRAGILE_RECHECK: a request starts with no pending cut
     c.fragile_pend = false;
     if (c.auto_on) ++c.auto_req;          // STRATA_ROUTE_BUDGET_AUTO: the request whose windows the next arm time counts
+    // STRATA_FRAGILE_BRAKE: this request starts at half the learned budget (auto_b itself when the brake is off)
+    c.req_b = c.brake_on ? 0.5f * c.auto_b : c.auto_b;
+    c.req_rc = c.req_fl = c.req_wins = c.req_brakes = 0;
 }
 
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
@@ -3875,6 +3902,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     RouteResidentCfg& c = route_resident_cfg();
     if (!c.dyn_on && !c.fragile_on) return;
     if (decode && c.fragile_on) route_fragile_zero_shift();   // STRATA_FRAGILE_RECHECK: this window's stand-in moves start at zero
+    if (decode && c.brake_on && ++c.req_wins % RouteResidentCfg::kBrakeWindows == 0) route_brake_grow(c);   // STRATA_FRAGILE_BRAKE
     float b = c.budget;
     float tail = c.budget_tail;
     if (c.dyn_on) {
@@ -3892,7 +3920,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
         } else {
             route_auto_schedule(c);
         }
-        b = c.auto_win_arm == 0 ? c.auto_b : c.auto_cand_b;
+        b = route_auto_arm_b(c, c.auto_win_arm);   // the request's budget (base arm) or its scaled candidate
         tail = b;
     }
     if (decode && c.fragile_exact) {
@@ -4027,6 +4055,23 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
         ++c.fragile_flips;
         ++c.fr_flips;
     }
+    // STRATA_FRAGILE_BRAKE / AUTO quality: the request's counts, and the counts of the arm of the cut window (auto_cut_arm)
+    ++c.req_rc;
+    ++c.auto_rc[c.auto_cut_arm];
+    if (flipped) {
+        ++c.req_fl;
+        ++c.auto_fl[c.auto_cut_arm];
+    }
+    if (c.brake_on && c.req_b > 0.0f && c.req_rc >= RouteResidentCfg::kBrakeMin && (double) c.req_fl / (double) c.req_rc > 0.2) {
+        const float old = c.req_b;
+        const float cut = old * 0.5f;
+        c.req_b = cut < 0.01f ? 0.0f : cut;
+        ++c.req_brakes;
+        std::fprintf(stderr, "strata serve: stand-in brake: budget %.3f -> %.3f (%lld of %lld re-checks flipped)\n",
+                     (double) old, (double) c.req_b, c.req_fl, c.req_rc);
+        c.req_rc = 0;
+        c.req_fl = 0;
+    }
     c.fr_ratio[c.fr_pos] = c.fragile_pend_ratio;
     c.fr_flip[c.fr_pos] = flipped;
     c.fr_explore[c.fr_pos] = c.fragile_pend_explore;
@@ -4053,7 +4098,7 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
 
 // This request's cuts, rows moved by stand-ins, flipped re-decisions and k; false when the switch is off.  Takes and resets the counts.
 bool Verifier::route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift,
-                                  float& med_gap) {
+                                  float& med_gap, float& req_b, long long& brakes) {
     RouteResidentCfg& c = route_resident_cfg();
     if (!c.fragile_on) return false;
     cuts = c.fr_cuts;
@@ -4061,6 +4106,8 @@ bool Verifier::route_fragile_take(long long& cuts, long long& explores, long lon
     moved = c.fr_moved;
     flips = c.fr_flips;
     k = c.fragile_k;
+    req_b = c.req_b;   // this request's budget at its end, and its brakes (not reset here: route_budget_begin resets them)
+    brakes = c.req_brakes;
     // the medians of the moved rows' stand-in shift and gap (this request's samples; diagnosis)
     auto median = [](std::vector<float>& v) -> float {
         if (v.empty()) return 0.0f;
@@ -4117,6 +4164,12 @@ bool Verifier::route_budget_take(long long& n_hi, long long& n_lo, float& b_hi, 
 namespace {
 float auto_clamp_b(double b) { return std::min(4.0f, std::max(0.02f, (float) b)); }
 
+// The decode budget of an arm's window: the base arm runs at the request's req_b, the candidate at req_b * s^d (clamped; 0 stays 0).
+float route_auto_arm_b(const RouteResidentCfg& c, int arm) {
+    if (arm == 0 || c.req_b <= 0.0f) return c.req_b;
+    return auto_clamp_b((double) c.req_b * std::pow((double) c.auto_step, (double) c.auto_dir));
+}
+
 // Starts a test of direction d at the base b (its arms' counts and times are cleared).
 void auto_begin_test(RouteResidentCfg& c, int d) {
     c.auto_dir = d;
@@ -4124,6 +4177,8 @@ void auto_begin_test(RouteResidentCfg& c, int d) {
     c.auto_n[0] = c.auto_n[1] = 0;
     c.auto_tok[0] = c.auto_tok[1] = 0;
     c.auto_secs[0] = c.auto_secs[1] = 0.0;
+    c.auto_rc[0] = c.auto_rc[1] = 0;
+    c.auto_fl[0] = c.auto_fl[1] = 0;
     c.auto_runs = 0;
     c.auto_run_left = 0;
     c.auto_testing = true;
@@ -4163,12 +4218,16 @@ void route_auto_schedule(RouteResidentCfg& c) {
     c.auto_win_sched = true;
 }
 
-// Both arms have kAutoMin scheduled windows: the candidate wins when its speed is at least 1.02 times the base's.
+// Both arms have kAutoMin scheduled windows: the candidate wins when its speed is at least 1.02 times the base's and its flip rate
+// (flips / re-checks of its arm) is at most the base's + 0.05.  A candidate with fewer than kAutoQuality re-checks counts as equal on quality.
 void route_auto_test_done(RouteResidentCfg& c) {
     const int d = c.auto_dir;
     const double sb = c.auto_secs[0] > 0.0 ? (double) c.auto_tok[0] / c.auto_secs[0] : 0.0;
     const double sc = c.auto_secs[1] > 0.0 ? (double) c.auto_tok[1] / c.auto_secs[1] : 0.0;
-    const bool won = sc >= sb * 1.02;
+    const double fb = c.auto_rc[0] > 0 ? (double) c.auto_fl[0] / (double) c.auto_rc[0] : 0.0;
+    const double fc = c.auto_rc[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_rc[1] : 0.0;
+    const bool quality = c.auto_rc[1] < RouteResidentCfg::kAutoQuality || fc <= fb + 0.05;
+    const bool won = sc >= sb * 1.02 && quality;
     const float b_old = c.auto_b, cand = c.auto_cand_b, step = c.auto_step;   // step: the factor this test's candidate used
     // the step: a win in the same direction as the last win grows it (to 2); a loss shrinks it toward 1.1 (sqrt, floor 1.1)
     if (won) {
@@ -4178,8 +4237,10 @@ void route_auto_test_done(RouteResidentCfg& c) {
         c.auto_step = std::max(std::sqrt(c.auto_step), 1.1f);
     }
     auto_next_stage(c, won, d);
-    std::fprintf(stderr, "strata serve: auto budget test %.3f vs %.3f: %.1f vs %.1f tok/s over %d+%d windows step %.2f -> %.3f\n",
-                 (double) cand, (double) b_old, sc, sb, (int) c.auto_n[1], (int) c.auto_n[0], (double) step, (double) c.auto_b);
+    std::fprintf(stderr, "strata serve: auto budget test %.3f vs %.3f: %.1f vs %.1f tok/s over %d+%d windows step %.2f -> %.3f; "
+                 "flip rate %.3f vs %.3f (%lld vs %lld re-checks)%s\n",
+                 (double) cand, (double) b_old, sc, sb, (int) c.auto_n[1], (int) c.auto_n[0], (double) step, (double) c.auto_b,
+                 fc, fb, c.auto_rc[1], c.auto_rc[0], quality ? "" : ", quality lost");
     c.auto_testing = false;
     ++c.auto_tests;
     ++c.auto_tests_take;

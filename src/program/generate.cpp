@@ -10317,6 +10317,7 @@ int main(int argc, char** argv) {
             ++swap_round;
             // STRATA_RESIDENCY_FILE=<path> (the server sets it for the Monitor's residency view): at most every 2 s, one JSON snapshot of which experts
             // are in VRAM - a character per expert, 0 not resident, 1 resident and cold (decayed use < 1), 2 warm (< 4), 3 hot - written aside and renamed
+            strata::core::timeline_tick();   // the Monitor's decode timeline: its switch and its snapshot (at most every 2 s)
             static const char* res_file = std::getenv("STRATA_RESIDENCY_FILE");
             static Clock::time_point res_last = Clock::now() - std::chrono::hours(1);
             if (res_file != nullptr && res_file[0] != '\0' && Clock::now() - res_last >= std::chrono::seconds(2)) {
@@ -16304,11 +16305,17 @@ int main(int argc, char** argv) {
             }
             {   // STRATA_FRAGILE_RECHECK: this request's cuts, rows moved by stand-ins, flipped re-decisions and k (takes and resets the counts)
                 long long fr_cuts = 0, fr_explores = 0, fr_moved = 0, fr_flips = 0;
-                float fr_k = 0.0f, fr_med_shift = 0.0f, fr_med_gap = 0.0f;
-                if (strata::core::Verifier::route_fragile_take(fr_cuts, fr_explores, fr_moved, fr_flips, fr_k, fr_med_shift, fr_med_gap))
+                float fr_k = 0.0f, fr_med_shift = 0.0f, fr_med_gap = 0.0f, fr_req_b = 0.0f;
+                long long fr_brakes = 0;
+                if (strata::core::Verifier::route_fragile_take(fr_cuts, fr_explores, fr_moved, fr_flips, fr_k, fr_med_shift, fr_med_gap,
+                                                               fr_req_b, fr_brakes)) {
                     std::fprintf(stderr, "strata serve: fragile recheck: %lld windows cut, %lld explore cuts, %lld rows moved by stand-ins, "
-                                 "%lld flipped (k %.3f; median row_shift %.4f, median gap %.4f of the moved rows)\n",
+                                 "%lld flipped (k %.3f; median row_shift %.4f, median gap %.4f of the moved rows)",
                                  fr_cuts, fr_explores, fr_moved, fr_flips, (double) fr_k, (double) fr_med_shift, (double) fr_med_gap);
+                    if (strata::core::Verifier::route_brake_on())   // STRATA_FRAGILE_BRAKE: this request's budget at its end
+                        std::fprintf(stderr, ", budget %.3f at end (%lld brakes)", (double) fr_req_b, fr_brakes);
+                    std::fprintf(stderr, "\n");
+                }
             }
             {   // STRATA_ROUTE_BUDGET_AUTO: the base budget the search ends this request at, and the tests it finished since the last line
                 float auto_b = 0.0f;
