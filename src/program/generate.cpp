@@ -15780,9 +15780,10 @@ int main(int argc, char** argv) {
                     while (a0 < T - 1 && window[(size_t) a0 + 1] == outv[(size_t) a0]) ++a0;
                     std::vector<float> fr_gap((size_t) a0 + 1), fr_shift((size_t) a0 + 1, 0.0f);
                     if (ver.route_fragile_gaps(a0 + 1, fr_gap.data()) && ver.route_fragile_shifts(a0 + 1, fr_shift.data())) {
-                        const int r = strata::core::Verifier::route_fragile_first(fr_gap.data(), fr_shift.data(), a0 + 1);
+                        bool fr_explore = false;   // an explore cut: no normal cut in this window; the first row with ratio in [k, 8k) (every 16th window)
+                        const int r = strata::core::Verifier::route_fragile_first(fr_gap.data(), fr_shift.data(), a0 + 1, &fr_explore);
                         if (r >= 1) {
-                            strata::core::Verifier::route_fragile_cut(fr_gap[(size_t) r] / fr_shift[(size_t) r], outv[(size_t) r]);
+                            strata::core::Verifier::route_fragile_cut(fr_gap[(size_t) r] / fr_shift[(size_t) r], outv[(size_t) r], fr_explore);
                             fr_cut = r;
                         }
                     }
@@ -16302,12 +16303,12 @@ int main(int argc, char** argv) {
                              (long long) req_hits, (long long) req_look, off);
             }
             {   // STRATA_FRAGILE_RECHECK: this request's cuts, rows moved by stand-ins, flipped re-decisions and k (takes and resets the counts)
-                long long fr_cuts = 0, fr_moved = 0, fr_flips = 0;
+                long long fr_cuts = 0, fr_explores = 0, fr_moved = 0, fr_flips = 0;
                 float fr_k = 0.0f, fr_med_shift = 0.0f, fr_med_gap = 0.0f;
-                if (strata::core::Verifier::route_fragile_take(fr_cuts, fr_moved, fr_flips, fr_k, fr_med_shift, fr_med_gap))
-                    std::fprintf(stderr, "strata serve: fragile recheck: %lld windows cut, %lld rows moved by stand-ins, %lld flipped (k %.3f; "
-                                 "median row_shift %.4f, median gap %.4f of the moved rows)\n",
-                                 fr_cuts, fr_moved, fr_flips, (double) fr_k, (double) fr_med_shift, (double) fr_med_gap);
+                if (strata::core::Verifier::route_fragile_take(fr_cuts, fr_explores, fr_moved, fr_flips, fr_k, fr_med_shift, fr_med_gap))
+                    std::fprintf(stderr, "strata serve: fragile recheck: %lld windows cut, %lld explore cuts, %lld rows moved by stand-ins, "
+                                 "%lld flipped (k %.3f; median row_shift %.4f, median gap %.4f of the moved rows)\n",
+                                 fr_cuts, fr_explores, fr_moved, fr_flips, (double) fr_k, (double) fr_med_shift, (double) fr_med_gap);
             }
             {   // STRATA_ROUTE_BUDGET_AUTO: the base budget the search ends this request at, and the tests it finished since the last line
                 float auto_b = 0.0f;
