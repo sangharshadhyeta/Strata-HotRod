@@ -69,3 +69,4 @@ dist-hip/
 data/ram-reserve.json
 data/vram-reserve.json
 data/standin-tune.txt
+data/expert-predictor/
