@@ -1070,6 +1070,10 @@ private:
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
+    /// STRATA_DIRECT_ZEROCOPY=1 (Linux): the O_DIRECT alignment of offsets, sizes and buffers (statx's, or STRATA_DIRECT_ALIGN, else
+    /// 4096), found once from the first descriptor read_direct uses; 0 until then, UINT32_MAX once the drive refused an in-place
+    /// read (off).  It applies to any aligned destination: stage buffers, the prompt's pinned ring, the RAM tier's places.
+    mutable std::atomic<uint32_t> direct_align_{0};
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
@@ -1107,6 +1111,7 @@ private:
     // header has no cuda_runtime.h).
     struct StageBufFree {
         bool pinned = false;
+        bool aligned = false;                     ///< STRATA_DIRECT_ZEROCOPY: a 4 KiB-aligned pageable buffer (aligned new)
         void operator()(uint8_t* p) const noexcept;
     };
     std::mutex stage_mu_;

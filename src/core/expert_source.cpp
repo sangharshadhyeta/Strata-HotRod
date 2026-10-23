@@ -36,6 +36,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -1577,8 +1578,19 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
 constexpr uint64_t kStagePinFloor = 3ull << 30;   // RAM left available after a pinned stage buffer
 void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
     if (pinned) (void) cudaFreeHost(p);
+    else if (aligned) ::operator delete[](p, std::align_val_t(4096));
     else delete[] p;
 }
+
+namespace {
+// STRATA_DIRECT_ZEROCOPY=1 (opt-in, Linux O_DIRECT): an expert whose file offset and size are multiples of the drive's O_DIRECT
+// alignment is read straight into its (4 KiB-aligned) stage buffer, not into read_direct's bounce buffer and then copied
+// (2.33 MB of memcpy per read on the decode's critical path, and RAM bandwidth for the read-ahead's).  The bytes are the same.
+bool zero_copy_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DIRECT_ZEROCOPY"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+}  // namespace
 
 // A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
 // its blob has not been asked for during `kStageAge` layers (begin_layer) or 256 assemblies, whichever comes
@@ -1625,9 +1637,12 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
         const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
         if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
-        uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
+        const bool aligned = !pinned && zero_copy_on();   // STRATA_DIRECT_ZEROCOPY: O_DIRECT may read into it (as into any aligned destination)
+        uint8_t* raw = pinned    ? (uint8_t*) p
+                       : aligned ? (uint8_t*) ::operator new[]((size_t) stage_blob_, std::align_val_t(4096), std::nothrow)
+                                 : new (std::nothrow) uint8_t[(size_t) stage_blob_];
         if (raw == nullptr) return false;
-        stage_buf_.emplace_back(raw, StageBufFree{pinned});
+        stage_buf_.emplace_back(raw, StageBufFree{pinned, aligned});
         stage_idx_[raw] = stage_buf_.size() - 1;
         stage_ev_.push_back(nullptr);
         stage_ev_live_.push_back(0);
@@ -2511,8 +2526,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         const char* v = std::getenv("STRATA_DIRECT_MERGE_GAP_KIB");
         return (v != nullptr && v[0] != '\0' && std::atol(v) > 0) ? (uint64_t) std::atol(v) * 1024 : 0ull;
     }();
-    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; };
-    struct Req { int fd; uint64_t a0, size, pos; };
+    struct Window { int file; uint64_t a0, size, skip, n, at; uint8_t* dst; size_t req; uint64_t in_req; bool zc; };
+    struct Req { int fd; uint64_t a0, size, pos; uint8_t* into; };   // into: the destination itself (zero-copy), else the scratch
     struct Scratch {
         uint8_t* buf = nullptr;
         size_t cap = 0;
@@ -2534,6 +2549,29 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         sc.ctx = 0;
         return false;   // no AIO (a seccomp profile, aio-max-nr): the caller falls back to the mapped copy
     }
+    const std::vector<void*>& fds = direct_.empty() ? pdirect_ : direct_;
+    // STRATA_DIRECT_ZEROCOPY: the alignment O_DIRECT needs here, found once (statx where the kernel reports it, else 4 KiB, which
+    // every drive accepts; STRATA_DIRECT_ALIGN=N overrides)
+    uint64_t zc_align = 0;
+    if (zero_copy_on() && !fds.empty()) {
+        uint32_t a = direct_align_.load(std::memory_order_relaxed);
+        if (a == UINT32_MAX) a = 0;   // switched off: the drive refused an in-place read (below)
+        else if (a == 0) {
+            a = 4096;
+            if (const char* v = std::getenv("STRATA_DIRECT_ALIGN"); v != nullptr && std::atoi(v) >= 512 && (std::atoi(v) & (std::atoi(v) - 1)) == 0)
+                a = (uint32_t) std::atoi(v);
+#if defined(STATX_DIOALIGN)
+            else {
+                struct statx sx;
+                if (statx((int) (intptr_t) fds[0], "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0 && (sx.stx_mask & STATX_DIOALIGN) &&
+                    sx.stx_dio_offset_align != 0)
+                    a = std::max<uint32_t>(sx.stx_dio_offset_align, sx.stx_dio_mem_align);
+            }
+#endif
+            direct_align_.store(a, std::memory_order_relaxed);
+        }
+        zc_align = a;
+    }
     sc.win.clear();
     for (size_t k = 0; k < n; ++k) {
         const Fill& f = fills[k];
@@ -2541,8 +2579,14 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
             const uint64_t per = layer_blob_bytes_[(size_t) f.layer];
             const uint64_t off = layer_offsets_[(size_t) f.layer] + (uint64_t) f.e * per;
+            // zero-copy: offset, size and destination all aligned - the read lands in place (4 KiB stage buffers satisfy any
+            // alignment up to 4 KiB; a larger one is checked like the rest)
+            if (zc_align != 0 && off % zc_align == 0 && per % zc_align == 0 && (uintptr_t) f.dst % zc_align == 0) {
+                sc.win.push_back({0, off, per, 0, per, 0, f.dst, 0, 0, true});
+                continue;
+            }
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
-            sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
+            sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0, false});
             continue;
         }
         uint64_t at = 0;
@@ -2552,7 +2596,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             const Map& m = maps_[(size_t) role_file_[i]];
             const uint64_t off = (uint64_t) (role_ptr_[i] - m.base) + (uint64_t) f.e * per;
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
-            sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0});
+            sc.win.push_back({role_file_[i], a0, a1 - a0, off - a0, per, at, f.dst, 0, 0, false});
             at += per;
         }
     }
@@ -2562,10 +2606,18 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         return sc.win[a].file != sc.win[b].file ? sc.win[a].file < sc.win[b].file : sc.win[a].a0 < sc.win[b].a0;
     });
     sc.req.clear();
-    uint64_t total = 0;
+    uint64_t total = 0, total_zc = 0;
     int last_file = -1;
     for (size_t w : sc.order) {
         Window& x = sc.win[w];
+        if (x.zc) {   // its own request, straight into the destination; nothing merges with it
+            sc.req.push_back({(int) (intptr_t) fds[(size_t) x.file], x.a0, x.size, 0, x.dst});
+            total_zc += x.size;
+            last_file = -1;
+            x.req = sc.req.size() - 1;
+            x.in_req = 0;
+            continue;
+        }
         if (!sc.req.empty() && x.file == last_file) {
             Req& q = sc.req.back();
             const uint64_t end = q.a0 + q.size, xend = x.a0 + x.size;
@@ -2579,7 +2631,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(int) (intptr_t) (direct_.empty() ? pdirect_ : direct_)[(size_t) x.file], x.a0, x.size, total});
+        sc.req.push_back({(int) (intptr_t) fds[(size_t) x.file], x.a0, x.size, total, nullptr});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -2589,7 +2641,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         uint64_t asked = 0;
         for (const Window& x : sc.win) asked += x.n;
         g_direct_requested.fetch_add(asked, std::memory_order_relaxed);
-        g_direct_read.fetch_add(total, std::memory_order_relaxed);
+        g_direct_read.fetch_add(total + total_zc, std::memory_order_relaxed);
     }
     if (total > sc.cap) {
         std::free(sc.buf);
@@ -2611,7 +2663,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
             std::memset(&c, 0, sizeof c);
             c.aio_lio_opcode = IOCB_CMD_PREAD;
             c.aio_fildes = (uint32_t) r.fd;
-            c.aio_buf = (uint64_t) (uintptr_t) (sc.buf + r.pos);
+            c.aio_buf = (uint64_t) (uintptr_t) (r.into != nullptr ? r.into : sc.buf + r.pos);
             c.aio_nbytes = r.size;
             c.aio_offset = (int64_t) r.a0;
             c.aio_data = (uint64_t) (w0 + j);
@@ -2640,6 +2692,12 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 const io_event& e = sc.ev[(size_t) j];
                 sc.got[(size_t) e.data] = e.res;
                 if (e.res < 0) ok = false;
+                // STRATA_DIRECT_ZEROCOPY: the drive refused an in-place read (an alignment it does not take, or memory it cannot
+                // pin): off from now on, said once - else every batch would fail and fall back to the mapped copy
+                if ((e.res == -EINVAL || e.res == -EFAULT) && sc.req[(size_t) e.data].into != nullptr &&
+                    direct_align_.exchange(UINT32_MAX, std::memory_order_relaxed) != UINT32_MAX)
+                    std::fprintf(stderr, "FileExpertSource: STRATA_DIRECT_ZEROCOPY off - the drive refused an in-place read (%s); "
+                                         "reads go through the bounce buffer as before\n", std::strerror((int) -e.res));
             }
             done += (size_t) r;
         }
@@ -2648,6 +2706,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
         if (sc.got[x.req] < 0 || (uint64_t) sc.got[x.req] < x.in_req + x.skip + x.n) return false;
+        if (x.zc) continue;   // read in place
         std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
     }
     return true;
