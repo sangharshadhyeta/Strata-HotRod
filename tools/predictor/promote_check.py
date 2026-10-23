@@ -85,6 +85,21 @@ def replay(windows, a, rule):
         lst.sort(reverse=True)
         vram[l] = set(e for _, e in lst[:a.vram])
     ram = set(k for k, _ in sorted(((k, c) for k, c in tally.items() if k[1] not in vram[k[0]]), key=lambda kv: -kv[1])[:a.ram])
+    # the RAM tier's eviction order: a lazy min-heap of (count, need count, key) - counts only grow between renormalisations, so an
+    # entry whose stored counts still match is the true minimum (stale ones are pushed again with their current counts)
+    ram_heap = [(cnt[k], need_cnt[k], k) for k in ram]
+    heapq.heapify(ram_heap)
+
+    def evict_min():
+        while ram_heap:
+            c, n, k = heapq.heappop(ram_heap)
+            if k not in ram:
+                continue
+            if (cnt[k], need_cnt[k]) != (c, n):
+                heapq.heappush(ram_heap, (cnt[k], need_cnt[k], k))
+                continue
+            return k
+        return next(iter(ram))
     promoted = {}                            # key -> window it landed (promoted and still in RAM)
     pending = []                             # (land window, key)
     st = dict(windows=0, cold=0, promotions=0, useful=0, saved=0, caused=0)
@@ -96,13 +111,15 @@ def replay(windows, a, rule):
             if key in ram or key in vram[key[0]]:
                 continue
             if len(ram) >= a.ram:            # evict the lowest decayed count (never the one landing)
-                victim = min(ram, key=lambda k: (cnt[k], need_cnt[k]))
+                victim = evict_min()
                 ram.discard(victim)
                 promoted.pop(victim, None)
                 evicted_by_promo[victim] = wi
             ram.add(key)
+            heapq.heappush(ram_heap, (cnt[key], need_cnt[key], key))
             promoted[key] = wi
-            st["promotions"] += 1
+            if wi >= n_warm:                 # scored: the useful share's denominator (warm-up promotions are not)
+                st["promotions"] += 1
         if wi >= n_warm:
             st["windows"] += 1
         for l, (need, every) in layers.items():
@@ -113,7 +130,7 @@ def replay(windows, a, rule):
                 if key in ram:
                     if key in promoted and wi >= n_warm:
                         st["saved"] += 1
-                        if (key, promoted[key]) not in used_once:
+                        if promoted[key] >= n_warm and (key, promoted[key]) not in used_once:
                             used_once.add((key, promoted[key]))
                             st["useful"] += 1
                     continue
@@ -128,6 +145,8 @@ def replay(windows, a, rule):
                 for k in d:
                     d[k] /= inc[0]
             inc[0] = 1.0
+            ram_heap[:] = [(cnt[k], need_cnt[k], k) for k in ram]   # the stored counts are in the old units
+            heapq.heapify(ram_heap)
         for l, (need, every) in layers.items():
             for e in every:
                 cnt[(l, e)] += inc[0]
@@ -154,14 +173,14 @@ def replay(windows, a, rule):
             score = {k: v for k, v in need_cnt.items() if v >= 0.5 * inc[0]}
         else:   # recency+frequency: the decayed need count, only experts needed recently
             score = {k: need_cnt[k] for k, w in last_need.items() if wi - w <= a.recent}
-        cands = [k for k in sorted(score, key=lambda k: -score[k]) if k not in ram and k[1] not in vram[k[0]]]
+        cands = heapq.nlargest(a.budget + len(pending), (k for k in score if k not in ram and k[1] not in vram[k[0]]), key=score.get)
         queued = {k for _, k in pending}
         for k in cands[:a.budget]:
             if k not in queued:
                 heapq.heappush(pending, (wi + a.lag, k))
     n_prom_eval = max(1, st["promotions"])
     w = max(1, st["windows"])
-    return dict(rule=rule, prom_w=st["promotions"] / max(1, len(windows)), useful=st["useful"] / n_prom_eval,
+    return dict(rule=rule, prom_w=st["promotions"] / max(1, st["windows"]), useful=st["useful"] / n_prom_eval,
                 saved_w=st["saved"] / w, caused_w=st["caused"] / w, cold_w=st["cold"] / w)
 
 
