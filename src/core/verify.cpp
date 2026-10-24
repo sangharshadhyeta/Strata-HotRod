@@ -1091,6 +1091,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // STRATA_LA_EDGE_SKIP (opt-in =1 since 24 Oct: under the confidence budget its skipped rank-2 reads became misses, reasoning wait 5.2 -> 11.8 s): the look-ahead's edge-skip counter, allocated before any graph capture
     if ((std::getenv("STRATA_LA_EDGE_SKIP") != nullptr && std::atoi(std::getenv("STRATA_LA_EDGE_SKIP")) != 0) && strata::kernels::route_pred_active())
         strata::kernels::route_pred_edge_skip_alloc();
+    // STRATA_LA_TAIL_READ=1: its stand-in counter (the same rule: allocated before any graph capture)
+    if ((std::getenv("STRATA_LA_TAIL_READ") != nullptr && std::atoi(std::getenv("STRATA_LA_TAIL_READ")) != 0) && strata::kernels::route_pred_active())
+        strata::kernels::route_pred_tail_read_alloc();
     // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
         strata::kernels::route_ring_alloc((size_t) (g.n_layers * g.n_expert));
@@ -2455,6 +2458,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool la_on_stream = false;   // HIP: the node stays on cs (the shared stream's cross-stream cost, as sh_stream_on)
 #endif
         static const bool la_edge_skip = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e != nullptr && std::atoi(e) != 0; }();
+        static const bool la_tail_read = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr && std::atoi(e) != 0; }();
         auto lookahead_node = [&](cudaStream_t s) -> bool {
             try {
                 for (int dist = 1; dist <= 2; ++dist) {
@@ -2475,6 +2479,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (la_edge_skip && hits_.d_res != nullptr)
                         strata::kernels::route_pred_edge_skip(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
                                                               hits_.d_res + (l + dist) * g.n_expert, n, s);
+                    // STRATA_LA_TAIL_READ (opt-in): a predicted rank >= lo that the router would serve with a resident stand-in is not read
+                    // (its id becomes -1).  The window's budgets are read on the device; under the open rule the kernel returns at once.
+                    if (la_tail_read && hits_.d_res != nullptr)
+                        strata::kernels::route_pred_tail_read(hits_.d_res + (l + dist) * g.n_expert, strata::kernels::route_pred_dev(l + dist, dist), n, s);
                 }
             } catch (const std::exception& e) { err = "verify look-ahead node: " + std::string(e.what()); return false; }
             return true;
@@ -4102,6 +4110,14 @@ static void la_tail_skip_update(const RouteResidentCfg& c) {
     int from = -1;
     if (on && c.margin >= 1e30f && c.lo >= 2 && c.win_tail <= 0.0f && c.budget_tail <= 0.0f) from = c.lo;
     strata::core::la_tail_skip_from.store(from, std::memory_order_relaxed);
+    // STRATA_LA_TAIL_READ=1 (opt-in): the read-ahead's ranks >= lo for this window, by the budgets the router's kernel reads now (the
+    // host-mapped config after this window's route_cfg_set_budgets): mode 2 = the open rule (no tail read), 1 = read, with the stand-in
+    // test on the device (route_pred_tail_read); 0 = off (the router is off too, or the switch is unset)
+    static const bool tail_read_on = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr && std::atoi(e) != 0; }();
+    int mode = 0;
+    if (tail_read_on && c.margin > 0.0f) mode = strata::kernels::route_cfg_tail_open() ? 2 : 1;
+    strata::core::la_tail_read_lo.store(c.lo, std::memory_order_relaxed);
+    strata::core::la_tail_read_mode.store(mode, std::memory_order_relaxed);
 }
 
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.

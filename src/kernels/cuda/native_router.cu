@@ -525,6 +525,8 @@ void route_cfg_set_budgets(float budget, float budget_tail) {
     __sync_synchronize();
 }
 const RouteCfg* route_cfg_device() { return g_cfg_dev; }
+// STRATA_LA_TAIL_READ: the open rule as the host holds it now (the same values the kernels read): any resident stand-in serves a rank at or above lo
+bool route_cfg_tail_open() { return g_cfg_host != nullptr && g_cfg_host->margin >= 1e30f && g_cfg_host->budget_tail <= 0.f; }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift) {
@@ -706,6 +708,79 @@ unsigned long long route_pred_edge_skips_take() {
     unsigned long long v = 0;
     if (cudaMemcpy(&v, g_pred_skip, sizeof v, cudaMemcpyDeviceToHost) != cudaSuccess) { cudaGetLastError(); return 0; }
     cudaMemset(g_pred_skip, 0, sizeof v);
+    return v;
+}
+// STRATA_LA_TAIL_READ (opt-in; decode look-ahead only, verify.cpp lookahead_node): a predicted pick at rank lo..hi that the router would
+// replace with a resident stand-in is not read ahead (its id becomes -1; the host warm skips a negative id).  The test is route_resident_k's
+// for a rank at or above lo: the stand-in is the best resident expert outside the predicted ten, the place cap (maxrank) and the heavy-pick
+// cap (wmax) refuse as there, and the replacement is taken when w * max(gap, 0) <= budget_tail (budget_tail > 0) or gap <= margin (else).
+// The open rule (margin unlimited, tail budget 0) is not tested here: the host leaves every such guess unread (la_tail_read_mode 2).
+// The config is the host-mapped RouteCfg, read at every launch, so the window's budgets reach this kernel as they reach the router.
+// Approximations: the router's own picks before a swap (its `used` set) and the ring's landed copies (counted resident there) are not seen.
+__global__ void pred_tail_read_k(const float* __restrict__ logits, int32_t* __restrict__ ids, const float* __restrict__ w, const int32_t* __restrict__ res,
+                                 const RouteCfg* cfg, unsigned long long* __restrict__ skipped, int n_tok) {
+    const int t = blockIdx.x;
+    if (t >= n_tok) return;
+    const int lane = (int) threadIdx.x;
+    const int lo = ((const volatile RouteCfg*) cfg)->lo;
+    const int hi = ((const volatile RouteCfg*) cfg)->hi;
+    const float margin = ((const volatile RouteCfg*) cfg)->margin;
+    const float budget_tail = ((const volatile RouteCfg*) cfg)->budget_tail;
+    const int maxrank = ((const volatile RouteCfg*) cfg)->maxrank;
+    const float wmax = ((const volatile RouteCfg*) cfg)->wmax;
+    if (margin >= 1e30f && budget_tail <= 0.f) return;   // the open rule: no test (uniform across the warp)
+    const float* l = logits + (size_t) t * 512;
+    int32_t* id = ids + (size_t) t * 10;
+    for (int r = lo; r <= hi && r < 10; ++r) {   // uniform across the warp: every value below is reduced or read from the same place
+        const int e = id[r];
+        if (e < 0 || e >= 512 || res[e] >= 0) continue;   // no pick, or resident (no stand-in is needed)
+        if (wmax > 0.f && w[(size_t) t * 10 + r] >= wmax) continue;   // a heavy pick stays exact (the router's wmax)
+        float bv = -INFINITY;
+        for (int f = lane; f < 512; f += 32) {
+            if (res[f] < 0) continue;   // the router's stand-in candidates are the resident experts
+            bool used = false;
+            for (int q = 0; q < 10; ++q) used |= id[q] == f;
+            if (!used && l[f] > bv) bv = l[f];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) bv = fmaxf(bv, __shfl_xor_sync(0xffffffffu, bv, off));
+        if (bv == -INFINITY) continue;   // no resident stand-in: the pick is computed exactly
+        if (maxrank > 0) {
+            int place = 0;   // the stand-in's place in the router's ranking of all 512 experts
+            for (int f = lane; f < 512; f += 32) place += l[f] > bv;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) place += __shfl_xor_sync(0xffffffffu, place, off);
+            if (place >= maxrank) continue;   // refused by the place cap: exact
+        }
+        const float gap = l[e] - bv;
+        const bool take = budget_tail > 0.f ? w[(size_t) t * 10 + r] * fmaxf(gap, 0.f) <= budget_tail : gap <= margin;
+        if (lane == 0 && take) {
+            id[r] = -1;
+            atomicAdd(skipped, 1ull);
+        }
+        __syncwarp();   // lane 0's write is what the next rank's reads see
+    }
+}
+static unsigned long long* g_pred_tail = nullptr;   // device counter: stand-in-served predictions not read since the last take
+void route_pred_tail_read_alloc() {
+    if (g_pred_tail != nullptr) return;
+    if (cudaMalloc((void**) &g_pred_tail, sizeof(unsigned long long)) != cudaSuccess) { cudaGetLastError(); g_pred_tail = nullptr; return; }
+    cudaMemset(g_pred_tail, 0, sizeof(unsigned long long));
+    note_scratch_dev();
+}
+void route_pred_tail_read(const int32_t* res_layer, int32_t* pred_ids, int n_tok, void* stream) {
+    const RouteCfg* cfg = route_cfg_device();
+    if (cfg == nullptr || g_pred_tail == nullptr || g_pred_w == nullptr || !scratch_here() || pred_ids == nullptr || res_layer == nullptr || !stream || n_tok < 1)
+        return;
+    pred_tail_read_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(g_pred_logits, pred_ids, g_pred_w, res_layer, cfg, g_pred_tail, n_tok);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+unsigned long long route_pred_tail_read_take() {
+    if (g_pred_tail == nullptr) return 0;
+    unsigned long long v = 0;
+    if (cudaMemcpy(&v, g_pred_tail, sizeof v, cudaMemcpyDeviceToHost) != cudaSuccess) { cudaGetLastError(); return 0; }
+    cudaMemset(g_pred_tail, 0, sizeof v);
     return v;
 }
 static uint8_t* g_ring = nullptr;

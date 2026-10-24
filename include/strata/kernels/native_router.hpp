@@ -88,6 +88,13 @@ void route_pred_bias_add(float* logits, const float* bias, int n_tok, void* stre
 void route_pred_edge_skip_alloc();
 void route_pred_edge_skip(const float* pred_logits, int32_t* pred_ids, const int32_t* res_layer, int n_tok, void* stream);
 unsigned long long route_pred_edge_skips_take();
+/// STRATA_LA_TAIL_READ (opt-in): route_pred_tail_read after the look-ahead's top-10 of a layer (its weights in route_pred_weights, the logits in
+/// route_pred_logits) writes a predicted rank lo..hi id as -1 when the router would replace it with a resident stand-in (the window's budgets).
+/// route_pred_tail_read_take returns the count since the last take and zeroes it.  route_cfg_tail_open: the open rule (no tail reads needed).
+void route_pred_tail_read_alloc();
+void route_pred_tail_read(const int32_t* res_layer, int32_t* pred_ids, int n_tok, void* stream);
+unsigned long long route_pred_tail_read_take();
+bool route_cfg_tail_open();
 void route_ring_alloc(size_t n);
 uint8_t* route_ring_ptr();                                   ///< the whole table (nullptr when not allocated)
 const uint8_t* route_ring_layer(int64_t layer, int64_t n_expert);   ///< the layer's slice, nullptr when not allocated

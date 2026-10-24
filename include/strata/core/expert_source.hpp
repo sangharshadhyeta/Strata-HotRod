@@ -278,6 +278,14 @@ struct ForesightSwap;
 inline std::atomic<int> la_tail_skip_from{-1};
 /// the predictions dropped by la_tail_skip_from since the last take (the request's stats line takes and zeroes it)
 inline std::atomic<long long> la_tail_skipped{0};
+/// STRATA_LA_TAIL_READ (opt-in): the decode read-ahead's rank >= la_tail_read_lo predictions.  Mode 0: off (the warm reads ranks < the
+/// GPU look-ahead's k, as before); 1: ranks lo..9 are read, a rank the router would serve with a stand-in is not (route_pred_tail_read) and a
+/// rank is queued only while the file tier's queue holds fewer guesses than it has I/O workers; 2: the open rule holds for this window (any
+/// resident stand-in serves a rank >= lo), so none of those ranks is read.  Set per decode window by the verifier (verify.cpp la_tail_skip_update).
+inline std::atomic<int> la_tail_read_mode{0};
+inline std::atomic<int> la_tail_read_lo{0};
+/// the window's counts since the request's stats line took them: guesses at ranks >= lo queued, held back (queue full), and not read under mode 2
+inline std::atomic<long long> la_tail_read_queued{0}, la_tail_read_held{0}, la_tail_read_open_skips{0};
 class RouterLookahead {
 public:
     RouterLookahead() = default;
@@ -1073,6 +1081,9 @@ public:
     /// STRATA_IO_ARRIVAL: what the read-ahead had done for a blob when its decode layer asked for it
     enum IoArrival { kArrLanded = 0, kArrInFlight, kArrQueued, kArrLost, kArrUnpredicted, kArrStagedDemand };
     bool io_arrival() const { return io_pf_ && io_arrival_; }
+    /// STRATA_LA_TAIL_READ: the read-ahead queue's length and the I/O worker count (the queue is held to one guess per worker for ranks >= lo)
+    size_t io_queue_depth();
+    int io_workers() const { return io_threads_; }
     IoCounters io_counters() const;
     /// STRATA_PROMPT_LOOKAHEAD_IO: the prompt's blobs taken from a read-ahead stage buffer (take_read_ahead) and those read from the drive.
     uint64_t prompt_ra_hits() const { return prompt_ra_hits_.load(std::memory_order_relaxed); }
