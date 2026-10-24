@@ -5467,6 +5467,13 @@ void router_trace_prefill(int64_t layer, const int32_t* pos, const int32_t* tok,
     if ((++t.calls & 0x3ffu) == 0) std::fflush(t.f);
 }
 
+// STRATA_LA_LEARN (dist 4 warm): the window's pass counter and, per (target layer, expert), the pass of the last dist-4 guess queued for it.
+// A dist-1 or dist-2 guess for the same target later in the window is not queued again (its read is already queued or done).
+using strata::kernels::kRoutePredDists;
+using strata::kernels::route_pred_slot;
+static std::vector<uint32_t> g_warm4_mark;
+static uint32_t g_warm4_pass = 0;
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -5487,7 +5494,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (target >= d.fs->n_layers) break;
             for (int64_t t = 0; t < n_tok; ++t)
                 for (int r = 0; r < d.gpu_pred_ranks && r < 10; ++r) {
-                    const int32_t e = d.gpu_pred[(((size_t) target * 2 + (size_t) (dist - 1)) * 8 + (size_t) t) * 10 + (size_t) r];
+                    const int32_t e = d.gpu_pred[(((size_t) target * kRoutePredDists + (size_t) route_pred_slot(dist)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
                     d.fs->predict(d.src, target, e);
                     ++d.pred_fed;
@@ -5497,7 +5504,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.gpu_pred != nullptr && d.gpu_pred_warm && d.host_res != nullptr && n_tok <= 8 && d.src != nullptr) {
         // STRATA_LOOKAHEAD_GPU: the GPU look-ahead's picks for the next two layers (computed on this layer's input before the doorbell),
         // warmed on the file tier as the CPU look-ahead's are - without recomputing the routers on the CPU
-        for (int dist = 1; dist <= 2; ++dist) {
+        // dists 1 and 2, then (STRATA_LA_LEARN: gpu_pred_d4) dist 4: queued after the nearer targets' guesses of this dispatch
+        static constexpr int kWarmDist[3] = {1, 2, 4};
+        if (d.layers == 0) ++g_warm4_pass;   // a new window: the dist-4 marks of the last one are stale
+        if (d.gpu_pred_d4 && g_warm4_mark.size() != (size_t) d.n_layers * (size_t) d.n_expert) g_warm4_mark.assign((size_t) d.n_layers * (size_t) d.n_expert, 0);
+        for (int di = 0; di < (d.gpu_pred_d4 ? 3 : 2); ++di) {
+            const int dist = kWarmDist[di];
             const int64_t target = d.layers + dist;
             if (target >= d.n_layers) break;
             int64_t want[8 * 10];
@@ -5511,13 +5523,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             for (int64_t a = 0; a < outer; ++a)
                 for (int64_t b = 0; b < inner; ++b) {
                     const int64_t t = rank_major ? b : a, r = rank_major ? a : b;
-                    const int32_t e = d.gpu_pred[(((size_t) target * 2 + (size_t) (dist - 1)) * 8 + (size_t) t) * 10 + (size_t) r];
+                    const int32_t e = d.gpu_pred[(((size_t) target * kRoutePredDists + (size_t) route_pred_slot(dist)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
                     if (skip_from >= 0 && r >= skip_from) {
                         la_tail_skipped.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
-                    if (std::find(want, want + nw, (int64_t) e) == want + nw) want[nw++] = e;
+                    // the dedup across dispatches: a dist-4 guess queued earlier in this window for this target is not queued again
+                    const size_t mi = (size_t) target * (size_t) d.n_expert + (size_t) e;
+                    if (d.gpu_pred_d4 && dist != 4 && g_warm4_mark[mi] == g_warm4_pass) continue;
+                    if (std::find(want, want + nw, (int64_t) e) == want + nw) {
+                        want[nw++] = e;
+                        if (d.gpu_pred_d4 && dist == 4) g_warm4_mark[mi] = g_warm4_pass;
+                    }
                 }
             t_decode_guess = true;
             if (nw > 0) d.src->warm(target, want, nw);

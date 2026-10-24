@@ -71,7 +71,11 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
 void route_pred_alloc(int64_t n_layers);
 bool route_pred_active();
 const int32_t* route_pred_host();                                   ///< the table the host reads
-int32_t* route_pred_dev(int64_t target_layer, int dist);            ///< dist 1 or 2: the slab of 8 x 10 ids, device alias
+/// The table is [target layer][slot][8 tokens][10 ranks] ids, slot = route_pred_slot(dist): 0 for dist 1, 1 for dist 2, 2 for dist 4
+/// (dist 4 is computed only with STRATA_LA_LEARN=1).  Every reader and writer takes its slot from route_pred_slot.
+constexpr int kRoutePredDists = 3;
+inline int route_pred_slot(int dist) { return dist == 1 ? 0 : dist == 2 ? 1 : dist == 4 ? 2 : -1; }
+int32_t* route_pred_dev(int64_t target_layer, int dist);            ///< dist 1, 2 or 4: the slab of 8 x 10 ids, device alias
 float* route_pred_logits();                                          ///< scratch, 8 x 512 floats
 float* route_pred_weights();                                         ///< scratch, 8 x 10 floats
 /// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear expert predictors, folded into one bf16 [512 x n_embd]

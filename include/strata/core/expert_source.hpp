@@ -615,6 +615,7 @@ struct ExpertDispatch {
     /// every layer's dispatch and the CPU look-ahead thread is not used.  `gpu_pred_ranks`: the ranks (per token) it feeds (STRATA_RING_RANKS).
     const int32_t* gpu_pred = nullptr;
     bool gpu_pred_warm = false;   ///< STRATA_LOOKAHEAD_GPU: the GPU look-ahead's picks are warmed on the file tier (no ring), the CPU look-ahead thread is not used in decode
+    bool gpu_pred_d4 = false;     ///< STRATA_LA_LEARN: the table's dist-4 slot is warmed too (after dists 1 and 2 of the same dispatch)
     int gpu_pred_ranks = 2;
     int64_t pred_fed = 0;          ///< experts the GPU look-ahead offered the ring (not resident, before its own dedupe)
     int pcie_num = 0;

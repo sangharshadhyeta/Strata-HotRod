@@ -2511,7 +2511,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         static const bool la_edge_skip = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e != nullptr && std::atoi(e) != 0; }();
         auto lookahead_node = [&](cudaStream_t s) -> bool {
             try {
-                for (int dist = 1; dist <= 2; ++dist) {
+                // dist 4 (STRATA_LA_LEARN=1 only, after dists 1 and 2: the nearest deadline first in the warm loop); without the learner, dists 1 and 2
+                static constexpr int kLookDist[3] = {1, 2, 4};
+                const int n_look = la_learn_env_on() ? 3 : 2;
+                for (int di = 0; di < n_look; ++di) {
+                    const int dist = kLookDist[di];
                     if (l + dist >= g.n_layers) break;
                     const LayerView vt(wt, l + dist);
                     const WeightRef* w_next = vt.get("ffn_gate_inp.weight");

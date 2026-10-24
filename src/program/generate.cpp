@@ -9973,6 +9973,7 @@ int main(int argc, char** argv) {
                     drive.d.gpu_pred = strata::kernels::route_pred_host();
                     drive.d.gpu_pred_ranks = drive.d.lookahead->k();
                     drive.d.gpu_pred_warm = true;
+                    drive.d.gpu_pred_d4 = strata::core::Verifier::la_learn_on();   // STRATA_LA_LEARN: the head 4 layers ahead is warmed too
                     std::fprintf(stderr, "strata serve: look-ahead on the GPU (layers +1 and +2, ranks 0-%d), warming the file tier; the CPU look-ahead is not used in decode\n",
                                  drive.d.gpu_pred_ranks - 1);
                 }

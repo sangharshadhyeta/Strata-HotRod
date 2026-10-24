@@ -551,7 +551,7 @@ static float* g_pred_logits = nullptr;
 static float* g_pred_w = nullptr;
 void route_pred_alloc(int64_t n_layers) {
     if (g_pred_host != nullptr || n_layers <= 0) return;
-    const size_t n = (size_t) n_layers * 2 * 8 * 10;
+    const size_t n = (size_t) n_layers * kRoutePredDists * 8 * 10;
     if (cudaHostAlloc((void**) &g_pred_host, n * sizeof(int32_t), cudaHostAllocMapped) != cudaSuccess) { cudaGetLastError(); g_pred_host = nullptr; return; }
     if (cudaHostGetDevicePointer((void**) &g_pred_dev, g_pred_host, 0) != cudaSuccess ||
         cudaMalloc((void**) &g_pred_logits, 8 * 512 * sizeof(float)) != cudaSuccess ||
@@ -566,7 +566,10 @@ void route_pred_alloc(int64_t n_layers) {
 }
 bool route_pred_active() { return g_pred_host != nullptr; }
 const int32_t* route_pred_host() { return g_pred_host; }
-int32_t* route_pred_dev(int64_t target_layer, int dist) { return g_pred_dev ? g_pred_dev + ((size_t) target_layer * 2 + (size_t) (dist - 1)) * 80 : nullptr; }
+int32_t* route_pred_dev(int64_t target_layer, int dist) {
+    const int slot = route_pred_slot(dist);
+    return g_pred_dev && slot >= 0 ? g_pred_dev + ((size_t) target_layer * kRoutePredDists + (size_t) slot) * 80 : nullptr;
+}
 float* route_pred_logits() { return g_pred_logits; }
 float* route_pred_weights() { return g_pred_w; }
 // STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear predictors (tools/predictor/export_la_model.py folds their
@@ -835,9 +838,9 @@ constexpr int kLaSlots = 4;
 constexpr int kLaRows = 28;      // the window's projection rows: slot 1 rows 0-3, slot 2 rows 4-11, slot 3 rows 12-27
 constexpr int kLaE = 512;
 constexpr int kLaTok = 8;
-// the look-ahead's distances: the one table.  A distance is one entry here; route_pred_dev's slots are [layer][dist 1..2][8][10], so a
-// new distance also needs its slot there, and the (s,d) lists below grow with kLaNd.  Everything below takes its count from here.
-constexpr int kLaDist[] = {1, 2};
+// the look-ahead's distances: the one table.  A distance is one entry here and needs its route_pred_slot (native_router.hpp: 1, 2, 4
+// are slots 0, 1, 2 of the table); the (s,d) lists below grow with kLaNd.  Everything below takes its count from here.
+constexpr int kLaDist[] = {1, 2, 4};
 constexpr int kLaNd = (int) (sizeof kLaDist / sizeof kLaDist[0]);
 constexpr int kLaNSlots = kLaSlots - 1;   // the trained slots per (s,d): ranks 4, 8, 16
 constexpr int kLaKernels = 8;             // the batch's kernels, in launch order: rank, score, prep, grad, upd_b, upd_a, decide, reinit
@@ -1573,8 +1576,9 @@ bool la_learn_save(const char* path, std::string& msg) {
     const std::string tmp = std::string(path) + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
     if (f == nullptr) { msg = "cannot write " + tmp; return false; }
-    // version 2: each word is the leader's rank, | 256 when the (s,d) is frozen (its leader alone trains, every 4th window)
-    const uint32_t hdr[5] = {0x314C414Cu, 2u, (uint32_t) s.L, (uint32_t) s.H, (uint32_t) kLaE};
+    // version 3: one word per (s,d) of kLaDist (kLaNd per layer): the leader's rank, | 256 when the (s,d) is frozen (its leader alone trains,
+    // every 4th window); version 2 had dists 1 and 2 only (la_learn_load maps it)
+    const uint32_t hdr[5] = {0x314C414Cu, 3u, (uint32_t) s.L, (uint32_t) s.H, (uint32_t) kLaE};
     bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1;
     for (int sd = 0; ok && sd < s.Nsd; ++sd) {
         const uint32_t r = (uint32_t) la_rank(lead[sd]) | (frozen[sd] ? 256u : 0u);
@@ -1605,15 +1609,21 @@ bool la_learn_load(const char* path, std::string& msg) {
     FILE* f = std::fopen(path, "rb");
     if (f == nullptr) { msg = "no file"; return false; }
     uint32_t hdr[5] = {0, 0, 0, 0, 0};
-    bool ok = std::fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x314C414Cu && (hdr[1] == 1u || hdr[1] == 2u) && (int) hdr[2] == s.L &&
-              (int) hdr[3] == s.H && hdr[4] == (uint32_t) kLaE;
+    bool ok = std::fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x314C414Cu && (hdr[1] == 1u || hdr[1] == 2u || hdr[1] == 3u) &&
+              (int) hdr[2] == s.L && (int) hdr[3] == s.H && hdr[4] == (uint32_t) kLaE;
     if (!ok) { std::fclose(f); msg = "not a LAL1 file for this model"; return false; }
-    std::vector<int> rl((size_t) s.Nsd, 0), fzv((size_t) s.Nsd, 0);
-    for (int sd = 0; ok && sd < s.Nsd; ++sd) {
+    // the file's (s,d) list: version 3 has every dist of kLaDist; versions 1 and 2 had dists 1 and 2 only, which map onto the first two
+    // entries of kLaDist (dist 4 then starts from the plain router, not frozen)
+    const int file_nd = hdr[1] == 3u ? kLaNd : 2;
+    const int n_file = file_nd * s.L;
+    std::vector<int> rl((size_t) s.Nsd, 0), fzv((size_t) s.Nsd, 0), fsd((size_t) n_file, 0);
+    for (int fi = 0; ok && fi < n_file; ++fi) {
         uint32_t w = 0;
         ok = std::fread(&w, sizeof w, 1, f) == 1;
         const uint32_t r = w & 255u;
         ok = ok && (r == 0 || r == 4 || r == 8 || r == 16) && (w >> 9) == 0;
+        const int sd = (fi / file_nd) * kLaNd + fi % file_nd;
+        fsd[(size_t) fi] = sd;
         rl[(size_t) sd] = (int) r;
         fzv[(size_t) sd] = (int) ((w >> 8) & 1u);
     }
@@ -1626,7 +1636,8 @@ bool la_learn_load(const char* path, std::string& msg) {
             for (int i = 0; i < r * s.H; ++i) hA[c][(size_t) sd * r * s.H + i] = la_rand_pm(la_key(sd, c, i, 0));
     }
     std::vector<int> lead((size_t) s.Nsd, 0);
-    for (int sd = 0; ok && sd < s.Nsd; ++sd) {
+    for (int fi = 0; ok && fi < n_file; ++fi) {   // the data follow the words in the file's order
+        const int sd = fsd[(size_t) fi];
         const int rL = rl[(size_t) sd];
         if (rL == 0) continue;
         const int cL = rL == 4 ? 1 : (rL == 8 ? 2 : 3);
