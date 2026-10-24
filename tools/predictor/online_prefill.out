@@ -1,0 +1,87 @@
+STEP D: prefill topic test, trace-prefill.bin, 15 requests (of 24 planned; the trace stopped after request 15), layers [8, 16, 24, 32, 40], lowrank-8/mse (stage-A settings per d), decode tokens scored before learning.
+(e) substitute split: requests 1-10 train the global part and freeze it, requests 11-15 are scored. The planned conversation split (1-18 vs 19-24) cannot be used: the trace does not contain those requests.
+request -> conversation (planned order, not verified against the trace): 1:a, 2:a, 3:a, 4:a, 5:b, 6:b, 7:c, 8:c, 9:c, 10:c, 11:d, 12:d, 13:e, 14:e, 15:f
+
+=== d=1 all decode tokens of requests 1-24 (mean over layers, %) ===
+                                    lo2     lo3     lo6      p1      p2      p4     mr4
+   reuse (router)                   76.7    79.8    82.9    36.3    29.4    21.0    62.2
+   b global, decode only            85.3    87.7    89.7    41.9    34.0    24.1    71.5
+   c global + prefill               86.0    88.4    90.3    42.4    34.3    24.4    72.4
+   d global + prefill + per-request r4   86.3    88.6    90.5    42.3    34.4    24.4    72.3
+
+=== d=1 first 100 decode tokens of each request, requests 1-24 (%) ===
+                                    lo2     lo3     lo6      p1      p2      p4     mr4
+   reuse (router)                   81.9    84.6    87.5    42.7    35.1    25.3    67.0
+   b global, decode only            88.5    90.4    92.5    48.7    40.1    28.4    75.1
+   c global + prefill               89.0    91.1    93.1    49.3    40.3    28.9    76.3
+   d global + prefill + per-request r4   89.3    91.1    93.3    49.3    40.5    29.0    76.8
+
+=== d=1 requests 11-15, all decode tokens: plain router vs frozen global (e) (%) ===
+                                    lo2     lo3     lo6      p1      p2      p4     mr4
+   reuse (router)                   73.4    76.9    80.5    36.8    30.0    21.8    61.1
+   e frozen global (1-10 trained)   83.2    85.9    88.4    42.4    34.9    25.1    70.2
+
+=== d=1 requests 11-15, first 100 decode tokens each (%) ===
+                                    lo2     lo3     lo6      p1      p2      p4     mr4
+   reuse (router)                   79.7    83.0    86.3    43.3    35.7    25.9    66.6
+   e frozen global (1-10 trained)   88.4    91.2    93.0    50.7    41.9    29.9    76.8
+
+--- d=1 per request, lo3 over all decode tokens (mean over layers, %) ---
+req conv      reuse         b         c         d         e
+  1     a        78.8      86.1      86.9      87.2      86.8
+  2     a        77.6      87.3      88.2      88.4      88.3
+  3     a        79.0      87.1      87.7      88.0      87.9
+  4     a        77.2      86.5      87.7      88.1      87.8
+  5     b        82.2      89.4      90.1      90.1      89.9
+  6     b        86.6      89.5      90.1      90.0      90.0
+  7     c        86.1      90.3      90.7      91.0      90.8
+  8     c        80.5      87.8      88.2      88.5      88.3
+  9     c        78.8      86.4      87.8      87.6      87.6
+ 10     c        78.6      89.0      89.6      90.1      89.8
+ 11     d        71.5      83.3      84.0      84.3      82.3
+ 12     d        78.1      87.1      88.1      88.1      85.7
+ 13     e        80.0      88.5      89.4      89.6      87.5
+ 14     e        75.5      88.4      88.7      89.3      86.7
+ 15     f        77.8      89.1      90.2      90.1      87.3
+
+=== d=2 all decode tokens of requests 1-24 (mean over layers, %) ===
+                                    lo2     lo3     lo6      p1      p2      p4     mr4
+   reuse (router)                   60.3    63.9    67.8    27.4    22.2    16.2    46.7
+   b global, decode only            73.0    76.5    79.8    31.8    25.6    18.6    54.2
+   c global + prefill               74.2    77.7    80.8    32.8    26.4    19.0    55.6
+   d global + prefill + per-request r4   74.3    77.8    80.9    32.7    26.4    19.0    55.5
+
+=== d=2 first 100 decode tokens of each request, requests 1-24 (%) ===
+                                    lo2     lo3     lo6      p1      p2      p4     mr4
+   reuse (router)                   64.1    67.9    72.4    32.9    27.3    19.7    52.0
+   b global, decode only            72.8    76.1    79.8    37.7    30.6    22.0    58.1
+   c global + prefill               74.3    77.7    81.4    37.6    31.0    22.5    59.4
+   d global + prefill + per-request r4   75.0    78.2    81.8    37.8    31.3    22.5    59.5
+
+=== d=2 requests 11-15, all decode tokens: plain router vs frozen global (e) (%) ===
+                                    lo2     lo3     lo6      p1      p2      p4     mr4
+   reuse (router)                   57.7    61.4    65.2    27.0    22.1    16.2    44.5
+   e frozen global (1-10 trained)   67.7    71.3    75.2    32.9    26.9    19.5    53.7
+
+=== d=2 requests 11-15, first 100 decode tokens each (%) ===
+                                    lo2     lo3     lo6      p1      p2      p4     mr4
+   reuse (router)                   63.4    67.6    71.3    33.7    28.1    20.2    51.5
+   e frozen global (1-10 trained)   74.8    78.5    81.8    41.0    33.5    24.2    62.2
+
+--- d=2 per request, lo3 over all decode tokens (mean over layers, %) ---
+req conv      reuse         b         c         d         e
+  1     a        63.1      74.4      76.1      75.6      76.1
+  2     a        63.0      74.5      75.6      75.5      75.6
+  3     a        62.9      75.8      76.4      76.9      76.5
+  4     a        61.8      71.6      72.3      72.6      72.2
+  5     b        66.8      78.2      79.0      79.5      78.9
+  6     b        66.8      81.2      81.5      81.6      81.5
+  7     c        71.1      79.2      80.2      80.3      80.2
+  8     c        64.9      79.3      80.3      81.2      80.3
+  9     c        58.3      73.6      74.4      75.5      74.1
+ 10     c        66.7      78.9      80.0      80.3      80.0
+ 11     d        58.3      71.6      72.9      73.4      68.0
+ 12     d        61.1      75.5      76.8      76.7      70.5
+ 13     e        66.3      77.3      79.3      79.1      72.6
+ 14     e        62.9      78.5      80.4      80.6      76.0
+ 15     f        58.7      77.2      79.9      79.8      69.9

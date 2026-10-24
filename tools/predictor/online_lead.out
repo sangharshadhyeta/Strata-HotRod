@@ -1,0 +1,67 @@
+STEP E: longer leads, trace_tok.bin (11284 decode tokens), lowrank-8/mse lr 1e-3, MSE settings per d (d=1: margin 0.1 K 16; d>=2: margin 0.1 K 64). Targets: every layer the lead allows.
+NOTE: d=3, 4, 6 use the K=64 setting (the d=2 choice); not tuned for these leads.
+
+=== d=3: mean over layers 3-47 (%): first 2000 | before shift | after shift ===
+--- lo2
+   reuse            60.6 |   60.4 |   57.5
+   lowrank-8/mse    69.0 |   72.9 |   71.2
+--- lo3
+   reuse            63.9 |   63.6 |   60.8
+   lowrank-8/mse    73.0 |   76.6 |   74.9
+--- lo6
+   reuse            67.3 |   66.9 |   64.5
+   lowrank-8/mse    76.6 |   79.6 |   78.3
+--- mr4
+   reuse            43.7 |   43.5 |   43.1
+   lowrank-8/mse    48.5 |   53.2 |   53.3
+
+=== d=4: mean over layers 4-47 (%): first 2000 | before shift | after shift ===
+--- lo2
+   reuse            58.8 |   58.6 |   55.5
+   lowrank-8/mse    66.3 |   70.4 |   68.5
+--- lo3
+   reuse            62.1 |   61.9 |   59.0
+   lowrank-8/mse    70.5 |   74.2 |   72.3
+--- lo6
+   reuse            65.5 |   65.1 |   62.5
+   lowrank-8/mse    74.3 |   77.5 |   76.0
+--- mr4
+   reuse            40.1 |   40.3 |   39.9
+   lowrank-8/mse    44.4 |   49.5 |   49.9
+
+=== d=6: mean over layers 6-47 (%): first 2000 | before shift | after shift ===
+--- lo2
+   reuse            51.0 |   50.7 |   47.5
+   lowrank-8/mse    58.3 |   62.1 |   60.2
+--- lo3
+   reuse            54.2 |   53.9 |   50.8
+   lowrank-8/mse    62.2 |   65.9 |   64.1
+--- lo6
+   reuse            57.7 |   57.2 |   54.8
+   lowrank-8/mse    66.1 |   69.5 |   68.1
+--- mr4
+   reuse            33.3 |   33.1 |   33.1
+   lowrank-8/mse    36.2 |   40.7 |   41.1
+
+=== cascade at lo3 (target layers 4-47; heads lowrank-8/mse, top-3 each) ===
+catch = share of true ranks 0-2 in the set; NR = same over true ranks 0-2 not routed at the target layer within 32 tokens
+--- d=4 head alone
+   catch      50.7 |   54.4 |   52.7  (first 2000 | before | after, %)
+   NR         36.2 |   40.7 |   40.2  (first 2000 | before | after, %)
+   distinct             3.00 |   3.00 |   3.00  (guesses per token per layer)
+   distinct_nonrecent   0.47 |   0.46 |   0.49  (guesses per token per layer)
+--- d=2 head alone
+   catch      58.4 |   61.5 |   59.9  (first 2000 | before | after, %)
+   NR         44.8 |   49.0 |   49.0  (first 2000 | before | after, %)
+   distinct             3.00 |   3.00 |   3.00  (guesses per token per layer)
+   distinct_nonrecent   0.40 |   0.40 |   0.42  (guesses per token per layer)
+--- d=1 head alone
+   catch      66.9 |   69.0 |   67.3  (first 2000 | before | after, %)
+   NR         55.6 |   59.0 |   58.0  (first 2000 | before | after, %)
+   distinct             3.00 |   3.00 |   3.00  (guesses per token per layer)
+   distinct_nonrecent   0.38 |   0.40 |   0.44  (guesses per token per layer)
+--- union d=4+d=2+d=1
+   catch      80.9 |   82.5 |   81.1  (first 2000 | before | after, %)
+   NR         69.4 |   73.1 |   72.1  (first 2000 | before | after, %)
+   distinct             5.18 |   5.00 |   5.08  (guesses per token per layer)
+   distinct_nonrecent   0.88 |   0.86 |   0.93  (guesses per token per layer)

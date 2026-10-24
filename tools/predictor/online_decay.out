@@ -1,0 +1,15 @@
+DECAY ARM: lowrank-8/mse (stage-A settings), AdamW weight decay on the correction only, trace_tok.bin, layers [8, 16, 24, 32, 40], lo3 = true ranks 0-2 in predicted top-6 (%)
+
+--- d=1, lr=0.001, margin=0.1 K=16: first 2000 | before shift | after shift (mean over layers)
+   reuse (router)         82.3 |   83.3 |   81.5
+   wd=0                  88.2 |   89.9 |   88.6
+   wd=0.0001             88.3 |   89.9 |   88.6
+   wd=0.001              88.2 |   90.0 |   88.6
+   wd=0.01               88.2 |   90.0 |   88.7
+
+--- d=2, lr=0.001, margin=0.1 K=64: first 2000 | before shift | after shift (mean over layers)
+   reuse (router)         68.2 |   68.4 |   65.3
+   wd=0                  82.2 |   82.5 |   80.9
+   wd=0.0001             82.1 |   82.5 |   80.8
+   wd=0.001              82.2 |   82.5 |   80.9
+   wd=0.01               82.2 |   82.6 |   81.0
