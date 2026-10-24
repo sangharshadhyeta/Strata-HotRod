@@ -112,7 +112,7 @@ unsigned long long route_pred_edge_skips_take();
 /// route_pred_logits) writes a predicted rank lo..hi id as -1 when the router would replace it with a resident stand-in (the window's budgets).
 /// route_pred_tail_read_take returns the count since the last take and zeroes it.  route_cfg_tail_open: the open rule (no tail reads needed).
 void route_pred_tail_read_alloc();
-void route_pred_tail_read(const int32_t* res_layer, int32_t* pred_ids, int n_tok, void* stream);
+void route_pred_tail_read(const int32_t* res_layer, int32_t* pred_ids, int n_tok, void* stream, int all_ranks = 0);
 unsigned long long route_pred_tail_read_take();
 bool route_cfg_tail_open();
 void route_ring_alloc(size_t n);

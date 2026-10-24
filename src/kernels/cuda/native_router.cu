@@ -723,7 +723,7 @@ unsigned long long route_pred_edge_skips_take() {
 // The config is the host-mapped RouteCfg, read at every launch, so the window's budgets reach this kernel as they reach the router.
 // Approximations: the router's own picks before a swap (its `used` set) and the ring's landed copies (counted resident there) are not seen.
 __global__ void pred_tail_read_k(const float* __restrict__ logits, int32_t* __restrict__ ids, const float* __restrict__ w, const int32_t* __restrict__ res,
-                                 const RouteCfg* cfg, unsigned long long* __restrict__ skipped, int n_tok) {
+                                 const RouteCfg* cfg, unsigned long long* __restrict__ skipped, int n_tok, int all_ranks) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -731,12 +731,17 @@ __global__ void pred_tail_read_k(const float* __restrict__ logits, int32_t* __re
     const int hi = ((const volatile RouteCfg*) cfg)->hi;
     const float margin = ((const volatile RouteCfg*) cfg)->margin;
     const float budget_tail = ((const volatile RouteCfg*) cfg)->budget_tail;
+    const float budget = ((const volatile RouteCfg*) cfg)->budget;
     const int maxrank = ((const volatile RouteCfg*) cfg)->maxrank;
     const float wmax = ((const volatile RouteCfg*) cfg)->wmax;
-    if (margin >= 1e30f && budget_tail <= 0.f) return;   // the open rule: no test (uniform across the warp)
+    const bool tail_open = margin >= 1e30f && budget_tail <= 0.f;   // the open rule: the host leaves those ranks unread (no test)
+    // STRATA_LA_TAIL_READ=2 (all_ranks): ranks below lo take the router's budget test too (w * gap <= budget), so a rank 0..lo-1
+    // pick a stand-in will serve is not read either - only the picks that will be computed exactly are read ahead
+    const int r0 = all_ranks != 0 && budget > 0.f ? 0 : lo;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
-    for (int r = lo; r <= hi && r < 10; ++r) {   // uniform across the warp: every value below is reduced or read from the same place
+    for (int r = r0; r <= hi && r < 10; ++r) {   // uniform across the warp: every value below is reduced or read from the same place
+        if (r >= lo && tail_open) break;
         const int e = id[r];
         if (e < 0 || e >= 512 || res[e] >= 0) continue;   // no pick, or resident (no stand-in is needed)
         if (wmax > 0.f && w[(size_t) t * 10 + r] >= wmax) continue;   // a heavy pick stays exact (the router's wmax)
@@ -758,7 +763,8 @@ __global__ void pred_tail_read_k(const float* __restrict__ logits, int32_t* __re
             if (place >= maxrank) continue;   // refused by the place cap: exact
         }
         const float gap = l[e] - bv;
-        const bool take = budget_tail > 0.f ? w[(size_t) t * 10 + r] * fmaxf(gap, 0.f) <= budget_tail : gap <= margin;
+        const bool take = r < lo ? w[(size_t) t * 10 + r] * fmaxf(gap, 0.f) <= budget
+                        : budget_tail > 0.f ? w[(size_t) t * 10 + r] * fmaxf(gap, 0.f) <= budget_tail : gap <= margin;
         if (lane == 0 && take) {
             id[r] = -1;
             atomicAdd(skipped, 1ull);
@@ -773,11 +779,11 @@ void route_pred_tail_read_alloc() {
     cudaMemset(g_pred_tail, 0, sizeof(unsigned long long));
     note_scratch_dev();
 }
-void route_pred_tail_read(const int32_t* res_layer, int32_t* pred_ids, int n_tok, void* stream) {
+void route_pred_tail_read(const int32_t* res_layer, int32_t* pred_ids, int n_tok, void* stream, int all_ranks) {
     const RouteCfg* cfg = route_cfg_device();
     if (cfg == nullptr || g_pred_tail == nullptr || g_pred_w == nullptr || !scratch_here() || pred_ids == nullptr || res_layer == nullptr || !stream || n_tok < 1)
         return;
-    pred_tail_read_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(g_pred_logits, pred_ids, g_pred_w, res_layer, cfg, g_pred_tail, n_tok);
+    pred_tail_read_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(g_pred_logits, pred_ids, g_pred_w, res_layer, cfg, g_pred_tail, n_tok, all_ranks);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

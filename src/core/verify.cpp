@@ -2512,7 +2512,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool la_on_stream = false;   // HIP: the node stays on cs (the shared stream's cross-stream cost, as sh_stream_on)
 #endif
         static const bool la_edge_skip = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e != nullptr && std::atoi(e) != 0; }();
-        static const bool la_tail_read = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr && std::atoi(e) != 0; }();
+        static const int la_tail_read_v = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr ? std::atoi(e) : 0; }();
+        static const bool la_tail_read = la_tail_read_v != 0;   // =2: ranks below lo take the predicted stand-in test too
         auto lookahead_node = [&](cudaStream_t s) -> bool {
             try {
                 // dist 4 (STRATA_LA_LEARN=1 only, after dists 1 and 2: the nearest deadline first in the warm loop); without the learner, dists 1 and 2
@@ -2542,7 +2543,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     // STRATA_LA_TAIL_READ (opt-in): a predicted rank >= lo that the router would serve with a resident stand-in is not read
                     // (its id becomes -1).  The window's budgets are read on the device; under the open rule the kernel returns at once.
                     if (la_tail_read && hits_.d_res != nullptr)
-                        strata::kernels::route_pred_tail_read(hits_.d_res + (l + dist) * g.n_expert, strata::kernels::route_pred_dev(l + dist, dist), n, s);
+                        strata::kernels::route_pred_tail_read(hits_.d_res + (l + dist) * g.n_expert, strata::kernels::route_pred_dev(l + dist, dist), n, s,
+                                                              la_tail_read_v == 2 ? 1 : 0);
                 }
             } catch (const std::exception& e) { err = "verify look-ahead node: " + std::string(e.what()); return false; }
             return true;
