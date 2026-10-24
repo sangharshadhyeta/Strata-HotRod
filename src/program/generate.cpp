@@ -8965,6 +8965,21 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
+        {   // STRATA_LA_LEARN unset (auto): the learned look-ahead runs only when a learned predictor is already kept beside the stand-in
+            // tuning (data/predictor-*.bin); without one it stays off (STRATA_LA_LEARN=1 starts one)
+            bool saved = false;
+            const std::string tune = standin_tune_path(o);
+            std::error_code dec;
+            if (!tune.empty())
+                for (const auto& f : std::filesystem::directory_iterator(std::filesystem::path(tune).parent_path(), dec)) {
+                    const std::string nm = f.path().filename().string();
+                    if (nm.rfind("predictor-", 0) == 0 && f.path().extension() == ".bin") { saved = true; break; }
+                }
+            strata::core::Verifier::la_learn_set_saved(saved);
+            if (std::getenv("STRATA_LA_LEARN") == nullptr)
+                std::fprintf(stderr, "strata serve: look-ahead learner (auto): %s\n",
+                             saved ? "on - a learned predictor is kept" : "off - no learned predictor kept (STRATA_LA_LEARN=1 starts one)");
+        }
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;

@@ -136,7 +136,7 @@ recomputed exactly, and each request brakes itself when it sees flips.
 
 **A look-ahead that learns.** Experts for 1, 2 and 4 layers ahead are guessed on the card and read from the SSD before they
 are needed. Each guess is the router's own score plus a small correction learned live from the real routing; its size is
-chosen per layer by a live contest, and it falls back to the plain router if it ever does worse.
+chosen per layer by a live contest, and it falls back to the plain router if it ever does worse. It runs when a learned predictor is kept on disk; on a fresh install it is off until `STRATA_LA_LEARN=1` starts one.
 
 </div>
 

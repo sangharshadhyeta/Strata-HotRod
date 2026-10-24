@@ -101,10 +101,12 @@ inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv(
 struct RouteResidentCfg;
 RouteResidentCfg& route_resident_cfg();
 // STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned correction (native_router.cu la_learn_*); STRATA_LA_LEARN_TIMING=1 times its training
+// STRATA_LA_LEARN unset = auto: on only when a learned predictor (data/predictor-*.bin) is already on disk (the serve start says so
+// through la_learn_set_saved, before the verifier allocates); =1 on (learns from the plain router when nothing is saved); =0 off.
+static int g_la_saved = 0;
 static bool la_learn_env_on() {
-    // default ON since 24 Oct evening (3-question A/B: 58.9 vs 56.8 tok/s, answers correct); STRATA_LA_LEARN=0 turns it off
-    static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN"); return e == nullptr || e[0] != '0'; }();
-    return on;
+    static const int mode = [] { const char* e = std::getenv("STRATA_LA_LEARN"); return e == nullptr ? 2 : (e[0] == '0' ? 0 : 1); }();
+    return mode == 1 || (mode == 2 && g_la_saved != 0);
 }
 static bool la_learn_timing_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN_TIMING"); return e != nullptr && e[0] == '1'; }();
@@ -1526,6 +1528,7 @@ bool Verifier::window_self_commits(int T) const {
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
 bool Verifier::la_learn_on() { return la_learn_env_on(); }
+void Verifier::la_learn_set_saved(bool saved) { g_la_saved = saved ? 1 : 0; }
 bool Verifier::la_learn_open(const std::string& path, std::string& msg) {
     if (!strata::kernels::la_learn_active()) { msg = "not on"; return false; }
     std::error_code ec;

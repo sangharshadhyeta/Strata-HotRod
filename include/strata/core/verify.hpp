@@ -261,6 +261,8 @@ public:
     /// (false with msg when there is none); la_learn_request_end(path, report) saves it to path (when not empty) and returns the stats
     /// line(s) for the request's log.  Both are no-ops when the feature is off.
     static bool la_learn_on();
+    /// STRATA_LA_LEARN unset (auto): the serve start reports whether a learned predictor file exists, before init allocates
+    static void la_learn_set_saved(bool saved);
     static bool la_learn_open(const std::string& path, std::string& msg);
     static void la_learn_request_end(const std::string& path, std::string& report);
 
