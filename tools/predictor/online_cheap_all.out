@@ -1,0 +1,216 @@
+STAGE B: all layers (d=1: layers 1-47; d=2: layers 2-47) with the stage-A settings; reuse = the real router
+
+=== STAGE B d=2 lo2: mean over layers 2-47 (%): first 2000 | before shift | after shift ===
+   reuse              65.2 |   65.5 |   61.9
+   lowrank-8/mse      74.0 |   77.5 |   75.9
+   lowrank-32/mse     72.9 |   77.4 |   75.4
+   bias/mse           75.2 |   75.4 |   71.5
+   scale+bias/mse     74.8 |   75.7 |   73.0
+
+=== STAGE B d=2 lo3: mean over layers 2-47 (%): first 2000 | before shift | after shift ===
+   reuse              68.6 |   68.8 |   65.4
+   lowrank-8/mse      77.8 |   80.9 |   79.4
+   lowrank-32/mse     76.4 |   80.4 |   78.7
+   bias/mse           79.1 |   78.5 |   74.8
+   scale+bias/mse     78.6 |   78.8 |   76.0
+
+=== STAGE B d=2 lo4: mean over layers 2-47 (%): first 2000 | before shift | after shift ===
+   reuse              70.4 |   70.5 |   67.4
+   lowrank-8/mse      79.7 |   82.6 |   81.1
+   lowrank-32/mse     77.9 |   81.8 |   80.1
+   bias/mse           80.8 |   79.9 |   76.3
+   scale+bias/mse     80.3 |   80.2 |   77.4
+
+=== STAGE B d=2 lo6: mean over layers 2-47 (%): first 2000 | before shift | after shift ===
+   reuse              71.8 |   72.0 |   69.3
+   lowrank-8/mse      81.2 |   83.7 |   82.6
+   lowrank-32/mse     78.9 |   82.5 |   81.1
+   bias/mse           82.0 |   80.6 |   77.3
+   scale+bias/mse     81.5 |   81.1 |   78.5
+
+=== STAGE B d=2 p1: mean over layers 2-47 (%): first 2000 | before shift | after shift ===
+   reuse              30.8 |   33.2 |   32.6
+   lowrank-8/mse      33.7 |   39.2 |   39.2
+   lowrank-32/mse     31.4 |   36.6 |   36.7
+   bias/mse           33.0 |   34.2 |   32.1
+   scale+bias/mse     34.0 |   36.3 |   34.8
+
+=== STAGE B d=2 p2: mean over layers 2-47 (%): first 2000 | before shift | after shift ===
+   reuse              25.1 |   27.1 |   26.6
+   lowrank-8/mse      27.9 |   32.3 |   32.3
+   lowrank-32/mse     25.9 |   30.3 |   30.3
+   bias/mse           27.4 |   28.4 |   26.7
+   scale+bias/mse     28.0 |   30.0 |   28.7
+
+=== STAGE B d=2 p4: mean over layers 2-47 (%): first 2000 | before shift | after shift ===
+   reuse              18.4 |   19.8 |   19.5
+   lowrank-8/mse      20.6 |   23.7 |   23.7
+   lowrank-32/mse     19.2 |   22.4 |   22.4
+   bias/mse           20.5 |   21.2 |   20.1
+   scale+bias/mse     20.7 |   22.2 |   21.4
+
+=== STAGE B d=2 mr4: mean over layers 2-47 (%): first 2000 | before shift | after shift ===
+   reuse              48.8 |   49.3 |   48.4
+   lowrank-8/mse      55.2 |   59.6 |   59.4
+   lowrank-32/mse     50.7 |   55.7 |   55.4
+   bias/mse           54.8 |   52.6 |   49.3
+   scale+bias/mse     55.6 |   55.5 |   52.9
+
+--- d=2 per-layer lo3 full stream (%) ---
+layer   reuse  lowrank-8/ms  lowrank-32/m      bias/mse  scale+bias/m
+    2    43.3          59.7          58.8          57.1          58.8
+    3    46.5          71.7          70.5          69.2          69.8
+    4    72.9          85.0          84.4          83.8          85.1
+    5    65.5          83.8          82.3          79.4          80.8
+    6    73.3          84.0          85.1          82.6          82.7
+    7    88.5          91.3          90.4          90.7          91.3
+    8    80.2          86.2          85.8          84.5          84.6
+    9    77.2          84.7          85.0          81.6          81.9
+   10    78.2          85.9          85.6          83.8          84.0
+   11    71.1          84.9          84.7          82.3          82.3
+   12    75.9          89.4          90.0          87.5          87.2
+   13    71.9          80.1          79.6          77.2          78.1
+   14    73.0          80.0          80.4          76.9          77.5
+   15    48.4          74.3          70.7          71.7          72.7
+   16    71.1          84.9          84.9          82.3          82.2
+   17    69.6          77.9          79.5          74.6          75.4
+   18    43.4          59.7          60.0          57.0          57.8
+   19    78.0          86.4          86.2          84.4          84.0
+   20    74.8          83.7          83.1          82.6          84.2
+   21    68.7          81.1          81.5          79.5          80.0
+   22    62.6          74.6          76.2          73.5          74.4
+   23    71.7          82.3          81.1          79.9          79.6
+   24    71.3          83.5          83.5          82.9          81.7
+   25    81.8          84.0          83.0          82.7          83.4
+   26    81.7          86.9          86.7          85.0          85.7
+   27    78.4          87.8          87.6          85.7          85.7
+   28    77.4          87.9          88.4          85.8          86.0
+   29    74.2          83.9          84.0          81.3          81.8
+   30    78.3          84.3          84.3          81.8          82.7
+   31    41.6          65.8          61.8          62.4          64.7
+   32    75.2          85.0          83.8          82.5          82.2
+   33    69.0          79.3          79.2          75.1          75.8
+   34    41.5          58.1          58.4          55.2          56.4
+   35    77.2          86.4          85.8          83.8          83.8
+   36    63.3          74.0          71.8          72.7          75.5
+   37    77.0          82.9          82.0          81.4          83.6
+   38    58.3          62.0          60.7          60.5          64.0
+   39    56.3          76.5          72.7          72.8          72.2
+   40    40.2          70.8          68.3          68.0          65.6
+   41    79.0          83.7          83.5          79.0          78.2
+   42    48.0          71.7          72.2          67.3          65.4
+   43    92.5          93.5          92.8          90.0          87.3
+   44    73.2          86.5          84.1          84.9          84.8
+   45    66.2          76.0          71.7          75.4          77.2
+   46    63.5          76.4          75.6          77.3          77.7
+   47    57.4          82.4          80.7          81.0          78.0
+5 worst layers for lowrank-8/mse (lo3 full stream): 34 (58.1, reuse 41.5), 18 (59.7, reuse 43.4), 2 (59.7, reuse 43.3), 38 (62.0, reuse 58.3), 31 (65.8, reuse 41.6)
+5 worst layers for reuse (lo3 full stream): 40 (40.2), 34 (41.5), 31 (41.6), 2 (43.3), 18 (43.4)
+
+=== STAGE B d=1 lo2: mean over layers 1-47 (%): first 2000 | before shift | after shift ===
+   reuse              74.5 |   75.0 |   72.5
+   lowrank-8/mse      82.6 |   84.9 |   83.2
+   lowrank-32/mse     82.2 |   85.3 |   83.8
+   bias/mse           81.0 |   84.2 |   83.0
+   scale+bias/mse     83.2 |   84.1 |   82.1
+
+=== STAGE B d=1 lo3: mean over layers 1-47 (%): first 2000 | before shift | after shift ===
+   reuse              77.8 |   78.3 |   75.8
+   lowrank-8/mse      85.5 |   87.4 |   85.6
+   lowrank-32/mse     85.2 |   87.9 |   86.4
+   bias/mse           84.4 |   87.3 |   86.1
+   scale+bias/mse     86.4 |   87.0 |   85.0
+
+=== STAGE B d=1 lo4: mean over layers 1-47 (%): first 2000 | before shift | after shift ===
+   reuse              79.4 |   79.9 |   77.5
+   lowrank-8/mse      86.7 |   88.3 |   86.7
+   lowrank-32/mse     86.5 |   89.0 |   87.6
+   bias/mse           86.1 |   88.8 |   87.6
+   scale+bias/mse     88.0 |   88.3 |   86.4
+
+=== STAGE B d=1 lo6: mean over layers 1-47 (%): first 2000 | before shift | after shift ===
+   reuse              80.8 |   81.2 |   79.1
+   lowrank-8/mse      87.5 |   88.7 |   87.2
+   lowrank-32/mse     87.4 |   89.6 |   88.3
+   bias/mse           87.4 |   89.8 |   88.6
+   scale+bias/mse     89.1 |   89.2 |   87.3
+
+=== STAGE B d=1 p1: mean over layers 1-47 (%): first 2000 | before shift | after shift ===
+   reuse              37.7 |   40.5 |   39.9
+   lowrank-8/mse      40.2 |   43.3 |   42.7
+   lowrank-32/mse     39.8 |   44.9 |   44.5
+   bias/mse           41.2 |   46.2 |   45.7
+   scale+bias/mse     42.6 |   46.0 |   44.8
+
+=== STAGE B d=1 p2: mean over layers 1-47 (%): first 2000 | before shift | after shift ===
+   reuse              31.0 |   33.3 |   32.9
+   lowrank-8/mse      33.1 |   35.9 |   35.4
+   lowrank-32/mse     32.8 |   37.1 |   36.9
+   bias/mse           34.0 |   38.2 |   37.9
+   scale+bias/mse     35.1 |   38.0 |   37.1
+
+=== STAGE B d=1 p4: mean over layers 1-47 (%): first 2000 | before shift | after shift ===
+   reuse              22.6 |   24.3 |   24.0
+   lowrank-8/mse      24.2 |   26.3 |   26.0
+   lowrank-32/mse     24.0 |   27.0 |   26.9
+   bias/mse           24.9 |   27.9 |   27.6
+   scale+bias/mse     25.6 |   27.6 |   27.0
+
+=== STAGE B d=1 mr4: mean over layers 1-47 (%): first 2000 | before shift | after shift ===
+   reuse              60.7 |   61.2 |   60.1
+   lowrank-8/mse      65.1 |   66.1 |   64.6
+   lowrank-32/mse     64.2 |   68.0 |   66.8
+   bias/mse           67.1 |   70.6 |   69.4
+   scale+bias/mse     69.3 |   69.9 |   67.6
+
+--- d=1 per-layer lo3 full stream (%) ---
+layer   reuse  lowrank-8/ms  lowrank-32/m      bias/mse  scale+bias/m
+    1    33.9          50.9          54.6          54.9          54.1
+    2    72.3          81.4          82.9          82.8          83.1
+    3    70.4          82.3          83.4          82.9          84.7
+    4    84.8          93.2          93.9          93.9          93.3
+    5    82.1          90.5          90.9          91.4          90.9
+    6    81.9          90.9          91.2          91.7          91.7
+    7    85.0          93.9          94.4          94.1          94.0
+    8    88.2          92.5          93.3          91.7          91.4
+    9    86.1          91.5          92.0          90.7          90.6
+   10    73.5          86.9          87.3          86.9          86.3
+   11    87.2          92.9          92.9          92.5          91.8
+   12    73.6          88.4          89.1          87.1          86.9
+   13    80.1          86.6          87.2          85.9          85.2
+   14    80.4          86.8          87.4          86.9          86.8
+   15    75.2          85.2          85.9          86.0          86.8
+   16    82.3          90.2          90.3          88.9          88.1
+   17    79.0          87.4          87.7          86.7          86.3
+   18    65.7          82.2          82.1          81.3          81.2
+   19    79.7          89.9          90.6          89.6          89.5
+   20    86.5          88.9          88.9          89.5          90.0
+   21    73.9          87.2          87.5          85.7          85.8
+   22    88.6          93.4          93.2          93.6          93.3
+   23    56.7          72.9          74.4          73.0          74.1
+   24    77.2          86.6          86.7          85.5          85.4
+   25    87.5          92.9          93.0          92.5          92.1
+   26    76.3          88.0          88.2          88.3          88.0
+   27    90.8          94.2          94.3          94.1          93.4
+   28    71.0          84.6          84.6          82.8          83.2
+   29    86.0          91.2          91.6          91.2          90.7
+   30    78.0          87.8          88.3          88.0          88.3
+   31    76.4          80.2          81.4          81.9          82.1
+   32    80.6          89.2          89.9          87.8          87.4
+   33    75.9          86.9          87.0          86.1          86.1
+   34    73.5          85.4          85.1          85.2          85.2
+   35    77.9          88.7          89.3          88.4          88.6
+   36    79.5          83.7          83.5          84.4          86.1
+   37    76.3          87.4          87.7          87.1          86.6
+   38    81.6          86.6          86.0          87.2          87.1
+   39    34.7          62.3          63.3          57.9          61.7
+   40    85.2          87.8          88.5          86.5          85.1
+   41    89.1          91.8          91.5          91.6          90.5
+   42    67.6          82.3          82.8          81.1          80.3
+   43    76.9          89.0          89.4          86.5          87.1
+   44    83.9          85.4          86.1          87.8          86.9
+   45    83.4          89.6          89.2          92.0          91.0
+   46    86.9          92.3          92.0          93.6          92.5
+   47    84.5          92.6          92.5          91.4          92.4
+5 worst layers for lowrank-8/mse (lo3 full stream): 1 (50.9, reuse 33.9), 39 (62.3, reuse 34.7), 23 (72.9, reuse 56.7), 31 (80.2, reuse 76.4), 2 (81.4, reuse 72.3)
+5 worst layers for reuse (lo3 full stream): 1 (33.9), 39 (34.7), 23 (56.7), 18 (65.7), 42 (67.6)

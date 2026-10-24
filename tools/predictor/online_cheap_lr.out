@@ -1,0 +1,165 @@
+STAGE A: lr grid widened once past any edge (bias/mse, scale+bias/mse), then margin {0.1,0.5} x K {16,32,64} for the best learner
+
+=== lr sweep d=2, first 3000 tokens, mean over layers [8, 16, 24, 32, 40] and floors (%) ===
+   lowrank-8/mse    lr=0.0001    75.94
+   lowrank-8/mse    lr=0.001     81.69
+   lowrank-8/mse    lr=0.01      55.74
+   -> chosen lowrank-8/mse lr=0.001
+   lowrank-32/mse   lr=0.0001    78.08
+   lowrank-32/mse   lr=0.001     80.26
+   lowrank-32/mse   lr=0.01      26.83
+   -> chosen lowrank-32/mse lr=0.001
+   bias/mse         lr=0.001     70.74
+   bias/mse         lr=0.01      78.97
+   bias/mse         lr=0.1       82.67
+   bias/mse         lr=0.3       70.85
+   bias/mse         lr=0.9       16.39
+   -> chosen bias/mse lr=0.1
+   scale+bias/mse   lr=0.0001    69.02
+   scale+bias/mse   lr=0.001     74.10
+   scale+bias/mse   lr=0.01      80.39
+   scale+bias/mse   lr=0.03      80.77
+   scale+bias/mse   lr=0.09      73.63
+   -> chosen scale+bias/mse lr=0.03
+
+=== lr sweep d=1, first 3000 tokens, mean over layers [8, 16, 24, 32, 40] and floors (%) ===
+   lowrank-8/mse    lr=0.0001    85.99
+   lowrank-8/mse    lr=0.001     88.19
+   lowrank-8/mse    lr=0.01      74.69
+   -> chosen lowrank-8/mse lr=0.001
+   lowrank-32/mse   lr=0.0001    87.00
+   lowrank-32/mse   lr=0.001     88.53
+   lowrank-32/mse   lr=0.01      32.45
+   -> chosen lowrank-32/mse lr=0.001
+   bias/mse         lr=0.001     83.61
+   bias/mse         lr=0.01      87.14
+   bias/mse         lr=0.1       86.70
+   bias/mse         lr=0.3       77.26
+   bias/mse         lr=0.9       23.86
+   -> chosen bias/mse lr=0.01
+   scale+bias/mse   lr=0.0001    82.91
+   scale+bias/mse   lr=0.001     85.94
+   scale+bias/mse   lr=0.01      87.52
+   scale+bias/mse   lr=0.03      85.62
+   scale+bias/mse   lr=0.09      71.87
+   -> chosen scale+bias/mse lr=0.01
+
+best learner (mean of its d=1 and d=2 sweep criterion): lowrank-8/mse
+
+=== lowrank-8/mse hinge margin x top-K sweep, d=2, lr=0.001, first 3000 tokens (mean floors %) ===
+   cfg margin=0.1 K=16       80.27
+   cfg margin=0.1 K=32       81.66
+   cfg margin=0.1 K=64       82.44
+   cfg margin=0.5 K=16       79.18
+   cfg margin=0.5 K=32       80.92
+   cfg margin=0.5 K=64       81.94
+   -> chosen cfg margin=0.1 K=64
+
+=== lowrank-8/mse hinge margin x top-K sweep, d=1, lr=0.001, first 3000 tokens (mean floors %) ===
+   cfg margin=0.1 K=16       88.31
+   cfg margin=0.1 K=32       87.84
+   cfg margin=0.1 K=64       87.98
+   cfg margin=0.5 K=16       87.40
+   cfg margin=0.5 K=32       87.26
+   cfg margin=0.5 K=64       87.08
+   -> chosen cfg margin=0.1 K=16
+
+=== FULL STREAM, layers [8, 16, 24, 32, 40], chosen settings: lowrank-8/mse lr=0.001 cfg=(0.1, 64), lowrank-32/mse lr=0.001 cfg=(0.1, 32), bias/mse lr=0.1 cfg=(0.1, 32), scale+bias/mse lr=0.03 cfg=(0.1, 32) (d=2) ===
+--- d=2 lo2: first 2000 | before shift | after shift (%)
+   reuse              64.3 |   64.7 |   62.2
+   lowrank-8/mse      79.1 |   79.3 |   78.1
+   lowrank-32/mse     76.9 |   79.3 |   76.8
+   bias/mse           79.8 |   77.8 |   73.3
+   scale+bias/mse     77.9 |   76.6 |   73.6
+--- d=2 lo3: first 2000 | before shift | after shift (%)
+   reuse              68.2 |   68.4 |   65.3
+   lowrank-8/mse      82.2 |   82.6 |   81.0
+   lowrank-32/mse     79.7 |   82.3 |   79.5
+   bias/mse           83.1 |   80.6 |   76.2
+   scale+bias/mse     81.1 |   79.8 |   76.5
+--- d=2 lo4: first 2000 | before shift | after shift (%)
+   reuse              69.8 |   70.1 |   67.0
+   lowrank-8/mse      83.5 |   84.0 |   82.4
+   lowrank-32/mse     80.8 |   83.2 |   80.9
+   bias/mse           84.5 |   81.6 |   77.5
+   scale+bias/mse     82.3 |   81.1 |   77.7
+--- d=2 lo6: first 2000 | before shift | after shift (%)
+   reuse              70.9 |   71.4 |   68.5
+   lowrank-8/mse      84.4 |   84.7 |   83.3
+   lowrank-32/mse     81.5 |   83.4 |   81.3
+   bias/mse           85.5 |   81.7 |   77.8
+   scale+bias/mse     83.4 |   81.6 |   78.6
+--- d=2 p1: first 2000 | before shift | after shift (%)
+   reuse              26.6 |   28.9 |   27.1
+   lowrank-8/mse      29.6 |   33.7 |   32.4
+   lowrank-32/mse     26.2 |   31.2 |   29.4
+   bias/mse           28.6 |   29.7 |   26.2
+   scale+bias/mse     30.0 |   31.8 |   28.2
+--- d=2 p2: first 2000 | before shift | after shift (%)
+   reuse              21.4 |   23.2 |   21.9
+   lowrank-8/mse      23.4 |   27.1 |   26.1
+   lowrank-32/mse     21.0 |   25.2 |   24.0
+   bias/mse           23.4 |   24.1 |   21.3
+   scale+bias/mse     23.8 |   25.7 |   23.1
+--- d=2 p4: first 2000 | before shift | after shift (%)
+   reuse              15.2 |   16.7 |   16.0
+   lowrank-8/mse      16.5 |   19.3 |   18.8
+   lowrank-32/mse     14.9 |   18.0 |   17.3
+   bias/mse           16.5 |   17.3 |   15.6
+   scale+bias/mse     16.9 |   18.4 |   16.8
+--- d=2 mr4: first 2000 | before shift | after shift (%)
+   reuse              50.8 |   50.5 |   48.5
+   lowrank-8/mse      56.5 |   59.5 |   57.9
+   lowrank-32/mse     50.5 |   54.8 |   52.2
+   bias/mse           56.2 |   52.5 |   46.5
+   scale+bias/mse     57.4 |   56.1 |   50.5
+
+=== FULL STREAM, layers [8, 16, 24, 32, 40], chosen settings: lowrank-8/mse lr=0.001 cfg=(0.1, 16), lowrank-32/mse lr=0.001 cfg=(0.1, 32), bias/mse lr=0.01 cfg=(0.1, 32), scale+bias/mse lr=0.01 cfg=(0.1, 32) (d=1) ===
+--- d=1 lo2: first 2000 | before shift | after shift (%)
+   reuse              79.5 |   80.8 |   79.0
+   lowrank-8/mse      85.5 |   87.7 |   86.7
+   lowrank-32/mse     86.3 |   88.3 |   87.0
+   bias/mse           84.2 |   86.3 |   84.3
+   scale+bias/mse     85.3 |   85.6 |   83.2
+--- d=1 lo3: first 2000 | before shift | after shift (%)
+   reuse              82.3 |   83.3 |   81.5
+   lowrank-8/mse      88.2 |   89.9 |   88.7
+   lowrank-32/mse     88.5 |   90.4 |   88.9
+   bias/mse           86.9 |   88.9 |   86.9
+   scale+bias/mse     88.0 |   88.0 |   85.7
+--- d=1 lo4: first 2000 | before shift | after shift (%)
+   reuse              83.4 |   84.4 |   82.7
+   lowrank-8/mse      89.1 |   90.8 |   89.5
+   lowrank-32/mse     89.4 |   91.4 |   89.7
+   bias/mse           88.3 |   90.1 |   88.1
+   scale+bias/mse     89.1 |   89.1 |   86.9
+--- d=1 lo6: first 2000 | before shift | after shift (%)
+   reuse              84.4 |   85.2 |   83.7
+   lowrank-8/mse      90.1 |   91.3 |   89.6
+   lowrank-32/mse     90.4 |   91.8 |   90.2
+   bias/mse           89.5 |   91.2 |   89.1
+   scale+bias/mse     90.2 |   90.1 |   87.8
+--- d=1 p1: first 2000 | before shift | after shift (%)
+   reuse              33.0 |   36.5 |   35.5
+   lowrank-8/mse      37.1 |   41.1 |   39.7
+   lowrank-32/mse     36.3 |   42.4 |   40.8
+   bias/mse           36.5 |   43.2 |   41.6
+   scale+bias/mse     38.0 |   42.1 |   40.2
+--- d=1 p2: first 2000 | before shift | after shift (%)
+   reuse              26.1 |   29.1 |   28.5
+   lowrank-8/mse      29.4 |   32.9 |   32.2
+   lowrank-32/mse     29.1 |   33.9 |   33.0
+   bias/mse           29.4 |   34.5 |   33.5
+   scale+bias/mse     30.1 |   33.6 |   32.4
+--- d=1 p4: first 2000 | before shift | after shift (%)
+   reuse              18.4 |   20.6 |   20.3
+   lowrank-8/mse      20.4 |   23.1 |   22.7
+   lowrank-32/mse     20.3 |   23.6 |   23.1
+   bias/mse           20.4 |   24.0 |   23.5
+   scale+bias/mse     20.8 |   23.4 |   22.8
+--- d=1 mr4: first 2000 | before shift | after shift (%)
+   reuse              62.8 |   63.8 |   62.6
+   lowrank-8/mse      71.3 |   72.3 |   70.6
+   lowrank-32/mse     70.5 |   73.7 |   72.0
+   bias/mse           71.2 |   75.5 |   73.0
+   scale+bias/mse     73.0 |   73.4 |   71.0
