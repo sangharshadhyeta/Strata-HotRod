@@ -51,25 +51,19 @@ Measured on the machine below; a token is about ¾ of a word. Every answer in th
 
 </div>
 
-<div align="center">
+<table width="100%">
+<tr><th align="left">Answer</th><th align="right">tokens/s (24 Oct, 131K context)</th></tr>
+<tr><td align="left">Code (a Python function, 500-650 tokens)</td><td align="right">52 - 55</td></tr>
+<tr><td align="left">Reasoning (a two-train problem, ~1,000 tokens)</td><td align="right">66 - 71</td></tr>
+<tr><td align="left">Story (a paragraph, 100-150 tokens)</td><td align="right">50 - 53</td></tr>
+</table>
 
-| Answer | tokens/s (24 Oct, 131K context) |
-| --- | ---: |
-| Code (a Python function, 500-650 tokens) | 52 - 55 |
-| Reasoning (a two-train problem, ~1,000 tokens) | 66 - 71 |
-| Story (a paragraph, 100-150 tokens) | 50 - 53 |
-
-</div>
-
-<div align="center">
-
-| Long prompts (262K context, 20 Oct) | Read in | Answer written at |
-| --- | ---: | ---: |
-| 8,554 tokens | 16.9 s | 52 - 54 tokens/s |
-| 45,398 tokens | 67 - 68 s | 38 - 41 tokens/s |
-| The same 45K conversation, next turn | 0.4 - 0.5 s | 34 - 45 tokens/s |
-
-</div>
+<table width="100%">
+<tr><th align="left">Long prompts (262K context, 20 Oct)</th><th align="right">Read in</th><th align="right">Answer written at</th></tr>
+<tr><td align="left">8,554 tokens</td><td align="right">16.9 s</td><td align="right">52 - 54 tokens/s</td></tr>
+<tr><td align="left">45,398 tokens</td><td align="right">67 - 68 s</td><td align="right">38 - 41 tokens/s</td></tr>
+<tr><td align="left">The same 45K conversation, next turn</td><td align="right">0.4 - 0.5 s</td><td align="right">34 - 45 tokens/s</td></tr>
+</table>
 
 <div align="justify">
 
@@ -81,19 +75,16 @@ already read. A 262K context costs about 8% against 131K, because more of the at
 <details>
 <summary><b>The machine</b></summary>
 
-<div align="center">
-
-| | |
-| --- | --- |
-| **Graphics card** | NVIDIA GeForce RTX 3060, 12 GB (driver 610.57, CUDA 13.3) |
-| **Processor, RAM** | Intel Core i5-12400F (6 cores, 12 threads), 30 GB |
-| **Disk** | 500 GB NVMe (WD Blue SN5000) on a PCIe 3.0 link; the model files live on it |
-| **System** | Rocky Linux 9.6, built with gcc-toolset-13 |
-| **Engine** | Strata 0.1.45 (upstream, merged 17 Oct 2026) plus this fork's changes |
-| **Model** | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), IQ3_S (about 3.5 bits per weight, 78 GB of files) by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
-| **Context** | 262K tokens (the longest prompt served so far: 114K) |
-
-</div>
+<table width="100%">
+<tr><th align="left"></th><th align="left"></th></tr>
+<tr><td align="left"><b>Graphics card</b></td><td align="left">NVIDIA GeForce RTX 3060, 12 GB (driver 610.57, CUDA 13.3)</td></tr>
+<tr><td align="left"><b>Processor, RAM</b></td><td align="left">Intel Core i5-12400F (6 cores, 12 threads), 30 GB</td></tr>
+<tr><td align="left"><b>Disk</b></td><td align="left">500 GB NVMe (WD Blue SN5000) on a PCIe 3.0 link; the model files live on it</td></tr>
+<tr><td align="left"><b>System</b></td><td align="left">Rocky Linux 9.6, built with gcc-toolset-13</td></tr>
+<tr><td align="left"><b>Engine</b></td><td align="left">Strata 0.1.45 (upstream, merged 17 Oct 2026) plus this fork's changes</td></tr>
+<tr><td align="left"><b>Model</b></td><td align="left"><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next">Qwen3.8-Flash-Next</a>, IQ3_S (about 3.5 bits per weight, 78 GB of files) by <a href="https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF">ISTA-DASLab</a></td></tr>
+<tr><td align="left"><b>Context</b></td><td align="left">262K tokens (the longest prompt served so far: 114K)</td></tr>
+</table>
 </details>
 
 <details>
@@ -196,15 +187,12 @@ and kept across restarts.
 </tr>
 </table>
 
-<div align="center">
-
-| Needed experts guessed (live, 24 Oct) | Plain router | Learned look-ahead |
-| --- | :---: | :---: |
-| 1 layer ahead | 77-79% | **85-88%** |
-| 2 layers ahead | 66-69% | **76-79%** |
-| 4 layers ahead | 55-58% | **66-71%** |
-
-</div>
+<table width="100%">
+<tr><th align="left">Needed experts guessed (live, 24 Oct)</th><th align="center">Plain router</th><th align="center">Learned look-ahead</th></tr>
+<tr><td align="left">1 layer ahead</td><td align="center">77-79%</td><td align="center"><b>85-88%</b></td></tr>
+<tr><td align="left">2 layers ahead</td><td align="center">66-69%</td><td align="center"><b>76-79%</b></td></tr>
+<tr><td align="left">4 layers ahead</td><td align="center">55-58%</td><td align="center"><b>66-71%</b></td></tr>
+</table>
 
 <div align="justify">
 
