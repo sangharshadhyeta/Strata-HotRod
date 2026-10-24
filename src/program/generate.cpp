@@ -16668,6 +16668,13 @@ int main(int argc, char** argv) {
                         }
                     }
                     std::fprintf(stderr, "\n");
+                    // STRATA_IO_GATE: the read-ahead gate this request (issued and held back: deltas; the use rates: the decayed counts now)
+                    if (src.io_gate())
+                        std::fprintf(stderr, "strata serve: read-ahead gate: issued %lld, held back %lld (drive load above the position's use rate), "
+                                             "use rate by dist d1 %.2f d2 %.2f d4 %.2f\n",
+                                     (long long) (ic.ra_issued - ic_prev.ra_issued), (long long) (ic.ra_held - ic_prev.ra_held),
+                                     (ic.ra_used_d[0] + 1.0) / (ic.ra_issued_d[0] + 2.0), (ic.ra_used_d[1] + 1.0) / (ic.ra_issued_d[1] + 2.0),
+                                     (ic.ra_used_d[2] + 1.0) / (ic.ra_issued_d[2] + 2.0));
                     io_prev = io_now;
                     ic_prev = ic;
                     fb_prev = fb;

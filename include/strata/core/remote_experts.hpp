@@ -157,8 +157,8 @@ public:
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override {
         fallback_.prefetch(layer, experts, n);
     }
-    void warm(int64_t layer, const int64_t* experts, int64_t n) override {
-        fallback_.warm(layer, experts, n);
+    void warm(int64_t layer, const int64_t* experts, int64_t n, const int* pos = nullptr) override {
+        fallback_.warm(layer, experts, n, pos);
     }
     bool warms() const override { return fallback_.warms(); }
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override {

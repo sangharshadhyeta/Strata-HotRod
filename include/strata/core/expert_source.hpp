@@ -253,7 +253,8 @@ public:
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
     /// CS-T: the experts of `layer` a predictor expects next - a source that reads a file may start reading their
     /// pages now, in the background.  Only warms: what `blob` returns is unchanged.  Default: nothing.
-    virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
+    /// `pos`: each expert's position in the caller's guess list (STRATA_IO_GATE learns each position's use); nullptr: untracked
+    virtual void warm(int64_t layer, const int64_t* experts, int64_t n, const int* pos = nullptr) { (void) layer; (void) experts; (void) n; (void) pos; }
     /// Whether `warm` does anything (the predictor is not run otherwise).
     virtual bool warms() const { return false; }
     /// Whether the expert's bytes are in the host page cache now (a swap-in of it costs a copy, not a drive read); sources without a file tier say true.
@@ -1031,7 +1032,7 @@ public:
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
     /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
-    void warm(int64_t layer, const int64_t* experts, int64_t n) override;
+    void warm(int64_t layer, const int64_t* experts, int64_t n, const int* pos = nullptr) override;
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
     bool warms() const override { return (!role_ptr_.empty() || io_pf_) && (direct_.empty() || io_overlay_active()); }
     bool page_cached(int64_t layer, int64_t expert) const override {
@@ -1092,6 +1093,8 @@ public:
         uint64_t blob_n = 0, blob_us = 0, blob_lock_us = 0, blob_wait_us = 0;   ///< blob() calls, their wall time, the stage_mu_ wait and the stage_cv_ wait inside
         uint64_t pf_calls = 0, pf_probe_us = 0, pf_fill_us = 0, pf_thread_us = 0;   ///< prefetch() calls (file tier, io prefetch): residency probes, fills, thread create/join (or pool hand-off) inside the fills
         uint64_t arr[2][6] = {};                             ///< STRATA_IO_ARRIVAL: [layers 0-1 | the rest][IoArrival]
+        uint64_t ra_held = 0, ra_issued = 0;                 ///< STRATA_IO_GATE: guesses held back by the gate, read ahead (totals)
+        uint64_t ra_used_d[3] = {}, ra_issued_d[3] = {};     ///< STRATA_IO_GATE: the decayed used and read-ahead counts by dist (1, 2, 4), summed over ranks
     };
     /// STRATA_IO_ARRIVAL: what the read-ahead had done for a blob when its decode layer asked for it
     enum IoArrival { kArrLanded = 0, kArrInFlight, kArrQueued, kArrLost, kArrUnpredicted, kArrStagedDemand };
@@ -1099,6 +1102,13 @@ public:
     /// STRATA_LA_TAIL_READ: the read-ahead queue's length and the I/O worker count (the queue is held to one guess per worker for ranks >= lo)
     size_t io_queue_depth();
     int io_workers() const { return io_threads_; }
+    /// STRATA_IO_GATE: the gate is on for this source (the read-ahead runs, so a guess can be held back)
+    bool io_gate() const { return io_gate_; }
+    bool ra_gate_on() const { return io_gate_ && io_pf_ && io_ahead_ && (direct_.empty() || io_overlay_active()); }
+    /// STRATA_IO_GATE: the drive's load now: reads in progress plus queued read-aheads (divide by io_workers())
+    size_t io_inflight();
+    /// STRATA_IO_GATE: whether a guess at position `pos` (dist slot * 10 + rank) is read ahead at this load; held back (counted) otherwise
+    bool ra_admit(int pos, double load);
     IoCounters io_counters() const;
     /// STRATA_PROMPT_LOOKAHEAD_IO: the prompt's blobs taken from a read-ahead stage buffer (take_read_ahead) and those read from the drive.
     uint64_t prompt_ra_hits() const { return prompt_ra_hits_.load(std::memory_order_relaxed); }
@@ -1209,7 +1219,7 @@ private:
     std::mutex io_mu_;
     std::condition_variable io_cv_;
     /// (layer, expert) to read ahead; win: the decode window that predicted it; from: the layer whose look-ahead queued it
-    struct IoReq { int32_t first, second; uint32_t win; int32_t from; };
+    struct IoReq { int32_t first, second; uint32_t win; int32_t from; int32_t pos = -1; };   ///< pos: the guess's position (STRATA_IO_GATE), -1 untracked
     static constexpr uint32_t kNoWin = 0xFFFFFFFFu;   ///< IoReq::win of a guess the decode's dispatch did not queue (the prompt's)
     std::deque<IoReq> io_q_;                          ///< the read-ahead queue
     bool io_quit_ = false;
@@ -1227,7 +1237,19 @@ private:
     // ([0] layers 0-1 of a window, [1] the rest); see IoArrival
     bool io_arrival_ = false;
     std::atomic<uint64_t> io_arr_[2][6] = {};
-    std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
+    // STRATA_IO_GATE=1: the read-ahead learns from its own outcome.  A guess's position is (dist slot: dist 1, 2, 4) x (rank 0-9); a read-ahead counts as
+    // issued when its worker starts the read and as used when a layer asks for its blob (claim_stage, take_read_ahead).  The counts are halved every
+    // 4096 issued, so they follow the text.  A guess is read ahead when its position's use rate (used + 1) / (issued + 2) is at least the drive's load
+    // ((reads in progress + queued) / workers): an idle drive reads every guess, a busy one only the guesses that are mostly used.  Unset: nothing changes.
+    bool io_gate_ = false;
+    static constexpr int kRaRanks = 10, kRaPos = 3 * kRaRanks;
+    std::atomic<uint32_t> ra_used_[kRaPos] = {}, ra_issued_[kRaPos] = {};   ///< written under stage_mu_
+    uint64_t ra_since_halve_ = 0;                     ///< read-aheads since the last halving (stage_mu_)
+    std::atomic<uint64_t> ra_held_{0}, ra_issued_total_{0};
+    std::atomic<int> io_busy_{0};                     ///< read-ahead workers in the middle of a read (with the queue: the drive's load)
+    void ra_issue(int pos);                           ///< stage_mu_ held
+    void ra_outcome(int pos);                         ///< stage_mu_ held: a layer used the blob read ahead from `pos`
+    std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer (1: untracked; 2 + pos: a guess's position)
     // STRATA_IO_DEMAND_FIRST=1: prefetch() reserves a stage buffer for each blob the layer needs and does not have, and queues
     // it in io_dq_; the workers drain io_dq_ before the read-ahead queue.  stage_queued_: the reservation no worker has started
     // yet (a blob() asking for it reads it itself).  Unset: both stay empty and nothing changes.
@@ -1258,7 +1280,7 @@ private:
     /// `exact` false: four sampled pages (a blob is cached when they are; a handful of syscalls, not hundreds of pages' walk).
     uint64_t cached_bytes(int64_t layer, int64_t expert, uint64_t& total, bool exact = true) const;
     void io_worker();
-    void io_enqueue(int64_t layer, int64_t expert);
+    void io_enqueue(int64_t layer, int64_t expert, int pos = -1);
     void io_enqueue_demand(int64_t layer, int64_t expert);   // STRATA_IO_DEMAND_FIRST: ahead of the guesses
     void io_stop();
     const uint8_t* io_blob(int64_t layer, int64_t expert);
