@@ -85,13 +85,16 @@ void route_pred_bias_add(float* logits, const float* bias, int n_tok, void* stre
 /// STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned low-rank correction per (source layer, dist), four slots (plain, rank 4, 8, 16)
 /// trained live, and a leader chosen by a Newcombe test on the hits (native_router.cu, la_learn_*).  la_learn_alloc once before graph
 /// capture (false with the reason in msg); la_learn_forward in the look-ahead after the router's logits (route_pred_logits: the
-/// leader's); la_learn_train at a layer after its router (the label: its logits, the resident flags); la_learn_window_end once per
-/// window after the layers.  All device-side: the graph reads the leader and the flags from device memory.
+/// leader's); la_learn_label at each layer after its router (the label, copied for the batch); la_learn_window_end after the layers
+/// (timing stamp); the batch runs on a side stream: la_learn_post_launch after a learning window's graph launch, la_learn_pre_launch
+/// before every window's graph launch (it waits for the last batch).  The graph reads the leader and the flags from device memory.
 bool la_learn_alloc(int64_t n_layers, int64_t n_embd, int lo, bool timing, std::string& msg);
 bool la_learn_active();                                              ///< allocated, on the scratch GPU
 void la_learn_forward(int64_t l, int dist, const float* x, int n, void* stream);
-void la_learn_train(int64_t m, const float* true_logits, const int* resident, int n, void* stream);
+void la_learn_label(int64_t l, const float* true_logits, int n, void* stream);
 void la_learn_window_end(void* stream);
+void la_learn_pre_launch(void* stream);
+void la_learn_post_launch(void* stream, const int* resident, int n);
 std::string la_learn_report();                                       ///< the stats line(s) since the start; "" when off
 bool la_learn_save(const char* path, std::string& msg);              ///< the leaders (fp16) and their ranks
 bool la_learn_load(const char* path, std::string& msg);              ///< before the first request; the file must match the model shape

@@ -629,6 +629,9 @@ private:
     cudaEvent_t df_join_[2] = {};
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    bool la_win_[9] = {};               // STRATA_LA_LEARN: this window size's graph runs the learner (its batch follows each launch)
+    void la_learn_before_launch();      // before a window's graph launch: the last batch's weights are done
+    bool la_learn_after_launch(int T, std::string& err);   // after a learning window's launch: its batch, on the side stream
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;

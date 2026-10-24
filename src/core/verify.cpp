@@ -1536,6 +1536,16 @@ void Verifier::la_learn_request_end(const std::string& path, std::string& report
     }
     report = strata::kernels::la_learn_report();
 }
+void Verifier::la_learn_before_launch() {
+    if (la_learn_env_on()) strata::kernels::la_learn_pre_launch(cs_);
+}
+bool Verifier::la_learn_after_launch(int T, std::string& err) {
+    if (T < 0 || T >= 9 || !la_win_[T]) return true;
+    try {
+        strata::kernels::la_learn_post_launch(cs_, hits_.d_res, T);
+    } catch (const std::exception& e) { err = "verify look-ahead learner: " + std::string(e.what()); return false; }
+    return true;
+}
 
 bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     using namespace strata::kernels;
@@ -1678,6 +1688,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               T <= 8 && lb_ == 0 && le_ == g.n_layers && NE == 512 && K == 10 && hits_.d_res != nullptr &&
                               native_router_enabled() && strata::kernels::route_pred_active() &&
                               strata::kernels::route_pred_logits() != nullptr;
+    if (T >= 0 && T < 9) la_win_[T] = la_learn_win;   // the launches of this window size run the batch after them
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     auto pre = [&](int64_t l, int grp) -> bool {
@@ -2566,10 +2577,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // the look-ahead node: on la_cs_ (above) or the shared stream (STRATA_LOOKAHEAD_GPU_FORK=1), else here on cs
         if (la_gpu && !la_on_sh && !la_on_stream && !lookahead_node(cs)) return false;
-        // STRATA_LA_LEARN: this layer's router logits are the label of the two sources behind it (their saved inputs and predictions)
+        // STRATA_LA_LEARN: this layer's router logits are the label of this window's batch (copied here; the batch runs after the window)
         if (la_learn_win) {
             try {
-                strata::kernels::la_learn_train(l, logits_ + tb * NE, hits_.d_res + l * g.n_expert, n, cs);
+                strata::kernels::la_learn_label(l, logits_ + tb * NE, n, cs);
             } catch (const std::exception& e) { err = "verify look-ahead learner: " + std::string(e.what()); return false; }
         }
         // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
@@ -3425,7 +3436,9 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     // 0.1.43: the same gate run() applies before it launches (the adaptive tier's copies land first)
     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
         !adapt_gate_wait((int32_t) g_->n_layers, err)) return false;
+    la_learn_before_launch();
     const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
+    if (le == cudaSuccess && !la_learn_after_launch(T, err)) return false;
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -3491,6 +3504,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
             !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+        la_learn_before_launch();   // STRATA_LA_LEARN: the last batch's weights are done before this window reads them
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
         static const bool threaded_launch = [] {
@@ -3511,6 +3525,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         (void) cudaStreamQuery(cs_);
 #endif
         VDBG("launched\n");
+        if (!la_learn_after_launch(T, err)) return false;   // STRATA_LA_LEARN: this window's batch, on the side stream
     }
     // The overlapped split: the next stage's window is staged and launched on a helper thread while this thread
     // serves this stage's layers; its graph waits on the GPU for this stage's hand-off flag.  The guard joins the
@@ -5580,7 +5595,9 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
+    la_learn_before_launch();
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    if (le == cudaSuccess && !la_learn_after_launch(T, err)) return false;
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
