@@ -237,6 +237,20 @@ struct RouteResidentCfg {
     std::vector<bool> cls_seen = std::vector<bool>(kClasses, false);
     int req_class = 0;                        ///< this request's size class (route_budget_begin)
     long long req_tok_all = 0, req_fl_all = 0;   ///< this request's committed decode tokens and flips over the whole request (a brake does not reset them)
+    // STRATA_ROLLBACK=1 (opt-in, --serve decode): the flips' token positions (generate.cpp's committed count: gen_now before the window,
+    // fragile_pend_pos = gen_now + the cut row).  A brake also fires when >= kBrakeFlips flips fall within the last kRecentTok committed
+    // tokens; the brake's evidence (first and last flip position, old and new budget) is kept for the caller (route_brake_take).
+    enum { kRecentTok = 64, kFlipPosCap = 256 };
+    bool rollback_on = false;                 ///< STRATA_ROLLBACK (read once)
+    long long gen_now = 0;                    ///< the request's committed decode tokens before the window (route_gen_now)
+    long long fragile_pend_pos = 0;           ///< the pending cut row's token position (route_fragile_pos)
+    std::vector<long long> req_flip_pos;      ///< flips' positions since the request's last brake (capped, oldest dropped)
+    long long brake_seq = 0;                  ///< brakes so far in the process (route_brake_take compares it)
+    long long brake_taken = 0;                ///< the last brake_seq the caller took
+    long long brake_first = -1, brake_last = -1;   ///< the evidence of the last brake: its first and last flip positions
+    float brake_old = 0.0f, brake_new = 0.0f;
+    bool low_open_off = false;                ///< STRATA_ROUTE_LOW_OPEN's rollback redo: ranks < lo follow the learned budget from the start
+    bool low_open_seen = false;               ///< this request's windows ran with ranks < lo open (route_low_open_used)
     // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
     // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
     // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
@@ -4040,7 +4054,42 @@ void Verifier::route_budget_begin(int64_t prompt_tokens) {
     c.req_b = c.brake_on ? std::min(c.auto_b, std::max((float) c.cls_clean[k], c.cls_start[k] * c.auto_b)) : c.auto_b;
     c.req_rc = c.req_fl = c.req_tok = c.req_wins = c.req_brakes = 0;
     c.req_tok_all = c.req_fl_all = 0;
+    static const bool rollback_env = [] { const char* v = std::getenv("STRATA_ROLLBACK"); return v != nullptr && std::atoi(v) != 0; }();
+    c.rollback_on = rollback_env;   // STRATA_ROLLBACK (opt-in): the fast brake and the flips' positions
+    c.req_flip_pos.clear();
+    c.gen_now = 0;
+    c.fragile_pend_pos = 0;
+    c.low_open_off = false;
+    c.low_open_seen = false;
 }
+
+// STRATA_ROLLBACK (generate.cpp's serve decode loop): the committed count before the window, and the token position of a cut's row.
+void Verifier::route_gen_now(int64_t n) { route_resident_cfg().gen_now = (long long) n; }
+void Verifier::route_fragile_pos(int64_t pos) { route_resident_cfg().fragile_pend_pos = (long long) pos; }
+
+// The brakes since the last call: true with the first and last flip positions and the budget before and after (the rewind's evidence).
+bool Verifier::route_brake_take(int64_t& first, int64_t& last, float& old_b, float& new_b) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (c.brake_seq == c.brake_taken) return false;
+    c.brake_taken = c.brake_seq;
+    first = (int64_t) c.brake_first;
+    last = (int64_t) c.brake_last;
+    old_b = c.brake_old;
+    new_b = c.brake_new;
+    return true;
+}
+
+// STRATA_ROLLBACK: a rewind's reset of the switch's pending state (a cut's exact successor, the pending verdict) - the redo starts clean.
+void Verifier::route_rollback_reset() {
+    RouteResidentCfg& c = route_resident_cfg();
+    c.fragile_pend = false;
+    c.fragile_exact = false;
+    c.req_flip_pos.clear();
+}
+
+// STRATA_ROUTE_LOW_OPEN's early redo (generate.cpp): whether this request's windows ran ranks < lo open, and the redo that closes them.
+bool Verifier::route_low_open_used() { return route_resident_cfg().low_open_seen; }
+void Verifier::route_low_open_redo() { route_resident_cfg().low_open_off = true; }
 
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
 // STRATA_ROUTE_BUDGET_AUTO: a decode window (auto_ok) takes the search's b for both ranks; a cut's next window is exact for ranks < lo only.
@@ -4074,7 +4123,10 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
         // STRATA_ROUTE_LOW_OPEN=1 (opt-in experiment, 24 Oct): ranks < lo also start open (any resident stand-in) and take the
         // learned budget only after the request's first brake (the re-check saw flips)
         static const bool low_open = [] { const char* v = std::getenv("STRATA_ROUTE_LOW_OPEN"); return v != nullptr && std::atoi(v) != 0; }();
-        if (low_open && c.req_brakes == 0) b = 1e30f;
+        if (low_open && !c.low_open_off && c.req_brakes == 0) {   // (low_open_off: STRATA_ROLLBACK's early redo runs at the learned budget)
+            b = 1e30f;
+            c.low_open_seen = true;
+        }
     }
     if (decode && c.fragile_exact) {
         b = 0.0f;
@@ -4250,6 +4302,10 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
         ++c.req_fl;
         ++c.req_fl_all;
         ++c.auto_fl[c.auto_cut_arm];
+        if (c.rollback_on) {   // STRATA_ROLLBACK: where the flip is (route_fragile_pos), for the brake's evidence and the rewind
+            c.req_flip_pos.push_back(c.fragile_pend_pos);
+            if ((int) c.req_flip_pos.size() > RouteResidentCfg::kFlipPosCap) c.req_flip_pos.erase(c.req_flip_pos.begin());
+        }
     }
     double flip_lo = 0.0, flip_hi = 0.0, tok_lo = 0.0, tok_hi = 0.0, ctrl_lo = 0.0, ctrl_hi = 0.0;
     route_wilson90(c.req_fl, c.req_rc, flip_lo, flip_hi);
@@ -4257,7 +4313,13 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
     route_ctrl_bounds(c, ctrl_lo, ctrl_hi);   // the noise floor: the re-check flips must exceed it too
     const bool by_recheck = c.req_rc >= RouteResidentCfg::kBrakeMin && flip_lo > std::max(0.2, ctrl_hi);
     const bool by_token = c.req_tok >= RouteResidentCfg::kBrakeTokMin && c.req_fl >= RouteResidentCfg::kBrakeFlips && tok_lo > 0.01;
-    if (c.brake_on && c.req_b > 0.0f && (by_recheck || by_token)) {
+    // STRATA_ROLLBACK: the fast brake - >= kBrakeFlips flips within the last kRecentTok committed tokens (their positions in req_flip_pos)
+    int n_recent = 0;
+    if (c.rollback_on)
+        for (long long q : c.req_flip_pos)
+            if (q >= c.gen_now - RouteResidentCfg::kRecentTok) ++n_recent;
+    const bool by_recent = c.rollback_on && n_recent >= RouteResidentCfg::kBrakeFlips;
+    if (c.brake_on && c.req_b > 0.0f && (by_recheck || by_token || by_recent)) {
         const float old = c.req_b;
         // the class's clean level L (0 = none yet): the brake stops at L, unless the request already runs at L (it flipped there: not clean)
         const float known = (float) c.cls_clean[(size_t) c.req_class];
@@ -4268,7 +4330,23 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
         if (at_known) c.cls_clean[(size_t) c.req_class] = (double) c.req_b;   // the known-clean level flipped: it was not clean
         ++c.req_brakes;
         std::fprintf(stderr, "strata serve: stand-in brake: budget %.3f -> %.3f (%lld of %lld re-checks flipped, %lld flips in %lld tokens, %s)\n",
-                     (double) old, (double) c.req_b, c.req_fl, c.req_rc, c.req_fl, c.req_tok, by_token ? "per token" : "per re-check");
+                     (double) old, (double) c.req_b, c.req_fl, c.req_rc, c.req_fl, c.req_tok,
+                     by_recent && !by_token && !by_recheck ? "per 64 tokens" : by_token ? "per token" : "per re-check");
+        if (c.rollback_on) {   // the evidence for the caller's rewind: the flips since the last brake, or the recent ones for the fast brake
+            const bool recent_only = by_recent && !by_token && !by_recheck;
+            long long first = -1, last = -1;
+            for (long long q : c.req_flip_pos) {
+                if (recent_only && q < c.gen_now - RouteResidentCfg::kRecentTok) continue;
+                if (first < 0 || q < first) first = q;
+                if (q > last) last = q;
+            }
+            c.brake_first = first;
+            c.brake_last = last;
+            c.brake_old = old;
+            c.brake_new = c.req_b;
+            ++c.brake_seq;
+            c.req_flip_pos.clear();
+        }
         c.req_rc = 0;
         c.req_fl = 0;
         c.req_tok = 0;

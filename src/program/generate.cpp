@@ -15671,6 +15671,95 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
+            // ---- STRATA_ROLLBACK=1 (opt-in; --serve, one GPU, this serial loop).  A brake (route_fragile_settle: also on >= 3 flips
+            // within 64 committed tokens) rewinds the request to a restore point before its first flip, and decodes on with the
+            // tighter budget, so the client never receives the damaged text.  A restore point is the conversation checkpoint of
+            // the session's running state (GDN recurrences and conv, the PLE history, the QSA indexer tails and block scores);
+            // the positional K/V is written again by the windows after the point.  Points: the request's start, then one at
+            // the first window boundary at or after every 32 committed tokens; the newest five are kept.  Emitted tokens are
+            // held and released once they are 128 positions behind the newest committed one; the request's end releases the rest.
+            static const bool rb_env = [] { const char* v = std::getenv("STRATA_ROLLBACK"); return v != nullptr && std::atoi(v) != 0; }();
+            const bool rb_on = rb_env && o.serve && n_stages == 1 && !pl_ran;
+            constexpr int64_t kRbHold = 128, kRbStep = 32;
+            constexpr size_t kRbRing = 5;
+            struct RbPoint {
+                int64_t gen = 0, p = 0;   // committed decode tokens and the session's length at the point
+                int32_t x = 0;            // the next window's input (the last emitted token)
+                ConvCheckpoint ck;
+            };
+            RbPoint rb_origin;                  // the request's start (gen 0), when rb_origin_ok
+            bool rb_origin_ok = false;
+            std::vector<RbPoint> rb_ring;       // the newest kRbRing points, oldest first
+            std::vector<int32_t> rb_emitted;    // every emitted token by its index; the held ones are [rb_released, produced_n)
+            int64_t rb_released = 0;            // tokens sent to the server
+            int64_t rb_next = kRbStep;          // the next point is taken once produced_n reaches this
+            bool rb_fresh = false;              // the next window decodes one token: the drafts of the state before a rewind are not used
+            bool rb_pending = false;            // a brake fired in this window: rewind at the window's end
+            int64_t rb_first = -1, rb_last = -1;
+            float rb_old = 0.0f, rb_new = 0.0f;
+            int64_t rb_rewinds = 0, rb_regen = 0;
+            bool rb_early_used = false, rb_bytes_said = false;
+            // the session's state and position now (the window's commit is waited for); false when the copy failed
+            auto rb_take = [&](RbPoint& pt) -> bool {
+                pt.gen = produced_n;
+                pt.p = p;
+                pt.x = x;
+                pt.ck.ids.assign(consumed.begin(), consumed.begin() + (std::ptrdiff_t) p);
+                if (!ver.wait_commit(err) || !checkpoint_save(pt.ck, ss, g)) return false;
+                if (!rb_bytes_said) {
+                    rb_bytes_said = true;
+                    const size_t bytes = pt.ck.ids.size() * sizeof(int32_t) + pt.ck.gdn.size() + pt.ck.ple.size() +
+                                         pt.ck.tails.size() + pt.ck.dead.size() + pt.ck.block_pos.size();
+                    std::fprintf(stderr, "strata serve: rollback: a restore point holds %zu bytes (%.1f MB; %lld tokens held back)\n",
+                                 bytes, (double) bytes / 1048576.0, (long long) kRbHold);
+                }
+                return true;
+            };
+            if (rb_on && !cancelled) {
+                rb_origin_ok = rb_take(rb_origin);
+                if (!rb_origin_ok) std::fprintf(stderr, "strata serve: rollback: the request's start point failed; no rewind\n");
+            }
+            // the rewind's target for a brake whose first flip is at f: the newest point before f the server has not received
+            // (gen >= rb_released), else the oldest such point; nullptr when every point was received
+            auto rb_pick = [&](int64_t f) -> const RbPoint* {
+                std::vector<const RbPoint*> cand;
+                if (rb_origin_ok) cand.push_back(&rb_origin);
+                for (const RbPoint& q : rb_ring) cand.push_back(&q);
+                const RbPoint* best = nullptr;
+                for (const RbPoint* q : cand)
+                    if (q->gen >= rb_released && q->gen <= f - 1 && (best == nullptr || q->gen > best->gen)) best = q;
+                if (best != nullptr) return best;
+                for (const RbPoint* q : cand)
+                    if (q->gen >= rb_released && (best == nullptr || q->gen < best->gen)) best = q;
+                return best;
+            };
+            // puts a point back: the running state, the position and the emitted tokens after it dropped (all still held)
+            auto rb_restore = [&](const RbPoint& pt) -> bool {
+                const int64_t gen = pt.gen, np = pt.p;
+                const int32_t nx = pt.x;
+                if (!ver.wait_commit(err) || !checkpoint_restore(pt.ck, ss, g)) return false;
+                p = np;
+                x = nx;
+                produced_n = gen;
+                consumed.resize((size_t) np);
+                rb_emitted.resize((size_t) gen);
+                while (!rb_ring.empty() && rb_ring.back().gen > gen) rb_ring.pop_back();   // (pt may be one of them: copied above)
+                rb_next = gen + kRbStep;
+                first_window = gen == 0;   // the start: the prompt's merged window again
+                rb_fresh = !first_window;
+                if (sfx_on) {   // the lookup sources hold the prompt and the emitted tokens below the point, as before the window
+                    sfx.reset();
+                    for (int64_t t : ids) sfx.append((int32_t) t);
+                    for (int32_t t : rb_emitted) sfx.append(t);
+                }
+                if (o.lookup_chain > 0) {
+                    extra_sources_reset();
+                    for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
+                    for (int32_t t : rb_emitted) extra_sources_append(&t, 1);
+                }
+                strata::core::Verifier::route_rollback_reset();
+                return true;
+            };
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
@@ -15678,12 +15767,13 @@ int main(int argc, char** argv) {
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = merge_T > 0 ? merge_T : 1;
+                if (rb_fresh) T = 1;   // STRATA_ROLLBACK: after a rewind the first window decodes one token (no drafts of the old state)
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
+                if (o.suffix_draft > 0 && !first_window && !rb_fresh) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
@@ -15693,7 +15783,7 @@ int main(int argc, char** argv) {
                 }
                 // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
                 int chain_n = 0, cm = 0;
-                if (o.lookup_chain > 0 && !first_window && !from_sfx && T < S) {
+                if (o.lookup_chain > 0 && !first_window && !from_sfx && !rb_fresh && T < S) {
                     int csrc = -1;
                     const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
                     chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
@@ -15824,11 +15914,23 @@ int main(int argc, char** argv) {
                 // call at row 0 makes no cut and no re-run (a re-run would step the GDN/PLE state twice): the rows stand.
                 int fr_cut = -1;
                 // the previous cut's row, decided exactly by this window: its row 0's top-1 id (argmax; the sampled token is not judged)
+                if (rb_on) strata::core::Verifier::route_gen_now(produced_n);   // STRATA_ROLLBACK: the flips' positions
                 if (!merged && strata::core::Verifier::route_fragile_pending()) {
                     float ex_gap = 0.0f;
                     int32_t ex_top1 = -1;
                     const bool ex_ok = ver.route_fragile_gaps(1, &ex_gap, &ex_top1);
                     strata::core::Verifier::route_fragile_settle(ex_ok, ex_top1);
+                    if (rb_on) {   // STRATA_ROLLBACK: a brake in this settle rewinds at this window's end (below)
+                        int64_t bf = -1, bl = -1;
+                        float bo = 0.0f, bn = 0.0f;
+                        if (strata::core::Verifier::route_brake_take(bf, bl, bo, bn)) {
+                            rb_pending = true;
+                            rb_first = bf >= 0 ? bf : produced_n;
+                            rb_last = bl >= 0 ? bl : produced_n;
+                            rb_old = bo;
+                            rb_new = bn;
+                        }
+                    }
                 }
                 if (!merged && strata::core::Verifier::route_fragile_wants()) {
                     int a0 = 0;
@@ -15842,6 +15944,7 @@ int main(int argc, char** argv) {
                         if (r >= 1) {
                             const float ratio = fr_shift[(size_t) r] > 0.0f ? fr_gap[(size_t) r] / fr_shift[(size_t) r] : 0.0f;
                             strata::core::Verifier::route_fragile_cut(ratio, fr_top1[(size_t) r], fr_explore, fr_control);
+                            if (rb_on) strata::core::Verifier::route_fragile_pos(produced_n + r);   // STRATA_ROLLBACK: row r's token position
                             fr_cut = r;
                         }
                     }
@@ -15909,14 +16012,21 @@ int main(int argc, char** argv) {
                     draft_accepted += a;
                 }
                 first_window = false;
+                rb_fresh = false;
                 bool eos = false;
                 for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
-                    std::printf("T %d\n", (int) outv[(size_t) i]);
+                    if (rb_on) rb_emitted.push_back(outv[(size_t) i]);   // STRATA_ROLLBACK: held, released below
+                    else std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                }
+                // STRATA_ROLLBACK: the held tokens that are kRbHold positions behind the newest committed one go out (token i when i + kRbHold < produced)
+                while (rb_on && rb_released + kRbHold + 1 <= produced_n) {
+                    std::printf("T %d\n", (int) rb_emitted[(size_t) rb_released]);
+                    ++rb_released;
                 }
                 std::fflush(stdout);
                 ++rounds;
@@ -15954,6 +16064,42 @@ int main(int argc, char** argv) {
                 else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
                     policy.observe_chain(T_mtp, chain_n, a, cm,
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                // STRATA_ROLLBACK: a brake's rewind - this window is committed, and the tokens after the restore point are dropped
+                // (they were all held: rb_pick takes a point the server has not received)
+                if (rb_pending) {
+                    rb_pending = false;
+                    const RbPoint* pick = rb_pick(rb_first);
+                    if (pick == nullptr) {
+                        std::fprintf(stderr, "strata serve: rollback: no restore point is left unreleased; the brake's budget applies from here\n");
+                    } else {
+                        const int64_t from = produced_n, to = pick->gen;
+                        if (!rb_restore(*pick)) {
+                            std::printf("ERR rollback: the restore point could not be put back\n");
+                            return 1;
+                        }
+                        ++rb_rewinds;
+                        rb_regen += from - to;
+                        std::fprintf(stderr, "strata serve: rollback: rewound %lld tokens to position %lld (flips at %lld..%lld), budget %.3f -> %.3f\n",
+                                     (long long) (from - to), (long long) to, (long long) rb_first, (long long) rb_last, (double) rb_old, (double) rb_new);
+                        continue;
+                    }
+                }
+                // STRATA_ROLLBACK + STRATA_ROUTE_LOW_OPEN: a request that ends within its first 32 tokens while ranks < lo were open is
+                // redone from its first decode position, with ranks < lo at the learned budget (once per request)
+                if (eos && rb_on && !rb_early_used && rb_origin_ok && produced_n < 32 && strata::core::Verifier::route_low_open_used()) {
+                    rb_early_used = true;
+                    const int64_t from = produced_n;
+                    strata::core::Verifier::route_low_open_redo();
+                    if (!rb_restore(rb_origin)) {
+                        std::printf("ERR rollback: the request's start point could not be put back\n");
+                        return 1;
+                    }
+                    ++rb_rewinds;
+                    rb_regen += from;
+                    std::fprintf(stderr, "strata serve: rollback: the request ended after %lld tokens with ranks < lo open: redone from its first "
+                                         "decode position with ranks < lo at the learned budget\n", (long long) from);
+                    continue;
+                }
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 // SPEC 13.40 (STRATA_COUNT_KEPT=1): the rows whose input token was kept are rows 0..a; count only those picks
@@ -15961,6 +16107,26 @@ int main(int argc, char** argv) {
                     strata::kernels::route_rows_apply(a + 1, drive.d.usage.data(), g.n_layers, g.n_expert);
                 x = outv[(size_t) a];
                 p += a + 1;
+                if (rb_on && produced_n >= rb_next) {   // STRATA_ROLLBACK: a restore point at this boundary (the state is committed here)
+                    RbPoint pt;
+                    if (rb_take(pt)) {
+                        rb_ring.push_back(std::move(pt));
+                        if (rb_ring.size() > kRbRing) rb_ring.erase(rb_ring.begin());
+                    } else {
+                        std::fprintf(stderr, "strata serve: rollback: a restore point at %lld failed; no rewind to it\n", (long long) produced_n);
+                    }
+                    rb_next = produced_n + kRbStep;
+                }
+            }
+            // STRATA_ROLLBACK: the request's end - every held token goes out (no more rewinds after this)
+            if (rb_on) {
+                while (rb_released < produced_n) {
+                    std::printf("T %d\n", (int) rb_emitted[(size_t) rb_released]);
+                    ++rb_released;
+                }
+                std::fflush(stdout);
+                std::fprintf(stderr, "strata serve: rollback: %lld rewinds, %lld tokens regenerated, hold-back %lld\n",
+                             (long long) rb_rewinds, (long long) rb_regen, (long long) kRbHold);
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it

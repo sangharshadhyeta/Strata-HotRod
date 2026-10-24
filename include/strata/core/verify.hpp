@@ -232,6 +232,16 @@ public:
     static void route_fragile_cut(float ratio, int32_t stand_top1, bool explore = false, bool control = false);
     /// exact_ok false: the exact row could not be read, so the pending cut is dropped without a verdict.
     static void route_fragile_settle(bool exact_ok, int32_t exact_top1);
+    /// STRATA_ROLLBACK (opt-in; serve decode loop, verify.cpp).  route_gen_now: the request's committed decode tokens before the window;
+    /// route_fragile_pos: the pending cut row's token position (call after route_fragile_cut).  route_brake_take: true once per brake, with its
+    /// flips' first and last position and the budget before and after.  route_rollback_reset: a rewind's reset of the pending cut.
+    /// route_low_open_used / route_low_open_redo: STRATA_ROUTE_LOW_OPEN's early redo (ranks < lo open this request / closed from now on).
+    static void route_gen_now(int64_t n);
+    static void route_fragile_pos(int64_t pos);
+    static bool route_brake_take(int64_t& first, int64_t& last, float& old_b, float& new_b);
+    static void route_rollback_reset();
+    static bool route_low_open_used();
+    static void route_low_open_redo();
     /// This request's cuts, rows moved by stand-ins and flipped re-decisions, the current k, and the medians of the moved rows' shift and gap
     /// (false when the switch is off); resets the counts.  Also this request's decode budget at its end (req_b) and its brakes.
     static bool route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift, float& med_gap,
