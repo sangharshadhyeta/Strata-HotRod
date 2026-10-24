@@ -145,7 +145,7 @@ correct. Design and offline replays: [docs/PREDICTOR-EXPERIMENTS.md](docs/PREDIC
 | `STRATA_IO_GATE=1` | read-ahead gate by drive load: no gain with the learned look-ahead |
 | `STRATA_LA_EDGE_SKIP=1`, `STRATA_LA_MODEL=<file>` | superseded by the learned look-ahead |
 | `STRATA_GDN_LOOP=1` | looped middle layers: 10% slower, no clear accuracy gain |
-| `STRATA_ROUTER_FUSED=1`, `STRATA_GR_DOWN_WPC=4` | kernel switches, not yet measured |
+| `STRATA_ROUTER_FUSED=1`, `STRATA_GR_DOWN_WPC=4\|2` | byte-identical outputs; 58.8 / 57.5 / 59.4 against 59.3 and 57.7 tokens/s: no gain |
 
 ## Using it
 

@@ -126,7 +126,8 @@ Opt-in, measured 24 Oct and left off (same 3-question test, every answer correct
   5.9 against 5.4 s): the learned guesses and the stand-in test leave little waste, and what the gate holds back is often needed.
 - **Two kernel switches from 19 Oct** (`STRATA_ROUTER_FUSED=1`: the router's GEMV and top-10 in one launch;
   `STRATA_GR_DOWN_WPC=8|4|2`: warps per staged down block) with their byte-exact bench `bench/micro/hotrod_kernel_ab.sh`:
-  ported, not yet measured.
+  ported and measured 24 Oct: `bench/micro/hotrod_kernel_ab.sh` byte-identical on 3 seeds (and the split top-k); live,
+  3 questions: default 59.3 and 57.7, fused router 58.8, WPC=4 57.5, WPC=2 59.4 tokens/s - within the spread, no gain.
 
 ## Stand-in experts, rank by rank (the rule until 23 Oct; prompt reading still uses it)
 
