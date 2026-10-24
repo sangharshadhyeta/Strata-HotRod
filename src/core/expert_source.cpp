@@ -937,6 +937,12 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
     io_cv_.notify_one();
 }
 
+// STRATA_LA_TAIL_READ: the read-ahead queue's length now (the warm loop holds a rank >= lo guess back while it exceeds the worker count)
+size_t FileExpertSource::io_queue_depth() {
+    std::lock_guard<std::mutex> lk(io_mu_);
+    return io_q_.size();
+}
+
 // STRATA_IO_DEMAND_FIRST (prefetch, below): a demand read the workers take before any guess.  A guess already queued for
 // this blob is promoted (taken off the read-ahead queue), not read twice.  (19 Oct A/B: no gain - the decode waits the same
 // read either way; kept opt-in.)
@@ -5516,15 +5522,39 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int64_t nw = 0;
             // STRATA_IO_EDF: every token's rank 0 guess before any rank 1 guess (the workers then read a layer's guesses in this order)
             static const bool rank_major = [] { const char* v = std::getenv("STRATA_IO_EDF"); return v == nullptr || std::atoi(v) != 0; }();
-            const int64_t outer = rank_major ? std::min(d.gpu_pred_ranks, 10) : n_tok, inner = rank_major ? n_tok : std::min(d.gpu_pred_ranks, 10);
+            // STRATA_LA_TAIL_READ (mode from the verifier, per window; 0 = off): every rank 0-9 is considered, rank-major, so every rank < lo
+            // guess of every token is queued before any rank >= lo guess.  A rank >= lo guess is queued only while the file tier's queue
+            // holds no more than one guess per I/O worker (the queue's length when the batch starts, plus the tail guesses this batch queued)
+            const int tail_mode = la_tail_read_mode.load(std::memory_order_relaxed);
+            const bool tail_read = tail_mode != 0;
+            const int64_t tail_lo = la_tail_read_lo.load(std::memory_order_relaxed);
+            FileExpertSource* fs = tail_read ? dynamic_cast<FileExpertSource*>(d.src) : nullptr;
+            const size_t tail_room = fs != nullptr ? (size_t) std::max(0, fs->io_workers() - (int) fs->io_queue_depth()) : 0;
+            size_t tail_queued = 0;
+            const int64_t n_ranks = tail_read ? 10 : std::min(d.gpu_pred_ranks, 10);
+            const int64_t outer = rank_major ? n_ranks : n_tok, inner = rank_major ? n_tok : n_ranks;
             // STRATA_LA_TAIL_SKIP (decode, set per window by the verifier): the ids are ranked (r = the router's own order), so a
             // prediction at rank r >= the floor that no card holds is not read ahead while the tail budget is 0 (a stand-in serves it)
-            const int skip_from = la_tail_skip_from.load(std::memory_order_relaxed);
+            // (STRATA_LA_TAIL_READ replaces it: the open rule is mode 2 and the stand-in test is the kernel's, route_pred_tail_read)
+            const int skip_from = tail_read ? -1 : la_tail_skip_from.load(std::memory_order_relaxed);
             for (int64_t a = 0; a < outer; ++a)
                 for (int64_t b = 0; b < inner; ++b) {
                     const int64_t t = rank_major ? b : a, r = rank_major ? a : b;
                     const int32_t e = d.gpu_pred[(((size_t) target * kRoutePredDists + (size_t) route_pred_slot(dist)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+                    if (tail_read && r >= tail_lo) {
+                        if (tail_mode == 2) {   // the open rule: a resident stand-in serves this rank in this window, so it is not read
+                            la_tail_read_open_skips.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        if (std::find(want, want + nw, (int64_t) e) != want + nw) continue;
+                        if (tail_queued >= tail_room) {   // the drive is backed up: not queued now
+                            la_tail_read_held.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        ++tail_queued;
+                        la_tail_read_queued.fetch_add(1, std::memory_order_relaxed);
+                    }
                     if (skip_from >= 0 && r >= skip_from) {
                         la_tail_skipped.fetch_add(1, std::memory_order_relaxed);
                         continue;

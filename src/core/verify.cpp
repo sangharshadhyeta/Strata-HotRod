@@ -1106,6 +1106,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const bool ok = strata::kernels::la_learn_alloc(g.n_layers, g.n_embd, route_resident_cfg().lo, la_learn_timing_on(), lm);
         std::fprintf(stderr, "strata verify: STRATA_LA_LEARN: %s%s\n", ok ? "on, " : "NOT on: ", lm.c_str());
     }
+    // STRATA_LA_TAIL_READ=1: its stand-in counter (the same rule: allocated before any graph capture)
+    if ((std::getenv("STRATA_LA_TAIL_READ") != nullptr && std::atoi(std::getenv("STRATA_LA_TAIL_READ")) != 0) && strata::kernels::route_pred_active())
+        strata::kernels::route_pred_tail_read_alloc();
     // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
         strata::kernels::route_ring_alloc((size_t) (g.n_layers * g.n_expert));
@@ -2509,6 +2512,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool la_on_stream = false;   // HIP: the node stays on cs (the shared stream's cross-stream cost, as sh_stream_on)
 #endif
         static const bool la_edge_skip = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e != nullptr && std::atoi(e) != 0; }();
+        static const bool la_tail_read = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr && std::atoi(e) != 0; }();
         auto lookahead_node = [&](cudaStream_t s) -> bool {
             try {
                 // dist 4 (STRATA_LA_LEARN=1 only, after dists 1 and 2: the nearest deadline first in the warm loop); without the learner, dists 1 and 2
@@ -2535,6 +2539,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (la_edge_skip && hits_.d_res != nullptr)
                         strata::kernels::route_pred_edge_skip(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
                                                               hits_.d_res + (l + dist) * g.n_expert, n, s);
+                    // STRATA_LA_TAIL_READ (opt-in): a predicted rank >= lo that the router would serve with a resident stand-in is not read
+                    // (its id becomes -1).  The window's budgets are read on the device; under the open rule the kernel returns at once.
+                    if (la_tail_read && hits_.d_res != nullptr)
+                        strata::kernels::route_pred_tail_read(hits_.d_res + (l + dist) * g.n_expert, strata::kernels::route_pred_dev(l + dist, dist), n, s);
                 }
             } catch (const std::exception& e) { err = "verify look-ahead node: " + std::string(e.what()); return false; }
             return true;
@@ -4178,6 +4186,14 @@ static void la_tail_skip_update(const RouteResidentCfg& c) {
     int from = -1;
     if (on && c.margin >= 1e30f && c.lo >= 2 && c.win_tail <= 0.0f && c.budget_tail <= 0.0f) from = c.lo;
     strata::core::la_tail_skip_from.store(from, std::memory_order_relaxed);
+    // STRATA_LA_TAIL_READ=1 (opt-in): the read-ahead's ranks >= lo for this window, by the budgets the router's kernel reads now (the
+    // host-mapped config after this window's route_cfg_set_budgets): mode 2 = the open rule (no tail read), 1 = read, with the stand-in
+    // test on the device (route_pred_tail_read); 0 = off (the router is off too, or the switch is unset)
+    static const bool tail_read_on = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr && std::atoi(e) != 0; }();
+    int mode = 0;
+    if (tail_read_on && c.margin > 0.0f) mode = strata::kernels::route_cfg_tail_open() ? 2 : 1;
+    strata::core::la_tail_read_lo.store(c.lo, std::memory_order_relaxed);
+    strata::core::la_tail_read_mode.store(mode, std::memory_order_relaxed);
 }
 
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
@@ -4208,10 +4224,12 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
             route_auto_schedule(c);
         }
         b = route_auto_arm_b(c, c.auto_win_arm);   // the request's budget (base arm) or its scaled candidate
-        // ranks >= lo keep the old rule (any resident stand-in: budget_tail 0 sends the kernel to its margin test) until the re-check
-        // says otherwise: a request that braked (flips seen) takes the budget there too.  The tail never runs stricter than before
-        // without evidence (24 Oct: a tail budget from the start cost 87-89% against 92% card hits, 44-49 against 50 tok/s)
-        tail = c.req_brakes > 0 ? b : 0.0f;
+        // ranks >= lo take the same budget as ranks < lo from the request's first window (24 Oct evening, the user saw malformed
+        // JSON and code with the open tail).  STRATA_ROUTE_TAIL_OPEN=1 (opt-in) brings back the open tail: any resident stand-in
+        // (budget_tail 0 sends the kernel to its margin test) until the request brakes - faster (card hits 92% against 87-89%,
+        // 8.5K run 56 against 53.6 tok/s on 24 Oct) but the re-check alone did not keep code and JSON clean
+        static const bool tail_open = [] { const char* v = std::getenv("STRATA_ROUTE_TAIL_OPEN"); return v != nullptr && std::atoi(v) != 0; }();
+        tail = tail_open && c.req_brakes == 0 ? 0.0f : b;
         // STRATA_ROUTE_LOW_OPEN=1 (opt-in experiment, 24 Oct): ranks < lo also start open (any resident stand-in) and take the
         // learned budget only after the request's first brake (the re-check saw flips)
         static const bool low_open = [] { const char* v = std::getenv("STRATA_ROUTE_LOW_OPEN"); return v != nullptr && std::atoi(v) != 0; }();
@@ -4223,6 +4241,16 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     if (decode && c.fragile_exact) {
         b = 0.0f;
         c.fragile_exact = false;
+    }
+    // STRATA_ROUTE_BRAKE_STEP=1 (opt-in, 24 Oct, the user's rule; the default checks every rank from the first window): ranks >= lo
+    // start open (any resident stand-in) and each brake of the request moves the floor one rank up - the rank just above the checked
+    // ones joins them (the budget test), the ranks above it stay open.  The floor returns to lo for the next request.
+    static const bool brake_step = [] { const char* v = std::getenv("STRATA_ROUTE_BRAKE_STEP"); return v != nullptr && std::atoi(v) != 0; }();
+    if (brake_step && decode && c.auto_on) {
+        tail = 0.0f;
+        strata::kernels::route_cfg_set_floor((int) std::min<long long>((long long) c.lo + c.req_brakes, (long long) c.hi + 1));
+    } else if (brake_step) {
+        strata::kernels::route_cfg_set_floor(c.lo);
     }
     c.win_low = b;
     c.win_tail = tail;
