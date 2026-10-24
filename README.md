@@ -164,6 +164,43 @@ Measured 24 Oct (131K context; code / reasoning / prose tokens/s, every answer r
 
 Prompt reading keeps the rank rule below (the re-check is decode only).
 
+**Ranks 3-9 take the budget from the first token** (since 24 Oct evening, after malformed JSON and code were seen when
+they took any stand-in until the request's first brake). Measured the same evening on one build: 44.7 against 46.4 tokens/s
+averaged over 19 answers (about 4% slower, 10% on the 8.5K run), 12 of 12 JSON and code answers valid either way. Two other
+rules stay for testing: `STRATA_ROUTE_TAIL_OPEN=1` (ranks 3-9 take any stand-in until the request brakes) and
+`STRATA_ROUTE_BRAKE_STEP=1` (ranks 3-9 open, each brake moves the checked ranks up by one; in the 3-question test it gave
+a wrong maths answer, 11:24 / 144 km instead of 11:36 / 156 km).
+
+## The look-ahead learns (default since 24 Oct)
+
+The look-ahead guesses, a few layers early, which experts the next layers will route to, so they can be read from the SSD
+before they are needed. Until now the guess was the next layer's own router applied to this layer's input. It now
+**learns while it runs** (`STRATA_LA_LEARN`, default on, `=0` off):
+
+- **Three heads**, guessing 1, 2 and 4 layers ahead (the farther the guess, the more time the read has).
+- **Each guess = the router's own scores + a small learned correction** (a few "directions" per layer). With the correction
+  at zero it is exactly the old guess, so it cannot start worse.
+- **Trained on the card, every window, from the real routing** (the router's top-32 scores as the target, a hinge keeping
+  the rest below), in one batch at the window's end on a side stream.
+- **The size chooses itself.** Per layer and head, versions with 4, 8 and 16 directions compete live with the plain router
+  on the picks that matter (ranks below the stand-in floor that are not on the card); one replaces the leader only when it is
+  better at 90% confidence, then the losers stop training. A leader that falls behind the plain router is reset to it.
+- **It remembers**: `data/predictor-<model fingerprint>.bin`, loaded at the next start. Never in git.
+- **Only what will be computed is read** (`STRATA_LA_TAIL_READ=2`, default; `1` = ranks 3-9 only, `0` = off): every guess,
+  any rank, goes through the router's own stand-in test on the predicted scores, and a pick a stand-in will serve is not read.
+  Ranks below the floor are queued first; ranks 3-9 only while the read queue holds at most one guess per I/O worker.
+
+Live on the abliterated IQ3_S (24 Oct, share of the needed experts not on the card that the guesses held):
+
+| Lead | Plain router | Learned |
+| --- | --- | --- |
+| 1 layer | 77-79% | 85-88% |
+| 2 layers | 66-69% | 76-79% |
+| 4 layers | 55% | 66% |
+
+3-question test (code / reasoning / prose tokens/s, sampled, answers checked): default 52.7 / 67.4 / 50.3, learned
+53.1 / 70.6 / 52.9. Offline replays and the design notes: `docs/PREDICTOR-EXPERIMENTS.md`, `tools/predictor/`.
+
 ## Stand-in experts, rank by rank (the rule until 23 Oct; prompt reading still uses it)
 
 For every token, each layer's router picks 10 of 512 experts and ranks them, rank 0 the most important. The ones on the
