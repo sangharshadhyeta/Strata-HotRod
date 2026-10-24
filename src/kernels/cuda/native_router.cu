@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::kernels {
@@ -839,6 +840,7 @@ constexpr int kLaTok = 8;
 constexpr int kLaDist[] = {1, 2};
 constexpr int kLaNd = (int) (sizeof kLaDist / sizeof kLaDist[0]);
 constexpr int kLaNSlots = kLaSlots - 1;   // the trained slots per (s,d): ranks 4, 8, 16
+constexpr int kLaKernels = 8;             // the batch's kernels, in launch order: rank, score, prep, grad, upd_b, upd_a, decide, reinit
 constexpr int kLaCnt = 17;       // counters per (s,d): [0] picks since change, [1] picks in the recent 500, [2] picks all,
                                  // [3+c] hits since change, [7+c] hits recent, [11+c] hits all, [15] changes, [16] resets
 constexpr int kLaMinPicks = 200, kLaFreezePicks = 2000, kLaRecPicks = 500, kLaLeaderEvery = 4;
@@ -958,6 +960,9 @@ struct LaBatch {
     unsigned long long* tot_ns;  // timing: the batch's time on the side stream
     unsigned long long* wait_ns; // timing: how far the batch ran past the window's end (the next window's wait bound)
     unsigned long long* nwin;    // the windows whose batch ran
+    unsigned long long* rinfo;   // [Nsd][4]: the last reset's recent picks, plain hits, old leader's hits, old leader's slot
+    unsigned long long* kst;     // timing: the per-kernel profile (kst: starts, kacc: sums), [kLaKernels]
+    unsigned long long* kacc;
     int dist[kLaNd];
     int L, H, lo, n, Nd, Nsd, Nset, timing;
 };
@@ -1052,20 +1057,34 @@ __global__ void la_b_upd_b_k(LaBatch a) {   // grid (32, Nset), block 256: 512 x
     const size_t i = (size_t) sd * kLaE * r + (size_t) e * r + k;
     la_adam(a.B[c][i], a.mB[c][i], a.vB[c][i], g, a.tstep[z]);
 }
-__global__ void la_b_upd_a_k(LaBatch a) {   // grid (ceil(16 H / 256), Nset), block 256
+// the A update, tiled: a thread per column h updates all r rows of the set, so each x element is read once per window (not once per row);
+// du for the set sits in shared memory.  grid (ceil(H / 256), Nset), block 256.
+__global__ void la_b_upd_a_k(LaBatch a) {
     const int z = blockIdx.y;
     if (!a.act[z]) return;
     const int sd = z / kLaNSlots, c = z % kLaNSlots + 1, r = la_rank(c);
     const int s = sd / a.Nd;
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < r * a.H) {
-        const int k = idx / a.H, h = idx % a.H;
-        float g = 0.0f;
-        for (int t = 0; t < a.n; ++t) g += a.du[((size_t) z * kLaTok + t) * 16 + k] * a.x[((size_t) s * kLaTok + t) * a.H + h];
-        const size_t i = (size_t) sd * r * a.H + idx;
-        la_adam(a.A[c][i], a.mA[c][i], a.vA[c][i], g, a.tstep[z]);
+    __shared__ float du_s[kLaTok][16];
+    for (int i = threadIdx.x; i < kLaTok * 16; i += blockDim.x) du_s[i / 16][i % 16] = a.du[(size_t) z * kLaTok * 16 + i];
+    __syncthreads();
+    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h < a.H) {
+        float xt[kLaTok];
+        for (int t = 0; t < a.n; ++t) xt[t] = a.x[((size_t) s * kLaTok + t) * a.H + h];
+        for (int k = 0; k < r; ++k) {
+            float g = 0.0f;
+            for (int t = 0; t < a.n; ++t) g += du_s[t][k] * xt[t];
+            const size_t i = ((size_t) sd * r + k) * a.H + h;
+            la_adam(a.A[c][i], a.mA[c][i], a.vA[c][i], g, a.tstep[z]);
+        }
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) a.steps[sd * kLaSlots + c] = a.tstep[z];
+}
+// the batch's per-kernel profile (STRATA_LA_LEARN_TIMING=1): kst[k] is the start of kernel k on the side stream, kacc[k] the sum of its spans
+__global__ void la_b_mark_k(unsigned long long* kst, unsigned long long* kacc, int k, int end) {
+    const unsigned long long now = la_now();
+    if (!end) kst[k] = now;
+    else kacc[k] += now - kst[k];
 }
 
 // the window's decision, one thread per (s,d): the leader (a candidate beats the leader by a Newcombe Wilson 90% interval on >= 200 picks
@@ -1124,6 +1143,11 @@ __global__ void la_b_decide_k(LaBatch a) {   // grid ceil(Nsd / 64), block 64
             a.frozen[sd] = 0;
             a.reset[sd] = 1;
             c[16] += 1;
+            // why it fired (the host logs the last one): the recent picks, the plain router's and the old leader's hits, the old leader's slot
+            a.rinfo[sd * kLaSlots + 0] = (unsigned long long) nR;
+            a.rinfo[sd * kLaSlots + 1] = c[7];
+            a.rinfo[sd * kLaSlots + 2] = c[7 + L];
+            a.rinfo[sd * kLaSlots + 3] = (unsigned long long) L;
             c[0] = 0;
             for (int k = 0; k < kLaSlots; ++k) c[3 + k] = 0;
             for (int k = 1; k < kLaSlots; ++k) {
@@ -1198,6 +1222,14 @@ struct LaLearn {
     unsigned long long* tot_ns = nullptr;
     unsigned long long* wait_ns = nullptr;
     unsigned long long* nwin = nullptr;
+    unsigned long long* rinfo = nullptr;   // [Nsd][4]: the last reset's facts (LaBatch::rinfo)
+    unsigned long long* kst = nullptr;     // [kLaKernels]: the per-kernel profile (timing)
+    unsigned long long* kacc = nullptr;    // [kLaKernels]
+    // host: the real main-stream waits (the batch not done when a window's launch came): windows that found it pending, and the timed ones
+    unsigned long long win_pending = 0, win_waited = 0;
+    double wait_ms_total = 0.0;   // the timed waits so far (ms)
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> wait_ev;   // timing: before/after the wait on cs, read at the request's end
+    std::vector<unsigned long long> resets_seen;                  // host: per (s,d), the resets already logged
     std::vector<char> logged;    // host: the (s,d) whose chosen r was logged
     size_t bytes = 0;
 };
@@ -1253,6 +1285,9 @@ bool la_learn_alloc(int64_t n_layers, int64_t n_embd, int lo, bool timing, std::
     dalloc((void**) &s->tot_ns, sizeof(unsigned long long));
     dalloc((void**) &s->wait_ns, sizeof(unsigned long long));
     dalloc((void**) &s->nwin, sizeof(unsigned long long));
+    dalloc((void**) &s->rinfo, (size_t) s->Nsd * kLaSlots * sizeof(unsigned long long));
+    dalloc((void**) &s->kst, kLaKernels * sizeof(unsigned long long));
+    dalloc((void**) &s->kacc, kLaKernels * sizeof(unsigned long long));
     if (ok && (cudaStreamCreateWithFlags(&s->side, cudaStreamNonBlocking) != cudaSuccess ||
                cudaEventCreateWithFlags(&s->ev_end, cudaEventDisableTiming) != cudaSuccess ||
                cudaEventCreateWithFlags(&s->ev_done, cudaEventDisableTiming) != cudaSuccess)) {
@@ -1267,7 +1302,7 @@ bool la_learn_alloc(int64_t n_layers, int64_t n_embd, int lo, bool timing, std::
         cudaFree(s->x); cudaFree(s->u); cudaFree(s->pred); cudaFree(s->lab); cudaFree(s->rk); cudaFree(s->thr); cudaFree(s->g);
         cudaFree(s->du); cudaFree(s->act); cudaFree(s->tstep); cudaFree(s->steps); cudaFree(s->tick); cudaFree(s->live);
         cudaFree(s->lead); cudaFree(s->frozen); cudaFree(s->reset); cudaFree(s->cnt); cudaFree(s->st); cudaFree(s->tot_ns);
-        cudaFree(s->wait_ns); cudaFree(s->nwin);
+        cudaFree(s->wait_ns); cudaFree(s->nwin); cudaFree(s->rinfo); cudaFree(s->kst); cudaFree(s->kacc);
         if (s->side != nullptr) cudaStreamDestroy(s->side);
         if (s->ev_end != nullptr) cudaEventDestroy(s->ev_end);
         if (s->ev_done != nullptr) cudaEventDestroy(s->ev_done);
@@ -1339,9 +1374,29 @@ void la_learn_window_end(void* stream) {
 }
 
 // before a window's graph is launched on cs: the previous window's batch must be done (its weights, its inputs)
+// The real wait: the batch is pending when this window's launch comes, so the query tells whether cs will stall on it.  A window that
+// finds it not done is counted, and under TIMING an event before and after the wait on cs is kept (read at the request's end).
 void la_learn_pre_launch(void* stream) {
     if (!la_learn_active() || !g_la->pending) return;
-    cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), g_la->ev_done, 0);
+    LaLearn& s = *g_la;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    s.win_pending += 1;
+    if (cudaEventQuery(s.ev_done) == cudaSuccess) {   // done already: the wait costs nothing
+        cudaStreamWaitEvent(cs, s.ev_done, 0);
+        return;
+    }
+    (void) cudaGetLastError();   // cudaErrorNotReady: the batch is still running
+    s.win_waited += 1;
+    cudaEvent_t before = nullptr, after = nullptr;
+    if (s.timing && cudaEventCreate(&before) == cudaSuccess && cudaEventCreate(&after) == cudaSuccess) {
+        cudaEventRecord(before, cs);
+        cudaStreamWaitEvent(cs, s.ev_done, 0);
+        cudaEventRecord(after, cs);
+        s.wait_ev.emplace_back(before, after);
+        return;
+    }
+    (void) cudaGetLastError();
+    cudaStreamWaitEvent(cs, s.ev_done, 0);
 }
 
 // after a learning window's graph is launched on cs: the batch on the side stream, which waits for the window's end and records done
@@ -1359,17 +1414,38 @@ void la_learn_post_launch(void* stream, const int* res, int n) {
     a.rk = s.rk; a.thr = s.thr; a.g = s.g; a.du = s.du; a.act = s.act; a.tstep = s.tstep;
     a.steps = s.steps; a.live = s.live; a.lead = s.lead; a.frozen = s.frozen; a.reset = s.reset; a.tick = s.tick;
     a.cnt = s.cnt; a.st = s.st; a.tot_ns = s.tot_ns; a.wait_ns = s.wait_ns; a.nwin = s.nwin;
+    a.rinfo = s.rinfo; a.kst = s.kst; a.kacc = s.kacc;
     for (int i = 0; i < kLaNd; ++i) a.dist[i] = kLaDist[i];
     a.L = s.L; a.H = s.H; a.lo = s.lo; a.n = n; a.Nd = kLaNd; a.Nsd = s.Nsd; a.Nset = s.Nset; a.timing = s.timing ? 1 : 0;
     cudaStream_t sd_s = s.side;
+    // TIMING: a one-thread mark before and after each kernel, in launch order (la_b_mark_k: the per-kernel sums)
+    auto mark = [&](int k, int end) {
+        if (s.timing) la_b_mark_k<<<1, 1, 0, sd_s>>>(s.kst, s.kacc, k, end);
+    };
+    mark(0, 0);
     la_b_rank_k<<<dim3(n, s.L), kLaE, 0, sd_s>>>(a);
+    mark(0, 1);
+    mark(1, 0);
     la_b_score_k<<<dim3(n, s.Nsd, kLaSlots), kLaE, 0, sd_s>>>(a);
+    mark(1, 1);
+    mark(2, 0);
     la_b_prep_k<<<(s.Nset + 63) / 64, 64, 0, sd_s>>>(a);
+    mark(2, 1);
+    mark(3, 0);
     la_b_grad_k<<<dim3(n, s.Nset), kLaE, 0, sd_s>>>(a);
+    mark(3, 1);
+    mark(4, 0);
     la_b_upd_b_k<<<dim3(32, s.Nset), 256, 0, sd_s>>>(a);
-    la_b_upd_a_k<<<dim3((16 * s.H + 255) / 256, s.Nset), 256, 0, sd_s>>>(a);
+    mark(4, 1);
+    mark(5, 0);
+    la_b_upd_a_k<<<dim3((s.H + 255) / 256, s.Nset), 256, 0, sd_s>>>(a);
+    mark(5, 1);
+    mark(6, 0);
     la_b_decide_k<<<(s.Nsd + 63) / 64, 64, 0, sd_s>>>(a);
+    mark(6, 1);
+    mark(7, 0);
     la_b_reinit_k<<<dim3(160, s.Nsd), 256, 0, sd_s>>>(a);
+    mark(7, 1);
     if (s.timing) la_b_end_k<<<1, 1, 0, sd_s>>>(a);
     cudaEventRecord(s.ev_done, sd_s);
     s.pending = true;
@@ -1431,22 +1507,58 @@ std::string la_learn_report() {
     for (int dd = 0; dd < kLaNd; ++dd)
         out += (dd > 0 ? ", " : " ") + std::string("d=") + std::to_string(kLaDist[dd]) + " " + pct(hit_l[dd], tot[dd]) + " vs plain " +
                pct(hit_p[dd], tot[dd]);
-    out += " (non-resident ranks < lo; picks since each layer's last change), resets " + std::to_string(resets);
-    if (!s.timing) {
-        out += ", batch timing off (STRATA_LA_LEARN_TIMING=1 measures it)\n";
-        return out;
+    out += " (non-resident ranks < lo; picks since each layer's last change), resets " + std::to_string(resets) + "\n";
+    // the resets: each (s,d)'s last one, logged when its count has grown (the recent picks, the plain router's hits, the old leader's)
+    if (s.resets_seen.size() != (size_t) s.Nsd) s.resets_seen.assign((size_t) s.Nsd, 0);
+    std::vector<unsigned long long> ri((size_t) s.Nsd * kLaSlots, 0);
+    if (cudaMemcpy(ri.data(), s.rinfo, ri.size() * sizeof(unsigned long long), cudaMemcpyDeviceToHost) != cudaSuccess) (void) cudaGetLastError();
+    for (int sd = 0; sd < s.Nsd; ++sd) {
+        const unsigned long long n_rs = cnt[(size_t) sd * kLaCnt + 16];
+        if (n_rs == s.resets_seen[(size_t) sd]) continue;
+        s.resets_seen[(size_t) sd] = n_rs;
+        const unsigned long long* q = ri.data() + (size_t) sd * kLaSlots;
+        out += "strata serve: look-ahead learner: layer " + std::to_string(sd / kLaNd) + " d=" + std::to_string(kLaDist[sd % kLaNd]) +
+               " reset (" + std::to_string(n_rs) + " so far): at " + std::to_string(q[0]) + " recent picks the plain router had " +
+               std::to_string(q[1]) + " hits, the leader r=" + std::to_string(la_rank((int) q[3])) + " " + std::to_string(q[2]) + "\n";
     }
-    unsigned long long tot_ns = 0, wait_ns = 0, nwin = 0;
+    // the main stream's real waits on the batch: the windows that found it pending, and (TIMING) the time cs spent waiting
+    for (auto& p : s.wait_ev) {
+        float ms = 0.0f;
+        if (cudaEventSynchronize(p.second) == cudaSuccess && cudaEventElapsedTime(&ms, p.first, p.second) == cudaSuccess) s.wait_ms_total += ms;
+        else (void) cudaGetLastError();
+        cudaEventDestroy(p.first);
+        cudaEventDestroy(p.second);
+    }
+    s.wait_ev.clear();
+    char wbuf[200];
+    std::snprintf(wbuf, sizeof wbuf, "strata serve: look-ahead learner: main stream waited on the batch in %llu of %llu windows%s\n",
+                  s.win_waited, s.win_pending, s.timing ? "" : " (not timed: STRATA_LA_LEARN_TIMING=1 times it)");
+    out += wbuf;
+    if (s.timing) {
+        std::snprintf(wbuf, sizeof wbuf, "strata serve: look-ahead learner: waited %.3f ms in total (measured on cs)\n", s.wait_ms_total);
+        out += wbuf;
+    }
+    if (!s.timing) return out;
+    unsigned long long tot_ns = 0, wait_ns = 0, nwin = 0, kacc[kLaKernels] = {};
     if (cudaMemcpy(&tot_ns, s.tot_ns, sizeof tot_ns, cudaMemcpyDeviceToHost) != cudaSuccess ||
         cudaMemcpy(&wait_ns, s.wait_ns, sizeof wait_ns, cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(&nwin, s.nwin, sizeof nwin, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaMemcpy(&nwin, s.nwin, sizeof nwin, cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(kacc, s.kacc, sizeof kacc, cudaMemcpyDeviceToHost) != cudaSuccess) {
         (void) cudaGetLastError();
-        return out + "\n";
+        return out;
     }
     const double w = nwin > 0 ? (double) nwin : 1.0;
-    char buf[160];
-    std::snprintf(buf, sizeof buf, ", batch on the side stream %.3f ms/window, main stream waited (bound) %.3f ms/window over %llu windows\n",
-                  (double) tot_ns / 1e6 / w, (double) wait_ns / 1e6 / w, nwin);
+    static const char* const kname[kLaKernels] = {"rank", "score", "prep", "grad", "upd_b", "upd_a", "decide", "reinit"};
+    std::string per;
+    for (int k = 0; k < kLaKernels; ++k) {
+        char kb[48];
+        std::snprintf(kb, sizeof kb, "%s %.3f", kname[k], (double) kacc[k] / 1e6 / w);
+        per += (k > 0 ? ", " : "") + std::string(kb);
+    }
+    char buf[320];
+    std::snprintf(buf, sizeof buf, "strata serve: look-ahead learner: batch on the side stream %.3f ms/window (per kernel ms: %s), "
+                  "end-of-window wait bound %.3f ms/window, over %llu windows\n",
+                  (double) tot_ns / 1e6 / w, per.c_str(), (double) wait_ns / 1e6 / w, nwin);
     return out + buf;
 }
 
@@ -1461,10 +1573,11 @@ bool la_learn_save(const char* path, std::string& msg) {
     const std::string tmp = std::string(path) + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
     if (f == nullptr) { msg = "cannot write " + tmp; return false; }
-    const uint32_t hdr[5] = {0x314C414Cu, 1u, (uint32_t) s.L, (uint32_t) s.H, (uint32_t) kLaE};
+    // version 2: each word is the leader's rank, | 256 when the (s,d) is frozen (its leader alone trains, every 4th window)
+    const uint32_t hdr[5] = {0x314C414Cu, 2u, (uint32_t) s.L, (uint32_t) s.H, (uint32_t) kLaE};
     bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1;
     for (int sd = 0; ok && sd < s.Nsd; ++sd) {
-        const uint32_t r = (uint32_t) la_rank(lead[sd]);
+        const uint32_t r = (uint32_t) la_rank(lead[sd]) | (frozen[sd] ? 256u : 0u);
         ok = std::fwrite(&r, sizeof r, 1, f) == 1;
     }
     for (int sd = 0; ok && sd < s.Nsd; ++sd) {
@@ -1492,14 +1605,17 @@ bool la_learn_load(const char* path, std::string& msg) {
     FILE* f = std::fopen(path, "rb");
     if (f == nullptr) { msg = "no file"; return false; }
     uint32_t hdr[5] = {0, 0, 0, 0, 0};
-    bool ok = std::fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x314C414Cu && hdr[1] == 1u && (int) hdr[2] == s.L &&
+    bool ok = std::fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x314C414Cu && (hdr[1] == 1u || hdr[1] == 2u) && (int) hdr[2] == s.L &&
               (int) hdr[3] == s.H && hdr[4] == (uint32_t) kLaE;
     if (!ok) { std::fclose(f); msg = "not a LAL1 file for this model"; return false; }
-    std::vector<int> rl((size_t) s.Nsd, 0);
+    std::vector<int> rl((size_t) s.Nsd, 0), fzv((size_t) s.Nsd, 0);
     for (int sd = 0; ok && sd < s.Nsd; ++sd) {
-        uint32_t r = 0;
-        ok = std::fread(&r, sizeof r, 1, f) == 1 && (r == 0 || r == 4 || r == 8 || r == 16);
+        uint32_t w = 0;
+        ok = std::fread(&w, sizeof w, 1, f) == 1;
+        const uint32_t r = w & 255u;
+        ok = ok && (r == 0 || r == 4 || r == 8 || r == 16) && (w >> 9) == 0;
         rl[(size_t) sd] = (int) r;
+        fzv[(size_t) sd] = (int) ((w >> 8) & 1u);
     }
     std::vector<float> hA[kLaSlots], hB[kLaSlots];
     for (int c = 1; c < kLaSlots; ++c) {
@@ -1541,16 +1657,23 @@ bool la_learn_load(const char* path, std::string& msg) {
         cudaMemset(s.vB[c], 0, nb);
     }
     std::vector<int> live((size_t) s.Nsd * kLaSlots, 1), zero((size_t) s.Nsd * kLaSlots, 0), zsd((size_t) s.Nsd, 0);
+    // a frozen (s,d) keeps only its leader training (every 4th window); its candidates are not restarted
+    for (int sd = 0; sd < s.Nsd; ++sd)
+        if (fzv[(size_t) sd])
+            for (int k = 1; k < kLaSlots; ++k) live[(size_t) sd * kLaSlots + k] = lead[(size_t) sd] == k ? 1 : 0;
     cudaMemcpy(s.lead, lead.data(), lead.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(s.live, live.data(), live.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(s.steps, zero.data(), zero.size() * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(s.frozen, zsd.data(), zsd.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(s.frozen, fzv.data(), fzv.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(s.reset, zsd.data(), zsd.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(s.tick, zsd.data(), zsd.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(s.cnt, 0, (size_t) s.Nsd * kLaCnt * sizeof(unsigned long long));
     s.logged.assign((size_t) s.Nsd, 0);
+    s.resets_seen.assign((size_t) s.Nsd, 0);
     if (cudaGetLastError() != cudaSuccess) { msg = "the copy to the GPU failed"; return false; }
-    msg = "loaded";
+    int nfrozen = 0;
+    for (int v : fzv) nfrozen += v;
+    msg = "loaded, " + std::to_string(nfrozen) + " of " + std::to_string(s.Nsd) + " frozen";
     return true;
 }
 }
