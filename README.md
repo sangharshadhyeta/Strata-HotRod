@@ -190,6 +190,8 @@ scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build -
 ```
 
 - `--build` matters: without it, setup downloads upstream's ready-made engine, which does not have this fork's changes.
+  The engine it compiles was checked against the one measured here (24 Oct, 3 questions alternated twice): 57.9 / 55.5
+  against 58.6 / 55.9 tokens/s, the same within run-to-run spread, every answer correct.
 - The speeds above use a 262K context: after setup, set `--max-context 262144` in the config's `args`. From 64K the K/V
   streams from RAM by itself.
 - `--model IQ3_S` is the size tested here. Setup says IQ3_S wants a 64 GB PC; naming it explicitly is the consent, and
