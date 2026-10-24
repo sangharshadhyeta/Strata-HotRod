@@ -16672,6 +16672,11 @@ int main(int argc, char** argv) {
             if (static const bool la_edge_skip_on = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e != nullptr && std::atoi(e) != 0; }(); la_edge_skip_on)
                 std::fprintf(stderr, "strata serve: look-ahead edge skip: %llu rank-2 predictions had a resident stand-in within the edge\n",
                              (unsigned long long) strata::kernels::route_pred_edge_skips_take());
+            // STRATA_LA_TAIL_SKIP (opt-in): the decode read-ahead's rank >= lo predictions not read, since the previous request (the count
+            // is taken and zeroed here); a stand-in serves them while the window's tail budget is 0 (la_tail_skip_update, verify.cpp)
+            if (static const bool la_tail_skip_on = [] { const char* e = std::getenv("STRATA_LA_TAIL_SKIP"); return e != nullptr && std::atoi(e) != 0; }(); la_tail_skip_on)
+                std::fprintf(stderr, "strata serve: look-ahead tail skip: %lld rank>=lo predictions dropped (a stand-in will serve them)\n",
+                             strata::core::la_tail_skipped.exchange(0, std::memory_order_relaxed));
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
             if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)

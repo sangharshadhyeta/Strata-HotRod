@@ -271,6 +271,13 @@ protected:
 /// source to `warm` the rest, so their pages are on the way while layer l computes.  A prediction only warms pages:
 /// it never changes which experts are computed or how.
 struct ForesightSwap;
+/// STRATA_LA_TAIL_SKIP=1 (opt-in): the rank from which a decode read-ahead prediction is dropped when its expert is not card-resident
+/// (-1 = off, the default).  Set per decode window by the verifier (verify.cpp la_tail_skip_update) from the floor `lo` of
+/// STRATA_ROUTE_RESIDENT_RANKS: while the window's tail budget is 0 the router serves those ranks with a resident stand-in, so the
+/// read would be wasted.  Read by the GPU look-ahead's warm loop (expert_pool_dispatch_multi) and by RouterLookahead's decode submit.
+inline std::atomic<int> la_tail_skip_from{-1};
+/// the predictions dropped by la_tail_skip_from since the last take (the request's stats line takes and zeroes it)
+inline std::atomic<long long> la_tail_skipped{0};
 class RouterLookahead {
 public:
     RouterLookahead() = default;
@@ -292,7 +299,8 @@ public:
     bool has_model() const { return !model_w_.empty(); }
     /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
     /// prediction still running for an earlier layer makes this one skip.
-    void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
+    /// `tail_skip_from` >= 0 (STRATA_LA_TAIL_SKIP, decode only): the guesses at rank >= it that no card holds are not queued.
+    void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res, int tail_skip_from = -1);
     /// STRATA_IO_PREFETCH_DEPTH: how many layers ahead of `layer` are predicted and warmed (default 1, the next layer).
     /// A deeper one predicts layer + j from layer's input, which is less exact the further it looks.
     void set_depth(int d) { depth_ = d < 1 ? 1 : d > 4 ? 4 : d; }
@@ -335,6 +343,7 @@ private:
     bool quit_ = false, pending_ = false, busy_ = false;
     int64_t layer_ = -1, n_tok_ = 0;
     const int32_t* host_res_ = nullptr;
+    int skip_from_ = -1;                            ///< (under mu_) submit's tail_skip_from
     uint64_t sub_gen_ = 0;
     ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
     std::vector<float> x_;

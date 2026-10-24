@@ -2855,7 +2855,7 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     return true;
 }
 
-void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res) {
+void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res, int tail_skip_from) {
     if (layer + 1 >= (int64_t) routers_.size() || n_tok <= 0 || x == nullptr) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -2864,6 +2864,7 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
         host_res_ = host_res;
+        skip_from_ = tail_skip_from;
         sub_gen_ = gen_.load(std::memory_order_relaxed);
         pending_ = true;
     }
@@ -2988,6 +2989,7 @@ void RouterLookahead::run() {
     for (;;) {
         int64_t layer, nt;
         const int32_t* host_res;
+        int skip_from;
         ForesightSwap* fs;
         uint64_t sgen;
         {
@@ -2999,6 +3001,7 @@ void RouterLookahead::run() {
             layer = layer_;
             nt = n_tok_;
             host_res = host_res_;
+            skip_from = skip_from_;
             fs = fs_;
             if (logits.size() < (size_t) max_tok_ * (size_t) n_expert_) logits.resize((size_t) max_tok_ * (size_t) n_expert_);
             sgen = sub_gen_;
@@ -3061,6 +3064,12 @@ void RouterLookahead::run() {
             for (int j = 0; j < kmax; ++j) {
                 const int64_t e = order[(size_t) j];
                 if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;   // on the GPU
+                // STRATA_LA_TAIL_SKIP (decode): rank j >= the floor lo that no card holds is not read ahead (the stand-in serves it).
+                // The rank is this guess's place in its own sort (j); skip_from comes from the window's tail budget (la_tail_skip_from)
+                if (skip_from >= 0 && j >= skip_from && j < k_) {
+                    la_tail_skipped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
                 if (j < k_ && std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
                 if (stats_on_ && dj == 0)
                     for (int s = 0; s < 3; ++s)
@@ -5434,11 +5443,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             // STRATA_IO_EDF: every token's rank 0 guess before any rank 1 guess (the workers then read a layer's guesses in this order)
             static const bool rank_major = [] { const char* v = std::getenv("STRATA_IO_EDF"); return v == nullptr || std::atoi(v) != 0; }();
             const int64_t outer = rank_major ? std::min(d.gpu_pred_ranks, 10) : n_tok, inner = rank_major ? n_tok : std::min(d.gpu_pred_ranks, 10);
+            // STRATA_LA_TAIL_SKIP (decode, set per window by the verifier): the ids are ranked (r = the router's own order), so a
+            // prediction at rank r >= the floor that no card holds is not read ahead while the tail budget is 0 (a stand-in serves it)
+            const int skip_from = la_tail_skip_from.load(std::memory_order_relaxed);
             for (int64_t a = 0; a < outer; ++a)
                 for (int64_t b = 0; b < inner; ++b) {
                     const int64_t t = rank_major ? b : a, r = rank_major ? a : b;
                     const int32_t e = d.gpu_pred[(((size_t) target * 2 + (size_t) (dist - 1)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+                    if (skip_from >= 0 && r >= skip_from) {
+                        la_tail_skipped.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
                     if (std::find(want, want + nw, (int64_t) e) == want + nw) want[nw++] = e;
                 }
             t_decode_guess = true;
@@ -5452,7 +5468,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (d.layers == 0) d.lookahead->stats_window_start();
             d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
         }
-        d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
+        // STRATA_LA_TAIL_SKIP: decode windows only (n <= 8, as the GPU look-ahead); the prompt windows keep every guess
+        const int tail_from = n_tok <= 8 ? la_tail_skip_from.load(std::memory_order_relaxed) : -1;
+        d.lookahead->submit(d.layers, x_f, n_tok, d.host_res, tail_from);   // CS-T: warm layer + 1
     }
     if (k < 1 || n_tok * k > kMaxWindowEntries) {
         d.failed = true;

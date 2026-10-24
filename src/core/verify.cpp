@@ -4091,11 +4091,27 @@ void Verifier::route_rollback_reset() {
 bool Verifier::route_low_open_used() { return route_resident_cfg().low_open_seen; }
 void Verifier::route_low_open_redo() { route_resident_cfg().low_open_off = true; }
 
+// STRATA_LA_TAIL_SKIP=1 (opt-in): the decode read-ahead drops its predictions at ranks >= lo that no card holds while this window's tail
+// budget is 0, because route_resident_k then serves those ranks with a resident stand-in.  The rule is exactly that serving rule only where
+// it is "any stand-in": the margin is unlimited (1e30, the production config) and the tail budget is 0 (win_tail, or the static budget_tail
+// when the AUTO budget is off).  A finite margin or a tail budget > 0 (a braked request) keeps every read.  lo is the configured floor
+// (STRATA_ROUTE_RESIDENT_RANKS); a floor below 2 is left alone (ranks 0-1 have the RAM floor's own margins).  Published to
+// strata::core::la_tail_skip_from for the look-ahead (expert_source.cpp), -1 = off.
+static void la_tail_skip_update(const RouteResidentCfg& c) {
+    static const bool on = [] { const char* e = std::getenv("STRATA_LA_TAIL_SKIP"); return e != nullptr && std::atoi(e) != 0; }();
+    int from = -1;
+    if (on && c.margin >= 1e30f && c.lo >= 2 && c.win_tail <= 0.0f && c.budget_tail <= 0.0f) from = c.lo;
+    strata::core::la_tail_skip_from.store(from, std::memory_order_relaxed);
+}
+
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
 // STRATA_ROUTE_BUDGET_AUTO: a decode window (auto_ok) takes the search's b for both ranks; a cut's next window is exact for ranks < lo only.
 void Verifier::route_budget_window(bool decode, bool auto_ok) {
     RouteResidentCfg& c = route_resident_cfg();
-    if (!c.dyn_on && !c.fragile_on) return;
+    if (!c.dyn_on && !c.fragile_on) {
+        la_tail_skip_update(c);   // (the static budget_tail decides the tail here: win_tail is never set)
+        return;
+    }
     if (decode && c.fragile_on) route_fragile_zero_shift();   // STRATA_FRAGILE_RECHECK: this window's stand-in moves start at zero
     if (decode && c.brake_on && ++c.req_wins % RouteResidentCfg::kBrakeWindows == 0) route_brake_grow(c);   // STRATA_FRAGILE_BRAKE
     float b = c.budget;
@@ -4135,6 +4151,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     c.win_low = b;
     c.win_tail = tail;
     strata::kernels::route_cfg_set_budgets(b, tail);
+    la_tail_skip_update(c);
 }
 
 // STRATA_FRAGILE_RECHECK.  route_fragile_wants: the window that just ran had a stand-in budget (ranks < lo or the tail).
