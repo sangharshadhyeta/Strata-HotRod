@@ -948,33 +948,43 @@ namespace {
 // counts again, as in a sorted list); a tree over the block's (first, second) pairs leaves the row's top two in slot 0.
 // Shared memory only, so it runs the same on CUDA and HIP.
 constexpr int kMarginThreads = 256;
-__global__ void logits_margin_kernel(const float* __restrict__ logits, int n, float* __restrict__ gap) {
+__global__ void logits_margin_kernel(const float* __restrict__ logits, int n, float* __restrict__ gap, int32_t* __restrict__ top1) {
     __shared__ float s1[kMarginThreads], s2[kMarginThreads];
+    __shared__ int i1[kMarginThreads];
     const float* l = logits + (size_t) blockIdx.x * (size_t) n;
     float m1 = -INFINITY, m2 = -INFINITY;
+    int j1 = -1;
     for (int v = (int) threadIdx.x; v < n; v += kMarginThreads) {
         const float x = l[v];
-        if (x > m1) { m2 = m1; m1 = x; }
+        if (x > m1 || j1 < 0) { m2 = m1; m1 = x; j1 = v; }
         else if (x > m2) m2 = x;
     }
     s1[threadIdx.x] = m1;
     s2[threadIdx.x] = m2;
+    i1[threadIdx.x] = j1;
     for (int s = kMarginThreads / 2; s > 0; s >>= 1) {
         __syncthreads();
         if ((int) threadIdx.x < s) {
             const float a1 = s1[threadIdx.x], a2 = s2[threadIdx.x], b1 = s1[threadIdx.x + s], b2 = s2[threadIdx.x + s];
+            const int ai = i1[threadIdx.x], bi = i1[threadIdx.x + s];
+            // the top-1 id: the larger first value; on a tie the smaller id (the same rule for every window, so stand-in and exact agree)
+            const bool take_b = b1 > a1 || (b1 == a1 && bi >= 0 && (ai < 0 || bi < ai));
+            i1[threadIdx.x] = take_b ? bi : ai;
             s1[threadIdx.x] = fmaxf(a1, b1);
             s2[threadIdx.x] = fmaxf(fminf(a1, b1), fmaxf(a2, b2));
         }
     }
     __syncthreads();
-    if (threadIdx.x == 0) gap[blockIdx.x] = s1[0] - s2[0];
+    if (threadIdx.x == 0) {
+        gap[blockIdx.x] = s1[0] - s2[0];
+        top1[blockIdx.x] = i1[0];
+    }
 }
 }  // namespace
 
-void logits_margin_rows(const float* logits, int n_rows, int n, float* gap, void* stream) {
+void logits_margin_rows(const float* logits, int n_rows, int n, float* gap, int32_t* top1, void* stream) {
     if (n_rows <= 0 || n <= 0) return;
-    logits_margin_kernel<<<dim3((unsigned) n_rows), kMarginThreads, 0, (cudaStream_t) stream>>>(logits, n, gap);
+    logits_margin_kernel<<<dim3((unsigned) n_rows), kMarginThreads, 0, (cudaStream_t) stream>>>(logits, n, gap, top1);
     check("logits_margin_rows");
 }
 

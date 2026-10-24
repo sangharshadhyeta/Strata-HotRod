@@ -181,8 +181,9 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 inline constexpr int kNonfiniteBlocks = 16;
 void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream);
 /// STRATA_ROUTE_BUDGET_DYN: gap[t] = the top-1 minus the top-2 RAW logit of row t (n floats a row) for n_rows rows, one block a
-/// row.  A row whose logits hold a NaN gives a NaN or a non-finite gap (the host treats those as close).  CUDA and HIP.
-void logits_margin_rows(const float* logits, int n_rows, int n, float* gap, void* stream);
+/// row.  A row whose logits hold a NaN gives a NaN or a non-finite gap (the host treats those as close).  top1[t] = the row's top-1 id
+/// (the smaller id on a tie; STRATA_FRAGILE_RECHECK judges flips on it, not on the sampled token).  CUDA and HIP.
+void logits_margin_rows(const float* logits, int n_rows, int n, float* gap, int32_t* top1, void* stream);
 /// True where row_top_prob_split runs as its own kernel (CUDA; AMD keeps the one-block row_top_prob, so it calls
 /// that).  STRATA_MULTI_BLOCK_ARGMAX=0: off.
 bool multi_block_head_ops();

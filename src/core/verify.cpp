@@ -125,7 +125,9 @@ struct RouteResidentCfg {
     // window (ranks < lo with no stand-in).  A close call at row 0 makes no cut: a re-run would step the GDN/PLE state twice.
     // fragile_k is learned: from the first 64 decode windows (route_fragile_first: the 10th percentile of the moved rows' gap / shift, no
     // cut meanwhile), then by the re-checks (route_fragile_settle: every 50 re-checks of this process, k = 1.25 times the largest flipped ratio
-    // in the ring; k never shrinks without a flip).  STRATA_FRAGILE_K0=<k> pins k: no learning, no updates, the file's k is not loaded over it.
+    // in the ring; k never shrinks without a flip; a raise needs the ring's flip rate above the control ring's noise (Wilson 90%), and each
+    // update moves k at most to 1.5 times or 0.5 times its value).  Flips are argmax changes (route_fragile_settle).
+    // STRATA_FRAGILE_K0=<k> pins k: no learning, no updates, the file's k is not loaded over it.
     // Exploration: when no normal cut is found, every 16th eligible window cuts at the first moved row r >= 1 with ratio in [k, 8k) (explore cut).
     bool fragile_on = false;
     float fragile_k = 4.0f;                   ///< the close-call factor (set by the learning below, or STRATA_FRAGILE_K0)
@@ -143,12 +145,21 @@ struct RouteResidentCfg {
     bool fr_flip[kFragileRing] = {};          ///< per re-check (ring): the exact row differed from the stand-in's token
     bool fr_explore[kFragileRing] = {};       ///< per re-check (ring): the cut was an explore cut
     int fr_pos = 0, fr_n = 0;                 ///< the ring's next slot and its filled count
+    // Noise control (STRATA_FRAGILE_RECHECK): every kCtrlEvery eligible windows with no normal or explore cut, the first accepted row r >= 1
+    // that no stand-in moved (row_shift 0) is re-checked the same way.  Its flips are the noise of a re-decision (two windows of the same
+    // tokens differ on their own), so they never enter fr_flip / req_fl / auto_fl.  The last kCtrlRing control re-checks are kept.
+    enum { kCtrlEvery = 32, kCtrlRing = 200 };
+    bool fr_ctrl[kCtrlRing] = {};             ///< per control re-check (ring): the exact row's top-1 differed from the stand-in's
+    int fr_ctrl_pos = 0, fr_ctrl_n = 0;       ///< the control ring's next slot and its filled count
+    long long fr_ctrl_win = 0;                ///< eligible windows counted for the control selection (every kCtrlEvery-th may be one)
+    long long fr_ctrl_rc = 0, fr_ctrl_fl = 0; ///< this request's control re-checks and their flips (the stats line takes them)
     long long fragile_rechecks = 0, fragile_flips = 0;   ///< all re-checks and flips
     float fragile_pend_ratio = 0.0f;          ///< the pending cut's gap / row_shift
     bool fragile_pend_explore = false;        ///< the pending cut is an explore cut
+    bool fragile_pend_control = false;        ///< the pending cut is a control re-check (its verdict is the noise floor)
     bool fragile_exact = false;               ///< the next decode window runs ranks < lo exact (after a cut)
     bool fragile_pend = false;                ///< a cut's row is waiting for the exact window that re-decides it
-    int32_t fragile_pend_tok = 0;             ///< the stand-in window's token at the cut row
+    int32_t fragile_pend_tok = 0;             ///< the stand-in window's top-1 id at the cut row (argmax, not the sampled token)
     float win_low = 0.0f, win_tail = 0.0f;   ///< the budgets (ranks < lo, ranks >= lo) the last window ran with
     long long fr_cuts = 0, fr_explore_cuts = 0, fr_moved = 0, fr_flips = 0;   ///< this request's cuts (explore ones too), explore cuts, rows moved by stand-ins, flipped re-decisions (the stats line takes them)
     // STRATA_ROUTE_BUDGET_AUTO=1 (needs fragile_on; decode loop only): the engine chooses ONE budget b for ranks < lo and ranks >= lo alike.
@@ -1260,6 +1271,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
         dyn_gap_ = b.take<float>(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on ? T : 0);   // STRATA_ROUTE_BUDGET_DYN, STRATA_FRAGILE_RECHECK
+        dyn_top1_ = b.take<int32_t>(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on ? T : 0);   // the rows' top-1 ids (the flips' argmax)
         row_shift_ = b.take<float>(route_resident_cfg().fragile_on ? T : 0);   // STRATA_FRAGILE_RECHECK: the stand-ins' moves per row (decode windows)
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         one_ = b.take<int32_t>(4);
@@ -2889,7 +2901,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
         // STRATA_ROUTE_BUDGET_DYN: each row's top-1 minus top-2 raw logit (read by route_budget_after, after the window's sync)
-        if ((route_resident_cfg().dyn_on || route_resident_cfg().fragile_on) && dyn_gap_ != nullptr) strata::kernels::logits_margin_rows(head_logits_, T, (int) n_vocab_, dyn_gap_, cs);
+        if ((route_resident_cfg().dyn_on || route_resident_cfg().fragile_on) && dyn_gap_ != nullptr) strata::kernels::logits_margin_rows(head_logits_, T, (int) n_vocab_, dyn_gap_, dyn_top1_, cs);
     }
     if (!stage_mark(cs, kStOther, err)) return false;   // the head
     stamp(g.n_layers, 1, 0);
@@ -4069,11 +4081,16 @@ bool Verifier::route_fragile_wants() {
 }
 
 // The top-1 minus top-2 gaps of the last window's rows 0..n-1 (the last stage holds the head's logits).
-bool Verifier::route_fragile_gaps(int n, float* out) {
-    if (next_ != nullptr) return next_->route_fragile_gaps(n, out);
-    if (dyn_gap_ == nullptr || n < 1 || n > max_t_) return false;
+// top1 (optional): the rows' top-1 ids, read with the gaps.
+bool Verifier::route_fragile_gaps(int n, float* out, int32_t* top1) {
+    if (next_ != nullptr) return next_->route_fragile_gaps(n, out, top1);
+    if (dyn_gap_ == nullptr || dyn_top1_ == nullptr || n < 1 || n > max_t_) return false;
     const OnDevice on(device_);
     if (cudaMemcpy(out, dyn_gap_, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (top1 != nullptr && cudaMemcpy(top1, dyn_top1_, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
@@ -4110,9 +4127,10 @@ void Verifier::route_fragile_zero_shift() {
 // Row 0 is never cut (a re-run would step the state twice), so the search is over rows 1..n-1.  Until k is set (STRATA_FRAGILE_K0, or learned
 // from the first kFragileLearn windows: the ratios gap / shift of their moved rows 1.., k = their 10th percentile, no cut meanwhile) it
 // returns -1.  The moved rows' shift and gap are sampled for the request's medians (route_fragile_take).
-int Verifier::route_fragile_first(const float* gap, const float* shift, int n, bool* explore) {
+int Verifier::route_fragile_first(const float* gap, const float* shift, int n, bool* explore, bool* control) {
     RouteResidentCfg& c = route_resident_cfg();
     if (explore != nullptr) *explore = false;
+    if (control != nullptr) *control = false;
     if (!c.fragile_k_set) {
         for (int r = 1; r < n; ++r)
             if (shift[r] > 0.0f && gap[r] == gap[r]) c.fr_learn_ratio.push_back(gap[r] / shift[r]);
@@ -4154,32 +4172,60 @@ int Verifier::route_fragile_first(const float* gap, const float* shift, int n, b
         }
         if (first >= 0 && explore != nullptr) *explore = true;
     }
+    // Noise control: every kCtrlEvery-th eligible window (k set) with no normal or explore cut re-checks its first accepted row r >= 1 that
+    // no stand-in moved (shift 0; rows 0..n-1 are the accepted ones).
+    if (c.fragile_k_set && first < 0 && ++c.fr_ctrl_win % RouteResidentCfg::kCtrlEvery == 0) {
+        for (int r = 1; r < n && first < 0; ++r)
+            if (!(shift[r] > 0.0f)) first = r;
+        if (first >= 0 && control != nullptr) *control = true;
+    }
     return first;
 }
 
 // A window is cut at its row r >= 1 (the caller keeps rows 0..r-1).  The row's stand-in token and its gap / shift wait for the exact
 // decision of the same position: the next window's row 0, which runs with ranks < lo exact.
-void Verifier::route_fragile_cut(float ratio, int32_t stand_tok, bool explore) {
+void Verifier::route_fragile_cut(float ratio, int32_t stand_top1, bool explore, bool control) {
     RouteResidentCfg& c = route_resident_cfg();
     ++c.fr_cuts;
     if (explore) ++c.fr_explore_cuts;
     c.auto_cut_arm = c.auto_win_arm;   // STRATA_ROUTE_BUDGET_AUTO: the cut window's arm; its exact successor is charged to it
     c.fragile_pend = true;
     c.fragile_pend_explore = explore;
+    c.fragile_pend_control = control;
     c.fragile_pend_ratio = ratio;
-    c.fragile_pend_tok = stand_tok;
+    c.fragile_pend_tok = stand_top1;   // the stand-in window's top-1 id at the cut row (argmax, not the sampled token)
     c.fragile_exact = true;
 }
 
-// The exact decision of a pending cut row (the first output of the exact window that follows it): a flip is a changed token.
+bool Verifier::route_fragile_pending() { return route_resident_cfg().fragile_pend; }
+
+// The noise floor: Wilson 90% bounds of the control ring's flip rate (0 and 1 while it is empty, so nothing above noise is shown yet).
+static void route_ctrl_bounds(const RouteResidentCfg& c, double& lo, double& hi) {
+    long long f = 0;
+    for (int i = 0; i < c.fr_ctrl_n; ++i)
+        if (c.fr_ctrl[i]) ++f;
+    route_wilson90(f, c.fr_ctrl_n, lo, hi);
+}
+
+// The exact decision of a pending cut row (the first output of the exact window that follows it): a flip is a changed top-1 id.
 // The ring holds the last 200 re-checks of this process (normal and explore cuts).  Every 50 re-checks of this process (and only once the
 // ring holds 50 of them, which the 50th does), k = 1.25 times the largest ratio of the flipped re-checks in the ring, clamped to
 // [0.005, 50].  With no flip in the ring k stays as it is: k never shrinks without evidence.  A pinned k (STRATA_FRAGILE_K0) never moves.
-void Verifier::route_fragile_settle(int32_t exact_tok) {
+void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
     RouteResidentCfg& c = route_resident_cfg();
     if (!c.fragile_pend) return;
     c.fragile_pend = false;
-    const bool flipped = exact_tok != c.fragile_pend_tok;
+    if (!exact_ok) return;   // the exact row was not read: no verdict
+    // a flip compares the argmax ids (the stand-in window's top-1 of the cut row, the exact window's top-1 of row 0), not the sampled tokens
+    const bool flipped = exact_top1 != c.fragile_pend_tok;
+    if (c.fragile_pend_control) {   // noise control: its own ring and counts, nothing else
+        ++c.fr_ctrl_rc;
+        if (flipped) ++c.fr_ctrl_fl;
+        c.fr_ctrl[c.fr_ctrl_pos] = flipped;
+        c.fr_ctrl_pos = (c.fr_ctrl_pos + 1) % RouteResidentCfg::kCtrlRing;
+        if (c.fr_ctrl_n < RouteResidentCfg::kCtrlRing) ++c.fr_ctrl_n;
+        return;
+    }
     ++c.fragile_rechecks;
     if (flipped) {
         ++c.fragile_flips;
@@ -4193,10 +4239,11 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
         ++c.req_fl_all;
         ++c.auto_fl[c.auto_cut_arm];
     }
-    double flip_lo = 0.0, flip_hi = 0.0, tok_lo = 0.0, tok_hi = 0.0;
+    double flip_lo = 0.0, flip_hi = 0.0, tok_lo = 0.0, tok_hi = 0.0, ctrl_lo = 0.0, ctrl_hi = 0.0;
     route_wilson90(c.req_fl, c.req_rc, flip_lo, flip_hi);
     route_wilson90(c.req_fl, c.req_tok, tok_lo, tok_hi);
-    const bool by_recheck = c.req_rc >= RouteResidentCfg::kBrakeMin && flip_lo > 0.2;
+    route_ctrl_bounds(c, ctrl_lo, ctrl_hi);   // the noise floor: the re-check flips must exceed it too
+    const bool by_recheck = c.req_rc >= RouteResidentCfg::kBrakeMin && flip_lo > std::max(0.2, ctrl_hi);
     const bool by_token = c.req_tok >= RouteResidentCfg::kBrakeTokMin && c.req_fl >= RouteResidentCfg::kBrakeFlips && tok_lo > 0.01;
     if (c.brake_on && c.req_b > 0.0f && (by_recheck || by_token)) {
         const float old = c.req_b;
@@ -4229,11 +4276,24 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
             if (c.fr_ratio[i] > largest) largest = c.fr_ratio[i];
         }
     if (!any_flip) return;   // no flip in the ring: k is kept
+    // Noise: a raise needs the ring's flip rate above the noise floor (Wilson 90%: the ring's lower bound above the control's upper bound)
+    long long ring_fl = 0;
+    for (int i = 0; i < c.fr_n; ++i)
+        if (c.fr_flip[i]) ++ring_fl;
+    double ring_lo = 0.0, ring_hi = 0.0, kctrl_lo = 0.0, kctrl_hi = 0.0;
+    route_wilson90(ring_fl, c.fr_n, ring_lo, ring_hi);
+    route_ctrl_bounds(c, kctrl_lo, kctrl_hi);
     const float old = c.fragile_k;
-    c.fragile_k = std::min((float) RouteResidentCfg::kFragileK, std::max(0.005f, 1.25f * largest));
+    float target = std::min((float) RouteResidentCfg::kFragileK, std::max(0.005f, 1.25f * largest));
+    if (target > old && !(ring_lo > kctrl_hi)) target = old;   // the flips are not above the noise: no raise
+    // a step is bounded: up to 1.5 times the old k, down to 0.5 times it
+    if (target > old) target = std::min(target, 1.5f * old);
+    if (target < old) target = std::max(target, 0.5f * old);
+    c.fragile_k = target;
     if (c.fragile_k != old) {
-        std::fprintf(stderr, "strata serve: fragile recheck: k %.3f (%lld rechecks, %lld flips, largest flipped ratio %.3f in the ring)\n",
-                     (double) c.fragile_k, c.fragile_rechecks, c.fragile_flips, (double) largest);
+        std::fprintf(stderr, "strata serve: fragile recheck: k %.3f (%lld rechecks, %lld flips, largest flipped ratio %.3f in the ring; "
+                     "ring flip rate lower bound %.3f vs control upper bound %.3f over %d control re-checks)\n",
+                     (double) c.fragile_k, c.fragile_rechecks, c.fragile_flips, (double) largest, ring_lo, kctrl_hi, c.fr_ctrl_n);
         route_tune_write(c);
     }
 }
@@ -4274,13 +4334,17 @@ void Verifier::route_class_state(int& cls, float& start, float& clean) {
 
 // This request's cuts, rows moved by stand-ins, flipped re-decisions and k; false when the switch is off.  Takes and resets the counts.
 bool Verifier::route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift,
-                                  float& med_gap, float& req_b, long long& brakes) {
+                                  float& med_gap, float& req_b, long long& brakes, long long& ctrl_rc, long long& ctrl_fl) {
     RouteResidentCfg& c = route_resident_cfg();
     if (!c.fragile_on) return false;
     cuts = c.fr_cuts;
     explores = c.fr_explore_cuts;
     moved = c.fr_moved;
     flips = c.fr_flips;
+    ctrl_rc = c.fr_ctrl_rc;   // this request's noise control re-checks and their flips
+    ctrl_fl = c.fr_ctrl_fl;
+    c.fr_ctrl_rc = 0;
+    c.fr_ctrl_fl = 0;
     k = c.fragile_k;
     req_b = c.req_b;   // this request's budget at its end, and its brakes (not reset here: route_budget_begin resets them)
     brakes = c.req_brakes;

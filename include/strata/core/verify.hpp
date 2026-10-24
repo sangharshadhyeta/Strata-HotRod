@@ -214,22 +214,28 @@ public:
     /// resets both counts.
     static bool route_budget_take(long long& n_hi, long long& n_lo, float& b_hi, float& b_lo, float& gap_min);
     /// STRATA_FRAGILE_RECHECK (decode loop only; verify.cpp).  Before a decode run: route_budget_window zeroes each stage's row_shift
-    /// (the stand-ins' moves per row).  After it: route_fragile_settle(outv[0]) (a cut's exact row), then, when route_fragile_wants(), the
-    /// gaps of rows 0..n-1 (route_fragile_gaps), the moves (route_fragile_shifts, summed over the stages) and route_fragile_first.  A cut
-    /// row r >= 1 is kept out of the commit and the next window runs exact (route_fragile_cut).  A cut at row 0 is not made: that
-    /// window's rows stand (a re-run would step the state twice, see verify.cpp).
+    /// (the stand-ins' moves per row).  After it: when route_fragile_pending(), route_fragile_gaps(1, ...) of the exact window and
+    /// route_fragile_settle(its row-0 top-1 id), then, when route_fragile_wants(), the gaps and top-1 ids of rows 0..n-1 (route_fragile_gaps),
+    /// the moves (route_fragile_shifts, summed over the stages) and route_fragile_first.  A cut row r >= 1 is kept out of the commit and the
+    /// next window runs exact (route_fragile_cut).  A cut at row 0 is not made: that window's rows stand (a re-run would step the state
+    /// twice, see verify.cpp).  Flips compare argmax ids, never the sampled tokens.
     static bool route_fragile_wants();
-    bool route_fragile_gaps(int n, float* out);
+    static bool route_fragile_pending();
+    /// top1 (optional): the rows' top-1 ids (the argmax; int32 per row).
+    bool route_fragile_gaps(int n, float* out, int32_t* top1 = nullptr);
     bool route_fragile_shifts(int n, float* out);   ///< adds each stage's row_shift for rows 0..n-1 into out (zeroed by the caller)
     void route_fragile_zero_shift();
     /// explore (optional): set true when the cut is an explore cut (no normal cut; every 16th eligible window; ratio in [k, 8k)).
-    static int route_fragile_first(const float* gap, const float* shift, int n, bool* explore = nullptr);
-    static void route_fragile_cut(float ratio, int32_t stand_tok, bool explore = false);
-    static void route_fragile_settle(int32_t exact_tok);
+    /// control (optional): set true when the cut is a control re-check (no normal or explore cut; every 32nd eligible window; a row
+    /// no stand-in moved, shift 0): its flip is the noise floor, kept apart from the k / brake / guard evidence.
+    static int route_fragile_first(const float* gap, const float* shift, int n, bool* explore = nullptr, bool* control = nullptr);
+    static void route_fragile_cut(float ratio, int32_t stand_top1, bool explore = false, bool control = false);
+    /// exact_ok false: the exact row could not be read, so the pending cut is dropped without a verdict.
+    static void route_fragile_settle(bool exact_ok, int32_t exact_top1);
     /// This request's cuts, rows moved by stand-ins and flipped re-decisions, the current k, and the medians of the moved rows' shift and gap
     /// (false when the switch is off); resets the counts.  Also this request's decode budget at its end (req_b) and its brakes.
     static bool route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift, float& med_gap,
-                                   float& req_b, long long& brakes);
+                                   float& req_b, long long& brakes, long long& ctrl_rc, long long& ctrl_fl);
     /// STRATA_FRAGILE_BRAKE (default on): the per-request decode budget brake (route_fragile_take's req_b and brakes are its).
     static bool route_brake_on();
     /// STRATA_FRAGILE_BRAKE: at a request's end, its size class learns its start fraction and clean level (route_class_end; the tune file is
@@ -701,6 +707,7 @@ private:
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
     float* dyn_gap_ = nullptr;         ///< STRATA_ROUTE_BUDGET_DYN: the head's top-1 minus top-2 raw logit per row (T floats; off: none)
+    int32_t* dyn_top1_ = nullptr;      ///< STRATA_FRAGILE_RECHECK: the head's top-1 id per row (T ints; off: none); flips are judged on it
     float* row_shift_ = nullptr;       ///< STRATA_FRAGILE_RECHECK: per row, the stand-ins' moves this stage's layers made (T floats; off: none)
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
