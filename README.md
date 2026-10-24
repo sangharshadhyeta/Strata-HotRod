@@ -23,9 +23,13 @@ Qwen3.8-Flash-Next on one RTX 3060 with 30 GB of RAM. Nothing leaves your PC.</p
 
 ---
 
+<div align="justify">
+
 A fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). Strata runs a model that normally
 needs a server by keeping the most-used parts on the graphics card and streaming the rest from the SSD. This fork makes
 that path faster and keeps answers correct while doing it.
+
+</div>
 
 > **Tested on one machine, with one model.** Other cards, AMD, Windows, macOS and other model sizes may work in upstream
 > Strata; we have not run them, so we do not describe them here.
@@ -41,7 +45,13 @@ that path faster and keeps answers correct while doing it.
 
 ## How fast
 
+<div align="justify">
+
 Measured on the machine below; a token is about ¾ of a word. Every answer in these runs was read and checked.
+
+</div>
+
+<div align="center">
 
 | Answer | tokens/s (24 Oct, 131K context) |
 | --- | ---: |
@@ -49,17 +59,29 @@ Measured on the machine below; a token is about ¾ of a word. Every answer in th
 | Reasoning (a two-train problem, ~1,000 tokens) | 66 - 71 |
 | Story (a paragraph, 100-150 tokens) | 50 - 53 |
 
+</div>
+
+<div align="center">
+
 | Long prompts (262K context, 20 Oct) | Read in | Answer written at |
 | --- | ---: | ---: |
 | 8,554 tokens | 16.9 s | 52 - 54 tokens/s |
 | 45,398 tokens | 67 - 68 s | 38 - 41 tokens/s |
 | The same 45K conversation, next turn | 0.4 - 0.5 s | 34 - 45 tokens/s |
 
+</div>
+
+<div align="justify">
+
 The first message of a chat is the slow part: it waits on the SSD for the model's experts. Follow-ups reuse what was
 already read. A 262K context costs about 8% against 131K, because more of the attention's memory streams from RAM.
 
+</div>
+
 <details>
 <summary><b>The machine</b></summary>
+
+<div align="center">
 
 | | |
 | --- | --- |
@@ -70,15 +92,21 @@ already read. A 262K context costs about 8% against 131K, because more of the at
 | **Engine** | Strata 0.1.45 (upstream, merged 17 Oct 2026) plus this fork's changes |
 | **Model** | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), IQ3_S (about 3.5 bits per weight, 78 GB of files) by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
 | **Context** | 262K tokens (the longest prompt served so far: 114K) |
+
+</div>
 </details>
 
 <details>
 <summary><b>Answer quality</b></summary>
 
+<div align="justify">
+
 Strata replaces some of a token's experts with similar ones already on the card to stay fast. In a small test (50 maths
 questions, 30 coding questions, answers read by hand): 47 of 50 and 30 of 30 correct, against 48 of 50 and 30 of 30 with
 nothing replaced. A test this small cannot show a difference of one or two answers either way. Since 24 Oct every JSON and
 code answer in the structured-output checks has been valid. Detail: [SPEC.md](SPEC.md).
+
+</div>
 </details>
 
 ## What you see
@@ -91,54 +119,84 @@ code answer in the structured-output checks has been valid. Detail: [SPEC.md](SP
 
 ## How it works
 
+<div align="justify">
+
 The model has 512 experts per layer and picks 10 for every token; only some fit on the card. Everything this fork adds is
 about the ones that do not.
+
+</div>
 
 <table>
 <tr>
 <td width="50%" valign="top">
 
+<div align="justify">
+
 **Stand-in experts.** A missing expert is replaced by one already on the card only when
 `router weight × logit gap ≤ budget`. The budget tunes itself by measured speed, a token a stand-in could have flipped is
 recomputed exactly, and each request brakes itself when it sees flips.
 
+</div>
+
 </td>
 <td width="50%" valign="top">
+
+<div align="justify">
 
 **A look-ahead that learns.** Experts for 1, 2 and 4 layers ahead are guessed on the card and read from the SSD before they
 are needed. Each guess is the router's own score plus a small correction learned live from the real routing; its size is
 chosen per layer by a live contest, and it falls back to the plain router if it ever does worse.
 
+</div>
+
 </td>
 </tr>
 <tr>
 <td valign="top">
+
+<div align="justify">
 
 **Three tiers: card → RAM → SSD.** The hottest experts on the card, the next in a RAM tier sized from free memory, the
 rest on the SSD. Swap rounds move a chat's experts onto the card in the background.
 
+</div>
+
 </td>
 <td valign="top">
 
+<div align="justify">
+
 **Long prompts, long memory.** Prompts are read layer by layer, each layer's experts once, straight from the SSD.
 Past 64K the attention's memory streams from RAM, and a long conversation resumes from a saved state in under a second.
+
+</div>
 
 </td>
 </tr>
 <tr>
 <td valign="top">
 
+<div align="justify">
+
 **Draft and check.** A small draft head guesses the next words; the big model checks several at once.
+
+</div>
 
 </td>
 <td valign="top">
 
+<div align="justify">
+
 **Nothing hand-set.** Budgets, reserves of RAM and video memory, and what the look-ahead learned are measured on your PC
 and kept across restarts.
+
+</div>
 
 </td>
 </tr>
 </table>
+
+<div align="center">
 
 | Needed experts guessed (live, 24 Oct) | Plain router | Learned look-ahead |
 | --- | :---: | :---: |
@@ -146,13 +204,23 @@ and kept across restarts.
 | 2 layers ahead | 66-69% | **76-79%** |
 | 4 layers ahead | 55-58% | **66-71%** |
 
+</div>
+
+<div align="justify">
+
 Every change and its measurement: [docs/HOTROD-DETAILS.md](docs/HOTROD-DETAILS.md) · the predictor study:
 [docs/PREDICTOR-EXPERIMENTS.md](docs/PREDICTOR-EXPERIMENTS.md) · the full log of ideas tried: [docs/perf-ideas.md](docs/perf-ideas.md).
 
+</div>
+
 ## Install
+
+<div align="justify">
 
 You need a recent NVIDIA driver, the CUDA 13 toolkit, gcc-toolset-13 (Rocky Linux 9; other distributions are untested)
 and about 80 GB free on an NVMe.
+
+</div>
 
 ```bash
 sudo dnf install -y git gcc-toolset-13
@@ -161,13 +229,21 @@ cd Strata-HotRod
 scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build --yes --no-start
 ```
 
+<div align="justify">
+
 - `--build` compiles this fork's engine; without it setup downloads upstream's, which lacks these changes. The compiled
   engine was checked against the one measured here: the same speed.
 - For 262K context set `--max-context 262144` in the config's `args`.
 - `--model IQ3_S` is the size tested here. Setup says it wants a 64 GB PC; naming it is the consent, and it runs on 30 GB.
 - `--models-dir /path/on/nvme` puts the model files elsewhere.
 
+</div>
+
+<div align="justify">
+
 **Run** inside a memory limit (94% of RAM; two uncapped runs once froze this PC):
+
+</div>
 
 ```bash
 systemd-run --scope -p MemoryMax=$(awk '/MemTotal/ {printf "%dK", $2 * 0.94}' /proc/meminfo) -p MemorySwapMax=0 \
@@ -175,14 +251,26 @@ systemd-run --scope -p MemoryMax=$(awk '/MemTotal/ {printf "%dK", $2 * 0.94}' /p
   --port 8095 --host 0.0.0.0 --api-key YOUR_KEY
 ```
 
+<div align="justify">
+
 When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095`. For this PC only, leave out `--host` and
 `--api-key`.
 
+</div>
+
+<div align="justify">
+
 **Update:** `scl enable gcc-toolset-13 -- ./update.sh --build` (new code, engine rebuilt where it changed, model kept).
+
+</div>
 
 ## Using it
 
+<div align="justify">
+
 Any OpenAI-compatible client works with **`http://127.0.0.1:8095/v1`** and your API key:
+
+</div>
 
 ```bash
 curl http://127.0.0.1:8095/v1/chat/completions \
@@ -190,6 +278,8 @@ curl http://127.0.0.1:8095/v1/chat/completions \
   -d '{"model":"strata","temperature":1.0,"top_p":0.95,"max_tokens":300,
        "messages":[{"role":"user","content":"Name the three largest cities in India."}]}'
 ```
+
+<div align="justify">
 
 - **Thinking** is on by default; the chat menu picks off, low, medium or high.
 - **Sampling:** with no temperature set, decoding is greedy. The model card recommends temperature 1.0, top-p 0.95, top-k 20
@@ -200,29 +290,49 @@ curl http://127.0.0.1:8095/v1/chat/completions \
   ([docs/IMAGES.md](docs/IMAGES.md)).
 - **One request at a time;** others wait their turn.
 
+</div>
+
+<div align="justify">
+
 Every option: [docs/DETAILS.md](docs/DETAILS.md) (upstream's reference; it covers more than we tested).
+
+</div>
 
 <details>
 <summary><b>Not tested</b></summary>
+
+<div align="justify">
 
 - Any other graphics card, any AMD card, Windows, macOS or another Linux.
 - Any other model or size (Q2_0, IQ2_XS, IQ3_XXS, Coder, Swift, Unsloth's files).
 - Several requests at once, or two graphics cards.
 - A prompt that fills the whole 262K window (the longest served: 114K tokens).
+
+</div>
 </details>
 
 ## Credits and license
+
+<div align="justify">
 
 The model is Qwen3.8-Flash-Next by the Qwen team, compressed by ISTA-DASLab. Strata is by Niko1221 and its contributors;
 this fork keeps its [MIT License](LICENSE) and copyright notice. The engine uses parts of
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp), and the picture encoder uses llama.cpp's `mtmd`. A few parts and
 every model have their own licenses: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#license). Security: [SECURITY.md](SECURITY.md).
 
+</div>
+
 <details>
 <summary><b>Ideas this fork builds on</b></summary>
 
+<div align="justify">
+
 Several changes were first built and measured in [solid.cpp](https://github.com/sangharshadhyeta/solid.cpp), a llama.cpp
 fork for MoE expert caching, and ported here one concept at a time. Prior art behind them:
+
+</div>
+
+<div align="justify">
 
 - [leloch/llama.cpp](https://github.com/leloch/llama.cpp) (moe-cache-pr): the original GPU-resident MoE expert cache.
 - [thecodacus/llama.cpp](https://github.com/thecodacus/llama.cpp) (prefetch-experts, from the
@@ -240,4 +350,6 @@ fork for MoE expert caching, and ported here one concept at a time. Prior art be
   written; the expert-prefetch literature (Speculating Experts [2603.19289](https://arxiv.org/abs/2603.19289), PILOT / Fate
   [2502.12224](https://arxiv.org/abs/2502.12224), FineMoE, SP-MoE [2510.10302](https://arxiv.org/abs/2510.10302), ProMoE,
   PowerInfer-2).
+
+</div>
 </details>
