@@ -4067,7 +4067,14 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
             route_auto_schedule(c);
         }
         b = route_auto_arm_b(c, c.auto_win_arm);   // the request's budget (base arm) or its scaled candidate
-        tail = b;
+        // ranks >= lo keep the old rule (any resident stand-in: budget_tail 0 sends the kernel to its margin test) until the re-check
+        // says otherwise: a request that braked (flips seen) takes the budget there too.  The tail never runs stricter than before
+        // without evidence (24 Oct: a tail budget from the start cost 87-89% against 92% card hits, 44-49 against 50 tok/s)
+        tail = c.req_brakes > 0 ? b : 0.0f;
+        // STRATA_ROUTE_LOW_OPEN=1 (opt-in experiment, 24 Oct): ranks < lo also start open (any resident stand-in) and take the
+        // learned budget only after the request's first brake (the re-check saw flips)
+        static const bool low_open = [] { const char* v = std::getenv("STRATA_ROUTE_LOW_OPEN"); return v != nullptr && std::atoi(v) != 0; }();
+        if (low_open && c.req_brakes == 0) b = 1e30f;
     }
     if (decode && c.fragile_exact) {
         b = 0.0f;
@@ -4081,7 +4088,8 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
 // STRATA_FRAGILE_RECHECK.  route_fragile_wants: the window that just ran had a stand-in budget (ranks < lo or the tail).
 bool Verifier::route_fragile_wants() {
     const RouteResidentCfg& c = route_resident_cfg();
-    return c.fragile_on && (c.win_low > 0.0f || c.win_tail > 0.0f);
+    // (under AUTO the tail runs the old any-stand-in rule with budget 0: its stand-ins are watched too)
+    return c.fragile_on && (c.win_low > 0.0f || c.win_tail > 0.0f || c.auto_on);
 }
 
 // The top-1 minus top-2 gaps of the last window's rows 0..n-1 (the last stage holds the head's logits).
