@@ -257,6 +257,12 @@ public:
     /// after each finished AUTO test and each k update.  An empty path keeps nothing.
     static bool route_fragile_on();
     static void route_tune_open(const std::string& path, uint64_t model_fp);
+    /// STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned corrections.  la_learn_open(path, msg) loads the saved state of this model
+    /// (false with msg when there is none); la_learn_request_end(path, report) saves it to path (when not empty) and returns the stats
+    /// line(s) for the request's log.  Both are no-ops when the feature is off.
+    static bool la_learn_on();
+    static bool la_learn_open(const std::string& path, std::string& msg);
+    static void la_learn_request_end(const std::string& path, std::string& report);
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //

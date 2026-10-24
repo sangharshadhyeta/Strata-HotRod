@@ -100,6 +100,15 @@ inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv(
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
 RouteResidentCfg& route_resident_cfg();
+// STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned correction (native_router.cu la_learn_*); STRATA_LA_LEARN_TIMING=1 times its training
+static bool la_learn_env_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+static bool la_learn_timing_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN_TIMING"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
 struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
@@ -1091,6 +1100,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // STRATA_LA_EDGE_SKIP (opt-in =1 since 24 Oct: under the confidence budget its skipped rank-2 reads became misses, reasoning wait 5.2 -> 11.8 s): the look-ahead's edge-skip counter, allocated before any graph capture
     if ((std::getenv("STRATA_LA_EDGE_SKIP") != nullptr && std::atoi(std::getenv("STRATA_LA_EDGE_SKIP")) != 0) && strata::kernels::route_pred_active())
         strata::kernels::route_pred_edge_skip_alloc();
+    // STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned correction, its buffers allocated before any graph capture
+    if (la_learn_env_on() && g.n_expert == 512 && strata::kernels::route_pred_active()) {
+        std::string lm;
+        const bool ok = strata::kernels::la_learn_alloc(g.n_layers, g.n_embd, route_resident_cfg().lo, la_learn_timing_on(), lm);
+        std::fprintf(stderr, "strata verify: STRATA_LA_LEARN: %s%s\n", ok ? "on, " : "NOT on: ", lm.c_str());
+    }
     // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
         strata::kernels::route_ring_alloc((size_t) (g.n_layers * g.n_expert));
@@ -1505,6 +1520,23 @@ bool Verifier::window_self_commits(int T) const {
 // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
+bool Verifier::la_learn_on() { return la_learn_env_on(); }
+bool Verifier::la_learn_open(const std::string& path, std::string& msg) {
+    if (!strata::kernels::la_learn_active()) { msg = "not on"; return false; }
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) { msg = "no saved state yet"; return false; }
+    return strata::kernels::la_learn_load(path.c_str(), msg);
+}
+void Verifier::la_learn_request_end(const std::string& path, std::string& report) {
+    if (!strata::kernels::la_learn_active()) return;
+    if (!path.empty()) {
+        std::string msg;
+        if (!strata::kernels::la_learn_save(path.c_str(), msg))
+            std::fprintf(stderr, "strata serve: look-ahead learner: cannot save %s (%s)\n", path.c_str(), msg.c_str());
+    }
+    report = strata::kernels::la_learn_report();
+}
+
 bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -1635,6 +1667,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     // STRATA_LOOKAHEAD_GPU_STREAM: set once this window has recorded a look-ahead node on la_cs_ (the join and the wait below)
     bool la_stream_used = false;
+    // STRATA_LA_LEARN: this window learns its look-ahead (a single stage, one group of n <= 8 rows, every layer's look-ahead on cs,
+    // every layer's router with its two look-ahead GEMVs): the forward and the training steps are recorded in the window
+    bool la_all_gates = true;
+    for (int64_t l = 0; l < g.n_layers && la_all_gates && la_learn_env_on(); ++l) {
+        const WeightRef* wr = LayerView(wt, l).get("ffn_gate_inp.weight");
+        la_all_gates = wr != nullptr && wr->kind == WeightKind::Bf16InF32;
+    }
+    const bool la_learn_win = la_learn_env_on() && la_all_gates && strata::kernels::la_learn_active() && G == 1 && !batch_rec_ &&
+                              T <= 8 && lb_ == 0 && le_ == g.n_layers && NE == 512 && K == 10 && hits_.d_res != nullptr &&
+                              native_router_enabled() && strata::kernels::route_pred_active() &&
+                              strata::kernels::route_pred_logits() != nullptr;
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     auto pre = [&](int64_t l, int grp) -> bool {
@@ -2447,10 +2490,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // (route_pred_logits is null on a GPU other than the scratch's - a layer split's later stage: no look-ahead node there)
         const bool la_gpu = strata::kernels::route_pred_active() && strata::kernels::route_pred_logits() != nullptr && n <= 8 &&
                             NE == 512 && K == 10 && native_router_enabled();
-        const bool la_on_sh = la_gpu && sh_fork && la_gpu_fork_env;
+        const bool la_on_sh = la_gpu && sh_fork && la_gpu_fork_env && !la_learn_win;
 #if !defined(STRATA_USE_HIP)
         const bool la_on_stream = la_gpu && !la_gpu_fork_env && la_gpu_stream_env && la_cs_ != nullptr && ev_la_fork_ != nullptr &&
-                                  ev_la_read_done_ != nullptr && ev_la_done_ != nullptr;
+                                  ev_la_read_done_ != nullptr && ev_la_done_ != nullptr && !la_learn_win;
 #else
         const bool la_on_stream = false;   // HIP: the node stays on cs (the shared stream's cross-stream cost, as sh_stream_on)
 #endif
@@ -2468,6 +2511,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               strata::kernels::route_pred_logits(), NE, N, NE, n, s);
                     if (w_lam != nullptr)
                         strata::kernels::route_pred_bias_add(strata::kernels::route_pred_logits(), strata::kernels::route_pred_model_b(l + 1), n, s);
+                    // STRATA_LA_LEARN: the leader's slot of the learned correction replaces the guess; this window's input is kept for the training steps
+                    if (la_learn_win) strata::kernels::la_learn_forward(l, dist, mixed_ + tb * N, n, s);
                     native_router_top10_multi(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
                                               strata::kernels::route_pred_weights(), n, s);
                     // STRATA_LA_EDGE_SKIP (decode windows: this node runs only for n <= 8): a predicted rank lo-1 pick that a resident
@@ -2521,6 +2566,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // the look-ahead node: on la_cs_ (above) or the shared stream (STRATA_LOOKAHEAD_GPU_FORK=1), else here on cs
         if (la_gpu && !la_on_sh && !la_on_stream && !lookahead_node(cs)) return false;
+        // STRATA_LA_LEARN: this layer's router logits are the label of the two sources behind it (their saved inputs and predictions)
+        if (la_learn_win) {
+            try {
+                strata::kernels::la_learn_train(l, logits_ + tb * NE, hits_.d_res + l * g.n_expert, n, cs);
+            } catch (const std::exception& e) { err = "verify look-ahead learner: " + std::string(e.what()); return false; }
+        }
         // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
         // resident experts; the weights stay the router's (route_prior.cu)
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
@@ -2811,6 +2862,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     if (la_stream_used) {
         cudaEventRecord(ev_la_done_, la_cs_);
         cudaStreamWaitEvent(cs, ev_la_done_, 0);
+    }
+    // STRATA_LA_LEARN: the window's decisions (the leader, the freeze, a reset) are device code, after the last layer's training
+    if (la_learn_win) {
+        try {
+            strata::kernels::la_learn_window_end(cs);
+        } catch (const std::exception& e) { err = "verify look-ahead learner: " + std::string(e.what()); return false; }
     }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;

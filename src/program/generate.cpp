@@ -12282,6 +12282,27 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // STRATA_LA_LEARN: the learned look-ahead corrections of this model, loaded before the first request and saved at each request's end
+        // (one file per model fingerprint, beside the stand-in tuning in data/)
+        std::string la_learn_path;
+        if (strata::core::Verifier::la_learn_on()) {
+            const std::string tune = standin_tune_path(o);
+            strata::core::SessionFileIdentity lid;
+            std::string le;
+            if (tune.empty())
+                std::fprintf(stderr, "strata serve: look-ahead learner: nothing kept (no expert profile directory)\n");
+            else if (session_identity(lid, le, {})) {
+                char hex[17];
+                std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) lid.model);
+                la_learn_path = (std::filesystem::path(tune).parent_path() / ("predictor-" + std::string(hex) + ".bin")).string();
+                std::string lm;
+                if (strata::core::Verifier::la_learn_open(la_learn_path, lm))
+                    std::fprintf(stderr, "strata serve: look-ahead learner: loaded %s\n", la_learn_path.c_str());
+                else
+                    std::fprintf(stderr, "strata serve: look-ahead learner: starts from the plain router (%s)\n", lm.c_str());
+            } else
+                std::fprintf(stderr, "strata serve: look-ahead learner: not kept (%s)\n", le.c_str());
+        }
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -16666,6 +16687,12 @@ int main(int argc, char** argv) {
                     dr_prev = dr;
                     dc_prev = dc;
                 }
+            }
+            // STRATA_LA_LEARN: the learned corrections are saved (their leaders, fp16) and the learner's stats line is logged
+            if (strata::core::Verifier::la_learn_on()) {
+                std::string la_rep;
+                strata::core::Verifier::la_learn_request_end(la_learn_path, la_rep);
+                std::fputs(la_rep.c_str(), stderr);
             }
             // STRATA_LA_EDGE_SKIP (opt-in =1 since 24 Oct): the decode look-ahead's rank lo-1 predictions that a resident stand-in
             // within the edge covers, not read ahead, since the previous request (the device counter is taken and zeroed here)
