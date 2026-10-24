@@ -197,16 +197,24 @@ struct RouteResidentCfg {
     // windows instead of auto_b.  route_budget_begin sets req_b = 0.5 * auto_b.  The AUTO arms scale it: base req_b, candidate req_b * s^d.
     // A settled re-check of the request counts into req_rc / req_fl.  Evidence (route_wilson90, z = 1.645): the brake acts only with >= 15
     // re-checks and a Wilson 90% lower bound of flips / rechecks above 0.2; then req_b halves (below 0.01 it is 0) and the counts reset,
-    // so it takes 15 more re-checks to act again.  Every 64 decode windows of the request with >= 15 re-checks and a Wilson 90% upper
-    // bound <= 0.2, req_b grows by 1.25 (never above auto_b; from 0 it becomes 0.25 * auto_b).  The request's first grow check (window 64)
-    // sets req_b = auto_b at once when that holds.  The search (auto_b) is unchanged by the brake.
-    enum { kBrakeMin = 15, kBrakeWindows = 64, kAutoQualityMin = 20 };
+    // so it takes 15 more re-checks to act again.  Flips per committed token (the harm rises with it; the re-check rate does not): the
+    // request's flips and committed decode tokens since its last brake (req_fl, req_tok) brake it when >= 3 flips, >= 100 tokens and the
+    // Wilson 90% lower bound of flips / tokens is above 0.01.  Every 64 decode windows of the request, req_b grows by 1.25 (never above
+    // auto_b; from 0 it becomes 0.25 * auto_b) when the request has >= 15 re-checks, a Wilson 90% upper bound <= 0.2 of its re-check
+    // flip rate and a Wilson 90% upper bound <= 0.01 of flips per token.  The request's first grow check (window 64) sets req_b = auto_b
+    // at once when that holds.  The search (auto_b) is unchanged by the brake.
+    enum { kBrakeMin = 15, kBrakeWindows = 64, kAutoTokMin = 200, kBrakeTokMin = 100, kBrakeFlips = 3, kCleanTok = 400 };
     bool brake_on = true;                     ///< STRATA_FRAGILE_BRAKE: the per-request brake (off: req_b is auto_b for every request)
     float req_b = 0.1f;                       ///< this request's decode budget
     long long req_rc = 0, req_fl = 0;         ///< this request's re-checks and flips since its last brake
+    long long req_tok = 0;                    ///< this request's committed decode tokens since its last brake (route_req_commit)
     long long req_wins = 0;                   ///< this request's decode windows (the grow check every kBrakeWindows)
     long long req_brakes = 0;                 ///< this request's brakes (the stats line takes it at the end)
     long long auto_rc[2] = {0, 0}, auto_fl[2] = {0, 0};   ///< the running test's re-checks and flips per arm (of the cut window's arm)
+    // The learned ceiling (kept in standin-tune.txt as "clean"): b_clean is the largest candidate budget of a completed test whose
+    // candidate arm had <= 0.5 flips per 100 committed tokens over >= kCleanTok tokens.  A candidate above 2 * b_clean is not tested
+    // (a loss); while b_clean is 0 the ceiling is 2 * auto_b0 (the start).
+    double b_clean = 0.0;
     // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
     // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
     // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
@@ -3838,7 +3846,7 @@ void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("S
 
 // STRATA_ROUTE_BUDGET_AUTO / STRATA_FRAGILE_RECHECK: the learned state across restarts.  standin-tune.txt (beside the expert profile)
 // holds "key value" lines: fingerprint (the model's, hex; a file keyed to another model is ignored), budget, step, k, tests, rechecks,
-// flips.  Written to a temp name and renamed, after each finished test and each k update; read once at serve start (route_tune_open).
+// flips, clean (the learned ceiling b_clean: 0 or missing = none yet).  Written to a temp name and renamed, after each finished test and each k update; read once at serve start (route_tune_open).
 namespace {
 void route_tune_write(const RouteResidentCfg& c) {
     if (!c.tune_open || c.tune_path.empty()) return;
@@ -3857,6 +3865,7 @@ void route_tune_write(const RouteResidentCfg& c) {
     ok = ok && std::fprintf(f, "tests %lld\n", c.auto_tests) > 0;
     ok = ok && std::fprintf(f, "rechecks %lld\n", c.fragile_rechecks) > 0;
     ok = ok && std::fprintf(f, "flips %lld\n", c.fragile_flips) > 0;
+    ok = ok && std::fprintf(f, "clean %.9g\n", c.b_clean) > 0;
     ok = std::fclose(f) == 0 && ok;
     std::error_code ec;
     if (ok) std::filesystem::rename(tmp, c.tune_path, ec);
@@ -3873,7 +3882,7 @@ bool route_tune_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) 
     if (f == nullptr) return false;
     char line[256];
     bool fp_ok = false;
-    double budget = -1.0, step = -1.0, k = -1.0;
+    double budget = -1.0, step = -1.0, k = -1.0, clean = -1.0;
     long long tests = -1, rechecks = -1, flips = -1;
     while (std::fgets(line, sizeof line, f) != nullptr) {
         char key[32] = "";
@@ -3886,6 +3895,7 @@ bool route_tune_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) 
         else if (std::strcmp(key, "tests") == 0) tests = std::atoll(val);
         else if (std::strcmp(key, "rechecks") == 0) rechecks = std::atoll(val);
         else if (std::strcmp(key, "flips") == 0) flips = std::atoll(val);
+        else if (std::strcmp(key, "clean") == 0) clean = std::atof(val);
     }
     std::fclose(f);
     if (!fp_ok) return false;
@@ -3900,6 +3910,7 @@ bool route_tune_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) 
     if (tests >= 0) c.auto_tests = tests;
     if (rechecks >= 0) c.fragile_rechecks = rechecks;
     if (flips >= 0) c.fragile_flips = flips;
+    if (clean >= 0.0) c.b_clean = clean;
     return true;
 }
 }  // namespace
@@ -3946,14 +3957,15 @@ void route_wilson90(long long f, long long n, double& lo, double& hi) {
     hi = (centre + half) / den;
 }
 
-// STRATA_FRAGILE_BRAKE: every kBrakeWindows decode windows of the request, the request's budget grows when it has >= kBrakeMin re-checks
-// and the Wilson 90% upper bound of its flip rate is at most 0.2: req_b * 1.25 (never above auto_b; from 0, 0.25 * auto_b).  The request's
+// STRATA_FRAGILE_BRAKE: every kBrakeWindows decode windows of the request, the request's budget grows when it has >= kBrakeMin re-checks,
+// the Wilson 90% upper bound of its re-check flip rate is at most 0.2 and that of its flips per token is at most 0.01: req_b * 1.25 (never above auto_b; from 0, 0.25 * auto_b).  The request's
 // first grow check (window kBrakeWindows) sets req_b = auto_b at once when that holds.  The counts are kept (only a brake resets them).
 void route_brake_grow(RouteResidentCfg& c) {
     if (c.req_rc < RouteResidentCfg::kBrakeMin) return;
-    double lo = 0.0, hi = 0.0;
+    double lo = 0.0, hi = 0.0, tok_lo = 0.0, tok_hi = 0.0;
     route_wilson90(c.req_fl, c.req_rc, lo, hi);
-    if (hi > 0.2) return;
+    route_wilson90(c.req_fl, c.req_tok, tok_lo, tok_hi);
+    if (hi > 0.2 || tok_hi > 0.01) return;
     if (c.req_wins == RouteResidentCfg::kBrakeWindows) {
         c.req_b = c.auto_b;
         return;
@@ -3970,7 +3982,7 @@ void Verifier::route_budget_begin() {
     if (c.auto_on) ++c.auto_req;          // STRATA_ROUTE_BUDGET_AUTO: the request whose windows the next arm time counts
     // STRATA_FRAGILE_BRAKE: this request starts at half the learned budget (auto_b itself when the brake is off)
     c.req_b = c.brake_on ? 0.5f * c.auto_b : c.auto_b;
-    c.req_rc = c.req_fl = c.req_wins = c.req_brakes = 0;
+    c.req_rc = c.req_fl = c.req_tok = c.req_wins = c.req_brakes = 0;
 }
 
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
@@ -4139,17 +4151,21 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
         ++c.req_fl;
         ++c.auto_fl[c.auto_cut_arm];
     }
-    double flip_lo = 0.0, flip_hi = 0.0;
+    double flip_lo = 0.0, flip_hi = 0.0, tok_lo = 0.0, tok_hi = 0.0;
     route_wilson90(c.req_fl, c.req_rc, flip_lo, flip_hi);
-    if (c.brake_on && c.req_b > 0.0f && c.req_rc >= RouteResidentCfg::kBrakeMin && flip_lo > 0.2) {
+    route_wilson90(c.req_fl, c.req_tok, tok_lo, tok_hi);
+    const bool by_recheck = c.req_rc >= RouteResidentCfg::kBrakeMin && flip_lo > 0.2;
+    const bool by_token = c.req_tok >= RouteResidentCfg::kBrakeTokMin && c.req_fl >= RouteResidentCfg::kBrakeFlips && tok_lo > 0.01;
+    if (c.brake_on && c.req_b > 0.0f && (by_recheck || by_token)) {
         const float old = c.req_b;
         const float cut = old * 0.5f;
         c.req_b = cut < 0.01f ? 0.0f : cut;
         ++c.req_brakes;
-        std::fprintf(stderr, "strata serve: stand-in brake: budget %.3f -> %.3f (%lld of %lld re-checks flipped)\n",
-                     (double) old, (double) c.req_b, c.req_fl, c.req_rc);
+        std::fprintf(stderr, "strata serve: stand-in brake: budget %.3f -> %.3f (%lld of %lld re-checks flipped, %lld flips in %lld tokens, %s)\n",
+                     (double) old, (double) c.req_b, c.req_fl, c.req_rc, c.req_fl, c.req_tok, by_token ? "per token" : "per re-check");
         c.req_rc = 0;
         c.req_fl = 0;
+        c.req_tok = 0;
     }
     c.fr_ratio[c.fr_pos] = c.fragile_pend_ratio;
     c.fr_flip[c.fr_pos] = flipped;
@@ -4173,6 +4189,11 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
                      (double) c.fragile_k, c.fragile_rechecks, c.fragile_flips, (double) largest);
         route_tune_write(c);
     }
+}
+
+// A non-merged decode window's commit: this request's committed tokens (the brake's flips per token; route_fragile_settle).
+void Verifier::route_req_commit(int n_keep) {
+    route_resident_cfg().req_tok += n_keep;
 }
 
 // This request's cuts, rows moved by stand-ins, flipped re-decisions and k; false when the switch is off.  Takes and resets the counts.
@@ -4281,7 +4302,10 @@ void auto_next_stage(RouteResidentCfg& c, bool won, int d) {
 void route_auto_schedule(RouteResidentCfg& c) {
     while (!c.auto_testing) {
         const int d = c.auto_stage == 0 ? c.auto_first : -c.auto_first;
-        if (auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d)) != c.auto_b) {
+        const double cand = auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d));
+        // the learned ceiling (b_clean; 2 x the start while none is learned): a candidate above it is not tested (a loss)
+        const double ceiling = c.b_clean > 0.0 ? 2.0 * c.b_clean : 2.0 * (double) c.auto_b0;
+        if (cand != c.auto_b && !(cand > c.auto_b && cand > ceiling)) {
             auto_begin_test(c, d);
         } else {
             auto_next_stage(c, false, d);   // clamped to the base: nothing to test
@@ -4298,19 +4322,26 @@ void route_auto_schedule(RouteResidentCfg& c) {
 }
 
 // Both arms have kAutoMin scheduled windows: the candidate wins when its speed is at least 1.02 times the base's, unless quality is lost.
-// Quality is lost only when both arms have >= kAutoQualityMin re-checks and the candidate's Wilson 90% lower flip-rate bound exceeds
-// the base's Wilson 90% upper bound (a real difference).  Otherwise speed decides.
+// Quality is judged per committed token (the harm rises with flips per token, not with the re-check rate): when both arms have
+// >= kAutoTokMin committed tokens, the candidate is blocked when its Wilson 90% lower flips-per-token bound exceeds the base's upper
+// bound, or when its point rate exceeds 1.5 times the base's with >= kBrakeFlips flips (no significance needed).  Otherwise speed decides.
+// A completed test whose candidate had <= 0.5 flips per 100 tokens over >= kCleanTok tokens raises b_clean (the ceiling) to its budget.
 void route_auto_test_done(RouteResidentCfg& c) {
     const int d = c.auto_dir;
     const double sb = c.auto_secs[0] > 0.0 ? (double) c.auto_tok[0] / c.auto_secs[0] : 0.0;
     const double sc = c.auto_secs[1] > 0.0 ? (double) c.auto_tok[1] / c.auto_secs[1] : 0.0;
     const double fb = c.auto_rc[0] > 0 ? (double) c.auto_fl[0] / (double) c.auto_rc[0] : 0.0;
     const double fc = c.auto_rc[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_rc[1] : 0.0;
+    const double pb = c.auto_tok[0] > 0 ? (double) c.auto_fl[0] / (double) c.auto_tok[0] : 0.0;   // flips per committed token
+    const double pc = c.auto_tok[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_tok[1] : 0.0;
     double base_lo = 0.0, base_hi = 0.0, cand_lo = 0.0, cand_hi = 0.0;
-    route_wilson90(c.auto_fl[0], c.auto_rc[0], base_lo, base_hi);
-    route_wilson90(c.auto_fl[1], c.auto_rc[1], cand_lo, cand_hi);
-    const bool quality = !(c.auto_rc[0] >= RouteResidentCfg::kAutoQualityMin && c.auto_rc[1] >= RouteResidentCfg::kAutoQualityMin
-                           && cand_lo > base_hi);
+    route_wilson90(c.auto_fl[0], c.auto_tok[0], base_lo, base_hi);
+    route_wilson90(c.auto_fl[1], c.auto_tok[1], cand_lo, cand_hi);
+    const bool enough = c.auto_tok[0] >= RouteResidentCfg::kAutoTokMin && c.auto_tok[1] >= RouteResidentCfg::kAutoTokMin;
+    const bool quality = !(enough && (cand_lo > base_hi || (pc > 1.5 * pb && c.auto_fl[1] >= RouteResidentCfg::kBrakeFlips)));
+    if (c.auto_tok[1] >= RouteResidentCfg::kCleanTok && 100.0 * (double) c.auto_fl[1] <= 0.5 * (double) c.auto_tok[1]
+        && (double) c.auto_cand_b > c.b_clean)
+        c.b_clean = (double) c.auto_cand_b;
     const bool won = sc >= sb * 1.02 && quality;
     const float b_old = c.auto_b, cand = c.auto_cand_b, step = c.auto_step;   // step: the factor this test's candidate used
     // the step: a win in the same direction as the last win grows it (to 2); a loss shrinks it toward 1.1 (sqrt, floor 1.1)
@@ -4322,9 +4353,9 @@ void route_auto_test_done(RouteResidentCfg& c) {
     }
     auto_next_stage(c, won, d);
     std::fprintf(stderr, "strata serve: auto budget test %.3f vs %.3f: %.1f vs %.1f tok/s over %d+%d windows step %.2f -> %.3f; "
-                 "flip rate %.3f vs %.3f (%lld vs %lld re-checks)%s\n",
+                 "flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f%s\n",
                  (double) cand, (double) b_old, sc, sb, (int) c.auto_n[1], (int) c.auto_n[0], (double) step, (double) c.auto_b,
-                 fc, fb, c.auto_rc[1], c.auto_rc[0], quality ? "" : ", quality lost");
+                 fc, fb, c.auto_rc[1], c.auto_rc[0], 100.0 * pc, 100.0 * pb, quality ? "" : ", quality lost");
     c.auto_testing = false;
     ++c.auto_tests;
     ++c.auto_tests_take;

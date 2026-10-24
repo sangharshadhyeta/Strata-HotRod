@@ -15864,6 +15864,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (!merged) strata::core::Verifier::route_req_commit(a + 1);   // STRATA_FRAGILE_BRAKE: the request's committed tokens (flips per token)
                 // STRATA_ROUTE_BUDGET_AUTO: this window's speed sample (ver.run start to this commit's end; one bool check when off)
                 if (strata::core::Verifier::route_auto_on() && !merged)
                     strata::core::Verifier::route_auto_window(a + 1, tw0, Clock::now());

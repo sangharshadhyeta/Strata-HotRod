@@ -207,6 +207,8 @@ public:
     /// commit's end); route_auto_take gives the AUTO budget and the tests finished since the last call (false when off).
     static bool route_auto_on();
     static void route_auto_window(int n_keep, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end);
+    /// STRATA_FRAGILE_BRAKE: a non-merged decode window's committed tokens (n_keep) for the request's flips per token (verify.cpp).
+    static void route_req_commit(int n_keep);
     static bool route_auto_take(float& budget, long long& tests);
     /// The decode windows run at b_hi and at b_lo since the last call, with the switch's values (false when the switch is off);
     /// resets both counts.
