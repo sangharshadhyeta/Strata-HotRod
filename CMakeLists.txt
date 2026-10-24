@@ -395,6 +395,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_prompt_attn.cu
                           src/kernels/cuda/fused_gdn.cu
                           src/kernels/cuda/dequant_bf16.cu
+                          src/drafter/dflash2.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
@@ -702,6 +703,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+
+  # The native DFlash 2 drafter (src/drafter/dflash2.cu, in strata_kernels) against the stage-A reference dumps.
+  add_executable(dflash2_ref_test tests/dflash2_ref_test.cu)
+  target_include_directories(dflash2_ref_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dflash2_ref_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
 
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
   # against llama.cpp by tools/qwen35/; the engine itself does not run the family yet

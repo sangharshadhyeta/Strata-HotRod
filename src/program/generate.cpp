@@ -1,3 +1,12 @@
+#include <chrono>
+#include <cstring>
+#include <string>
+#include <vector>
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
 #include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
@@ -17,6 +26,7 @@
 
 #include "strata/platform/memory.hpp"
 #include "strata/core/arch_defaults.hpp"
+#include "../drafter/dflash2.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
@@ -2477,6 +2487,364 @@ static bool lookahead_promote_env() {
     return v == nullptr || std::atoi(v) != 0;
 }
 
+// The drafter a decode window asks for its block: the native one in this process (DflashNative, STRATA_DFLASH_GGUF) or the helper
+// process (DflashLink, STRATA_DFLASH).  The window hooks are the same for both: begin_request at a request's start, stage from the
+// verifier's draft feed, commit for the rows a window keeps, propose before a window (its block after the token x at p), round for a
+// served window, report at the request's end.
+class DflashSource {
+public:
+    virtual ~DflashSource() = default;
+    virtual int block() const = 0;
+    virtual bool usable() const = 0;
+    virtual void begin_request() = 0;
+    virtual void stage(int64_t pos0, int T, const uint16_t* feats) = 0;
+    virtual void commit(int n) = 0;
+    virtual bool propose(int64_t start, int32_t anchor, std::vector<int32_t>& out) = 0;
+    virtual void round(int64_t tokens) = 0;
+    virtual void report() const = 0;
+};
+
+// STRATA_DFLASH=<socket> (opt-in, measurement): the DFlash 2 drafter as a helper process (tools/drafter/dflash_server.py) proposes the
+// serial decode windows' drafts in place of the MTP's and the prompt lookup's.  The verifier's draft feed (verify.cpp, the STRATA_DRAFT_TRACE
+// capture, in memory) stages each window's features; the engine FEEDs the rows it COMMITS, and before a window PROPOSEs a block from its
+// first position p and that token x (the window is [x, drafts...], T = block).  Contiguity: a request's features must run from its
+// position 0 without a gap (a cached prefix, a batched part or a pipelined read leaves one), else the request keeps the MTP.  A socket
+// error logs once and the rest of the process keeps the MTP.  Wire: little endian (the header "<Iqii": op, a, b, c; see the server).
+class DflashLink : public DflashSource {
+public:
+    DflashLink(std::string path, int block, int64_t row) : path_(std::move(path)), block_(block), row_(row) {}
+    ~DflashLink() { close_(); }
+    DflashLink(const DflashLink&) = delete;
+    DflashLink& operator=(const DflashLink&) = delete;
+
+    static bool requested() {
+        const char* s = std::getenv("STRATA_DFLASH");
+        return s != nullptr && *s != 0;
+    }
+    int block() const override { return block_; }
+    bool usable() const override { return on_ && !broken_ && !failed_; }
+
+    // a new request: the helper's context is emptied (RESET); the request's features start at position 0
+    void begin_request() override {
+        on_ = true;
+        broken_ = false;
+        fed_ = 0;
+        rounds_ = 0;
+        produced_ = 0;
+        proposes_ = 0;
+        propose_ms_ = 0.0;
+        stage_T_ = 0;
+        if (failed_) return;
+        if (fd_ < 0 && !connect_()) return fail_("cannot connect to the helper socket");
+        int32_t st = -1;
+        if (!exchange_(kReset, 0, 0, 0, nullptr, 0) || !reply_status_(st)) return fail_("the helper stopped answering RESET");
+        if (st != 0) fail_("the helper refused RESET");
+    }
+
+    // the verifier's draft feed: a window that has finished (its rows' features, bf16 [T][row_]), kept until commit() says how many rows stay
+    void stage(int64_t pos0, int T, const uint16_t* feats) override {
+        stage_pos_ = pos0;
+        stage_T_ = T;
+        stage_.assign(feats, feats + (size_t) T * (size_t) row_);
+    }
+
+    // rows 0..n-1 of the staged window are committed: FEED their features (they are the context from here on)
+    void commit(int n) override {
+        if (!usable()) return;
+        if (stage_T_ < n || stage_pos_ != fed_) {   // not the next positions: this request keeps the MTP
+            broken_ = true;
+            return;
+        }
+        int32_t st = -1;
+        if (!exchange_(kFeed, stage_pos_, n, 0, stage_.data(), (size_t) n * (size_t) row_ * 2) || !reply_status_(st)) return fail_("the helper stopped answering FEED");
+        if (st != 0) {
+            broken_ = true;
+            return;
+        }
+        fed_ += n;
+    }
+
+    // the block's drafts after the anchor x at position `start` (block - 1 tokens into out); false: use the MTP's drafts
+    bool propose(int64_t start, int32_t anchor, std::vector<int32_t>& out) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        ++proposes_;
+        int32_t st = -1;
+        bool ok = exchange_(kPropose, start, anchor, block_) && reply_status_(st);
+        if (!ok) {
+            fail_("the helper stopped answering PROPOSE");
+            return false;
+        }
+        if (st != 0) {   // the helper has not got the context this window needs: the rest of the request keeps the MTP
+            broken_ = true;
+            return false;
+        }
+        out.resize((size_t) block_ - 1);
+        if (!reply_(out.data(), out.size() * sizeof(int32_t))) {
+            fail_("the helper's reply was cut short");
+            return false;
+        }
+        propose_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return true;
+    }
+
+    // a served window from the helper's drafts: its tokens committed (the accepted drafts and the bonus)
+    void round(int64_t tokens) override {
+        ++rounds_;
+        produced_ += tokens;
+    }
+
+    // the request's line (per request, as the other draft counts)
+    void report() const override {
+        if (!on_) return;
+        if (broken_ || failed_)
+            std::fprintf(stderr, "strata serve: dflash: this request kept the MTP for some windows (%s)\n",
+                         failed_ ? "the helper socket failed" : "its features were not contiguous from position 0 or the helper refused");
+        std::fprintf(stderr, "strata serve: dflash: %lld rounds, %.2f tokens per round, %.1f ms per propose\n", (long long) rounds_,
+                     rounds_ > 0 ? (double) produced_ / (double) rounds_ : 0.0, proposes_ > 0 ? propose_ms_ / (double) proposes_ : 0.0);
+    }
+
+private:
+    static constexpr uint32_t kReset = 1, kFeed = 2, kPropose = 3;
+
+    void fail_(const char* why) {
+        if (!failed_) std::fprintf(stderr, "strata serve: dflash: %s; the MTP drafts for the rest of the process\n", why);
+        failed_ = true;
+        close_();
+    }
+
+    bool connect_() {
+#if defined(_WIN32)
+        return false;   // the helper's socket is a Unix one (Windows: the MTP only)
+#else
+        if (path_.size() >= sizeof(sockaddr_un::sun_path)) return false;
+        fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd_ < 0) return false;
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::strncpy(addr.sun_path, path_.c_str(), sizeof addr.sun_path - 1);
+        if (::connect(fd_, (const sockaddr*) &addr, sizeof addr) != 0) {
+            close_();
+            return false;
+        }
+#if defined(__APPLE__)
+        int one = 1;
+        setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+        return true;
+#endif
+    }
+
+    void close_() {
+#if !defined(_WIN32)
+        if (fd_ >= 0) ::close(fd_);
+#endif
+        fd_ = -1;
+    }
+
+    // the header (op, a, b, c) and a payload; false when the socket failed
+    bool exchange_(uint32_t op, int64_t a, int32_t b, int32_t c, const void* payload = nullptr, size_t n = 0) {
+        unsigned char h[20];
+        std::memcpy(h, &op, 4);
+        std::memcpy(h + 4, &a, 8);
+        std::memcpy(h + 12, &b, 4);
+        std::memcpy(h + 16, &c, 4);
+        return send_(h, sizeof h) && (n == 0 || send_(payload, n));
+    }
+    bool reply_status_(int32_t& st) { return reply_(&st, sizeof st); }
+    bool reply_(void* p, size_t n) {
+        unsigned char* q = static_cast<unsigned char*>(p);
+        while (n > 0) {
+            const long long got = recv_(q, n);
+            if (got <= 0) return false;
+            q += got;
+            n -= (size_t) got;
+        }
+        return true;
+    }
+    bool send_(const void* p, size_t n) {
+#if defined(_WIN32)
+        (void) p; (void) n;
+        return false;
+#else
+        const unsigned char* q = static_cast<const unsigned char*>(p);
+        while (n > 0) {
+#if defined(MSG_NOSIGNAL)
+            const long long w = ::send(fd_, q, n, MSG_NOSIGNAL);   // a dead helper is an error, not a SIGPIPE
+#else
+            const long long w = ::send(fd_, q, n, 0);
+#endif
+            if (w <= 0) return false;
+            q += w;
+            n -= (size_t) w;
+        }
+        return true;
+#endif
+    }
+    long long recv_(void* p, size_t n) {
+#if defined(_WIN32)
+        (void) p; (void) n;
+        return -1;
+#else
+        return ::recv(fd_, p, n, 0);
+#endif
+    }
+
+    std::string path_;
+    int block_;
+    int64_t row_;   // one position's features: the drafter's layers x n_embd
+    int fd_ = -1;
+    bool on_ = false, failed_ = false, broken_ = false;
+    int64_t fed_ = 0;   // positions fed this request
+    std::vector<uint16_t> stage_;
+    int64_t stage_pos_ = 0;
+    int stage_T_ = 0;
+    int64_t rounds_ = 0, produced_ = 0, proposes_ = 0;
+    double propose_ms_ = 0.0;
+};
+
+// STRATA_DFLASH_GGUF=<gguf> (opt-in): the native DFlash 2 drafter (src/drafter/dflash2.hpp) in this process, in DflashLink's place.  The
+// same windows and contiguity rules; the block is proposed on this object's stream with the engine's own token embedding and output
+// head (Verifier::draft_embed / draft_head, no copies of either).  The MTP is off for the run (main clears --mtp for it).  load() runs
+// before the expert cache is sized, so the drafter's weights and its window ring come out of the VRAM the cache sizing sees.
+class DflashNative : public DflashSource {
+public:
+    DflashNative(std::string gguf, int block, int64_t row) : gguf_(std::move(gguf)), block_(block), row_(row) {}
+    ~DflashNative() override {
+        if (feat_dev_ != nullptr) cudaFree(feat_dev_);
+        if (stream_ != nullptr) cudaStreamDestroy(stream_);
+    }
+    DflashNative(const DflashNative&) = delete;
+    DflashNative& operator=(const DflashNative&) = delete;
+
+    static bool requested() {
+        const char* s = std::getenv("STRATA_DFLASH_GGUF");
+        return s != nullptr && *s != 0;
+    }
+    const std::string& gguf() const { return gguf_; }
+
+    // the drafter's weights and ring on the current device (before the cache is sized); its stream and the feature staging
+    bool load(std::string& err) {
+        if (row_ != strata::drafter::Dflash2::kCtxFeat) {
+            err = "the drafter's feature row is " + std::to_string(row_) + ", not " + std::to_string(strata::drafter::Dflash2::kCtxFeat);
+            return false;
+        }
+        if (!drafter_.load(gguf_, err)) return false;
+        if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaMalloc((void**) &feat_dev_, (size_t) strata::kernels::kVerifyMaxT * (size_t) row_ * sizeof(uint16_t)) != cudaSuccess) {
+            err = "the drafter's stream or feature buffer does not fit";
+            return false;
+        }
+        return true;
+    }
+    // the verifier whose embedding and head the drafter uses (after the verifier is made; before its first window)
+    void bind(strata::core::Verifier* ver) { ver_ = ver; }
+
+    int block() const override { return block_; }
+    bool usable() const override { return on_ && !broken_ && !failed_ && ver_ != nullptr; }
+
+    void begin_request() override {
+        on_ = true;
+        broken_ = false;
+        fed_ = 0;
+        rounds_ = 0;
+        produced_ = 0;
+        proposes_ = 0;
+        propose_ms_ = 0.0;
+        stage_T_ = 0;
+        drafter_.reset();
+    }
+
+    void stage(int64_t pos0, int T, const uint16_t* feats) override {
+        stage_pos_ = pos0;
+        stage_T_ = T;
+        stage_.assign(feats, feats + (size_t) T * (size_t) row_);
+    }
+
+    // rows 0..n-1 of the staged window are committed: their features are fed to the drafter (its context from here on)
+    void commit(int n) override {
+        if (!usable()) return;
+        if (stage_T_ < n || stage_pos_ != fed_) {   // not the next positions: this request decodes plainly from here on
+            broken_ = true;
+            return;
+        }
+        if (cudaMemcpy(feat_dev_, stage_.data(), (size_t) n * (size_t) row_ * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            std::fprintf(stderr, "strata serve: dflash: the features could not be copied to the device; this request decodes plainly\n");
+            broken_ = true;
+            return;
+        }
+        std::string err;
+        if (!drafter_.feed(feat_dev_, (int) fed_, (int) (fed_ + n), stream_, err)) {
+            keep_plain_(err);
+            return;
+        }
+        fed_ += n;
+    }
+
+    bool propose(int64_t start, int32_t anchor, std::vector<int32_t>& out) override {
+        if (!usable()) return false;
+        if (!checked_) {   // the drafter's logits are kVocab wide: an engine with another vocabulary cannot run it
+            checked_ = true;
+            if (ver_->draft_vocab() != strata::drafter::Dflash2::kVocab) {
+                std::fprintf(stderr, "strata serve: dflash: the model's vocabulary (%lld) is not the drafter's (%d); the drafter is off\n",
+                             (long long) ver_->draft_vocab(), strata::drafter::Dflash2::kVocab);
+                failed_ = true;
+                return false;
+            }
+        }
+        ++proposes_;
+        const auto t0 = std::chrono::steady_clock::now();
+        const strata::drafter::EmbedFn embed = [this](const int32_t* ids, int n, float* o, void* s, std::string& e) {
+            return ver_->draft_embed(ids, n, o, s, e);
+        };
+        const strata::drafter::HeadFn head = [this](const float* h, int n, float* l, void* s, std::string& e) {
+            return ver_->draft_head(h, n, l, s, e);
+        };
+        std::string err;
+        if (!drafter_.propose((int) start, anchor, block_, embed, head, out, stream_, err)) {
+            keep_plain_(err);
+            return false;
+        }
+        propose_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return true;
+    }
+
+    void round(int64_t tokens) override {
+        ++rounds_;
+        produced_ += tokens;
+    }
+
+    void report() const override {
+        if (!on_) return;
+        if (broken_ || failed_)
+            std::fprintf(stderr, "strata serve: dflash: this request decoded plainly for some windows (%s)\n",
+                         failed_ ? "the drafter is off" : "its features were not contiguous from position 0 or the drafter refused");
+        std::fprintf(stderr, "strata serve: dflash: %lld rounds, %.2f tokens per round, %.1f ms per propose\n", (long long) rounds_,
+                     rounds_ > 0 ? (double) produced_ / (double) rounds_ : 0.0, proposes_ > 0 ? propose_ms_ / (double) proposes_ : 0.0);
+    }
+
+private:
+    // this request's drafter is out of step: its windows decode plainly for the rest of the request (the drafter's message once)
+    void keep_plain_(const std::string& why) {
+        if (!broken_) std::fprintf(stderr, "strata serve: dflash: %s; this request decodes plainly from here on\n", why.c_str());
+        broken_ = true;
+    }
+
+    std::string gguf_;
+    int block_;
+    int64_t row_;   // one position's features: the drafter's layers x n_embd
+    strata::drafter::Dflash2 drafter_;
+    strata::core::Verifier* ver_ = nullptr;
+    cudaStream_t stream_ = nullptr;
+    uint16_t* feat_dev_ = nullptr;   // kVerifyMaxT rows of features (bf16), the commit's copy from stage_
+    bool on_ = false, broken_ = false, failed_ = false, checked_ = false;
+    int64_t fed_ = 0;   // positions fed this request
+    std::vector<uint16_t> stage_;
+    int64_t stage_pos_ = 0;
+    int stage_T_ = 0;
+    int64_t rounds_ = 0, produced_ = 0, proposes_ = 0;
+    double propose_ms_ = 0.0;
+};
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -2942,6 +3310,19 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+        }
+    }
+    // STRATA_DFLASH_GGUF (opt-in): the native drafter replaces the MTP for the run.  Its files are not loaded, it binds no VRAM, and it
+    // neither prefills nor drafts; the windows the drafter does not serve decode plainly.  Needs --batch 0 and the native head (else
+    // the MTP stays and the drafter is off, said here).
+    if (DflashNative::requested()) {
+        if (o.batch == 0 && (!o.native_head_gguf.empty() || !o.native_preset.empty()) && !o.mtp.empty()) {   // (the head defaults to --native's shard below)
+            std::fprintf(stderr, "strata generate: STRATA_DFLASH_GGUF: the native drafter replaces --mtp %s for this run (the MTP "
+                                 "does not load, bind or draft)\n", o.mtp.c_str());
+            o.mtp.clear();
+        } else if (!(o.batch == 0 && (!o.native_head_gguf.empty() || !o.native_preset.empty()))) {
+            std::fprintf(stderr, "strata generate: STRATA_DFLASH_GGUF is off: it needs --batch 0 and the native head "
+                                 "(--native-head-gguf); the MTP stays\n");
         }
     }
     if (o.conversation_cache_min_free_mib < 0) {   // auto (--conversation-cache-min-free-mib -1 or the default): 8% of MemTotal in 256 MiB steps
@@ -5640,6 +6021,32 @@ int main(int argc, char** argv) {
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
+    // STRATA_DFLASH_GGUF: the native drafter's weights and its window ring (dflash2: 2048 slots per layer, f32) are allocated here, with
+    // the head, before the expert cache is sized: the cache takes what is free less the reserve, so what is allocated after it comes out
+    // of the reserve.  The MTP is off for this mode (main), so its "+N MiB for the draft head" term is 0 and this takes its place.
+    std::unique_ptr<DflashNative> dflash_native;
+    if (DflashNative::requested() && o.batch == 0 && !o.native_head_gguf.empty()) {
+        if (!native_head.loaded() || multi_gpu) {
+            std::fprintf(stderr, "strata generate: STRATA_DFLASH_GGUF needs one GPU, the native head (--native-head-gguf) and no layer split\n");
+            return 1;
+        }
+        const int bv = std::getenv("STRATA_DFLASH_BLOCK") != nullptr && *std::getenv("STRATA_DFLASH_BLOCK") != 0
+                           ? std::atoi(std::getenv("STRATA_DFLASH_BLOCK")) : 4;
+        const int blk = std::max(2, std::min(bv, std::min((int) strata::drafter::Dflash2::kBlock, (int) strata::kernels::kVerifyMaxT)));
+        dflash_native = std::make_unique<DflashNative>(std::getenv("STRATA_DFLASH_GGUF"), blk, 5 * (int64_t) g.n_embd);
+        size_t free_before = 0, total_b = 0;
+        cudaMemGetInfo(&free_before, &total_b);
+        std::string derr;
+        if (!dflash_native->load(derr)) {
+            std::fprintf(stderr, "strata generate: STRATA_DFLASH_GGUF=%s: %s\n", std::getenv("STRATA_DFLASH_GGUF"), derr.c_str());
+            return 1;
+        }
+        size_t free_after = 0;
+        cudaMemGetInfo(&free_after, &total_b);
+        std::fprintf(stderr, "strata generate: STRATA_DFLASH_GGUF: the native DFlash 2 drafter, block %d, %.0f MiB of VRAM (weights and the "
+                             "2048-slot window ring) before the expert cache\n", blk,
+                     (double) (free_before - std::min(free_before, free_after)) / 1048576.0);
+    }
     std::vector<float> logits((size_t) n_vocab);
     mem_mark("the native head");
     float* d_logits = nullptr;
@@ -5650,7 +6057,7 @@ int main(int argc, char** argv) {
     }
     bool prefill_head_alias_bound = false;
     const void* prefill_head_alias_at = nullptr;   // where the head came back the first time
-    if (o.prefill_head_alias) {
+    if (o.prefill_head_alias && !dflash_native) {   // (STRATA_DFLASH_GGUF: the MTP is off, so its head is not bound)
         const char* why = !o.serve ? "it needs --serve"
                         : multi_gpu || !stages.empty() ? "it supports one GPU only"
                         : o.batch > 0 ? "it does not support --batch"
@@ -9173,11 +9580,42 @@ int main(int argc, char** argv) {
             // the setters reach the later stages; the pipeline never chains run/commit
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
+        // The drafter that proposes the serial decode windows' drafts: STRATA_DFLASH_GGUF (DflashNative, loaded before the cache) or
+        // STRATA_DFLASH (DflashLink, the helper process).  Its windows are block rows, so the verifier must hold that many; one GPU,
+        // one slot, no --batch-mtp (the capture needs the whole model).
+        std::unique_ptr<DflashSource> dflash;
+        int dflash_T = 0;
+        if (dflash_native) {
+            if (n_stages != 1 || batch_mtp) {
+                std::fprintf(stderr, "strata generate: STRATA_DFLASH_GGUF needs one stage and no --batch-mtp\n");
+                return 1;
+            }
+            dflash_native->bind(&ver);
+            dflash_T = dflash_native->block();
+            std::fprintf(stderr, "strata serve: STRATA_DFLASH_GGUF: the native DFlash 2 drafter proposes blocks of %d (the prompt "
+                                 "must be read through the verify windows: --short-read 100000)\n", dflash_T);
+            dflash = std::move(dflash_native);
+        } else if (DflashLink::requested()) {
+            const char* bv = std::getenv("STRATA_DFLASH_BLOCK");
+            const int blk = std::max(2, std::min(bv != nullptr && *bv != 0 ? std::atoi(bv) : 4, (int) strata::kernels::kVerifyMaxT));
+            if (o.batch == 0 && n_stages == 1 && !batch_mtp) {
+                dflash = std::make_unique<DflashLink>(std::getenv("STRATA_DFLASH"), blk, 5 * (int64_t) g.n_embd);
+                dflash_T = blk;
+                std::fprintf(stderr, "strata serve: STRATA_DFLASH=%s: the DFlash 2 drafter proposes blocks of %d (the prompt "
+                                     "must be read through the verify windows: --short-read 100000)\n", std::getenv("STRATA_DFLASH"), blk);
+            } else {
+                std::fprintf(stderr, "strata serve: STRATA_DFLASH is off: it needs one GPU, no --batch and no --batch-mtp\n");
+            }
+        }
+        if (dflash) ver.set_draft_feed([link = dflash.get()](int64_t pos0, int T, const int32_t*, const int32_t*, const uint16_t* f) {
+            link->stage(pos0, T, f);
+        });
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
+                      batch_mtp ? strata::kernels::kVerifyMaxT
+                                : std::max(std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), dflash_T), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -13098,6 +13536,7 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
+            if (dflash) dflash->begin_request();   // STRATA_DFLASH: the helper's context starts empty for this request
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
@@ -13763,7 +14202,9 @@ int main(int argc, char** argv) {
                     }();
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
-                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+                    if (!ver.commit(T, e)) return false;
+                    if (dflash) dflash->commit(T);   // STRATA_DFLASH: the committed rows' features go to the helper
+                    if (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -14950,8 +15391,9 @@ int main(int argc, char** argv) {
             int32_t x = (int32_t) ids[(size_t) p];
             // (the drafter writes max_t - 1 drafts: 8 rows with --pipeline-windows 2)
             const size_t DS = (size_t) std::max(S, use_mtp ? mtp.max_t() : 0);
-            const size_t WS = (size_t) std::max(S, merge_T);
+            const size_t WS = (size_t) std::max(std::max(S, merge_T), dflash_T);
             std::vector<int32_t> drafts(DS, 0), window(WS), outv(WS);
+            std::vector<int32_t> dbuf((size_t) dflash_T, 0);   // STRATA_DFLASH: the helper's block-1 drafts
             std::vector<float> dprob(DS, 0.0f);
             std::vector<int32_t> sbuf((size_t) S, 0);
             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
@@ -15669,11 +16111,18 @@ int main(int argc, char** argv) {
                 }
                 if (first_window) T = merge_T > 0 ? merge_T : 1;
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
+                // STRATA_DFLASH: the block after x (at p) from the helper, the window is [x, drafts] with T = block; a failed
+                // proposal keeps the MTP's window for this round
+                bool from_dflash = false;
+                if (dflash && !first_window && dflash->usable() && dflash->propose(p, x, dbuf)) {
+                    from_dflash = true;
+                    T = dflash_T;
+                }
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
+                if (o.suffix_draft > 0 && !first_window && !from_dflash) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
@@ -15683,7 +16132,7 @@ int main(int argc, char** argv) {
                 }
                 // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
                 int chain_n = 0, cm = 0;
-                if (o.lookup_chain > 0 && !first_window && !from_sfx && T < S) {
+                if (o.lookup_chain > 0 && !first_window && !from_sfx && !from_dflash && T < S) {
                     int csrc = -1;
                     const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
                     chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
@@ -15704,6 +16153,7 @@ int main(int argc, char** argv) {
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i)
                     window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
+                                         : from_dflash ? dbuf[(size_t) i - 1]
                                          : from_sfx ? sbuf[(size_t) i - 1]
                                                     : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
@@ -15801,7 +16251,7 @@ int main(int argc, char** argv) {
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
-                if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                if (use_mtp && mtp.prob() && !from_sfx && !from_dflash && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
                 ver.route_budget_window(true, !merged);   // STRATA_ROUTE_BUDGET_DYN: the decode budget of this window (no-op when off); AUTO: not a merged window
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -15845,10 +16295,11 @@ int main(int argc, char** argv) {
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (fr_cut >= 1) a = std::min(a, fr_cut - 1);   // STRATA_FRAGILE_RECHECK: rows fr_cut.. are re-decided, not kept
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                if (from_dflash) dflash->round(a + 1);   // the helper's window: the tokens it committed (accepted drafts and the bonus)
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
-                if (!from_sfx && !first_window)
+                if (!from_sfx && !from_dflash && !first_window)
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
-                if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
+                if (strata::core::MtpDrafter::top2_env() && !from_sfx && !from_dflash && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
@@ -15877,6 +16328,7 @@ int main(int argc, char** argv) {
                     finish = "nonfinite";
                     break;
                 }
+                if (dflash) dflash->commit(a + 1);   // STRATA_DFLASH: the committed rows' features go to the helper (rejected rows never do)
                 // a merged window: the drafter's rows of the prompt tokens in it, as the prompt windows give them
                 if (merged && use_mtp && !mtp.prefill(ver.final_R_all(), window.data() + 1, T - 1, p, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -15929,10 +16381,10 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                if (timed_round && !eos && chain_n == 0)
+                if (timed_round && !eos && chain_n == 0 && !from_dflash)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
-                else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
+                else if (timed_round && !eos && !from_dflash)   // a chained window: its MTP part, its chain, its cost
                     policy.observe_chain(T_mtp, chain_n, a, cm,
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
@@ -16505,6 +16957,7 @@ int main(int argc, char** argv) {
                              (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
                              over ? " - OVERFLOW (too few resident cells)" : "");
             }
+            if (dflash) dflash->report();   // STRATA_DFLASH: this request's helper rounds
             if (sfx_windows > 0)
                 std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);

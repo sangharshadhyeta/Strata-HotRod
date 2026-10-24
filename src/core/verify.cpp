@@ -460,17 +460,21 @@ bool gdn_loop_enabled() { return gdn_loop_k() > 1; }
 // tools/drafter/dflash_offline.py replays the drafter on it.  The capture is a device copy per traced layer inside the window graph;
 // the host writes the window once it has finished.  File: u32 "DFT1", u32 L, u32 n_embd, u32 hc, i32 layer[L]; then per window
 // i64 pos0 | i32 T | i32 tokens[T] | i32 picks[T] | u16 bf16 [T][L][n_embd].  Later windows rewrite a position its rejected drafts held.
+// STRATA_DFLASH=<socket> (generate.cpp) turns the same capture on without a file: the windows go to the verifier's draft feed.
 struct DraftTrace {
     std::mutex mu;
     FILE* f = nullptr;
     bool header = false;
+    bool on = false;   // a file, or STRATA_DFLASH: the windows' features are captured
     std::vector<int> layers;
 };
 DraftTrace& draft_trace() {
     static DraftTrace d;   // (a mutex: filled in place, once)
     static const bool opened = [] {
         const char* p = std::getenv("STRATA_DRAFT_TRACE");
-        if (p == nullptr || *p == 0) return false;
+        const char* sock = std::getenv("STRATA_DFLASH");
+        const char* gguf = std::getenv("STRATA_DFLASH_GGUF");   // the native drafter needs the same features
+        if ((p == nullptr || *p == 0) && (sock == nullptr || *sock == 0) && (gguf == nullptr || *gguf == 0)) return false;
         const char* lv = std::getenv("STRATA_DRAFT_TRACE_LAYERS");
         std::string ls = lv != nullptr && *lv != 0 ? lv : "5,15,25,35,45";
         for (size_t i = 0; i < ls.size();) {
@@ -478,6 +482,8 @@ DraftTrace& draft_trace() {
             d.layers.push_back(std::atoi(ls.substr(i, j == std::string::npos ? std::string::npos : j - i).c_str()));
             i = j == std::string::npos ? ls.size() : j + 1;
         }
+        d.on = true;
+        if (p == nullptr || *p == 0) return true;   // STRATA_DFLASH only: no file
         d.f = std::fopen(p, "wb");
         if (d.f == nullptr) std::fprintf(stderr, "strata: STRATA_DRAFT_TRACE: cannot open %s\n", p);
         else std::fprintf(stderr, "strata: STRATA_DRAFT_TRACE=%s (measurement: the residual after layers %s of every verify window)\n", p, ls.c_str());
@@ -486,7 +492,7 @@ DraftTrace& draft_trace() {
     (void) opened;
     return d;
 }
-bool draft_trace_on() { return draft_trace().f != nullptr; }
+bool draft_trace_on() { return draft_trace().on; }
 int draft_trace_slot(int64_t l) {
     const std::vector<int>& ls = draft_trace().layers;
     for (size_t i = 0; i < ls.size(); ++i)
@@ -5158,6 +5164,47 @@ void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
     if (nf_row_ >= 0) nf_pos_ = pos_b != nullptr ? pos_b[nf_row_] : last_pos0_ + nf_row_;
 }
 
+// STRATA_DFLASH_GGUF: the native drafter's embedding and head (verify.hpp).  The same kernels as the window's own: the
+// NativeEmbed table or the canonical token_embd codes, and the native head's q8_1 quantize and mmvq over the head's weights.
+bool Verifier::draft_embed(const int32_t* ids_dev, int n, float* out_dev, void* stream, std::string& err) {
+    if (const NativeEmbed* ne = native_embed()) {
+        ne->gather_dev(ids_dev, n, out_dev, stream);
+        return true;
+    }
+    const WeightRef* w = wt_ != nullptr ? wt_->find("token_embd.weight") : nullptr;
+    if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
+        err = "verify: token_embd.weight is missing or not an S2/S4/S8 tensor";
+        return false;
+    }
+    const auto* codes = (const uint8_t*) w->data;
+    const auto* scales = (const float*) (codes + w->codes_bytes);
+    const auto* offsets = w->has_offset ? (const float*) (codes + w->codes_bytes + w->scales_bytes) : nullptr;
+    const uint64_t row_codes = (uint64_t) (w->ne0 / (8 / w->code_bits));
+    const uint64_t row_groups = (uint64_t) (w->ne0 / w->group_elems);
+    strata::kernels::embedding_gather_dev(codes, scales, offsets, ids_dev, n, w->ne0, w->code_bits, w->code_bias, w->group_elems, row_codes,
+                         row_groups, out_dev, stream);
+    return true;
+}
+
+bool Verifier::draft_head(const float* hidden_dev, int n, float* logits_dev, void* stream, std::string& err) {
+    if (head_ == nullptr || !head_->loaded() || xq_ == nullptr) {
+        err = "verify: the native drafter needs the native output head (--native-head-gguf)";
+        return false;
+    }
+    if (n < 1 || n > strata::kernels::kVerifyMaxT) {
+        err = "verify: draft_head rows " + std::to_string(n) + " outside 1.." + std::to_string(strata::kernels::kVerifyMaxT);
+        return false;
+    }
+    try {
+        strata::kernels::native_quantize_q8_1(hidden_dev, xq_, (int) g_->n_embd, n, stream);
+        strata::kernels::native_mmvq(head_->type(), head_->weights(), xq_, logits_dev, (int) g_->n_embd, (int) n_vocab_, n, stream);
+    } catch (const std::exception& e) {
+        err = std::string("verify draft head: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
 bool Verifier::copy_logits(int t, float* host) const {
 #if defined(STRATA_GPU_METAL)
     return strata::metal_engine::window_copy_logits(metal_, t, host);
@@ -5431,6 +5478,7 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
 
 void Verifier::draft_trace_write(int T, const int32_t* tokens, int64_t pos0, const int32_t* out) {
     DraftTrace& d = draft_trace();
+    if (d.f == nullptr && !draft_feed_) return;   // STRATA_DFLASH: only the verifier with a feed takes the window
     const int64_t N = g_->n_embd, HC = g_->hc, L = (int64_t) d.layers.size();
     std::vector<float> res((size_t) (L * max_t_ * HC * N));
     if (cudaMemcpy(res.data(), dtr_, res.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -5454,6 +5502,7 @@ void Verifier::draft_trace_write(int T, const int32_t* tokens, int64_t pos0, con
         }
     std::vector<int32_t> picks((size_t) T);
     for (int t = 0; t < T; ++t) picks[(size_t) t] = ((const volatile int32_t*) out)[t];
+    if (draft_feed_) draft_feed_(pos0, T, tokens, picks.data(), row.data());
     std::lock_guard<std::mutex> lk(d.mu);
     if (d.f == nullptr) return;
     if (!d.header) {

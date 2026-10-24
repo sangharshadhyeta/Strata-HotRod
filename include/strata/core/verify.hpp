@@ -388,6 +388,18 @@ public:
     /// times its pool, and after each window *model (the dispatch's) takes the costs. One GPU, no batch slots. Set
     /// before `init` (the stamps are captured). `paused`: a request's own --pcie-frac holds meanwhile.
     void set_pcie_balance(PcieModel* model) { bal_ = model; }
+    // STRATA_DFLASH: every window this verifier runs hands its traced features over, in memory, once the window has finished
+    // and before its commit: tokens and picks [T], feats bf16 [T][L][n_embd] (the layers of draft_trace; see verify.cpp).
+    using DraftFeed = std::function<void(int64_t pos0, int T, const int32_t* tokens, const int32_t* picks, const uint16_t* feats)>;
+    void set_draft_feed(DraftFeed f) { draft_feed_ = std::move(f); }
+    // STRATA_DFLASH_GGUF: the engine's own token embedding and output head for the native drafter (strata::drafter::Dflash2).
+    // draft_embed: n token ids (device) -> n rows of n_embd floats (device).  draft_head: n normed hidden rows (device,
+    // fp32, n_embd each) -> n rows of n_vocab logits (device), through the head already on the GPU; n <= kVerifyMaxT.
+    // Both run on `stream` and reuse the verifier's scratch (its windows never run beside them).  False with err when the
+    // weights are not there.
+    bool draft_embed(const int32_t* ids_dev, int n, float* out_dev, void* stream, std::string& err);
+    bool draft_head(const float* hidden_dev, int n, float* logits_dev, void* stream, std::string& err);
+    int64_t draft_vocab() const { return n_vocab_; }
     void pause_pcie_balance(bool paused) {
         bal_paused_ = paused;
         if (bal_ != nullptr && m_bal_ != nullptr) bal_->on = !paused;
@@ -676,6 +688,7 @@ private:
     float *loop_beta_ = nullptr, *loop_z_ = nullptr, *loop_y_ = nullptr;
     // STRATA_DRAFT_TRACE (measurement only; zero-sized when off): the window's residual after each traced layer, [layer][max_t][hc * n_embd]
     float* dtr_ = nullptr;
+    DraftFeed draft_feed_;   // STRATA_DFLASH: this verifier's windows, in memory (set_draft_feed)
     void draft_trace_write(int T, const int32_t* tokens, int64_t pos0, const int32_t* out);
     float *loop_st_ = nullptr;   // one GDN layer's state + conv history before a one-token window's pass 0 (the looped passes
                                  // read it; pass 0 self-commits); one buffer: the looped layers are recorded one after another
