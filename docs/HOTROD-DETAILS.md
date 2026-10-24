@@ -178,3 +178,33 @@ What we found on the way (20 Oct 2026, every answer read by hand):
 
 The opt-in switches for the top two ranks stay in the engine for testing: `STRATA_ROUTE_RAM_FLOOR=1` (rank 1 within
 `STRATA_ROUTE_RAM_FLOOR_MARGIN` logits, default 1) and `STRATA_ROUTE_RAM_FLOOR_RANK0=1` (rank 0 too).
+
+## Switches (moved from the README, 24 Oct)
+
+| On by default | Off: `=0` |
+| --- | --- |
+| `STRATA_ROUTE_BUDGET_AUTO`, `STRATA_FRAGILE_RECHECK`, `STRATA_FRAGILE_BRAKE` | the self-tuning stand-ins |
+| `STRATA_LA_LEARN`, `STRATA_LA_TAIL_READ=2` | the learned look-ahead, need-only read-ahead |
+
+| Opt-in, measured and left off | Why |
+| --- | --- |
+| `STRATA_ROUTE_TAIL_OPEN=1` | ranks 3-9 unchecked until a brake: faster, malformed JSON/code seen |
+| `STRATA_ROUTE_BRAKE_STEP=1` | each brake checks one more rank: a wrong maths answer |
+| `STRATA_IO_GATE=1` | read-ahead gate by drive load: no gain with the learned look-ahead |
+| `STRATA_LA_EDGE_SKIP=1`, `STRATA_LA_MODEL=<file>` | superseded by the learned look-ahead |
+| `STRATA_GDN_LOOP=1` | looped middle layers: 10% slower, no clear accuracy gain |
+| `STRATA_ROUTER_FUSED=1`, `STRATA_GR_DOWN_WPC=4\|2` | byte-identical outputs; alone and together within run-to-run spread: no gain |
+
+## Earlier speed tables (moved from the README)
+
+Writing answers, 17 Oct 2026 (three prompts, each asked three times; the repeats are faster because the prompt's experts
+are already on the card):
+
+| Prompt (answer length) | 128K context, first ask | 128K, repeats | 32K context, first ask (5 runs) |
+| --- | ---: | ---: | ---: |
+| Code (240 - 320 tokens) | 43.9 tokens/s | 67.9, 76.1 | 43.0 - 44.0 |
+| Reasoning (790 - 900 tokens) | 53.7 tokens/s | 64.1, 71.7 | 53.7 - 61.8 |
+| Story (140 - 180 tokens) | 41.8 tokens/s | 43.1, 51.1 | 36.1 - 39.8 |
+
+Short prompts, seconds until the first word (10 Oct 2026, before the 0.1.45 merge): 150-260 tokens 3.8-5.8 s, 430-500 tokens
+7.5-10.5 s, 1,600-2,100 tokens 14-16 s.
