@@ -202,6 +202,16 @@ Live on the abliterated IQ3_S (24 Oct, share of the needed experts not on the ca
 59.0 and 54.4 tokens/s on the mean, the learned look-ahead 58.6 and 58.6 (about +3% and steadier); SSD wait 7.0-7.2 against
 6.2-6.5 s. Offline replays and the design notes: `docs/PREDICTOR-EXPERIMENTS.md`, `tools/predictor/`.
 
+Opt-in, measured 24 Oct and left off (same 3-question test, every answer correct):
+
+- **Read-ahead gate** (`STRATA_IO_GATE=1`): each guess position (1, 2 or 4 layers ahead, rank 0-9) learns how often its reads
+  are used, and a guess is read only when that rate is at least the drive's load ((reads in progress + queued) / workers).
+  It won 3% on 19 Oct, before the learned look-ahead. Now 58.5 and 57.4 against 57.7 tokens/s, and the SSD wait rose (8.8 and
+  5.9 against 5.4 s): the learned guesses and the stand-in test leave little waste, and what the gate holds back is often needed.
+- **Two kernel switches from 19 Oct** (`STRATA_ROUTER_FUSED=1`: the router's GEMV and top-10 in one launch;
+  `STRATA_GR_DOWN_WPC=8|4|2`: warps per staged down block) with their byte-exact bench `bench/micro/hotrod_kernel_ab.sh`:
+  ported, not yet measured.
+
 ## Stand-in experts, rank by rank (the rule until 23 Oct; prompt reading still uses it)
 
 For every token, each layer's router picks 10 of 512 experts and ranks them, rank 0 the most important. The ones on the
