@@ -678,6 +678,14 @@ void set_tail_skip_rank(int r);
 /// (tools/predictor/trace_reader.py pairs them in order and checks the row count).  The verifier calls it as it launches a window;
 /// a no-op when the trace is off.
 void router_trace_tokens(const int32_t* tokens, int64_t n_tok);
+/// STRATA_ROUTER_TRACE_PREFILL=1 (with STRATA_ROUTER_TRACE): the prompt's routing in the same file (format RTR2, see expert_source.cpp).
+/// router_trace_prefill_on() is false otherwise and the other calls are no-ops.  router_trace_request starts a request (its prefill records carry its number).
+/// router_trace_prefill writes one MoE layer's sampled prompt tokens: pos and tok (n_tok each), x_bf16 (n_tok x 2560 bf16, the router input), ids (n_tok x k).
+bool router_trace_prefill_on();
+int64_t router_trace_prefill_every();
+void router_trace_request(int64_t n_prompt);
+void router_trace_prefill(int64_t layer, const int32_t* pos, const int32_t* tok, const uint16_t* x_bf16, const int32_t* ids, int64_t n_tok,
+                          int64_t k);
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);

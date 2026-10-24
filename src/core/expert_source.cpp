@@ -5335,14 +5335,24 @@ namespace {
 // `step` counts windows (it advances at layer 0).  Run with the stand-ins OFF (no STRATA_ROUTE_RESIDENT) so `ids` are the model's own top-k.
 // Token records (router_trace_tokens, written when the verifier launches a window, so before that window's layer-0 record):
 // u32 0 | u16 0xFFFF | u8 n_tok | u8 0 | i32[n_tok] token ids.  Readers that predate them stop at the first one (its size differs).
+// STRATA_ROUTER_TRACE_PREFILL=1 (with STRATA_ROUTER_TRACE; the file is then "RTR2"): the prompt's routing too, so a predictor can learn a
+// conversation from its prefill.  Request record (at each Prefill::run): u32 request | u16 0xFFFE | u16 0 | u32 n_prompt.  Prefill record (per MoE
+// layer and prompt chunk, the chunk's sampled tokens: absolute positions divisible by STRATA_ROUTER_TRACE_PREFILL_EVERY, default 4):
+// u32 request | u16 0xFFFD | u16 layer | u16 n_tok | u8 k | u8 0, then per token: i32 pos | i32 token id | u16[H] bf16 router input | i16[k] ids.
+// Decode records keep their layout; tools/predictor/trace_reader.py reads both files.
 struct RouterTrace {
     std::mutex mu;
     FILE* f = nullptr;
     uint32_t step = 0;
+    uint32_t request = 0;
     uint64_t calls = 0;
     ~RouterTrace() { if (f != nullptr) std::fclose(f); }
 };
 RouterTrace& router_trace() { static RouterTrace t; return t; }
+bool router_trace_prefill_env() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_ROUTER_TRACE_PREFILL"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
 bool router_trace_on() {
     static const bool on = [] {
         const char* p = std::getenv("STRATA_ROUTER_TRACE");
@@ -5351,9 +5361,10 @@ bool router_trace_on() {
         t.f = std::fopen(p, "wb");
         if (t.f == nullptr) { std::fprintf(stderr, "strata: STRATA_ROUTER_TRACE: cannot open %s\n", p); return false; }
         std::setvbuf(t.f, nullptr, _IOFBF, 1 << 22);
-        const uint32_t magic = 0x31525452u;   // "RTR1"
+        const uint32_t magic = router_trace_prefill_env() ? 0x32525452u : 0x31525452u;   // "RTR2" with prefill records, else "RTR1"
         std::fwrite(&magic, 4, 1, t.f);
-        std::fprintf(stderr, "strata: STRATA_ROUTER_TRACE=%s (measurement: every MoE layer's router input and routed experts of every decode window)\n", p);
+        std::fprintf(stderr, "strata: STRATA_ROUTER_TRACE=%s (measurement: every MoE layer's router input and routed experts of every decode window%s)\n",
+                     p, router_trace_prefill_env() ? " and of the sampled prompt tokens" : "");
         return true;
     }();
     return on;
@@ -5403,6 +5414,57 @@ void router_trace_tokens(const int32_t* tokens, int64_t n_tok) {
     std::fwrite(&nt, 1, 1, t.f);
     std::fwrite(&kk, 1, 1, t.f);
     std::fwrite(tokens, 4, (size_t) n_tok, t.f);
+}
+
+bool router_trace_prefill_on() { return router_trace_on() && router_trace_prefill_env(); }
+
+int64_t router_trace_prefill_every() {
+    static const int64_t every = [] {
+        const char* e = std::getenv("STRATA_ROUTER_TRACE_PREFILL_EVERY");
+        const int v = e != nullptr ? std::atoi(e) : 4;
+        return (int64_t) (v >= 1 ? v : 4);
+    }();
+    return every;
+}
+
+void router_trace_request(int64_t n_prompt) {
+    if (!router_trace_prefill_on()) return;
+    RouterTrace& t = router_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    if (t.f == nullptr) return;
+    const uint32_t req = ++t.request, np = (uint32_t) n_prompt;
+    const uint16_t marker = 0xFFFEu, zero = 0;
+    std::fwrite(&req, 4, 1, t.f);
+    std::fwrite(&marker, 2, 1, t.f);
+    std::fwrite(&zero, 2, 1, t.f);
+    std::fwrite(&np, 4, 1, t.f);
+}
+
+void router_trace_prefill(int64_t layer, const int32_t* pos, const int32_t* tok, const uint16_t* x_bf16, const int32_t* ids, int64_t n_tok,
+                          int64_t k) {
+    if (!router_trace_prefill_on() || n_tok < 1 || n_tok > 65535 || k < 1 || k > 16) return;
+    constexpr int64_t kH = strata::kernels::cpu::H;
+    RouterTrace& t = router_trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    if (t.f == nullptr) return;
+    const uint32_t req = t.request;
+    const uint16_t marker = 0xFFFDu, l16 = (uint16_t) layer, nt = (uint16_t) n_tok;
+    const uint8_t kk = (uint8_t) k, zero = 0;
+    std::fwrite(&req, 4, 1, t.f);
+    std::fwrite(&marker, 2, 1, t.f);
+    std::fwrite(&l16, 2, 1, t.f);
+    std::fwrite(&nt, 2, 1, t.f);
+    std::fwrite(&kk, 1, 1, t.f);
+    std::fwrite(&zero, 1, 1, t.f);
+    std::vector<int16_t> tid((size_t) k);
+    for (int64_t j = 0; j < n_tok; ++j) {
+        std::fwrite(&pos[j], 4, 1, t.f);
+        std::fwrite(&tok[j], 4, 1, t.f);
+        std::fwrite(x_bf16 + j * kH, 2, (size_t) kH, t.f);
+        for (int64_t r = 0; r < k; ++r) tid[(size_t) r] = (int16_t) ids[(size_t) (j * k + r)];
+        std::fwrite(tid.data(), 2, (size_t) k, t.f);
+    }
+    if ((++t.calls & 0x3ffu) == 0) std::fflush(t.f);
 }
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,

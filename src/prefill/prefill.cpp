@@ -41,6 +41,7 @@
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/expert_source.hpp"
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -3943,6 +3944,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    // STRATA_ROUTER_TRACE_PREFILL=1 (measurement, off by default): the chunk's sampled prompt tokens (absolute position divisible
+                    // by STRATA_ROUTER_TRACE_PREFILL_EVERY) get this layer's router input (m.mixed_bf, bf16) and the router's own top-K (m.ids,
+                    // before the stand-ins) copied to the host and written to the router trace.  Nothing is copied or synced otherwise.
+                    if (strata::core::router_trace_prefill_on()) {
+                        const int64_t every = strata::core::router_trace_prefill_every();
+                        std::vector<int64_t> sel;
+                        for (int64_t t = 0; t < T; ++t)
+                            if ((p0 + t) % every == 0) sel.push_back(t);
+                        if (!sel.empty()) {
+                            const int64_t S = (int64_t) sel.size();
+                            std::vector<int32_t> rpos((size_t) S), rtok((size_t) S), rids((size_t) (S * K));
+                            std::vector<uint16_t> rx((size_t) (S * N));
+                            cudaStreamSynchronize((cudaStream_t) m.cs);
+                            for (int64_t j = 0; j < S; ++j) {
+                                const int64_t t = sel[(size_t) j];
+                                rpos[(size_t) j] = (int32_t) (p0 + t);
+                                rtok[(size_t) j] = (int32_t) tokens[c0 + t];
+                                cudaMemcpy(rx.data() + j * N, m.mixed_bf + t * N, (size_t) N * 2, cudaMemcpyDeviceToHost);
+                                cudaMemcpy(rids.data() + j * K, m.ids + t * K, (size_t) K * 4, cudaMemcpyDeviceToHost);
+                            }
+                            strata::core::router_trace_prefill(l, rpos.data(), rtok.data(), rx.data(), rids.data(), S, K);
+                        }
+                    }
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -5920,6 +5944,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     }
 #endif
     t_lm_choice = {};
+    strata::core::router_trace_request(n);   // STRATA_ROUTER_TRACE_PREFILL: a request record, so its prefill records and decode windows can be grouped
     const auto t_run0 = std::chrono::steady_clock::now();
     const bool body_ok = run_impl(tokens, n, pos0, err);
 

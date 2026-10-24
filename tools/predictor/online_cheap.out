@@ -1,0 +1,363 @@
+[   12s] loaded 11284 tokens from /mnt/nvme/strata-data/traces/trace_tok.bin layers [6, 7, 8, 14, 15, 16, 22, 23, 24, 30, 31, 32, 38, 39, 40]
+[   12s] prompt starts: 20 logged requests do not match the trace's window boundaries
+[   13s] residency proxy built; recent share of routed experts per layer: {8: 0.187, 16: 0.14, 24: 0.189, 32: 0.134, 40: 0.136}
+
+=== lr sweep, d=2, first 3000 tokens: mean over layers [8, 16, 24, 32, 40] and floors ['lo2', 'lo3', 'lo4', 'lo6'] (%) ===
+   online-R       lr=3e-05     74.37
+   online-R       lr=0.0001    74.14
+   online-R       lr=0.0003    78.98
+   -> chosen online-R lr=0.0003
+   lowrank-8      lr=0.0001    71.24
+   lowrank-8      lr=0.001     69.74
+   lowrank-8      lr=0.01      67.71
+   -> chosen lowrank-8 lr=0.0001
+   lowrank-32     lr=0.0001    67.82
+   lowrank-32     lr=0.001     71.91
+   lowrank-32     lr=0.01      56.87
+   -> chosen lowrank-32 lr=0.001
+   bias           lr=0.001     70.36
+   bias           lr=0.01      72.61
+   bias           lr=0.1       68.24
+   -> chosen bias lr=0.01
+   scale+bias     lr=0.0001    68.95
+   scale+bias     lr=0.001     72.82
+   scale+bias     lr=0.01      69.90
+   -> chosen scale+bias lr=0.001
+   lowrank-8/mse  lr=0.0001    75.94
+   lowrank-8/mse  lr=0.001     81.69
+   lowrank-8/mse  lr=0.01      55.84
+   -> chosen lowrank-8/mse lr=0.001
+   lowrank-32/mse lr=0.0001    78.09
+   lowrank-32/mse lr=0.001     80.27
+   lowrank-32/mse lr=0.01      25.03
+   -> chosen lowrank-32/mse lr=0.001
+   bias/mse       lr=0.001     70.74
+   bias/mse       lr=0.01      78.97
+   bias/mse       lr=0.1       82.67
+   -> chosen bias/mse lr=0.1
+   scale+bias/mse lr=0.0001    69.02
+   scale+bias/mse lr=0.001     74.10
+   scale+bias/mse lr=0.01      80.39
+   -> chosen scale+bias/mse lr=0.01
+[   60s] sweep d=2 done
+
+=== lr sweep, d=1, first 3000 tokens: mean over layers [8, 16, 24, 32, 40] and floors ['lo2', 'lo3', 'lo4', 'lo6'] (%) ===
+   online-R       lr=3e-05     82.56
+   online-R       lr=0.0001    81.46
+   online-R       lr=0.0003    83.14
+   -> chosen online-R lr=0.0003
+   lowrank-8      lr=0.0001    81.82
+   lowrank-8      lr=0.001     78.20
+   lowrank-8      lr=0.01      72.87
+   -> chosen lowrank-8 lr=0.0001
+   lowrank-32     lr=0.0001    77.69
+   lowrank-32     lr=0.001     79.18
+   lowrank-32     lr=0.01      59.29
+   -> chosen lowrank-32 lr=0.001
+   bias           lr=0.001     83.29
+   bias           lr=0.01      81.86
+   bias           lr=0.1       75.64
+   -> chosen bias lr=0.001
+   scale+bias     lr=0.0001    82.76
+   scale+bias     lr=0.001     84.06
+   scale+bias     lr=0.01      79.66
+   -> chosen scale+bias lr=0.001
+   lowrank-8/mse  lr=0.0001    86.04
+   lowrank-8/mse  lr=0.001     88.04
+   lowrank-8/mse  lr=0.01      71.85
+   -> chosen lowrank-8/mse lr=0.001
+   lowrank-32/mse lr=0.0001    87.02
+   lowrank-32/mse lr=0.001     88.50
+   lowrank-32/mse lr=0.01      30.21
+   -> chosen lowrank-32/mse lr=0.001
+   bias/mse       lr=0.001     83.61
+   bias/mse       lr=0.01      87.14
+   bias/mse       lr=0.1       86.70
+   -> chosen bias/mse lr=0.01
+   scale+bias/mse lr=0.0001    82.91
+   scale+bias/mse lr=0.001     85.94
+   scale+bias/mse lr=0.01      87.52
+   -> chosen scale+bias/mse lr=0.01
+[  100s] sweep d=1 done
+[  113s] d=2 layer 8 done
+[  126s] d=2 layer 16 done
+[  138s] d=2 layer 24 done
+[  150s] d=2 layer 32 done
+[  163s] d=2 layer 40 done
+[  175s] d=1 layer 8 done
+[  186s] d=1 layer 16 done
+[  198s] d=1 layer 24 done
+[  210s] d=1 layer 32 done
+[  385s] d=1 layer 40 done
+
+=== d=2: lo2 = true ranks 0-1 in predicted top-4 (%), prequential, mean over layers [8, 16, 24, 32, 40]; * = after the shift ===
+window(tokens)        reuse    online-R   lowrank-8  lowrank-32        bias  scale+bias lowrank-8/m lowrank-32/    bias/mse scale+bias/ pp-lowrank- pp-lowrank-     pp-bias pp-scale+bi
+     0-1000           62.8        73.5        64.0        66.6        67.3        65.0        76.9        74.4        79.5        75.4        64.0        66.7        67.3        65.0
+  1000-2000           65.8        76.8        70.7        69.3        69.8        69.9        80.3        79.5        80.2        77.7        70.7        69.2        69.8        69.9
+  2000-3000           63.5        75.2        63.9        66.8        64.6        68.2        78.4        78.0        78.1        74.7        63.8        67.0        64.6        68.2
+  3000-4000           63.6        74.5        60.2        64.7        64.0        68.0        78.9        79.0        78.7        76.4        60.3        65.4        64.0        68.0
+  4000-5000           68.8        76.3        58.8        69.9        62.7        71.3        80.2        80.4        78.8        79.0        58.8        70.0        62.7        71.3
+  5000-6000           65.8        75.7        62.9        70.0        64.4        69.9        79.2        80.2        78.0        77.5        62.9        70.2        64.4        69.9
+  6000-7000           65.8        80.7        63.7        72.8        64.3        69.5        81.7        82.3        79.9        79.1        63.7        72.5        64.3        69.5
+  7000-8000           63.5        73.9        57.1        66.8        57.2        64.1        76.7        77.6        74.9        75.2        57.1        67.0        57.2        64.1
+  8000-9000           62.6        77.5        60.6        70.4        61.2        65.9        77.5        79.0        75.6        75.2        60.6        69.6        61.2        65.9
+  9000-10000 *        66.2        76.4        60.8        69.2        60.8        65.3        80.8        81.1        77.9        77.8        60.8        69.1        60.8        65.3
+ 10000-11000 *        58.6        70.2        46.2        62.3        42.9        53.9        75.5        73.9        70.4        73.1        46.2        62.6        42.9        53.9
+--- d=2 lo2: true ranks 0-1 in predicted top-4 (%): first 2000 | before shift | after shift   [lr]
+   reuse              64.3 |   64.7 |   62.2
+   online-R           75.1 |   76.3 |   72.9  [lr 0.0003]
+   lowrank-8          67.3 |   61.0 |   54.3  [lr 0.0001]
+   lowrank-32         68.0 |   68.7 |   66.1  [lr 0.001]
+   bias               68.6 |   62.6 |   52.3  [lr 0.01]
+   scale+bias         67.4 |   68.2 |   59.5  [lr 0.001]
+   lowrank-8/mse      78.6 |   78.9 |   77.4  [lr 0.001]
+   lowrank-32/mse     77.0 |   79.4 |   76.8  [lr 0.001]
+   bias/mse           79.8 |   77.8 |   73.3  [lr 0.1]
+   scale+bias/mse     76.5 |   76.7 |   75.0  [lr 0.01]
+   pp-lowrank-8       67.3 |   61.0 |   54.3  [lr 0.0001]
+   pp-lowrank-32      68.0 |   68.9 |   66.1  [lr 0.001]
+   pp-bias            68.6 |   62.6 |   52.3  [lr 0.01]
+   pp-scale+bias      67.4 |   68.2 |   59.5  [lr 0.001]
+--- d=2 lo3: true ranks 0-2 in predicted top-6 (%): first 2000 | before shift | after shift   [lr]
+   reuse              68.2 |   68.4 |   65.3
+   online-R           78.7 |   80.1 |   76.9  [lr 0.0003]
+   lowrank-8          71.9 |   65.3 |   57.2  [lr 0.0001]
+   lowrank-32         72.4 |   72.3 |   70.0  [lr 0.001]
+   bias               73.3 |   67.1 |   55.3  [lr 0.01]
+   scale+bias         72.0 |   73.0 |   62.8  [lr 0.001]
+   lowrank-8/mse      81.5 |   82.0 |   79.8  [lr 0.001]
+   lowrank-32/mse     79.7 |   82.3 |   79.6  [lr 0.001]
+   bias/mse           83.1 |   80.6 |   76.2  [lr 0.1]
+   scale+bias/mse     80.6 |   80.3 |   78.2  [lr 0.01]
+   pp-lowrank-8       71.9 |   65.3 |   57.2  [lr 0.0001]
+   pp-lowrank-32      72.4 |   72.3 |   69.9  [lr 0.001]
+   pp-bias            73.3 |   67.1 |   55.3  [lr 0.01]
+   pp-scale+bias      72.0 |   73.0 |   62.8  [lr 0.001]
+--- d=2 lo4: true ranks 0-3 in predicted top-8 (%): first 2000 | before shift | after shift   [lr]
+   reuse              69.8 |   70.1 |   67.0
+   online-R           80.2 |   82.0 |   79.0  [lr 0.0003]
+   lowrank-8          74.0 |   67.4 |   58.7  [lr 0.0001]
+   lowrank-32         74.3 |   74.1 |   71.9  [lr 0.001]
+   bias               75.8 |   69.4 |   56.9  [lr 0.01]
+   scale+bias         74.0 |   75.2 |   64.4  [lr 0.001]
+   lowrank-8/mse      82.7 |   83.0 |   81.2  [lr 0.001]
+   lowrank-32/mse     80.9 |   83.2 |   81.0  [lr 0.001]
+   bias/mse           84.5 |   81.6 |   77.5  [lr 0.1]
+   scale+bias/mse     82.3 |   81.7 |   79.6  [lr 0.01]
+   pp-lowrank-8       74.0 |   67.4 |   58.7  [lr 0.0001]
+   pp-lowrank-32      74.3 |   74.1 |   71.7  [lr 0.001]
+   pp-bias            75.8 |   69.4 |   56.9  [lr 0.01]
+   pp-scale+bias      74.0 |   75.2 |   64.4  [lr 0.001]
+--- d=2 lo6: true ranks 0-5 in predicted top-12 (%): first 2000 | before shift | after shift   [lr]
+   reuse              70.9 |   71.4 |   68.5
+   online-R           81.1 |   83.3 |   80.4  [lr 0.0003]
+   lowrank-8          75.9 |   69.1 |   60.4  [lr 0.0001]
+   lowrank-32         75.4 |   75.8 |   73.5  [lr 0.001]
+   bias               78.1 |   71.1 |   58.5  [lr 0.01]
+   scale+bias         76.0 |   77.3 |   66.1  [lr 0.001]
+   lowrank-8/mse      83.3 |   83.3 |   81.7  [lr 0.001]
+   lowrank-32/mse     81.5 |   83.4 |   81.3  [lr 0.001]
+   bias/mse           85.5 |   81.7 |   77.8  [lr 0.1]
+   scale+bias/mse     84.0 |   82.5 |   80.4  [lr 0.01]
+   pp-lowrank-8       75.9 |   69.1 |   60.4  [lr 0.0001]
+   pp-lowrank-32      75.3 |   75.7 |   73.4  [lr 0.001]
+   pp-bias            78.1 |   71.1 |   58.5  [lr 0.01]
+   pp-scale+bias      76.0 |   77.3 |   66.1  [lr 0.001]
+--- d=2 non-resident precision@1 (%): first 2000 | before shift | after shift   [lr]
+   reuse              26.6 |   28.9 |   27.1
+   online-R           25.8 |   32.0 |   30.4  [lr 0.0003]
+   lowrank-8          27.8 |   22.9 |   20.8  [lr 0.0001]
+   lowrank-32         21.7 |   24.7 |   24.2  [lr 0.001]
+   bias               27.6 |   23.9 |   19.8  [lr 0.01]
+   scale+bias         27.9 |   29.3 |   24.1  [lr 0.001]
+   lowrank-8/mse      28.0 |   31.6 |   30.4  [lr 0.001]
+   lowrank-32/mse     26.3 |   31.2 |   29.4  [lr 0.001]
+   bias/mse           28.6 |   29.7 |   26.2  [lr 0.1]
+   scale+bias/mse     28.7 |   33.3 |   31.7  [lr 0.01]
+   pp-lowrank-8       27.8 |   22.9 |   20.8  [lr 0.0001]
+   pp-lowrank-32      21.6 |   24.6 |   24.2  [lr 0.001]
+   pp-bias            27.6 |   23.9 |   19.8  [lr 0.01]
+   pp-scale+bias      27.9 |   29.3 |   24.1  [lr 0.001]
+--- d=2 non-resident precision@2 (%): first 2000 | before shift | after shift   [lr]
+   reuse              21.4 |   23.2 |   21.9
+   online-R           20.2 |   25.5 |   24.3  [lr 0.0003]
+   lowrank-8          22.2 |   18.3 |   16.6  [lr 0.0001]
+   lowrank-32         17.2 |   19.8 |   19.7  [lr 0.001]
+   bias               21.9 |   19.0 |   15.7  [lr 0.01]
+   scale+bias         22.4 |   23.4 |   19.2  [lr 0.001]
+   lowrank-8/mse      22.2 |   25.5 |   24.7  [lr 0.001]
+   lowrank-32/mse     21.0 |   25.2 |   23.9  [lr 0.001]
+   bias/mse           23.4 |   24.1 |   21.3  [lr 0.1]
+   scale+bias/mse     23.7 |   27.0 |   25.8  [lr 0.01]
+   pp-lowrank-8       22.2 |   18.2 |   16.6  [lr 0.0001]
+   pp-lowrank-32      17.1 |   19.7 |   19.5  [lr 0.001]
+   pp-bias            21.9 |   19.0 |   15.7  [lr 0.01]
+   pp-scale+bias      22.4 |   23.4 |   19.2  [lr 0.001]
+--- d=2 non-resident precision@4 (%): first 2000 | before shift | after shift   [lr]
+   reuse              15.2 |   16.7 |   16.0
+   online-R           14.0 |   17.8 |   17.1  [lr 0.0003]
+   lowrank-8          15.7 |   13.0 |   11.8  [lr 0.0001]
+   lowrank-32         12.2 |   14.3 |   14.3  [lr 0.001]
+   bias               15.4 |   13.6 |   11.2  [lr 0.01]
+   scale+bias         15.8 |   16.9 |   14.0  [lr 0.001]
+   lowrank-8/mse      15.8 |   18.2 |   17.8  [lr 0.001]
+   lowrank-32/mse     14.9 |   18.1 |   17.4  [lr 0.001]
+   bias/mse           16.5 |   17.3 |   15.6  [lr 0.1]
+   scale+bias/mse     17.1 |   19.4 |   18.5  [lr 0.01]
+   pp-lowrank-8       15.7 |   13.0 |   11.9  [lr 0.0001]
+   pp-lowrank-32      12.2 |   14.2 |   14.3  [lr 0.001]
+   pp-bias            15.4 |   13.6 |   11.2  [lr 0.01]
+   pp-scale+bias      15.8 |   16.9 |   14.0  [lr 0.001]
+--- d=2 non-resident miss-recall@4 (%): first 2000 | before shift | after shift   [lr]
+   reuse              50.8 |   50.5 |   48.5
+   online-R           45.7 |   53.0 |   50.4  [lr 0.0003]
+   lowrank-8          53.0 |   38.0 |   33.5  [lr 0.0001]
+   lowrank-32         39.4 |   41.8 |   41.5  [lr 0.001]
+   bias               51.3 |   40.1 |   32.1  [lr 0.01]
+   scale+bias         53.5 |   51.1 |   40.4  [lr 0.001]
+   lowrank-8/mse      53.7 |   55.7 |   54.3  [lr 0.001]
+   lowrank-32/mse     50.5 |   55.1 |   52.5  [lr 0.001]
+   bias/mse           56.2 |   52.5 |   46.5  [lr 0.1]
+   scale+bias/mse     58.4 |   59.7 |   56.9  [lr 0.01]
+   pp-lowrank-8       53.0 |   38.1 |   33.6  [lr 0.0001]
+   pp-lowrank-32      39.2 |   41.7 |   41.3  [lr 0.001]
+   pp-bias            51.3 |   40.1 |   32.1  [lr 0.01]
+   pp-scale+bias      53.5 |   51.1 |   40.4  [lr 0.001]
+--- d=2 (b) and (c) SKIPPED: prompt boundaries not found (20 logged requests do not match the trace's window boundaries)
+--- d=2 trainable parameters per layer (added to the router): online-R 1311232, lowrank-8 24576, lowrank-32 98304, bias 512, scale+bias 1024, lowrank-8/mse 24576, lowrank-32/mse 98304, bias/mse 512, scale+bias/mse 1024, pp-lowrank-8 24576, pp-lowrank-32 98304, pp-bias 512, pp-scale+bias 1024
+
+=== d=1: lo2 = true ranks 0-1 in predicted top-4 (%), prequential, mean over layers [8, 16, 24, 32, 40]; * = after the shift ===
+window(tokens)        reuse    online-R   lowrank-8  lowrank-32        bias  scale+bias lowrank-8/m lowrank-32/    bias/mse scale+bias/ pp-lowrank- pp-lowrank-     pp-bias pp-scale+bi
+     0-1000           77.8        78.9        78.2        74.7        78.1        78.9        84.0        84.2        81.7        84.0        78.2        74.9        78.1        78.9
+  1000-2000           81.2        81.5        82.2        77.2        82.1        82.9        86.9        88.2        86.7        86.7        82.2        77.2        82.1        82.9
+  2000-3000           79.4        79.0        73.5        74.6        80.5        79.5        85.3        86.3        83.7        83.5        73.4        74.8        80.5        79.5
+  3000-4000           82.2        81.2        73.0        77.0        83.5        82.3        87.7        88.6        87.3        86.6        73.0        76.9        83.5        82.3
+  4000-5000           83.3        82.2        74.8        79.9        85.2        83.7        89.7        89.7        89.1        88.6        74.8        79.8        85.2        83.7
+  5000-6000           80.7        83.1        75.0        78.1        82.2        80.6        87.8        88.2        85.6        84.2        75.0        78.0        82.2        80.6
+  6000-7000           80.0        84.4        73.6        79.7        81.6        79.0        88.0        88.7        85.0        83.9        73.6        79.4        81.6        79.0
+  7000-8000           80.0        80.8        70.1        76.4        81.2        75.1        87.8        88.2        86.7        85.8        70.1        76.4        81.2        75.1
+  8000-9000           80.0        82.6        73.8        78.2        81.5        77.1        88.4        88.8        86.8        86.1        73.8        78.1        81.5        77.1
+  9000-10000 *        79.2        81.9        72.6        77.8        80.5        76.2        87.7        88.2        84.2        83.3        72.7        77.5        80.5        76.2
+ 10000-11000 *        78.9        74.5        64.6        70.4        79.3        70.9        86.4        85.8        84.0        83.0        64.6        70.8        79.3        70.9
+--- d=1 lo2: true ranks 0-1 in predicted top-4 (%): first 2000 | before shift | after shift   [lr]
+   reuse              79.5 |   80.8 |   79.0
+   online-R           80.2 |   81.8 |   78.1  [lr 0.0003]
+   lowrank-8          80.2 |   73.3 |   69.6  [lr 0.0001]
+   lowrank-32         75.9 |   77.7 |   74.3  [lr 0.001]
+   bias               80.1 |   82.3 |   79.7  [lr 0.001]
+   scale+bias         80.9 |   79.6 |   73.7  [lr 0.001]
+   lowrank-8/mse      85.4 |   87.8 |   87.0  [lr 0.001]
+   lowrank-32/mse     86.2 |   88.3 |   87.0  [lr 0.001]
+   bias/mse           84.2 |   86.3 |   84.3  [lr 0.01]
+   scale+bias/mse     85.3 |   85.6 |   83.2  [lr 0.01]
+   pp-lowrank-8       80.2 |   73.3 |   69.6  [lr 0.0001]
+   pp-lowrank-32      76.1 |   77.6 |   74.2  [lr 0.001]
+   pp-bias            80.1 |   82.3 |   79.7  [lr 0.001]
+   pp-scale+bias      80.9 |   79.6 |   73.7  [lr 0.001]
+--- d=1 lo3: true ranks 0-2 in predicted top-6 (%): first 2000 | before shift | after shift   [lr]
+   reuse              82.3 |   83.3 |   81.5
+   online-R           83.0 |   85.3 |   81.9  [lr 0.0003]
+   lowrank-8          83.6 |   76.5 |   71.5  [lr 0.0001]
+   lowrank-32         79.3 |   80.5 |   77.2  [lr 0.001]
+   bias               83.0 |   85.1 |   82.8  [lr 0.001]
+   scale+bias         84.1 |   82.7 |   76.0  [lr 0.001]
+   lowrank-8/mse      87.9 |   90.1 |   89.1  [lr 0.001]
+   lowrank-32/mse     88.3 |   90.5 |   89.0  [lr 0.001]
+   bias/mse           86.9 |   88.9 |   86.9  [lr 0.01]
+   scale+bias/mse     88.0 |   88.0 |   85.7  [lr 0.01]
+   pp-lowrank-8       83.6 |   76.5 |   71.5  [lr 0.0001]
+   pp-lowrank-32      79.3 |   80.7 |   77.2  [lr 0.001]
+   pp-bias            83.0 |   85.1 |   82.8  [lr 0.001]
+   pp-scale+bias      84.1 |   82.7 |   76.0  [lr 0.001]
+--- d=1 lo4: true ranks 0-3 in predicted top-8 (%): first 2000 | before shift | after shift   [lr]
+   reuse              83.4 |   84.4 |   82.7
+   online-R           84.4 |   87.0 |   83.9  [lr 0.0003]
+   lowrank-8          85.1 |   77.9 |   72.7  [lr 0.0001]
+   lowrank-32         81.1 |   81.8 |   78.6  [lr 0.001]
+   bias               84.3 |   86.4 |   84.1  [lr 0.001]
+   scale+bias         85.6 |   84.0 |   77.1  [lr 0.001]
+   lowrank-8/mse      89.1 |   91.1 |   89.9  [lr 0.001]
+   lowrank-32/mse     89.3 |   91.4 |   89.7  [lr 0.001]
+   bias/mse           88.3 |   90.1 |   88.1  [lr 0.01]
+   scale+bias/mse     89.1 |   89.1 |   86.9  [lr 0.01]
+   pp-lowrank-8       85.1 |   77.9 |   72.7  [lr 0.0001]
+   pp-lowrank-32      81.1 |   81.9 |   78.8  [lr 0.001]
+   pp-bias            84.3 |   86.4 |   84.1  [lr 0.001]
+   pp-scale+bias      85.6 |   84.0 |   77.1  [lr 0.001]
+--- d=1 lo6: true ranks 0-5 in predicted top-12 (%): first 2000 | before shift | after shift   [lr]
+   reuse              84.4 |   85.2 |   83.7
+   online-R           85.0 |   88.0 |   85.4  [lr 0.0003]
+   lowrank-8          86.2 |   78.9 |   73.5  [lr 0.0001]
+   lowrank-32         81.7 |   82.7 |   79.9  [lr 0.001]
+   bias               85.4 |   87.7 |   85.5  [lr 0.001]
+   scale+bias         86.9 |   85.0 |   77.9  [lr 0.001]
+   lowrank-8/mse      90.0 |   91.7 |   90.5  [lr 0.001]
+   lowrank-32/mse     90.2 |   91.8 |   90.2  [lr 0.001]
+   bias/mse           89.5 |   91.2 |   89.1  [lr 0.01]
+   scale+bias/mse     90.2 |   90.1 |   87.8  [lr 0.01]
+   pp-lowrank-8       86.2 |   78.9 |   73.5  [lr 0.0001]
+   pp-lowrank-32      81.8 |   82.8 |   80.1  [lr 0.001]
+   pp-bias            85.4 |   87.7 |   85.5  [lr 0.001]
+   pp-scale+bias      86.9 |   85.0 |   77.9  [lr 0.001]
+--- d=1 non-resident precision@1 (%): first 2000 | before shift | after shift   [lr]
+   reuse              33.0 |   36.5 |   35.5
+   online-R           29.2 |   35.9 |   34.2  [lr 0.0003]
+   lowrank-8          33.0 |   28.0 |   26.4  [lr 0.0001]
+   lowrank-32         26.1 |   29.1 |   28.0  [lr 0.001]
+   bias               33.2 |   37.5 |   35.2  [lr 0.001]
+   scale+bias         33.2 |   32.9 |   27.5  [lr 0.001]
+   lowrank-8/mse      37.5 |   42.6 |   41.7  [lr 0.001]
+   lowrank-32/mse     36.5 |   42.3 |   40.7  [lr 0.001]
+   bias/mse           36.5 |   43.2 |   41.6  [lr 0.01]
+   scale+bias/mse     38.0 |   42.1 |   40.2  [lr 0.01]
+   pp-lowrank-8       33.0 |   28.0 |   26.4  [lr 0.0001]
+   pp-lowrank-32      26.1 |   29.3 |   28.2  [lr 0.001]
+   pp-bias            33.2 |   37.5 |   35.2  [lr 0.001]
+   pp-scale+bias      33.2 |   32.9 |   27.5  [lr 0.001]
+--- d=1 non-resident precision@2 (%): first 2000 | before shift | after shift   [lr]
+   reuse              26.1 |   29.1 |   28.5
+   online-R           22.7 |   28.3 |   27.1  [lr 0.0003]
+   lowrank-8          26.3 |   22.0 |   20.8  [lr 0.0001]
+   lowrank-32         20.2 |   23.2 |   22.4  [lr 0.001]
+   bias               26.5 |   30.1 |   28.1  [lr 0.001]
+   scale+bias         26.7 |   26.3 |   22.1  [lr 0.001]
+   lowrank-8/mse      29.7 |   33.9 |   33.4  [lr 0.001]
+   lowrank-32/mse     29.1 |   33.9 |   32.7  [lr 0.001]
+   bias/mse           29.4 |   34.5 |   33.5  [lr 0.01]
+   scale+bias/mse     30.1 |   33.6 |   32.4  [lr 0.01]
+   pp-lowrank-8       26.3 |   22.0 |   20.8  [lr 0.0001]
+   pp-lowrank-32      20.2 |   23.2 |   22.5  [lr 0.001]
+   pp-bias            26.5 |   30.1 |   28.1  [lr 0.001]
+   pp-scale+bias      26.7 |   26.3 |   22.1  [lr 0.001]
+--- d=1 non-resident precision@4 (%): first 2000 | before shift | after shift   [lr]
+   reuse              18.4 |   20.6 |   20.3
+   online-R           15.5 |   19.6 |   18.9  [lr 0.0003]
+   lowrank-8          18.6 |   15.6 |   14.6  [lr 0.0001]
+   lowrank-32         14.2 |   16.5 |   16.2  [lr 0.001]
+   bias               18.6 |   21.3 |   20.1  [lr 0.001]
+   scale+bias         18.9 |   19.0 |   15.9  [lr 0.001]
+   lowrank-8/mse      20.6 |   23.6 |   23.4  [lr 0.001]
+   lowrank-32/mse     20.3 |   23.6 |   23.1  [lr 0.001]
+   bias/mse           20.4 |   24.0 |   23.5  [lr 0.01]
+   scale+bias/mse     20.8 |   23.4 |   22.8  [lr 0.01]
+   pp-lowrank-8       18.6 |   15.6 |   14.6  [lr 0.0001]
+   pp-lowrank-32      14.3 |   16.5 |   16.1  [lr 0.001]
+   pp-bias            18.6 |   21.3 |   20.1  [lr 0.001]
+   pp-scale+bias      18.9 |   19.0 |   15.9  [lr 0.001]
+--- d=1 non-resident miss-recall@4 (%): first 2000 | before shift | after shift   [lr]
+   reuse              62.8 |   63.8 |   62.6
+   online-R           51.7 |   59.5 |   56.8  [lr 0.0003]
+   lowrank-8          63.9 |   47.1 |   43.3  [lr 0.0001]
+   lowrank-32         46.9 |   49.4 |   48.1  [lr 0.001]
+   bias               63.8 |   66.6 |   62.3  [lr 0.001]
+   scale+bias         65.0 |   58.2 |   47.4  [lr 0.001]
+   lowrank-8/mse      71.7 |   73.8 |   73.1  [lr 0.001]
+   lowrank-32/mse     70.7 |   73.8 |   71.8  [lr 0.001]
+   bias/mse           71.2 |   75.5 |   73.0  [lr 0.01]
+   scale+bias/mse     73.0 |   73.4 |   71.0  [lr 0.01]
+   pp-lowrank-8       63.8 |   47.1 |   43.4  [lr 0.0001]
+   pp-lowrank-32      47.3 |   49.5 |   48.0  [lr 0.001]
+   pp-bias            63.8 |   66.6 |   62.3  [lr 0.001]
+   pp-scale+bias      65.0 |   58.2 |   47.4  [lr 0.001]
+--- d=1 (b) and (c) SKIPPED: prompt boundaries not found (20 logged requests do not match the trace's window boundaries)
+--- d=1 trainable parameters per layer (added to the router): online-R 1311232, lowrank-8 24576, lowrank-32 98304, bias 512, scale+bias 1024, lowrank-8/mse 24576, lowrank-32/mse 98304, bias/mse 512, scale+bias/mse 1024, pp-lowrank-8 24576, pp-lowrank-32 98304, pp-bias 512, pp-scale+bias 1024
