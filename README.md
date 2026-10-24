@@ -191,7 +191,10 @@ The same rule also works in two more places (both on by default since 21 Oct):
   A predicted rank-2 expert with a stand-in already on the card within 1 logit is no longer read: the router will take
   the stand-in. On the 8.5K run that skipped about 47,000 reads, cut the experts read ahead from 16,968 to 12,009 and the
   decode's wait for the SSD from 4.7 to 4.0 s: 56.4 against 53.6 tokens/s, and 9 to 13% faster on short prompts.
-  `STRATA_LA_EDGE_SKIP=0` turns it off. It only changes what is read ahead, never the answer.
+  **Off by default since 24 Oct** (`STRATA_LA_EDGE_SKIP=1` turns it on): it assumes the rank-2 stand-in rule, but decode now
+  follows the confidence budget, which often computes those picks exactly, so the skipped reads became misses (reasoning
+  waited 11.8 against 5.2 s; with it off 30.2 / 42.9 / 30.6 against 28.4 / 32.3 / 23.1 tokens/s). It only changes what is
+  read ahead, never the answer.
 - **Reading the prompt uses stand-ins too.** The prompt is read with the same rule, so a short prompt reads far fewer
   experts from the SSD: 76 to 118-token prompts are read in 1.3 to 1.8 s instead of 2.3 to 2.8 s (35 to 45% faster); an
   8.5K prompt 15.1 against 15.8 s. This changes what the model computes from the prompt; the answers checked (code, a

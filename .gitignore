@@ -70,3 +70,4 @@ data/ram-reserve.json
 data/vram-reserve.json
 data/standin-tune.txt
 data/expert-predictor/
+data/standin-tune-*.txt

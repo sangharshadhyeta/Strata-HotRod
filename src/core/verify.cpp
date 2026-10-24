@@ -1063,8 +1063,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         std::fprintf(stderr, "strata verify: STRATA_LA_MODEL %s: %s%s\n", lam, ok ? "loaded, " : "NOT loaded (the routers stay the look-ahead): ",
                      msg.c_str());
     }
-    // STRATA_LA_EDGE_SKIP (default on since 21 Oct, =0 off): the look-ahead's edge-skip counter, allocated before any graph capture
-    if ((std::getenv("STRATA_LA_EDGE_SKIP") == nullptr || std::atoi(std::getenv("STRATA_LA_EDGE_SKIP")) != 0) && strata::kernels::route_pred_active())
+    // STRATA_LA_EDGE_SKIP (opt-in =1 since 24 Oct: under the confidence budget its skipped rank-2 reads became misses, reasoning wait 5.2 -> 11.8 s): the look-ahead's edge-skip counter, allocated before any graph capture
+    if ((std::getenv("STRATA_LA_EDGE_SKIP") != nullptr && std::atoi(std::getenv("STRATA_LA_EDGE_SKIP")) != 0) && strata::kernels::route_pred_active())
         strata::kernels::route_pred_edge_skip_alloc();
     // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
@@ -2424,7 +2424,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #else
         const bool la_on_stream = false;   // HIP: the node stays on cs (the shared stream's cross-stream cost, as sh_stream_on)
 #endif
-        static const bool la_edge_skip = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e == nullptr || std::atoi(e) != 0; }();
+        static const bool la_edge_skip = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e != nullptr && std::atoi(e) != 0; }();
         auto lookahead_node = [&](cudaStream_t s) -> bool {
             try {
                 for (int dist = 1; dist <= 2; ++dist) {

@@ -12263,9 +12263,19 @@ int main(int argc, char** argv) {
                 strata::core::SessionFileIdentity tid;
                 std::string te;
                 try {
-                    if (session_identity(tid, te, {}))
-                        strata::core::Verifier::route_tune_open(tune, tid.model);
-                    else
+                    if (session_identity(tid, te, {})) {
+                        // one file per model fingerprint (standin-tune-<fp>.txt): a run with other model files (e.g. without --mtp,
+                        // which is part of the fingerprint) keeps its own state instead of overwriting this one's.  The older single
+                        // standin-tune.txt is carried over once (route_tune_read keeps it only if its fingerprint matches)
+                        char hex[17];
+                        std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) tid.model);
+                        const std::filesystem::path legacy(tune);
+                        const std::filesystem::path per = legacy.parent_path() / ("standin-tune-" + std::string(hex) + ".txt");
+                        std::error_code ec;
+                        if (!std::filesystem::exists(per, ec) && std::filesystem::exists(legacy, ec))
+                            std::filesystem::copy_file(legacy, per, ec);
+                        strata::core::Verifier::route_tune_open(per.string(), tid.model);
+                    } else
                         std::fprintf(stderr, "strata serve: stand-in tuning not kept (%s)\n", te.c_str());
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "strata serve: stand-in tuning not kept (%s)\n", e.what());
@@ -16481,9 +16491,9 @@ int main(int argc, char** argv) {
                     dc_prev = dc;
                 }
             }
-            // STRATA_LA_EDGE_SKIP (default on since 21 Oct, =0 off): the decode look-ahead's rank lo-1 predictions that a resident stand-in
+            // STRATA_LA_EDGE_SKIP (opt-in =1 since 24 Oct): the decode look-ahead's rank lo-1 predictions that a resident stand-in
             // within the edge covers, not read ahead, since the previous request (the device counter is taken and zeroed here)
-            if (static const bool la_edge_skip_on = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e == nullptr || std::atoi(e) != 0; }(); la_edge_skip_on)
+            if (static const bool la_edge_skip_on = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e != nullptr && std::atoi(e) != 0; }(); la_edge_skip_on)
                 std::fprintf(stderr, "strata serve: look-ahead edge skip: %llu rank-2 predictions had a resident stand-in within the edge\n",
                              (unsigned long long) strata::kernels::route_pred_edge_skips_take());
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
