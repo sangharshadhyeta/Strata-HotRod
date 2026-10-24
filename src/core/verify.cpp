@@ -4132,10 +4132,12 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
             route_auto_schedule(c);
         }
         b = route_auto_arm_b(c, c.auto_win_arm);   // the request's budget (base arm) or its scaled candidate
-        // ranks >= lo keep the old rule (any resident stand-in: budget_tail 0 sends the kernel to its margin test) until the re-check
-        // says otherwise: a request that braked (flips seen) takes the budget there too.  The tail never runs stricter than before
-        // without evidence (24 Oct: a tail budget from the start cost 87-89% against 92% card hits, 44-49 against 50 tok/s)
-        tail = c.req_brakes > 0 ? b : 0.0f;
+        // ranks >= lo take the same budget as ranks < lo from the request's first window (24 Oct evening, the user saw malformed
+        // JSON and code with the open tail).  STRATA_ROUTE_TAIL_OPEN=1 (opt-in) brings back the open tail: any resident stand-in
+        // (budget_tail 0 sends the kernel to its margin test) until the request brakes - faster (card hits 92% against 87-89%,
+        // 8.5K run 56 against 53.6 tok/s on 24 Oct) but the re-check alone did not keep code and JSON clean
+        static const bool tail_open = [] { const char* v = std::getenv("STRATA_ROUTE_TAIL_OPEN"); return v != nullptr && std::atoi(v) != 0; }();
+        tail = tail_open && c.req_brakes == 0 ? 0.0f : b;
         // STRATA_ROUTE_LOW_OPEN=1 (opt-in experiment, 24 Oct): ranks < lo also start open (any resident stand-in) and take the
         // learned budget only after the request's first brake (the re-check saw flips)
         static const bool low_open = [] { const char* v = std::getenv("STRATA_ROUTE_LOW_OPEN"); return v != nullptr && std::atoi(v) != 0; }();
