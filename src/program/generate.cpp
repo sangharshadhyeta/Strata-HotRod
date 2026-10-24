@@ -14964,7 +14964,7 @@ int main(int argc, char** argv) {
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
             }
             bool first_window = true;
-            strata::core::Verifier::route_budget_begin();   // STRATA_ROUTE_BUDGET_DYN: this request's first decode window runs at b_lo
+            strata::core::Verifier::route_budget_begin(n);   // STRATA_ROUTE_BUDGET_DYN: this request's first decode window runs at b_lo (n: the prompt tokens, the size class)
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
@@ -16342,6 +16342,7 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
+            strata::core::Verifier::route_class_end();   // STRATA_FRAGILE_BRAKE: this request's size class learns its start and clean level
             {   // STRATA_FRAGILE_RECHECK: this request's cuts, rows moved by stand-ins, flipped re-decisions and k (takes and resets the counts)
                 long long fr_cuts = 0, fr_explores = 0, fr_moved = 0, fr_flips = 0;
                 float fr_k = 0.0f, fr_med_shift = 0.0f, fr_med_gap = 0.0f, fr_req_b = 0.0f;
@@ -16351,8 +16352,13 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: fragile recheck: %lld windows cut, %lld explore cuts, %lld rows moved by stand-ins, "
                                  "%lld flipped (k %.3f; median row_shift %.4f, median gap %.4f of the moved rows)",
                                  fr_cuts, fr_explores, fr_moved, fr_flips, (double) fr_k, (double) fr_med_shift, (double) fr_med_gap);
-                    if (strata::core::Verifier::route_brake_on())   // STRATA_FRAGILE_BRAKE: this request's budget at its end
-                        std::fprintf(stderr, ", budget %.3f at end (%lld brakes)", (double) fr_req_b, fr_brakes);
+                    if (strata::core::Verifier::route_brake_on()) {   // STRATA_FRAGILE_BRAKE: this request's budget at its end, and its size class
+                        int fr_class = 0;
+                        float fr_start = 0.0f, fr_clean = 0.0f;
+                        strata::core::Verifier::route_class_state(fr_class, fr_start, fr_clean);
+                        std::fprintf(stderr, ", budget %.3f at end (%lld brakes), class %d start %.2f clean %.3f", (double) fr_req_b, fr_brakes,
+                                     fr_class, (double) fr_start, (double) fr_clean);
+                    }
                     std::fprintf(stderr, "\n");
                 }
             }

@@ -198,7 +198,7 @@ public:
     /// STRATA_ROUTE_BUDGET_DYN (decode only; verify.cpp): the route budget of the next window.  The serve decode loop calls
     /// route_budget_begin at a request's first window, route_budget_window before each window (decode or prompt), and
     /// route_budget_after after a decode window's sync and before its commit.  Off (no calls change anything) when unset.
-    static void route_budget_begin();
+    static void route_budget_begin(int64_t prompt_tokens);
     /// `auto_ok` = false (a decode-loop window that holds prompt tokens, a merged one): the decode budget stays the static one, not the AUTO search's
     void route_budget_window(bool decode, bool auto_ok = true);
     void route_budget_after(int n_keep);
@@ -232,6 +232,10 @@ public:
                                    float& req_b, long long& brakes);
     /// STRATA_FRAGILE_BRAKE (default on): the per-request decode budget brake (route_fragile_take's req_b and brakes are its).
     static bool route_brake_on();
+    /// STRATA_FRAGILE_BRAKE: at a request's end, its size class learns its start fraction and clean level (route_class_end; the tune file is
+    /// written); route_class_state gives the request's class and that class's start and clean level.
+    static void route_class_end();
+    static void route_class_state(int& cls, float& start, float& clean);
     /// The FRAGILE switch (STRATA_FRAGILE_RECHECK).  route_tune_open(path, model_fp), once at serve start before the first decode window
     /// (FRAGILE on): loads the learned b, k, step and counts from `path` when its fingerprint is model_fp, and keeps writing that file
     /// after each finished AUTO test and each k update.  An empty path keeps nothing.

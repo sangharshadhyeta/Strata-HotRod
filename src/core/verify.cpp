@@ -194,7 +194,8 @@ struct RouteResidentCfg {
     float auto_step = 1.25f;                  ///< the candidate's step factor s: candidate = b * s^d (saved; after a win in the same direction as the last win s grows to 2, after a loss it shrinks toward 1.1)
     int auto_last_win = 0;                    ///< the direction of the last win (0: no win yet)
     // STRATA_FRAGILE_BRAKE (default on, =0 off; with FRAGILE and AUTO): each request has its own decode budget req_b, used for its decode
-    // windows instead of auto_b.  route_budget_begin sets req_b = 0.5 * auto_b.  The AUTO arms scale it: base req_b, candidate req_b * s^d.
+    // windows instead of auto_b.  route_budget_begin sets req_b = s[c] * auto_b (at least the class's clean level L[c], at most auto_b; per-class
+    // learned, see cls_start).  A brake stops at L[c] while L[c] is known (route_fragile_settle).  The AUTO arms scale it: base req_b, candidate req_b * s^d.
     // A settled re-check of the request counts into req_rc / req_fl.  Evidence (route_wilson90, z = 1.645): the brake acts only with >= 15
     // re-checks and a Wilson 90% lower bound of flips / rechecks above 0.2; then req_b halves (below 0.01 it is 0) and the counts reset,
     // so it takes 15 more re-checks to act again.  Flips per committed token (the harm rises with it; the re-check rate does not): the
@@ -215,6 +216,16 @@ struct RouteResidentCfg {
     // candidate arm had <= 0.5 flips per 100 committed tokens over >= kCleanTok tokens.  A candidate above 2 * b_clean is not tested
     // (a loss); while b_clean is 0 the ceiling is 2 * auto_b0 (the start).
     double b_clean = 0.0;
+    // STRATA_FRAGILE_BRAKE, learned per request size class c = floor(log2(prompt tokens)) (route_size_class; kClasses of them, the last
+    // one takes the rest): cls_start[c] is the start fraction s of auto_b (initial 0.5); cls_clean[c] is the clean level L, the highest
+    // req_b at which a request of the class finished with >= 100 committed tokens and a Wilson 90% upper bound of flips per token <= 0.01
+    // (0 = unknown).  Kept in standin-tune.txt as "class <c> start <s> clean <L>" lines, for the classes seen (route_class_end).
+    enum { kClasses = 32 };
+    std::vector<float> cls_start = std::vector<float>(kClasses, 0.5f);
+    std::vector<double> cls_clean = std::vector<double>(kClasses, 0.0);
+    std::vector<bool> cls_seen = std::vector<bool>(kClasses, false);
+    int req_class = 0;                        ///< this request's size class (route_budget_begin)
+    long long req_tok_all = 0, req_fl_all = 0;   ///< this request's committed decode tokens and flips over the whole request (a brake does not reset them)
     // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
     // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
     // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
@@ -3866,6 +3877,9 @@ void route_tune_write(const RouteResidentCfg& c) {
     ok = ok && std::fprintf(f, "rechecks %lld\n", c.fragile_rechecks) > 0;
     ok = ok && std::fprintf(f, "flips %lld\n", c.fragile_flips) > 0;
     ok = ok && std::fprintf(f, "clean %.9g\n", c.b_clean) > 0;
+    for (int k = 0; k < RouteResidentCfg::kClasses && ok; ++k)
+        if (c.cls_seen[(size_t) k])
+            ok = ok && std::fprintf(f, "class %d start %.9g clean %.9g\n", k, (double) c.cls_start[(size_t) k], c.cls_clean[(size_t) k]) > 0;
     ok = std::fclose(f) == 0 && ok;
     std::error_code ec;
     if (ok) std::filesystem::rename(tmp, c.tune_path, ec);
@@ -3884,11 +3898,16 @@ bool route_tune_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) 
     bool fp_ok = false;
     double budget = -1.0, step = -1.0, k = -1.0, clean = -1.0;
     long long tests = -1, rechecks = -1, flips = -1;
+    struct ClassLine { int c; double start, clean; };
+    std::vector<ClassLine> classes;
     while (std::fgets(line, sizeof line, f) != nullptr) {
         char key[32] = "";
         char val[64] = "";
         if (std::sscanf(line, "%31s %63s", key, val) != 2) continue;
-        if (std::strcmp(key, "fingerprint") == 0) fp_ok = std::strtoull(val, nullptr, 16) == (unsigned long long) fp;
+        if (std::strcmp(key, "class") == 0) {
+            ClassLine cl{-1, -1.0, -1.0};
+            if (std::sscanf(line, "class %d start %lf clean %lf", &cl.c, &cl.start, &cl.clean) == 3) classes.push_back(cl);
+        } else if (std::strcmp(key, "fingerprint") == 0) fp_ok = std::strtoull(val, nullptr, 16) == (unsigned long long) fp;
         else if (std::strcmp(key, "budget") == 0) budget = std::atof(val);
         else if (std::strcmp(key, "step") == 0) step = std::atof(val);
         else if (std::strcmp(key, "k") == 0) k = std::atof(val);
@@ -3911,6 +3930,12 @@ bool route_tune_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) 
     if (rechecks >= 0) c.fragile_rechecks = rechecks;
     if (flips >= 0) c.fragile_flips = flips;
     if (clean >= 0.0) c.b_clean = clean;
+    for (const ClassLine& cl : classes) {
+        if (cl.c < 0 || cl.c >= RouteResidentCfg::kClasses || cl.start <= 0.0 || cl.clean < 0.0) continue;
+        c.cls_start[(size_t) cl.c] = std::min(1.0f, std::max(0.05f, (float) cl.start));
+        c.cls_clean[(size_t) cl.c] = cl.clean;
+        c.cls_seen[(size_t) cl.c] = true;
+    }
     return true;
 }
 }  // namespace
@@ -3972,17 +3997,33 @@ void route_brake_grow(RouteResidentCfg& c) {
     }
     c.req_b = c.req_b <= 0.0f ? 0.25f * c.auto_b : std::min(c.auto_b, c.req_b * 1.25f);
 }
+
+// STRATA_FRAGILE_BRAKE: the request size class of a prompt: floor(log2(max(1, prompt tokens))), the last class taking the rest.
+int route_size_class(int64_t prompt_tokens) {
+    int64_t n = std::max<int64_t>(1, prompt_tokens);
+    int c = 0;
+    while (n > 1) {
+        n >>= 1;
+        ++c;
+    }
+    return std::min(c, RouteResidentCfg::kClasses - 1);
+}
 }  // namespace
 
-void Verifier::route_budget_begin() {
+// prompt_tokens: the request's prompt token count (generate.cpp), which picks its size class.
+void Verifier::route_budget_begin(int64_t prompt_tokens) {
     RouteResidentCfg& c = route_resident_cfg();
     if (c.dyn_on) c.dyn_cur_hi = false;   // a request's first decode window starts at b_lo
     c.fragile_exact = false;              // STRATA_FRAGILE_RECHECK: a request starts with no pending cut
     c.fragile_pend = false;
     if (c.auto_on) ++c.auto_req;          // STRATA_ROUTE_BUDGET_AUTO: the request whose windows the next arm time counts
-    // STRATA_FRAGILE_BRAKE: this request starts at half the learned budget (auto_b itself when the brake is off)
-    c.req_b = c.brake_on ? 0.5f * c.auto_b : c.auto_b;
+    // STRATA_FRAGILE_BRAKE: this request starts at its class's start fraction s of auto_b, at least the class's clean level L when known,
+    // and never above auto_b (auto_b itself when the brake is off)
+    c.req_class = route_size_class(prompt_tokens);
+    const size_t k = (size_t) c.req_class;
+    c.req_b = c.brake_on ? std::min(c.auto_b, std::max((float) c.cls_clean[k], c.cls_start[k] * c.auto_b)) : c.auto_b;
     c.req_rc = c.req_fl = c.req_tok = c.req_wins = c.req_brakes = 0;
+    c.req_tok_all = c.req_fl_all = 0;
 }
 
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
@@ -4149,6 +4190,7 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
     ++c.auto_rc[c.auto_cut_arm];
     if (flipped) {
         ++c.req_fl;
+        ++c.req_fl_all;
         ++c.auto_fl[c.auto_cut_arm];
     }
     double flip_lo = 0.0, flip_hi = 0.0, tok_lo = 0.0, tok_hi = 0.0;
@@ -4158,8 +4200,13 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
     const bool by_token = c.req_tok >= RouteResidentCfg::kBrakeTokMin && c.req_fl >= RouteResidentCfg::kBrakeFlips && tok_lo > 0.01;
     if (c.brake_on && c.req_b > 0.0f && (by_recheck || by_token)) {
         const float old = c.req_b;
-        const float cut = old * 0.5f;
+        // the class's clean level L (0 = none yet): the brake stops at L, unless the request already runs at L (it flipped there: not clean)
+        const float known = (float) c.cls_clean[(size_t) c.req_class];
+        const bool at_known = known > 0.0f && old <= known;
+        float cut = old * 0.5f;
+        if (known > 0.0f && !at_known) cut = std::max(known, cut);
         c.req_b = cut < 0.01f ? 0.0f : cut;
+        if (at_known) c.cls_clean[(size_t) c.req_class] = (double) c.req_b;   // the known-clean level flipped: it was not clean
         ++c.req_brakes;
         std::fprintf(stderr, "strata serve: stand-in brake: budget %.3f -> %.3f (%lld of %lld re-checks flipped, %lld flips in %lld tokens, %s)\n",
                      (double) old, (double) c.req_b, c.req_fl, c.req_rc, c.req_fl, c.req_tok, by_token ? "per token" : "per re-check");
@@ -4193,7 +4240,36 @@ void Verifier::route_fragile_settle(int32_t exact_tok) {
 
 // A non-merged decode window's commit: this request's committed tokens (the brake's flips per token; route_fragile_settle).
 void Verifier::route_req_commit(int n_keep) {
-    route_resident_cfg().req_tok += n_keep;
+    RouteResidentCfg& c = route_resident_cfg();
+    c.req_tok += n_keep;
+    c.req_tok_all += n_keep;
+}
+
+// STRATA_FRAGILE_BRAKE, at a request's end: its size class learns.  A request that braked lowers the class's start s (x 0.8, at least 0.05).
+// A clean one (>= kBrakeTokMin = 100 committed tokens and a Wilson 90% upper bound of its flips per token <= 0.01) raises s (x 1.1, at most
+// 1.0) and its clean level L to the req_b it ended at (when higher).  Then the file is written.
+void Verifier::route_class_end() {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.brake_on) return;
+    const size_t k = (size_t) c.req_class;
+    c.cls_seen[k] = true;
+    double lo = 0.0, hi = 0.0;
+    route_wilson90(c.req_fl_all, c.req_tok_all, lo, hi);
+    const bool clean = c.req_tok_all >= RouteResidentCfg::kBrakeTokMin && hi <= 0.01;
+    if (c.req_brakes > 0) c.cls_start[k] = std::max(0.05f, 0.8f * c.cls_start[k]);
+    if (clean) {
+        c.cls_start[k] = std::min(1.0f, 1.1f * c.cls_start[k]);
+        c.cls_clean[k] = std::max(c.cls_clean[k], (double) c.req_b);
+    }
+    route_tune_write(c);
+}
+
+// The request's size class, its start fraction and its clean level (after route_class_end), for the stats line.
+void Verifier::route_class_state(int& cls, float& start, float& clean) {
+    const RouteResidentCfg& c = route_resident_cfg();
+    cls = c.req_class;
+    start = c.cls_start[(size_t) c.req_class];
+    clean = (float) c.cls_clean[(size_t) c.req_class];
 }
 
 // This request's cuts, rows moved by stand-ins, flipped re-decisions and k; false when the switch is off.  Takes and resets the counts.
