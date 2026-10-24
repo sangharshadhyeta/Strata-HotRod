@@ -16707,7 +16707,7 @@ int main(int argc, char** argv) {
                              strata::core::la_tail_skipped.exchange(0, std::memory_order_relaxed));
             // STRATA_LA_TAIL_READ=1 (opt-in): the decode read-ahead's rank >= lo guesses since the previous request (the counts are taken and
             // zeroed here): queued; skipped = not read under the open rule (host) or served by a stand-in (the device's count, route_pred_tail_read)
-            if (static const bool la_tail_read_on = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr && std::atoi(e) != 0; }(); la_tail_read_on)
+            if (static const bool la_tail_read_on = strata::core::la_tail_read_level() != 0; la_tail_read_on)
                 std::fprintf(stderr, "strata serve: look-ahead tail read: %lld rank>=lo guesses queued, %lld skipped (a stand-in will serve them), %lld held back (drive busy)\n",
                              strata::core::la_tail_read_queued.exchange(0, std::memory_order_relaxed),
                              strata::core::la_tail_read_open_skips.exchange(0, std::memory_order_relaxed) +

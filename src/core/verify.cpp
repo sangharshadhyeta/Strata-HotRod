@@ -102,7 +102,8 @@ struct RouteResidentCfg;
 RouteResidentCfg& route_resident_cfg();
 // STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned correction (native_router.cu la_learn_*); STRATA_LA_LEARN_TIMING=1 times its training
 static bool la_learn_env_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN"); return e != nullptr && e[0] == '1'; }();
+    // default ON since 24 Oct evening (3-question A/B: 58.9 vs 56.8 tok/s, answers correct); STRATA_LA_LEARN=0 turns it off
+    static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN"); return e == nullptr || e[0] != '0'; }();
     return on;
 }
 static bool la_learn_timing_on() {
@@ -1107,7 +1108,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         std::fprintf(stderr, "strata verify: STRATA_LA_LEARN: %s%s\n", ok ? "on, " : "NOT on: ", lm.c_str());
     }
     // STRATA_LA_TAIL_READ=1: its stand-in counter (the same rule: allocated before any graph capture)
-    if ((std::getenv("STRATA_LA_TAIL_READ") != nullptr && std::atoi(std::getenv("STRATA_LA_TAIL_READ")) != 0) && strata::kernels::route_pred_active())
+    if (strata::core::la_tail_read_level() != 0 && strata::kernels::route_pred_active())
         strata::kernels::route_pred_tail_read_alloc();
     // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
     if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
@@ -2512,7 +2513,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool la_on_stream = false;   // HIP: the node stays on cs (the shared stream's cross-stream cost, as sh_stream_on)
 #endif
         static const bool la_edge_skip = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e != nullptr && std::atoi(e) != 0; }();
-        static const int la_tail_read_v = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr ? std::atoi(e) : 0; }();
+        static const int la_tail_read_v = strata::core::la_tail_read_level();
         static const bool la_tail_read = la_tail_read_v != 0;   // =2: ranks below lo take the predicted stand-in test too
         auto lookahead_node = [&](cudaStream_t s) -> bool {
             try {
@@ -4191,7 +4192,7 @@ static void la_tail_skip_update(const RouteResidentCfg& c) {
     // STRATA_LA_TAIL_READ=1 (opt-in): the read-ahead's ranks >= lo for this window, by the budgets the router's kernel reads now (the
     // host-mapped config after this window's route_cfg_set_budgets): mode 2 = the open rule (no tail read), 1 = read, with the stand-in
     // test on the device (route_pred_tail_read); 0 = off (the router is off too, or the switch is unset)
-    static const bool tail_read_on = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr && std::atoi(e) != 0; }();
+    static const bool tail_read_on = strata::core::la_tail_read_level() != 0;
     int mode = 0;
     if (tail_read_on && c.margin > 0.0f) mode = strata::kernels::route_cfg_tail_open() ? 2 : 1;
     strata::core::la_tail_read_lo.store(c.lo, std::memory_order_relaxed);

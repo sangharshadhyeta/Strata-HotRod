@@ -282,6 +282,12 @@ inline std::atomic<long long> la_tail_skipped{0};
 /// GPU look-ahead's k, as before); 1: ranks lo..9 are read, a rank the router would serve with a stand-in is not (route_pred_tail_read) and a
 /// rank is queued only while the file tier's queue holds fewer guesses than it has I/O workers; 2: the open rule holds for this window (any
 /// resident stand-in serves a rank >= lo), so none of those ranks is read.  Set per decode window by the verifier (verify.cpp la_tail_skip_update).
+// STRATA_LA_TAIL_READ: 0 off, 1 ranks >= lo only, 2 every rank (read ahead only the picks the stand-in test will compute exactly).
+// Default 2 since 24 Oct evening, with the learned look-ahead (STRATA_LA_LEARN, default on).
+inline int la_tail_read_level() {
+    static const int v = [] { const char* e = std::getenv("STRATA_LA_TAIL_READ"); return e != nullptr ? std::atoi(e) : 2; }();
+    return v;
+}
 inline std::atomic<int> la_tail_read_mode{0};
 inline std::atomic<int> la_tail_read_lo{0};
 /// the window's counts since the request's stats line took them: guesses at ranks >= lo queued, held back (queue full), and not read under mode 2
