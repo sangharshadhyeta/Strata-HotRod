@@ -12975,6 +12975,9 @@ int main(int argc, char** argv) {
                     if (f) std::fclose(f);
                     int64_t p = 0, i = 0;
                     size_t k = 0;
+                    // the positions table has `cells` entries; a longer picture prompt is refused here, before put() writes past it
+                    // (the context check below runs after this loop - 24 Oct review)
+                    if (ve.empty() && n > cells) ve = "the prompt (" + std::to_string((long long) n) + " tokens) exceeds the context";
                     while (ve.empty() && i < n) {
                         if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
                         if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }

@@ -2938,7 +2938,9 @@ bool RouterLookahead::predicted_at(int j, int64_t layer, int64_t e) const {
 }
 
 void RouterLookahead::set_max_tokens(int n) {
-    std::lock_guard<std::mutex> lk(mu_);
+    // the thread reads x_ without the lock while busy_: wait for its job to end before x_ may move (24 Oct review)
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait(lk, [&] { return !busy_; });
     max_tok_ = n < 8 ? 8 : n > 512 ? 512 : n;
     x_.assign((size_t) max_tok_ * (size_t) n_embd_, 0.f);
 }
@@ -3176,6 +3178,7 @@ void RouterLookahead::run() {
             std::lock_guard<std::mutex> lk(mu_);
             busy_ = false;
         }
+        cv_.notify_all();   // set_max_tokens waits for the job to end before it resizes x_
     }
 }
 

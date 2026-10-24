@@ -1693,7 +1693,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               T <= 8 && lb_ == 0 && le_ == g.n_layers && NE == 512 && K == 10 && hits_.d_res != nullptr &&
                               native_router_enabled() && strata::kernels::route_pred_active() &&
                               strata::kernels::route_pred_logits() != nullptr;
-    if (T >= 0 && T < 9) la_win_[T] = la_learn_win;   // the launches of this window size run the batch after them
+    // the launches of this window size run the batch after them (a --batch-mtp capture of the same size must not clear the flag
+    // of the single-request graph, whose learner nodes would then run without their training batch: 24 Oct review)
+    if (T >= 0 && T < 9 && !batch_rec_) la_win_[T] = la_learn_win;
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     auto pre = [&](int64_t l, int grp) -> bool {

@@ -1064,7 +1064,9 @@ __device__ __forceinline__ float la_block_sum(float v, float* sh) {
         if (threadIdx.x == 0) sh[0] = s;
     }
     __syncthreads();
-    return sh[0];
+    const float r = sh[0];
+    __syncthreads();   // every thread has read sh[0] before a following call writes sh[w] (24 Oct review: a race on the second sum)
+    return r;
 }
 __device__ __forceinline__ unsigned long long la_now() {   // the GPU's clock (ns), for the timing only
     unsigned long long now;
