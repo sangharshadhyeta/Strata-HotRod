@@ -55,8 +55,12 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
+#include <sstream>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -560,6 +564,114 @@ inline uint64_t lm_map_budget() {
         return mib > 0 ? (uint64_t) mib << 20 : (uint64_t) 0;
     }();
     return bytes;
+}
+
+// STRATA_PREFILL_LM_MAP_AUTO (opt-in, =1; off: the static budget, as before. 24 Oct: the per-prompt "off" keeps the memory plan, so it lacks the static =0 gain: 8.5K 17.8 s vs 11.8 s - a per-prompt plan is needed first).  Whether a layer-major prompt fills and reads the
+// expert map is decided per prompt by what this machine measured: per prompt-size bucket b (floor(log2 n), n >= 1024), the
+// time per token of the prompts that used the map ("with") and of those that did not ("without"), kept in lm-map.json beside
+// ram-reserve.json under the model fingerprint.  Both arms with two prompts: the faster arm, the other arm on 1 prompt in 8;
+// before that, the arm with fewer prompts (the map on a tie).  The carve is the same for both arms.
+inline bool lm_map_auto_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_LM_MAP_AUTO"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+struct LmChoice {
+    bool active = false;
+    int bucket = 0, arm = 0;                       // arm 0: with the map, 1: without
+    double cnt[2] = {0, 0}, mean[2] = {0, 0};      // the bucket's prompts before this one, and their mean ms per token
+};
+static thread_local LmChoice t_lm_choice;          // the run in progress on this thread (Prefill::run)
+struct LmStore {
+    std::mutex mu;
+    std::string path, key;                         // lm-map.json, and the key (the model fingerprint); no path: in memory only
+    bool loaded = false;
+    std::map<std::string, double> values;          // every number of the file, keyed as written
+};
+inline LmStore& lm_store() { static LmStore s; return s; }
+// "lm-map <key> b<bucket> with|without n|ms": the count of the arm's prompts, and the sum of their ms per token
+inline std::string lm_entry(int b, int arm, const char* what) {
+    return "lm-map " + lm_store().key + " b" + std::to_string(b) + (arm == 0 ? " with " : " without ") + what;
+}
+inline double lm_value(const LmStore& st, const std::string& k) {
+    const auto it = st.values.find(k);
+    return it == st.values.end() ? 0.0 : it->second;
+}
+// the flat file: every "name": number pair (other models' entries are kept as they are)
+void lm_map_read(const std::string& p, std::map<std::string, double>& out) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string s = ss.str();
+    size_t i = 0;
+    while (i < s.size()) {
+        const size_t q1 = s.find('"', i);
+        if (q1 == std::string::npos) break;
+        const size_t q2 = s.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        const size_t c = s.find(':', q2 + 1);
+        if (c == std::string::npos) break;
+        const char* vb = s.c_str() + c + 1;
+        char* ve = nullptr;
+        const double v = std::strtod(vb, &ve);
+        if (ve == vb) { i = q2 + 1; continue; }
+        out[s.substr(q1 + 1, q2 - q1 - 1)] = v;
+        i = (size_t) (ve - s.c_str());
+    }
+}
+// written to a temp file and renamed over the old one, after each prompt
+void lm_map_write(const std::string& p, const std::map<std::string, double>& m) {
+    if (p.empty()) return;
+    const std::string tmp = p + ".tmp";
+    bool ok = false;
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (f) {
+            f << "{\n";
+            size_t n = 0;
+            for (const auto& kv : m) {
+                char v[64];
+                std::snprintf(v, sizeof v, "%.17g", kv.second);
+                f << "  \"" << kv.first << "\": " << v << (++n < m.size() ? ",\n" : "\n");
+            }
+            f << "}\n";
+            ok = (bool) f;
+        }
+    }
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, p, ec);
+}
+// the arm for this layer-major prompt of n >= 1024 tokens (see above)
+void lm_map_choose(int64_t n, LmChoice& c) {
+    LmStore& st = lm_store();
+    std::lock_guard<std::mutex> g(st.mu);
+    if (!st.loaded) {
+        if (!st.path.empty()) lm_map_read(st.path, st.values);
+        st.loaded = true;
+    }
+    int b = 0;
+    while (((int64_t) 1 << (b + 1)) <= n) ++b;
+    c.bucket = b;
+    for (int a = 0; a < 2; ++a) {
+        c.cnt[a] = lm_value(st, lm_entry(b, a, "n"));
+        const double sum = lm_value(st, lm_entry(b, a, "ms"));
+        c.mean[a] = c.cnt[a] > 0 ? sum / c.cnt[a] : 0.0;
+    }
+    if (c.cnt[0] >= 2 && c.cnt[1] >= 2) {
+        const int faster = c.mean[0] <= c.mean[1] ? 0 : 1;
+        const long long decided = (long long) (c.cnt[0] + c.cnt[1]);
+        c.arm = decided % 8 == 7 ? 1 - faster : faster;
+    } else {
+        c.arm = c.cnt[0] <= c.cnt[1] ? 0 : 1;
+    }
+    c.active = true;
+}
+void lm_map_record(const LmChoice& c, double ms_per_tok) {
+    LmStore& st = lm_store();
+    std::lock_guard<std::mutex> g(st.mu);
+    st.values[lm_entry(c.bucket, c.arm, "n")] += 1.0;
+    st.values[lm_entry(c.bucket, c.arm, "ms")] += ms_per_tok;
+    lm_map_write(st.path, st.values);
 }
 
 }  // namespace
@@ -2170,6 +2282,14 @@ static std::function<uint64_t(uint64_t)> g_ram_give_back;
 static std::function<void(int64_t)> g_on_layer_pass;
 void Prefill::set_ram_give_back(std::function<uint64_t(uint64_t)> fn) { g_ram_give_back = std::move(fn); }
 void Prefill::set_on_layer_pass(std::function<void(int64_t)> fn) { g_on_layer_pass = std::move(fn); }
+void Prefill::set_lm_map_store(const std::string& path, const std::string& key) {
+    LmStore& st = lm_store();
+    std::lock_guard<std::mutex> g(st.mu);
+    st.path = path;
+    st.key = key;
+    st.loaded = false;
+    st.values.clear();
+}
 static thread_local bool t_reporting_after_layers = false;
 bool Prefill::reporting_after_layers() { return t_reporting_after_layers; }
 
@@ -5400,6 +5520,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): %s\n",
                      (long long) n, (long long) C, why);
     }
+    // The expert map for this prompt (STRATA_PREFILL_LM_MAP_AUTO, see LmChoice): the static budget unless the choice is on.
+    // Skipped, the map's region is the residuals' room too (lm_dev0 below), so this arm reads as STRATA_PREFILL_LM_MAP_MIB=0.
+    bool lm_map_use = lm_map_budget() > 0;
+    if (lm && lm_map_use && lm_map_auto_on() && n >= 1024) {
+        lm_map_choose(n, t_lm_choice);
+        lm_map_use = t_lm_choice.arm == 0;
+    }
+    uint8_t* lm_dev0 = m.lm_dev;                // the loan's tail for the residuals (Impl::lm_dev, or from the map when skipped)
+    uint64_t lm_dev_room = m.lm_dev_bytes;
+    if (!lm_map_use && m.lm_map != nullptr && m.lm_dev != nullptr && m.lm_dev >= m.lm_map) {
+        lm_dev0 = m.lm_map;                     // carve put the map right before the tail: the tail starts where the map starts
+        lm_dev_room = m.lm_dev_bytes + (uint64_t) (m.lm_dev - m.lm_map);
+    }
     // The GPU part of the residual state (STRATA_LM_DEVICE=0 keeps it all in pinned RAM): the longest prefix of whole chunks
     // whose state fits the loan's tail (Impl::lm_dev).  A chunk is on the GPU iff its whole range fits; the last chunk may be
     // shorter.  Each array is 256-byte aligned, as carve's takes are.
@@ -5412,10 +5545,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // what is left after them; a tail too small for both keeps the unstaged path and its whole room
     auto up256 = [](uint64_t b) { return (b + 255) & ~(uint64_t) 255; };
     const uint64_t stage_bytes = C > 0 ? 2 * up256((uint64_t) C * D * 4) : 0;
-    const bool stage_room = lm && lm_device_env && m.lm_dev != nullptr && C > 0 && m.lm_dev_bytes >= stage_bytes;
+    const bool stage_room = lm && lm_device_env && lm_dev0 != nullptr && C > 0 && lm_dev_room >= stage_bytes;
     int64_t n_dev = 0;
-    if (lm_device_env && m.lm_dev != nullptr && m.lm_dev_bytes > 0 && C > 0) {
-        const uint64_t room = m.lm_dev_bytes - (stage_room ? stage_bytes : 0);
+    if (lm_device_env && lm_dev0 != nullptr && lm_dev_room > 0 && C > 0) {
+        const uint64_t room = lm_dev_room - (stage_room ? stage_bytes : 0);
         for (int64_t k = (n + C - 1) / C; k > 0; --k) {
             const int64_t t = std::min(k * C, n);
             if (lm_gpu_bytes(t) <= room) { n_dev = t; break; }
@@ -5469,7 +5602,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         if (!stg_ok) (void) cudaGetLastError();
         lm_stage_on = stg_ok;
-        uint8_t* p = m.lm_dev;
+        uint8_t* p = lm_dev0;
         auto take = [&](uint64_t bytes) -> void* {
             void* q = p;
             p += (bytes + 255) & ~(uint64_t) 255;
@@ -5499,14 +5632,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                  "pinned RAM\n", (long long) n_dev, (long long) n, lm_gpu_bytes(n_dev) / 1048576.0);
     }
     const char* lm_map_src = "none";
+    if (!lm) t_lm_choice.active = false;   // the prompt is not layer-major after all: nothing to learn from it
     if (lm) {
-        if (m.lm_map != nullptr) {
+        if (lm_map_use && m.lm_map != nullptr) {
             // the expert map from the borrowed loan (carve): its bytes are the loan's, so it is not cudaFree'd here
             lmh.map = m.lm_map;
             lmh.map_shared = true;
             lm_cap = (size_t) m.lm_map_bytes;
             lm_map_src = "borrowed";
-        } else if (const size_t budget = (size_t) lm_map_budget(); budget != 0) {
+        } else if (const size_t budget = lm_map_use ? (size_t) lm_map_budget() : 0; budget != 0) {
             // the expert map: as much of the device as the first try gets (a layer's experts that do not fit stream as before),
             // sized from STRATA_PREFILL_LM_MAP_MIB (=0: no map at all - it used to mean a fixed 700 MiB cudaMalloc here instead)
             for (const size_t want : {budget, std::min(budget, (size_t) 256 << 20)}) {
@@ -5523,6 +5657,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         lm_carry.assign((size_t) ((n + C - 1) / C), 0);
         lm_sync.s = m.cs;
         lm_skip_cpu_share = true;   // the chunks below run without the CPU share (it would hold the pool per chunk)
+        if (t_lm_choice.active)
+            std::fprintf(stderr, "strata prefill: layer-major map %s for %lld tokens (bucket %d: with %.2f ms/tok over %lld, "
+                                 "without %.2f over %lld)\n", lm_map_use ? "on" : "off", (long long) n, t_lm_choice.bucket,
+                         t_lm_choice.mean[0], (long long) t_lm_choice.cnt[0], t_lm_choice.mean[1], (long long) t_lm_choice.cnt[1]);
     }
     const int64_t streamed0 = stats_.experts_streamed;
     if (!lm) {
@@ -5781,10 +5919,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return ok;
     }
 #endif
+    t_lm_choice = {};
+    const auto t_run0 = std::chrono::steady_clock::now();
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
+    // a layer-major prompt that ran whole: its time per token is the sample of the map arm run_impl chose
+    if (body_ok && drain_ok && t_lm_choice.active)
+        lm_map_record(t_lm_choice, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_run0).count() / (double) n);
+    t_lm_choice = {};
 
     if (!body_ok) return false;
     if (!drain_ok) {

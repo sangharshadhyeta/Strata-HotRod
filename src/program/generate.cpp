@@ -1589,6 +1589,14 @@ static std::string ram_reserve_path(const Options& o) {
     const std::filesystem::path dir = std::filesystem::path(p).parent_path();
     return ((dir.empty() ? std::filesystem::path(".") : dir) / "ram-reserve.json").string();
 }
+/// The per-prompt expert map choice (STRATA_PREFILL_LM_MAP_AUTO: per prompt-size bucket, the time per token with and without the
+/// map), beside ram-reserve.json; keyed inside by the model fingerprint (Prefill::set_lm_map_store).
+static std::string lm_map_path(const Options& o) {
+    const std::string& p = !o.expert_profile.empty() ? o.expert_profile : o.expert_profile_save;
+    if (p.empty()) return "";
+    const std::filesystem::path dir = std::filesystem::path(p).parent_path();
+    return ((dir.empty() ? std::filesystem::path(".") : dir) / "lm-map.json").string();
+}
 /// The stand-in tuning of this model (STRATA_ROUTE_BUDGET_AUTO / STRATA_FRAGILE_RECHECK: budget, k, step, counts), beside the expert
 /// profile like the reserve files.  It is keyed to the model fingerprint inside (Verifier::route_tune_open).
 static std::string standin_tune_path(const Options& o) {
@@ -14122,6 +14130,23 @@ int main(int argc, char** argv) {
                         strata::core::progress_beat();
                         std::fflush(stdout);
                     });
+                    // the per-prompt expert map choice's file, once: keyed by the model fingerprint (session_identity), else the pack
+                    static bool lm_store_set = false;
+                    if (!lm_store_set) {
+                        lm_store_set = true;
+                        std::string lm_key = o.pack;
+                        strata::core::SessionFileIdentity lid;
+                        std::string le;
+                        try {
+                            if (session_identity(lid, le, {})) {
+                                char hx[32];
+                                std::snprintf(hx, sizeof hx, "%016llx", (unsigned long long) lid.model);
+                                lm_key = hx;
+                            }
+                        } catch (const std::exception&) {
+                        }
+                        strata::prefill::Prefill::set_lm_map_store(lm_map_path(o), lm_key);
+                    }
                     const bool ok = sp.run(ids.data() + q, r - q, q, e);
                     strata::prefill::Prefill::set_on_layer_pass(nullptr);
                     return ok;
