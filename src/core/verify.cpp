@@ -4166,6 +4166,16 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
         b = 0.0f;
         c.fragile_exact = false;
     }
+    // STRATA_ROUTE_BRAKE_STEP=1 (opt-in, 24 Oct, the user's rule; the default checks every rank from the first window): ranks >= lo
+    // start open (any resident stand-in) and each brake of the request moves the floor one rank up - the rank just above the checked
+    // ones joins them (the budget test), the ranks above it stay open.  The floor returns to lo for the next request.
+    static const bool brake_step = [] { const char* v = std::getenv("STRATA_ROUTE_BRAKE_STEP"); return v != nullptr && std::atoi(v) != 0; }();
+    if (brake_step && decode && c.auto_on) {
+        tail = 0.0f;
+        strata::kernels::route_cfg_set_floor((int) std::min<long long>((long long) c.lo + c.req_brakes, (long long) c.hi + 1));
+    } else if (brake_step) {
+        strata::kernels::route_cfg_set_floor(c.lo);
+    }
     c.win_low = b;
     c.win_tail = tail;
     strata::kernels::route_cfg_set_budgets(b, tail);
