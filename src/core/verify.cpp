@@ -1273,6 +1273,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         dyn_gap_ = b.take<float>(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on ? T : 0);   // STRATA_ROUTE_BUDGET_DYN, STRATA_FRAGILE_RECHECK
         dyn_top1_ = b.take<int32_t>(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on ? T : 0);   // the rows' top-1 ids (the flips' argmax)
         row_shift_ = b.take<float>(route_resident_cfg().fragile_on ? T : 0);   // STRATA_FRAGILE_RECHECK: the stand-ins' moves per row (decode windows)
+        // a zero-size take returns the NEXT buffer's address (Bump::take), not null: a switched-off feature must hold no pointer, or
+        // a kernel that tests it for null writes into that buffer (row_shift_ into arg_scratch_ broke every token with the re-check off)
+        if (!(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on)) { dyn_gap_ = nullptr; dyn_top1_ = nullptr; }
+        if (!route_resident_cfg().fragile_on) row_shift_ = nullptr;
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
