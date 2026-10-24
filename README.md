@@ -198,8 +198,9 @@ Live on the abliterated IQ3_S (24 Oct, share of the needed experts not on the ca
 | 2 layers | 66-69% | 76-79% |
 | 4 layers | 55% | 66% |
 
-3-question test (code / reasoning / prose tokens/s, sampled, answers checked): default 52.7 / 67.4 / 50.3, learned
-53.1 / 70.6 / 52.9. Offline replays and the design notes: `docs/PREDICTOR-EXPERIMENTS.md`, `tools/predictor/`.
+3-question test (code / reasoning / prose, sampled, every answer correct), alternated twice on one build: old defaults
+59.0 and 54.4 tokens/s on the mean, the learned look-ahead 58.6 and 58.6 (about +3% and steadier); SSD wait 7.0-7.2 against
+6.2-6.5 s. Offline replays and the design notes: `docs/PREDICTOR-EXPERIMENTS.md`, `tools/predictor/`.
 
 ## Stand-in experts, rank by rank (the rule until 23 Oct; prompt reading still uses it)
 
