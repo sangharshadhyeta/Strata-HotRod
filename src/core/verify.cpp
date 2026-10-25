@@ -4255,10 +4255,20 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
             c.low_open_seen = true;
         }
     }
+    // A cut's exact successor decides every rank exactly: before 25 Oct only ranks < lo were made exact here and the tail kept its
+    // stand-ins, so a "re-decided" token could still be moved by a rank 3-9 stand-in.  A tail budget of ~0 lets only a stand-in that
+    // the router scored at least as high as the pick through (gap <= 0), i.e. no change.
     if (decode && c.fragile_exact) {
         b = 0.0f;
+        tail = 1e-30f;
         c.fragile_exact = false;
     }
+    // Ranks below the configured floor (STRATA_ROUTE_RESIDENT_RANKS=3-9: ranks 0-2) follow the configured rank rule - ranks 0-1 exact,
+    // the edge rank lo-1 only within STRATA_ROUTE_RESIDENT_EDGE logits - and the confidence budget acts on ranks lo-9 (25 Oct: with the
+    // budget on ranks 0-2 too, 4 of 11 emoji in 60 "hi" replies broke - a rank 0-1 stand-in on one byte-piece - against 0 of 6 under
+    // the rank rule).  STRATA_ROUTE_BUDGET_LOW=1 puts ranks below the floor under the budget again (the 24 Oct behaviour).
+    static const bool budget_low = [] { const char* v = std::getenv("STRATA_ROUTE_BUDGET_LOW"); return v != nullptr && std::atoi(v) != 0; }();
+    const float low = budget_low || b >= 1e29f ? b : 0.0f;   // (b >= 1e29: STRATA_ROUTE_LOW_OPEN's open start keeps its value)
     // STRATA_ROUTE_BRAKE_STEP=1 (opt-in, 24 Oct, the user's rule; the default checks every rank from the first window): ranks >= lo
     // start open (any resident stand-in) and each brake of the request moves the floor one rank up - the rank just above the checked
     // ones joins them (the budget test), the ranks above it stay open.  The floor returns to lo for the next request.
@@ -4269,9 +4279,9 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     } else if (brake_step) {
         strata::kernels::route_cfg_set_floor(c.lo);
     }
-    c.win_low = b;
+    c.win_low = low;
     c.win_tail = tail;
-    strata::kernels::route_cfg_set_budgets(b, tail);
+    strata::kernels::route_cfg_set_budgets(low, tail);
     la_tail_skip_update(c);
 }
 
