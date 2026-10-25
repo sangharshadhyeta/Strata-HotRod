@@ -217,6 +217,11 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+# A client that stops reading (or sending) for this long is dropped (25 Oct: a client that stopped reading held the one
+# turn for 16 minutes - the engine had finished in 45 s, the server sat in a socket write - and every request queued
+# behind it).  A write that cannot finish raises TimeoutError, an OSError: the stream's write handler cancels the
+# request and frees the turn.  A healthy stream writes far more often (tokens, keep-alives every KEEPALIVE_S).
+CLIENT_TIMEOUT_S = 60.0
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -5504,6 +5509,7 @@ def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
         disable_nagle_algorithm = True                      # each SSE chunk is a small write: send it now, not after the last ACK
+        timeout = CLIENT_TIMEOUT_S                          # a stalled client (not reading or not sending) is dropped, not waited for
 
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
