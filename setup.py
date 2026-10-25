@@ -2422,6 +2422,44 @@ def fetch_expert_predictor(env) -> Path:
     return LA_MODEL
 
 
+# The learned look-ahead's trained state for Qwen3.8-Flash-Next GSQ-RCO IQ3_S (25 Oct 2026: 62K + one top-up pass of
+# sampled code, agent, reasoning, prose and long conversations on an RTX 3060).  The engine loads data/predictor-<model id>.bin
+# only when the id matches the model files it runs, and its learned look-ahead (STRATA_LA_LEARN, auto) switches on when a learned
+# predictor is kept - so this download turns it on for this model, and it keeps learning live from there.
+HOTROD_PREDICTOR = "predictor-5400e1aece241c0f.bin"
+HOTROD_PREDICTOR_URL = "https://github.com/sangharshadhyeta/Strata-HotRod/releases/download/predictor-qwen38-iq3s-v1/" + HOTROD_PREDICTOR
+HOTROD_PREDICTOR_SHA = "SHA_PENDING"
+HOTROD_PREDICTOR_FAMILIES = ("qwen",)
+HOTROD_PREDICTOR_MODELS = ("IQ3_S",)
+
+
+def fetch_hotrod_predictor(family: str, model: str) -> None:
+    """data/predictor-<model id>.bin for Qwen3.8 IQ3_S: a ~4 MB download, once, SHA-256 checked.  Kept as it is when it is
+    already there (it is what this PC has learned since)."""
+    if family not in HOTROD_PREDICTOR_FAMILIES or model not in HOTROD_PREDICTOR_MODELS:
+        return
+    dst = ROOT / "data" / HOTROD_PREDICTOR
+    if dst.is_file():
+        ok("learned look-ahead: kept (this PC's own learned state)")
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(".download")
+    say("  The learned look-ahead's trained state for this model: a 4 MB download, once.")
+    try:
+        download(HOTROD_PREDICTOR_URL, tmp, "learned look-ahead")
+    except SystemExit:
+        warn("the learned look-ahead could not be downloaded: it stays off (STRATA_LA_LEARN=1 lets it learn from scratch)")
+        return
+    h = hashlib.sha256(tmp.read_bytes()).hexdigest()
+    if h != HOTROD_PREDICTOR_SHA:
+        tmp.unlink(missing_ok=True)
+        warn(f"the learned look-ahead's download has the wrong SHA-256 ({h}): not used")
+        return
+    tmp.replace(dst)
+    tmp.with_name(tmp.name + ".done").unlink(missing_ok=True)   # the download's finish mark: the file itself now marks it
+    ok(f"learned look-ahead: {dst}")
+
+
 def menu_families(hip: bool) -> list:
     """The families the model menu lists, in menu order.  The NVFP4 packs run on NVIDIA cards only (the AMD and Intel
     engines have no NVFP4 kernels), so on those the menu does not offer them; `--family nvfp4` still says why not."""
@@ -6942,6 +6980,8 @@ def main() -> int:
         if not la_model.is_file():
             fail(f"the expert predictor file is missing: {la_model}")
     ok("expert predictor: " + (f"ON, {la_model} (not measured yet)" if la_model else "off"))
+    # the learned look-ahead's trained state (HOTROD_PREDICTOR above): only for the model it was trained on
+    fetch_hotrod_predictor(family, model)
 
     # ---- 7. the start script
     step(7, "writing the start script")
