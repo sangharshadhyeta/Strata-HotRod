@@ -136,7 +136,7 @@ recomputed exactly, and each request brakes itself when it sees flips.
 
 **A look-ahead that learns.** Experts for 1, 2 and 4 layers ahead are guessed on the card and read from the SSD before they
 are needed. Each guess is the router's own score plus a small correction learned live from the real routing; its size is
-chosen per layer by a live contest, and it falls back to the plain router if it ever does worse. It runs when a learned predictor is kept on disk; on a fresh install it is off until `STRATA_LA_LEARN=1` starts one.
+chosen per layer by a live contest, and it falls back to the plain router if it ever does worse. For Qwen3.8 IQ3_S setup downloads a trained one ([release](https://github.com/sangharshadhyeta/Strata-HotRod/releases/tag/predictor-qwen38-iq3s-v1), 4 MB: 91 / 84 / 77% of the needed experts guessed 1 / 2 / 4 layers ahead) and it keeps learning on your PC; for other models it is off until `STRATA_LA_LEARN=1` starts one.
 
 </div>
 
@@ -221,6 +221,7 @@ scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build -
 
 - `--build` compiles this fork's engine; without it setup downloads upstream's, which lacks these changes. The compiled
   engine was checked against the one measured here: the same speed.
+- For Qwen3.8 IQ3_S it also downloads the learned look-ahead's trained state (4 MB, SHA-256 checked) into `data/`.
 - For 262K context set `--max-context 262144` in the config's `args`.
 - `--model IQ3_S` is the size tested here. Setup says it wants a 64 GB PC; naming it is the consent, and it runs on 30 GB.
 - `--models-dir /path/on/nvme` puts the model files elsewhere.
