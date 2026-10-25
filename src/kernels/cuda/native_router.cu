@@ -1025,8 +1025,9 @@ constexpr int kLaDist[] = {1, 2, 4};
 constexpr int kLaNd = (int) (sizeof kLaDist / sizeof kLaDist[0]);
 constexpr int kLaNSlots = kLaSlots - 1;   // the trained slots per (s,d): ranks 4, 8, 16
 constexpr int kLaKernels = 8;             // the batch's kernels, in launch order: rank, score, prep, grad, upd_b, upd_a, decide, reinit
-constexpr int kLaCnt = 17;       // counters per (s,d): [0] picks since change, [1] picks in the recent 500, [2] picks all,
-                                 // [3+c] hits since change, [7+c] hits recent, [11+c] hits all, [15] changes, [16] resets
+constexpr int kLaCnt = 18;       // counters per (s,d): [0] picks since change, [1] picks in the recent 500, [2] picks all,
+                                 // [3+c] hits since change, [7+c] hits recent, [11+c] hits all, [15] changes, [16] resets,
+                                 // [17] recent blocks in a row where the plain router beat the leader
 constexpr int kLaMinPicks = 200, kLaFreezePicks = 2000, kLaRecPicks = 500, kLaLeaderEvery = 4;
 constexpr float kLaLr = 1e-3f, kLaB1 = 0.9f, kLaB2 = 0.999f, kLaEps = 1e-8f, kLaWd = 1e-3f, kLaZ90 = 1.6448536f;
 
@@ -1141,7 +1142,7 @@ struct LaBatch {
     int* frozen;                 // [Nsd]
     int* reset;                  // [Nsd]
     int* tick;                   // [Nsd]: windows seen by the (s,d)
-    unsigned long long* cnt;     // [Nsd][17]
+    unsigned long long* cnt;     // [Nsd][kLaCnt]
     unsigned long long* st;      // [3]: the batch's start, the window's end (timing)
     unsigned long long* tot_ns;  // timing: the batch's time on the side stream
     unsigned long long* wait_ns; // timing: how far the batch ran past the window's end (the next window's wait bound)
@@ -1324,7 +1325,11 @@ __global__ void la_b_decide_k(LaBatch a) {   // grid ceil(Nsd / 64), block 64
     const float nR = (float) c[1];
     if (L != 0 && nR >= kLaRecPicks) {   // the plain router beats the leader over the recent picks: back to the plain router
         const float p0 = (float) c[7] / nR, pL = (float) c[7 + L] / nR;
-        if (la_diff_lo(p0, nR, pL, nR) > 0.0f) {
+        // two failing blocks in a row (25 Oct): one 90% test per 500 picks over 144 (layer, head) pairs fired ~1 in 20 by chance -
+        // 35 resets in a 62K-token run while the leaders kept winning - each one throwing a good correction away
+        c[17] = la_diff_lo(p0, nR, pL, nR) > 0.0f ? c[17] + 1 : 0;
+        if (c[17] >= 2) {
+            c[17] = 0;
             a.lead[sd] = 0;
             a.frozen[sd] = 0;
             a.reset[sd] = 1;
@@ -1403,7 +1408,7 @@ struct LaLearn {
     int* lead = nullptr;         // [Nsd]
     int* frozen = nullptr;       // [Nsd]
     int* reset = nullptr;        // [Nsd]
-    unsigned long long* cnt = nullptr;   // [Nsd][17]
+    unsigned long long* cnt = nullptr;   // [Nsd][kLaCnt]
     unsigned long long* st = nullptr;    // [3]
     unsigned long long* tot_ns = nullptr;
     unsigned long long* wait_ns = nullptr;
