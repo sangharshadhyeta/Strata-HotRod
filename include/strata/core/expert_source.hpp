@@ -708,8 +708,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 
 /// The Monitor's decode timeline (STRATA_TIMELINE_FILE + STRATA_TIMELINE_CTL, both set by the server; off until the CTL file
 /// holds "1"): host times of each layer's dispatch and of the I/O threads' file-tier reads, in fixed rings; the GPU's work is not
-/// touched.  timeline_tick() is called from the adaptive tier's round: at most every 2 s it reads the switch and, while on, writes
-/// the last 4 decode windows to STRATA_TIMELINE_FILE (aside and renamed).
+/// touched.  timeline_tick() is called from the adaptive tier's round: at most every 0.5 s it reads the switch and, while on, appends
+/// the decode windows finished since the last write to STRATA_TIMELINE_FILE as one v 2 chunk (times in us after one run-wide base).
 bool timeline_on();
 void timeline_tick();
 

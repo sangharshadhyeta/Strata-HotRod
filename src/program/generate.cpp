@@ -10354,7 +10354,7 @@ int main(int argc, char** argv) {
             ++swap_round;
             // STRATA_RESIDENCY_FILE=<path> (the server sets it for the Monitor's residency view): at most every 2 s, one JSON snapshot of which experts
             // are in VRAM - a character per expert, 0 not resident, 1 resident and cold (decayed use < 1), 2 warm (< 4), 3 hot - written aside and renamed
-            strata::core::timeline_tick();   // the Monitor's decode timeline: its switch and its snapshot (at most every 2 s)
+            strata::core::timeline_tick();   // the Monitor's decode timeline: its switch and its chunk (at most every 0.5 s)
             static const char* res_file = std::getenv("STRATA_RESIDENCY_FILE");
             static Clock::time_point res_last = Clock::now() - std::chrono::hours(1);
             if (res_file != nullptr && res_file[0] != '\0' && Clock::now() - res_last >= std::chrono::seconds(2)) {

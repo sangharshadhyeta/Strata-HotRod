@@ -153,11 +153,17 @@ function setMetric(key, value, unit, sub) {
   $(`ms-${key}`).textContent = sub || "";
 }
 
+// the poll: the requests table's span, and the timeline rows since the page's newest (tl_after) of this run (tl_base)
+function metricsUrl() {
+  const q = [reqShowAll ? "requests=all" : "", tl.after != null && tl.base != null ? `tl_after=${tl.after}&tl_base=${tl.base}` : ""];
+  const s = q.filter(Boolean).join("&");
+  return s ? `metrics?${s}` : "metrics";
+}
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 async function poll() {
   try {
-    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
+    const r = await fetch(metricsUrl(), {headers: headers()});
     if (r.status === 401) {
       setPill("error", "API key needed");
       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
@@ -246,8 +252,10 @@ function renderResidency(r) {
   const total = r.layers * r.experts;
   $("res-sum").textContent = `${fmt(r.resident)} of ${fmt(total)} experts · ${fmt(r.swaps)} swaps in ${fmt(r.round)} rounds${r.quality_swaps ? ` (${fmt(r.quality_swaps)} for quality)` : ""}`;
 }
-// the decode timeline: the engine's host times of the last decode windows (layers: [window, layer, tokens, demand reads, CPU jobs,
-// doorbell, plan published, quantise, reads start, reads done, jobs ready, CPU done] in us; reads: [I/O thread, layer, demand, start, end])
+// the decode timeline: a scrolling view of the engine's host times, one buffer a second from /metrics (layers: [window, layer, tokens,
+// demand reads, CPU jobs, doorbell, plan published, quantise, reads start, reads done, jobs ready, CPU done] in us after the run's
+// base; reads: [I/O thread, layer, demand, start, end]; gaps: [at, windows lost]).  The server keeps the last 15 s.  While following,
+// the right edge is the engine's clock (set by each poll, moved every frame); a drag, a wheel or Pause stops following, Live resumes.
 const TL_KINDS = [
   ["gpu", "GPU: experts in VRAM, then waiting for the CPU's rows", "--st-info", 0.45],
   ["gpu2", "GPU: combine + next layer (the host waits)", "--st-info", 1],
@@ -259,124 +267,218 @@ const TL_KINDS = [
   ["guess", "I/O: read-ahead guess", "--st-warn", 0.55],
   ["dread", "I/O: demand read", "--st-danger", 0.7],
 ];
-const tl = {data: null, segs: [], lanes: [], v0: 0, v1: 1, drag: null, on: false, busy: false};
+const TL_IX = Object.fromEntries(TL_KINDS.map((k, i) => [k[0], i]));
+const TL_LW = 92, TL_LANE = 22, TL_SPAN = 4000, TL_BUCKET = 250, TL_LAG = 1000, TL_KEEP_US = 15000000;   // ms: the visible span, the index's buckets, and how far
+// behind the engine's clock the right edge sits (a window reaches the page at the next 0.5 s write and the next poll)
+const tl = {v0: 0, v1: TL_SPAN, width: TL_SPAN, follow: true, anchor: null, drag: null, on: false, busy: false, dirty: true, raf: 0, last: 0};
+tlClear();
 function renderTimeline(t) {
   if (!t) { $("tl-card").hidden = true; return; }        // an older server
   $("tl-card").hidden = false;
   tl.on = !!t.on;
-  const btn = $("tl-btn");
-  if (!tl.busy) { btn.setAttribute("aria-pressed", String(tl.on)); btn.textContent = tl.on ? "Stop" : "Record"; }
-  $("tl-off").hidden = tl.on && !!t.data;
+  if (!tl.busy) { const b = $("tl-engine"); b.setAttribute("aria-pressed", String(tl.on)); b.textContent = tl.on ? "Stop" : "Record"; }
+  const live = tl.on && !!t.data;
+  $("tl-off").hidden = live;
   if (tl.on && !t.data) $("tl-off").textContent = "Recording: the first decode windows show here within a few seconds of a request.";
-  $("tl-body").hidden = !(tl.on && t.data);
-  if (!(tl.on && t.data)) $("tl-sum").textContent = "";
-  $("tl-reset").hidden = !(tl.on && t.data);
-  if (!tl.on || !t.data || (tl.data && tl.data.time === t.data.time)) return;
-  // zoomed in: the windows being looked at stay until Reset view (a new snapshot every 2 s would swap them under the pointer)
-  if (tl.data && (tl.v0 > 0 || tl.v1 < tl.span - 1e-6)) { $("tl-reset").textContent = "Reset view (paused)"; return; }
-  $("tl-reset").textContent = "Reset view";
-  tl.data = t.data;
-  buildTimeline(t.data);
-  tl.v0 = 0; tl.v1 = tl.span;                         // (only reached at the full view: a zoomed view is paused above)
-  drawTimeline();
+  $("tl-body").hidden = !live;
+  tlButtons();
+  if (!live) { tlClear(); $("tl-sum").textContent = ""; return; }
+  tlApply(t.data);
+  tl.dirty = true;
+  tlKick();
 }
-function buildTimeline(d) {
-  const segs = [], L = d.layers.slice().sort((a, b) => a[5] - b[5]);
-  let reads = 0, bwait = 0, cpu = 0, gpuOnly = 0;
-  const wins = {};
-  L.forEach((r, i) => {
-    const [w, l, nt, mis, jobs, t0, tp, t1, t2, tpf, t3, t4] = r;
-    const nx = L[i + 1], ms = (a, b) => (b - a) / 1000;
-    (wins[w] = wins[w] || {t0: t0, t1: t4, tok: nt}).t1 = t4;
-    segs.push(["host", "plan", t0, Math.max(tp, t2), `layer ${l}: plan + quantise`]);
-    if (tpf > t2) {   // the CPU experts' blobs: read from the drive (mis of them), the rest from RAM or a landed guess
-      segs.push(["host", mis > 0 ? "read" : "plan", t2, tpf, mis > 0 ? `layer ${l}: ${mis} demand read${mis > 1 ? "s" : ""} from the drive`
-                                                                   : `layer ${l}: CPU experts' blobs from RAM`]);
-      if (mis > 0) reads += ms(t2, tpf);
-    }
-    if (t3 - tpf > 20) { segs.push(["host", "bwait", tpf, t3, `layer ${l}: waiting on reads already in flight`]); bwait += ms(tpf, t3); }
-    if (jobs > 0 && t4 > t3) { segs.push(["cpu", "cpu", t3, t4, `layer ${l}: ${jobs} expert${jobs > 1 ? "s" : ""} on the CPU`]); cpu += ms(t3, t4); }
-    segs.push(["gpu", "gpu", tp, t4, `layer ${l}: VRAM experts, then the CPU's rows`]);
-    if (nx) {
-      const end = nx[5], kind = nx[0] !== w ? "gpuw" : "gpu2";
-      segs.push(["gpu", kind, t4, end, kind === "gpuw" ? `window end after layer ${l}: commit, draft, next window's first layer`
-                                                        : `layer ${l} combine, layer ${nx[1]} attention + router (host waits)`]);
-      if (kind === "gpu2") gpuOnly += ms(t4, end);
-    }
-  });
-  for (const r of d.reads || []) segs.push([`io${r[0]}`, r[2] ? "dread" : "guess", r[3], r[4], `I/O thread ${r[0]}: ${r[2] ? "demand read" : "guess"} for layer ${r[1]}`]);
-  const ios = [...new Set((d.reads || []).map(r => r[0]))].sort((a, b) => a - b);
+function tlButtons() {
+  $("tl-btn").textContent = tl.follow ? "Pause" : "Resume";
+  $("tl-btn").setAttribute("aria-pressed", String(!tl.follow));
+  $("tl-reset").hidden = tl.follow;
+}
+// the page's own buffer: the server sends the rows since its newest (tl_after) and keeps only what it has; the page keeps the last
+// TL_KEEP_US of them, indexed by start time, and appends each poll's rows.  A reset (a first poll, or another run) starts it over.
+function tlClear() {
+  tl.data = null; tl.layers = []; tl.prev = null; tl.buckets = new Map(); tl.maxLen = 0; tl.gaps = []; tl.ios = new Set();
+  tl.used = new Set(); tl.after = null; tl.base = null; tl.bmin = 0; tl.lanes = [["gpu", "GPU (inferred)"], ["host", "host thread"], ["cpu", "CPU pool"]];
+  tl.laneIx = Object.fromEntries(tl.lanes.map((l, i) => [l[0], i]));
+}
+function tlAdd(lane, kind, a, b, label) {
+  const s = {l: lane, k: TL_IX[kind], a: a / 1000, b: b / 1000, t: label};
+  const key = Math.floor(s.a / TL_BUCKET);
+  if (!tl.buckets.has(key)) tl.buckets.set(key, []);
+  tl.buckets.get(key).push(s);
+  tl.maxLen = Math.max(tl.maxLen, s.b - s.a);
+  tl.used.add(s.k);
+}
+// one layer's segments; the GPU's gap after the previous layer is drawn when this one comes (its window ends there)
+function tlAddLayer(r) {
+  const [w, l, nt, mis, jobs, t0, tp, t1, t2, tpf, t3, t4] = r;
+  if (tl.prev) {
+    const p = tl.prev, kind = p[0] !== w ? "gpuw" : "gpu2";
+    tlAdd("gpu", kind, p[11], t0, kind === "gpuw" ? `window end after layer ${p[1]}: commit, draft, next window's first layer`
+                                                  : `layer ${p[1]} combine, layer ${l} attention + router (host waits)`);
+  }
+  tl.prev = r;
+  tlAdd("host", "plan", t0, Math.max(tp, t2), `layer ${l}: plan + quantise`);
+  if (tpf > t2) {   // the CPU experts' blobs: read from the drive (mis of them), the rest from RAM or a landed guess
+    tlAdd("host", mis > 0 ? "read" : "plan", t2, tpf, mis > 0 ? `layer ${l}: ${mis} demand read${mis > 1 ? "s" : ""} from the drive`
+                                                            : `layer ${l}: CPU experts' blobs from RAM`);
+  }
+  if (t3 - tpf > 20) tlAdd("host", "bwait", tpf, t3, `layer ${l}: waiting on reads already in flight`);
+  if (jobs > 0 && t4 > t3) tlAdd("cpu", "cpu", t3, t4, `layer ${l}: ${jobs} expert${jobs > 1 ? "s" : ""} on the CPU`);
+  tlAdd("gpu", "gpu", tp, t4, `layer ${l}: VRAM experts, then the CPU's rows`);
+}
+function tlApply(d) {
+  if (d.reset || d.base_ns !== tl.base) tlClear();
+  tl.base = d.base_ns;
+  tl.data = d;
+  tl.anchor = {eng: d.now_us / 1000, perf: performance.now()};    // the engine's clock at this poll, ms
+  let after = tl.after ?? -Infinity;
+  for (const r of d.layers) { tl.layers.push(r); tlAddLayer(r); after = Math.max(after, r[11]); }
+  for (const r of d.reads) {
+    tlAdd(`io${r[0]}`, r[2] ? "dread" : "guess", r[3], r[4], `I/O thread ${r[0]}: ${r[2] ? "demand read" : "guess"} for layer ${r[1]}`);
+    after = Math.max(after, r[4]);
+  }
+  for (const g of d.gaps) tl.gaps.push({at: g[0] / 1000, lost: g[1]});
+  if (isFinite(after)) tl.after = after;
+  // keep TL_KEEP_US behind the newest row: the rows and the buckets (by start) older than that go
+  const cut = (tl.after ?? 0) - TL_KEEP_US;
+  let k = 0;
+  while (k < tl.layers.length && tl.layers[k][11] < cut) k++;
+  if (k) tl.layers.splice(0, k);
+  for (const key of [...tl.buckets.keys()]) if (key < Math.floor(cut / 1000 / TL_BUCKET)) tl.buckets.delete(key);
+  tl.gaps = tl.gaps.filter(g => g.at * 1000 >= cut);
+  tl.bmin = tl.layers.length ? tl.layers[0][5] / 1000 : 0;
+  const ids = [...tl.ios, ...((d.reads || []).map(r => r[0]))];
+  tl.ios = new Set(ids);
+  const ios = [...tl.ios].sort((a, b) => a - b);
   tl.lanes = [["gpu", "GPU (inferred)"], ["host", "host thread"], ["cpu", "CPU pool"], ...ios.map(i => [`io${i}`, `I/O ${i}`])];
-  tl.segs = segs;
-  tl.span = d.span_us / 1000 || 1;
-  const nw = Object.keys(wins).length || 1, tot = (L.length ? (L[L.length - 1][11] - L[0][5]) / 1000 : 0) || 1;
-  const toks = Object.values(wins).reduce((a, w) => a + w.tok, 0);
+  tl.laneIx = Object.fromEntries(tl.lanes.map((l, i) => [l[0], i]));
+  tlSummary();
+}
+// the summary and the legend over the rows the buffer holds
+function tlSummary() {
+  const L = tl.layers;
+  let reads = 0, bwait = 0, cpu = 0, gpuOnly = 0;
+  const wins = new Map();
+  const ms = (a, b) => (b - a) / 1000;
+  L.forEach((r, i) => {
+    const [w, , nt, mis, jobs, t0, tp, , t2, tpf, t3, t4] = r;
+    if (!wins.has(w)) wins.set(w, nt);
+    if (tpf > t2 && mis > 0) reads += ms(t2, tpf);
+    if (t3 - tpf > 20) bwait += ms(tpf, t3);
+    if (jobs > 0 && t4 > t3) cpu += ms(t3, t4);
+    const nx = L[i + 1];
+    if (nx && nx[0] === w) gpuOnly += ms(t4, nx[5]);
+  });
+  const nw = wins.size || 1, tot = (L.length ? (L[L.length - 1][11] - L[0][5]) / 1000 : 0) || 1;
+  const toks = [...wins.values()].reduce((a, n) => a + n, 0);
   const part = (v, label) => `<span><b>${fmt(v / nw, 1)} ms</b> ${label} (${fmt((100 * v) / tot)}%)</span>`;
   $("tl-why").innerHTML = part(gpuOnly, "GPU alone, host waiting") + part(reads, "demand reads") + part(bwait, "waits on reads in flight") +
                           part(cpu, "CPU experts");
   $("tl-sum").textContent = `${nw} window${nw > 1 ? "s" : ""} · ${fmt(tot / nw, 1)} ms each · ${fmt(toks / nw, 1)} rows a window`;
-  $("tl-legend").innerHTML = TL_KINDS.filter(k => segs.some(s => s[1] === k[0]))
+  $("tl-legend").innerHTML = TL_KINDS.filter((k, i) => tl.used.has(i))
     .map(k => `<span><i class="res-sw" style="background:${tlColor(k)}"></i>${esc(k[1])}</span>`).join("");
 }
 function tlColor(k) {
   const v = getComputedStyle(document.documentElement).getPropertyValue(k[2]).trim() || "#888";
   return k[3] >= 1 ? v : `color-mix(in srgb, ${v} ${Math.round(k[3] * 100)}%, transparent)`;
 }
+// the x of a time (ms) in a canvas W px wide, for the view as it is now
+const tlPx = (t, W) => TL_LW + ((t - tl.v0) / (tl.v1 - tl.v0)) * (W - TL_LW - 4);
 function drawTimeline() {
-  const cv = $("tl-canvas"), ctx = cv.getContext("2d"), LH = 22, LW = 92;
+  const cv = $("tl-canvas"), ctx = cv.getContext("2d"), LH = TL_LANE, LW = TL_LW;
   const dpr = devicePixelRatio || 1, W = cv.clientWidth || 600, H = tl.lanes.length * LH + 20;
   cv.width = W * dpr; cv.height = H * dpr; cv.style.height = H + "px";
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const css = getComputedStyle(document.documentElement), mut = css.getPropertyValue("--st-ink-muted"), line = css.getPropertyValue("--st-line");
-  const colors = Object.fromEntries(TL_KINDS.map(k => [k[0], tlColor(k)]));
+  const colors = TL_KINDS.map(k => tlColor(k));
   ctx.clearRect(0, 0, W, H);
   ctx.font = "11px " + (css.getPropertyValue("--st-font") || "system-ui");
-  const x = t => LW + ((t / 1000 - tl.v0) / (tl.v1 - tl.v0)) * (W - LW - 4);
+  const span = tl.v1 - tl.v0, x = t => tlPx(t, W);
   tl.lanes.forEach(([id, name], i) => {
     ctx.fillStyle = mut; ctx.fillText(name, 4, i * LH + 15);
     ctx.fillStyle = line; ctx.fillRect(LW, i * LH + LH - 1, W - LW, 1);
   });
-  for (const s of tl.segs) {
-    const i = tl.lanes.findIndex(l => l[0] === s[0]);
-    if (i < 0 || s[3] / 1000 < tl.v0 || s[2] / 1000 > tl.v1) continue;
-    const a = Math.max(LW, x(s[2])), b = Math.max(a + 1, Math.min(W - 4, x(s[3])));
-    ctx.fillStyle = colors[s[1]];
-    ctx.fillRect(a, i * LH + 4, b - a, LH - 9);
+  // the short segments (under 2 px) are drawn once per lane, kind and pixel: a 4 s view of 30 ms windows has more of them than pixels
+  const drawn = new Set();
+  for (let b = Math.floor((tl.v0 - tl.maxLen) / TL_BUCKET), e = Math.floor(tl.v1 / TL_BUCKET); b <= e; b++) {
+    for (const s of tl.buckets.get(b) || []) {
+      if (s.b < tl.v0 || s.a > tl.v1) continue;
+      const i = tl.laneIx[s.l], a = Math.max(LW, x(s.a)), z = Math.max(a + 1, Math.min(W - 4, x(s.b)));
+      if (z - a < 2) {
+        const key = (Math.floor(a) * 64 + i) * 16 + s.k;
+        if (drawn.has(key)) continue;
+        drawn.add(key);
+      }
+      ctx.fillStyle = colors[s.k];
+      ctx.fillRect(a, i * LH + 4, z - a, LH - 9);
+    }
   }
-  // ticks at 1, 2 or 5 x 10^n ms, at least 70 px apart
-  const span = tl.v1 - tl.v0, want = span / Math.max(1, Math.floor((W - LW) / 70));
+  // a gap: the engine's ring overwrote windows before a chunk carried them (a thin line and the count)
+  ctx.fillStyle = css.getPropertyValue("--st-warn") || "#c80";
+  for (const g of tl.gaps) {
+    if (g.at < tl.v0 || g.at > tl.v1) continue;
+    const gx = x(g.at);
+    ctx.fillRect(gx, 0, 1, H - 20);
+    ctx.fillText(`${g.lost} lost`, gx + 3, 11);
+  }
+  // ticks at 1, 2 or 5 x 10^n ms, at least 70 px apart; the labels count back from the right edge (now)
+  const want = span / Math.max(1, Math.floor((W - LW) / 70));
   const mag = Math.pow(10, Math.floor(Math.log10(want))), step = [1, 2, 5, 10].map(m => m * mag).find(s => s >= want);
   ctx.fillStyle = mut;
   for (let t = Math.ceil(tl.v0 / step) * step; t <= tl.v1; t += step) {
-    const a = LW + ((t - tl.v0) / span) * (W - LW - 4);
+    const a = x(t);
     ctx.fillRect(a, tl.lanes.length * LH, 1, 4);
-    ctx.fillText(`${fmt(t, step < 1 ? 1 : 0)} ms`, a + 2, tl.lanes.length * LH + 15);
+    ctx.fillText(`${fmt(t - tl.v1, step < 1 ? 1 : 0)} ms`, a + 2, tl.lanes.length * LH + 15);
   }
+  tl.dirty = false;
+}
+// the segment of a lane under a time (ms), or null
+function tlSegAt(lane, t) {
+  const b = Math.floor(t / TL_BUCKET);
+  for (let k = Math.floor((t - tl.maxLen) / TL_BUCKET); k <= b; k++)
+    for (const s of tl.buckets.get(k) || []) if (s.l === lane && s.a <= t && s.b >= t) return s;
+  return null;
 }
 function tlAt(e) {
-  const cv = $("tl-canvas"), R = cv.getBoundingClientRect(), LW = 92;
-  return {t: (tl.v0 + ((e.clientX - R.left - LW) / (cv.clientWidth - LW - 4)) * (tl.v1 - tl.v0)) * 1000, lane: Math.floor((e.clientY - R.top) / 22)};
+  const cv = $("tl-canvas"), R = cv.getBoundingClientRect();
+  return {t: tl.v0 + ((e.clientX - R.left - TL_LW) / (cv.clientWidth - TL_LW - 4)) * (tl.v1 - tl.v0), lane: Math.floor((e.clientY - R.top) / TL_LANE)};
+}
+// the engine's clock now (ms): the last poll's, moved on by the time since, less the lag the right edge keeps
+function tlNow() { return tl.anchor ? tl.anchor.eng + (performance.now() - tl.anchor.perf) - TL_LAG : tl.v1; }
+function tlKick() { if (!tl.raf) tl.raf = requestAnimationFrame(tlFrame); }
+// every frame while the view follows the clock; drawn at most 30 times a second, and a view that has stopped moving is drawn once
+function tlFrame(ts) {
+  tl.raf = 0;
+  if (!tl.data || !tl.on || tab !== "monitor") return;
+  if (tl.follow) { const now = tlNow(); tl.v1 = now; tl.v0 = now - tl.width; }
+  if ((tl.follow || tl.dirty) && ts - tl.last >= 33) { tl.last = ts; drawTimeline(); }
+  if (tl.follow || tl.dirty) tlKick();
 }
 (function initTimeline() {
   const cv = $("tl-canvas"), tip = $("tl-tip");
   cv.addEventListener("mousemove", e => {
-    const p = tlAt(e), lane = tl.lanes[p.lane];
-    const s = lane && !tl.drag && tl.segs.find(s => s[0] === lane[0] && s[2] <= p.t && s[3] >= p.t);
-    tip.hidden = !s;
-    if (!s) return;
+    const p = tlAt(e), R = cv.getBoundingClientRect(), W = cv.clientWidth, lane = tl.lanes[p.lane];
+    const g = !tl.drag && tl.gaps.find(g => Math.abs(tlPx(g.at, W) - (e.clientX - R.left)) < 4);
+    const s = !g && !tl.drag && lane && tlSegAt(lane[0], p.t);
+    const text = g ? `${g.lost} window${g.lost > 1 ? "s" : ""} lost here: the engine's ring overwrote them before a chunk carried them`
+                   : s ? `${s.t} · ${fmt(s.b - s.a, 2)} ms` : "";
+    tip.hidden = !text;
+    if (!text) return;
     tip.style.left = e.clientX + 12 + "px"; tip.style.top = e.clientY + 12 + "px";
-    tip.textContent = `${s[4]} · ${fmt((s[3] - s[2]) / 1000, 2)} ms`;
+    tip.textContent = text;
   });
   cv.addEventListener("mouseleave", () => (tip.hidden = true));
-  // the view: double-click or the wheel zooms around the pointer, a drag pans, Reset shows everything again
+  // the view: double-click or the wheel zooms around the pointer, a drag pans; a view moved this way stops following the clock
   const setView = (v0, v1) => {
-    const full = tl.span || 1, w = Math.min(full, Math.max(0.02, v1 - v0));
-    tl.v0 = Math.min(Math.max(0, v0), full - w);
+    const max = Math.max(tl.bmin + 20, tlNow()), w = Math.min(15000, Math.min(max - tl.bmin, Math.max(20, v1 - v0)));
+    tl.v0 = Math.min(Math.max(tl.bmin, v0), max - w);
     tl.v1 = tl.v0 + w;
+    tl.width = w;
+    tl.follow = false;
+    tlButtons();
     drawTimeline();
   };
   const zoomAt = (e, factor) => {
-    const t = tlAt(e).t / 1000, w = (tl.v1 - tl.v0) / factor, f = (t - tl.v0) / (tl.v1 - tl.v0);
+    const t = tlAt(e).t, w = (tl.v1 - tl.v0) / factor, f = (t - tl.v0) / (tl.v1 - tl.v0);
     setView(t - f * w, t - f * w + w);
   };
   cv.addEventListener("dblclick", e => { e.preventDefault(); zoomAt(e, e.shiftKey ? 0.5 : 2); });
@@ -394,24 +496,35 @@ function tlAt(e) {
   });
   addEventListener("mousemove", e => {
     if (!tl.drag) return;
-    const dt = ((e.clientX - tl.drag.x) / (cv.clientWidth - 96)) * (tl.drag.v1 - tl.drag.v0);
+    const dt = ((e.clientX - tl.drag.x) / (cv.clientWidth - TL_LW)) * (tl.drag.v1 - tl.drag.v0);
     setView(tl.drag.v0 - dt, tl.drag.v1 - dt);
   });
   addEventListener("mouseup", () => { if (tl.drag) { tl.drag = null; cv.style.cursor = ""; } });
+  // Pause freezes the view (the engine keeps recording and the buffer keeps filling); Resume follows the clock again
+  $("tl-btn").addEventListener("click", () => {
+    tl.follow = !tl.follow;
+    tlButtons();
+    tl.dirty = true;
+    tlKick();
+  });
+  // Live: back to the clock at the default span
   $("tl-reset").addEventListener("click", () => {
-    setView(0, tl.span || 1);
-    $("tl-reset").textContent = "Reset view";
-    if (lastMetrics) renderTimeline(lastMetrics.timeline);    // back to live: the newest snapshot at once
+    tl.follow = true;
+    tl.width = TL_SPAN;
+    tlButtons();
+    tl.dirty = true;
+    tlKick();
   });
   addEventListener("resize", () => tl.data && drawTimeline());
-  $("tl-btn").addEventListener("click", async () => {
-    const want = !tl.on, btn = $("tl-btn");
+  // the engine's switch (POST /v1/monitor/timeline): off stops the stamps, on starts them (the engine starts with the switch on)
+  $("tl-engine").addEventListener("click", async () => {
+    const want = !tl.on, btn = $("tl-engine");
     tl.busy = true; btn.disabled = true;
     try {
       const r = await fetch("v1/monitor/timeline", {method: "POST", headers: headers(true), body: JSON.stringify({on: want})});
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || `HTTP ${r.status}`);
       tl.on = want;
-      if (!want) tl.data = null;
+      if (!want) tlClear();
       btn.setAttribute("aria-pressed", String(want)); btn.textContent = want ? "Stop" : "Record";
       $("tl-off").hidden = false;
       $("tl-off").textContent = want ? "Recording: the first decode windows show here within a few seconds of a request." : $("tl-off").dataset.text;

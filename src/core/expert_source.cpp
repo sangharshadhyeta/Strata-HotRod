@@ -795,15 +795,18 @@ thread_local int32_t t_pf_reads = 0;
 
 // ---- the decode timeline (STRATA_TIMELINE_FILE + STRATA_TIMELINE_CTL; the server sets both for the Monitor).  HOST times only:
 // each MoE layer's dispatch (the doorbell, the plan published, the demand reads, the CPU pool) and each file-tier read the I/O
-// threads make are stamped into fixed rings while the switch is on.  The GPU's graph is not touched - its work shows as the time
-// between the host's hand-offs - so the GPU runs the same with the timeline on or off.  Off: one relaxed load per layer and per
-// read.  The switch is the CTL file ("1": on); timeline_tick() reads it and writes the snapshot at most every 2 s, from the
-// adaptive tier's round (between windows, not on the decode thread).  Each ring entry carries a sequence number written last, so a
-// snapshot skips an entry a writer is still filling.
-struct TlLayer { std::atomic<uint64_t> seq{0}; int64_t t[7]; int32_t layer, n_tok, misses, jobs; uint32_t win; };
+// threads make are stamped into fixed rings.  The GPU's graph is not touched - its work shows as the time between the host's
+// hand-offs.  On from the start (the server writes "1" to the CTL file; config "timeline": false keeps it off until switched on).
+// Off: one relaxed load per layer and per read.  timeline_tick() reads the CTL file at most every 0.5 s, from the adaptive tier's
+// round (between windows, not on the decode thread), and writes the windows finished since the last write as one chunk (v 2: times
+// in us after g_tl_base, one clock for the whole run).  A chunk also holds the windows of the write before it, so a reader that
+// polls once a second gets every window (it skips the ones it has).  Each ring entry carries a sequence number written last, so a
+// chunk skips an entry a writer is still filling.
+struct TlLayer { std::atomic<uint64_t> seq{0}; int64_t t[7]; int32_t layer, n_tok, misses, jobs; uint32_t win; uint8_t first; };
 struct TlRead { std::atomic<uint64_t> seq{0}; int64_t t0, t1; int32_t layer, worker; uint32_t win; uint8_t demand; };
-constexpr uint64_t kTlLayers = 48 * 16;   // 16 windows of 48 layers
-constexpr uint64_t kTlReads = 4096;
+constexpr uint64_t kTlWindows = 64;               // a window is one decode step (about 30 ms): the rings hold about 2 s of them
+constexpr uint64_t kTlLayers = 48 * kTlWindows;   // 48 layers a window
+constexpr uint64_t kTlReads = 65536;
 TlLayer g_tl_layers[kTlLayers];
 TlRead g_tl_reads[kTlReads];
 std::atomic<uint64_t> g_tl_layer_next{0}, g_tl_read_next{0};
@@ -815,9 +818,11 @@ int64_t tl_ns(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
 }
 int64_t tl_ns() { return tl_ns(std::chrono::steady_clock::now()); }
+const int64_t g_tl_base = tl_ns();                // the run's one clock: the chunks' times are us after it
 // the decode thread, at the end of a layer's dispatch
 void tl_layer(int32_t layer, int32_t n_tok, int32_t misses, int32_t jobs, const int64_t* t) {
-    if (layer < g_tl_last_layer.exchange(layer, std::memory_order_relaxed)) g_tl_win.fetch_add(1, std::memory_order_relaxed);
+    const int32_t last = g_tl_last_layer.exchange(layer, std::memory_order_relaxed);
+    if (layer < last) g_tl_win.fetch_add(1, std::memory_order_relaxed);
     const uint64_t i = g_tl_layer_next.fetch_add(1, std::memory_order_relaxed);
     TlLayer& e = g_tl_layers[i % kTlLayers];
     e.seq.store(0, std::memory_order_relaxed);
@@ -828,6 +833,7 @@ void tl_layer(int32_t layer, int32_t n_tok, int32_t misses, int32_t jobs, const 
     e.misses = misses;
     e.jobs = jobs;
     e.win = g_tl_win.load(std::memory_order_relaxed);
+    e.first = last < 0 || layer < last;           // the window's first layer: the rings overwrite oldest first, so this marks a whole window
     e.seq.store(i + 1, std::memory_order_release);
 }
 // an I/O thread, after a file-tier read (a guess, or a demand read the decode handed it)
@@ -857,7 +863,7 @@ void timeline_tick() {
     if (ctl == nullptr || out == nullptr || ctl[0] == '\0' || out[0] == '\0') return;
     static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now() - std::chrono::hours(1);
     const auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::seconds(2)) return;
+    if (now - last < std::chrono::milliseconds(500)) return;
     last = now;
     char c = '0';
     if (FILE* f = std::fopen(ctl, "rb")) {
@@ -865,44 +871,56 @@ void timeline_tick() {
         std::fclose(f);
     }
     const bool want = c == '1';
+    // the newest whole window of the last write and of the write before it (-1: none); the entries from this switch-on on
+    static int64_t hi_prev = -1, hi_prev2 = -1;
+    static uint64_t from_layer = 0, from_read = 0;
     if (want != g_tl_on.load(std::memory_order_relaxed)) {
         g_tl_on.store(want, std::memory_order_relaxed);
-        if (!want) {
+        hi_prev = hi_prev2 = -1;
+        if (want) {
+            from_layer = g_tl_layer_next.load(std::memory_order_acquire);
+            from_read = g_tl_read_next.load(std::memory_order_acquire);
+        } else {
             std::error_code ec;
             std::filesystem::remove(out, ec);
         }
-        return;                              // just switched on: nothing recorded yet
+        return;                              // just switched: nothing to write yet
     }
     if (!want) return;
-    // the last 4 windows the rings hold whole
+    // the windows the rings hold whole: the newest one may still be filling and waits for the next write
     struct L { int64_t t[7]; int32_t layer, n_tok, misses, jobs; uint32_t win; };
     std::vector<L> ls;
+    uint32_t w0 = UINT32_MAX, wmax = 0;
     const uint64_t ln = g_tl_layer_next.load(std::memory_order_acquire);
-    for (uint64_t i = ln > kTlLayers ? ln - kTlLayers : 0; i < ln; ++i) {
+    for (uint64_t i = std::max(ln > kTlLayers ? ln - kTlLayers : 0, from_layer); i < ln; ++i) {
         const TlLayer& e = g_tl_layers[i % kTlLayers];
         if (e.seq.load(std::memory_order_acquire) != i + 1) continue;
         L x;
         for (int j = 0; j < 7; ++j) x.t[j] = e.t[j];
         x.layer = e.layer; x.n_tok = e.n_tok; x.misses = e.misses; x.jobs = e.jobs; x.win = e.win;
+        const bool first = e.first != 0;
         std::atomic_thread_fence(std::memory_order_acquire);
         if (e.seq.load(std::memory_order_relaxed) != i + 1) continue;   // overwritten while copied
         ls.push_back(x);
+        wmax = std::max(wmax, x.win);
+        if (first) w0 = std::min(w0, x.win);
     }
-    if (ls.empty()) return;
-    const uint32_t wmax = ls.back().win;
-    const uint32_t wmin = wmax >= 3 ? wmax - 3 : 0;
-    int64_t t_lo = INT64_MAX, t_hi = 0;
-    for (const L& x : ls)
-        if (x.win >= wmin) { t_lo = std::min(t_lo, x.t[0]); t_hi = std::max(t_hi, x.t[6]); }
-    if (t_lo == INT64_MAX) return;
-    auto us = [&](int64_t t) { return (double) (t - t_lo) / 1000.0; };
-    std::string js = "{\"v\":1,\"time\":" + std::to_string((long long) std::time(nullptr)) + ",\"span_us\":" +
-                     std::to_string((long long) ((t_hi - t_lo) / 1000)) + ",\"layers\":[";
+    if (w0 >= wmax) return;                  // no window whole yet (w0 is UINT32_MAX when none holds its first layer)
+    const int64_t hi = (int64_t) wmax - 1;
+    if (hi <= hi_prev) return;               // nothing new since the last write: the file stays as it is
+    const int64_t lost = hi_prev >= 0 && (int64_t) w0 > hi_prev + 1 ? (int64_t) w0 - hi_prev - 1 : 0;   // overwritten before a write
+    const int64_t start = std::max<int64_t>(hi_prev2 + 1, (int64_t) w0);
+    auto us = [&](int64_t t) { return (double) (t - g_tl_base) / 1000.0; };
     char buf[256];
+    std::snprintf(buf, sizeof buf, "{\"v\":2,\"time\":%lld,\"base_ns\":%lld,\"now_us\":%.1f,\"first\":%lld,\"last\":%lld",
+                  (long long) std::time(nullptr), (long long) g_tl_base, us(tl_ns()), (long long) start, (long long) hi);
+    std::string js = buf;
+    if (lost > 0) js += ",\"gap\":" + std::to_string((long long) lost);
+    js += ",\"layers\":[";
     bool first = true;
     for (const L& x : ls) {
-        if (x.win < wmin) continue;
-        std::snprintf(buf, sizeof buf, "%s[%u,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f]", first ? "" : ",", (unsigned) (x.win - wmin),
+        if ((int64_t) x.win < start || (int64_t) x.win > hi) continue;
+        std::snprintf(buf, sizeof buf, "%s[%u,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f]", first ? "" : ",", (unsigned) x.win,
                       x.layer, x.n_tok, x.misses, x.jobs, us(x.t[0]), us(x.t[1]), us(x.t[2]), us(x.t[3]), us(x.t[4]), us(x.t[5]), us(x.t[6]));
         js += buf;
         first = false;
@@ -910,14 +928,15 @@ void timeline_tick() {
     js += "],\"reads\":[";
     first = true;
     const uint64_t rn = g_tl_read_next.load(std::memory_order_acquire);
-    for (uint64_t i = rn > kTlReads ? rn - kTlReads : 0; i < rn; ++i) {
+    for (uint64_t i = std::max(rn > kTlReads ? rn - kTlReads : 0, from_read); i < rn; ++i) {
         const TlRead& e = g_tl_reads[i % kTlReads];
         if (e.seq.load(std::memory_order_acquire) != i + 1) continue;
         const int64_t t0 = e.t0, t1 = e.t1;
         const int32_t layer = e.layer, worker = e.worker;
+        const uint32_t win = e.win;
         const uint8_t demand = e.demand;
         std::atomic_thread_fence(std::memory_order_acquire);
-        if (e.seq.load(std::memory_order_relaxed) != i + 1 || t1 < t_lo || t0 > t_hi) continue;
+        if (e.seq.load(std::memory_order_relaxed) != i + 1 || (int64_t) win < start || (int64_t) win > hi) continue;
         std::snprintf(buf, sizeof buf, "%s[%d,%d,%d,%.1f,%.1f]", first ? "" : ",", worker, layer, (int) demand, us(t0), us(t1));
         js += buf;
         first = false;
@@ -930,6 +949,8 @@ void timeline_tick() {
     }
     std::error_code ec;
     std::filesystem::rename(tmp, out, ec);
+    hi_prev2 = hi_prev;
+    hi_prev = hi;
 }
 
 void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, int pos) {

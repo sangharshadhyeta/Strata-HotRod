@@ -5907,6 +5907,179 @@ class UntimedReads(unittest.TestCase):
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
 
 
+class TimelineBuffer(unittest.TestCase):
+    """The Monitor's decode timeline (timeline_view): the engine's chunks join into one rolling buffer of the last 15 s."""
+
+    def setUp(self):
+        import serve.server as srv
+        self.srv = srv
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = Path(self.tmp.name)
+        self.file, self.ctl = d / "timeline.json", d / "timeline.ctl"
+        self.ctl.write_bytes(b"1")
+        for name, value in (("TIMELINE_FILE", str(self.file)), ("TIMELINE_CTL", str(self.ctl))):
+            p = mock.patch.object(srv, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        srv._timeline_reset()
+        self.addCleanup(srv._timeline_reset)
+
+    @staticmethod
+    def row(w, k):
+        t = w * 100_000.0 + k * 1_000.0               # a window is 100 ms; two layers a window
+        return [w, k, 1, 0, 0, t, t + 10, t + 20, t + 30, t + 40, t + 50, t + 60]
+
+    def write(self, first, last, now_us=None, base=1000, gap=None, reads=(), v=2):
+        c = {"v": v, "time": 0, "base_ns": base, "now_us": now_us if now_us is not None else last * 100_000.0 + 100_000.0,
+             "first": first, "last": last, "layers": [self.row(w, k) for w in range(first, last + 1) for k in range(2)],
+             "reads": [list(r) for r in reads]}
+        if gap:
+            c["gap"] = gap
+        self.file.write_text(json.dumps(c))
+
+    def windows(self, data):
+        return sorted({r[0] for r in data["layers"]})
+
+    def test_new_chunk_is_appended_once(self):
+        self.write(0, 2)
+        data = self.srv.timeline_view()["data"]
+        self.assertEqual(data["v"], 2)
+        self.assertEqual(self.windows(data), [0, 1, 2])
+        self.assertEqual(len(data["layers"]), 6)
+        self.assertEqual((data["first"], data["last"]), (0, 2))
+        again = self.srv.timeline_view()["data"]        # the same file read again adds nothing
+        self.assertEqual(len(again["layers"]), 6)
+
+    def test_overlapping_chunk_adds_only_the_new_windows(self):
+        self.write(0, 2)
+        self.srv.timeline_view()
+        self.write(1, 3)                                 # the engine's next write repeats window 1 and 2
+        data = self.srv.timeline_view()["data"]
+        self.assertEqual(self.windows(data), [0, 1, 2, 3])
+        self.assertEqual(len(data["layers"]), 8)
+        self.assertEqual(data["last"], 3)
+
+    def test_stale_and_duplicate_chunks_are_ignored(self):
+        self.write(0, 3)
+        self.srv.timeline_view()
+        self.write(1, 2)                                 # older than the buffer's last window
+        self.assertEqual(len(self.srv.timeline_view()["data"]["layers"]), 8)
+        self.write(0, 3)                                 # the same chunk again
+        self.assertEqual(len(self.srv.timeline_view()["data"]["layers"]), 8)
+
+    def test_a_chunk_of_another_version_is_ignored(self):
+        self.write(0, 2, v=1)
+        self.assertIsNone(self.srv.timeline_view()["data"])
+
+    def test_reads_are_joined_once(self):
+        reads = [[0, 3, 1, 500.0, 900.0], [1, 3, 0, 600.0, 700.0]]
+        self.write(0, 2, reads=reads)
+        self.srv.timeline_view()
+        self.write(1, 3, reads=reads)                    # the overlap carries the same reads
+        data = self.srv.timeline_view()["data"]
+        self.assertEqual(len(data["reads"]), 2)
+        self.write(4, 4, reads=[[0, 4, 0, 4_000_000.0, 4_000_500.0]])
+        self.assertEqual(len(self.srv.timeline_view()["data"]["reads"]), 3)
+
+    def test_gap_is_marked_at_the_first_window_of_its_chunk(self):
+        self.write(0, 1)
+        self.srv.timeline_view()
+        self.write(5, 6, gap=3)
+        data = self.srv.timeline_view()["data"]
+        self.assertEqual(data["gaps"], [[500_000.0, 3]])
+
+    def test_fifteen_seconds_are_kept(self):
+        self.write(0, 2, reads=[[0, 0, 0, 100.0, 200.0]])
+        self.srv.timeline_view()
+        self.write(200, 201, now_us=20_100_000.0)        # 20 s on: the first chunk is older than 15 s
+        data = self.srv.timeline_view()["data"]
+        self.assertEqual(self.windows(data), [200, 201])
+        self.assertEqual(data["reads"], [])
+        self.assertEqual(len(self._tl_rows()), 4)
+
+    def test_rows_are_bounded(self):
+        self.write(0, 2)
+        self.srv.timeline_view()
+        with mock.patch.object(self.srv, "TIMELINE_MAX_ROWS", 4):
+            self.write(3, 9)
+            data = self.srv.timeline_view()["data"]
+        self.assertEqual(len(data["layers"]), 4)
+        self.assertEqual(data["layers"][-1][0], 9)
+
+    def test_a_new_engine_run_starts_the_buffer_over(self):
+        self.write(0, 2, base=1000)
+        self.srv.timeline_view()
+        self.write(0, 1, base=2000)
+        data = self.srv.timeline_view()["data"]
+        self.assertEqual(data["base_ns"], 2000)
+        self.assertEqual(self.windows(data), [0, 1])
+        self.assertEqual(len(data["layers"]), 4)
+
+    def test_switch_off_clears_the_buffer(self):
+        self.write(0, 2)
+        self.assertIsNotNone(self.srv.timeline_view()["data"])
+        self.srv.set_timeline(False)
+        self.assertEqual(self.srv.timeline_view(), {"on": False, "data": None})
+        self.assertIsNone(self._tl_rows_or_none())
+        self.assertFalse(self.file.exists())
+
+    def test_the_engine_side_off_returns_nothing(self):
+        self.write(0, 2)
+        self.ctl.write_bytes(b"0")
+        self.assertEqual(self.srv.timeline_view(), {"on": False, "data": None})
+
+    def test_incremental_poll_returns_only_the_rows_after_the_page_s_newest(self):
+        self.write(0, 2)
+        self.srv.timeline_view()
+        self.write(1, 3)
+        after = self.row(2, 1)[11]                        # the page holds window 2 through its last layer
+        data = self.srv.timeline_view(after, 1000)["data"]
+        self.assertFalse(data["reset"])
+        self.assertEqual(self.windows(data), [3])
+        self.assertEqual(len(data["layers"]), 2)
+        self.assertEqual(data["last"], 3)
+
+    def test_incremental_poll_returns_the_reads_after_it_too(self):
+        reads = [[0, 3, 1, 500.0, 900.0], [1, 3, 0, 600.0, 700.0]]
+        self.write(0, 2, reads=reads)
+        self.srv.timeline_view()
+        self.write(3, 3, reads=[[0, 3, 0, 300_000.0, 300_500.0]])
+        data = self.srv.timeline_view(self.row(2, 1)[11], 1000)["data"]
+        self.assertEqual(data["reads"], [[0, 3, 0, 300_000.0, 300_500.0]])
+
+    def test_no_after_returns_the_last_five_seconds_and_resets(self):
+        self.write(0, 2)
+        self.srv.timeline_view()
+        self.write(0, 100)                                # now 10.1 s: the last 5 s are windows 51 to 100
+        with mock.patch.object(self.srv.time, "time", return_value=os.stat(self.file).st_mtime):   # (no file age)
+            data = self.srv.timeline_view()["data"]
+        self.assertTrue(data["reset"])
+        self.assertEqual(min(self.windows(data)), 51)
+        self.assertEqual(len(data["layers"]), 100)
+        self.assertEqual(data["first"], 0)               # (the buffer's own first window: the page is told what it holds)
+
+    def test_a_new_run_resets_even_with_an_after(self):
+        self.write(0, 2, base=1000)
+        self.srv.timeline_view()
+        self.write(0, 1, base=2000)
+        data = self.srv.timeline_view(self.row(2, 1)[11], 1000)["data"]
+        self.assertTrue(data["reset"])
+        self.assertEqual(data["base_ns"], 2000)
+        self.assertEqual(self.windows(data), [0, 1])
+
+    def test_query_parameters_are_read(self):
+        self.assertEqual(self.srv.timeline_query("/metrics?tl_after=123&tl_base=456"), (123, 456))
+        self.assertEqual(self.srv.timeline_query("/metrics"), (None, None))
+        self.assertEqual(self.srv.timeline_query("/metrics?tl_after=abc"), (None, None))
+
+    def _tl_rows(self):
+        return self.srv._TL["layers"]
+
+    def _tl_rows_or_none(self):
+        return self.srv._TL["last"]
+
+
 if __name__ == "__main__":
     unittest.main()
 
