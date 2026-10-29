@@ -25,6 +25,7 @@
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_store.hpp"
+#include "ds4_timeline.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
@@ -1095,6 +1096,7 @@ struct Model::Impl {
     std::vector<uint8_t> ahead_rank;   // [layer][1024]: 1 + the expert's rank in the guess a layer before (0: not guessed)
     std::vector<unsigned> ahead_for;   // [layer]: the request (seq) its flags are for
     std::thread pf_th;
+    tl::Writer tl_writer;   // the Monitor's decode timeline (ds4_timeline.hpp): its file, every 0.5 s, when the server asks
     std::mutex pf_mu;
     std::condition_variable pf_cv;
     std::vector<std::pair<const void*, size_t>> pf_q;
@@ -3083,6 +3085,7 @@ struct Model::Impl {
                 serve_lane();
             });
             if (ahead_mode > 0) pf_th = std::thread([this] { prefetch_loop(); });
+            tl_writer.start();
         }
         if (o.expert_cache) {
             size_t maxb = 0;
@@ -7224,6 +7227,11 @@ struct Model::Impl {
                 Layer& l = L[(size_t) li];
                 uint32_t* pr = prof.data() + (size_t) li * g.n_exp;
                 ents.clear();
+                // the Monitor's timeline (ds4_timeline.hpp): this layer's stamps, the trunk's layers only (no effect on the work)
+                const bool tlo = tl::on() && !l.mtp;
+                int64_t tlt[7] = {};
+                int64_t tl_w0 = 0, tl_m0 = 0;
+                if (tlo) tlt[0] = tlt[1] = tlt[2] = tl::ns();
                 if (store && li > 0 && li < g.nl) store->cancel_stale(li - 1);   // (guesses for layers the token has passed: dropped unread)
                 // lookahead: the guesses made for this layer (when they are for this request), counted on decode
                 const uint8_t* fl = T == 1 && !ahead_for.empty() && ahead_for[(size_t) li] == next
@@ -7340,6 +7348,13 @@ struct Model::Impl {
                         }
                     po = ord;
                 }
+                if (tlo) {
+                    tlt[3] = tlt[4] = tl::ns();   // the picks built; the store's reads start with the experts' call
+                    if (store) {
+                        tl_w0 = store->stats().wait_ns.load(std::memory_order_relaxed);
+                        tl_m0 = store->stats().misses.load(std::memory_order_relaxed);
+                    }
+                }
                 if (!ents.empty()) {
                     const double tc = now_ms();
                     cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
@@ -7359,6 +7374,17 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
+                }
+                if (tlo) {   // the lane's waits on reads drawn first, then its experts (the two interleave as reads land)
+                    tlt[6] = tl::ns();
+                    int64_t wait = 0;
+                    int32_t mis = 0;
+                    if (store) {
+                        wait = store->stats().wait_ns.load(std::memory_order_relaxed) - tl_w0;
+                        mis = (int32_t) (store->stats().misses.load(std::memory_order_relaxed) - tl_m0);
+                    }
+                    tlt[5] = std::min(tlt[6], tlt[4] + std::max<int64_t>(0, wait));
+                    tl::layer(li, T, mis, nslots, tlt);
                 }
             }
             std::atomic_thread_fence(std::memory_order_release);

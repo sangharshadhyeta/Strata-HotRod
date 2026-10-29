@@ -499,6 +499,8 @@ private:
             j.left = &sp.left;
             j.bad = &sp.bad;
             j.cancel = demand ? nullptr : &sp.cancel;
+            j.tl_layer = layer;
+            j.tl_demand = demand;
         }
         st_.bytes_read.fetch_add((int64_t) (g.bytes[0] + g.bytes[1] + g.bytes[2]), std::memory_order_relaxed);
         io_->push(jobs, 3, !demand);   // (a guess waits behind every demand read)

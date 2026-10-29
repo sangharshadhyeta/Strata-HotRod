@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "ds4_os.hpp"
+#include "ds4_timeline.hpp"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -147,6 +148,8 @@ public:
         uint8_t* keep = nullptr;        // non-null (a read): the len bytes read copied here as well
         bool exact = false;             // the len bytes land exactly at dst (a ring slot: no staging slack around them)
         std::atomic<bool>* cancel = nullptr;   // set before the job starts: it is dropped unread (bad is set, left counted down)
+        int tl_layer = -1;              // the Monitor's timeline (ds4_timeline.hpp): the read's layer (-1: not stamped)
+        bool tl_demand = false;         // a demand read (the CPU lane waits for it), else a guess
     };
     explicit IoQueue(int n) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
@@ -229,6 +232,7 @@ private:
                 buffered_.fetch_add(j.len, std::memory_order_relaxed);
             }
             if (ok && j.keep != nullptr && j.mem == nullptr) std::memmove(j.keep, j.exact ? j.dst : j.dst + lead, (size_t) j.len);   // (keep may overlap dst: the store reads in place and moves up)
+            if (j.tl_layer >= 0 && j.mem == nullptr && tl::on()) tl::read(j.tl_layer, j.tl_demand, tl::ns(t0));
             busy_us_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now() - t0).count(),
                                std::memory_order_relaxed);
