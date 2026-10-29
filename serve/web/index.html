@@ -187,6 +187,24 @@
         <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them
           (in this page's chat only; switch it off in Sampling).</p>
       </div>
+
+      <div class="st-card tl-card" id="tl-card">
+        <div class="req-head"><span class="card-title">Decode timeline</span>
+          <span class="tl-head-right"><span class="muted small" id="tl-sum"></span>
+          <button type="button" class="st-btn st-btn--secondary tl-btn" id="tl-reset" hidden>Live</button>
+          <button type="button" class="st-btn st-btn--secondary tl-btn" id="tl-btn" aria-pressed="false">Pause</button>
+          <button type="button" class="st-btn st-btn--secondary tl-btn" id="tl-engine" aria-pressed="false">Record</button></span></div>
+        <div class="tl-off" id="tl-off">Off. While on (the default), the engine stamps the host's times of each decode layer and each expert read the I/O
+          threads make (a clock read per step, nothing on the GPU), and the last 15 seconds scroll past here.</div>
+        <div id="tl-body" hidden>
+          <div class="tl-why" id="tl-why"></div>
+          <canvas class="tl-canvas" id="tl-canvas" role="img" aria-label="Timeline of the last decode windows: GPU, host thread and I/O threads"></canvas>
+          <div class="res-legend" id="tl-legend" aria-hidden="true"></div>
+          <p class="muted small res-note">Measured on the host. The GPU's time is what passes between the host's hand-offs: from the plan to the CPU's
+            rows it computes the experts in VRAM (and may wait for the rows), after the rows it combines and runs the next layer's attention. Double-click or scroll to zoom (shift + double-click zooms out), drag to pan: that stops the scroll, and Live follows the engine again. Pause freezes the view while the engine keeps recording; Record stops or starts the engine's stamps. A gap marker means windows the engine overwrote before they were sent.</p>
+        </div>
+        <div class="tl-tip" id="tl-tip" hidden></div>
+      </div>
     </div>
   </section>
 

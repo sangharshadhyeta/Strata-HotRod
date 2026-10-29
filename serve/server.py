@@ -27,6 +27,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import collections
 import base64
@@ -3573,6 +3574,216 @@ def deepseek_slot_env(env: dict, cfg: dict) -> None:
         env["STRATA_DS4_SLOT_DIR"] = str(Path(log).parent / "ds4-slots")
 
 
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this id runs (True when unsure: its files are kept).  Not os.kill(pid, 0): on Windows that sends a
+    console Ctrl+C event, never reports a dead process, and may interrupt a process sharing the console."""
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+    if os.name == "nt":
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.GetLastError() == 5   # access denied: it runs (another user's); invalid parameter: gone
+        try:
+            code = ctypes.c_ulong()
+            return not k32.GetExitCodeProcess(h, ctypes.byref(code)) or code.value == 259   # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+# the Monitor's decode timeline: the engine appends its finished decode windows' host times to TIMELINE_FILE while TIMELINE_CTL
+# holds "1".  One pair of files per server process (its pid in the name).
+TIMELINE_FILE = os.path.join(tempfile.gettempdir(), f"strata-timeline-{os.getpid()}.json")
+TIMELINE_CTL = os.path.join(tempfile.gettempdir(), f"strata-timeline-{os.getpid()}.ctl")
+
+
+def _drop_stale_timeline_files():
+    """The timeline's files are per server process and were never removed, so they piled up in the temp folder.  At start, the
+    files of servers that no longer run are deleted, and so is any left under this process's own id (an earlier process with the
+    same id, as Windows reuses ids: its "1" would start the timeline unasked).  This server's own files go when it ends."""
+    tmp = tempfile.gettempdir()
+    for name in os.listdir(tmp):
+        if not name.startswith("strata-timeline-"):
+            continue
+        ext = next((x for x in (".json.tmp", ".json", ".ctl") if name.endswith(x)), None)   # (.tmp: an engine ended mid-write)
+        if ext is None:
+            continue
+        pid = name[len("strata-timeline-"):-len(ext)]
+        if not pid.isdigit():
+            continue
+        if int(pid) == os.getpid() or not _pid_alive(int(pid)):
+            try:
+                os.remove(os.path.join(tmp, name))
+            except OSError:
+                pass
+
+
+def _remove_timeline_files() -> None:
+    for f in (TIMELINE_FILE, TIMELINE_CTL):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+try:
+    _drop_stale_timeline_files()
+except OSError:
+    pass
+atexit.register(_remove_timeline_files)
+
+
+def timeline_on() -> bool:
+    try:
+        with open(TIMELINE_CTL, "rb") as f:
+            return f.read(1) == b"1"
+    except OSError:
+        return False
+
+
+def set_timeline(on: bool) -> None:
+    """The Monitor's switch: the engine reads it at most every 0.5 s (between decode windows) and records host times only while on."""
+    # one byte, written in place: no rename (Windows refuses to replace a file the Monitor's poll or the engine has open) and no
+    # truncation (a reader in between would see an empty file, read as off).  A busy file is tried again for a moment.
+    for attempt in range(20):
+        try:
+            with open(TIMELINE_CTL, "r+b" if os.path.exists(TIMELINE_CTL) else "wb") as f:
+                f.seek(0)
+                f.write(b"1" if on else b"0")
+            break
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
+    if not on:
+        with _tl_lock:
+            _timeline_reset()
+        try:
+            os.remove(TIMELINE_FILE)
+        except OSError:
+            pass
+
+
+# timeline_view's rolling buffer: the windows of the last TIMELINE_KEEP_US (the page scrolls it), bounded by row counts too.
+TIMELINE_KEEP_US = 15_000_000
+TIMELINE_FALLBACK_US = 5_000_000      # a poll with no `after` (a first poll, or a new run) gets the last 5 s
+TIMELINE_MAX_ROWS = 30_000
+TIMELINE_MAX_READS = 30_000
+_tl_lock = threading.Lock()
+_TL: dict = {}
+
+
+def _timeline_reset() -> None:
+    _TL.clear()
+    _TL.update(base=None, key=None, last=None, now_us=0.0, mtime=0.0, layers=collections.deque(), reads=collections.deque(),
+               seen=set(), gaps=collections.deque())
+
+
+_timeline_reset()
+
+
+def _timeline_take(c: dict, mtime: float) -> None:
+    """Append one engine chunk to the buffer.  A chunk is new when its (base, first, last) differ from the last file read; it overlaps
+    the chunk before it, so only the windows after the buffer's last one are appended.  Reads have no window number: a read the buffer
+    holds (the same row) is skipped."""
+    key = (c.get("base_ns"), c.get("first"), c.get("last"))
+    if key == _TL["key"]:
+        return
+    if c.get("base_ns") != _TL["base"]:                  # another engine run: the buffer starts over
+        _timeline_reset()
+        _TL["base"] = c.get("base_ns")
+    _TL["key"] = key
+    _TL["now_us"] = float(c.get("now_us") or 0.0)
+    _TL["mtime"] = mtime
+    last = _TL["last"]
+    if last is not None and c["last"] <= last:          # a stale or duplicate chunk: nothing new
+        return
+    new = [r for r in c["layers"] if last is None or r[0] > last]
+    _TL["layers"].extend(new)
+    for r in c["reads"]:
+        k = tuple(r)
+        if k not in _TL["seen"]:
+            _TL["seen"].add(k)
+            _TL["reads"].append(k)
+    if c.get("gap") and new:                            # windows the engine's ring overwrote before it wrote them
+        _TL["gaps"].append((new[0][5], int(c["gap"])))
+    _TL["last"] = c["last"]
+
+
+def _timeline_data(after=None, base=None) -> dict:
+    """The buffer as /metrics returns it.  The engine's clock now is the chunk's, moved on by the file's age (the file is written only
+    when a window finishes, so the age runs on while the decode is idle).  With `after` (the newest engine time the page holds, us) and
+    the run's `base` the page has, only the rows that end later come back - a poll carries about a second of windows.  Without them
+    (the first poll, or another run) the last TIMELINE_FALLBACK_US come back with reset: true, and the page starts its buffer over."""
+    now = _TL["now_us"] + max(0.0, time.time() - _TL["mtime"]) * 1e6
+    cut = now - TIMELINE_KEEP_US
+    L, R, G, S = _TL["layers"], _TL["reads"], _TL["gaps"], _TL["seen"]
+    while L and (L[0][11] < cut or len(L) > TIMELINE_MAX_ROWS):      # the rows come in window order: the oldest go first
+        L.popleft()
+    while R and (R[0][4] < cut or len(R) > TIMELINE_MAX_READS):
+        S.discard(R.popleft())
+    while G and G[0][0] < cut:
+        G.popleft()
+    reset = after is None or base != _TL["base"]
+    lo = now - TIMELINE_FALLBACK_US if reset else max(after, cut)
+    # the layer rows end in order (a window's layers, then the next window's): the walk from the newest stops at the first old one
+    layers = []
+    for r in reversed(L):
+        if r[11] <= lo:
+            break
+        layers.append(r)
+    layers.reverse()
+    return {"v": 2, "base_ns": _TL["base"], "now_us": round(now, 1), "first": L[0][0] if L else None, "last": _TL["last"],
+            "reset": reset, "layers": layers, "reads": [list(r) for r in R if r[4] > lo],
+            "gaps": [list(g) for g in G if g[0] > lo]}
+
+
+def timeline_query(path: str) -> tuple:
+    """/metrics?tl_after=<us>&tl_base=<base_ns>: the newest engine time the page holds and the run's base (None on a first poll)."""
+    qs = parse_qs(urlsplit(path).query)
+
+    def one(name):
+        try:
+            v = float(qs[name][0])
+        except (KeyError, IndexError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+    return one("tl_after"), one("tl_base")
+
+
+def timeline_view(after=None, base=None) -> dict:
+    """/metrics: {"on": the switch, "data": the rolling buffer's rows (v 2) or None}.  The engine appends its finished decode windows to
+    TIMELINE_FILE (one chunk every 0.5 s while on); each poll takes the chunk when it is new.  Layers [window, layer, tokens, demand
+    reads, CPU jobs, then 7 host times in us after the run's base: doorbell, plan published, quantise, reads start, reads done, jobs
+    ready, CPU done], reads [I/O thread, layer, demand, start us, end us], gaps [at us, windows lost].  The rows are those after
+    `after` (see _timeline_data).  A switch off clears it."""
+    on = timeline_on()
+    with _tl_lock:
+        if not on:
+            _timeline_reset()
+            return {"on": False, "data": None}
+        try:
+            mtime = os.stat(TIMELINE_FILE).st_mtime
+            with open(TIMELINE_FILE, "rb") as f:
+                c = json.loads(f.read())
+        except (OSError, ValueError):
+            c = None
+        if (isinstance(c, dict) and c.get("v") == 2 and isinstance(c.get("layers"), list) and isinstance(c.get("reads"), list)
+                and isinstance(c.get("first"), int) and isinstance(c.get("last"), int)):
+            _timeline_take(c, mtime)
+        return {"on": True, "data": _timeline_data(after, base) if _TL["last"] is not None else None}
+
+
 def child_env(cfg: dict, *, offline: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -3589,6 +3800,13 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env[str(k)] = str(v)
     if (cfg.get("arch") or "") == "deepseek41":      # (only this engine reads these; Qwen's environment is untouched)
         deepseek_slot_env(env, cfg)
+    env.setdefault("STRATA_TIMELINE_FILE", TIMELINE_FILE)     # the Monitor's decode timeline (timeline_view), off until switched on
+    env.setdefault("STRATA_TIMELINE_CTL", TIMELINE_CTL)
+    if cfg.get("timeline") is not False:           # the Monitor's timeline runs from the start (config "timeline": false: off until switched on)
+        try:
+            set_timeline(True)
+        except OSError:
+            pass                                    # (the Monitor's switch still works)
     # Strict offline reaches children through the environment, because a tool subprocess or a model
     # loader is code this server does not own. Applied last so a profile's own `env` cannot remove
     # the policy by naming the same variable.
@@ -4729,7 +4947,7 @@ class Service:
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
-    def metrics(self, all_requests=False) -> dict:
+    def metrics(self, all_requests=False, tl_after=None, tl_base=None) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
         with self.status_lock:
@@ -4781,6 +4999,7 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "timeline": timeline_view(tl_after, tl_base),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -6884,7 +7103,8 @@ def make_handler(svc: Service):
                     return
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
-                    self._json(200, svc.metrics(all_requests="requests=all" in self.path))
+                    tl_after, tl_base = timeline_query(self.path)    # the Monitor's timeline rows since its last poll
+                    self._json(200, svc.metrics(all_requests="requests=all" in self.path, tl_after=tl_after, tl_base=tl_base))
                 return
             if path == "/v1/telemetry":
                 if self._authorized_telemetry():
@@ -7279,6 +7499,15 @@ def make_handler(svc: Service):
                         self._json(200, svc.vram(r))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                if path == "/v1/monitor/timeline":           # the Monitor's decode timeline: on / off (host times only)
+                    if not self._own_page("the timeline can be switched on or off"):
+                        return
+                    on = req.get("on")
+                    if not isinstance(on, bool):
+                        raise ValueError("on: true or false")
+                    set_timeline(on)
+                    self._json(200, {"on": on})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
