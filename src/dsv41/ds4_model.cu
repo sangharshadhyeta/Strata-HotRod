@@ -1111,6 +1111,13 @@ struct Model::Impl {
     // store, only those ranked below the stand-in floor (standin_floor); 1 every guess (upstream's reading); 0 none (upstream's default
     // with the store).  DS4_AHEAD, when set, decides as before.
     int la_tail_read = 2, standin_floor = 0;
+    // STRATA_KV_HOST (Strata-HotRod's K/V streaming, this model's way): unset = on when --max-context is above 131072, 1 on, 0 off.  The
+    // compressed K/V rows (288 bytes a row) go to host-mapped RAM instead of the card: the sparse attention reads only the top-k rows each
+    // query picks (a few MB a token over PCIe), the compressor writes a row every `ratio` positions through the same pointer, and the card
+    // memory they leave goes to the experts.  The index keys, scanned in full for every token, stay on the card.  A long prompt reads
+    // more rows per chunk, so short contexts keep them on the card.  kv_host_bytes: what went to RAM.
+    int kv_host = -1;
+    size_t kv_host_bytes = 0;
     // STRATA_ROUTE_BUDGET_AUTO (on with the stand-ins and their re-check; 0: off): the budget searches itself by measured speed under the
     // flips (ds4_standin_tune.hpp: Strata-HotRod's interleaved A/B, the learned clean ceiling, the per-request brake, k from the re-checks),
     // kept in <pack>/standin-tune.txt.  tune_b: the budget the device block holds (written before each decode token when it changes);
@@ -2692,12 +2699,25 @@ struct Model::Impl {
                     CK(cudaEventCreateWithFlags(&s.ev_ik, cudaEventDisableTiming));
                     CK(cudaSetDevice(d.id));
                 }
-                if (s.ckv[di] != nullptr && !dalloc(d, s.ckv[di], (size_t) s.cap * ckv_rb(), err, &d.caches))
-                    return false;
+                if (kv_host < 0) {
+                    const char* v = std::getenv("STRATA_KV_HOST");
+                    kv_host = v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : (o.max_context > 131072 ? 1 : 0);
+                }
+                if (s.ckv[di] != nullptr) {
+                    if (kv_host == 1) {
+                        if (!hmap(s.ckv[di], (size_t) s.cap * ckv_rb(), err)) return false;
+                        kv_host_bytes += (size_t) s.cap * ckv_rb();
+                    } else if (!dalloc(d, s.ckv[di], (size_t) s.cap * ckv_rb(), err, &d.caches)) {
+                        return false;
+                    }
+                }
                 if (s.ik[di] != nullptr && !dalloc(d, s.ik[di], (size_t) s.cap * ik_rb(), err, &d.caches))
                     return false;
             }
         }
+        if (kv_host_bytes > 0)
+            std::fprintf(stderr, "ds4: K/V streaming: the compressed K/V rows in RAM (%.2f GB, read over PCIe; the index keys stay on the card)\n",
+                         kv_host_bytes / 1e9);
         for (Src& sr : srcs) {
             if (sr.remote && (!hmap(sr.x_stage, x_cap() * (ckv_rb() + ik_rb()), err) || !hmap(sr.x_flag, 32, err)))
                 return false;
@@ -5871,7 +5891,7 @@ struct Model::Impl {
             }
             const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
             cudaSetDevice(devs[(size_t) di].id);
-            if (cudaMemcpy(p + off, ckv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            if (cudaMemcpy(p + off, ckv, cb, cudaMemcpyDefault) != cudaSuccess ||   // (Default: the rows may be in RAM, STRATA_KV_HOST)
                 (ik != nullptr && cudaMemcpy(p + off + cb, ik, ib, cudaMemcpyDeviceToHost) != cudaSuccess)) {
                 err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
                 return 0;
@@ -6025,7 +6045,7 @@ struct Model::Impl {
             for (size_t di = 0; di < devs.size(); ++di) {
                 if (s.ckv[di] == nullptr && s.ik[di] == nullptr) continue;
                 cudaSetDevice(devs[di].id);
-                if (s.ckv[di] != nullptr && cudaMemcpy(s.ckv[di], data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                if (s.ckv[di] != nullptr && cudaMemcpy(s.ckv[di], data + off, cb, cudaMemcpyDefault) != cudaSuccess) {   // (STRATA_KV_HOST)
                     err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
