@@ -271,6 +271,11 @@ def focused_recovery_prompt(tok, ids, generated):
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
+# A client that stops reading (or sending) for this long is dropped (Strata-HotRod, 25 Oct: a client that stopped reading held
+# the one turn for 16 minutes - the engine had finished in 45 s, the server sat in a socket write - and every request queued
+# behind it).  A write that cannot finish raises TimeoutError, an OSError: the stream's write handler cancels the request and
+# frees the turn.  A healthy stream writes far more often (tokens, keep-alives every KEEPALIVE_S).
+CLIENT_TIMEOUT_S = 60.0
 # Anthropic clients add /v1/messages to their base URL themselves. A base URL that already ends in /v1 (copied from an OpenAI-style
 # setup) makes them post /v1/v1/messages; these two paths mean the same as the real ones. Nothing else is aliased.
 V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
@@ -6514,6 +6519,7 @@ class BadBody(Exception):
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
+        timeout = CLIENT_TIMEOUT_S                          # a stalled client (not reading or not sending) is dropped, not waited for
 
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
