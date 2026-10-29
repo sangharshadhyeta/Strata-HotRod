@@ -262,6 +262,9 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,
               cudaStream_t s);
+/// The row's largest and second largest logits and the largest one's id (as a float; ids below 2^24): out[0..2] = v1, v2, id.  One
+/// block (the stand-ins' flip re-check reads it after a decode token).
+void logit_top2(const float* logits, int n, float* out, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
 /// A chunk's routed experts as sorted rows: the picks (t, i < k) of T tokens (idx rows kPicks apart) by the virtual

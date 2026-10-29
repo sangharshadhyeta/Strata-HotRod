@@ -1707,6 +1707,48 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         for (int i = threadIdx.x; i < dim; i += blockDim.x) req->x[t][i] = x[(size_t) t * dim + i];
 }
 
+// the row's two largest logits and the first one's id: each thread its own pair, then the block's (ties: the lower id first)
+__global__ void __launch_bounds__(1024) logit_top2_kernel(const float* __restrict__ x, int n, float* __restrict__ out) {
+    __shared__ float s1[1024], s2[1024];
+    __shared__ int si[1024];
+    float v1 = -FLT_MAX, v2 = -FLT_MAX;
+    int i1 = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = x[i];
+        if (v > v1 || (v == v1 && i < i1)) {
+            v2 = v1;
+            v1 = v;
+            i1 = i;
+        } else if (v > v2) {
+            v2 = v;
+        }
+    }
+    s1[threadIdx.x] = v1;
+    s2[threadIdx.x] = v2;
+    si[threadIdx.x] = i1;
+    __syncthreads();
+    for (int h = blockDim.x / 2; h > 0; h >>= 1) {
+        if (threadIdx.x < h) {
+            const int o = threadIdx.x + h;
+            const float a1 = s1[threadIdx.x], a2 = s2[threadIdx.x], b1 = s1[o], b2 = s2[o];
+            const int ai = si[threadIdx.x], bi = si[o];
+            if (b1 > a1 || (b1 == a1 && bi < ai)) {
+                s1[threadIdx.x] = b1;
+                si[threadIdx.x] = bi;
+                s2[threadIdx.x] = fmaxf(a1, b2);
+            } else {
+                s2[threadIdx.x] = fmaxf(a2, b1);
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out[0] = s1[0];
+        out[1] = s2[0];
+        out[2] = (float) si[0];
+    }
+}
+
 // a later layer's m likely picks (route_kernel's choice from its logits) into req->ahead[t][off ..)
 __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restrict__ logits,
                                                           const float* __restrict__ bias, int n, int m, Req* req,
@@ -2163,6 +2205,9 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
                                            vl != 0 ? bias_vl : nullptr, vl, standin);
     if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
+}
+void logit_top2(const float* logits, int n, float* out, cudaStream_t s) {
+    strata_ds4_launch(logit_top2_kernel, 1, 1024, 0, s, logits, n, out);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
 #if defined(STRATA_METAL)

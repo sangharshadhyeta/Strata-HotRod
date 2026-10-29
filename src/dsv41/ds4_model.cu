@@ -1100,6 +1100,15 @@ struct Model::Impl {
     // Its block is device memory on the trunk's GPU (null: off, the router as it was); a single-GPU trunk only (the members of a
     // tensor-parallel layer must make the same plan).
     Standin* d_standin = nullptr;
+    // STRATA_FRAGILE_RECHECK (on with the stand-ins; 0: off): a decode token that took stand-ins is a close call when its top-two logit
+    // gap is under fr_k (STRATA_FRAGILE_K0, 4) x its risk (the sum of weight x logit gap its stand-ins carried); a close call is run
+    // again exactly at the same position (step(); standin_bypass), and the exact run's logits are the ones sampled.  The ring row,
+    // the compressor's slot (position % ratio) and the index keys of a position are written, not added to, so the re-run leaves the
+    // state as an exact run would.  fr_used / fr_checks / fr_flips: tokens that took stand-ins, re-checked, whose argmax changed.
+    bool fr_on = false, standin_bypass = false;
+    float fr_k = 4.0f;
+    float* d_top2 = nullptr;
+    long long fr_used = 0, fr_checks = 0, fr_flips = 0;
     long la_toks = 0;
     std::string la_path;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
@@ -1432,8 +1441,16 @@ struct Model::Impl {
                     if (h.offered[r] > 0) line += " " + std::to_string(r) + ": " + std::to_string(h.taken[r]) + " / " + std::to_string(h.offered[r]);
                 std::fprintf(stderr, "%s\n", line.c_str());
             }
+            if (fr_on)
+                std::fprintf(stderr, "stand-ins: %lld decode tokens took them, %lld re-checked exactly, %lld of those changed the top token\n",
+                             fr_used, fr_checks, fr_flips);
             cudaFree(d_standin);
             d_standin = nullptr;
+            if (d_top2 != nullptr) {
+                cudaSetDevice(devs[(size_t) head_dev].id);
+                cudaFree(d_top2);
+                d_top2 = nullptr;
+            }
         }
         if (la_on) {   // the learner's report and its file, before the devices go
             cudaSetDevice(devs[(size_t) L[0].dev].id);
@@ -3221,6 +3238,18 @@ struct Model::Impl {
         }
         std::fprintf(stderr, "ds4: stand-ins: on (ranks below %d exact, rank %d within %.2f logits, from rank %d w x gap <= %.3f)\n",
                      std::max(0, h.floor - 1), h.floor - 1, h.edge, h.floor, h.budget);
+        const char* fr = std::getenv("STRATA_FRAGILE_RECHECK");
+        if (fr == nullptr || std::atoi(fr) != 0) {
+            cudaSetDevice(devs[(size_t) head_dev].id);
+            if (cudaMalloc(&d_top2, 4 * sizeof(float)) == cudaSuccess) {
+                fr_on = true;
+                fr_k = std::max(0.0f, envf("STRATA_FRAGILE_K0", 4.0f));
+                std::fprintf(stderr, "ds4: stand-ins: flip re-check on (a token with gap < %.2f x risk runs again exactly)\n", fr_k);
+            } else {
+                (void) cudaGetLastError();
+                d_top2 = nullptr;
+            }
+        }
     }
     // the learner's stage for trunk layer l on its stream s (a decode token, after the router's GEMV): its label, then for each
     // distance the next layer's plain logits on this layer's FFN input (rows of glog_a) and the learner's forward, which corrects them
@@ -7135,7 +7164,7 @@ struct Model::Impl {
             js += '"';
         }
         js += "],\"resident\":" + std::to_string(n_res) + "}";
-        const std::string tmp = std::string(file) + ".ds4.tmp";
+        const std::string tmp = std::string(file) + ".tmp";   // (the name the server's cleanup knows: an engine that ends mid-write)
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
             f << js;
@@ -7981,7 +8010,44 @@ struct Model::Impl {
     }
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
-    bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, err); }
+    bool step(int token, bool want_logits, std::string& err) {
+        if (!fr_on || !want_logits || d_standin == nullptr) return forward(&token, 1, want_logits ? 1 : 0, err);
+        const int64_t p0 = pos;
+        if (!forward(&token, 1, 1, err)) return false;
+        // the stand-ins' flip re-check: did this token take any, and is its top-two gap a close call against their risk
+        Dev& sd = devs[(size_t) L[0].dev];
+        cudaSetDevice(sd.id);
+        int used = 0;
+        float risk = 0.0f;
+        CK(cudaMemcpyAsync(&used, &d_standin->used[0], sizeof used, cudaMemcpyDeviceToHost, sd.st));
+        CK(cudaMemcpyAsync(&risk, &d_standin->risk[0], sizeof risk, cudaMemcpyDeviceToHost, sd.st));
+        CK(cudaStreamSynchronize(sd.st));
+        if (!used) return true;
+        ++fr_used;
+        Dev& hd = devs[(size_t) head_dev];
+        cudaSetDevice(hd.id);
+        float t2[3];
+        logit_top2(hd.logits, g.vocab, d_top2, hd.st);
+        CK(cudaMemcpyAsync(t2, d_top2, sizeof t2, cudaMemcpyDeviceToHost, hd.st));
+        CK(cudaStreamSynchronize(hd.st));
+        if (t2[0] - t2[1] >= fr_k * risk) return true;
+        const int before = (int) t2[2];
+        pos = p0;   // the same position again, exactly (forward appends the token again)
+        toks.resize((size_t) p0);
+        ctoks.resize((size_t) p0);
+        standin_bypass = true;
+        const bool ok = forward(&token, 1, 1, err);
+        standin_bypass = false;
+        if (!ok) return false;
+        --st.tokens;   // (one token, run twice)
+        ++fr_checks;
+        cudaSetDevice(hd.id);
+        logit_top2(hd.logits, g.vocab, d_top2, hd.st);
+        CK(cudaMemcpyAsync(t2, d_top2, sizeof t2, cudaMemcpyDeviceToHost, hd.st));
+        CK(cudaStreamSynchronize(hd.st));
+        fr_flips += (int) t2[2] != before;
+        return true;
+    }
 
 
     // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
@@ -10243,7 +10309,7 @@ struct Model::Impl {
             }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1], T == 1 && !l.mtp ? d_standin : nullptr);   // (stand-ins: decode tokens of the trunk only)
+                          na[1], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr);   // (stand-ins: decode tokens of the trunk only)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
