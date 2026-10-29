@@ -1106,6 +1106,10 @@ struct Model::Impl {
     // the compressor's slot (position % ratio) and the index keys of a position are written, not added to, so the re-run leaves the
     // state as an exact run would.  fr_used / fr_checks / fr_flips: tokens that took stand-ins, re-checked, whose argmax changed.
     bool fr_on = false, standin_bypass = false;
+    // STRATA_LA_TAIL_READ (with the learner and the stand-ins on, and the RAM store up): 2 (default) the guesses are read ahead into the
+    // store, only those ranked below the stand-in floor (standin_floor); 1 every guess (upstream's reading); 0 none (upstream's default
+    // with the store).  DS4_AHEAD, when set, decides as before.
+    int la_tail_read = 2, standin_floor = 0;
     float fr_k = 4.0f;
     float* d_top2 = nullptr;
     long long fr_used = 0, fr_checks = 0, fr_flips = 0;
@@ -3165,6 +3169,7 @@ struct Model::Impl {
             }
         calibrate_paths();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
+        tail_read_init();  // (after the store: it turns the read-ahead off, this may turn the learned one back on)
         preload_store();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         if (chunk > 0) (void) pick_flow_min();   // (the startup line)
@@ -3238,6 +3243,7 @@ struct Model::Impl {
         }
         std::fprintf(stderr, "ds4: stand-ins: on (ranks below %d exact, rank %d within %.2f logits, from rank %d w x gap <= %.3f)\n",
                      std::max(0, h.floor - 1), h.floor - 1, h.edge, h.floor, h.budget);
+        standin_floor = h.floor;
         const char* fr = std::getenv("STRATA_FRAGILE_RECHECK");
         if (fr == nullptr || std::atoi(fr) != 0) {
             cudaSetDevice(devs[(size_t) head_dev].id);
@@ -3250,6 +3256,13 @@ struct Model::Impl {
                 d_top2 = nullptr;
             }
         }
+    }
+    void tail_read_init() {
+        if (const char* v = std::getenv("STRATA_LA_TAIL_READ")) la_tail_read = std::max(0, std::min(2, std::atoi(v)));
+        if (!la_on || d_standin == nullptr || !store || la_tail_read == 0 || std::getenv("DS4_AHEAD") != nullptr || ahead_mode != 0) return;
+        ahead_mode = 1;   // (the store reads the guesses: the page-cache prefetch thread is not needed)
+        std::fprintf(stderr, "ds4: read-ahead: the learned guesses into the RAM store (%s)\n",
+                     la_tail_read == 2 ? "the exact ranks only" : "every guess");
     }
     // the learner's stage for trunk layer l on its stream s (a decode token, after the router's GEMV): its label, then for each
     // distance the next layer's plain logits on this layer's FFN input (rows of glog_a) and the learner's forward, which corrects them
@@ -7366,13 +7379,15 @@ struct Model::Impl {
                 std::memset(rk, 0, 1024);
                 ahead_for[(size_t) j] = seq + (unsigned) a;
             }
+            // STRATA_LA_TAIL_READ=2 with the stand-ins on: only the guesses ranked below the floor are read (the rest are counted)
+            const int lim = d_standin != nullptr && la_tail_read == 2 && standin_floor > 0 ? std::min(m, standin_floor) : m;
             for (int t = 0; t < T; ++t)
                 for (int i = 0; i < m; ++i) {
                     const int e = r.ahead[t][(a - 1) * kAhead1 + i];
                     if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                     fl[e] |= a == 2 ? 4 : (i < n.k_exp ? 3 : 2);
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
-                    if ((fl[e] & 8) || !file_read(n, e)) continue;
+                    if (i >= lim || (fl[e] & 8) || !file_read(n, e)) continue;
                     fl[e] |= 8;
                     if (store) store->prefetch(j, e);
                     else
