@@ -7106,6 +7106,42 @@ struct Model::Impl {
         cache_tick_swaps(T);
         store_sync();
         store_watch();
+        residency_write();
+    }
+    // STRATA_RESIDENCY_FILE=<path> (the server sets it for the Monitor's experts map; Strata-HotRod's format v 1): at most every 2 s,
+    // between windows, one JSON snapshot of which trunk experts are in VRAM - a character per expert, 0 not on the card, 1 on it and
+    // cold, 2 warm, 3 hot - written aside and renamed.  Heat here is the cache's own (+1 a use, x DS4_CACHE_DECAY every 256 tokens:
+    // about ten times the uses of the last 256 tokens), so cold is under 10 (less than one use in 256 tokens) and hot 40 or more.
+    void residency_write() {
+        static const char* file = std::getenv("STRATA_RESIDENCY_FILE");
+        if (file == nullptr || file[0] == '\0') return;
+        static auto last = std::chrono::steady_clock::now() - std::chrono::hours(1);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(2)) return;
+        last = now;
+        std::string js = "{\"v\":1,\"time\":" + std::to_string((long long) std::time(nullptr)) + ",\"layers\":" + std::to_string(g.nl) +
+                         ",\"experts\":" + std::to_string(g.n_exp) + ",\"round\":0,\"swaps\":" + std::to_string((long long) st.swaps) +
+                         ",\"quality_swaps\":0,\"rows\":[";
+        long long n_res = 0;
+        for (int il = 0; il < g.nl; ++il) {
+            const Layer& l = L[(size_t) il];
+            js += il ? ",\"" : "\"";
+            for (int e = 0; e < g.n_exp; ++e) {
+                const bool in = e < (int) l.slot.size() && l.slot[(size_t) e] >= 0;
+                const float h = e < (int) l.heat.size() ? l.heat[(size_t) e] : 0.0f;
+                n_res += in;
+                js += !in ? '0' : h < 10.0f ? '1' : h < 40.0f ? '2' : '3';
+            }
+            js += '"';
+        }
+        js += "],\"resident\":" + std::to_string(n_res) + "}";
+        const std::string tmp = std::string(file) + ".ds4.tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            f << js;
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, file, ec);
     }
     // the store gives RAM back when the PC runs short (the owner opened something): below 4 GB free, a 0.7 GB chunk at a time
     // until 5 GB are free again (checked every 16 windows); it grows again by itself once 8 GB beside its chunk are free
