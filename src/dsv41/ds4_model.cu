@@ -2201,6 +2201,7 @@ struct Model::Impl {
             CK(cudaMemGetInfo(&d.free0, &d.total));
             d.free0 = uma_free(d.id, d.free0);
         }
+        vram_reserve_apply();   // (before anything is sized from o.reserve_mib)
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
         int tp = o.tp;
@@ -3205,6 +3206,7 @@ struct Model::Impl {
         calibrate_paths();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         tail_read_init();  // (after the store: it turns the read-ahead off, this may turn the learned one back on)
+        vram_reserve_learn();
         preload_store();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         if (chunk > 0) (void) pick_flow_min();   // (the startup line)
@@ -3301,6 +3303,68 @@ struct Model::Impl {
                 d_top2 = nullptr;
             }
         }
+    }
+    // ---- the learned VRAM reserve (Strata-HotRod): <pack>/vram-reserve.txt, "<key> <MiB>" a line.  The key: the first GPU's name (spaces as
+    // _), its total MiB, the context, where the compressed K/V rows live (STRATA_KV_HOST: ram / card) and whether the drafter loads.
+    // Without --reserve-mib a start uses its key's value; a load that ends with less than 512 MiB free on a GPU raises it by the shortfall
+    // and 128 MiB, one that ends with more than 1.5 GiB free lowers it by half the excess over 768 MiB, never below kReserveFloor.
+    static constexpr int64_t kReserveFloor = 600;
+    std::string vram_reserve_key() const {
+        cudaDeviceProp pr{};
+        std::string name = "unknown";
+        if (!devs.empty() && cudaGetDeviceProperties(&pr, devs[0].id) == cudaSuccess) name = pr.name;
+        for (char& c : name)
+            if (c == ' ') c = '_';
+        const char* kv = std::getenv("STRATA_KV_HOST");
+        const bool ram = kv != nullptr ? std::atoi(kv) != 0 : o.max_context > 131072;
+        const size_t total = devs.empty() ? 0 : devs[0].total >> 20;
+        return name + "/" + std::to_string(total) + "MiB/ctx" + std::to_string((long long) o.max_context) + "/kv-" + (ram ? "ram" : "card") +
+               "/dspark-" + (o.dspark ? "on" : "off");
+    }
+    std::map<std::string, int64_t> vram_reserve_read() const {
+        std::map<std::string, int64_t> m;
+        std::ifstream f(o.pack + "/vram-reserve.txt");
+        std::string k;
+        long long v = 0;
+        while (f >> k >> v) m[k] = v;
+        return m;
+    }
+    void vram_reserve_apply() {
+        if (o.reserve_set) return;
+        const auto m = vram_reserve_read();
+        const auto it = m.find(vram_reserve_key());
+        if (it == m.end()) return;
+        o.reserve_mib = std::max<int64_t>(kReserveFloor, it->second);
+        std::fprintf(stderr, "ds4: VRAM reserve: %lld MiB (learned for %s)\n", (long long) o.reserve_mib, vram_reserve_key().c_str());
+    }
+    void vram_reserve_learn() {
+        if (o.reserve_set || devs.empty()) return;
+        size_t low = SIZE_MAX;
+        for (const Dev& d : devs) {
+            size_t fr = 0, tot = 0;
+            cudaSetDevice(d.id);
+            if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return;
+            }
+            low = std::min(low, fr);
+        }
+        const int64_t free_mib = (int64_t) (low >> 20), old = o.reserve_mib;
+        int64_t now = old;
+        if (free_mib < 512) now = old + (512 - free_mib) + 128;
+        else if (free_mib > 1536) now = std::max<int64_t>(kReserveFloor, old - (free_mib - 768) / 2);
+        if (now == old) return;
+        auto m = vram_reserve_read();
+        m[vram_reserve_key()] = now;
+        const std::string path = o.pack + "/vram-reserve.txt", tmp = path + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            for (const auto& kv : m) f << kv.first << " " << kv.second << "\n";
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        std::fprintf(stderr, "ds4: VRAM reserve: the load ended with %lld MiB free; the next start keeps %lld MiB (was %lld)\n",
+                     (long long) free_mib, (long long) now, (long long) old);
     }
     void tail_read_init() {
         if (const char* v = std::getenv("STRATA_LA_TAIL_READ")) la_tail_read = std::max(0, std::min(2, std::atoi(v)));

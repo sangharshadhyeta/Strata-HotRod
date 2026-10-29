@@ -27,6 +27,7 @@ struct Options {
     int64_t max_context = 32768;
     std::vector<int> gpus;            // empty: every visible GPU
     int64_t reserve_mib = 600;        // VRAM left free on each GPU
+    bool reserve_set = false;         // --reserve-mib was given (else the learned one, <pack>/vram-reserve.txt, may replace 600)
     bool vram_experts_auto = true;    // (Metal: no --vram-experts given: the share the anonymous-memory cap leaves - metal_expert_cap)
     double vram_experts = 1.0;        // the share of the expert budget to use (tests: less, so the CPU lane works)
     int cpu_threads = 0;              // 0: the physical cores
