@@ -238,7 +238,8 @@ struct Resp {
 /// when the swap is small.  Ranks below floor - 1 are always exact; rank floor - 1 swaps when its logit gap is at most `edge` (0: that
 /// rank exact too); ranks from `floor` on when weight x logit gap is at most `budget`.  The pick keeps its weight.  Device memory: the
 /// host sets floor / edge / budget (a tuner may change budget between tokens) and reads the counters; route_publish with a null Standin
-/// is the router as it was.  used[t] / risk[t]: the window's token t took a stand-in, and the sum of its weight x gap (the flip re-check).
+/// is the router as it was.  used[t] / risk[t]: the window's token t took a stand-in in some layer, and the sum of weight x gap over its
+/// layers (the flip re-check); they add up over the window's layers, and the host clears them before a window starts.
 struct Standin {
     int floor;
     float edge;

@@ -9598,6 +9598,10 @@ struct Model::Impl {
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
         plan_window(p0, T, wplan);
         la_win = la_on && T == 1 && wplan.async;   // the learner's window: a decode token on the async path
+        if (d_standin != nullptr && T == 1) {   // the stand-ins' per-token flags start at 0 for this token's layers
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            CK(cudaMemsetAsync(&d_standin->used[0], 0, sizeof(int) * kWin + sizeof(float) * kWin, devs[(size_t) L[0].dev].st));
+        }
         if (la_win) {
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             la::pre_launch(devs[(size_t) L[0].dev].st);

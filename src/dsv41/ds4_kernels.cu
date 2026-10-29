@@ -1681,9 +1681,9 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 took = 1;
                 risk += wk[r] * gap;
             }
-            if (t < kWin) {
-                sti->used[t] = took;
-                sti->risk[t] = risk;
+            if (t < kWin && took) {   // (over the token's layers: the host clears them when a decode token starts)
+                sti->used[t] = 1;
+                sti->risk[t] += risk;
             }
         }
         int cpu = 0;
