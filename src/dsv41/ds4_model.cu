@@ -1094,6 +1094,12 @@ struct Model::Impl {
     // STRATA_LA_LEARN (ds4_lalearn.cuh): the learned look-ahead.  la_on: the learner is up; la_win: this window is a decode token that
     // runs the learner's stages (set in forward); la_toks: the decode tokens counted for the periodic save
     bool la_on = false, la_win = false;
+    // STRATA_STANDIN=1 (Strata-HotRod's rank rule, ds4_kernels.cuh Standin): on a decode token a pick that is off the card may take the
+    // best card-resident expert instead.  STRATA_ROUTE_RESIDENT_RANKS (the floor, 3): ranks below floor - 1 exact; rank floor - 1 within
+    // STRATA_ROUTE_RESIDENT_EDGE logits (1; 0: exact too); ranks from the floor on when weight x logit gap <= STRATA_ROUTE_BUDGET (0.1).
+    // Its block is device memory on the trunk's GPU (null: off, the router as it was); a single-GPU trunk only (the members of a
+    // tensor-parallel layer must make the same plan).
+    Standin* d_standin = nullptr;
     long la_toks = 0;
     std::string la_path;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
@@ -1417,6 +1423,18 @@ struct Model::Impl {
     }
 
     ~Impl() {
+        if (d_standin != nullptr) {   // the stand-ins' counts by rank, before the devices go
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            Standin h{};
+            if (cudaMemcpy(&h, d_standin, sizeof h, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                std::string line = "stand-ins (rank: taken / offered):";
+                for (int r = 0; r < kPicks; ++r)
+                    if (h.offered[r] > 0) line += " " + std::to_string(r) + ": " + std::to_string(h.taken[r]) + " / " + std::to_string(h.offered[r]);
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
+            cudaFree(d_standin);
+            d_standin = nullptr;
+        }
         if (la_on) {   // the learner's report and its file, before the devices go
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             std::fputs(la::report().c_str(), stderr);
@@ -3122,6 +3140,7 @@ struct Model::Impl {
             CK(cudaStreamSynchronize(d.st));
         }
         la_init();   // (STRATA_LA_LEARN: the learner, on the trunk's GPU; off unless the env var or the saved file says on)
+        standin_init();
         if (par || chunk > 0)   // (the windows' threads; the prompt path's, whatever mode the windows take)
             for (size_t di = 0; di < devs.size(); ++di) {
                 workers.push_back(std::make_unique<Worker>());
@@ -3177,6 +3196,31 @@ struct Model::Impl {
         }
         la_on = true;
         std::fprintf(stderr, "ds4: look-ahead learner: on (%s)\n", how.c_str());
+    }
+    void standin_init() {
+        const char* on = std::getenv("STRATA_STANDIN");
+        if (on == nullptr || std::atoi(on) == 0) return;
+        for (int il = 0; il < g.nl; ++il)
+            if (L[(size_t) il].dev != L[0].dev || L[(size_t) il].nm != 1) {
+                std::fprintf(stderr, "ds4: stand-ins: off (the trunk is not on one GPU)\n");
+                return;
+            }
+        auto envf = [](const char* k, float d) { const char* v = std::getenv(k); return v != nullptr ? (float) std::atof(v) : d; };
+        Standin h{};
+        h.floor = std::max(0, (int) envf("STRATA_ROUTE_RESIDENT_RANKS", 3.0f));
+        h.edge = std::max(0.0f, envf("STRATA_ROUTE_RESIDENT_EDGE", 1.0f));
+        h.budget = std::max(0.0f, envf("STRATA_ROUTE_BUDGET", 0.1f));
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        if (cudaMalloc(&d_standin, sizeof(Standin)) != cudaSuccess ||
+            cudaMemcpy(d_standin, &h, sizeof h, cudaMemcpyHostToDevice) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (d_standin != nullptr) cudaFree(d_standin);
+            d_standin = nullptr;
+            std::fprintf(stderr, "ds4: stand-ins: off (no device memory)\n");
+            return;
+        }
+        std::fprintf(stderr, "ds4: stand-ins: on (ranks below %d exact, rank %d within %.2f logits, from rank %d w x gap <= %.3f)\n",
+                     std::max(0, h.floor - 1), h.floor - 1, h.edge, h.floor, h.budget);
     }
     // the learner's stage for trunk layer l on its stream s (a decode token, after the router's GEMV): its label, then for each
     // distance the next layer's plain logits on this layer's FFN input (rows of glog_a) and the learner's forward, which corrects them
@@ -10159,7 +10203,7 @@ struct Model::Impl {
             }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1]);
+                          na[1], T == 1 && !l.mtp ? d_standin : nullptr);   // (stand-ins: decode tokens of the trunk only)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;

@@ -34,6 +34,14 @@ the saved conversations.
    (`STRATA_ROUTE_RESIDENT_RANKS`, 3 here: ranks 0-1 exact, rank 2 within `STRATA_ROUTE_RESIDENT_EDGE`), is replaced by the best-scoring
    expert already on the card when `w x gap <= budget` (gap on the router's selection score, bias included); its weight kept. The device
    publishes the scores of the top 16 for that. A token a stand-in could have flipped is computed again exactly. Replaces DISK_SKIP_W's drop.
+   Where: `route_publish_kernel` (ds4_kernels.cu). It already holds every expert's selection score (`sqrt(softplus(logit)) + bias`),
+   the weights (`sc / sum * route_scale`) and the card table `vram[]`; the plan the GPU runs and the request the CPU lane reads are
+   both written from `pick[]` there. So the swap happens before either sees the pick: after the top-k, one block-wide pass finds the
+   best-scoring card-resident experts not already picked (as many as ranks past the floor), then rank by rank from the floor up: a pick
+   with `vram == 0` whose `w x (bs_pick - bs_cand) <= budget` (rank 2: `bs_pick - bs_cand <= edge`) becomes the candidate, its weight
+   kept. Counters: offered / taken per rank (device, read at exit). The flip re-check: a token whose stand-ins could have changed the
+   argmax (top-2 logit margin under the check) is run again exactly at the same position - this engine already rewinds for DSpark's
+   rejected drafts, the same rewind is used. The budget lives in device memory (one float), so tuning needs no relaunch.
 4. **Self-tuning budget + brake**, saved per model fingerprint (`standin-tune-<fp>.txt`), as on Qwen.
 5. **Read ahead only exact picks** (`STRATA_LA_TAIL_READ=2`): the store reads ahead only the guesses step 3 will compute exactly.
 6. **Setup / README**: the family in our `setup.py`, the start script, the Monitor for this engine.

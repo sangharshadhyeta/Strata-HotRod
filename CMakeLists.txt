@@ -991,6 +991,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_include_directories(ds4_lalearn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
                                    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
         target_link_libraries(ds4_lalearn_test PRIVATE ${_strata_gpu_runtime_target})
+        # stand-ins in the router (route_publish's Standin, ds4_kernels.cu): a GPU, no model; built, not run by the build
+        add_executable(ds4_standin_test tests/dsv41/standin_test.cu src/dsv41/ds4_kernels.cu)
+        target_include_directories(ds4_standin_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+        target_link_libraries(ds4_standin_test PRIVATE strata_dsv41_kernels ${_strata_gpu_runtime_target})
       endif()
     endif()
     if(STRATA_ENABLE_HIP)

@@ -233,12 +233,27 @@ struct Resp {
     int cpu[kWin];   // 1: part[t] is the CPU lane's weighted sum for token t
     float part[kWin][kMaxDim];
 };
+/// Stand-ins (Strata-HotRod, the rank rule of our Qwen engine): a pick that is not on the card (vram 0, so the CPU lane would compute
+/// it from RAM or the SSD) is replaced by the best card-resident expert the token did not pick, by the router's own selection score,
+/// when the swap is small.  Ranks below floor - 1 are always exact; rank floor - 1 swaps when its logit gap is at most `edge` (0: that
+/// rank exact too); ranks from `floor` on when weight x logit gap is at most `budget`.  The pick keeps its weight.  Device memory: the
+/// host sets floor / edge / budget (a tuner may change budget between tokens) and reads the counters; route_publish with a null Standin
+/// is the router as it was.  used[t] / risk[t]: the window's token t took a stand-in, and the sum of its weight x gap (the flip re-check).
+struct Standin {
+    int floor;
+    float edge;
+    float budget;
+    int pad;
+    unsigned long long offered[kPicks], taken[kPicks];
+    int used[kWin];
+    float risk[kWin];
+};
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
 /// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, int na0 = 0, int na1 = 0);
+                   unsigned vl = 0, int na0 = 0, int na1 = 0, Standin* standin = nullptr);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);

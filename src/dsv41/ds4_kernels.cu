@@ -1587,12 +1587,14 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
-                                                            const float* __restrict__ bias_vl, unsigned vl) {
+                                                            const float* __restrict__ bias_vl, unsigned vl,
+                                                            Standin* __restrict__ sti) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
     __shared__ int pick[16];
     __shared__ int on_cpu;
+    __shared__ int cand[kPicks], n_cand, want;
     const int t = blockIdx.x;
     logits += (size_t) t * 1024;
     if (bias_vl != nullptr && ((vl >> t) & 1u)) bias = bias_vl;
@@ -1626,12 +1628,67 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         }
         __syncthreads();
     }
+    // stand-ins: the card-resident experts the token did not pick, best selection score first, one for each rank that may swap and
+    // is off the card (the picked ones are already out of bs).  Searched only when there is such a rank.
+    const int r0 = sti != nullptr ? max(0, sti->floor - (sti->edge > 0.0f ? 1 : 0)) : k;
+    if (threadIdx.x == 0) {
+        int m = 0;
+        for (int r = r0; r < k; ++r) m += vram[pick[r]] == 0ull;
+        want = m;
+        n_cand = 0;
+    }
+    __syncthreads();
+    for (int c = 0; c < want; ++c) {
+        float best = -FLT_MAX;
+        int bix = 0x7fffffff;
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+            if (vram[i] != 0ull && (bs[i] > best || (bs[i] == best && i < bix))) best = bs[i], bix = i;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+        }
+        if (lane == 0) bv[wp] = best, bi[wp] = bix;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float b = -FLT_MAX;
+            int ix = 0x7fffffff;
+            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (ix < n && b > -FLT_MAX) {
+                cand[n_cand++] = ix;
+                bs[ix] = -FLT_MAX;
+            }
+        }
+        __syncthreads();
+    }
     if (threadIdx.x == 0) {
         float s = 0.0f;
         for (int r = 0; r < k; ++r) s += sc[pick[r]];
+        float wk[kPicks];
+        for (int r = 0; r < k; ++r) wk[r] = sc[pick[r]] / (s + 1e-20f) * route_scale;
+        if (sti != nullptr) {   // the weights stay the picks' own; the ids swap where the rule allows, nearest rank first
+            int c = 0, took = 0;
+            float risk = 0.0f;
+            for (int r = r0; r < k && c < n_cand; ++r) {
+                if (vram[pick[r]] != 0ull) continue;
+                atomicAdd(&sti->offered[r], 1ull);
+                const float gap = fmaxf(0.0f, logits[pick[r]] - logits[cand[c]]);
+                const bool ok = r < sti->floor ? gap <= sti->edge : wk[r] * gap <= sti->budget;
+                if (!ok) continue;
+                atomicAdd(&sti->taken[r], 1ull);
+                pick[r] = cand[c++];
+                took = 1;
+                risk += wk[r] * gap;
+            }
+            if (t < kWin) {
+                sti->used[t] = took;
+                sti->risk[t] = risk;
+            }
+        }
         int cpu = 0;
         for (int r = 0; r < k; ++r) {
-            const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
+            const float wv = wk[r];
             idx[(size_t) t * kPicks + r] = pick[r];
             w[(size_t) t * kPicks + r] = wv;
             plan_ptr[(size_t) t * kPicks + r] = vram[pick[r]];
@@ -2093,7 +2150,7 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1) {
+                   unsigned vl, int na0, int na1, Standin* standin) {
 #if defined(STRATA_METAL)
     // selection only: the prefetch schedule (req) is published by the CUDA kernel, and is turned on separately here
     if (strata::dsv41::metal_host::route_publish(logits, bias, n, k, T, route_scale, vram, idx, w, plan_ptr,
@@ -2104,7 +2161,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     }
 #endif
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl);
+                                           vl != 0 ? bias_vl : nullptr, vl, standin);
     if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
