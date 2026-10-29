@@ -1789,10 +1789,11 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     }
 }
 
-__global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1) {
+__global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, int na2) {
     __threadfence_system();
     req->na[0] = na0;
     req->na[1] = na1;
+    req->na[2] = na2;
     req->T = T;
     __threadfence_system();
     *(volatile unsigned*) &req->seq = seq;
@@ -2192,7 +2193,7 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1, Standin* standin) {
+                   unsigned vl, int na0, int na1, int na2, Standin* standin) {
 #if defined(STRATA_METAL)
     // selection only: the prefetch schedule (req) is published by the CUDA kernel, and is turned on separately here
     if (strata::dsv41::metal_host::route_publish(logits, bias, n, k, T, route_scale, vram, idx, w, plan_ptr,
@@ -2204,7 +2205,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 #endif
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
                                            vl != 0 ? bias_vl : nullptr, vl, standin);
-    if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
+    if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, na2);
 }
 void logit_top2(const float* logits, int n, float* out, cudaStream_t s) {
     strata_ds4_launch(logit_top2_kernel, 1, 1024, 0, s, logits, n, out);

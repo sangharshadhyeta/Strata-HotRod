@@ -217,11 +217,12 @@ void combine(const float* ed, const float* cpu, const float* sh, const Combine& 
 /// a system fence); the host answers with the CPU lane's weighted part of each token that took a CPU-lane expert.
 constexpr int kRing = 64;
 constexpr int kMaxDim = 8192;
-constexpr int kAhead1 = 16, kAhead = kAhead1 + kPicks;   // a token's guesses for the next layer, then the one after
+constexpr int kAhead1 = 16, kAhead = kAhead1 + 2 * kPicks;   // a token's guesses for the next layer, the one after, then 4 ahead
 struct Req {
     unsigned seq;
     int T;
-    int na[2];   // lookahead: ahead[t][0 .. na[0]) the next layer's likely picks, ahead[t][kAhead1 ..) +na[1] the one after's
+    int na[3];   // lookahead: ahead[t][0 .. na[0]) the next layer's likely picks, ahead[t][kAhead1 ..) +na[1] the one after's,
+                 // ahead[t][kAhead1 + kPicks ..) +na[2] the learner's 4 layers ahead (STRATA_LA_LEARN)
     int ids[kWin][kPicks];
     float w[kWin][kPicks];
     int ahead[kWin][kAhead];
@@ -254,7 +255,7 @@ struct Standin {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, int na0 = 0, int na1 = 0, Standin* standin = nullptr);
+                   unsigned vl = 0, int na0 = 0, int na1 = 0, int na2 = 0, Standin* standin = nullptr);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);

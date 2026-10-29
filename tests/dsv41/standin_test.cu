@@ -56,7 +56,7 @@ static Out run(const std::vector<float>& logits, const std::vector<int>& res, co
         cudaMalloc(&d_st, sizeof(Standin));
         cudaMemcpy(d_st, cfg, sizeof(Standin), cudaMemcpyHostToDevice);
     }
-    route_publish(d_log, d_bias, N, K, 1, kScale, d_vram, d_x, DIM, d_idx, d_w, d_plan, nullptr, 0, 0, nullptr, 0, 0, 0, d_st);
+    route_publish(d_log, d_bias, N, K, 1, kScale, d_vram, d_x, DIM, d_idx, d_w, d_plan, nullptr, 0, 0, nullptr, 0, 0, 0, 0, d_st);
     Out o{};
     cudaMemcpy(o.idx, d_idx, K * 4, cudaMemcpyDeviceToHost);
     cudaMemcpy(o.w, d_w, K * 4, cudaMemcpyDeviceToHost);

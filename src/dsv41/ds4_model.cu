@@ -7393,8 +7393,9 @@ struct Model::Impl {
     std::vector<std::pair<const void*, size_t>> pf_want;
     void ahead_ask(int li, const Req& r, unsigned seq, int T) {
         pf_want.clear();
-        for (int a = 1; a <= 2; ++a) {
-            const int m = std::min(r.na[a - 1], a == 1 ? kAhead1 : kPicks), j = li + a;
+        for (int q = 0; q < 3; ++q) {   // the guesses 1, 2 and (the learner's) 4 layers ahead
+            const int a = q == 2 ? 4 : q + 1, off = q == 0 ? 0 : q == 1 ? kAhead1 : kAhead1 + kPicks;
+            const int m = std::min(r.na[q], q == 0 ? kAhead1 : kPicks), j = li + a;
             if (m <= 0 || j >= (int) L.size()) continue;
             const Layer& n = L[(size_t) j];
             uint8_t* fl = ahead_fl.data() + (size_t) j * 1024;
@@ -7408,9 +7409,9 @@ struct Model::Impl {
             const int lim = d_standin != nullptr && la_tail_read == 2 && standin_floor > 0 ? std::min(m, standin_floor) : m;
             for (int t = 0; t < T; ++t)
                 for (int i = 0; i < m; ++i) {
-                    const int e = r.ahead[t][(a - 1) * kAhead1 + i];
+                    const int e = r.ahead[t][off + i];
                     if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
-                    fl[e] |= a == 2 ? 4 : (i < n.k_exp ? 3 : 2);
+                    fl[e] |= a == 4 ? 16 : a == 2 ? 4 : (i < n.k_exp ? 3 : 2);   // (16: 4 layers before)
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
                     if (i >= lim || (fl[e] & 8) || !file_read(n, e)) continue;
                     fl[e] |= 8;
@@ -10369,7 +10370,7 @@ struct Model::Impl {
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
-            int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
+            int na[3] = {0, 0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
             for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
                 const Layer* nx = ahead_layer(L0, a);
                 if (nx == nullptr) break;
@@ -10380,9 +10381,17 @@ struct Model::Impl {
                 route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
                 na[a - 1] = m;
             }
+            // the learner's 4-layers-ahead guesses (row 2 of glog_a, corrected by la_stage) for the read-ahead: their reads start three
+            // layers before the 1-ahead ones would
+            if (lead && la_lay && ahead_mode > 0 && la_tail_read > 0)
+                if (const Layer* n4 = ahead_layer(L0, 4)) {
+                    const int m = std::min(kPicks, n4->k_exp);
+                    route_ahead(d.glog_a + (size_t) 2 * kWin * 1024, n4->gate_bias, n4->n_exp, m, T, reqs + slot, kAhead1 + kPicks, s);
+                    na[2] = m;
+                }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr);   // (stand-ins: decode tokens of the trunk only)
+                          na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr);   // (stand-ins: decode tokens of the trunk only)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
