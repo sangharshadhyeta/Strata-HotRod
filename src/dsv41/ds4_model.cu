@@ -27,6 +27,7 @@
 #include "ds4_pool.hpp"
 #include "ds4_store.hpp"
 #include "ds4_timeline.hpp"
+#include "ds4_standin_tune.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
@@ -1110,6 +1111,16 @@ struct Model::Impl {
     // store, only those ranked below the stand-in floor (standin_floor); 1 every guess (upstream's reading); 0 none (upstream's default
     // with the store).  DS4_AHEAD, when set, decides as before.
     int la_tail_read = 2, standin_floor = 0;
+    // STRATA_ROUTE_BUDGET_AUTO (on with the stand-ins and their re-check; 0: off): the budget searches itself by measured speed under the
+    // flips (ds4_standin_tune.hpp: Strata-HotRod's interleaved A/B, the learned clean ceiling, the per-request brake, k from the re-checks),
+    // kept in <pack>/standin-tune.txt.  tune_b: the budget the device block holds (written before each decode token when it changes);
+    // tune_last_pos: the position after the last decode step (a request starts when a decode step does not follow the last one).
+    bool tune_on = false;
+    StandinTune tune;
+    std::string tune_path;
+    float tune_b = -1.0f;
+    int64_t tune_last_pos = -1;
+    long long tune_toks = 0;
     float fr_k = 4.0f;
     float* d_top2 = nullptr;
     long long fr_used = 0, fr_checks = 0, fr_flips = 0;
@@ -1448,6 +1459,10 @@ struct Model::Impl {
             if (fr_on)
                 std::fprintf(stderr, "stand-ins: %lld decode tokens took them, %lld re-checked exactly, %lld of those changed the top token\n",
                              fr_used, fr_checks, fr_flips);
+            if (tune_on) {
+                std::fprintf(stderr, "stand-ins: the budget's search: %s\n", tune.stats().c_str());
+                if (!tune.save(tune_path)) std::fprintf(stderr, "ds4: stand-ins: %s not written\n", tune_path.c_str());
+            }
             cudaFree(d_standin);
             d_standin = nullptr;
             if (d_top2 != nullptr) {
@@ -3251,6 +3266,16 @@ struct Model::Impl {
                 fr_on = true;
                 fr_k = std::max(0.0f, envf("STRATA_FRAGILE_K0", 4.0f));
                 std::fprintf(stderr, "ds4: stand-ins: flip re-check on (a token with gap < %.2f x risk runs again exactly)\n", fr_k);
+                const char* au = std::getenv("STRATA_ROUTE_BUDGET_AUTO");
+                if (au == nullptr || std::atoi(au) != 0) {
+                    const char* br = std::getenv("STRATA_FRAGILE_BRAKE");
+                    tune.configure(h.budget, fr_k, std::getenv("STRATA_FRAGILE_K0") != nullptr, br == nullptr || std::atoi(br) != 0);
+                    tune_path = o.pack + "/standin-tune.txt";
+                    const bool loaded = tune.load(tune_path);
+                    tune_on = true;
+                    std::fprintf(stderr, "ds4: stand-ins: the budget tunes itself (%s): %s\n", loaded ? ("loaded " + tune_path).c_str() : "new",
+                                 tune.stats().c_str());
+                }
             } else {
                 (void) cudaGetLastError();
                 d_top2 = nullptr;
@@ -8028,6 +8053,35 @@ struct Model::Impl {
     bool step(int token, bool want_logits, std::string& err) {
         if (!fr_on || !want_logits || d_standin == nullptr) return forward(&token, 1, want_logits ? 1 : 0, err);
         const int64_t p0 = pos;
+        const double t_step = now_ms();
+        bool rc = false, flipped = false;
+        float gap = 0.0f, rk = 0.0f;
+        if (tune_on) {   // the budget this token runs at (a request starts when this step does not follow the last decode step)
+            if (p0 != tune_last_pos) tune.begin_request();
+            const float b = tune.budget_for_next_token();
+            fr_k = tune.k();
+            if (b != tune_b) {
+                tune_b = b;
+                Dev& sd = devs[(size_t) L[0].dev];
+                cudaSetDevice(sd.id);
+                CK(cudaMemcpyAsync(&d_standin->budget, &tune_b, sizeof tune_b, cudaMemcpyHostToDevice, sd.st));
+            }
+        }
+        // the tuner's report of this token (its wall time with a re-run, the re-check and its verdict), whichever way the step ends
+        struct Report {
+            Impl* m;
+            const double& t0;
+            const bool& rc;
+            const float& gap;
+            const float& risk;
+            const bool& flipped;
+            ~Report() {
+                if (!m->tune_on) return;
+                m->tune_last_pos = m->pos;
+                m->tune.end_token((now_ms() - t0) / 1000.0, rc, gap, risk, flipped);
+                if (++m->tune_toks % 4096 == 0) m->tune.save(m->tune_path);
+            }
+        } report{this, t_step, rc, gap, rk, flipped};
         if (!forward(&token, 1, 1, err)) return false;
         // the stand-ins' flip re-check: did this token take any, and is its top-two gap a close call against their risk
         Dev& sd = devs[(size_t) L[0].dev];
@@ -8039,13 +8093,16 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(sd.st));
         if (!used) return true;
         ++fr_used;
+        rk = risk;
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
         float t2[3];
         logit_top2(hd.logits, g.vocab, d_top2, hd.st);
         CK(cudaMemcpyAsync(t2, d_top2, sizeof t2, cudaMemcpyDeviceToHost, hd.st));
         CK(cudaStreamSynchronize(hd.st));
-        if (t2[0] - t2[1] >= fr_k * risk) return true;
+        gap = t2[0] - t2[1];
+        if (gap >= fr_k * risk) return true;
+        rc = true;
         const int before = (int) t2[2];
         pos = p0;   // the same position again, exactly (forward appends the token again)
         toks.resize((size_t) p0);
@@ -8060,7 +8117,8 @@ struct Model::Impl {
         logit_top2(hd.logits, g.vocab, d_top2, hd.st);
         CK(cudaMemcpyAsync(t2, d_top2, sizeof t2, cudaMemcpyDeviceToHost, hd.st));
         CK(cudaStreamSynchronize(hd.st));
-        fr_flips += (int) t2[2] != before;
+        flipped = (int) t2[2] != before;
+        fr_flips += flipped;
         return true;
     }
 
