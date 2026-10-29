@@ -20,6 +20,7 @@
 
 #include "ds4_gguf.cuh"
 #include "ds4_iq.cuh"
+#include "ds4_lalearn.cuh"
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
@@ -64,6 +65,7 @@ extern "C" void ds4_busy_end();
 #include <mutex>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 
@@ -536,7 +538,7 @@ struct Dev {
           *sh_out = nullptr, *cpu_part = nullptr, *eg_x = nullptr, *eg_kv = nullptr, *logits = nullptr,
           *freqs_win = nullptr, *freqs_comp = nullptr, *xe = nullptr, *xg = nullptr, *xu = nullptr, *xhh = nullptr,
           *ed = nullptr;
-    float* glog_a = nullptr;   // lookahead: the next two layers' gate logits on this layer's FFN input (rows 1024 apart)
+    float* glog_a = nullptr;   // lookahead: the next layers' gate logits on this layer's FFN input (rows 1024 apart; row dd for the learner's dist kDist[dd])
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     uint8_t* eg_rows = nullptr;
@@ -1089,6 +1091,11 @@ struct Model::Impl {
     // picks by rank on Sun: 97 91 81 70 57 41 %, past the top 6 29 20 %: reads wasted on an SSD-bound PC).
     int ahead_mode = std::getenv("DS4_AHEAD") ? std::atoi(std::getenv("DS4_AHEAD")) : 1;
     int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
+    // STRATA_LA_LEARN (ds4_lalearn.cuh): the learned look-ahead.  la_on: the learner is up; la_win: this window is a decode token that
+    // runs the learner's stages (set in forward); la_toks: the decode tokens counted for the periodic save
+    bool la_on = false, la_win = false;
+    long la_toks = 0;
+    std::string la_path;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
     std::vector<uint8_t> ahead_fl;     // [layer][1024]: 1 the top-k guess, 2 any guess, a layer before; 4 two layers before;
@@ -1410,6 +1417,13 @@ struct Model::Impl {
     }
 
     ~Impl() {
+        if (la_on) {   // the learner's report and its file, before the devices go
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            std::fputs(la::report().c_str(), stderr);
+            la_save();
+            la::release();
+            la_on = false;
+        }
         quit.store(true);
         if (warm_bg.joinable()) warm_bg.join();   // (the warm-up uses the BLAS handles destroyed below)
         eg_io.stop();   // (its threads write into h_eg)
@@ -2577,7 +2591,7 @@ struct Model::Impl {
                       dalloc(d, d.mix, W * 32, err) && dalloc(d, d.a_pre, W * 8, err) && dalloc(d, d.a_post, W * 8, err) &&
                       dalloc(d, d.a_comb, W * 64, err) && dalloc(d, d.f_pre, W * 8, err) &&
                       dalloc(d, d.f_post, W * 8, err) && dalloc(d, d.f_comb, W * 64, err) && dalloc(d, d.pre, W * 8, err) &&
-                      dalloc(d, d.glog, W * 1024, err) && dalloc(d, d.glog_a, 2 * W * 1024, err) &&
+                      dalloc(d, d.glog, W * 1024, err) && dalloc(d, d.glog_a, 3 * W * 1024, err) &&
                       dalloc(d, d.rw, W * kPicks, err) &&
                       dalloc(d, d.ridx, W * kPicks, err) && dalloc(d, d.ridx_a, 2 * kPicks, err) && dalloc(d, d.rw_a, 2 * kPicks, err) &&
                       dalloc(d, d.moe_out, W * D, err) &&
@@ -3107,6 +3121,7 @@ struct Model::Impl {
             cudaSetDevice(d.id);
             CK(cudaStreamSynchronize(d.st));
         }
+        la_init();   // (STRATA_LA_LEARN: the learner, on the trunk's GPU; off unless the env var or the saved file says on)
         if (par || chunk > 0)   // (the windows' threads; the prompt path's, whatever mode the windows take)
             for (size_t di = 0; di < devs.size(); ++di) {
                 workers.push_back(std::make_unique<Worker>());
@@ -3122,6 +3137,66 @@ struct Model::Impl {
         return true;
     }
 
+
+    // STRATA_LA_LEARN (ds4_lalearn.cuh): the learned look-ahead.  Unset: on only when the pack's saved file exists; "0": off; any other
+    // value: on.  Its state lives on the trunk's GPU (all trunk layers on one device).  A saved file that does not fit this model is
+    // refused, and the learner starts new.
+    void la_init() {
+        const char* env = std::getenv("STRATA_LA_LEARN");
+        la_path = o.pack + "/hotrod-predictor.bin";
+        const bool saved = std::ifstream(la_path).good();
+        if (!(env != nullptr ? std::strcmp(env, "0") != 0 : saved)) {
+            std::fprintf(stderr, "ds4: look-ahead learner: off\n");
+            return;
+        }
+        for (int il = 0; il < g.nl; ++il)
+            if (L[(size_t) il].dev != L[0].dev || L[(size_t) il].gate_w == nullptr || L[(size_t) il].n_exp != g.n_exp) {
+                std::fprintf(stderr, "ds4: look-ahead learner: off (the trunk is not on one GPU, or a layer has no router)\n");
+                return;
+            }
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        std::string msg;
+        if (!la::alloc(g.nl, g.dim, g.n_exp, 3, msg)) {
+            std::fprintf(stderr, "ds4: look-ahead learner: off (%s)\n", msg.c_str());
+            return;
+        }
+        std::vector<const unsigned long long*> tabs((size_t) g.nl);
+        for (int il = 0; il < g.nl; ++il) tabs[(size_t) il] = L[(size_t) il].vram_tab;
+        if (!la::set_resident_tables(tabs.data(), g.nl)) {
+            la::release();
+            std::fprintf(stderr, "ds4: look-ahead learner: off (the resident tables)\n");
+            return;
+        }
+        std::string how = "new";
+        if (saved) {
+            std::string lm;
+            if (la::load(la_path.c_str(), lm))
+                how = "loaded " + la_path;
+            else
+                std::fprintf(stderr, "ds4: look-ahead learner: %s not loaded (%s)\n", la_path.c_str(), lm.c_str());
+        }
+        la_on = true;
+        std::fprintf(stderr, "ds4: look-ahead learner: on (%s)\n", how.c_str());
+    }
+    // the learner's stage for trunk layer l on its stream s (a decode token, after the router's GEMV): its label, then for each
+    // distance the next layer's plain logits on this layer's FFN input (rows of glog_a) and the learner's forward, which corrects them
+    void la_stage(Dev& d, const Layer& l, cudaStream_t s) {
+        la::label(l.il, d.glog, 1, s);
+        for (int dd = 0; dd < la::kNd; ++dd) {
+            const int dist = la::kDist[dd];
+            if (l.il + dist >= g.nl) break;
+            const Layer& n = L[(size_t) (l.il + dist)];
+            float* gl = d.glog_a + (size_t) dd * kWin * 1024;
+            gemv_f32(n.gate_w, d.x, n.n_exp, g.dim, 1, gl, 1024, s);
+            la::forward(l.il, dist, d.x, gl, 1, s);
+        }
+    }
+    void la_save() {
+        if (!la_on) return;
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        std::string msg;
+        if (!la::save(la_path.c_str(), msg)) std::fprintf(stderr, "ds4: look-ahead learner: not saved to %s (%s)\n", la_path.c_str(), msg.c_str());
+    }
 
     // the caches' row bytes, packed as DeepSeek keeps them (ds4_kernels.cuh): the window ring's (FP8), the compressed
     // KV's (FP4 + E4M3 scales), the index keys' (FP4 + power-of-two scales)
@@ -9478,12 +9553,25 @@ struct Model::Impl {
         for (int t = 0; t < T; ++t)   // (h_emb is written again by the next window, after this one's last sync)
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
         plan_window(p0, T, wplan);
+        la_win = la_on && T == 1 && wplan.async;   // the learner's window: a decode token on the async path
+        if (la_win) {
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            la::pre_launch(devs[(size_t) L[0].dev].st);
+        }
         prof_window = prof_on && T == 1;
         n_logits = std::min(logits_rows, T);
         const double tl = now_ms();
         if (par) {
             if (!forward_par(p0, T, err)) return false;
         } else if (!forward_serial(p0, T, err)) return false;
+        if (la_win) {   // the window's batch on the learner's side stream, after the window's last layer
+            try {
+                la::post_launch(devs[(size_t) L[0].dev].st, 1);
+            } catch (const std::exception& e) {
+                err = std::string("look-ahead learner: ") + e.what();
+                return false;
+            }
+        }
         st.layer_ms += now_ms() - tl;
         for (auto& b : eg_win)
             if (b->live) eg_finish(*b);
@@ -9498,6 +9586,8 @@ struct Model::Impl {
         pos += T;
         st.tokens += T;
         cache_tick(T);
+        if (la_win && ++la_toks % 4096 == 0) la_save();
+        la_win = false;   // (the window's learner stages end here: the drafter's blocks after it are not learned)
         if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
     }
@@ -10050,6 +10140,9 @@ struct Model::Impl {
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
             // router made), and waits for the answer only before the experts' sum
             gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+            // the learner (la_win: a decode token): this layer's label, and the next layers' logits corrected before they pick
+            const bool la_lay = la_win && !l.mtp && mi == 0;
+            if (la_lay) la_stage(d, l, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
@@ -10059,7 +10152,7 @@ struct Model::Impl {
                 if (nx == nullptr) break;
                 const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
                 float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
-                gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
+                if (!la_lay) gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
                                                                          // weights instead: the same hit rate)
                 route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
                 na[a - 1] = m;
