@@ -3605,6 +3605,8 @@ def _pid_alive(pid: int) -> bool:
 # holds "1".  One pair of files per server process (its pid in the name).
 TIMELINE_FILE = os.path.join(tempfile.gettempdir(), f"strata-timeline-{os.getpid()}.json")
 TIMELINE_CTL = os.path.join(tempfile.gettempdir(), f"strata-timeline-{os.getpid()}.ctl")
+# the Monitor's "Experts in VRAM" map: the engine rewrites RESIDENCY_FILE every swap round (see residency_view)
+RESIDENCY_FILE = os.path.join(tempfile.gettempdir(), f"strata-residency-{os.getpid()}.json")
 
 
 def _drop_stale_timeline_files():
@@ -3628,6 +3630,26 @@ def _drop_stale_timeline_files():
                 pass
 
 
+def _drop_stale_residency_files():
+    """The residency map's file is per server process too, and was never removed: 269 of them had piled up in the temp folder
+    (19 Oct).  At start, the files of servers that no longer run are deleted, and so is one under this process's own id."""
+    tmp = tempfile.gettempdir()
+    for name in os.listdir(tmp):
+        if not name.startswith("strata-residency-"):
+            continue
+        ext = next((x for x in (".json.tmp", ".json") if name.endswith(x)), None)   # (.tmp: an engine ended mid-write)
+        if ext is None:
+            continue
+        pid = name[len("strata-residency-"):-len(ext)]
+        if not pid.isdigit():
+            continue
+        if int(pid) == os.getpid() or not _pid_alive(int(pid)):
+            try:
+                os.remove(os.path.join(tmp, name))
+            except OSError:
+                pass
+
+
 def _remove_timeline_files() -> None:
     for f in (TIMELINE_FILE, TIMELINE_CTL):
         try:
@@ -3638,6 +3660,10 @@ def _remove_timeline_files() -> None:
 
 try:
     _drop_stale_timeline_files()
+except OSError:
+    pass
+try:
+    _drop_stale_residency_files()
 except OSError:
     pass
 atexit.register(_remove_timeline_files)
@@ -3784,6 +3810,21 @@ def timeline_view(after=None, base=None) -> dict:
         return {"on": True, "data": _timeline_data(after, base) if _TL["last"] is not None else None}
 
 
+def residency_view(max_age_s: float = 30.0) -> dict | None:
+    """/metrics: which experts are in VRAM (a layer-by-expert map the engine's swap round writes every couple of seconds to
+    STRATA_RESIDENCY_FILE); None when the engine has not written one (an older engine, or nothing swapped yet) or the file is
+    stale."""
+    try:
+        st = os.stat(RESIDENCY_FILE)
+        if time.time() - st.st_mtime > max_age_s:
+            return None
+        with open(RESIDENCY_FILE, "rb") as f:
+            d = json.loads(f.read())
+        return d if isinstance(d, dict) and d.get("v") == 1 and isinstance(d.get("rows"), list) else None
+    except (OSError, ValueError):
+        return None
+
+
 def child_env(cfg: dict, *, offline: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -3802,6 +3843,7 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         deepseek_slot_env(env, cfg)
     env.setdefault("STRATA_TIMELINE_FILE", TIMELINE_FILE)     # the Monitor's decode timeline (timeline_view), off until switched on
     env.setdefault("STRATA_TIMELINE_CTL", TIMELINE_CTL)
+    env.setdefault("STRATA_RESIDENCY_FILE", RESIDENCY_FILE)   # the Monitor's expert map (residency_view), written per swap round
     if cfg.get("timeline") is not False:           # the Monitor's timeline runs from the start (config "timeline": false: off until switched on)
         try:
             set_timeline(True)
@@ -4999,7 +5041,7 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
-                "timeline": timeline_view(tl_after, tl_base),
+                "timeline": timeline_view(tl_after, tl_base), "residency": residency_view(),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}

@@ -374,6 +374,7 @@ function render(m) {
   if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderResidency(m.residency);
   if (tab === "monitor") renderTimeline(m.timeline);
   if (tab === "about") renderAbout(eng, hw, st);
 }
@@ -409,6 +410,47 @@ function renderConvCache(c) {
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+}
+
+// the experts held in VRAM, from the engine's swap round: rows[layer][expert] is '0' not resident, '1' resident and idle, '2' used, '3' hot.
+// The layers and experts counts come from the data (DeepSeek: 40 x 384, Qwen: 48 x 512), so nothing here is a constant.
+function renderResidency(r) {
+  const card = $("res-card");
+  card.hidden = !r || !r.rows.length;
+  if (card.hidden) return;                         // an older engine, no swap round yet, or a stale file
+  const canvas = $("res-canvas"), n = r.experts, rows = r.rows, L = rows.length;
+  // one layer = a block of bw x bh cells (512 experts: 32 x 16), the blocks tiled bcols across with a 1-cell gap: every expert is a square
+  const bw = n % 32 === 0 ? 32 : Math.ceil(Math.sqrt(n)), bh = Math.ceil(n / bw);
+  const bcols = Math.min(L, 8), brows = Math.ceil(L / bcols);
+  const cw = bcols * bw + (bcols - 1), ch = brows * bh + (brows - 1);
+  if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
+  const css = getComputedStyle(document.documentElement);
+  const tone = (name, fallback) => {                // "#rrggbb" of a token, drawn into an ImageData
+    const v = css.getPropertyValue(name).trim();
+    const m = /^#([0-9a-f]{6})$/i.exec(v) || /^#([0-9a-f]{6})$/i.exec(fallback);
+    const x = parseInt(m[1], 16);
+    return [(x >> 16) & 255, (x >> 8) & 255, x & 255];
+  };
+  const bg = tone("--st-surface-2", "#f7f7f7"), acc = tone("--st-accent", "#10b981"), hot = tone("--st-accent-hover", "#0c8a60");
+  const surf = tone("--st-surface", "#ffffff");
+  const idle = acc.map((c, i) => Math.round(0.28 * c + 0.72 * surf[i]));
+  const colors = [bg, idle, acc, hot];
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(cw, ch);
+  const gap = tone("--st-line", "#e5e7eb");           // the 1-cell gaps between the layers' blocks
+  for (let i = 0; i < cw * ch; i++) {
+    img.data[i * 4] = gap[0]; img.data[i * 4 + 1] = gap[1]; img.data[i * 4 + 2] = gap[2]; img.data[i * 4 + 3] = 255;
+  }
+  rows.forEach((row, l) => {
+    const x0 = (l % bcols) * (bw + 1), y0 = Math.floor(l / bcols) * (bh + 1);
+    for (let e = 0; e < n; e++) {
+      const c = colors[row.charCodeAt(e) - 48] || bg, o = ((y0 + Math.floor(e / bw)) * cw + x0 + (e % bw)) * 4;
+      img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
+    }
+  });
+  ctx.putImageData(img, 0, 0);
+  const total = r.layers * r.experts;
+  $("res-sum").textContent = `${fmt(r.resident)} of ${fmt(total)} experts · ${fmt(r.swaps)} swaps in ${fmt(r.round)} rounds${r.quality_swaps ? ` (${fmt(r.quality_swaps)} for quality)` : ""}`;
 }
 
 // the decode timeline: a scrolling view of the engine's host times, one buffer a second from /metrics (layers: [window, layer, tokens,
