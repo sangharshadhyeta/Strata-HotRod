@@ -400,6 +400,7 @@ void MtpDrafter::slot_service() {
             if (old >= 0) h_slot_[old] = -1;
             h_slot_[e] = slot;
             expert_of_[(size_t) slot] = e;
+            ref_h_[slot] = 1;   // a fresh install gets one pass of the hand: it was just missed at rank 0-1, so it is wanted
             L.state[b] = MtpSlotLoader::kCopying;
             ++slot_loads_;
             installed = true;
