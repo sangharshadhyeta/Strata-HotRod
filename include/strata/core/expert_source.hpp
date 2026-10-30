@@ -715,9 +715,12 @@ bool timeline_on();
 /// token being decoded, 1..: the drafts), split into RAM-tier reads (ram) and SSD reads (ssd), rows 0-7; take() returns and clears them.
 bool draft_miss_on();
 void draft_miss_take(int64_t ram[8], int64_t ssd[8]);
-/// STRATA_DRAFT_COLD_CUT=1: a decode window's draft row that needs an SSD read cuts the window there (the read is not made, the rows from the
-/// cut on are rejected at the commit).  take() returns the window's cut row (99: none) and clears it; skipped() counts the reads saved.
+/// STRATA_DRAFT_COLD_CUT=<theta>: a decode window's draft row that needs an SSD read and whose chance to be kept (draft_reach_set: the product
+/// of the draft probabilities up to it) is below theta cuts the window there (the read is not made, the rows from the cut on are rejected at
+/// the commit).  take() returns the window's cut row (99: none) and clears it and the chances; skipped() counts the reads saved.
 bool draft_cold_cut_on();
+float draft_cold_cut_theta();
+void draft_reach_set(const float* reach, int n);   ///< rows 0..n-1 of the next window (row 0: 1); rows not set: 1
 int draft_cold_cut_take();
 int64_t draft_cold_cut_skipped();
 void timeline_tick();

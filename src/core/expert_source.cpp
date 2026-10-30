@@ -867,12 +867,20 @@ bool draft_miss_on() {
 namespace {
 std::atomic<int> g_cold_cut{99};
 std::atomic<int64_t> g_cold_skipped{0};
+float g_reach[8] = {1, 1, 1, 1, 1, 1, 1, 1};   // the next window's rows' chances to be kept (the serve loop sets them before the window)
 }  // namespace
-bool draft_cold_cut_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_DRAFT_COLD_CUT"); return v != nullptr && std::atoi(v) != 0; }();
-    return on;
+float draft_cold_cut_theta() {
+    static const float th = [] { const char* v = std::getenv("STRATA_DRAFT_COLD_CUT"); return v != nullptr ? (float) std::atof(v) : 0.0f; }();
+    return th;
 }
-int draft_cold_cut_take() { return g_cold_cut.exchange(99, std::memory_order_relaxed); }
+bool draft_cold_cut_on() { return draft_cold_cut_theta() > 0.0f; }
+void draft_reach_set(const float* reach, int n) {
+    for (int r = 0; r < 8; ++r) g_reach[r] = r < n ? reach[r] : 1.0f;
+}
+int draft_cold_cut_take() {
+    for (float& x : g_reach) x = 1.0f;
+    return g_cold_cut.exchange(99, std::memory_order_relaxed);
+}
 int64_t draft_cold_cut_skipped() { return g_cold_skipped.load(std::memory_order_relaxed); }
 void draft_miss_take(int64_t ram[8], int64_t ssd[8]) {
     for (int r = 0; r < 8; ++r) {
@@ -5782,7 +5790,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int32_t e = ids[distinct[q]];
                 if (skip_d[q] || e < 0 || e >= d.n_expert || d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;
                 if ((d.peer != nullptr && d.peer->has(d.layers, e)) || helper_holds(e)) continue;
-                if (minr[q] >= 1 && !d.src->page_cached(d.layers, e)) cut = std::min(cut, minr[q]);   // an SSD read for a draft (not in the RAM tier or the page cache)
+                if (minr[q] >= 1 && minr[q] < 8 && g_reach[minr[q]] < draft_cold_cut_theta() && !d.src->page_cached(d.layers, e))
+                    cut = std::min(cut, minr[q]);   // an SSD read for an unlikely draft (not in the RAM tier or the page cache)
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];

@@ -15843,6 +15843,12 @@ int main(int argc, char** argv) {
                 }
                 const int T_mtp = T;
                 T += chain_n;
+                if (strata::core::draft_cold_cut_on()) {   // STRATA_DRAFT_COLD_CUT: each row's chance to be kept (the MTP's draft probabilities)
+                    float reach[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+                    if (use_mtp && !from_sfx && !first_window)
+                        for (int r = 1; r < T_mtp && r < 8; ++r) reach[r] = reach[r - 1] * dprob[(size_t) r - 1];
+                    strata::core::draft_reach_set(reach, 8);
+                }
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
