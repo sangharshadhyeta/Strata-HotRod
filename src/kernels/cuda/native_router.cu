@@ -652,6 +652,54 @@ void native_route_tally(const float* logits, const int32_t* ids, const float* we
                         int32_t* seq_ids, float* seq_w, unsigned int* seq_n, unsigned int seq_cap) {
     route_tally_k<<<n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, acc, seq_ids, seq_w, seq_n, seq_cap);
 }
+namespace {
+// STRATA_MTP_SLOTS: one warp per token (see mtp_slot_remap).  Every lane runs the same decisions (the argmax is a butterfly, so all
+// lanes hold the winner); lane 0 does the atomics and the final writes, after all ten picks were read into registers.
+__global__ void mtp_slot_remap_k(const float* __restrict__ logits, int32_t* __restrict__ ids, const int32_t* __restrict__ d_slot,
+                                 uint8_t* __restrict__ ref, int32_t* __restrict__ want, unsigned int* __restrict__ want_n,
+                                 unsigned int want_cap, unsigned long long* __restrict__ stats) {
+    const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
+    int orig[10], chosen[10], fin[10];
+    for (int r = 0; r < 10; ++r) { orig[r] = ids[t * 10 + r]; chosen[r] = -1; }
+    for (int r = 0; r < 10; ++r) {
+        const int e = orig[r];
+        const int s = (e >= 0 && e < 512) ? d_slot[e] : -1;
+        if (lane == 0) atomicAdd(&stats[r], 1ull);
+        if (s >= 0) {
+            fin[r] = s;
+            if (lane == 0) { ref[s] = 1; atomicAdd(&stats[10 + r], 1ull); }
+            continue;
+        }
+        if (r < 2 && lane == 0) {
+            const unsigned int i = atomicAdd(want_n, 1u);
+            if (i < want_cap) want[i] = e;
+        }
+        float bv = -FLT_MAX;
+        int bi = -1;
+        for (int x = lane; x < 512; x += 32) {
+            if (d_slot[x] < 0) continue;
+            bool used = false;
+            for (int q = 0; q < 10; ++q) if (orig[q] == x || chosen[q] == x) { used = true; break; }
+            if (used) continue;
+            const float v = logits[(size_t) t * 512 + x];
+            if (bi < 0 || v > bv) { bv = v; bi = x; }   // this lane's x ascend: the first (lowest id) of equal values stays
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
+        }
+        const int best = __shfl_sync(0xffffffffu, bi, 0);
+        chosen[r] = best;
+        fin[r] = best >= 0 ? d_slot[best] : 0;
+    }
+    if (lane == 0) for (int r = 0; r < 10; ++r) ids[t * 10 + r] = fin[r];
+}
+}  // namespace
+void mtp_slot_remap(const float* logits, int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* ref, int32_t* want, unsigned int* want_n,
+                    unsigned int want_cap, unsigned long long* stats, void* stream) {
+    mtp_slot_remap_k<<<n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, d_slot, ref, want, want_n, want_cap, stats);
+}
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift) {

@@ -175,6 +175,13 @@ void route_want_drain(float* usage, size_t n);
 /// seq_*: nullptr, or the routed tokens in order (token k at [k*10 .. k*10+9], ids by rank and their weights) up to seq_cap tokens.
 void native_route_tally(const float* logits, const int32_t* ids, const float* weights, int n_tok, float* acc, void* stream,
                         int32_t* seq_ids = nullptr, float* seq_w = nullptr, unsigned int* seq_n = nullptr, unsigned int seq_cap = 0);
+/// STRATA_MTP_SLOTS (opt-in, the drafter): ids [n_tok][10] hold expert ids (the router's picks by rank); d_slot[e] is expert e's slot or
+/// -1.  One warp per token: a resident pick becomes its slot (ref[slot] = 1, a hit); a miss becomes the slot of the resident expert with the
+/// highest logit that is not one of the token's ten picks nor an earlier stand-in of the token (ties: lower id), and a rank 0-1 miss is
+/// also appended to `want` (want_n counts every one, want_cap entries are kept).  stats: [r] picks of rank r, [10 + r] hits of rank r.
+/// The ids are written as slots after all ten ranks are decided.  Weights are not touched.  Capturable; CUDA.
+void mtp_slot_remap(const float* logits, int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* ref, int32_t* want, unsigned int* want_n,
+                    unsigned int want_cap, unsigned long long* stats, void* stream);
 void route_detail_alloc();
 void route_detail_read(unsigned long long* out16);   // 48 entries: [16..21] replaced-pick weight buckets (<1%,<2,<5,<10,<20,>=20), [22..26] substitute rank in the router ranking (<20,<40,<80,<160,>=160), [27..32] score gap (<0.5,<1,<2,<4,<8,>=8), [33..42] summed weight per rank x1e6
 }

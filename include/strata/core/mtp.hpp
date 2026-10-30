@@ -33,6 +33,7 @@
 namespace strata::core {
 
 class NativeHead;
+struct MtpSlotLoader;   // STRATA_MTP_SLOTS: the host loader (mtp.cpp)
 
 class MtpDrafter {
 public:
@@ -295,6 +296,30 @@ private:
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
+
+    // ---- STRATA_MTP_SLOTS=<n> (opt-in): only n of the 512 drafter experts are on the GPU, in slots 0..n-1.  A pick whose
+    // expert is resident uses its slot; a miss takes a stand-in (mtp_slot_remap, native_router.cu).  A rank 0-1 miss is
+    // loaded by the host loader thread from experts.bin and installed between rounds (slot_service), evicting by CLOCK.
+    bool slots_load(const std::string& rt_dir, std::string& err);   ///< experts_ as n slots, the maps, the loader thread
+    void slot_service();     ///< the host's share of a round: installs, evictions, wants; a no-op while the stream is busy
+    void slot_stop();       ///< joins the loader, frees its buffers, prints the stats line (destructor)
+    int slots_n_ = 0;
+    int32_t* d_slot_ = nullptr;      ///< device: expert id -> slot or -1 (512 int32)
+    int32_t* h_slot_ = nullptr;      ///< pinned host copy of d_slot_ (512 int32)
+    std::vector<int> expert_of_;     ///< slot -> the expert it holds (-1 none)
+    uint8_t* ref_h_ = nullptr;       ///< mapped: CLOCK reference bit per slot (set by the remap kernel on a hit)
+    uint8_t* ref_d_ = nullptr;
+    int32_t* want_h_ = nullptr;      ///< mapped: the rank 0-1 misses the kernel saw (4096 entries)
+    int32_t* want_d_ = nullptr;
+    unsigned int* want_n_h_ = nullptr;   ///< mapped: how many misses were written (may exceed the entries)
+    unsigned int* want_n_d_ = nullptr;
+    unsigned long long* st_h_ = nullptr; ///< mapped: 20 counters, picks[r] at r, hits[r] at 10 + r
+    unsigned long long* st_d_ = nullptr;
+    unsigned int want_read_ = 0;
+    int clock_hand_ = 0;
+    uint64_t slot_loads_ = 0, slot_rounds_ = 0;
+    std::vector<bool> pending_;      ///< host: an expert requested from the loader and not yet installed
+    MtpSlotLoader* slot_ld_ = nullptr;
 };
 
 }  // namespace strata::core

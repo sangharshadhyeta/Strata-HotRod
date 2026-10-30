@@ -43,6 +43,15 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <cerrno>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #if defined(_WIN32)
 #include <intrin.h>
 #elif defined(__x86_64__)
@@ -173,9 +182,72 @@ struct MtpTally {
 } g_tally;
 }
 
+#if !defined(_WIN32) && !defined(STRATA_GPU_METAL)
+// STRATA_MTP_SLOTS: the loader's state.  The thread reads experts.bin into one of kBufs pinned buffers per request; the
+// drafter's service (its stream idle) installs the ready ones and frees the copied ones.  The fields are guarded by mu.
+struct MtpSlotLoader {
+    static constexpr int kBufs = 8;
+    enum State { kFree, kLoading, kReady, kCopying };
+    int fd = -1;
+    uint8_t* buf[kBufs] = {};
+    State state[kBufs] = {};
+    int exp_of[kBufs] = {};
+    bool bad[kBufs] = {};     ///< the read came up short
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<int> req;      ///< expert ids asked for
+    bool stop = false;
+    std::thread th;
+};
+
+void slot_loader_main(MtpSlotLoader* L) {
+    const size_t blob = strata::kernels::cpu::BLOB;
+    std::unique_lock<std::mutex> lk(L->mu);
+    for (;;) {
+        L->cv.wait(lk, [L] { return L->stop || !L->req.empty(); });
+        if (L->stop) return;
+        const int e = L->req.front();
+        L->req.pop_front();
+        int b = -1;
+        auto find_free = [L] {
+            for (int i = 0; i < MtpSlotLoader::kBufs; ++i) if (L->state[i] == MtpSlotLoader::kFree) return i;
+            return -1;
+        };
+        L->cv.wait(lk, [&] { return L->stop || (b = find_free()) >= 0; });
+        if (L->stop) return;
+        L->state[b] = MtpSlotLoader::kLoading;
+        L->exp_of[b] = e;
+        L->bad[b] = false;
+        lk.unlock();
+        uint8_t* dst = L->buf[b];
+        bool ok = true;
+        for (size_t got = 0; got < blob && ok;) {
+            const ssize_t r = ::pread(L->fd, dst + got, blob - got, (off_t) ((uint64_t) e * blob + got));
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) ok = false;
+            else got += (size_t) r;
+        }
+        lk.lock();
+        L->bad[b] = !ok;
+        L->state[b] = MtpSlotLoader::kReady;
+    }
+}
+
+void print_slot_stats(const unsigned long long* st, uint64_t rounds, uint64_t loads) {
+    const volatile unsigned long long* v = st;   // [r] picks of rank r, [10 + r] hits of rank r (written by the kernel)
+    auto pct = [](unsigned long long hit, unsigned long long pick) { return pick ? 100.0 * (double) hit / (double) pick : 0.0; };
+    unsigned long long h3 = 0, p3 = 0;
+    for (int r = 3; r < 10; ++r) { h3 += v[10 + r]; p3 += v[r]; }
+    std::fprintf(stderr, "strata mtp slots: %llu rounds, hits r0 %.1f%% r1 %.1f%% r2 %.1f%% r3-9 %.1f%%, %llu loads\n",
+                 (unsigned long long) rounds, pct(v[10], v[0]), pct(v[11], v[1]), pct(v[12], v[2]), pct(h3, p3),
+                 (unsigned long long) loads);
+}
+#endif
+
 MtpDrafter::~MtpDrafter() {
     g_tally.dump();
     if (cs_) cudaStreamSynchronize(cs_);
+    slot_stop();   // the loader thread ends before anything it uses is freed
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
@@ -197,6 +269,12 @@ MtpDrafter::~MtpDrafter() {
     if (sh_join_) cudaEventDestroy(sh_join_);
     if (owns_weights_ && dense_) cudaFree(dense_);
     if (owns_weights_ && experts_) cudaFree(experts_);
+    if (d_slot_) cudaFree(d_slot_);
+    if (h_slot_) cudaFreeHost(h_slot_);
+    if (ref_h_) cudaFreeHost(ref_h_);
+    if (want_h_) cudaFreeHost(want_h_);
+    if (want_n_h_) cudaFreeHost(want_n_h_);
+    if (st_h_) cudaFreeHost(st_h_);
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
@@ -206,6 +284,165 @@ MtpDrafter::~MtpDrafter() {
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
+}
+
+// STRATA_MTP_SLOTS: the experts as n slots (the drafter's own; a shared drafter cannot borrow them)
+bool MtpDrafter::slots_load(const std::string& rt_dir, std::string& err) {
+#if defined(_WIN32) || defined(STRATA_GPU_METAL)
+    (void) rt_dir;
+    err = "mtp: STRATA_MTP_SLOTS needs a POSIX build";
+    return false;
+#else
+    const size_t blob = strata::kernels::cpu::BLOB;
+    const int n = slots_n_;
+    // the initial experts: STRATA_MTP_SLOTS_RANK=<file> (512 little-endian u16 ids, most used first), else 0..n-1
+    std::vector<int> init;
+    std::vector<bool> used(512, false);
+    if (const char* rf = std::getenv("STRATA_MTP_SLOTS_RANK"); rf != nullptr && *rf != 0) {
+        std::vector<uint8_t> raw;
+        if (read_file(rf, raw) && raw.size() == 1024) {
+            for (size_t i = 0; i < 512 && (int) init.size() < n; ++i) {
+                const int e = raw[2 * i] | (raw[2 * i + 1] << 8);
+                if (e < 512 && !used[(size_t) e]) { used[(size_t) e] = true; init.push_back(e); }
+            }
+        } else {
+            std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS_RANK=%s is not a 1024-byte ranking; using experts 0..%d\n", rf, n - 1);
+        }
+    }
+    for (int e = 0; (int) init.size() < n; ++e) if (!used[(size_t) e]) { used[(size_t) e] = true; init.push_back(e); }
+    const int fd = ::open((rt_dir + "/experts.bin").c_str(), O_RDONLY);
+    if (fd < 0) { err = "mtp: cannot open experts.bin"; return false; }
+    if (cudaMalloc((void**) &experts_, (size_t) n * blob) != cudaSuccess) {
+        ::close(fd);
+        err = "mtp: the drafter's expert slots do not fit in VRAM";
+        return false;
+    }
+    vram_ += (uint64_t) n * blob;
+    std::vector<uint8_t> chunk(blob);
+    for (int s = 0; s < n; ++s) {
+        for (size_t got = 0; got < blob;) {
+            const ssize_t r = ::pread(fd, chunk.data() + got, blob - got, (off_t) ((uint64_t) init[(size_t) s] * blob + got));
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) { ::close(fd); err = "mtp: experts.bin is truncated"; return false; }
+            got += (size_t) r;
+        }
+        if (cudaMemcpy(experts_ + (size_t) s * blob, chunk.data(), blob, cudaMemcpyHostToDevice) != cudaSuccess) {
+            ::close(fd);
+            err = "mtp: the drafter's expert slots";
+            return false;
+        }
+    }
+    expert_of_.assign((size_t) n, -1);
+    for (int s = 0; s < n; ++s) expert_of_[(size_t) s] = init[(size_t) s];
+    if (cudaHostAlloc((void**) &h_slot_, 512 * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess ||
+        cudaMalloc((void**) &d_slot_, 512 * sizeof(int32_t)) != cudaSuccess) {
+        ::close(fd);
+        err = "mtp: the slot map";
+        return false;
+    }
+    for (int e = 0; e < 512; ++e) h_slot_[e] = -1;
+    for (int s = 0; s < n; ++s) h_slot_[init[(size_t) s]] = s;
+    cudaMemcpy(d_slot_, h_slot_, 512 * sizeof(int32_t), cudaMemcpyHostToDevice);
+    if (!mapped((size_t) n, (void**) &ref_h_, (void**) &ref_d_) ||
+        !mapped(4096 * sizeof(int32_t), (void**) &want_h_, (void**) &want_d_) ||
+        !mapped(sizeof(unsigned int), (void**) &want_n_h_, (void**) &want_n_d_) ||
+        !mapped(20 * sizeof(unsigned long long), (void**) &st_h_, (void**) &st_d_)) {
+        ::close(fd);
+        err = "mtp: the slot counters";
+        return false;
+    }
+    pending_.assign(512, false);
+    want_read_ = 0;
+    clock_hand_ = 0;
+    slot_ld_ = new MtpSlotLoader();   // owns fd from here (slot_stop closes it)
+    slot_ld_->fd = fd;
+    for (uint8_t*& b : slot_ld_->buf) {
+        if (cudaHostAlloc((void**) &b, blob, cudaHostAllocDefault) != cudaSuccess) { err = "mtp: the loader's buffers"; return false; }
+    }
+    slot_ld_->th = std::thread(slot_loader_main, slot_ld_);
+    std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS=%d: %d of 512 drafter experts on the GPU (%.0f MiB, %.0f MiB freed), a rank 0-1 miss loads its expert, other misses take a stand-in\n",
+                 n, n, (double) n * (double) blob / 1048576.0, (double) (512 - n) * (double) blob / 1048576.0);
+    return true;
+#endif
+}
+
+// The host's share of a round, first thing in draft / chain_launch / draft_first.  Only when the drafter's stream is idle: then
+// every copy and every map write is ordered before the next launch, so a slot is never evicted while a copy into it is pending.
+void MtpDrafter::slot_service() {
+#if !defined(_WIN32) && !defined(STRATA_GPU_METAL)
+    if (slots_n_ <= 0 || slot_ld_ == nullptr || cs_ == nullptr) return;
+    if (cudaStreamQuery(cs_) != cudaSuccess) return;   // busy: skip this round
+    MtpSlotLoader& L = *slot_ld_;
+    const size_t blob = strata::kernels::cpu::BLOB;
+    bool installed = false;
+    {
+        std::lock_guard<std::mutex> lk(L.mu);
+        for (int b = 0; b < MtpSlotLoader::kBufs; ++b)   // a: the copies that have finished
+            if (L.state[b] == MtpSlotLoader::kCopying) L.state[b] = MtpSlotLoader::kFree;
+        for (int b = 0; b < MtpSlotLoader::kBufs; ++b) {   // b: the ready ones into slots, CLOCK for the victim
+            if (L.state[b] != MtpSlotLoader::kReady) continue;
+            const int e = L.exp_of[b];
+            if (e < 0 || e >= 512) { L.state[b] = MtpSlotLoader::kFree; continue; }
+            pending_[(size_t) e] = false;
+            if (L.bad[b] || h_slot_[e] >= 0) { L.state[b] = MtpSlotLoader::kFree; continue; }
+            int slot = -1;
+            while (slot < 0) {
+                const int s = clock_hand_;
+                clock_hand_ = (s + 1) % slots_n_;
+                if (ref_h_[s] != 0) ref_h_[s] = 0;
+                else slot = s;
+            }
+            if (cudaMemcpyAsync(experts_ + (size_t) slot * blob, L.buf[b], blob, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+                L.state[b] = MtpSlotLoader::kFree;
+                continue;
+            }
+            const int old = expert_of_[(size_t) slot];
+            if (old >= 0) h_slot_[old] = -1;
+            h_slot_[e] = slot;
+            expert_of_[(size_t) slot] = e;
+            L.state[b] = MtpSlotLoader::kCopying;
+            ++slot_loads_;
+            installed = true;
+        }
+        if (installed && cudaMemcpyAsync(d_slot_, h_slot_, 512 * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess)
+            std::fprintf(stderr, "strata mtp slots: the slot map copy failed\n");
+        L.cv.notify_all();   // frees above wake the loader
+    }
+    // d: the rank 0-1 misses the kernel wrote since the last round (the stream is idle: nothing writes them now)
+    const unsigned int n_want = *(volatile unsigned int*) want_n_h_;
+    const unsigned int lim = std::min(n_want, 4096u);
+    if (lim > want_read_) {
+        std::lock_guard<std::mutex> lk(L.mu);
+        for (unsigned int i = want_read_; i < lim; ++i) {
+            const int e = want_h_[i];
+            if (e < 0 || e >= 512 || h_slot_[e] >= 0 || pending_[(size_t) e]) continue;
+            pending_[(size_t) e] = true;
+            L.req.push_back(e);
+        }
+        L.cv.notify_all();
+    }
+    *(volatile unsigned int*) want_n_h_ = 0;
+    want_read_ = 0;
+    ++slot_rounds_;
+    if (slot_rounds_ % 512 == 0) print_slot_stats(st_h_, slot_rounds_, slot_loads_);
+#endif
+}
+
+void MtpDrafter::slot_stop() {
+#if !defined(_WIN32) && !defined(STRATA_GPU_METAL)
+    if (slots_n_ > 0 && st_h_ != nullptr) print_slot_stats(st_h_, slot_rounds_, slot_loads_);
+    if (slot_ld_ == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lk(slot_ld_->mu);
+        slot_ld_->stop = true;
+    }
+    slot_ld_->cv.notify_all();
+    if (slot_ld_->th.joinable()) slot_ld_->th.join();
+    if (slot_ld_->fd >= 0) ::close(slot_ld_->fd);
+    for (uint8_t* p : slot_ld_->buf) if (p) cudaFreeHost(p);
+    delete slot_ld_;
+    slot_ld_ = nullptr;
+#endif
 }
 
 const float* MtpDrafter::f32(const char* name) const {
@@ -306,6 +543,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     rt_dir_ = rt_dir;
     if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
     if (shared != nullptr) {
+        if (shared->slots_n_ > 0) { err = "mtp: a drafter with STRATA_MTP_SLOTS keeps its own experts; it cannot be shared"; return false; }
         if (shared->device_ != device_ || shared->g_ != &g || shared->dense_ == nullptr ||
             shared->experts_ == nullptr || shared->rt_dir_ != rt_dir) {
             err = "mtp: incompatible shared weights";
@@ -319,6 +557,18 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     // Loader fix (0.1.15+loaderfix.2): the two reads below are the whole “drafter files” cost; reporting
     // them apart from the rest of the stage is what makes the next regression visible.
+    // STRATA_MTP_SLOTS=<n> (opt-in): n drafter experts on the GPU, 32..511.  Anything else leaves today's path (said once).
+    if (const char* sv = std::getenv("STRATA_MTP_SLOTS"); sv != nullptr) {
+#if defined(_WIN32)
+        std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored: the slot loader needs a POSIX build\n");
+#else
+        const int n = std::atoi(sv);
+        if (shared != nullptr) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored for a shared drafter\n");
+        else if (n < 32 || n > 511) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS=%s ignored: want 32..511\n", sv);
+        else if (g.n_expert != 512 || ss.k != 10) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored: the drafter is not 512 experts, top 10\n");
+        else slots_n_ = n;
+#endif
+    }
     const auto t_files = std::chrono::steady_clock::now();
     // ---- the index and the dense weights
     if (shared == nullptr) {
@@ -348,8 +598,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         vram_ += blob.size();
         if (q4_ && !make_q4_dense(blob, err)) return false;
     }
-    // ---- the 512 routed experts, one blob each
-    if (shared == nullptr) {
+    // ---- the 512 routed experts, one blob each (STRATA_MTP_SLOTS: n slots instead, slots_load)
+    if (shared == nullptr && slots_n_ > 0) {
+        if (!slots_load(rt_dir, err)) return false;
+    } else if (shared == nullptr) {
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
         // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
         // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
@@ -1177,13 +1429,17 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         if (g_tally.dev != nullptr && g.n_expert == 512 && K == 10) native_route_tally(logits_, ids_, w_, (int) T, g_tally.dev, cs,
                                                                                         g_tally.seq_ids, g_tally.seq_w, g_tally.seq_n, MtpTally::kSeqCap);
-        if (rr_res_ != nullptr && rr_margin_ > 0.0f && g.n_expert == 512 && K == 10) {
+        if (rr_res_ != nullptr && rr_margin_ > 0.0f && g.n_expert == 512 && K == 10 && slots_n_ == 0) {
             try {
                 // solid-wins: the floor (lo, hi, margin, edge) is the verifier's one shared RouteCfg, read by the kernel at every launch, so the
                 // draft window uses the same floor as the verify windows (rr_margin_/lo/hi only say that this draft layer takes part)
                 native_route_resident(logits_, ids_, w_, rr_res_, T, nullptr, cs);
             } catch (const std::exception& e) { err = std::string("mtp route-resident: ") + e.what(); return false; }
         }
+#if !defined(STRATA_GPU_METAL)
+        // STRATA_MTP_SLOTS: the picks become slots (after the tally, which still sees the expert ids)
+        if (slots_n_ > 0) mtp_slot_remap(logits_, ids_, d_slot_, (int) T, ref_d_, want_d_, want_n_d_, 4096, st_d_, cs);
+#endif
         g_mp.stamp(9, cs);
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
@@ -1615,6 +1871,7 @@ DraftTiming g_dt;
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     g_tally.tick();
+    slot_service();
 #if defined(STRATA_GPU_METAL)
     {
         if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
@@ -1833,6 +2090,7 @@ bool MtpDrafter::prepare_chain(std::string& err) {
 bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force,
                               int n_out, int n_early, std::string& err) {
     g_tally.tick();
+    slot_service();
     const OnDevice on_device(device_);
     if (chain_live_) { err = "mtp: a chain is already in flight"; return false; }
     if (!force_on_ || ev_chain_ == nullptr) { err = "mtp: chains need prepare_chain"; return false; }
@@ -1916,6 +2174,7 @@ int MtpDrafter::chain_poll(std::string& err) {
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                              float* probs, float min_p, int* n_drafts) {
     g_tally.tick();
+    slot_service();
 #if defined(STRATA_GPU_METAL)
     {   // the decode window's row 0 is the residual (the window that just ran)
         (void) R_row;
