@@ -629,6 +629,29 @@ void route_cfg_set_budgets(float budget, float budget_tail) {
 const RouteCfg* route_cfg_device() { return g_cfg_dev; }
 // STRATA_LA_TAIL_READ: the open rule as the host holds it now (the same values the kernels read): any resident stand-in serves a rank at or above lo
 bool route_cfg_tail_open() { return g_cfg_host != nullptr && g_cfg_host->margin >= 1e30f && g_cfg_host->budget_tail <= 0.f; }
+namespace {
+// STRATA_MTP_TALLY (measurement only): per (rank, expert) the router weight the drafter gave it; row 10 the rank-2 picks within one
+// logit of rank 1; [11*512] the routed tokens.  One warp per token.
+__global__ void route_tally_k(const float* __restrict__ logits, const int32_t* __restrict__ ids, const float* __restrict__ w,
+                              float* __restrict__ acc, int32_t* __restrict__ seq_ids, float* __restrict__ seq_w,
+                              unsigned int* __restrict__ seq_n, unsigned int seq_cap) {
+    const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
+    unsigned int slot = 0;
+    if (lane == 0 && seq_n != nullptr) slot = atomicAdd(seq_n, 1u);
+    slot = __shfl_sync(0xffffffffu, slot, 0);
+    if (lane >= 10) return;
+    const int e = ids[t * 10 + lane];
+    const float v = w[t * 10 + lane];
+    if (seq_n != nullptr && slot < seq_cap) { seq_ids[(size_t) slot * 10 + lane] = e; seq_w[(size_t) slot * 10 + lane] = v; }
+    atomicAdd(&acc[lane * 512 + e], v);
+    if (lane == 2 && logits[(size_t) t * 512 + e] >= logits[(size_t) t * 512 + ids[t * 10 + 1]] - 1.0f) atomicAdd(&acc[10 * 512 + e], v);
+    if (lane == 0) atomicAdd(&acc[11 * 512], 1.0f);
+}
+}
+void native_route_tally(const float* logits, const int32_t* ids, const float* weights, int n_tok, float* acc, void* stream,
+                        int32_t* seq_ids, float* seq_w, unsigned int* seq_n, unsigned int seq_cap) {
+    route_tally_k<<<n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, acc, seq_ids, seq_w, seq_n, seq_cap);
+}
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift) {

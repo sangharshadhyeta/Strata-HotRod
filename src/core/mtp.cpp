@@ -132,7 +132,49 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 
 }  // namespace
 
+namespace {
+// STRATA_MTP_TALLY=<file> (measurement only, off by default): the drafter's router weight per rank and expert (native_route_tally),
+// written to <file> as 11 * 512 + 1 little-endian floats every 64 draft rounds and when the drafter ends.
+struct MtpTally {
+    const char* path = std::getenv("STRATA_MTP_TALLY");
+    float* dev = nullptr;
+    static constexpr unsigned int kSeqCap = 1u << 20;   // routed tokens kept in order (<file>.seq): 80 MiB
+    int32_t* seq_ids = nullptr;
+    float* seq_w = nullptr;
+    unsigned int* seq_n = nullptr;
+    uint64_t rounds = 0;
+    void tick() { if (dev != nullptr && (++rounds & 63u) == 0) dump(); }   // each draft entry point: the tally so far, every 64 calls
+    void dump() {
+        if (dev == nullptr) return;
+        std::vector<float> h(11 * 512 + 1);
+        if (cudaMemcpy(h.data(), dev, h.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+        const std::string tmp = std::string(path) + ".tmp";
+        if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+            std::fwrite(h.data(), sizeof(float), h.size(), f);
+            std::fclose(f);
+            std::rename(tmp.c_str(), path);
+        }
+        unsigned int n = 0;   // <file>.seq: u32 tokens, then their ids (int32 x 10 each), then their weights (float x 10 each)
+        if (seq_n == nullptr || cudaMemcpy(&n, seq_n, sizeof(n), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+        n = std::min(n, kSeqCap);
+        std::vector<int32_t> si((size_t) n * 10);
+        std::vector<float> sw((size_t) n * 10);
+        if (n > 0 && (cudaMemcpy(si.data(), seq_ids, si.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                      cudaMemcpy(sw.data(), seq_w, sw.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess)) return;
+        const std::string sp = std::string(path) + ".seq", st = sp + ".tmp";
+        if (FILE* f = std::fopen(st.c_str(), "wb")) {
+            std::fwrite(&n, sizeof(n), 1, f);
+            std::fwrite(si.data(), 4, si.size(), f);
+            std::fwrite(sw.data(), 4, sw.size(), f);
+            std::fclose(f);
+            std::rename(st.c_str(), sp.c_str());
+        }
+    }
+} g_tally;
+}
+
 MtpDrafter::~MtpDrafter() {
+    g_tally.dump();
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
@@ -329,6 +371,18 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             off += n;
         }
         vram_ += bytes;
+    }
+    if (g_tally.path != nullptr && g_tally.dev == nullptr && cudaMalloc((void**) &g_tally.dev, (11 * 512 + 1) * sizeof(float)) == cudaSuccess) {
+        cudaMemset(g_tally.dev, 0, (11 * 512 + 1) * sizeof(float));
+        if (cudaMalloc((void**) &g_tally.seq_ids, (size_t) MtpTally::kSeqCap * 10 * 4) != cudaSuccess ||
+            cudaMalloc((void**) &g_tally.seq_w, (size_t) MtpTally::kSeqCap * 10 * 4) != cudaSuccess ||
+            cudaMalloc((void**) &g_tally.seq_n, sizeof(unsigned int)) != cudaSuccess) {
+            g_tally.seq_n = nullptr;
+            std::fprintf(stderr, "strata: STRATA_MTP_TALLY: no room for the ordered trace; totals only\n");
+        } else {
+            cudaMemset(g_tally.seq_n, 0, sizeof(unsigned int));
+        }
+        std::fprintf(stderr, "strata: STRATA_MTP_TALLY=%s (measurement: the drafter's router weight per rank and expert)\n", g_tally.path);
     }
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
@@ -1121,6 +1175,8 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         }
+        if (g_tally.dev != nullptr && g.n_expert == 512 && K == 10) native_route_tally(logits_, ids_, w_, (int) T, g_tally.dev, cs,
+                                                                                        g_tally.seq_ids, g_tally.seq_w, g_tally.seq_n, MtpTally::kSeqCap);
         if (rr_res_ != nullptr && rr_margin_ > 0.0f && g.n_expert == 512 && K == 10) {
             try {
                 // solid-wins: the floor (lo, hi, margin, edge) is the verifier's one shared RouteCfg, read by the kernel at every launch, so the
@@ -1558,6 +1614,7 @@ DraftTiming g_dt;
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
+    g_tally.tick();
 #if defined(STRATA_GPU_METAL)
     {
         if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
@@ -1775,6 +1832,7 @@ bool MtpDrafter::prepare_chain(std::string& err) {
 
 bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force,
                               int n_out, int n_early, std::string& err) {
+    g_tally.tick();
     const OnDevice on_device(device_);
     if (chain_live_) { err = "mtp: a chain is already in flight"; return false; }
     if (!force_on_ || ev_chain_ == nullptr) { err = "mtp: chains need prepare_chain"; return false; }
@@ -1857,6 +1915,7 @@ int MtpDrafter::chain_poll(std::string& err) {
 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                              float* probs, float min_p, int* n_drafts) {
+    g_tally.tick();
 #if defined(STRATA_GPU_METAL)
     {   // the decode window's row 0 is the residual (the window that just ran)
         (void) R_row;

@@ -170,6 +170,11 @@ void route_want_drain(float* usage, size_t n);
 /// STRATA_TRACE_ADAPT: cumulative counters of the decode rows' router picks (16 uint64): [0..9] picks of rank r that were not
 /// resident, [10] router weight on them (x1e6), [11] rows, [12] rows with the top-1 not resident, [13] rows with a
 /// non-resident pick among the top 5. Allocated outside graph capture; read on the host between windows.
+/// STRATA_MTP_TALLY (measurement only): adds each token's top-10 router weights into acc[rank * 512 + expert] (11 * 512 + 1 floats,
+/// zeroed by the caller; row 10: rank-2 picks within one logit of rank 1; the last float: tokens).  Capturable.
+/// seq_*: nullptr, or the routed tokens in order (token k at [k*10 .. k*10+9], ids by rank and their weights) up to seq_cap tokens.
+void native_route_tally(const float* logits, const int32_t* ids, const float* weights, int n_tok, float* acc, void* stream,
+                        int32_t* seq_ids = nullptr, float* seq_w = nullptr, unsigned int* seq_n = nullptr, unsigned int seq_cap = 0);
 void route_detail_alloc();
 void route_detail_read(unsigned long long* out16);   // 48 entries: [16..21] replaced-pick weight buckets (<1%,<2,<5,<10,<20,>=20), [22..26] substitute rank in the router ranking (<20,<40,<80,<160,>=160), [27..32] score gap (<0.5,<1,<2,<4,<8,>=8), [33..42] summed weight per rank x1e6
 }
