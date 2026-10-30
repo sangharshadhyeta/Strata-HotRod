@@ -136,7 +136,7 @@ recomputed exactly, and each request brakes itself when it sees flips.
 
 **A look-ahead that learns.** Experts for 1, 2 and 4 layers ahead are guessed on the card and read from the SSD before they
 are needed. Each guess is the router's own score plus a small correction learned live from the real routing; its size is
-chosen per layer by a live contest, and it falls back to the plain router if it ever does worse. For Qwen3.8 IQ3_S setup downloads a trained one ([release](https://github.com/sangharshadhyeta/Strata-HotRod/releases/tag/predictor-qwen38-iq3s-v1), 4 MB: 91 / 84 / 77% of the needed experts guessed 1 / 2 / 4 layers ahead) and it keeps learning on your PC; for other models it is off until `STRATA_LA_LEARN=1` starts one.
+chosen per layer by a live contest, and it falls back to the plain router if it ever does worse. For Qwen3.8 IQ3_S setup downloads a trained one ([release](https://github.com/sangharshadhyeta/Strata-HotRod/releases/tag/predictor-qwen38-iq3s-v2), 4 MB: 91 / 84 / 77% of the needed experts guessed 1 / 2 / 4 layers ahead) and it keeps learning on your PC; for other models it is off until `STRATA_LA_LEARN=1` starts one.
 
 </div>
 

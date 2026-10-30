@@ -2427,8 +2427,8 @@ def fetch_expert_predictor(env) -> Path:
 # only when the id matches the model files it runs, and its learned look-ahead (STRATA_LA_LEARN, auto) switches on when a learned
 # predictor is kept - so this download turns it on for this model, and it keeps learning live from there.
 HOTROD_PREDICTOR = "predictor-5400e1aece241c0f.bin"
-HOTROD_PREDICTOR_URL = "https://github.com/sangharshadhyeta/Strata-HotRod/releases/download/predictor-qwen38-iq3s-v1/" + HOTROD_PREDICTOR
-HOTROD_PREDICTOR_SHA = "251d0508b279ba9ca0324b47784693accef48d5912373e83427ff2cc63249efe"
+HOTROD_PREDICTOR_URL = "https://github.com/sangharshadhyeta/Strata-HotRod/releases/download/predictor-qwen38-iq3s-v2/" + HOTROD_PREDICTOR
+HOTROD_PREDICTOR_SHA = "04367a17b49b26a94c86aec7dbc7c5046e78dab909038fb44b87c1290f401b70"
 HOTROD_PREDICTOR_FAMILIES = ("qwen",)
 HOTROD_PREDICTOR_MODELS = ("IQ3_S",)
 
