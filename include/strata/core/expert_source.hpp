@@ -711,6 +711,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 /// touched.  timeline_tick() is called from the adaptive tier's round: at most every 0.5 s it reads the switch and, while on, appends
 /// the decode windows finished since the last write to STRATA_TIMELINE_FILE as one v 2 chunk (times in us after one run-wide base).
 bool timeline_on();
+/// STRATA_DRAFT_MISS=1 (measurement only): a decode window's missed experts counted by the first window row that needs them (0: the
+/// token being decoded, 1..: the drafts), split into RAM-tier reads (ram) and SSD reads (ssd), rows 0-7; take() returns and clears them.
+bool draft_miss_on();
+void draft_miss_take(int64_t ram[8], int64_t ssd[8]);
+/// STRATA_DRAFT_COLD_CUT=1: a decode window's draft row that needs an SSD read cuts the window there (the read is not made, the rows from the
+/// cut on are rejected at the commit).  take() returns the window's cut row (99: none) and clears it; skipped() counts the reads saved.
+bool draft_cold_cut_on();
+int draft_cold_cut_take();
+int64_t draft_cold_cut_skipped();
 void timeline_tick();
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the

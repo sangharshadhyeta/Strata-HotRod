@@ -15019,6 +15019,11 @@ int main(int argc, char** argv) {
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
+            // STRATA_DRAFT_MISS=1: the decode windows' missed experts by who needed them first - the real token (row 0), an accepted draft,
+            // a rejected draft (a wasted read) - RAM tier and SSD apart
+            int64_t dm_tok_ram = 0, dm_tok_ssd = 0, dm_ok_ram = 0, dm_ok_ssd = 0, dm_rej_ram = 0, dm_rej_ssd = 0, dm_windows = 0;
+            int64_t cold_cuts = 0;   // STRATA_DRAFT_COLD_CUT: windows cut
+            const int64_t cold_skip0 = strata::core::draft_cold_cut_skipped();
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
             strata::spec::PromptLookupSource lookup_src(sfx);
             static const bool chain_fixed = std::getenv("STRATA_LOOKUP_CHAIN_FIXED") != nullptr;   // no policy gate
@@ -16006,6 +16011,13 @@ int main(int argc, char** argv) {
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (fr_cut >= 1) a = std::min(a, fr_cut - 1);   // STRATA_FRAGILE_RECHECK: rows fr_cut.. are re-decided, not kept
+                if (strata::core::draft_cold_cut_on()) {   // STRATA_DRAFT_COLD_CUT: rows from the cut on skipped an SSD read: not kept
+                    const int cc = strata::core::draft_cold_cut_take();
+                    if (!merged && cc >= 1 && cc < 99) {   // (rows cc.. ran with skipped experts: their matches prove nothing)
+                        a = std::min(a, cc - 1);
+                        ++cold_cuts;
+                    }
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
@@ -16027,6 +16039,19 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 if (!merged) strata::core::Verifier::route_req_commit(a + 1);   // STRATA_FRAGILE_BRAKE: the request's committed tokens (flips per token)
+                if (strata::core::draft_miss_on()) {   // rows 0..a were kept: row 0 the token, 1..a accepted drafts, the rest rejected
+                    int64_t mr[8], ms[8];
+                    strata::core::draft_miss_take(mr, ms);
+                    if (!merged && T > 1) {
+                        ++dm_windows;
+                        for (int r = 0; r < 8; ++r) {
+                            int64_t& wr = r == 0 ? dm_tok_ram : r <= a ? dm_ok_ram : dm_rej_ram;
+                            int64_t& ws = r == 0 ? dm_tok_ssd : r <= a ? dm_ok_ssd : dm_rej_ssd;
+                            wr += mr[r];
+                            ws += ms[r];
+                        }
+                    }
+                }
                 // STRATA_ROUTE_BUDGET_AUTO: this window's speed sample (ver.run start to this commit's end; one bool check when off)
                 if (strata::core::Verifier::route_auto_on() && !merged)
                     strata::core::Verifier::route_auto_window(a + 1, tw0, Clock::now());
@@ -16769,6 +16794,14 @@ int main(int argc, char** argv) {
             if (o.lookup_chain > 0)
                 std::fprintf(stderr, "strata serve: lookup chain: %lld of %lld windows, %lld of %lld chained drafts accepted\n",
                              (long long) chain_windows, (long long) dec_windows, (long long) chain_ok, (long long) chain_drafts);
+            if (strata::core::draft_cold_cut_on())
+                std::fprintf(stderr, "strata serve: draft cold cut: %lld windows cut, %lld reads skipped\n", (long long) cold_cuts,
+                             (long long) (strata::core::draft_cold_cut_skipped() - cold_skip0));
+            if (strata::core::draft_miss_on() && dm_windows > 0)
+                std::fprintf(stderr, "strata serve: draft misses over %lld windows (RAM tier / SSD reads, first needed by): the token %lld / %lld, "
+                                     "accepted drafts %lld / %lld, rejected drafts %lld / %lld (wasted)\n", (long long) dm_windows,
+                             (long long) dm_tok_ram, (long long) dm_tok_ssd, (long long) dm_ok_ram, (long long) dm_ok_ssd,
+                             (long long) dm_rej_ram, (long long) dm_rej_ssd);
             if (std::getenv("STRATA_SPEC_DEPTH") != nullptr)
                 std::fprintf(stderr, "strata serve: spec depth: accepted/tested %lld/%lld %lld/%lld %lld/%lld %lld/%lld %lld/%lld\n",
                              (long long) dp_ok[0], (long long) dp_tested[0], (long long) dp_ok[1], (long long) dp_tested[1],

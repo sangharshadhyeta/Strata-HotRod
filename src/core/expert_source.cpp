@@ -857,6 +857,30 @@ void tl_read(int32_t layer, bool demand, int64_t t0) {
 
 bool timeline_on() { return g_tl_on.load(std::memory_order_relaxed); }
 
+namespace {
+std::atomic<int64_t> g_dm_ram[8], g_dm_ssd[8];
+}  // namespace
+bool draft_miss_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DRAFT_MISS"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+namespace {
+std::atomic<int> g_cold_cut{99};
+std::atomic<int64_t> g_cold_skipped{0};
+}  // namespace
+bool draft_cold_cut_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DRAFT_COLD_CUT"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+int draft_cold_cut_take() { return g_cold_cut.exchange(99, std::memory_order_relaxed); }
+int64_t draft_cold_cut_skipped() { return g_cold_skipped.load(std::memory_order_relaxed); }
+void draft_miss_take(int64_t ram[8], int64_t ssd[8]) {
+    for (int r = 0; r < 8; ++r) {
+        ram[r] = g_dm_ram[r].exchange(0, std::memory_order_relaxed);
+        ssd[r] = g_dm_ssd[r].exchange(0, std::memory_order_relaxed);
+    }
+}
+
 void timeline_tick() {
     static const char* ctl = std::getenv("STRATA_TIMELINE_CTL");
     static const char* out = std::getenv("STRATA_TIMELINE_FILE");
@@ -5744,6 +5768,47 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++d.tail_experts;
             }
         }
+        // STRATA_DRAFT_COLD_CUT: a draft row (r >= 1) that needs an SSD read cuts the window at r (the earliest such row over the window's
+        // layers so far); a miss that only rows from the cut on need is skipped - its rows are rejected at the commit, so it is never read
+        if (draft_cold_cut_on() && n_tok > 1 && n_tok <= 8) {
+            int cut = g_cold_cut.load(std::memory_order_relaxed);
+            int minr[kMaxWindowEntries];
+            for (int q = 0; q < nd; ++q) {
+                minr[q] = 99;
+                for (int64_t i = 0; i < n; ++i)
+                    if (first_of[i] == distinct[q]) minr[q] = std::min(minr[q], (int) (i / k));
+            }
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (skip_d[q] || e < 0 || e >= d.n_expert || d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+                if ((d.peer != nullptr && d.peer->has(d.layers, e)) || helper_holds(e)) continue;
+                if (minr[q] >= 1 && !d.src->page_cached(d.layers, e)) cut = std::min(cut, minr[q]);   // an SSD read for a draft (not in the RAM tier or the page cache)
+            }
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (skip_d[q] || minr[q] < cut || e < 0 || e >= d.n_expert) continue;
+                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // on the card: no read to save
+                if ((d.peer != nullptr && d.peer->has(d.layers, e)) || helper_holds(e)) continue;
+                skip_d[q] = true;
+                --nmiss;
+                g_cold_skipped.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (cut < 99) {
+                int cur = g_cold_cut.load(std::memory_order_relaxed);
+                while (cut < cur && !g_cold_cut.compare_exchange_weak(cur, cut, std::memory_order_relaxed)) {}
+            }
+        }
+        // STRATA_DRAFT_MISS (measurement): each missed expert of a decode window by the first row that needs it (rows t: ids[t * k ..])
+        if (draft_miss_on() && n_tok > 1 && n_tok <= 8)
+            for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (skip_d[q] || e < 0 || e >= d.n_expert || d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+                if ((d.peer != nullptr && d.peer->has(d.layers, e)) || helper_holds(e)) continue;
+                int r = 99;
+                for (int64_t i = 0; i < n; ++i)
+                    if (first_of[i] == distinct[q]) r = std::min(r, (int) (i / k));
+                if (r < 8) (d.src->page_cached(d.layers, e) ? g_dm_ram : g_dm_ssd)[r].fetch_add(1, std::memory_order_relaxed);
+            }
         // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
         const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
         int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
