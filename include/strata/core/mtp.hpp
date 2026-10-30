@@ -324,6 +324,7 @@ private:
     unsigned long long* d_ptr_ = nullptr;
     int zc_installs_ = 8;            ///< STRATA_MTP_ZC_INSTALLS: the wanted experts copied into slots per round at most
     int slots_n_ = 0;
+    bool slots_default_ = false;     ///< the slots came from the default (STRATA_MTP_SLOTS unset): no RAM copy -> the whole drafter
     int32_t* d_slot_ = nullptr;      ///< device: expert id -> slot or -1 (512 int32)
     int32_t* h_slot_ = nullptr;      ///< pinned host copy of d_slot_ (512 int32)
     std::vector<int> expert_of_;     ///< slot -> the expert it holds (-1 none)

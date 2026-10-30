@@ -398,7 +398,8 @@ bool MtpDrafter::slots_load(const std::string& rt_dir, std::string& err) {
     // STRATA_MTP_ZC=1: all 512 experts in pinned RAM (mapped, read once from the open fd); the slots keep the hot ones, a drafter
     // expert that is not in a slot is computed from its RAM copy.  No loader thread here.  If the RAM copy cannot be made, the
     // stand-in mode stays (fd and loader as below).
-    if (const char* zv = std::getenv("STRATA_MTP_ZC"); zv != nullptr && std::atoi(zv) == 1) {
+    // (on by default since 31 Oct; STRATA_MTP_ZC=0: the stand-in mode with the disk loader)
+    if (const char* zv = std::getenv("STRATA_MTP_ZC"); zv == nullptr || std::atoi(zv) != 0) {
         const size_t total = 512 * blob;
         std::string why;
         uint8_t* zh = nullptr;
@@ -431,11 +432,21 @@ bool MtpDrafter::slots_load(const std::string& rt_dir, std::string& err) {
             std::fprintf(stderr, "strata mtp: STRATA_MTP_ZC: the drafter's %d non-resident experts are read from %.0f MiB of pinned RAM (exact, no stand-ins); a rank 0-1 miss is promoted into a slot from RAM\n",
                          512 - n, (double) total / 1048576.0);
         } else {
-            std::fprintf(stderr, "strata mtp: STRATA_MTP_ZC off (%s): the stand-in mode stays\n", why.c_str());
             if (zh) cudaFreeHost(zh);
             if (h_ptr_) { cudaFreeHost(h_ptr_); h_ptr_ = nullptr; }
             if (d_ptr_) { cudaFree(d_ptr_); d_ptr_ = nullptr; }
             (void) cudaGetLastError();
+            if (slots_default_) {   // the default never takes stand-ins: without the RAM copy the whole drafter goes on the GPU
+                std::fprintf(stderr, "strata mtp: the drafter's RAM copy failed (%s): all 512 experts on the GPU\n", why.c_str());
+                ::close(fd);
+                cudaFree(experts_);
+                experts_ = nullptr;
+                vram_ -= (uint64_t) n * blob;
+                slots_n_ = 0;
+                slots_default_ = false;
+                return true;
+            }
+            std::fprintf(stderr, "strata mtp: STRATA_MTP_ZC off (%s): the stand-in mode stays\n", why.c_str());
         }
         if (const char* iv = std::getenv("STRATA_MTP_ZC_INSTALLS"); iv != nullptr) zc_installs_ = std::max(0, std::min(64, std::atoi(iv)));
     }
@@ -771,16 +782,26 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     // Loader fix (0.1.15+loaderfix.2): the two reads below are the whole “drafter files” cost; reporting
     // them apart from the rest of the stage is what makes the next regression visible.
-    // STRATA_MTP_SLOTS=<n> (opt-in): n drafter experts on the GPU, 32..511.  Anything else leaves today's path (said once).
-    if (const char* sv = std::getenv("STRATA_MTP_SLOTS"); sv != nullptr) {
-#if defined(_WIN32)
-        std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored: the slot loader needs a POSIX build\n");
+    // STRATA_MTP_SLOTS=<n>: n drafter experts on the GPU, 32..511; unset: 256 with STRATA_MTP_ZC (the default since 31 Oct: exact, 338 MiB
+    // of VRAM to the expert cache); 0: all 512 on the GPU (the path before).  Anything else leaves that path (said once).
+    {
+        const char* sv = std::getenv("STRATA_MTP_SLOTS");
+#if defined(_WIN32) || defined(STRATA_GPU_METAL)
+        if (sv != nullptr && std::atoi(sv) != 0) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored: the slots need a POSIX CUDA build\n");
 #else
-        const int n = std::atoi(sv);
-        if (shared != nullptr) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored for a shared drafter\n");
-        else if (n < 32 || n > 511) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS=%s ignored: want 32..511\n", sv);
-        else if (g.n_expert != 512 || ss.k != 10) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored: the drafter is not 512 experts, top 10\n");
-        else slots_n_ = n;
+        const bool dflt = sv == nullptr;
+        const int n = dflt ? 256 : std::atoi(sv);
+        if (n == 0) {
+        } else if (shared != nullptr) {
+            if (!dflt) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored for a shared drafter\n");
+        } else if (n < 32 || n > 511) {
+            std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS=%s ignored: want 32..511 (0: all 512 on the GPU)\n", sv);
+        } else if (g.n_expert != 512 || ss.k != 10) {
+            if (!dflt) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored: the drafter is not 512 experts, top 10\n");
+        } else {
+            slots_n_ = n;
+            slots_default_ = dflt;
+        }
 #endif
     }
     const auto t_files = std::chrono::steady_clock::now();
@@ -813,9 +834,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         if (q4_ && !make_q4_dense(blob, err)) return false;
     }
     // ---- the 512 routed experts, one blob each (STRATA_MTP_SLOTS: n slots instead, slots_load)
-    if (shared == nullptr && slots_n_ > 0) {
-        if (!slots_load(rt_dir, err)) return false;
-    } else if (shared == nullptr) {
+    // (the default's slots fall back to all 512 here when their RAM copy cannot be made: slots_load leaves slots_n_ at 0)
+    if (shared == nullptr && slots_n_ > 0 && !slots_load(rt_dir, err)) return false;
+    if (shared == nullptr && slots_n_ == 0) {
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
         // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
         // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
