@@ -1453,6 +1453,33 @@ struct Model::Impl {
         std::fflush(dump_s);
     }
 
+    // a request's end: the HotRod features report and save what they have so far (the counters are cumulative and
+    // stay; the destructor reports the same at a clean shutdown, which a server's kill never reaches)
+    void request_end() {
+        if (d_standin != nullptr) {
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            Standin h{};
+            if (cudaMemcpy(&h, d_standin, sizeof h, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                std::string line = "ds4: request: stand-ins (rank: taken / offered):";
+                for (int r = 0; r < kPicks; ++r)
+                    if (h.offered[r] > 0) line += " " + std::to_string(r) + ": " + std::to_string(h.taken[r]) + " / " + std::to_string(h.offered[r]);
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
+            if (fr_on)
+                std::fprintf(stderr, "ds4: request: stand-ins: %lld decode tokens took them, %lld re-checked exactly, %lld of those changed the top token\n",
+                             fr_used, fr_checks, fr_flips);
+            if (tune_on) {
+                std::fprintf(stderr, "ds4: request: the budget's search: %s\n", tune.stats().c_str());
+                if (!tune.save(tune_path)) std::fprintf(stderr, "ds4: stand-ins: %s not written\n", tune_path.c_str());
+            }
+        }
+        if (la_on) {
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            std::fputs(la::report().c_str(), stderr);
+            la_save();
+        }
+    }
+
     ~Impl() {
         if (d_standin != nullptr) {   // the stand-ins' counts by rank, before the devices go
             cudaSetDevice(devs[(size_t) L[0].dev].id);
@@ -10951,6 +10978,7 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::save_profile() const { p_->save_profile(); }
+void Model::request_end() { p_->request_end(); }
 const Stats& Model::stats() const {
     Stats& st = p_->st;
     if (p_->store) {   // (the store keeps its own counters: copied in when asked)

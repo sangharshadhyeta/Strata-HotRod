@@ -192,6 +192,9 @@ public:
     void set_images(std::vector<Image> images);
 
     void save_profile() const;
+    /// A request's end: the HotRod features (stand-ins, the budget's search, the look-ahead learner) report and save
+    /// their state so far; nothing when they are off.
+    void request_end();
     const Stats& stats() const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
