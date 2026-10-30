@@ -9199,6 +9199,30 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
+        // STRATA_MTP_LA=1 (opt-in; the drafter's slots and the main learner on, single GPU): a look-ahead learner for the drafter's first step,
+        // predicted from layer STRATA_MTP_LA_SRC's router input (default n_layers - 8) in each verify window.  Its file is loaded below, beside
+        // the main learner's, and saved at each request's end.  Before the prefill and the chain are captured (their graphs carry the label).
+        std::string mtp_la_path;   // the drafter learner's file (set with the main learner's file, below)
+        bool mtp_la_on = false;
+        if (use_mtp && stages.empty() && std::getenv("STRATA_MTP_LA") != nullptr && std::atoi(std::getenv("STRATA_MTP_LA")) == 1 &&
+            mtp.slots_on() && strata::kernels::la_learn_active()) {
+            const bool timing = std::getenv("STRATA_LA_LEARN_TIMING") != nullptr && std::atoi(std::getenv("STRATA_LA_LEARN_TIMING")) == 1;
+            int64_t src = g.n_layers - 8;
+            if (const char* v = std::getenv("STRATA_MTP_LA_SRC")) src = std::atoll(v);
+            std::string lm;
+            if (src < 0 || src >= g.n_layers)
+                std::fprintf(stderr, "strata serve: drafter look-ahead learner off: STRATA_MTP_LA_SRC=%lld is not a layer\n", (long long) src);
+            else if (!strata::kernels::la_mtp_alloc(g.n_embd, timing, lm))
+                std::fprintf(stderr, "strata serve: drafter look-ahead learner off (%s)\n", lm.c_str());
+            else if (!mtp.set_la_mtp(true))
+                std::fprintf(stderr, "strata serve: drafter look-ahead learner off: the drafter's round graphs are already captured\n");
+            else {
+                ver.set_mtp_la(mtp.gate_weight(), (int) src);
+                mtp_la_on = true;
+                std::fprintf(stderr, "strata serve: drafter look-ahead learner (STRATA_MTP_LA): layer %d's router input predicts the drafter's first step, %d predicted loads a window at most\n",
+                             (int) src, strata::core::MtpDrafter::la_loads());
+            }
+        }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
@@ -12318,6 +12342,15 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: look-ahead learner: starts from the plain router (%s)\n", lm.c_str());
             } else
                 std::fprintf(stderr, "strata serve: look-ahead learner: not kept (%s)\n", le.c_str());
+        }
+        // STRATA_MTP_LA: the drafter learner's file, beside the main learner's (predictor-<hex>-mtp.bin), loaded before the first request
+        if (mtp_la_on && !la_learn_path.empty()) {
+            mtp_la_path = la_learn_path.substr(0, la_learn_path.size() - 4) + "-mtp.bin";
+            std::string lm;
+            if (strata::kernels::la_mtp_load(mtp_la_path.c_str(), lm))
+                std::fprintf(stderr, "strata serve: drafter look-ahead learner: loaded %s\n", mtp_la_path.c_str());
+            else
+                std::fprintf(stderr, "strata serve: drafter look-ahead learner: starts from the plain router (%s)\n", lm.c_str());
         }
         for (;;) {
             line_drain_ms = 0.0;
@@ -16715,6 +16748,12 @@ int main(int argc, char** argv) {
                 }
             }
             // STRATA_LA_LEARN: the learned corrections are saved (their leaders, fp16) and the learner's stats line is logged
+            if (mtp_la_on) {   // STRATA_MTP_LA: the drafter learner's file and its stats line
+                std::string lm;
+                if (!mtp_la_path.empty() && !strata::kernels::la_mtp_save(mtp_la_path.c_str(), lm))
+                    std::fprintf(stderr, "strata serve: drafter look-ahead learner: cannot save %s (%s)\n", mtp_la_path.c_str(), lm.c_str());
+                std::fputs(strata::kernels::la_mtp_report().c_str(), stderr);
+            }
             if (strata::core::Verifier::la_learn_on()) {
                 std::string la_rep;
                 strata::core::Verifier::la_learn_request_end(la_learn_path, la_rep);

@@ -198,16 +198,51 @@ struct MtpSlotLoader {
     std::deque<int> req;      ///< expert ids asked for
     bool stop = false;
     std::thread th;
+    // STRATA_MTP_LA: the predicted experts (served only while req is empty), the window's mapped record (its sequence at [0]), the drafter's
+    // slot map and pending flags (read and written under mu), the loads per window, and the last sequence polled
+    std::deque<int> pred;
+    const volatile int* pred_h = nullptr;
+    const int32_t* h_slot = nullptr;
+    std::vector<bool>* pending = nullptr;
+    int loads = 0;
+    int seq_seen = 0;
 };
+
+// STRATA_MTP_LA: a new window's record (under mu): its rows from the last down, each row's predicted ranks 0 and 1, the experts that are not
+// resident and not pending, at most `loads` per window.  The queue holds at most 16 (a window's predictions wait for the drafter's round).
+void slot_pred_poll(MtpSlotLoader* L) {
+    if (L->pred_h == nullptr) return;
+    const int seq = L->pred_h[0];
+    if (seq == L->seq_seen) return;
+    L->seq_seen = seq;
+    const int n = std::min(std::max((int) L->pred_h[1], 0), 8);
+    int taken = 0;
+    for (int t = n - 1; t >= 0 && taken < L->loads; --t)
+        for (int r = 0; r < 2 && taken < L->loads; ++r) {
+            const int e = L->pred_h[2 + 10 * t + r];
+            if (e < 0 || e >= 512 || L->pred.size() >= 16 || L->h_slot[e] >= 0 || (*L->pending)[(size_t) e]) continue;
+            (*L->pending)[(size_t) e] = true;
+            L->pred.push_back(e);
+            ++taken;
+        }
+}
 
 void slot_loader_main(MtpSlotLoader* L) {
     const size_t blob = strata::kernels::cpu::BLOB;
     std::unique_lock<std::mutex> lk(L->mu);
     for (;;) {
-        L->cv.wait(lk, [L] { return L->stop || !L->req.empty(); });
+        slot_pred_poll(L);
         if (L->stop) return;
-        const int e = L->req.front();
-        L->req.pop_front();
+        if (L->req.empty() && L->pred.empty()) {
+            // with the learner on, the wait is 100 us at most, so the window's record is polled while the loader is idle
+            if (L->pred_h != nullptr) L->cv.wait_for(lk, std::chrono::microseconds(100), [L] { return L->stop || !L->req.empty(); });
+            else L->cv.wait(lk, [L] { return L->stop || !L->req.empty(); });
+            continue;
+        }
+        const bool from_req = !L->req.empty();   // real misses first
+        const int e = from_req ? L->req.front() : L->pred.front();
+        if (from_req) L->req.pop_front();
+        else L->pred.pop_front();
         int b = -1;
         auto find_free = [L] {
             for (int i = 0; i < MtpSlotLoader::kBufs; ++i) if (L->state[i] == MtpSlotLoader::kFree) return i;
@@ -343,6 +378,9 @@ bool MtpDrafter::slots_load(const std::string& rt_dir, std::string& err) {
     for (int e = 0; e < 512; ++e) h_slot_[e] = -1;
     for (int s = 0; s < n; ++s) h_slot_[init[(size_t) s]] = s;
     cudaMemcpy(d_slot_, h_slot_, 512 * sizeof(int32_t), cudaMemcpyHostToDevice);
+#if !defined(STRATA_GPU_METAL)
+    if (la_mtp_on_ && strata::kernels::la_mtp_res_row() != nullptr) cudaMemcpy(strata::kernels::la_mtp_res_row(), d_slot_, 512 * sizeof(int32_t), cudaMemcpyDeviceToDevice);
+#endif
     if (!mapped((size_t) n, (void**) &ref_h_, (void**) &ref_d_) ||
         !mapped(4096 * sizeof(int32_t), (void**) &want_h_, (void**) &want_d_) ||
         !mapped(sizeof(unsigned int), (void**) &want_n_h_, (void**) &want_n_d_) ||
@@ -356,6 +394,9 @@ bool MtpDrafter::slots_load(const std::string& rt_dir, std::string& err) {
     clock_hand_ = 0;
     slot_ld_ = new MtpSlotLoader();   // owns fd from here (slot_stop closes it)
     slot_ld_->fd = fd;
+    slot_ld_->h_slot = h_slot_;
+    slot_ld_->pending = &pending_;
+    slot_ld_->loads = la_loads();
     for (uint8_t*& b : slot_ld_->buf) {
         if (cudaHostAlloc((void**) &b, blob, cudaHostAllocDefault) != cudaSuccess) { err = "mtp: the loader's buffers"; return false; }
     }
@@ -407,6 +448,10 @@ void MtpDrafter::slot_service() {
         }
         if (installed && cudaMemcpyAsync(d_slot_, h_slot_, 512 * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess)
             std::fprintf(stderr, "strata mtp slots: the slot map copy failed\n");
+#if !defined(STRATA_GPU_METAL)
+        if (installed && la_mtp_on_ && strata::kernels::la_mtp_res_row() != nullptr)   // the learner's copy of the map (its batch reads it, after this stream's work)
+            cudaMemcpyAsync(strata::kernels::la_mtp_res_row(), d_slot_, 512 * sizeof(int32_t), cudaMemcpyDeviceToDevice, cs_);
+#endif
         L.cv.notify_all();   // frees above wake the loader
     }
     // d: the rank 0-1 misses the kernel wrote since the last round (the stream is idle: nothing writes them now)
@@ -443,6 +488,67 @@ void MtpDrafter::slot_stop() {
     for (uint8_t* p : slot_ld_->buf) if (p) cudaFreeHost(p);
     delete slot_ld_;
     slot_ld_ = nullptr;
+#endif
+}
+
+// STRATA_MTP_LA: the switch.  On needs the slots and the learner (la_mtp_alloc), and round graphs not yet captured (their label is in them).
+bool MtpDrafter::set_la_mtp(bool on) {
+#if defined(_WIN32) || defined(STRATA_GPU_METAL)
+    return !on;   // no slot loader here
+#else
+    if (!on) {
+        la_mtp_on_ = false;
+        if (slot_ld_ != nullptr) {
+            std::lock_guard<std::mutex> lk(slot_ld_->mu);
+            slot_ld_->pred_h = nullptr;
+        }
+        return true;
+    }
+    if (slots_n_ <= 0 || slot_ld_ == nullptr || !strata::kernels::la_mtp_active()) return false;
+    for (cudaGraphExec_t e : round_exec_) if (e != nullptr) return false;
+    for (cudaGraphExec_t e : round_exec_c_) if (e != nullptr) return false;
+    const OnDevice on_device(device_);
+    la_mtp_on_ = true;
+    {
+        std::lock_guard<std::mutex> lk(slot_ld_->mu);
+        slot_ld_->pred_h = strata::kernels::la_mtp_pred_host();
+        slot_ld_->loads = la_loads();
+    }
+    if (strata::kernels::la_mtp_res_row() != nullptr)
+        cudaMemcpy(strata::kernels::la_mtp_res_row(), d_slot_, 512 * sizeof(int32_t), cudaMemcpyDeviceToDevice);
+    return true;
+#endif
+}
+
+int MtpDrafter::la_loads() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_MTP_LA_LOADS");
+        return e != nullptr ? std::max(0, std::min(16, std::atoi(e))) : 4;
+    }();
+    return v;
+}
+
+// STRATA_MTP_LA: a round's entry, after its slot service and before its graph: the previous round's batch when this stream is idle (its label
+// is written and its copies are done), then this round's source row.  The round's label follows in its graph.
+bool MtpDrafter::la_mtp_entry(int a, std::string& err) {
+#if defined(_WIN32) || defined(STRATA_GPU_METAL)
+    (void) a;
+    (void) err;
+    return true;
+#else
+    if (!la_mtp_on_) return true;
+    try {
+        if (la_label_ready_ && cudaStreamQuery(cs_) == cudaSuccess) {
+            strata::kernels::la_mtp_batch();
+            la_label_ready_ = false;
+        }
+        strata::kernels::la_mtp_take_source(a, cs_);
+    } catch (const std::exception& e) {
+        err = std::string("mtp look-ahead learner: ") + e.what();
+        return false;
+    }
+    la_label_ready_ = true;
+    return true;
 #endif
 }
 
@@ -1438,6 +1544,10 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             } catch (const std::exception& e) { err = std::string("mtp route-resident: ") + e.what(); return false; }
         }
 #if !defined(STRATA_GPU_METAL)
+        // STRATA_MTP_LA: the round's first draft routes row 0 (T = 1 here): its router logits are the learner's label, before the slot remap
+        if (la_mtp_on_ && la_label_rec_) la_mtp_label(logits_, cs);
+#endif
+#if !defined(STRATA_GPU_METAL)
         // STRATA_MTP_SLOTS: the picks become slots (after the tally, which still sees the expert ids)
         if (slots_n_ > 0) mtp_slot_remap(logits_, ids_, d_slot_, (int) T, ref_d_, want_d_, want_n_d_, 4096, st_d_, cs);
 #endif
@@ -1623,7 +1733,9 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
         }
         coupled_rec_ = coupled;
         coupled_j_ = 0;
+        la_label_rec_ = la_mtp_on_;   // the first draft's router is the round's label (STRATA_MTP_LA)
         ok = record_rest(ra, cs_, err);
+        la_label_rec_ = false;
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
@@ -1894,6 +2006,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
+    if (!la_mtp_entry(a, err)) return false;   // STRATA_MTP_LA: the round's source row (no-op when off)
     if (!capture_round(T, cp, err)) return false;
     // Draft j writes its K/V at cell p + a + j, and the K/V ends at max_cells (its page table has no page past it):
     // near the context's end the round drafts only the cells that exist
@@ -2122,6 +2235,7 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!la_mtp_entry(a, err)) return false;   // STRATA_MTP_LA: the round's source row, before its graph (no-op when off)
     if (!stage_source_R(T, err)) return false;
     chain_early_ = std::max(0, std::min(n_early, n_out));
     bool ok = cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;

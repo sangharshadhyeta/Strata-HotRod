@@ -125,6 +125,16 @@ public:
     bool prob() const { return coupled_active_ && h_q_ != nullptr; }
     const int32_t* spec_q() const { return h_q_; }
 
+    /// STRATA_MTP_LA=1 (opt-in): the drafter's router weight (bf16 [512 x n_embd]): the verify window's learner applies it to a main layer's input.
+    const uint16_t* gate_weight() const { return bf16("mlp.gate.weight"); }
+    /// STRATA_MTP_SLOTS is on (the learner needs the slot loader).
+    bool slots_on() const { return slots_n_ > 0; }
+    /// STRATA_MTP_LA: turns the drafter's learner on or off.  On needs the slots, a drafter whose round graphs are not captured yet (their
+    /// label is part of them) and the learner (la_mtp_alloc); false otherwise (the reason is not kept: the caller says the feature is off).
+    bool set_la_mtp(bool on);
+    /// STRATA_MTP_LA_LOADS (default 4, 0..16): the predicted experts loaded per window at most.
+    static int la_loads();
+
     // ---- --pipeline-windows 2: the chain as one asynchronous launch (the round and its steps back to back, no host
     // wait), its first `n_force` steps fed the given tokens instead of their own picks (teacher forcing: the drafts of
     // a window already in flight), each output read once the event after its step has completed.
@@ -320,6 +330,14 @@ private:
     uint64_t slot_loads_ = 0, slot_rounds_ = 0;
     std::vector<bool> pending_;      ///< host: an expert requested from the loader and not yet installed
     MtpSlotLoader* slot_ld_ = nullptr;
+
+    // ---- STRATA_MTP_LA=1 (opt-in, with STRATA_MTP_SLOTS): the drafter's first step is predicted by a learner (native_router.cu la_mtp_*).
+    // Its round graph writes the label (the first draft's router logits), each round takes its source row, and the loader reads the window's
+    // predictions and loads the predicted experts that are not resident.
+    bool la_mtp_on_ = false;          ///< set_la_mtp(true) before the round graphs are captured
+    bool la_label_rec_ = false;       ///< capture_round: the record_rest that routes the round's first draft (the label)
+    bool la_label_ready_ = false;     ///< a round was entered: its label is written by its graph; the next entry runs its batch
+    bool la_mtp_entry(int a, std::string& err);   ///< at a round's entry (draft, chain_launch): the last batch, this round's source row
 };
 
 }  // namespace strata::core

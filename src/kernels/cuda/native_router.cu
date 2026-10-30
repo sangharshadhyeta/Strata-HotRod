@@ -1457,6 +1457,7 @@ __global__ void la_b_end_k(LaBatch a) {
 
 struct LaLearn {
     int L = 0, H = 0, lo = 6, Nd = kLaNd, Nsd = 0, Nset = 0;
+    int dist[kLaNd] = {};        // the instance's distances (kLaDist for the main learner; {1} for the drafter's)
     bool timing = false;
     bool pending = false;        // a batch was launched and its done event is not yet waited on by a launch
     cudaStream_t side = nullptr; // the batch's stream (non-blocking): never the stream the host waits on at a window's end
@@ -1501,17 +1502,15 @@ struct LaLearn {
 };
 static LaLearn* g_la = nullptr;
 
-bool la_learn_alloc(int64_t n_layers, int64_t n_embd, int lo, bool timing, std::string& msg) {
-    if (g_la != nullptr) { msg = "already on"; return true; }
-    if (n_layers <= 0 || n_embd <= 0) { msg = "no layers"; return false; }
-    note_scratch_dev();
-    if (!scratch_here()) { msg = "not on the scratch GPU"; return false; }
+// one learner instance: L layers, H wide, Nd distances per layer (the caller sets the dists), lo the stand-in floor
+static LaLearn* la_new(int L, int H, int lo, int Nd, bool timing, std::string& msg) {
     LaLearn* s = new LaLearn();
-    s->L = (int) n_layers;
-    s->H = (int) n_embd;
+    s->L = L;
+    s->H = H;
     s->lo = lo;
     s->timing = timing;
-    s->Nsd = kLaNd * s->L;
+    s->Nd = Nd;
+    s->Nsd = Nd * s->L;
     s->Nset = s->Nsd * kLaNSlots;
     bool ok = true;
     auto dalloc = [&](void** p, size_t bytes) {
@@ -1574,7 +1573,7 @@ bool la_learn_alloc(int64_t n_layers, int64_t n_embd, int lo, bool timing, std::
         if (s->ev_done != nullptr) cudaEventDestroy(s->ev_done);
         (void) cudaGetLastError();
         delete s;
-        return false;
+        return nullptr;
     }
     // the initial draws (the reset's function, nothing learned yet): A random, B zero; slot 0 has no parameters
     for (int c = 1; c < kLaSlots; ++c) {
@@ -1587,10 +1586,20 @@ bool la_learn_alloc(int64_t n_layers, int64_t n_embd, int lo, bool timing, std::
     std::vector<int> live((size_t) s->Nsd * kLaSlots, 1);
     cudaMemcpy(s->live, live.data(), live.size() * sizeof(int), cudaMemcpyHostToDevice);
     s->logged.assign((size_t) s->Nsd, 0);
-    g_la = s;
     char buf[160];
-    std::snprintf(buf, sizeof buf, "%lld layers, %zu MiB of VRAM%s", (long long) n_layers, s->bytes >> 20, timing ? ", timing on" : "");
+    std::snprintf(buf, sizeof buf, "%lld layers, %zu MiB of VRAM%s", (long long) L, s->bytes >> 20, timing ? ", timing on" : "");
     msg = buf;
+    return s;
+}
+bool la_learn_alloc(int64_t n_layers, int64_t n_embd, int lo, bool timing, std::string& msg) {
+    if (g_la != nullptr) { msg = "already on"; return true; }
+    if (n_layers <= 0 || n_embd <= 0) { msg = "no layers"; return false; }
+    note_scratch_dev();
+    if (!scratch_here()) { msg = "not on the scratch GPU"; return false; }
+    LaLearn* s = la_new((int) n_layers, (int) n_embd, lo, kLaNd, timing, msg);
+    if (s == nullptr) return false;
+    for (int i = 0; i < kLaNd; ++i) s->dist[i] = kLaDist[i];
+    g_la = s;
     return true;
 }
 bool la_learn_active() { return g_la != nullptr && scratch_here(); }
@@ -1666,12 +1675,18 @@ void la_learn_pre_launch(void* stream) {
 }
 
 // after a learning window's graph is launched on cs: the batch on the side stream, which waits for the window's end and records done
+static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd);
 void la_learn_post_launch(void* stream, const int* res, int n) {
     if (!la_learn_active() || n < 1 || n > kLaTok) return;
     LaLearn& s = *g_la;
     cudaStream_t cs = static_cast<cudaStream_t>(stream);
     cudaEventRecord(s.ev_end, cs);
     cudaStreamWaitEvent(s.side, s.ev_end, 0);
+    la_batch(s, res, n, kLaDist, kLaNd);
+}
+// the batch of n token rows on the instance's side stream (the caller ordered it after the work it reads): the LaBatch from the instance,
+// the dists (Nd of them), every kernel in launch order, and the done event.  The main learner's post launch and the drafter's batch share it.
+static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd) {
     LaBatch a{};
     for (int c = 1; c < kLaSlots; ++c) {
         a.A[c] = s.A[c]; a.B[c] = s.B[c]; a.mA[c] = s.mA[c]; a.vA[c] = s.vA[c]; a.mB[c] = s.mB[c]; a.vB[c] = s.vB[c];
@@ -1681,8 +1696,8 @@ void la_learn_post_launch(void* stream, const int* res, int n) {
     a.steps = s.steps; a.live = s.live; a.lead = s.lead; a.frozen = s.frozen; a.reset = s.reset; a.tick = s.tick;
     a.cnt = s.cnt; a.st = s.st; a.tot_ns = s.tot_ns; a.wait_ns = s.wait_ns; a.nwin = s.nwin;
     a.rinfo = s.rinfo; a.kst = s.kst; a.kacc = s.kacc;
-    for (int i = 0; i < kLaNd; ++i) a.dist[i] = kLaDist[i];
-    a.L = s.L; a.H = s.H; a.lo = s.lo; a.n = n; a.Nd = kLaNd; a.Nsd = s.Nsd; a.Nset = s.Nset; a.timing = s.timing ? 1 : 0;
+    for (int i = 0; i < Nd; ++i) a.dist[i] = dist[i];
+    a.L = s.L; a.H = s.H; a.lo = s.lo; a.n = n; a.Nd = Nd; a.Nsd = s.Nsd; a.Nset = s.Nset; a.timing = s.timing ? 1 : 0;
     static const float exact_w = [] { const char* v = std::getenv("STRATA_LA_EXACT_W"); const float w = v != nullptr ? (float) std::atof(v) : 1.0f; return w > 0.0f ? w : 1.0f; }();
     a.exact_w = exact_w;
     cudaStream_t sd_s = s.side;
@@ -1731,9 +1746,9 @@ static bool la_learn_read(LaLearn& s, std::vector<unsigned long long>& cnt, std:
            cudaMemcpy(lead.data(), s.lead, lead.size() * sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess &&
            cudaMemcpy(frozen.data(), s.frozen, frozen.size() * sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess;
 }
-std::string la_learn_report() {
-    if (g_la == nullptr) return "";
-    LaLearn& s = *g_la;
+// the stats line(s) of one learner instance since its start, "" when there are none: name is the instance's name in the lines
+static std::string la_report_inst(LaLearn& s, const char* name) {
+    const std::string pre = std::string("strata serve: ") + name;
     std::vector<unsigned long long> cnt;
     std::vector<int> lead, frozen;
     if (!la_learn_read(s, cnt, lead, frozen)) { (void) cudaGetLastError(); return ""; }
@@ -1741,7 +1756,7 @@ std::string la_learn_report() {
     double hit_l[kLaNd] = {}, hit_p[kLaNd] = {}, tot[kLaNd] = {};
     unsigned long long resets = 0;
     for (int sd = 0; sd < s.Nsd; ++sd) {
-        const int dd = sd % kLaNd, L = lead[sd];
+        const int dd = sd % s.Nd, L = lead[sd];
         const unsigned long long* c = cnt.data() + (size_t) sd * kLaCnt;
         resets += c[16];
         tot[dd] += (double) c[0];
@@ -1749,7 +1764,7 @@ std::string la_learn_report() {
         hit_p[dd] += (double) c[3];
         if (frozen[sd] && !s.logged[sd]) {   // the chosen r of each layer, logged once
             s.logged[sd] = 1;
-            out += "strata serve: look-ahead learner: layer " + std::to_string(sd / kLaNd) + " d=" + std::to_string(kLaDist[dd]) + " chose r=" +
+            out += pre + ": layer " + std::to_string(sd / s.Nd) + " d=" + std::to_string(s.dist[dd]) + " chose r=" +
                    std::to_string(la_rank(L)) + " (" + std::to_string(c[15]) + " changes, " + std::to_string(c[2]) + " picks)\n";
         }
     }
@@ -1757,7 +1772,7 @@ std::string la_learn_report() {
         std::string h = "{";
         for (int r : {0, 4, 8, 16}) {
             int k = 0;
-            for (int sd = dd; sd < s.Nsd; sd += kLaNd) k += la_rank(lead[sd]) == r;
+            for (int sd = dd; sd < s.Nsd; sd += s.Nd) k += la_rank(lead[sd]) == r;
             if (k > 0) h += (h.size() > 1 ? "," : "") + std::to_string(r) + ":" + std::to_string(k);
         }
         return h + "}";
@@ -1768,12 +1783,12 @@ std::string la_learn_report() {
         std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * a / b);
         return std::string(buf);
     };
-    out += "strata serve: look-ahead learner:";
-    for (int dd = 0; dd < kLaNd; ++dd)
-        out += (dd > 0 ? ", " : " layers ") + std::string("d=") + std::to_string(kLaDist[dd]) + " r=" + hist_of(dd);
+    out += pre + ":";
+    for (int dd = 0; dd < s.Nd; ++dd)
+        out += (dd > 0 ? ", " : " layers ") + std::string("d=") + std::to_string(s.dist[dd]) + " r=" + hist_of(dd);
     out += ", leader hit rate";
-    for (int dd = 0; dd < kLaNd; ++dd)
-        out += (dd > 0 ? ", " : " ") + std::string("d=") + std::to_string(kLaDist[dd]) + " " + pct(hit_l[dd], tot[dd]) + " vs plain " +
+    for (int dd = 0; dd < s.Nd; ++dd)
+        out += (dd > 0 ? ", " : " ") + std::string("d=") + std::to_string(s.dist[dd]) + " " + pct(hit_l[dd], tot[dd]) + " vs plain " +
                pct(hit_p[dd], tot[dd]);
     out += " (non-resident ranks < lo; picks since each layer's last change), resets " + std::to_string(resets) + "\n";
     // the resets: each (s,d)'s last one, logged when its count has grown (the recent picks, the plain router's hits, the old leader's)
@@ -1785,7 +1800,7 @@ std::string la_learn_report() {
         if (n_rs == s.resets_seen[(size_t) sd]) continue;
         s.resets_seen[(size_t) sd] = n_rs;
         const unsigned long long* q = ri.data() + (size_t) sd * kLaSlots;
-        out += "strata serve: look-ahead learner: layer " + std::to_string(sd / kLaNd) + " d=" + std::to_string(kLaDist[sd % kLaNd]) +
+        out += pre + ": layer " + std::to_string(sd / s.Nd) + " d=" + std::to_string(s.dist[sd % s.Nd]) +
                " reset (" + std::to_string(n_rs) + " so far): at " + std::to_string(q[0]) + " recent picks the plain router had " +
                std::to_string(q[1]) + " hits, the leader r=" + std::to_string(la_rank((int) q[3])) + " " + std::to_string(q[2]) + "\n";
     }
@@ -1799,11 +1814,11 @@ std::string la_learn_report() {
     }
     s.wait_ev.clear();
     char wbuf[200];
-    std::snprintf(wbuf, sizeof wbuf, "strata serve: look-ahead learner: main stream waited on the batch in %llu of %llu windows%s\n",
+    std::snprintf(wbuf, sizeof wbuf, "%s: main stream waited on the batch in %llu of %llu windows%s\n", pre.c_str(),
                   s.win_waited, s.win_pending, s.timing ? "" : " (not timed: STRATA_LA_LEARN_TIMING=1 times it)");
     out += wbuf;
     if (s.timing) {
-        std::snprintf(wbuf, sizeof wbuf, "strata serve: look-ahead learner: waited %.3f ms in total (measured on cs)\n", s.wait_ms_total);
+        std::snprintf(wbuf, sizeof wbuf, "%s: waited %.3f ms in total (measured on cs)\n", pre.c_str(), s.wait_ms_total);
         out += wbuf;
     }
     if (!s.timing) return out;
@@ -1824,17 +1839,19 @@ std::string la_learn_report() {
         per += (k > 0 ? ", " : "") + std::string(kb);
     }
     char buf[320];
-    std::snprintf(buf, sizeof buf, "strata serve: look-ahead learner: batch on the side stream %.3f ms/window (per kernel ms: %s), "
+    std::snprintf(buf, sizeof buf, "%s: batch on the side stream %.3f ms/window (per kernel ms: %s), "
                   "end-of-window wait bound %.3f ms/window, over %llu windows\n",
-                  (double) tot_ns / 1e6 / w, per.c_str(), (double) wait_ns / 1e6 / w, nwin);
+                  pre.c_str(), (double) tot_ns / 1e6 / w, per.c_str(), (double) wait_ns / 1e6 / w, nwin);
     return out + buf;
+}
+std::string la_learn_report() {
+    if (g_la == nullptr) return "";
+    return la_report_inst(*g_la, "look-ahead learner");
 }
 
 // The file (STRATA_LA_LEARN): "LAL1", version 1, n_layers, n_embd, 512; then per (s,d) the leader's rank (0, 4, 8 or 16); then for each
 // (s,d) with a rank, the leader's A (r x n_embd) and B (512 x r) as fp16.  Written to a temporary file and renamed.
-bool la_learn_save(const char* path, std::string& msg) {
-    if (!la_learn_active()) { msg = "off"; return false; }
-    LaLearn& s = *g_la;
+static bool la_save_inst(LaLearn& s, const char* path, std::string& msg) {
     std::vector<unsigned long long> cnt;
     std::vector<int> lead, frozen;
     if (!la_learn_read(s, cnt, lead, frozen)) { (void) cudaGetLastError(); msg = "cannot read the GPU state"; return false; }
@@ -1866,20 +1883,22 @@ bool la_learn_save(const char* path, std::string& msg) {
     if (std::rename(tmp.c_str(), path) != 0) { std::remove(tmp.c_str()); msg = "rename failed"; return false; }
     return true;
 }
+bool la_learn_save(const char* path, std::string& msg) {
+    if (!la_learn_active()) { msg = "off"; return false; }
+    return la_save_inst(*g_la, path, msg);
+}
 // Loads a file saved for this model shape.  Each (s,d) takes the file's leader in its rank's slot; the other slots start from the
 // leader's first rows and columns (the rest random / zero), all live, with fresh moments.  Called between requests, before any window.
-bool la_learn_load(const char* path, std::string& msg) {
-    if (!la_learn_active()) { msg = "off"; return false; }
-    LaLearn& s = *g_la;
+static bool la_load_inst(LaLearn& s, const char* path, std::string& msg) {
     FILE* f = std::fopen(path, "rb");
     if (f == nullptr) { msg = "no file"; return false; }
     uint32_t hdr[5] = {0, 0, 0, 0, 0};
     bool ok = std::fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x314C414Cu && (hdr[1] == 1u || hdr[1] == 2u || hdr[1] == 3u) &&
-              (int) hdr[2] == s.L && (int) hdr[3] == s.H && hdr[4] == (uint32_t) kLaE;
+              (int) hdr[2] == s.L && (int) hdr[3] == s.H && hdr[4] == (uint32_t) kLaE && (hdr[1] == 3u || s.Nd == kLaNd);
     if (!ok) { std::fclose(f); msg = "not a LAL1 file for this model"; return false; }
     // the file's (s,d) list: version 3 has every dist of kLaDist; versions 1 and 2 had dists 1 and 2 only, which map onto the first two
     // entries of kLaDist (dist 4 then starts from the plain router, not frozen)
-    const int file_nd = hdr[1] == 3u ? kLaNd : 2;
+    const int file_nd = hdr[1] == 3u ? s.Nd : 2;
     const int n_file = file_nd * s.L;
     std::vector<int> rl((size_t) s.Nsd, 0), fzv((size_t) s.Nsd, 0), fsd((size_t) n_file, 0);
     for (int fi = 0; ok && fi < n_file; ++fi) {
@@ -1887,7 +1906,7 @@ bool la_learn_load(const char* path, std::string& msg) {
         ok = std::fread(&w, sizeof w, 1, f) == 1;
         const uint32_t r = w & 255u;
         ok = ok && (r == 0 || r == 4 || r == 8 || r == 16) && (w >> 9) == 0;
-        const int sd = (fi / file_nd) * kLaNd + fi % file_nd;
+        const int sd = (fi / file_nd) * s.Nd + fi % file_nd;
         fsd[(size_t) fi] = sd;
         rl[(size_t) sd] = (int) r;
         fzv[(size_t) sd] = (int) ((w >> 8) & 1u);
@@ -1951,5 +1970,197 @@ bool la_learn_load(const char* path, std::string& msg) {
     for (int v : fzv) nfrozen += v;
     msg = "loaded, " + std::to_string(nfrozen) + " of " + std::to_string(s.Nsd) + " frozen";
     return true;
+}
+bool la_learn_load(const char* path, std::string& msg) {
+    if (!la_learn_active()) { msg = "off"; return false; }
+    return la_load_inst(*g_la, path, msg);
+}
+
+// ---- STRATA_MTP_LA=1 (opt-in; mtp.cpp, verify.cpp): the drafter's look-ahead.  A second instance g_lam: L = 2 (layer 0 is the main model's
+// layer src's router input, layer 1 the drafter), Nd = 1, dist {1}, lo 2.  Each decode window's graph runs la_mtp_forward on that layer's
+// input rows: the drafter's own router (its gate, the plain logits in la_mtp_route) with the learned correction, the leader's top 10 per row,
+// written to the mapped record (pred_h, its sequence last) for the drafter's loader.  The drafter's first round writes its router logits as
+// the label (la_mtp_label, in its graph) and starts from window row a: la_mtp_take_source copies that row's source, slot logits and u into
+// token 0 of the instance's own buffers before the round.  The batch (la_mtp_batch) runs when the drafter's stream is idle and reads only
+// those buffers: the window's forward buffers are written by the next window before the batch, so they cannot be what the batch reads.
+static LaLearn* g_lam = nullptr;
+struct MtpLaBuf {
+    int H = 0;
+    float* route = nullptr;     // [8][512]: the plain logits in, the leader's out
+    float* xall = nullptr;      // [8][H]: the window's source rows
+    float* pscr = nullptr;      // [4][8][512]: the window's slot logits (LaFwdArgs::pred)
+    float* uscr = nullptr;      // [8][kLaRows]: the window's u (LaFwdArgs::u)
+    int* res2 = nullptr;        // [2][512]: row 0 all -1, row 1 the drafter's slot map (device copy of d_slot_)
+    int32_t* pids = nullptr;    // [8][10]: the leader's top 10 per row
+    float* pw = nullptr;        // [8][10]: their weights
+    int* pred_h = nullptr;      // mapped: [0] the sequence, [1] the rows, [2 + 10 t + r] row t's rank r id
+    int* pred_d = nullptr;      // the device alias of pred_h
+    cudaEvent_t ev_src = nullptr;   // recorded after take_source's copies
+    bool src_recorded = false;
+};
+static MtpLaBuf g_mla;
+
+// the window's publish, one block of 128 threads: the ids of the rows, then the rows, then the sequence (after the ids, system-wide)
+__global__ void la_mtp_pub_k(const int32_t* pids, int n, int* rec) {
+    const int i = threadIdx.x;
+    if (i < n * 10) rec[2 + i] = pids[i];
+    if (i == 0) rec[1] = n;
+    __threadfence_system();
+    __syncthreads();
+    if (i == 0) {
+        __threadfence_system();
+        rec[0] = rec[0] + 1;
+    }
+}
+
+static void la_mtp_free_buf() {
+    MtpLaBuf& m = g_mla;
+    cudaFree(m.route);
+    cudaFree(m.xall);
+    cudaFree(m.pscr);
+    cudaFree(m.uscr);
+    cudaFree(m.res2);
+    cudaFree(m.pids);
+    cudaFree(m.pw);
+    if (m.pred_h != nullptr) cudaFreeHost(m.pred_h);
+    if (m.ev_src != nullptr) cudaEventDestroy(m.ev_src);
+    m = MtpLaBuf();
+}
+
+bool la_mtp_alloc(int64_t n_embd, bool timing, std::string& msg) {
+    if (g_lam != nullptr) { msg = "already on"; return true; }
+    if (g_la == nullptr) { msg = "the look-ahead learner is off"; return false; }
+    if (n_embd <= 0) { msg = "no width"; return false; }
+    note_scratch_dev();
+    if (!scratch_here()) { msg = "not on the scratch GPU"; return false; }
+    MtpLaBuf& m = g_mla;
+    m.H = (int) n_embd;
+    bool ok = true;
+    auto dalloc = [&](void** p, size_t bytes) {
+        *p = nullptr;
+        if (!ok) return;
+        if (cudaMalloc(p, bytes) != cudaSuccess) { (void) cudaGetLastError(); ok = false; return; }
+        cudaMemset(*p, 0, bytes);
+    };
+    dalloc((void**) &m.route, (size_t) kLaTok * kLaE * sizeof(float));
+    dalloc((void**) &m.xall, (size_t) kLaTok * m.H * sizeof(float));
+    dalloc((void**) &m.pscr, (size_t) kLaSlots * kLaTok * kLaE * sizeof(float));
+    dalloc((void**) &m.uscr, (size_t) kLaTok * kLaRows * sizeof(float));
+    dalloc((void**) &m.res2, (size_t) 2 * kLaE * sizeof(int));
+    dalloc((void**) &m.pids, (size_t) kLaTok * 10 * sizeof(int32_t));
+    dalloc((void**) &m.pw, (size_t) kLaTok * 10 * sizeof(float));
+    if (ok) {
+        cudaMemset(m.res2, 0xff, (size_t) 2 * kLaE * sizeof(int));   // -1: not resident (row 1 is copied in by the drafter)
+        if (cudaHostAlloc((void**) &m.pred_h, (2 + kLaTok * 10) * sizeof(int), cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &m.pred_d, m.pred_h, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ok = false;
+        } else {
+            for (int i = 0; i < 2 + kLaTok * 10; ++i) m.pred_h[i] = 0;
+        }
+    }
+    if (ok && cudaEventCreateWithFlags(&m.ev_src, cudaEventDisableTiming) != cudaSuccess) { (void) cudaGetLastError(); ok = false; }
+    if (!ok) {
+        la_mtp_free_buf();
+        msg = "no room on the GPU for the drafter's look-ahead (or no events)";
+        return false;
+    }
+    LaLearn* s = la_new(2, (int) n_embd, 2, 1, timing, msg);
+    if (s == nullptr) {
+        la_mtp_free_buf();
+        return false;
+    }
+    s->dist[0] = 1;
+    g_lam = s;
+    return true;
+}
+bool la_mtp_active() { return g_lam != nullptr && scratch_here(); }
+float* la_mtp_route() { return la_mtp_active() ? g_mla.route : nullptr; }
+int* la_mtp_res_row() { return la_mtp_active() ? g_mla.res2 + kLaE : nullptr; }
+const int* la_mtp_pred_host() { return la_mtp_active() ? g_mla.pred_h : nullptr; }
+
+// the window's forward (on the window's stream, in its graph): the source rows into xall, the drafter's plain logits (la_mtp_route, written by
+// the caller) through the leader of the instance's sd 0, then the top 10 per row and the record
+void la_mtp_forward(const float* x, int n, void* stream) {
+    if (!la_mtp_active() || n < 1 || n > kLaTok) return;
+    LaLearn& s = *g_lam;
+    MtpLaBuf& m = g_mla;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    cudaMemcpyAsync(m.xall, x, (size_t) n * m.H * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+    LaFwdArgs a{};
+    a.x = m.xall;
+    a.xsave = nullptr;
+    a.u = m.uscr;
+    a.pred = m.pscr;
+    a.route = m.route;
+    a.lead = s.lead;
+    a.n = n;
+    a.H = m.H;
+    for (int c = 1; c < kLaSlots; ++c) {
+        a.A[c] = s.A[c];
+        a.B[c] = s.B[c];
+    }
+    la_fwd_u_k<<<kLaRows, 256, 0, cs>>>(a);
+    la_fwd_pred_k<<<(n * kLaE + 255) / 256, 256, 0, cs>>>(a);
+    native_router_top10_multi(m.route, m.pids, m.pw, n, stream);
+    la_mtp_pub_k<<<1, 128, 0, cs>>>(m.pids, n, m.pred_d);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+// the drafter's round starts from window row `row`: its source, the slot logits and u of that row into token 0 of the instance's buffers
+// (after the last batch, which reads them), and the event the window waits on before it overwrites the window's buffers
+void la_mtp_take_source(int row, void* stream) {
+    if (!la_mtp_active() || row < 0 || row >= kLaTok) return;
+    LaLearn& s = *g_lam;
+    MtpLaBuf& m = g_mla;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    if (s.pending) cudaStreamWaitEvent(cs, s.ev_done, 0);
+    cudaMemcpyAsync(s.x, m.xall + (size_t) row * m.H, (size_t) m.H * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+    for (int c = 0; c < kLaSlots; ++c)   // slot c, token 0 (the batch's layout: sd 0, token 0 of each slot)
+        cudaMemcpyAsync(s.pred + (size_t) c * kLaTok * kLaE, m.pscr + ((size_t) c * kLaTok + row) * kLaE, (size_t) kLaE * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs);
+    cudaMemcpyAsync(s.u, m.uscr + (size_t) row * kLaRows, (size_t) kLaRows * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+    cudaEventRecord(m.ev_src, cs);
+    m.src_recorded = true;
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+// the drafter's first step's router logits (512) as the label of layer 1, token 0 (in the drafter's round graph)
+void la_mtp_label(const float* logits_row, void* stream) {
+    if (!la_mtp_active()) return;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    cudaMemcpyAsync(g_lam->lab + (size_t) kLaTok * kLaE, logits_row, (size_t) kLaE * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+// the batch of the last round, on the instance's side stream (the caller found the drafter's stream idle: the label and the copies are done)
+void la_mtp_batch() {
+    if (!la_mtp_active()) return;
+    static const int kDist1[1] = {1};
+    la_batch(*g_lam, g_mla.res2, 1, kDist1, 1);
+}
+
+// before a window's graph is launched on its stream: the last batch is done, and the source copies are (the forward overwrites them)
+void la_mtp_pre_launch(void* stream) {
+    if (!la_mtp_active()) return;
+    cudaStream_t cs = static_cast<cudaStream_t>(stream);
+    if (g_lam->pending) cudaStreamWaitEvent(cs, g_lam->ev_done, 0);
+    if (g_mla.src_recorded) cudaStreamWaitEvent(cs, g_mla.ev_src, 0);
+}
+
+bool la_mtp_save(const char* path, std::string& msg) {
+    if (!la_mtp_active()) { msg = "off"; return false; }
+    return la_save_inst(*g_lam, path, msg);
+}
+bool la_mtp_load(const char* path, std::string& msg) {
+    if (!la_mtp_active()) { msg = "off"; return false; }
+    return la_load_inst(*g_lam, path, msg);
+}
+std::string la_mtp_report() {
+    if (!la_mtp_active()) return "";
+    return la_report_inst(*g_lam, "drafter look-ahead learner");
 }
 }

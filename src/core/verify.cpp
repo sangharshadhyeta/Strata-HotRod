@@ -1546,6 +1546,7 @@ void Verifier::la_learn_request_end(const std::string& path, std::string& report
 }
 void Verifier::la_learn_before_launch() {
     if (la_learn_env_on()) strata::kernels::la_learn_pre_launch(cs_);
+    if (strata::kernels::la_mtp_active()) strata::kernels::la_mtp_pre_launch(cs_);   // STRATA_MTP_LA: the drafter's batch and copies first
 }
 bool Verifier::la_learn_after_launch(int T, std::string& err) {
     if (T < 0 || T >= 9 || !la_win_[T]) return true;
@@ -2523,6 +2524,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         static const bool la_tail_read = la_tail_read_v != 0;   // =2: ranks below lo take the predicted stand-in test too
         auto lookahead_node = [&](cudaStream_t s) -> bool {
             try {
+                // STRATA_MTP_LA: in a learning window, the drafter's plain router on the source layer's input, then the learner's forward (once
+                // per window: this layer only, before the dists)
+                if (la_learn_win && l == mtp_src_ && mtp_gate_ != nullptr && strata::kernels::la_mtp_active()) {
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, mtp_gate_, strata::kernels::la_mtp_route(), 512, N, 512, n, s);
+                    strata::kernels::la_mtp_forward(mixed_ + tb * N, n, s);
+                }
                 // dist 4 (STRATA_LA_LEARN=1 only, after dists 1 and 2: the nearest deadline first in the warm loop); without the learner, dists 1 and 2
                 static constexpr int kLookDist[3] = {1, 2, 4};
                 const int n_look = la_learn_env_on() ? 3 : 2;

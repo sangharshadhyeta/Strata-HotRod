@@ -265,6 +265,9 @@ public:
     static void la_learn_set_saved(bool saved);
     static bool la_learn_open(const std::string& path, std::string& msg);
     static void la_learn_request_end(const std::string& path, std::string& report);
+    /// STRATA_MTP_LA=1 (opt-in): the drafter's look-ahead reads layer src's router input in each learning window: gate is the drafter's
+    /// router weight (bf16 [512 x n_embd], MtpDrafter::gate_weight), src the layer.  Set before any window is captured.
+    void set_mtp_la(const uint16_t* gate, int src_layer) { mtp_gate_ = gate; mtp_src_ = src_layer; }
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -632,6 +635,8 @@ private:
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     bool la_win_[9] = {};               // STRATA_LA_LEARN: this window size's graph runs the learner (its batch follows each launch)
+    const uint16_t* mtp_gate_ = nullptr; // STRATA_MTP_LA: the drafter's router weight (set_mtp_la)
+    int mtp_src_ = -1;                   // STRATA_MTP_LA: the source layer whose router input the drafter's learner reads
     void la_learn_before_launch();      // before a window's graph launch: the last batch's weights are done
     bool la_learn_after_launch(int T, std::string& err);   // after a learning window's launch: its batch, on the side stream
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the

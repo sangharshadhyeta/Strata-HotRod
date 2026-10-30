@@ -110,6 +110,25 @@ void la_learn_post_launch(void* stream, const int* resident, int n);
 std::string la_learn_report();                                       ///< the stats line(s) since the start; "" when off
 bool la_learn_save(const char* path, std::string& msg);              ///< the leaders (fp16) and their ranks
 bool la_learn_load(const char* path, std::string& msg);              ///< before the first request; the file must match the model shape
+/// STRATA_MTP_LA=1 (opt-in, with STRATA_MTP_SLOTS and the main learner): the drafter's look-ahead, a second instance (L = 2: layer 0 the
+/// main model's input, layer 1 the drafter; dist 1, lo 2).  la_mtp_alloc once before graph capture (needs the main learner on).  Per window
+/// (decode, in the window's graph): la_mtp_route() takes the drafter's plain logits, then la_mtp_forward(x, n) runs the forward and writes the
+/// leader's top 10 per row to the mapped record la_mtp_pred_host() (word 0 the sequence, word 1 the rows, then the ids).  The drafter's
+/// round: la_mtp_take_source(row) before its graph, la_mtp_label(logits) in it, la_mtp_batch() when its stream is idle; la_mtp_res_row()
+/// is the drafter's slot map (512 ints).  la_mtp_pre_launch before every window's graph launch (waits for the batch and the copies).
+bool la_mtp_alloc(int64_t n_embd, bool timing, std::string& msg);
+bool la_mtp_active();
+float* la_mtp_route();
+void la_mtp_forward(const float* x, int n, void* stream);
+int* la_mtp_res_row();
+void la_mtp_take_source(int row, void* stream);
+void la_mtp_label(const float* logits_row, void* stream);
+void la_mtp_batch();
+void la_mtp_pre_launch(void* stream);
+const int* la_mtp_pred_host();
+bool la_mtp_save(const char* path, std::string& msg);
+bool la_mtp_load(const char* path, std::string& msg);
+std::string la_mtp_report();                                         ///< the drafter's stats line(s); "" when off
 /// STRATA_LA_EDGE_SKIP (default on, =0 off): route_pred_edge_skip_alloc once before graph capture; route_pred_edge_skip after the look-ahead's top-10
 /// writes a predicted rank lo-1 id as -1 when a resident stand-in is within the edge (the floor's config); skips are counted on the
 /// device, and route_pred_edge_skips_take returns the count since the last take and zeroes it.
