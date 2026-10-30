@@ -313,6 +313,16 @@ private:
     bool slots_load(const std::string& rt_dir, std::string& err);   ///< experts_ as n slots, the maps, the loader thread
     void slot_service();     ///< the host's share of a round: installs, evictions, wants; a no-op while the stream is busy
     void slot_stop();       ///< joins the loader, frees its buffers, prints the stats line (destructor)
+    void slot_service_zc();  ///< STRATA_MTP_ZC: slot_service's share in zero-copy mode (no loader: wants are installed from the pinned RAM copy)
+    // ---- STRATA_MTP_ZC=1 (opt-in, with STRATA_MTP_SLOTS): a drafter expert that is not in a slot is computed exactly from its pinned RAM copy
+    // (zc_h_, all 512 experts, mapped; zc_d_ its device address).  h_ptr_/d_ptr_ (512 u64): each expert's blob address, its slot or its RAM copy;
+    // the grouping reads d_ptr_ (moe_group_ptr).  Set in slots_load; no loader thread in this mode.
+    bool zc_on_ = false;
+    uint8_t* zc_h_ = nullptr;
+    uint8_t* zc_d_ = nullptr;
+    unsigned long long* h_ptr_ = nullptr;
+    unsigned long long* d_ptr_ = nullptr;
+    int zc_installs_ = 8;            ///< STRATA_MTP_ZC_INSTALLS: the wanted experts copied into slots per round at most
     int slots_n_ = 0;
     int32_t* d_slot_ = nullptr;      ///< device: expert id -> slot or -1 (512 int32)
     int32_t* h_slot_ = nullptr;      ///< pinned host copy of d_slot_ (512 int32)

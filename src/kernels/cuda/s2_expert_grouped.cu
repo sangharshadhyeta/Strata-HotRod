@@ -1119,6 +1119,48 @@ __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, in
         ent_tok[at] = i / k_per_tok;
     }
 }
+
+// STRATA_MTP_ZC: group_resident_kernel with the blob addresses from a pointer table (ptr_tab[e]: a slot, or the pinned RAM copy of e).
+__global__ void group_ptr_kernel(const int32_t* __restrict__ ids, int n, int k_per_tok, const unsigned long long* __restrict__ ptr_tab,
+                                 unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start, int32_t* __restrict__ counts,
+                                 int32_t* __restrict__ ent_dst, int32_t* __restrict__ ent_tok) {
+    __shared__ int e_s[128], first_s[128], size_s[128], gidx_s[128], gstart_s[129];
+    const int i = threadIdx.x;
+    const int e = i < n ? ids[i] : -1;
+    e_s[i] = e;
+    __syncthreads();
+    int first = i, rank = 0, size = 0;
+    if (i < n) {
+        for (int j = 0; j < i; ++j)
+            if (e_s[j] == e) { if (first == i) first = j; ++rank; }
+        if (first == i)
+            for (int j = i; j < n; ++j) size += e_s[j] == e;
+    }
+    first_s[i] = first;
+    size_s[i] = (i < n && first == i) ? size : 0;
+    __syncthreads();
+    if (i == 0) {
+        int gi = 0, acc = 0;
+        for (int j = 0; j < n; ++j)
+            if (first_s[j] == j) {
+                gidx_s[j] = gi;
+                gstart_s[gi] = acc;
+                grp_ptr[gi] = ptr_tab[e_s[j]];
+                grp_start[gi] = acc;
+                acc += size_s[j];
+                ++gi;
+            }
+        grp_start[gi] = acc;
+        counts[0] = gi;
+        counts[1] = acc;
+    }
+    __syncthreads();
+    if (i < n) {
+        const int at = gstart_s[gidx_s[first]] + rank;
+        ent_dst[at] = i;
+        ent_tok[at] = i / k_per_tok;
+    }
+}
 }  // namespace
 
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
@@ -1128,6 +1170,13 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
     group_resident_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n, k_per_tok, base, (long long) blob, grp_ptr,
                                                                grp_start, counts, ent_dst, ent_tok);
     check("moe_group_resident", stream);
+}
+
+void moe_group_ptr(const int32_t* ids, int n, int k_per_tok, const unsigned long long* ptr_tab, unsigned long long* grp_ptr,
+                   int32_t* grp_start, int32_t* counts, int32_t* ent_dst, int32_t* ent_tok, void* stream) {
+    if (n < 1 || n > 128) { std::fprintf(stderr, "moe_group_ptr: n must be 1..128\n"); std::exit(1); }
+    group_ptr_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n, k_per_tok, ptr_tab, grp_ptr, grp_start, counts, ent_dst, ent_tok);
+    check("moe_group_ptr", stream);
 }
 
 void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,

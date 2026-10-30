@@ -201,6 +201,11 @@ void native_route_tally(const float* logits, const int32_t* ids, const float* we
 /// The ids are written as slots after all ten ranks are decided.  Weights are not touched.  Capturable; CUDA.
 void mtp_slot_remap(const float* logits, int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* ref, int32_t* want, unsigned int* want_n,
                     unsigned int want_cap, unsigned long long* stats, void* stream);
+/// STRATA_MTP_ZC (opt-in, with STRATA_MTP_SLOTS): one thread per (token, rank).  ids [n_tok][10] are NOT changed: a resident pick
+/// marks its slot (ref[slot] = 1, a hit); a miss is counted, and a rank 0-1 miss is appended to `want` (want_n counts every one).
+/// stats as mtp_slot_remap.  Capturable; CUDA.
+void mtp_zc_mark(const int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* ref, int32_t* want, unsigned int* want_n,
+                 unsigned int want_cap, unsigned long long* stats, void* stream);
 void route_detail_alloc();
 void route_detail_read(unsigned long long* out16);   // 48 entries: [16..21] replaced-pick weight buckets (<1%,<2,<5,<10,<20,>=20), [22..26] substitute rank in the router ranking (<20,<40,<80,<160,>=160), [27..32] score gap (<0.5,<1,<2,<4,<8,>=8), [33..42] summed weight per rank x1e6
 }

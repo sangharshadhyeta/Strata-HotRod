@@ -283,6 +283,9 @@ MtpDrafter::~MtpDrafter() {
     g_tally.dump();
     if (cs_) cudaStreamSynchronize(cs_);
     slot_stop();   // the loader thread ends before anything it uses is freed
+    if (zc_h_) cudaFreeHost(zc_h_);   // STRATA_MTP_ZC: the pinned RAM copy and its pointer tables
+    if (h_ptr_) cudaFreeHost(h_ptr_);
+    if (d_ptr_) cudaFree(d_ptr_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
@@ -392,6 +395,55 @@ bool MtpDrafter::slots_load(const std::string& rt_dir, std::string& err) {
     pending_.assign(512, false);
     want_read_ = 0;
     clock_hand_ = 0;
+    // STRATA_MTP_ZC=1: all 512 experts in pinned RAM (mapped, read once from the open fd); the slots keep the hot ones, a drafter
+    // expert that is not in a slot is computed from its RAM copy.  No loader thread here.  If the RAM copy cannot be made, the
+    // stand-in mode stays (fd and loader as below).
+    if (const char* zv = std::getenv("STRATA_MTP_ZC"); zv != nullptr && std::atoi(zv) == 1) {
+        const size_t total = 512 * blob;
+        std::string why;
+        uint8_t* zh = nullptr;
+        uint8_t* zd = nullptr;
+        const off_t size = ::lseek(fd, 0, SEEK_END);
+        if (size < 0 || (size_t) size < total) why = "experts.bin is shorter than 512 blobs";
+        else if (cudaHostAlloc((void**) &zh, total, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) why = "the pinned RAM copy (cudaHostAlloc) failed";
+        else {
+            for (size_t got = 0; got < total && why.empty();) {
+                const ssize_t r = ::pread(fd, zh + got, total - got, (off_t) got);
+                if (r < 0 && errno == EINTR) continue;
+                if (r <= 0) why = "reading experts.bin failed";
+                else got += (size_t) r;
+            }
+        }
+        if (why.empty() && cudaHostGetDevicePointer((void**) &zd, zh, 0) != cudaSuccess) why = "cudaHostGetDevicePointer failed";
+        if (why.empty() && (cudaHostAlloc((void**) &h_ptr_, 512 * sizeof(unsigned long long), cudaHostAllocDefault) != cudaSuccess ||
+                            cudaMalloc((void**) &d_ptr_, 512 * sizeof(unsigned long long)) != cudaSuccess))
+            why = "the expert pointer table";
+        if (why.empty()) {
+            for (int e = 0; e < 512; ++e)
+                h_ptr_[e] = (unsigned long long) (h_slot_[e] >= 0 ? experts_ + (size_t) h_slot_[e] * blob : zd + (size_t) e * blob);
+            if (cudaMemcpy(d_ptr_, h_ptr_, 512 * sizeof(unsigned long long), cudaMemcpyHostToDevice) != cudaSuccess) why = "the expert pointer table copy";
+        }
+        if (why.empty()) {
+            zc_h_ = zh;
+            zc_d_ = zd;
+            zc_on_ = true;
+            ::close(fd);
+            std::fprintf(stderr, "strata mtp: STRATA_MTP_ZC: the drafter's %d non-resident experts are read from %.0f MiB of pinned RAM (exact, no stand-ins); a rank 0-1 miss is promoted into a slot from RAM\n",
+                         512 - n, (double) total / 1048576.0);
+        } else {
+            std::fprintf(stderr, "strata mtp: STRATA_MTP_ZC off (%s): the stand-in mode stays\n", why.c_str());
+            if (zh) cudaFreeHost(zh);
+            if (h_ptr_) { cudaFreeHost(h_ptr_); h_ptr_ = nullptr; }
+            if (d_ptr_) { cudaFree(d_ptr_); d_ptr_ = nullptr; }
+            (void) cudaGetLastError();
+        }
+        if (const char* iv = std::getenv("STRATA_MTP_ZC_INSTALLS"); iv != nullptr) zc_installs_ = std::max(0, std::min(64, std::atoi(iv)));
+    }
+    if (zc_on_) {   // the zero-copy mode: no loader (its line above says what the non-resident experts are)
+        std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS=%d: %d of 512 drafter experts on the GPU (%.0f MiB, %.0f MiB freed)\n",
+                     n, n, (double) n * (double) blob / 1048576.0, (double) (512 - n) * (double) blob / 1048576.0);
+        return true;
+    }
     slot_ld_ = new MtpSlotLoader();   // owns fd from here (slot_stop closes it)
     slot_ld_->fd = fd;
     slot_ld_->h_slot = h_slot_;
@@ -411,8 +463,9 @@ bool MtpDrafter::slots_load(const std::string& rt_dir, std::string& err) {
 // every copy and every map write is ordered before the next launch, so a slot is never evicted while a copy into it is pending.
 void MtpDrafter::slot_service() {
 #if !defined(_WIN32) && !defined(STRATA_GPU_METAL)
-    if (slots_n_ <= 0 || slot_ld_ == nullptr || cs_ == nullptr) return;
+    if (slots_n_ <= 0 || (slot_ld_ == nullptr && !zc_on_) || cs_ == nullptr) return;
     if (cudaStreamQuery(cs_) != cudaSuccess) return;   // busy: skip this round
+    if (zc_on_) { slot_service_zc(); return; }
     MtpSlotLoader& L = *slot_ld_;
     const size_t blob = strata::kernels::cpu::BLOB;
     bool installed = false;
@@ -474,6 +527,59 @@ void MtpDrafter::slot_service() {
 #endif
 }
 
+// STRATA_MTP_ZC: slot_service's share in the zero-copy mode (the stream is idle).  The rank 0-1 misses the kernel wrote are installed from the
+// pinned RAM copy, at most zc_installs_ per round, CLOCK for the victim.  Each copy is queued on cs_ before the next round's graph; the victim's
+// pointer goes to RAM in the same update, so no group points at a slot while it is overwritten.
+void MtpDrafter::slot_service_zc() {
+#if !defined(_WIN32) && !defined(STRATA_GPU_METAL)
+    const size_t blob = strata::kernels::cpu::BLOB;
+    const unsigned int n_want = *(volatile unsigned int*) want_n_h_;
+    const unsigned int lim = std::min(n_want, 4096u);
+    std::vector<uint8_t> seen(512, 0);
+    int installs = 0;
+    for (unsigned int i = want_read_; i < lim && installs < zc_installs_; ++i) {
+        const int e = want_h_[i];
+        if (e < 0 || e >= 512 || h_slot_[e] >= 0 || seen[(size_t) e]) continue;
+        seen[(size_t) e] = 1;
+        int slot = -1;
+        while (slot < 0) {
+            const int s = clock_hand_;
+            clock_hand_ = (s + 1) % slots_n_;
+            if (ref_h_[s] != 0) ref_h_[s] = 0;
+            else slot = s;
+        }
+        if (cudaMemcpyAsync(experts_ + (size_t) slot * blob, zc_h_ + (size_t) e * blob, blob, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+            (void) cudaGetLastError();
+            continue;
+        }
+        const int old = expert_of_[(size_t) slot];
+        if (old >= 0) {
+            h_slot_[old] = -1;
+            h_ptr_[old] = (unsigned long long) (zc_d_ + (size_t) old * blob);
+        }
+        h_slot_[e] = slot;
+        h_ptr_[e] = (unsigned long long) (experts_ + (size_t) slot * blob);
+        expert_of_[(size_t) slot] = e;
+        ref_h_[slot] = 1;   // a fresh install gets one pass of the hand, as in the loader mode
+        ++slot_loads_;
+        ++installs;
+    }
+    if (installs > 0) {
+        if (cudaMemcpyAsync(d_slot_, h_slot_, 512 * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+            cudaMemcpyAsync(d_ptr_, h_ptr_, 512 * sizeof(unsigned long long), cudaMemcpyHostToDevice, cs_) != cudaSuccess)
+            std::fprintf(stderr, "strata mtp slots: the slot map copy failed\n");
+#if !defined(STRATA_GPU_METAL)
+        if (la_mtp_on_ && strata::kernels::la_mtp_res_row() != nullptr)   // the learner's copy of the map (as in the loader mode)
+            cudaMemcpyAsync(strata::kernels::la_mtp_res_row(), d_slot_, 512 * sizeof(int32_t), cudaMemcpyDeviceToDevice, cs_);
+#endif
+    }
+    *(volatile unsigned int*) want_n_h_ = 0;
+    want_read_ = 0;
+    ++slot_rounds_;
+    if (slot_rounds_ % 512 == 0) print_slot_stats(st_h_, slot_rounds_, slot_loads_);
+#endif
+}
+
 void MtpDrafter::slot_stop() {
 #if !defined(_WIN32) && !defined(STRATA_GPU_METAL)
     if (slots_n_ > 0 && st_h_ != nullptr) print_slot_stats(st_h_, slot_rounds_, slot_loads_);
@@ -504,6 +610,7 @@ bool MtpDrafter::set_la_mtp(bool on) {
         }
         return true;
     }
+    if (zc_on_) { std::fprintf(stderr, "strata mtp: the look-ahead learner needs the loader thread: STRATA_MTP_ZC has none\n"); return false; }
     if (slots_n_ <= 0 || slot_ld_ == nullptr || !strata::kernels::la_mtp_active()) return false;
     for (cudaGraphExec_t e : round_exec_) if (e != nullptr) return false;
     for (cudaGraphExec_t e : round_exec_c_) if (e != nullptr) return false;
@@ -1549,11 +1656,14 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
 #endif
 #if !defined(STRATA_GPU_METAL)
         // STRATA_MTP_SLOTS: the picks become slots (after the tally, which still sees the expert ids)
-        if (slots_n_ > 0) mtp_slot_remap(logits_, ids_, d_slot_, (int) T, ref_d_, want_d_, want_n_d_, 4096, st_d_, cs);
+        // STRATA_MTP_ZC: the picks stay expert ids; a miss is read from its pinned RAM copy by the grouping (d_ptr_)
+        if (zc_on_) mtp_zc_mark(ids_, d_slot_, (int) T, ref_d_, want_d_, want_n_d_, 4096, st_d_, cs);
+        else if (slots_n_ > 0) mtp_slot_remap(logits_, ids_, d_slot_, (int) T, ref_d_, want_d_, want_n_d_, 4096, st_d_, cs);
 #endif
         g_mp.stamp(9, cs);
-        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
-                           grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
+        if (zc_on_) moe_group_ptr(ids_, (int) (T * K), (int) K, d_ptr_, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
+        else moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
+                                grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
                        hit_xs_, hit_scratch_, parts_, cs);

@@ -700,6 +700,32 @@ void mtp_slot_remap(const float* logits, int32_t* ids, const int32_t* d_slot, in
                     unsigned int want_cap, unsigned long long* stats, void* stream) {
     mtp_slot_remap_k<<<n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, d_slot, ref, want, want_n, want_cap, stats);
 }
+// STRATA_MTP_ZC (opt-in, with STRATA_MTP_SLOTS): one thread per (token, rank).  Marks the slot of a resident pick (ref = 1, a hit) and
+// writes the rank 0-1 misses to `want`; the ids are NOT changed (a miss is computed from its pinned RAM copy, see moe_group_ptr).
+__global__ void mtp_zc_mark_k(const int32_t* __restrict__ ids, const int32_t* __restrict__ d_slot, int n_thr,
+                              uint8_t* __restrict__ ref, int32_t* __restrict__ want, unsigned int* __restrict__ want_n,
+                              unsigned int want_cap, unsigned long long* __restrict__ stats) {
+    const int idx = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n_thr) return;
+    const int r = idx % 10;
+    const int e = ids[idx];
+    atomicAdd(&stats[r], 1ull);
+    const int s = (e >= 0 && e < 512) ? d_slot[e] : -1;
+    if (s >= 0) {
+        ref[s] = 1;
+        atomicAdd(&stats[10 + r], 1ull);
+    } else if (r < 2) {
+        const unsigned int i = atomicAdd(want_n, 1u);
+        if (i < want_cap) want[i] = e;
+    }
+}
+void mtp_zc_mark(const int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* ref, int32_t* want, unsigned int* want_n,
+                 unsigned int want_cap, unsigned long long* stats, void* stream) {
+    const int n_thr = n_tok * 10;
+    const int block = 128;
+    mtp_zc_mark_k<<<(n_thr + block - 1) / block, block, 0, static_cast<cudaStream_t>(stream)>>>(ids, d_slot, n_thr, ref, want, want_n,
+                                                                                              want_cap, stats);
+}
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift) {

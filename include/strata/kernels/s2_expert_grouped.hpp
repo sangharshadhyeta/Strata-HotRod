@@ -105,6 +105,10 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
                         int32_t* ent_tok, void* stream);
+/// STRATA_MTP_ZC: moe_group_resident with each expert's blob address taken from ptr_tab[id] (512 entries: a VRAM slot, or a pinned
+/// RAM copy the kernel reads over PCIe).  Same outputs as moe_group_resident for the same addresses.
+void moe_group_ptr(const int32_t* ids, int n, int k_per_tok, const unsigned long long* ptr_tab, unsigned long long* grp_ptr,
+                   int32_t* grp_start, int32_t* counts, int32_t* ent_dst, int32_t* ent_tok, void* stream);
 void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int n_expert, int32_t* slot, int32_t* dst,
                           int32_t* count, void* stream);
 void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
