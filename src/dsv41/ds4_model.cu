@@ -4674,6 +4674,17 @@ struct Model::Impl {
         for (const Dev& d : devs)
             if (commit_charged(d)) room = commit_room();
         const double room0 = room;
+        // DS4_DSPARK_VRAM=f (0 < f < 1): the drafter keeps only its hottest f of its experts on the GPU, the rest computed
+        // from RAM like a trunk layer's misses.  Unset (or invalid): all of them, as before
+        double dsp_f = 0.0;
+        if (const char* dv = std::getenv("DS4_DSPARK_VRAM")) {
+            char* dend = nullptr;
+            const double f = std::strtod(dv, &dend);
+            if (dend != dv && *dend == '\0' && f > 0.0 && f < 1.0)
+                dsp_f = f;
+            else if (g.n_mtp > 0)
+                std::fprintf(stderr, "ds4: DS4_DSPARK_VRAM=%s is not a fraction in (0, 1): ignored, the drafter keeps all its experts on the GPU\n", dv);
+        }
         // per group: what its tightest member has left (each member holds its part of every VRAM expert of the
         // group's layers, its unit bytes a slot - counted at the members' mean: an uneven split's odd blocks go round
         // the members layer by layer, so each member's total comes to about the mean's)
@@ -4725,7 +4736,10 @@ struct Model::Impl {
             double budget_t = budget;   // the drafter's experts first, all of them (every draft uses its blocks)
             for (Layer& l : L)
                 if (l.grp == (int) gi && l.mtp) {
-                    l.n_vram = std::min(l.n_exp, (int) std::floor(budget_t / (double) ucount(l)));
+                    if (dsp_f > 0.0)   // DS4_DSPARK_VRAM: its hottest fraction (the profile's order, in place_experts' layer loop)
+                        l.n_vram = std::min({l.n_exp, (int) std::floor(dsp_f * l.n_exp), (int) std::floor(budget_t / (double) ucount(l))});
+                    else
+                        l.n_vram = std::min(l.n_exp, (int) std::floor(budget_t / (double) ucount(l)));
                     budget_t -= (double) l.n_vram * ucount(l);
                 }
             double want = 0;
@@ -4873,6 +4887,15 @@ struct Model::Impl {
                 cudaSetDevice(devs[(size_t) x.dev].id);
                 CK(cudaMemcpy(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice));
             }
+        }
+        if (dsp_f > 0.0 && g.n_mtp > 0) {   // (after the spare: the counts are the final ones)
+            const Layer& m0 = L[(size_t) g.nl];
+            double saved = 0.0;
+            for (const Layer& l : L)
+                if (l.mtp) saved += (double) (l.n_exp - l.n_vram) * ucount(l);
+            std::fprintf(stderr, "ds4: DS4_DSPARK_VRAM=%.2f: the drafter keeps %d of its %d experts a block on the GPU (%.2f GB), "
+                                 "the rest computed from RAM like the trunk's misses; %.2f GB more for the trunk's experts\n",
+                         dsp_f, m0.n_vram, m0.n_exp, (double) m0.n_vram * ucount(m0) / 1e9, saved / 1e9);
         }
         return true;
     }
