@@ -36,10 +36,14 @@ class LaunchDeepSeek(unittest.TestCase):
 
     def test_the_model_is_in_the_list(self):
         rows = [r for r in catalog(self.hw).rows() if r.family == "deepseek41"]
-        self.assertEqual([r.model for r in rows], ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "IST-DAS-1.75bpw", "UD-Q8_K_XL"])
+        self.assertEqual([r.model for r in rows], ["IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "IST-DAS-1.75bpw", "Starw1-2.00bpw-MXFP8",
+                                                   "UD-Q8_K_XL"])   # (Starw1: Strata-HotRod's set)
         self.assertEqual([r.download_gb for r in rows[:3]], [256.8, 273.8, 239.3])
         self.assertEqual(catalog(self.hw).resolve("ist-das-2.25bpw"), ("deepseek41", "IST-DAS-2.25bpw"))
-        r = rows[3]
+        r = rows[3]   # Strata-HotRod's set: the 2.00 backbone with the 202.8 GB MXFP8 table
+        self.assertEqual((r.id, r.download_gb), ("deepseek-v4.1-flash-starw1-2.00bpw-mxfp8", 349.3))
+        self.assertEqual(catalog(self.hw).resolve("starw1-2.00bpw-mxfp8"), ("deepseek41", "Starw1-2.00bpw-MXFP8"))
+        r = rows[4]
         self.assertEqual((r.id, r.download_gb, r.verdict, r.images), ("deepseek-v4.1-flash-ud-q8_k_xl", 508.4, "fits", True))   # 0.2.7: pictures through the engine's own tower
         self.assertEqual(catalog(self.hw).resolve("ud-q8_k_xl"), ("deepseek41", "UD-Q8_K_XL"))
         self.assertEqual(catalog(self.hw).max_context("deepseek41", "UD-Q8_K_XL"), 8192)

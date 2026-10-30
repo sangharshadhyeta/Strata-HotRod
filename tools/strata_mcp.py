@@ -570,7 +570,8 @@ class Strata:
         big = self.multi_family(family)
         if big and model in big["models"]:
             # nine shards; the memory the weights need is VRAM + RAM together WITHOUT the n-gram table (it stays on the SSD)
-            gb = sum(big["sha256"][n][0] for n in [*big["models"][model]["shards"], *big["models"][model].get("shared", [])]) / 1e9
+            pins = {**big["sha256"], **big["models"][model].get("sha256", {})}   # (a model's own pins first: Strata-HotRod's Starw1 set)
+            gb = sum(pins[n][0] for n in [*big["models"][model]["shards"], *big["models"][model].get("shared", [])]) / 1e9
             return {"about": big["models"][model]["about"], "download_gb": round(gb, 1), "ram_gb": big["models"][model]["ram_gb"],
                     "arena_gb": round(float(big["models"][model]["ram_gb"]) - 17.0, 1), "mem_total": True, "vision": bool(big.get("vision", True)),
                     "engine": None, "families": (family,), "multi_file": True}

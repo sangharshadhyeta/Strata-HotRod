@@ -71,7 +71,19 @@ ISTA_SETS = {
                         "ppl": "7.3%", "ram_ok_gb": 44.0, "ram_great_gb": 176.0, "disk_total": 274.0,
                         "quality": "about 7.3% above the original model's perplexity (code and agent work about 2-3% above), "
                                    "the better of the two, 17 GB more disk"},
+    # Strata-HotRod: Starw1's uncensored 2.00 set (Abiray's abliteration of the IQ2_XXS shards: the same sizes, other weights) with DeepSeek's
+    # own MXFP8 Engram (202.8 GB) in place of the 4-bit one; the planner's numbers are the 2.00 set's, the table's size its own
+    "Starw1-2.00bpw-MXFP8": {"title": "Starw1 2.00 bpw uncensored, MXFP8 Engram", "set_bytes": 138_580_870_816, "experts_gb": 132.07,
+                             "profile": "profile-2.00.bin", "ppl": "15.5%", "ram_ok_gb": 40.0, "ram_great_gb": 160.0, "disk_total": 349.0,
+                             "engram_bytes": 202_758_032_880,
+                             "quality": "the official 2.00 set uncensored (abliterated), with the n-gram table at DeepSeek's own 8-bit "
+                                        "precision; its quality against the original model is not measured"},
 }
+
+
+def _eg(v: dict) -> int:
+    """The set's n-gram table in bytes: the official IQ4_NL one, or the set's own (Strata-HotRod's MXFP8)."""
+    return v.get("engram_bytes", ISTA_ENGRAM_BYTES)
 ISTA_DENSE_GB = 6.16                  # the dense weights in the shards (attention, router, shared experts, the head; the embedding stays on the CPU)
 ISTA_DENSE_ON_GPU_GB = 4.5            # what a card holds of them with a 12 GB card (measured on the 5070 / 3060: the engine places the rest itself)
 ISTA_MEASURED = ("an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe drive: answers about 4.7 tokens a second, a 4,000-token prompt "
@@ -122,7 +134,7 @@ def variant_key(model: str | None) -> str | None:
 
 def ista_download_bytes(model: str, have_engram: bool = False) -> int:
     v = variant(model)
-    return v["set_bytes"] + ISTA_DSPARK_BYTES + ISTA_META_BYTES + (0 if have_engram else ISTA_ENGRAM_BYTES)
+    return v["set_bytes"] + ISTA_DSPARK_BYTES + ISTA_META_BYTES + (0 if have_engram else _eg(v))
 
 
 def recommend(ram_gb: float | None, disk_free_gb: float | None = None) -> str:
@@ -203,14 +215,14 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
     download = ista_download_bytes(model) / GB
     out: dict[str, Any] = {"variant": model, "cards": [], "experts_total": EXPERTS, "experts_in_vram": 0, "vram_experts_gb": 0.0,
                            "cpu_experts_gb": v["experts_gb"], "weights_gb": _round1(set_gb), "experts_gb": _round1(v["experts_gb"]),
-                           "dense_gb": _round1(ISTA_DENSE_GB), "engram_gb": _round1(ISTA_ENGRAM_BYTES / GB), "download_gb": _round1(download),
+                           "dense_gb": _round1(ISTA_DENSE_GB), "engram_gb": _round1(_eg(v) / GB), "download_gb": _round1(download),
                            "tp": tp_for(n, keep), "args": [], "measured": ISTA_MEASURED, "lines": [], "warnings": [], "ram_gb": ram_gb,
                            "context": context, "disk_total_gb": v["disk_total"]}
     need_disk = download + DISK_HEADROOM_GB
     out["disk_need_gb"] = _round1(need_disk)
     out["disk_ok"] = None if disk_free_gb is None else disk_free_gb >= need_disk
     lines, warns = out["lines"], out["warnings"]
-    lines.append(f"DeepSeek-V4.1-Flash, {v['title']}: a {download:.0f} GB download ({set_gb:.0f} GB of model, {ISTA_ENGRAM_BYTES / GB:.0f} GB "
+    lines.append(f"DeepSeek-V4.1-Flash, {v['title']}: a {download:.0f} GB download ({set_gb:.0f} GB of model, {_eg(v) / GB:.0f} GB "
                  f"n-gram table, {ISTA_DSPARK_BYTES / GB:.0f} GB drafter). Quality: {v['quality']}.")
     lines.append("The n-gram table stays on the SSD and is read a few rows for each word: use an NVMe drive for the model files (a slow "
                  "disk makes every word slower). The same table serves every IST-DAS set, so installing another one downloads it once.")
@@ -295,7 +307,7 @@ def _plan_uma(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
                                      "experts_gb": _round1(resident), "experts": in_mem}],
         "experts_total": EXPERTS, "experts_in_vram": in_mem, "vram_experts_gb": _round1(resident), "cpu_experts_gb": 0.0,
         "weights_gb": _round1(set_gb), "experts_gb": _round1(v["experts_gb"]), "dense_gb": _round1(ISTA_DENSE_GB),
-        "engram_gb": _round1(ISTA_ENGRAM_BYTES / GB), "download_gb": _round1(download), "tp": 1, "args": [],
+        "engram_gb": _round1(_eg(v) / GB), "download_gb": _round1(download), "tp": 1, "args": [],
         "measured": UMA_MEASURED, "lines": [], "warnings": [], "ram_gb": ram_gb, "context": context,
         "disk_total_gb": v["disk_total"], "disk_need_gb": _round1(need_disk),
         "disk_ok": None if disk_free_gb is None else disk_free_gb >= need_disk,
@@ -304,7 +316,7 @@ def _plan_uma(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
     }
     lines, warns = out["lines"], out["warnings"]
     lines.append(f"DeepSeek-V4.1-Flash, {v['title']}: a {download:.0f} GB download ({set_gb:.0f} GB of model, "
-                 f"{ISTA_ENGRAM_BYTES / GB:.0f} GB n-gram table, {ISTA_DSPARK_BYTES / GB:.0f} GB drafter). Quality: {v['quality']}.")
+                 f"{_eg(v) / GB:.0f} GB n-gram table, {ISTA_DSPARK_BYTES / GB:.0f} GB drafter). Quality: {v['quality']}.")
     lines.append("The n-gram table stays on the SSD and is read a few rows for each word: use an NVMe drive for the model files (a slow "
                  "disk makes every word slower). The same table serves every IST-DAS set, so installing another one downloads it once.")
     name = card.get("name") or "the built-in Radeon"
@@ -625,7 +637,7 @@ def _plan_mac(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
                    "layers": [0, LAYERS - 1], "dense_gb": _round1(ISTA_DENSE_GB), "experts_gb": _round1(resident), "experts": in_mem}],
         "experts_total": EXPERTS, "experts_in_vram": in_mem, "vram_experts_gb": _round1(resident), "cpu_experts_gb": 0.0,
         "weights_gb": _round1(v["set_bytes"] / GB), "experts_gb": _round1(v["experts_gb"]), "dense_gb": _round1(ISTA_DENSE_GB),
-        "engram_gb": _round1(ISTA_ENGRAM_BYTES / GB), "download_gb": _round1(download), "tp": 1, "args": [],
+        "engram_gb": _round1(_eg(v) / GB), "download_gb": _round1(download), "tp": 1, "args": [],
         "measured": MAC_MEASURED, "lines": [], "warnings": [], "ram_gb": ram_gb, "context": context,
         "disk_total_gb": v["disk_total"], "disk_need_gb": _round1(need_disk),
         "disk_ok": None if disk_free_gb is None else disk_free_gb >= need_disk,
@@ -635,7 +647,7 @@ def _plan_mac(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
     }
     lines, warns = out["lines"], out["warnings"]
     lines.append(f"DeepSeek-V4.1-Flash, {v['title']}: a {download:.0f} GB download ({v['set_bytes'] / GB:.0f} GB of model, "
-                 f"{ISTA_ENGRAM_BYTES / GB:.0f} GB n-gram table, {ISTA_DSPARK_BYTES / GB:.0f} GB drafter). Quality: {v['quality']}.")
+                 f"{_eg(v) / GB:.0f} GB n-gram table, {ISTA_DSPARK_BYTES / GB:.0f} GB drafter). Quality: {v['quality']}.")
     lines.extend(l for l in mp["lines"][1:] if not l.startswith("Measured on "))
     lines.append("Measured on " + MAC_MEASURED_PACK[MAC_SET_PACK[key]] + ".")
     out["measured"] = MAC_MEASURED_PACK[MAC_SET_PACK[key]]

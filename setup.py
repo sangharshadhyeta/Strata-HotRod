@@ -102,6 +102,7 @@ HF_REVISIONS = {
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",           # 2026-10-13
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": "f924b94f19c1fea02c06a65c8475b0a45e2b88b1",             # 2026-10-20 (the port's reference)
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": "cb02422c900df489cea5833e8a92171224059b3c",    # 2026-10-24 (ISTA-DASLab's final 1.75 / 2.00 / 2.25 bpw sets and Engram)
+    "Starw1/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-IQ2_XXS-MXFP8-Engram-GGUF": "b12d5ce1ae7d3b724d01a18c3a828907f124f595",   # 2026-10-30 (Strata-HotRod)
 }
 
 
@@ -727,6 +728,18 @@ DSV41_LEGACY_FILES = {
     "model-2.25bpw-00004-of-00004.gguf": (36771591232, "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf"),
     "engram-IQ4_NL.gguf": (110595290720, "1f17d8ae37e9df3bb45f7ef1b4fcd1706d7b759af0413c117bf8e92aed459281"),
 }
+# Strata-HotRod's DeepSeek model: Starw1's uncensored 2.00 set (Abiray's abliteration of ISTA's IQ2_XXS shards - the official names and, for
+# shard 1, the official size, other weights) and DeepSeek's own Engram at its MXFP8 precision.  Its pins are its own (the model's "sha256"
+# is read before the family's), from the repository's SHA256SUMS at the pinned revision.
+DSV41_STARW1_REPO = "Starw1/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-IQ2_XXS-MXFP8-Engram-GGUF"
+DSV41_MXFP8_ENGRAM = "DeepSeek-V4.1-Flash-Engram-MXFP8.gguf"
+DSV41_STARW1_FILES = {
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf": (39075714624, "89156abe782f5e6416563a91c7b0d0fc382a8fdbecb222d1d50fb54a5eac0868"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00004.gguf": (39388449504, "ea63f4a003f90bbf324f07f585a3e51a6391673c3ef203d1b883e236747feb38"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00004.gguf": (39246891616, "b347a95133cfa45c017945186a8da5f7ab69bcdeb5439e50c2f95605d543b113"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf": (20870099072, "f49bfdecba1b9d04289fb5d1a86efa3a62830202f3c7b271a664d2651d7d3473"),
+    DSV41_MXFP8_ENGRAM: (202758032880, "fdd44bfc8ef37ccf292754c057230197c914907df4e3aa231d55a01d99b1b030"),
+}
 # today's name -> the name it had in the first release
 DSV41_LEGACY_NAMES = {
     **{DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i): "model-2.00bpw-%05d-of-00004.gguf" % i for i in range(1, 5)},
@@ -740,8 +753,11 @@ DSV41_SHARED = {
     DSV41_ISTA_ENGRAM: hf(DSV41_ISTA_REPO),
     DSV41_SHARD.format(i=1): hf(DSV41_REPO) + "UD-Q8_K_XL/",      # only its metadata is read (pack_gguf --engram-meta)
     DSV41_DSPARK: hf(DSV41_REPO),
+    DSV41_MXFP8_ENGRAM: hf(DSV41_STARW1_REPO),                    # (Strata-HotRod's model only)
 }
-DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES, **DSV41_LEGACY_FILES}
+# (the MXFP8 table's name is its own, so the family's table carries it too, for the lookups by name; the Starw1 shards keep the official
+# names, whose pins here stay the official set's - install_dsv41 reads a model's own pins first)
+DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES, **DSV41_LEGACY_FILES, DSV41_MXFP8_ENGRAM: DSV41_STARW1_FILES[DSV41_MXFP8_ENGRAM]}
 DSV41_PROFILES = ROOT / "data" / "dsv41"           # the shipped hot-expert profiles (profile-2.00.bin, profile-2.25.bin, + .sha256)
 DSV41_CONTEXT = 8192          # the context the engine was checked at (4096 and 8192; 64K is not tried yet)
 DSV41_MAC_VISION = False      # an Apple Silicon Mac: the Metal engine has not run DeepSeek's picture tower (0.2.7.1), so pictures stay off there
@@ -781,6 +797,14 @@ MULTI_FILE_FAMILIES["deepseek41"]["models"] = {
         "ram_gb": 34, "recipe": "ista", "subdir": None, "legacy_subdir": None, "profile": "profile-2.00.bin", "hf": hf(DSV41_ISTA_REPO),
         "shards": [DSV41_ISTA_SHARD.format(quant="IQ1_M", i=i) for i in range(1, 5)],
         "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
+    "Starw1-2.00bpw-MXFP8": {
+        "label": "Starw1 2.00 bpw uncensored, MXFP8 Engram (Strata-HotRod)",
+        "about": "the 2.00 set uncensored (Abiray's abliteration) with DeepSeek's own 8-bit n-gram table: 139 GB of model + 203 GB table + "
+                 "8 GB drafter (349 GB of disk). Its quality against the original model is not measured",
+        "ram_gb": 40, "recipe": "ista", "subdir": None, "legacy_subdir": None, "profile": "profile-2.00.bin", "hf": hf(DSV41_STARW1_REPO),
+        "source": "Starw1 (huggingface.co/" + DSV41_STARW1_REPO + "), with the DSpark drafter and a small metadata file from Unsloth",
+        "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i) for i in range(1, 5)],
+        "shared": [DSV41_MXFP8_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK], "sha256": DSV41_STARW1_FILES},
     "UD-Q8_K_XL": {
         "label": "Unsloth UD-Q8_K_XL",
         "about": "Unsloth Dynamic 8-bit: the experts in MXFP4 as DeepSeek made them, the rest in BF16 (the checkpoint's own precision); "
@@ -8095,7 +8119,7 @@ def dsv41_shared_dir(a, fam: dict) -> Path:
     return Path(a.models_dir) / (fam["tag"] + "shared")
 
 
-def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
+def dsv41_find_shared(a, name: str, folder: Path, shared: Path, pins: dict | None = None) -> Path:
     """The file `name` (an Engram, the drafter, ...) the person already has: in the shared folder, beside the shards, or (--gguf-dir) in the
     folder above them or one folder level down from either; else where it will be downloaded to (the shared folder).  The size must be the
     pinned one, so a half-copied file is not taken for the file."""
@@ -8117,7 +8141,7 @@ def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
             for n in names:
                 f = k / n
                 try:
-                    if f.is_file() and f.stat().st_size == DSV41_ALL_FILES[n][0]:
+                    if f.is_file() and f.stat().st_size == (pins or DSV41_ALL_FILES)[n][0]:
                         return f
                 except OSError:
                     pass
@@ -8252,8 +8276,10 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         model = names[int(ask("Which version?", [str(i) for i in range(1, len(names) + 1)], str(names.index(rec) + 1), a.yes)) - 1]
     ok(f"size: {model}")
     md = fam["models"][model]
-    say("  Its GGUF files: " + ("IST-DAS / ISTA-DASLab (huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), with the DSpark drafter and a small metadata file from Unsloth"
-                              if md.get("recipe") == "ista" else "Unsloth (huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)"))
+    pins = {**fam["sha256"], **md.get("sha256", {})}       # a model's own pins first (Strata-HotRod's Starw1 set: the official names, other weights)
+    say("  Its GGUF files: " + (md["source"] if md.get("source") else
+                                "IST-DAS / ISTA-DASLab (huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), with the DSpark drafter and a small metadata file from Unsloth"
+                                if md.get("recipe") == "ista" else "Unsloth (huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)"))
     ista = md.get("recipe") == "ista"
     tag = fam["tag"] + model
     cards = dsv41_cards(gpu, all_cards, bool(a.gpu is not None or a.gpus))
@@ -8271,7 +8297,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     if mac and not DSV41_MAC_VISION and a.vision not in ("no", "off"):
         warn("pictures are off for DeepSeek on a Mac: its picture reader has not been run on the Metal engine yet, so it reads text only")
     shared_names = list(md.get("shared", [])) + ([DSV41_MMPROJ] if ds_vision == "on" else [])
-    shared = [dsv41_find_shared(a, n, folder, shared_dir) for n in shared_names]
+    shared = [dsv41_find_shared(a, n, folder, shared_dir, pins) for n in shared_names]
     mmproj_file = shared[len(md.get("shared", []))] if ds_vision == "on" else None
     own_files = {f: bool(a.gguf_dir) or f.parent != shared_dir for f in shared}         # a file found outside setup's own folder is the person's
 
@@ -8279,7 +8305,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         p = f.with_name(f.name + ".part")
         return p.stat().st_size if p.is_file() else 0
 
-    left = sum(0 if f.exists() and (done(f) or a.gguf_dir or own_files.get(f) or f.name in DSV41_LEGACY_FILES) else fam["sha256"][f.name][0] - partial(f)
+    left = sum(0 if f.exists() and (done(f) or a.gguf_dir or own_files.get(f) or f.name in DSV41_LEGACY_FILES) else pins[f.name][0] - partial(f)
                for f in [*shards, *shared]) / 1e9
     probe = folder if folder.exists() else (folder.parent if folder.parent.exists() else Path(a.models_dir))
     free = free_gb(probe)
@@ -8292,10 +8318,10 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
             f"is {left * 1e9 / 50e6 / 3600:.1f} hours. Files you already have: --gguf-dir DIR.")
     else:
         say("  Nothing to download: the files are already here.")
-    unchecked = [f for f in [*shards, *shared] if f.exists() and f"sha256 {fam['sha256'][f.name][1]}" not in
+    unchecked = [f for f in [*shards, *shared] if f.exists() and f"sha256 {pins[f.name][1]}" not in
                  (f.with_name(f.name + ".done").read_text(encoding="utf-8", errors="replace") if done(f) else "")]
     if unchecked:
-        gb = sum(fam["sha256"][f.name][0] for f in unchecked) / 1e9
+        gb = sum(pins[f.name][0] for f in unchecked) / 1e9
         say(f"  The files already here ({gb:.0f} GB) are checked against their SHA-256 once, now: about {max(1, round(gb / 55))} minutes on a fast "
             "drive (4-5 minutes for the 257 GB of 2.00), longer on a slow one. The next runs skip it.")
     for w in plan["warnings"]:
@@ -8377,8 +8403,8 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
                 download((md.get("hf") or fam["hf"]) + f.name, f)
         if f.name in DSV41_LEGACY_FILES:
             ok(f"{f.name}: a file of the first release of this set (the same weights); it is used as it is")
-        pin = fam["sha256"][f.name]
-        new = DSV41_NEW_SHARD1.get(f.name)
+        pin = pins[f.name]
+        new = DSV41_NEW_SHARD1.get(f.name) if not md.get("sha256") else None   # (ISTA's newer shard 1: not for a set with its own pins)
         if new and a.gguf_dir and f.is_file() and f.stat().st_size == new[0] and f.stat().st_size != pin[0]:      # shard 1 with the 2026-10-26 chat template
             pin = new
             ok(f"{f.name}: the version with ISTA's newer chat template (the same weights); it is used as it is")
@@ -8388,7 +8414,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
             ok(f"{f.name} already here ({f.parent})")
         else:
             download(DSV41_SHARED[f.name] + f.name, f)
-        verify_sha256(f, *fam["sha256"][f.name], own=own_files[f])
+        verify_sha256(f, *pins[f.name], own=own_files[f])
     ok(f"model files: {folder} ({len(shards)} shards" + (f"; shared files: {shared_dir if any(not own_files[f] for f in shared) else shared[0].parent}" if shared else "") + ")")
 
     step(6, "preparing the model for Strata")

@@ -110,7 +110,8 @@ class CatalogRules(unittest.TestCase):
             self.assertEqual(source, "setup.py")                       # the same tables setup.py and the app read
             for r in rows:
                 if r.family == "deepseek41":                           # its sizes are in MULTI_FILE_FAMILIES (shards + shared files), not in MODELS
-                    self.assertAlmostEqual(r.download_gb, {"UD-Q8_K_XL": 508.4, "IST-DAS-2.00bpw": 256.8, "IST-DAS-2.25bpw": 273.8, "IST-DAS-1.75bpw": 239.3}[r.model], delta=0.1)
+                    self.assertAlmostEqual(r.download_gb, {"UD-Q8_K_XL": 508.4, "IST-DAS-2.00bpw": 256.8, "IST-DAS-2.25bpw": 273.8, "IST-DAS-1.75bpw": 239.3,
+                                                         "Starw1-2.00bpw-MXFP8": 349.3}[r.model], delta=0.1)
                     continue
                 self.assertAlmostEqual(r.download_gb, models[r.model]["download_gb"])
             rec = [r for r in rows if r.recommended]
