@@ -52,6 +52,10 @@ class TimelineTest(unittest.TestCase):
         env = server.child_env({})
         self.assertEqual(env["STRATA_TIMELINE_FILE"], server.TIMELINE_FILE)
         self.assertEqual(env["STRATA_TIMELINE_CTL"], server.TIMELINE_CTL)
+        self.assertFalse(server.timeline_on())           # off until the Monitor's Record (it costs answer speed)
+        server.child_env({"timeline": True})              # config "timeline": true: on from the start
+        self.assertTrue(server.timeline_on())
+        server.set_timeline(False)
 
     def test_switch_and_snapshot(self):
         self.assertEqual(self.post({"on": True}), (200, {"on": True}))

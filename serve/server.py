@@ -3135,11 +3135,12 @@ def child_env(cfg: dict) -> dict:
     env.setdefault("STRATA_RESIDENCY_FILE", RESIDENCY_FILE)   # the engine's expert map for the Monitor (residency_view)
     env.setdefault("STRATA_TIMELINE_FILE", TIMELINE_FILE)     # the Monitor's decode timeline (timeline_view), off until switched on
     env.setdefault("STRATA_TIMELINE_CTL", TIMELINE_CTL)
-    if cfg.get("timeline") is not False:           # the Monitor's timeline runs from the start (config "timeline": false: off until switched on)
-        try:
-            set_timeline(True)
-        except OSError:
-            pass                                    # (the Monitor's switch still works)
+    # The Monitor's timeline is off until the Monitor's Record switches it on (config "timeline": true: on from the start).  Always on it cost
+    # 5-13% of the answer speed on 30 Oct (the 29 Oct A/B, read again on answer speed: on 30.2 / 32.0 against off 34.1 / 33.9 tok/s on code).
+    try:
+        set_timeline(cfg.get("timeline") is True)
+    except OSError:
+        pass                                        # (the Monitor's switch still works)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
