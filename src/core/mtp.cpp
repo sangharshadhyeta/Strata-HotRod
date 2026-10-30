@@ -782,15 +782,16 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     // Loader fix (0.1.15+loaderfix.2): the two reads below are the whole “drafter files” cost; reporting
     // them apart from the rest of the stage is what makes the next regression visible.
-    // STRATA_MTP_SLOTS=<n>: n drafter experts on the GPU, 32..511; unset: 256 with STRATA_MTP_ZC (the default since 31 Oct: exact, 338 MiB
-    // of VRAM to the expert cache); 0: all 512 on the GPU (the path before).  Anything else leaves that path (said once).
+    // STRATA_MTP_SLOTS=<n> (opt-in): n drafter experts on the GPU, 32..511, the rest exact from pinned RAM (STRATA_MTP_ZC, on with the
+    // slots); unset or 0: all 512 on the GPU.  (A default of 256 was tried on 31 Oct and switched back off for Qwen: speed within the
+    // A/B's noise; it is kept for the DeepSeek drafter's port.)  Anything else leaves that path (said once).
     {
         const char* sv = std::getenv("STRATA_MTP_SLOTS");
 #if defined(_WIN32) || defined(STRATA_GPU_METAL)
         if (sv != nullptr && std::atoi(sv) != 0) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored: the slots need a POSIX CUDA build\n");
 #else
-        const bool dflt = sv == nullptr;
-        const int n = dflt ? 256 : std::atoi(sv);
+        const bool dflt = false;   // no default: the slots are opt-in (slots_default_'s fallback stays for a future default)
+        const int n = sv == nullptr ? 0 : std::atoi(sv);
         if (n == 0) {
         } else if (shared != nullptr) {
             if (!dflt) std::fprintf(stderr, "strata mtp: STRATA_MTP_SLOTS ignored for a shared drafter\n");
