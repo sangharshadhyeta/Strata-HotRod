@@ -1152,6 +1152,7 @@ struct LaBatch {
     unsigned long long* kacc;
     int dist[kLaNd];
     int L, H, lo, n, Nd, Nsd, Nset, timing;
+    float exact_w;               // STRATA_LA_EXACT_W: the weight of a true pick below the stand-in floor in the loss (1: as the rest)
 };
 // the true rank of each expert (ties by index) and the true 32nd logit: grid (n, L), a thread per expert
 __global__ void la_b_rank_k(LaBatch a) {
@@ -1220,6 +1221,9 @@ __global__ void la_b_grad_k(LaBatch a) {   // grid (n, Nset), block 512
     const float mP = la_block_sum(top ? p : 0.0f, sh) / 32.0f;
     const float mT = la_block_sum(top ? tv : 0.0f, sh) / 32.0f;
     float g = top ? (2.0f / 32.0f) * ((p - mP) - (tv - mT)) : (p > a.thr[row] - 0.1f ? 1.0f / 480.0f : 0.0f);
+    // STRATA_LA_EXACT_W (a.exact_w, 1: off): the true picks below the stand-in floor (ranks 0 .. lo-1, the ones a miss reads from RAM or
+    // the SSD) weigh w times as much as the rest of the top 32 - the placement solver's rank weighting, in the learner's loss
+    if (top && a.rk[row * kLaE + e] < a.lo) g *= a.exact_w;
     g /= (float) a.n;
     a.g[((size_t) z * kLaTok + t) * kLaE + e] = g;
     for (int k = 0; k < r; ++k) P[k][e] = g * a.B[c][(size_t) sd * kLaE * r + e * r + k];
@@ -1608,6 +1612,8 @@ void la_learn_post_launch(void* stream, const int* res, int n) {
     a.rinfo = s.rinfo; a.kst = s.kst; a.kacc = s.kacc;
     for (int i = 0; i < kLaNd; ++i) a.dist[i] = kLaDist[i];
     a.L = s.L; a.H = s.H; a.lo = s.lo; a.n = n; a.Nd = kLaNd; a.Nsd = s.Nsd; a.Nset = s.Nset; a.timing = s.timing ? 1 : 0;
+    static const float exact_w = [] { const char* v = std::getenv("STRATA_LA_EXACT_W"); const float w = v != nullptr ? (float) std::atof(v) : 1.0f; return w > 0.0f ? w : 1.0f; }();
+    a.exact_w = exact_w;
     cudaStream_t sd_s = s.side;
     // TIMING: a one-thread mark before and after each kernel, in launch order (la_b_mark_k: the per-kernel sums)
     auto mark = [&](int k, int end) {
