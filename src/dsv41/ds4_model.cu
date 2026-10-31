@@ -1176,13 +1176,19 @@ struct Model::Impl {
     cudaStream_t ring_st = nullptr;
     std::vector<RingSlot> ring_s;
     std::vector<std::vector<int>> ring_own;   // trunk layer -> expert -> its ring slot (-1: none)
-    unsigned long long* ring_pin = nullptr;   // pinned: [0, ring_n) the fills' table entries, [ring_n, 2 ring_n) the frees'
+    unsigned long long* ring_pin = nullptr;   // pinned: [0, ring_n) the fills' table entries, [ring_n, 2 ring_n) the frees', [2 ring_n, 3 ring_n) the evict-aheads'
+    // DS4_RING_STICKY: an evict-ahead (a slot of a layer >= the request's) is written back on the compute stream, and its event (per slot,
+    // ring_ev) is waited for on ring_st before the slot's next copy. ring_evp: the slot's event is recorded and not yet synced (the pinned entry is reused only after it).
+    std::vector<cudaEvent_t> ring_ev;
+    std::vector<char> ring_evp;
     uint64_t rc_issued = 0, rc_landed = 0, rc_used = 0, rc_late = 0, rc_unused = 0, rc_throttled = 0, rc_nostore = 0, rc_skipped = 0, rc_beyond = 0;
+    uint64_t rc_evicted_ahead = 0;
     std::mutex ring_mu;   // the ring's bookkeeping (the slots, ring_own, the table entries' decisions) and cache_tick_swaps; never held in a CUDA call
     // The ring's CUDA work is on ring_th (ring_loop): serve_lane and the host thread only queue items.  Items run in order; ring_handled
     // is the seq of the last one done.  A barrier item syncs ring_st (ring_barrier).
     struct RingItem {
         bool fill = true, barrier = false, clear_only = false;   // clear_only: a free that only clears the slot's flag
+        bool ahead = false;   // evict-ahead (sticky, a slot of a layer >= the request's): the write-back on the compute stream, then the event
         int layer = -1, expert = -1, k = -1;
         size_t bytes = 0;                 // fill: the copy's size
         const uint8_t* src = nullptr;     // fill: the store's blob
@@ -7616,6 +7622,10 @@ struct Model::Impl {
     // the slots after it (ring_start).  Single GPU, one member a layer, not with DS4_STORE_ZC.  The guesses are the lookahead's:
     // with DS4_AHEAD unset the lookahead stays on when the ring is.
     void ring_free_mem() {
+        for (cudaEvent_t ev : ring_ev)
+            if (ev != nullptr) cudaEventDestroy(ev);
+        ring_ev.clear();
+        ring_evp.clear();
         if (ring_st != nullptr) cudaStreamDestroy(ring_st);
         ring_st = nullptr;
         ring_s.clear();
@@ -7685,7 +7695,7 @@ struct Model::Impl {
         }
         ring_pin_on = std::getenv("DS4_RING_PIN") != nullptr && std::atoi(std::getenv("DS4_RING_PIN")) != 0;
         std::string err;
-        const bool ok = cudaStreamCreateWithFlags(&ring_st, cudaStreamNonBlocking) == cudaSuccess && halloc(ring_pin, (size_t) 2 * n, err);
+        const bool ok = cudaStreamCreateWithFlags(&ring_st, cudaStreamNonBlocking) == cudaSuccess && halloc(ring_pin, (size_t) 3 * n, err);
         if (!ok) {
             (void) cudaGetLastError();
             std::fprintf(stderr, "ds4: ring: off (the copy stream or staging would not allocate)\n");
@@ -7713,6 +7723,18 @@ struct Model::Impl {
         if (ring_move && !ring_sticky) {
             std::fprintf(stderr, "ds4: ring: DS4_RING_MOVE needs DS4_RING_STICKY=1: off\n");
             ring_move = false;
+        }
+        if (ring_sticky) {   // (the evict-aheads' events: one per slot, on the compute stream's order)
+            cudaSetDevice(devs[0].id);
+            ring_ev.assign((size_t) ring_n, nullptr);
+            ring_evp.assign((size_t) ring_n, 0);
+            for (int k = 0; k < ring_n; ++k)
+                if (cudaEventCreateWithFlags(&ring_ev[(size_t) k], cudaEventDisableTiming) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    ring_sticky = false;
+                    std::fprintf(stderr, "ds4: ring: DS4_RING_STICKY off (the events would not create)\n");
+                    break;
+                }
         }
         if (const char* v = std::getenv("DS4_RING_COST")) ring_cost = std::atoi(v) != 0;
         if (const char* v = std::getenv("DS4_RING_COST_EXTRA")) ring_cost_extra = std::max(0.0, std::atof(v));
@@ -7808,6 +7830,28 @@ struct Model::Impl {
             }
             return;
         }
+        if (it.ahead) {
+            // the slot's copy is done (its flag was seen). The table write-back goes on the compute stream, ordered after the work queued
+            // before it; the event after it; ring_st waits for the event, so the slot's next copy comes after that work.
+            if (ring_evp[k] != 0) {   // the pinned entry's last copy: done when its event is
+                if (cudaEventSynchronize(ring_ev[k]) != cudaSuccess) (void) cudaGetLastError();
+                ring_evp[k] = 0;
+            }
+            bool same = false;
+            {
+                std::lock_guard<std::mutex> lk(ring_mu);
+                same = ring_own[(size_t) it.layer][(size_t) it.expert] == -1 && l.slot[(size_t) it.expert] == it.slot_seen;
+            }
+            if (same) {
+                ring_pin[2 * (size_t) ring_n + k] = it.value;
+                if (cudaMemcpyAsync(l.vram_tab + it.expert, &ring_pin[2 * (size_t) ring_n + k], 8, cudaMemcpyHostToDevice, devs[0].st) != cudaSuccess)
+                    (void) cudaGetLastError();
+            }
+            if (cudaEventRecord(ring_ev[k], devs[0].st) != cudaSuccess) (void) cudaGetLastError();
+            ring_evp[k] = 1;
+            if (cudaStreamWaitEvent(ring_st, ring_ev[k], 0) != cudaSuccess) (void) cudaGetLastError();
+            return;
+        }
         // a free (or a clear): the slot's flag back to 0 before any reuse (the slot was freed only after its flag was seen)
         ring_landed[k].store(0, std::memory_order_release);
         if (it.clear_only) return;
@@ -7864,19 +7908,20 @@ struct Model::Impl {
             if (ring_move && store->drop(s.layer, e)) ++rc_moved;   // (DS4_RING_MOVE: landed, so the copy is done; the store's slot back)
         }
     }
-    // (DS4_RING_STICKY; caller holds ring_mu) the slot a fill of layer li may take over: landed (done; a slot still copying is never one),
-    // of a layer before li (its expert kernels for this token are done, and the next token reaches it only a pass later). Two tiers:
-    // first the slots nobody has picked since their fill, oldest fill first; then the picked ones by the key: the least recently picked
-    // (sticky alone), or with DS4_RING_COST the lowest c_layer / (1 + age in tokens). -1: none.
-    int ring_evict_pick(int li) const {
+    // (DS4_RING_STICKY; caller holds ring_mu) the slot a fill of layer j (requested while layer li runs) may take over. Only landed slots
+    // (done: a slot still copying is never one), never layer j's own. Tiers in order: (a) never picked, of a layer < li, oldest fill first;
+    // (b) picked, of a layer < li, by the key (least recently picked, or with DS4_RING_COST the lowest c_layer / (1 + age in tokens));
+    // (c) never picked, of a layer >= li, oldest fill first; (d) picked, of a layer >= li, by the key. Layers < li are safe (their expert
+    // kernels for this token are done); (c)/(d) are evict-aheads (the ring thread's compute-stream write-back and event). -1: none.
+    int ring_evict_pick(int li, int j) const {
         int best = -1, btier = 0;
         double bv = 0.0;
         for (int k = 0; k < ring_n; ++k) {
             const RingSlot& s = ring_s[(size_t) k];
-            if (!s.used || !s.done || s.layer >= li) continue;
-            const int tier = s.picked_once ? 1 : 0;
+            if (!s.used || !s.done || s.layer == j) continue;
+            const int tier = (s.layer < li ? 0 : 2) + (s.picked_once ? 1 : 0);
             double v;
-            if (tier == 0) v = (double) s.fill_tok;
+            if (!s.picked_once) v = (double) s.fill_tok;
             else {
                 const double last = (double) ring_last[(size_t) k].load(std::memory_order_relaxed);
                 v = ring_cost ? ring_cl[(size_t) s.layer] / (1.0 + ((double) ring_tok - last)) : last;
@@ -7916,6 +7961,25 @@ struct Model::Impl {
     // (cache_tick_swaps holds ring_mu across its copies), this request's ring work is skipped and counted. The copies that landed and the
     // picks the device took from the ring are counted; the slots of the layers before li are given back; the guesses for the next two
     // layers are queued (decode windows only).
+    // (DS4_RING_STICKY; caller holds ring_mu and ring_qmu) slot k, landed, of a layer >= the request's, taken for a fill: queued as an
+    // evict-ahead (the ring thread: the table write-back on the compute stream, the event, ring_st waits for it). serve_lane makes no CUDA call.
+    void ring_evict_ahead_slot(int k) {
+        RingSlot& s = ring_s[(size_t) k];
+        Layer& l = L[(size_t) s.layer];
+        RingItem it;
+        it.fill = false;
+        it.ahead = true;
+        it.layer = s.layer;
+        it.expert = s.expert;
+        it.k = k;
+        if (ring_own[(size_t) s.layer][(size_t) s.expert] == k) ring_own[(size_t) s.layer][(size_t) s.expert] = -1;
+        const int sl = l.slot[(size_t) s.expert];
+        it.value = sl >= 0 ? (unsigned long long) (uintptr_t) (l.vram_base + (size_t) sl * unit(l)) : 0ull;
+        it.slot_seen = sl;
+        ring_push_l(it);
+        s.used = s.done = s.counted = false;
+        s.layer = s.expert = -1;
+    }
     void ring_request(int li, const Req& r, int T) {
         if (li == 0) ++ring_tok;   // (serve_lane's thread only: the token's first trunk layer)
         if (ring_cost) ring_cost_snapshot();
@@ -7995,7 +8059,7 @@ struct Model::Impl {
                     if (!ring_s[(size_t) c].used) k = c;
                 if (k < 0) {
                     if (!ring_sticky) break;
-                    kev = ring_evict_pick(li);   // (sticky: the room of a landed slot of a layer before li, or none: this fill is dropped)
+                    kev = ring_evict_pick(li, j);   // (sticky: the room of a landed slot (layers before li first), or none: this fill is dropped)
                     if (kev < 0) {
                         ++rc_throttled;
                         continue;
@@ -8011,8 +8075,13 @@ struct Model::Impl {
                     continue;
                 }
                 if (kev >= 0) {   // (the eviction is queued before this fill's copy: the table entry back, then the copy, on ring_st)
-                    ring_free_slot(kev);
-                    ++rc_evicted;
+                    if (ring_s[(size_t) kev].layer < li) {
+                        ring_free_slot(kev);
+                        ++rc_evicted;
+                    } else {   // (a layer >= li: the write-back on the compute stream, ring_st waits for its event before the copy)
+                        ring_evict_ahead_slot(kev);
+                        ++rc_evicted_ahead;
+                    }
                     k = kev;
                 }
                 RingSlot& s = ring_s[(size_t) k];
@@ -8064,7 +8133,9 @@ struct Model::Impl {
                      (unsigned long long) rc_issued, (unsigned long long) rc_landed, (unsigned long long) rc_used, (unsigned long long) rc_late,
                      (unsigned long long) rc_unused, (unsigned long long) rc_throttled, (unsigned long long) rc_nostore, (unsigned long long) rc_skipped);
         if (ring_ranks > 0 || ring_cost) std::fprintf(stderr, ", %llu beyond the ranks", (unsigned long long) rc_beyond);
-        if (ring_sticky) std::fprintf(stderr, ", %llu reused, %llu evicted", (unsigned long long) rc_reused, (unsigned long long) rc_evicted);
+        if (ring_sticky)
+            std::fprintf(stderr, ", %llu reused, %llu evicted, %llu evicted ahead", (unsigned long long) rc_reused, (unsigned long long) rc_evicted,
+                         (unsigned long long) rc_evicted_ahead);
         if (ring_move) std::fprintf(stderr, ", %llu moved", (unsigned long long) rc_moved);
         if (ring_cost) std::fprintf(stderr, ", cost %.2f..%.2f us/MB, mean R %.2f", ring_cmin, ring_cmax, ring_rmean);
         std::fprintf(stderr, "\n");
