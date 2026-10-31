@@ -194,6 +194,7 @@ The opt-in switches for the top two ranks stay in the engine for testing: `STRAT
 | `STRATA_LA_EDGE_SKIP=1`, `STRATA_LA_MODEL=<file>` | superseded by the learned look-ahead |
 | `STRATA_GDN_LOOP=1` | looped middle layers: 10% slower, no clear accuracy gain |
 | `STRATA_ROUTER_FUSED=1`, `STRATA_GR_DOWN_WPC=4\|2` | byte-identical outputs; alone and together within run-to-run spread: no gain |
+| `STRATA_PIN_SEGS=1` | untested until measured: the pageable RAM tier page-locked in 1 GiB segments (no extra RAM; a give-back unlocks a segment first) |
 
 ## Earlier speed tables (moved from the README)
 

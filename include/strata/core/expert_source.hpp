@@ -1363,6 +1363,18 @@ private:
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
+    /// STRATA_PIN_SEGS (opt-in): the pageable RAM copy page-locked in place, in segments of whole blobs (pin_segs_build).
+    /// [lo, hi) is the registered range (page-aligned); `reg`: registered now (give_back_ram unlocks a segment before it
+    /// madvise's a place in it); `parked`: the places give_back_ram parked in it (registered again when none is left).
+    struct PinSeg { uint64_t lo = 0, hi = 0; const uint8_t* dev = nullptr; bool reg = false; int parked = 0; };
+    std::vector<PinSeg> pin_segs_;            ///< ascending by lo; only segments registered at pin time are listed
+    bool pin_segs_on_ = false;
+    void pin_segs_build(uint64_t bytes, uint64_t reserve);
+    bool pin_seg_register(PinSeg& s);         ///< cudaHostRegister + device alias of [lo, hi); false: left pageable
+    void pin_seg_unregister(PinSeg& s);
+    /// The index of the segment holding [off, off + len) whole, or -1.
+    int pin_seg_index(uint64_t off, uint64_t len) const;
+    const PinSeg* seg_of(uint64_t off, uint64_t len) const;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     bool budget_auto_ = false;                ///< set_resident_budget_auto
