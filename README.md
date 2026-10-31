@@ -97,6 +97,10 @@ questions, 30 coding questions, answers read by hand): 47 of 50 and 30 of 30 cor
 nothing replaced. A test this small cannot show a difference of one or two answers either way. Since 24 Oct every JSON and
 code answer in the structured-output checks has been valid. Detail: [SPEC.md](SPEC.md).
 
+**MMLU-Pro (30 Oct): 87.1%** - 183 of 210 questions (15 from each of its 14 subjects), thinking on, 32K context,
+temperature 0, the stand-ins on; every answer finished cleanly (no cut-offs or loops). For comparison, published Vals
+scores: Qwen3.8-27B 84.3%, Qwen3.8 Max 88.6%.
+
 </div>
 </details>
 
@@ -198,6 +202,35 @@ and kept across restarts.
 
 Every change and its measurement: [docs/HOTROD-DETAILS.md](docs/HOTROD-DETAILS.md) · the predictor study:
 [docs/PREDICTOR-EXPERIMENTS.md](docs/PREDICTOR-EXPERIMENTS.md) · the full log of ideas tried: [docs/perf-ideas.md](docs/perf-ideas.md).
+
+**New in v0.1.45-hotrod.2 (31 Oct):** the learned look-ahead v2 (trained with a rank-weighted loss) is the one setup
+downloads; the expert placement comes from routing traces (`tools/placement/solve.py`); the Monitor's decode timeline
+runs only when you press Record (it cost 5-13% always on). Opt-in: the draft head's experts in slots with the rest
+computed exactly from RAM (`STRATA_MTP_SLOTS`, `STRATA_MTP_ZC`), and the look-ahead ring weighted by each layer's CPU
+cost (`STRATA_RING_COST`).
+
+</div>
+
+### Every setting
+
+<div align="justify">
+
+Each model has its own config (`strata-iq3_s.json` here): engine settings go in its `"env"` (a blank value means the
+engine's default), engine flags in `"args"`, server settings at the top level. Every switch, flag and server key, with
+its default and what it does: [docs/FEATURES-qwen.md](docs/FEATURES-qwen.md) (generated from the code by
+`tools/features_ref.py`).
+
+</div>
+
+## DeepSeek-V4.1-Flash too
+
+<div align="justify">
+
+The same ideas ported to upstream Strata's DeepSeek engine run **DeepSeek-V4.1-Flash** (Starw1's uncensored GSQ-RCO
+IQ2_XXS backbone with DeepSeek's MXFP8 Engram, 341 GB of files) on this same PC: about **5.2-5.4 tokens/s** with its
+VRAM ring and stand-ins against 4.8-5.0 without them. It lives on the
+[`upstream-dsv41`](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41) branch, release
+[`v0.2.7.1-hotrod.1`](https://github.com/sangharshadhyeta/Strata-HotRod/releases/tag/v0.2.7.1-hotrod.1).
 
 </div>
 
