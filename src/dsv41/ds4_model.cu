@@ -7563,10 +7563,19 @@ struct Model::Impl {
         static int tick = 0;
         if (++tick % 16 != 0) return;
         const uint64_t avail = ram_avail();
+        if (avail != ~uint64_t{0} && avail >= (6ull << 30) && store->gone_chunks() > 0) {   // (RAM is back: one given-back chunk, the same tick)
+            const size_t took = store->regrow_chunks(1);
+            if (took > 0) std::fprintf(stderr, "ds4: RAM store: %.1f GB free: took back %zu chunks\n", avail / 1e9, took);
+            return;
+        }
         if (avail == ~uint64_t{0} || avail >= (4ull << 30)) return;
         const size_t chunks = 1 + (size_t) (((5ull << 30) - avail) / (700ull << 20));
-        const size_t n = store->shrink_chunks(chunks);
-        if (n > 0) std::fprintf(stderr, "ds4: RAM store: %.1f GB free: gave back %zu chunks (%zu slots left)\n", avail / 1e9, n, store->slots_allocated());
+        size_t coldest = 0;
+        double use = 0.0;
+        const size_t n = store->shrink_chunks(chunks, &coldest, &use);
+        if (n > 0)
+            std::fprintf(stderr, "ds4: RAM store: %.1f GB free: gave back %zu chunks (coldest: chunk %zu, use %.0f; %zu slots left)\n", avail / 1e9, n,
+                         coldest, use, store->slots_allocated());
     }
     void cache_tick_swaps(int T) {
         if (!o.expert_cache || cache_ths.empty()) return;

@@ -99,3 +99,6 @@ profile shows DeepSeek's routing is flat, so a fixed hot set adds about 3 points
 (about 99 of 10.3 MB on top of the 32), the ring's fills may take them, and a chunked pass takes them back first (no fill is in flight
 when the pass starts) and gives them back after. No fixed experts are planned in this mode. The ring's line then ends with ` x <n>`, the
 fills that went into arena slots. Untested until measured.
+
+**RAM store under pressure (`ds4_store.hpp`):** below 4 GB free the store gives back its idle chunk with the least use (use: the reads it
+served, x0.5 per shrink), not the last one; a given-back chunk is taken back once 6 GB are free (one per 16-window check). Untested here.

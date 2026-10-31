@@ -120,13 +120,21 @@ public:
         for (size_t i = 0; i < chunks_.size(); ++i)
             if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
         if (cfg_.unpin_chunk)
-            for (size_t i = 0; i < chunks_.size(); ++i) cfg_.unpin_chunk(chunks_[i].first);
+            for (size_t i = 0; i < chunks_.size(); ++i)
+                if (!gone_[i]) cfg_.unpin_chunk(chunks_[i].first);   // (a given-back chunk was unpinned when it went)
         os::range_release(arena_, arena_bytes_);
     }
 
     size_t slot_bytes() const { return slot_bytes_; }
-    size_t slots_allocated() const { return nalloc_; }
-    size_t slots_max() const { return nmax_; }
+    size_t slots_allocated() const { return nalloc_ - gone_slots_; }   // (the slots in chunks the store holds, not given back)
+    size_t slots_max() const { return nmax_ - gone_slots_; }
+    /// The chunks given back (RAM short) and not taken back yet.
+    size_t gone_chunks() {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t n = 0;
+        for (char g : gone_) n += g ? 1 : 0;
+        return n;
+    }
     const Stats& stats() const { return st_; }
     double busy_ms() const { return io_ ? io_->busy_ms() : 0.0; }
     static constexpr size_t kSlack = 8192;
@@ -175,6 +183,7 @@ public:
                 sp.prefetch = false;
                 sp.pin++;
                 sp.tick = ++clock_;
+                sp.use += 1.0f;   // (the slot's use: a read it serves - shrink_chunks gives back the idle chunk with the least)
                 sl[(size_t) i] = s;
                 continue;
             }
@@ -250,7 +259,8 @@ public:
         size_t n = 0;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            const size_t room = nmax_ > leave ? nmax_ - leave : 0;
+            const size_t cap = nmax_ - gone_slots_;   // (the slots not given back)
+            const size_t room = cap > leave ? cap - leave : 0;
             const size_t take = std::min(list.size(), room);
             for (size_t k = take; k-- > 0;) {   // (coldest first: the hottest get the newest ticks)
                 const int layer = list[k].first, e = list[k].second;
@@ -302,6 +312,7 @@ public:
         sp.prefetch = false;
         sp.visible = false;
         sp.tick = ++clock_;
+        sp.use = 0.0f;
         sp.bad.store(false);
         sp.cancel.store(false);
         sp.left.store(1, std::memory_order_release);
@@ -342,9 +353,16 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         touch_heat(layer, e);
         const int s = where_[(size_t) layer][(size_t) e];
-        if (s >= 0) slots_[(size_t) s].tick = ++clock_;
+        if (s >= 0) {
+            slots_[(size_t) s].tick = ++clock_;
+            slots_[(size_t) s].use += 1.0f;
+        }
     }
-    bool gpu_mapped() const { return !chunk_dev_.empty() && chunk_dev_[0] != nullptr; }
+    bool gpu_mapped() const {   // (any chunk mapped: chunk 0 may be one of the given-back ones)
+        for (void* d : chunk_dev_)
+            if (d != nullptr) return true;
+        return false;
+    }
     /// The arena's address range (the device sees its host pointers as they are when the mapping is the identity)
     unsigned long long arena_lo() const { return (unsigned long long) (uintptr_t) arena_; }
     unsigned long long arena_hi() const { return (unsigned long long) (uintptr_t) (arena_ + arena_bytes_); }
@@ -401,46 +419,78 @@ public:
         }
         return ev.size();
     }
-    /// RAM is short: gives back whole chunks from the end of the arena (their experts forgotten) - up to `want`, stopping at one
-    /// with a slot in use (pinned, loading, or GPU-visible).  Returns the chunks given back.
-    size_t shrink_chunks(size_t want) {
+    /// RAM is short: gives back whole chunks, the idle one with the least use first (use x0.5 at each call, so old use fades). An
+    /// idle chunk: no pinned slot (a read or a ring copy in flight holds its pin until it has landed), none GPU-visible, none loading.
+    /// Up to `want` chunks; returns the chunks given back. *first_chunk / *first_use: the first one given back and its use.
+    size_t shrink_chunks(size_t want, size_t* first_chunk = nullptr, double* first_use = nullptr) {
         std::lock_guard<std::mutex> lk(mu_);
+        for (size_t i = 0; i < nalloc_; ++i) slots_[i].use *= 0.5f;
         size_t done = 0;
-        while (done < want && !chunks_.empty()) {
-            const size_t c = chunks_.size() - 1, first = c * kChunk;
-            bool busy = false;
-            for (size_t i = first; i < nalloc_ && !busy; ++i) {
-                Slot& sp = slots_[i];
-                if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {   // (read by now)
-                    try_ready(sp);
-                    if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+        while (done < want) {
+            size_t pick = chunks_.size();
+            double pv = 0.0;
+            for (size_t c = 0; c < chunks_.size(); ++c) {
+                if (gone_[c]) continue;
+                const size_t first = c * kChunk, last = std::min(nalloc_, first + kChunk);
+                bool busy = false;
+                double sum = 0.0;
+                for (size_t i = first; i < last && !busy; ++i) {
+                    Slot& sp = slots_[i];
+                    if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {   // (read by now)
+                        try_ready(sp);
+                        if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+                    }
+                    busy = sp.pin > 0 || sp.visible || sp.state.load(std::memory_order_acquire) == kLoading;
+                    sum += (double) sp.use;
                 }
-                busy = sp.pin > 0 || sp.visible || sp.state.load(std::memory_order_acquire) == kLoading;
-            }
-            if (busy) break;
-            for (size_t i = first; i < nalloc_; ++i) {
-                Slot& sp = slots_[i];
-                if (sp.layer >= 0 && sp.expert >= 0) {
-                    where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
-                    st_.evictions.fetch_add(1, std::memory_order_relaxed);
+                if (busy) continue;
+                if (pick == chunks_.size() || sum < pv) {
+                    pick = c;
+                    pv = sum;
                 }
-                sp.layer = sp.expert = -1;
-                sp.prefetch = false;
-                sp.state.store(kFree, std::memory_order_release);
-                sp.base = nullptr;
             }
-            if (cfg_.unmap_chunk && chunk_dev_[c] != nullptr) cfg_.unmap_chunk(chunks_[c].first);
-            if (cfg_.unpin_chunk) cfg_.unpin_chunk(chunks_[c].first);
-            os::range_decommit(chunks_[c].first, chunks_[c].second);
-            chunks_.pop_back();
-            chunk_dev_.pop_back();
-            nalloc_ = first;
-            free_hint_ = std::min(free_hint_, first);
+            if (pick == chunks_.size()) break;   // (every chunk left has a slot in use)
+            give_back(pick);
+            if (done == 0) {
+                if (first_chunk != nullptr) *first_chunk = pick;
+                if (first_use != nullptr) *first_use = pv;
+            }
             ++done;
             ++shrunk_;
         }
         return done;
     }
+    /// RAM is back: takes back up to `want` given-back chunks (the same commit as the growth; its slots free again). Host thread only: the
+    /// registrations (pin_chunk, map_chunk) are CUDA calls. Returns the chunks taken back.
+    size_t regrow_chunks(size_t want) {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t done = 0;
+        for (size_t c = 0; c < chunks_.size() && done < want; ++c) {
+            if (!gone_[c]) continue;
+            const size_t first = c * kChunk, last = std::min(nalloc_, first + kChunk);
+            void* p = chunks_[c].first;
+            const size_t bytes = chunks_[c].second;
+            if (!os::range_commit(p, bytes)) break;
+            if (cfg_.pin_chunk) cfg_.pin_chunk(p, bytes);
+            chunk_dev_[c] = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
+            for (size_t i = first; i < last; ++i) {
+                Slot& sp = slots_[i];
+                sp.base = (uint8_t*) p + (i - first) * slot_bytes_ + kSlack;
+                sp.layer = sp.expert = -1;
+                sp.pin = 0;
+                sp.prefetch = sp.visible = false;
+                sp.use = 0.0f;
+                sp.state.store(kFree, std::memory_order_release);
+            }
+            gone_[c] = 0;
+            gone_slots_ -= last - first;
+            free_hint_ = std::min(free_hint_, first);
+            ++done;
+            ++regrown_;
+        }
+        return done;
+    }
+    size_t regrown() const { return regrown_; }
     size_t shrunk() const { return shrunk_; }
     /// An expert VRAM took over: no longer a visible slot
     void unmark(int layer, int e) {
@@ -456,7 +506,7 @@ public:
     }
 
 private:
-    static constexpr int kFree = 0, kLoading = 1, kReady = 2, kFailed = 3;
+    static constexpr int kFree = 0, kLoading = 1, kReady = 2, kFailed = 3, kGone = 4;   // (kGone: a slot of a chunk given back)
     // slots a chunk of the arena (the unit the GPU mapping registers; DS4_STORE_CHUNK_SLOTS: a test knob for the registration segment size)
     static size_t chunk_slots() {
         const char* e = std::getenv("DS4_STORE_CHUNK_SLOTS");
@@ -468,6 +518,7 @@ private:
         uint8_t* base = nullptr;   // the blob's first byte
         int layer = -1, expert = -1, pin = 0;
         bool prefetch = false, visible = false;
+        float use = 0.0f;   // reads served from this slot (begin's hits, touch), x0.5 at each shrink
         std::atomic<int> state{kFree}, left{0};
         std::atomic<bool> bad{false}, cancel{false};
         uint64_t tick = 0;
@@ -502,6 +553,7 @@ private:
         sp.prefetch = !demand;
         sp.visible = false;
         sp.tick = ++clock_;
+        sp.use = 0.0f;
         sp.state.store(kLoading, std::memory_order_release);
         sp.bad.store(false);
         sp.cancel.store(false);
@@ -552,6 +604,30 @@ private:
         }
         sp.state.store(kReady, std::memory_order_release);
     }
+    // gives chunk c back (mu_ held; the chunk is idle): its experts forgotten, its slots kGone (never handed out), unmapped and unpinned as
+    // before the decommit. Its place in chunks_ stays (regrow_chunks takes it back at the same address).
+    void give_back(size_t c) {
+        const size_t first = c * kChunk, last = std::min(nalloc_, first + kChunk);
+        for (size_t i = first; i < last; ++i) {
+            Slot& sp = slots_[i];
+            if (sp.layer >= 0 && sp.expert >= 0) {
+                where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
+                st_.evictions.fetch_add(1, std::memory_order_relaxed);
+            }
+            sp.layer = sp.expert = -1;
+            sp.prefetch = false;
+            sp.use = 0.0f;
+            sp.state.store(kGone, std::memory_order_release);
+            sp.base = nullptr;
+        }
+        if (cfg_.unmap_chunk && chunk_dev_[c] != nullptr) cfg_.unmap_chunk(chunks_[c].first);
+        chunk_dev_[c] = nullptr;
+        if (cfg_.unpin_chunk) cfg_.unpin_chunk(chunks_[c].first);
+        os::range_decommit(chunks_[c].first, chunks_[c].second);
+        gone_[c] = 1;
+        gone_slots_ += last - first;
+        free_hint_ = std::min(free_hint_, first);
+    }
     bool grow() {
         if (nalloc_ >= nmax_ || frozen_) return false;
         const size_t n = std::min(kChunk, nmax_ - nalloc_);
@@ -561,6 +637,7 @@ private:
         void* p = arena_ + nalloc_ * slot_bytes_;
         if (!os::range_commit(p, bytes)) return false;
         chunks_.push_back({p, bytes});
+        gone_.push_back(0);
         if (cfg_.pin_chunk) cfg_.pin_chunk(p, bytes);
         void* dev = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
         chunk_dev_.push_back(dev);
@@ -610,6 +687,8 @@ private:
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::pair<void*, size_t>> chunks_;
     std::vector<void*> chunk_dev_;
+    std::vector<char> gone_;         // [chunk]: given back (RAM short): its slots are kGone, its memory decommitted
+    size_t gone_slots_ = 0, regrown_ = 0;
     std::vector<std::vector<int>> where_;
     std::vector<std::vector<float>> heat_;
     std::vector<uint64_t> hits_in_layer_;
