@@ -59,8 +59,9 @@ Every switch, flag and server key: [FEATURES-deepseek.md](FEATURES-deepseek.md).
    (setup never deletes your files; it checks them against Starw1's pins). The pack is a few MB beside the files: no weights copied.
 2. In the config setup writes, the default set: `"env": { "DS4_RING": "32", "DS4_RING_PIN": "1", "STRATA_STANDIN": "1" }` (a blank
    value means the engine's default). The drafter: a pack made with `--dspark-gguf`, `--dspark on`, and `DS4_DSPARK_VRAM=0.05`.
-3. Known issue: the ring's slots are allocated after the expert placement, so the learned VRAM reserve grows after a load and the next
-   start keeps fewer experts on the card (270 -> 197); keep `vram-reserve.txt` at its first value until the reserve counts the ring.
+3. The learned VRAM reserve counts the ring's slots as planned use (they are taken after the expert placement), so it does not grow
+   because of them: 270 experts stay on the card start after start. A reserve raised by an engine before this fix (e.g. 1244 MiB)
+   comes down only slowly; set its line in `<pack>/vram-reserve.txt` back once (926 MiB on a 3060 at 32K).
 
 ## Tests
 

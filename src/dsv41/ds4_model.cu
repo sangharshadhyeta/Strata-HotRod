@@ -3448,6 +3448,10 @@ struct Model::Impl {
             }
             low = std::min(low, fr);
         }
+        // DS4_RING: its slots are planned use taken after the placement, not headroom the load lacked - counted back as free, so the
+        // next start does not keep fewer experts on the card for them (the ring itself starts only with 256 MiB left over; single GPU)
+        const size_t ring_bytes = ring_buf != nullptr ? (size_t) ring_n * ring_stride : 0;
+        low += ring_bytes;
         const int64_t free_mib = (int64_t) (low >> 20), old = o.reserve_mib;
         int64_t now = old;
         if (free_mib < 512) now = old + (512 - free_mib) + 128;
@@ -3462,8 +3466,8 @@ struct Model::Impl {
         }
         std::error_code ec;
         std::filesystem::rename(tmp, path, ec);
-        std::fprintf(stderr, "ds4: VRAM reserve: the load ended with %lld MiB free; the next start keeps %lld MiB (was %lld)\n",
-                     (long long) free_mib, (long long) now, (long long) old);
+        std::fprintf(stderr, "ds4: VRAM reserve: the load ended with %lld MiB free%s; the next start keeps %lld MiB (was %lld)\n",
+                     (long long) free_mib, ring_bytes != 0 ? " (the ring's slots counted as free)" : "", (long long) now, (long long) old);
     }
     void tail_read_init() {
         if (const char* v = std::getenv("STRATA_LA_TAIL_READ")) la_tail_read = std::max(0, std::min(2, std::atoi(v)));
