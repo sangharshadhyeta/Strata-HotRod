@@ -1696,6 +1696,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             if (req != nullptr) {
                 req->ids[t][r] = pick[r];
                 req->w[t][r] = wv;
+                req->gpu[t][r] = vram[pick[r]] != 0ull;
             }
         }
         on_cpu = cpu;

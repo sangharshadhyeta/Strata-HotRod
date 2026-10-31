@@ -66,6 +66,10 @@ public:
         // a new chunk of the arena for the GPU to read in place: returns the device address of `host` (null: not visible)
         std::function<void*(void* host, size_t bytes)> map_chunk;
         std::function<void(void* host)> unmap_chunk;
+        // (DS4_RING) a new chunk page-locked for the GPU's async copies, without the device mapping: the store's experts stay
+        // the CPU lane's; unpin_chunk before the chunk is given back and at the end
+        std::function<void(void* host, size_t bytes)> pin_chunk;
+        std::function<void(void* host)> unpin_chunk;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
     };
@@ -98,7 +102,7 @@ public:
         // the decode is running waited on it for good on Linux (H100, driver 580): registering all chunks before the first
         // kernel avoids it
 #if defined(__linux__)
-        const bool pregrow = cfg_.map_chunk && !(std::getenv("DS4_STORE_PREGROW") != nullptr && std::atoi(std::getenv("DS4_STORE_PREGROW")) == 0);   // (Linux: on with the GPU mapping)
+        const bool pregrow = (cfg_.map_chunk || cfg_.pin_chunk) && !(std::getenv("DS4_STORE_PREGROW") != nullptr && std::atoi(std::getenv("DS4_STORE_PREGROW")) == 0);   // (Linux: on with the GPU mapping)
 #else
         const bool pregrow = std::getenv("DS4_STORE_PREGROW") != nullptr && std::atoi(std::getenv("DS4_STORE_PREGROW")) != 0;
 #endif
@@ -111,6 +115,8 @@ public:
         io_.reset();
         for (size_t i = 0; i < chunks_.size(); ++i)
             if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
+        if (cfg_.unpin_chunk)
+            for (size_t i = 0; i < chunks_.size(); ++i) cfg_.unpin_chunk(chunks_[i].first);
         os::range_release(arena_, arena_bytes_);
     }
 
@@ -404,6 +410,7 @@ public:
                 sp.base = nullptr;
             }
             if (cfg_.unmap_chunk && chunk_dev_[c] != nullptr) cfg_.unmap_chunk(chunks_[c].first);
+            if (cfg_.unpin_chunk) cfg_.unpin_chunk(chunks_[c].first);
             os::range_decommit(chunks_[c].first, chunks_[c].second);
             chunks_.pop_back();
             chunk_dev_.pop_back();
@@ -534,6 +541,7 @@ private:
         void* p = arena_ + nalloc_ * slot_bytes_;
         if (!os::range_commit(p, bytes)) return false;
         chunks_.push_back({p, bytes});
+        if (cfg_.pin_chunk) cfg_.pin_chunk(p, bytes);
         void* dev = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
         chunk_dev_.push_back(dev);
         for (size_t i = 0; i < n; ++i) slots_[nalloc_ + i].base = (uint8_t*) p + i * slot_bytes_ + kSlack;

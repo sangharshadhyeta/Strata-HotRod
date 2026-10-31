@@ -1139,6 +1139,24 @@ struct Model::Impl {
                                        // 8 asked for (prefetch)
     std::vector<uint8_t> ahead_rank;   // [layer][1024]: 1 + the expert's rank in the guess a layer before (0: not guessed)
     std::vector<unsigned> ahead_for;   // [layer]: the request (seq) its flags are for
+    // DS4_RING=<slots> (opt-in): a ring of VRAM slots filled ahead from the RAM store with the next layers' guessed experts, on a copy
+    // stream.  A ring slot's expert is served by the device when its table entry (vram_tab) was set when the router ran; the host lane
+    // follows the device's own per-pick flag (Req::gpu).  Nothing waits for a copy.
+    struct RingSlot {
+        int layer = -1, expert = -1;
+        bool used = false, done = false, counted = false;   // done: the copy has landed (its event is done); counted: its layer's request came
+        cudaEvent_t ev = nullptr;
+    };
+    bool ring_want = false, ring_on = false;
+    int ring_n = 0, ring_inflight_max = 12;
+    size_t ring_stride = 0;
+    uint8_t* ring_buf = nullptr;
+    cudaStream_t ring_st = nullptr;
+    std::vector<RingSlot> ring_s;
+    std::vector<std::vector<int>> ring_own;   // trunk layer -> expert -> its ring slot (-1: none)
+    unsigned long long* ring_pin = nullptr;   // pinned: [0, ring_n) the fills' table entries, [ring_n, 2 ring_n) the frees'
+    uint64_t rc_issued = 0, rc_landed = 0, rc_used = 0, rc_late = 0, rc_unused = 0, rc_throttled = 0, rc_nostore = 0;
+    std::mutex ring_mu;   // the host thread's ring work and cache_tick_swaps (the slots, the table entries)
     std::thread pf_th;
     tl::Writer tl_writer;   // the Monitor's decode timeline (ds4_timeline.hpp): its file, every 0.5 s, when the server asks
     std::mutex pf_mu;
@@ -1478,6 +1496,10 @@ struct Model::Impl {
             std::fputs(la::report().c_str(), stderr);
             la_save();
         }
+        if (ring_on) {   // (DS4_RING: the slots back to the CPU lane between requests)
+            ring_drain();
+            ring_print();
+        }
     }
 
     ~Impl() {
@@ -1523,6 +1545,11 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        if (ring_on) {   // (DS4_RING: the copies done, the slots freed, the report)
+            ring_drain();
+            ring_print();
+        }
+        ring_free_mem();
         if (store_bg.joinable()) store_bg.join();   // (the store's background fill: it checks quit between its pieces)
         {
             std::lock_guard<std::mutex> lk(pf_mu);
@@ -3231,7 +3258,9 @@ struct Model::Impl {
                 workers.back()->start();
             }
         calibrate_paths();
+        ring_setup();      // (DS4_RING: its staging is page-locked before the store's arena is)
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
+        ring_start();
         tail_read_init();  // (after the store: it turns the read-ahead off, this may turn the learned one back on)
         vram_reserve_learn();
         preload_store();
@@ -5612,6 +5641,17 @@ struct Model::Impl {
                 cudaHostUnregister(h);
             };
         }
+        if (ring_want && !want_zc) {   // (DS4_RING: the arena's chunks page-locked for the copies, no device mapping; before the first kernel)
+            const int dev1 = devs[0].id;
+            cfg.pin_chunk = [dev1](void* h, size_t n) {
+                cudaSetDevice(dev1);
+                if (cudaHostRegister(h, n, cudaHostRegisterPortable) != cudaSuccess) (void) cudaGetLastError();
+            };
+            cfg.unpin_chunk = [dev1](void* h) {
+                cudaSetDevice(dev1);
+                if (cudaHostUnregister(h) != cudaSuccess) (void) cudaGetLastError();
+            };
+        }
         bool direct = true;
         for (os::fd_t f : pk.dfds) direct = direct && f != os::kBadFd;
         auto st = std::make_unique<ExpertStore>();
@@ -5622,7 +5662,7 @@ struct Model::Impl {
         store = std::move(st);
         // (the router lookahead's guesses are not read ahead with the store: measured 4.5 against 4.7 tok/s, 62% of the guesses are right and
         // the SSD is the narrow part; DS4_AHEAD=1 turns them on)
-        if (std::getenv("DS4_AHEAD") == nullptr) ahead_mode = 0;
+        if (std::getenv("DS4_AHEAD") == nullptr && !ring_want) ahead_mode = 0;
         for (Layer& l : L)
             if (l.il < g.nl && want_zc) l.zc.assign((size_t) l.n_exp, 0);
         std::fprintf(stderr, "ds4: RAM store: up to %zu slots of %.1f MB (%.1f GB), policy %d, %d reader threads, %s reads\n",
@@ -7358,6 +7398,8 @@ struct Model::Impl {
     }
     void cache_tick_swaps(int T) {
         if (!o.expert_cache || cache_ths.empty()) return;
+        std::unique_lock<std::mutex> rlk(ring_mu, std::defer_lock);   // (DS4_RING: the ring's table entries are the host thread's too)
+        if (ring_on) rlk.lock();
         std::vector<Swap> ready;
         std::vector<RamSwap> rready;
         {
@@ -7522,6 +7564,218 @@ struct Model::Impl {
             if (file_read(n, e)) return &n;
         return nullptr;
     }
+    // ---- DS4_RING (see the members): setup before the store (decided here, its arena is page-locked for the copies as it grows),
+    // the slots after it (ring_start).  Single GPU, one member a layer, not with DS4_STORE_ZC.  The guesses are the lookahead's:
+    // with DS4_AHEAD unset the lookahead stays on when the ring is.
+    void ring_free_mem() {
+        if (ring_st != nullptr) cudaStreamDestroy(ring_st);
+        ring_st = nullptr;
+        for (RingSlot& s : ring_s)
+            if (s.ev != nullptr) cudaEventDestroy(s.ev);
+        ring_s.clear();
+        if (ring_buf != nullptr) cudaFree(ring_buf);
+        ring_buf = nullptr;
+        ring_n = 0;
+    }
+    void ring_setup() {
+        const char* env = std::getenv("DS4_RING");
+        const int n = env != nullptr ? std::atoi(env) : 0;
+        if (n <= 0) return;
+#if defined(STRATA_METAL)
+        std::fprintf(stderr, "ds4: ring: off (the Metal path publishes no per-pick flags)\n");
+        return;
+#else
+        if (devs.size() != 1) {
+            std::fprintf(stderr, "ds4: ring: off (%zu GPUs: one only)\n", devs.size());
+            return;
+        }
+        for (int il = 0; il < g.nl; ++il)
+            if (L[(size_t) il].nm != 1) {
+                std::fprintf(stderr, "ds4: ring: off (layer %d has %d members)\n", il, L[(size_t) il].nm);
+                return;
+            }
+        if (std::getenv("DS4_STORE_ZC") && std::atoi(std::getenv("DS4_STORE_ZC")) != 0) {
+            std::fprintf(stderr, "ds4: ring: off (DS4_STORE_ZC is on: the store's slots are the device's experts there)\n");
+            return;
+        }
+        size_t stride = 0;
+        for (int il = 0; il < g.nl; ++il) stride = std::max(stride, unit(L[(size_t) il]));
+        stride = (stride + 255) & ~(size_t) 255;
+        cudaSetDevice(devs[0].id);
+        size_t fr = 0, tot = 0;
+        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+            (void) cudaGetLastError();
+            fr = 0;
+        }
+        if (fr < (size_t) n * stride + ((size_t) 256 << 20)) {
+            std::fprintf(stderr, "ds4: ring: off (%.2f GB of VRAM free: %d slots of %.1f MB and 0.25 GB kept would not fit)\n", (double) fr / 1e9, n,
+                         (double) stride / 1e6);
+            return;
+        }
+        if (cudaMalloc((void**) &ring_buf, (size_t) n * stride) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ring_buf = nullptr;
+            std::fprintf(stderr, "ds4: ring: off (the slots would not allocate)\n");
+            return;
+        }
+        ring_n = n;
+        ring_stride = stride;
+        ring_s.assign((size_t) n, RingSlot{});
+        std::string err;
+        bool ok = cudaStreamCreateWithFlags(&ring_st, cudaStreamNonBlocking) == cudaSuccess && halloc(ring_pin, (size_t) 2 * n, err);
+        for (RingSlot& s : ring_s) ok = ok && cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming) == cudaSuccess;
+        if (!ok) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "ds4: ring: off (the copy stream, events or staging would not allocate)\n");
+            ring_free_mem();
+            return;
+        }
+        ring_own.assign((size_t) g.nl, std::vector<int>());
+        for (int il = 0; il < g.nl; ++il) ring_own[(size_t) il].assign((size_t) L[(size_t) il].n_exp, -1);
+        if (const char* v = std::getenv("DS4_RING_INFLIGHT")) ring_inflight_max = std::max(1, std::atoi(v));
+        ring_want = true;
+#endif
+    }
+    // after the store: the ring is on when the store is up
+    void ring_start() {
+        if (!ring_want) return;
+        if (store == nullptr) {
+            std::fprintf(stderr, "ds4: ring: off (no RAM store)\n");
+            ring_want = false;
+            ring_free_mem();
+            return;
+        }
+        ring_on = true;
+        std::fprintf(stderr,
+                     "ds4: ring: %d VRAM slots (%.2f GB) filled ahead from the RAM store (guesses 1-2 layers ahead); a pick uses its slot only if the copy landed before its layer\n",
+                     ring_n, (double) ring_n * (double) ring_stride / 1e9);
+    }
+    // a slot's copy has landed (its event is done): the store's read-pin on its expert is dropped
+    void ring_reap() {
+        for (RingSlot& s : ring_s) {
+            if (!s.used || s.done) continue;
+            if (cudaEventQuery(s.ev) != cudaSuccess) {   // (not ready yet: cudaErrorNotReady, not an error here)
+                (void) cudaGetLastError();
+                continue;
+            }
+            s.done = true;
+            const int e = s.expert;
+            const std::vector<char> one(1, 1);
+            store->release(s.layer, &e, 1, one);
+        }
+    }
+    // the slot k is free again (its copy landed, its layer is done): the expert's table entry goes back to its VRAM slot, or 0. Written on
+    // the compute stream, where the swaps write their entries too, so the two stay in order.
+    void ring_free_slot(int k) {
+        RingSlot& s = ring_s[(size_t) k];
+        Layer& l = L[(size_t) s.layer];
+        if (ring_own[(size_t) s.layer][(size_t) s.expert] == k) {
+            ring_own[(size_t) s.layer][(size_t) s.expert] = -1;
+            const int sl = l.slot[(size_t) s.expert];
+            ring_pin[ring_n + k] = sl >= 0 ? (unsigned long long) (uintptr_t) (l.vram_base + (size_t) sl * unit(l)) : 0ull;
+            cudaMemcpyAsync(l.vram_tab + s.expert, &ring_pin[ring_n + k], 8, cudaMemcpyHostToDevice, devs[0].st);
+        }
+        s.used = s.done = s.counted = false;
+        s.layer = s.expert = -1;
+    }
+    // layer li's request (the host thread, before its CPU lane): the copies that landed and the picks the device took from the ring
+    // are counted; the slots of the layers before li are given back (their experts are done: li's router ran after them on the compute
+    // stream; at li 0 every trunk layer is); the guesses for the next two layers are copied in (decode windows only)
+    void ring_request(int li, const Req& r, int T) {
+        std::lock_guard<std::mutex> lk(ring_mu);
+        cudaSetDevice(devs[0].id);
+        ring_reap();
+        Layer& l = L[(size_t) li];
+        for (int k = 0; k < ring_n; ++k) {
+            RingSlot& s = ring_s[(size_t) k];
+            if (!s.used || s.layer != li || s.counted) continue;
+            s.counted = true;
+            bool picked = false;
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < l.k_exp; ++i) picked = picked || r.ids[t][i] == s.expert;
+            if (s.done) ++rc_landed;
+            else ++rc_late;
+            if (picked) ++rc_used;
+            else if (s.done) ++rc_unused;
+        }
+        for (int k = 0; k < ring_n; ++k) {
+            const RingSlot& s = ring_s[(size_t) k];
+            if (s.used && s.done && (li == 0 || s.layer < li)) ring_free_slot(k);
+        }
+        if (T != 1 || ahead_mode <= 0) return;
+        int inflight = 0;
+        for (const RingSlot& s : ring_s) inflight += s.used && !s.done;
+        for (int q = 0; q < 2; ++q) {   // the guesses 1 and 2 layers ahead (ahead_ask's q)
+            const int j = li + q + 1;
+            if (j >= g.nl) break;
+            Layer& n = L[(size_t) j];
+            const int m = std::min(r.na[q], q == 0 ? kAhead1 : kPicks), off = q == 0 ? 0 : kAhead1;
+            for (int i = 0; i < m; ++i) {
+                const int e = r.ahead[0][off + i];
+                if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
+                if (n.slot[(size_t) e] >= 0 || n.swap_pending || ring_own[(size_t) j][(size_t) e] >= 0) continue;
+                if (store->find(j, e) < 0) {   // (not read yet: the read-ahead's, a later guess may find it)
+                    ++rc_nostore;
+                    continue;
+                }
+                if (inflight >= ring_inflight_max) {
+                    ++rc_throttled;
+                    continue;
+                }
+                int k = -1;
+                for (int c = 0; c < ring_n && k < 0; ++c)
+                    if (!ring_s[(size_t) c].used) k = c;
+                if (k < 0) break;
+                // the store's slot pinned while the copy is in flight (begin: no read, the slot is ready or not found here)
+                std::vector<char> ok;
+                std::vector<int> sl;
+                store->begin(j, &e, 1, ok, sl);
+                if (sl[0] < 0 || store->find(j, e) != sl[0]) {   // (given up in between: its pin dropped)
+                    const std::vector<char> one(1, 1);
+                    store->release(j, &e, 1, one);
+                    continue;
+                }
+                RingSlot& s = ring_s[(size_t) k];
+                uint8_t* dst = ring_buf + (size_t) k * ring_stride;
+                ring_pin[k] = (unsigned long long) (uintptr_t) dst;
+                const bool queued = cudaMemcpyAsync(dst, store->blob(sl[0]), unit(n), cudaMemcpyHostToDevice, ring_st) == cudaSuccess &&
+                                    cudaMemcpyAsync(n.vram_tab + e, &ring_pin[k], 8, cudaMemcpyHostToDevice, ring_st) == cudaSuccess &&
+                                    cudaEventRecord(s.ev, ring_st) == cudaSuccess;
+                if (!queued) {
+                    (void) cudaGetLastError();
+                    const std::vector<char> one(1, 1);
+                    store->release(j, &e, 1, one);
+                    continue;
+                }
+                s.layer = j;
+                s.expert = e;
+                s.used = true;
+                s.done = false;
+                s.counted = false;
+                ring_own[(size_t) j][(size_t) e] = k;
+                ++rc_issued;
+                ++inflight;
+            }
+        }
+    }
+    // request end / shutdown: every copy done, every slot given back
+    void ring_drain() {
+        if (!ring_on) return;
+        std::lock_guard<std::mutex> lk(ring_mu);
+        cudaSetDevice(devs[0].id);
+        cudaStreamSynchronize(ring_st);
+        ring_reap();
+        for (int k = 0; k < ring_n; ++k)
+            if (ring_s[(size_t) k].used) ring_free_slot(k);
+        cudaStreamSynchronize(devs[0].st);
+    }
+    void ring_print() const {
+        std::fprintf(stderr,
+                     "ds4: request: ring: %llu copies, %llu landed in time, %llu used, %llu late, %llu unused, %llu throttled, %llu not in the store\n",
+                     (unsigned long long) rc_issued, (unsigned long long) rc_landed, (unsigned long long) rc_used, (unsigned long long) rc_late,
+                     (unsigned long long) rc_unused, (unsigned long long) rc_throttled, (unsigned long long) rc_nostore);
+    }
+
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
     // guessed experts read from the files asked for now (each once a window), the guesses kept for the hit counts
     std::vector<std::pair<const void*, size_t>> pf_want;
@@ -7644,7 +7898,8 @@ struct Model::Impl {
                             st.ahead_hit += (fl[e] & 6) != 0;
                             st.ahead_hit2 += (fl[e] >> 2) & 1;
                         }
-                        if (l.slot[(size_t) e] < 0) {
+                        const bool cpu_pick = ring_on ? !r.gpu[t][i] : l.slot[(size_t) e] < 0;   // (DS4_RING: the device's own choice)
+                        if (cpu_pick) {
                             l.cpu_hits.push_back(e);
                             if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
                                 store->touch(li, e);
@@ -7674,6 +7929,7 @@ struct Model::Impl {
                         st.ahead_rank_hit[rk[e] - 1] += hit;
                     }
                 }
+                if (ring_on && !l.mtp) ring_request(li, r, T);
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 std::sort(picks.begin(), picks.end());
                 for (size_t a = 0; a < picks.size();) {

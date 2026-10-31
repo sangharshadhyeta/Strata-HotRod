@@ -227,6 +227,7 @@ struct Req {
     float w[kWin][kPicks];
     int ahead[kWin][kAhead];
     float x[kWin][kMaxDim];
+    unsigned char gpu[kWin][kPicks];   // 1: the pick's table entry was set when the router ran (the device computes it; DS4_RING's host check)
 };
 struct Resp {
     unsigned seq;
