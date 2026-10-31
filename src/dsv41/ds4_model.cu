@@ -1146,6 +1146,7 @@ struct Model::Impl {
         int layer = -1, expert = -1;
         bool used = false, done = false, counted = false;   // done: the copy has landed (its flag is set); counted: its layer's request came
         uint64_t fill_tok = 0;   // the token counter when the fill was issued
+        bool picked_once = false;   // sticky: some request picked its expert since the fill (the eviction's first tier is the others)
     };
     bool ring_want = false, ring_on = false;
     int ring_n = 0, ring_inflight_max = 12;
@@ -7859,19 +7860,26 @@ struct Model::Impl {
             if (ring_move && store->drop(s.layer, e)) ++rc_moved;   // (DS4_RING_MOVE: landed, so the copy is done; the store's slot back)
         }
     }
-    // (DS4_RING_STICKY; caller holds ring_mu) the slot a fill of layer li may take over: landed, of a layer before li (its expert kernels
-    // for this token are done, and the next token reaches it only a pass later), the least recently picked. -1: none.
-    // With DS4_RING_COST the key is c_layer / (1 + age in tokens) (the cheapest to recompute and the least recently used first).
+    // (DS4_RING_STICKY; caller holds ring_mu) the slot a fill of layer li may take over: landed (done; a slot still copying is never one),
+    // of a layer before li (its expert kernels for this token are done, and the next token reaches it only a pass later). Two tiers:
+    // first the slots nobody has picked since their fill, oldest fill first; then the picked ones by the key: the least recently picked
+    // (sticky alone), or with DS4_RING_COST the lowest c_layer / (1 + age in tokens). -1: none.
     int ring_evict_pick(int li) const {
-        int best = -1;
+        int best = -1, btier = 0;
         double bv = 0.0;
         for (int k = 0; k < ring_n; ++k) {
             const RingSlot& s = ring_s[(size_t) k];
             if (!s.used || !s.done || s.layer >= li) continue;
-            const double last = (double) ring_last[(size_t) k].load(std::memory_order_relaxed);
-            const double v = ring_cost ? ring_cl[(size_t) s.layer] / (1.0 + ((double) ring_tok - last)) : last;
-            if (best < 0 || v < bv) {
+            const int tier = s.picked_once ? 1 : 0;
+            double v;
+            if (tier == 0) v = (double) s.fill_tok;
+            else {
+                const double last = (double) ring_last[(size_t) k].load(std::memory_order_relaxed);
+                v = ring_cost ? ring_cl[(size_t) s.layer] / (1.0 + ((double) ring_tok - last)) : last;
+            }
+            if (best < 0 || tier < btier || (tier == btier && v < bv)) {
                 best = k;
+                btier = tier;
                 bv = v;
             }
         }
@@ -7933,12 +7941,13 @@ struct Model::Impl {
         }
         if (ring_sticky) {   // (the landed slots stay: a pick of layer li's expert is its use now, the last one is its eviction's order)
             for (int k = 0; k < ring_n; ++k) {
-                const RingSlot& s = ring_s[(size_t) k];
+                RingSlot& s = ring_s[(size_t) k];
                 if (!s.used || s.layer != li) continue;
                 bool picked = false;
                 for (int t = 0; t < T; ++t)
                     for (int i = 0; i < l.k_exp; ++i) picked = picked || r.ids[t][i] == s.expert;
                 if (!picked) continue;
+                s.picked_once = true;
                 ring_last[(size_t) k].store(ring_tok, std::memory_order_relaxed);
                 if (s.done && !ring_bad[(size_t) k] && s.fill_tok < ring_tok) ++rc_reused;
             }
@@ -8021,6 +8030,7 @@ struct Model::Impl {
                 s.done = false;
                 s.counted = false;
                 s.fill_tok = ring_tok;
+                s.picked_once = false;
                 if (ring_sticky) ring_last[(size_t) k].store(ring_tok, std::memory_order_relaxed);
                 ring_own[(size_t) j][(size_t) e] = k;
                 ++rc_issued;
