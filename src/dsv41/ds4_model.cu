@@ -1144,8 +1144,7 @@ struct Model::Impl {
     // follows the device's own per-pick flag (Req::gpu).  Nothing waits for a copy.
     struct RingSlot {
         int layer = -1, expert = -1;
-        bool used = false, done = false, counted = false;   // done: the copy has landed (its event is done); counted: its layer's request came
-        cudaEvent_t ev = nullptr;
+        bool used = false, done = false, counted = false;   // done: the copy has landed (its flag is set); counted: its layer's request came
     };
     bool ring_want = false, ring_on = false;
     int ring_n = 0, ring_inflight_max = 12;
@@ -1155,12 +1154,12 @@ struct Model::Impl {
     std::vector<RingSlot> ring_s;
     std::vector<std::vector<int>> ring_own;   // trunk layer -> expert -> its ring slot (-1: none)
     unsigned long long* ring_pin = nullptr;   // pinned: [0, ring_n) the fills' table entries, [ring_n, 2 ring_n) the frees'
-    uint64_t rc_issued = 0, rc_landed = 0, rc_used = 0, rc_late = 0, rc_unused = 0, rc_throttled = 0, rc_nostore = 0;
+    uint64_t rc_issued = 0, rc_landed = 0, rc_used = 0, rc_late = 0, rc_unused = 0, rc_throttled = 0, rc_nostore = 0, rc_skipped = 0;
     std::mutex ring_mu;   // the ring's bookkeeping (the slots, ring_own, the table entries' decisions) and cache_tick_swaps; never held in a CUDA call
     // The ring's CUDA work is on ring_th (ring_loop): serve_lane and the host thread only queue items.  Items run in order; ring_handled
     // is the seq of the last one done.  A barrier item syncs ring_st (ring_barrier).
     struct RingItem {
-        bool fill = true, barrier = false;
+        bool fill = true, barrier = false, clear_only = false;   // clear_only: a free that only clears the slot's flag
         int layer = -1, expert = -1, k = -1;
         size_t bytes = 0;                 // fill: the copy's size
         const uint8_t* src = nullptr;     // fill: the store's blob
@@ -1176,6 +1175,7 @@ struct Model::Impl {
     bool ring_qquit = false;
     bool ring_pin_on = false;   // DS4_RING_PIN=1: the store's chunks page-locked (true async DMA); else the store as it is (staged by the driver)
     std::unique_ptr<std::atomic<bool>[]> ring_bad;   // [ring_n]: the slot's blob copy failed (its table entry was not written)
+    std::unique_ptr<std::atomic<int>[]> ring_landed; // [ring_n]: 1 once the slot's copies have run on ring_st (set by a stream callback)
     std::thread pf_th;
     tl::Writer tl_writer;   // the Monitor's decode timeline (ds4_timeline.hpp): its file, every 0.5 s, when the server asks
     std::mutex pf_mu;
@@ -5671,6 +5671,7 @@ struct Model::Impl {
                 cudaSetDevice(dev1);
                 if (cudaHostUnregister(h) != cudaSuccess) (void) cudaGetLastError();
             };
+            cfg.force_pregrow = true;   // (every chunk registered at start: none on the CPU lane's thread later)
         }
         bool direct = true;
         for (os::fd_t f : pk.dfds) direct = direct && f != os::kBadFd;
@@ -7590,8 +7591,6 @@ struct Model::Impl {
     void ring_free_mem() {
         if (ring_st != nullptr) cudaStreamDestroy(ring_st);
         ring_st = nullptr;
-        for (RingSlot& s : ring_s)
-            if (s.ev != nullptr) cudaEventDestroy(s.ev);
         ring_s.clear();
         if (ring_buf != nullptr) cudaFree(ring_buf);
         ring_buf = nullptr;
@@ -7642,14 +7641,17 @@ struct Model::Impl {
         ring_stride = stride;
         ring_s.assign((size_t) n, RingSlot{});
         ring_bad.reset(new std::atomic<bool>[(size_t) n]);
-        for (int k = 0; k < n; ++k) ring_bad[(size_t) k] = false;
+        ring_landed.reset(new std::atomic<int>[(size_t) n]);
+        for (int k = 0; k < n; ++k) {
+            ring_bad[(size_t) k] = false;
+            ring_landed[(size_t) k] = 0;
+        }
         ring_pin_on = std::getenv("DS4_RING_PIN") != nullptr && std::atoi(std::getenv("DS4_RING_PIN")) != 0;
         std::string err;
-        bool ok = cudaStreamCreateWithFlags(&ring_st, cudaStreamNonBlocking) == cudaSuccess && halloc(ring_pin, (size_t) 2 * n, err);
-        for (RingSlot& s : ring_s) ok = ok && cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming) == cudaSuccess;
+        const bool ok = cudaStreamCreateWithFlags(&ring_st, cudaStreamNonBlocking) == cudaSuccess && halloc(ring_pin, (size_t) 2 * n, err);
         if (!ok) {
             (void) cudaGetLastError();
-            std::fprintf(stderr, "ds4: ring: off (the copy stream, events or staging would not allocate)\n");
+            std::fprintf(stderr, "ds4: ring: off (the copy stream or staging would not allocate)\n");
             ring_free_mem();
             return;
         }
@@ -7673,7 +7675,8 @@ struct Model::Impl {
         std::fprintf(stderr,
                      "ds4: ring: %d VRAM slots (%.2f GB) filled ahead from the RAM store (guesses 1-2 layers ahead), %s; a pick uses its slot only if the copy landed before its layer\n",
                      ring_n, (double) ring_n * (double) ring_stride / 1e9,
-                     ring_pin_on ? "pinned store, DMA" : "the store as it is, staged by the driver on the ring thread");
+                     ring_pin_on ? "pinned store, DMA (DS4_RING_PIN=1: the store's whole arena grown and registered at start, none after it)"
+                                 : "the store as it is, staged by the driver on the ring thread");
     }
     // the ring thread: every CUDA call of the ring (fills, frees, barriers) runs here, in queue order, on ring_st
     void ring_loop() {
@@ -7691,28 +7694,35 @@ struct Model::Impl {
             ring_donecv.notify_all();
         }
     }
+    // the stream callback after a fill's copies: the slot's flag (no CUDA call in it)
+    static void landed_cb(void* p) { static_cast<std::atomic<int>*>(p)->store(1, std::memory_order_release); }
     void ring_do(const RingItem& it) {
         if (it.barrier) {
             if (cudaStreamSynchronize(ring_st) != cudaSuccess) (void) cudaGetLastError();
             return;
         }
         Layer& l = L[(size_t) it.layer];
+        const size_t k = (size_t) it.k;
         if (it.fill) {
-            uint8_t* dst = ring_buf + (size_t) it.k * ring_stride;
-            ring_pin[it.k] = (unsigned long long) (uintptr_t) dst;   // (the previous use of this entry landed: its event was done before the slot was reused)
+            uint8_t* dst = ring_buf + k * ring_stride;
+            ring_pin[it.k] = (unsigned long long) (uintptr_t) dst;   // (the previous use of this entry landed: its flag was seen before the slot was reused)
             const bool copied = cudaMemcpyAsync(dst, it.src, it.bytes, cudaMemcpyHostToDevice, ring_st) == cudaSuccess;
             bool ok = copied;
             if (copied) ok = cudaMemcpyAsync(l.vram_tab + it.expert, &ring_pin[it.k], 8, cudaMemcpyHostToDevice, ring_st) == cudaSuccess;
             if (!ok) (void) cudaGetLastError();
-            ring_bad[(size_t) it.k] = !copied;
-            if (cudaEventRecord(ring_s[(size_t) it.k].ev, ring_st) != cudaSuccess) {
+            ring_bad[k] = !copied;
+            if (cudaLaunchHostFunc(ring_st, landed_cb, &ring_landed[k]) != cudaSuccess) {   // (the flag set after the copies, here: the callback is missing)
                 (void) cudaGetLastError();
-                ring_bad[(size_t) it.k] = true;
+                ring_bad[k] = true;
+                ring_landed[k].store(1, std::memory_order_release);
             }
             return;
         }
-        // a free: re-checked under ring_mu (decide, release, then the CUDA call): still no newer fill of this expert, and its VRAM slot
-        // unchanged (a swap that installed it wrote its own entry)
+        // a free (or a clear): the slot's flag back to 0 before any reuse (the slot was freed only after its flag was seen)
+        ring_landed[k].store(0, std::memory_order_release);
+        if (it.clear_only) return;
+        // re-checked under ring_mu, then released before the CUDA call: still no newer fill of this expert, and its VRAM slot unchanged
+        // (a swap that installed it wrote its own entry)
         {
             std::lock_guard<std::mutex> lk(ring_mu);
             if (ring_own[(size_t) it.layer][(size_t) it.expert] != -1 || l.slot[(size_t) it.expert] != it.slot_seen) return;
@@ -7721,17 +7731,17 @@ struct Model::Impl {
         if (cudaMemcpyAsync(l.vram_tab + it.expert, &ring_pin[ring_n + it.k], 8, cudaMemcpyHostToDevice, ring_st) != cudaSuccess)
             (void) cudaGetLastError();
     }
-    // queue an item (serve_lane's and the host thread's calls: never waits for the thread)
-    uint64_t ring_push(RingItem it) {
-        std::lock_guard<std::mutex> lk(ring_qmu);
+    // queue an item; the caller holds ring_qmu
+    uint64_t ring_push_l(RingItem it) {
         it.seq = ++ring_pushed;
         ring_q.push_back(it);
         ring_qcv.notify_one();
         return it.seq;
     }
-    size_t ring_qlen() {
+    // (host thread only: blocking)
+    uint64_t ring_push(RingItem it) {
         std::lock_guard<std::mutex> lk(ring_qmu);
-        return ring_q.size();
+        return ring_push_l(it);
     }
     // waits until the ring thread has done everything queued before (and ring_st is synced): the host thread's only wait on it
     void ring_barrier() {
@@ -7751,42 +7761,56 @@ struct Model::Impl {
         ring_qcv.notify_all();
         ring_th.join();
     }
-    // a slot's copy has landed (its event is done): the store's read-pin on its expert is dropped
+    // a slot's copies have landed (its flag is set): the store's read-pin on its expert is dropped. No CUDA call, no wait.
     void ring_reap() {
-        for (RingSlot& s : ring_s) {
+        for (size_t k = 0; k < ring_s.size(); ++k) {
+            RingSlot& s = ring_s[k];
             if (!s.used || s.done) continue;
-            if (cudaEventQuery(s.ev) != cudaSuccess) continue;   // (not ready yet: cudaErrorNotReady, not an error here; the one CUDA call on serve_lane's path)
+            if (ring_landed[k].load(std::memory_order_acquire) == 0) continue;
             s.done = true;
             const int e = s.expert;
             const std::vector<char> one(1, 1);
             store->release(s.layer, &e, 1, one);
         }
     }
-    // the slot k is free again (its copy landed, its layer is done): the expert's table entry goes back to its VRAM slot, or 0. The write is
-    // a queued item, issued on ring_st by the ring thread (in order with the fills there).  Called under ring_mu.
+    // the slot k is free again (its copies landed, its layer is done): the expert's table entry goes back to its VRAM slot, or 0. Always
+    // a queued item (the ring thread clears the slot's flag with it); the write itself only when the expert is still the slot's.
+    // Caller holds ring_mu and ring_qmu.
     void ring_free_slot(int k) {
         RingSlot& s = ring_s[(size_t) k];
         Layer& l = L[(size_t) s.layer];
+        RingItem it;
+        it.fill = false;
+        it.layer = s.layer;
+        it.expert = s.expert;
+        it.k = k;
         if (ring_own[(size_t) s.layer][(size_t) s.expert] == k) {
             ring_own[(size_t) s.layer][(size_t) s.expert] = -1;
             const int sl = l.slot[(size_t) s.expert];
-            RingItem it;
-            it.fill = false;
-            it.layer = s.layer;
-            it.expert = s.expert;
-            it.k = k;
             it.value = sl >= 0 ? (unsigned long long) (uintptr_t) (l.vram_base + (size_t) sl * unit(l)) : 0ull;
             it.slot_seen = sl;
-            ring_push(it);
+        } else {
+            it.clear_only = true;
         }
+        ring_push_l(it);
         s.used = s.done = s.counted = false;
         s.layer = s.expert = -1;
     }
-    // layer li's request (the host thread, before its CPU lane): the copies that landed and the picks the device took from the ring
-    // are counted; the slots of the layers before li are given back (their experts are done: li's router ran after them on the compute
-    // stream; at li 0 every trunk layer is); the guesses for the next two layers are copied in (decode windows only)
+    // layer li's request (serve_lane's thread, before its CPU lane). It never blocks: if ring_mu or the queue is held by someone else
+    // (cache_tick_swaps holds ring_mu across its copies), this request's ring work is skipped and counted. The copies that landed and the
+    // picks the device took from the ring are counted; the slots of the layers before li are given back; the guesses for the next two
+    // layers are queued (decode windows only).
     void ring_request(int li, const Req& r, int T) {
-        std::lock_guard<std::mutex> lk(ring_mu);
+        std::unique_lock<std::mutex> lk(ring_mu, std::try_to_lock);
+        if (!lk.owns_lock()) {
+            ++rc_skipped;
+            return;
+        }
+        std::unique_lock<std::mutex> qk(ring_qmu, std::try_to_lock);
+        if (!qk.owns_lock()) {
+            ++rc_skipped;
+            return;
+        }
         ring_reap();
         Layer& l = L[(size_t) li];
         for (int k = 0; k < ring_n; ++k) {
@@ -7825,7 +7849,7 @@ struct Model::Impl {
                     ++rc_throttled;
                     continue;
                 }
-                if (ring_qlen() > 4 * (size_t) ring_n) {   // the ring thread is behind: this fill is dropped (counted as throttled)
+                if (ring_q.size() > 4 * (size_t) ring_n) {   // the ring thread is behind: this fill is dropped (counted as throttled)
                     ++rc_throttled;
                     continue;
                 }
@@ -7850,8 +7874,8 @@ struct Model::Impl {
                 it.k = k;
                 it.bytes = unit(n);
                 it.src = store->blob(sl[0]);
-                ring_bad[(size_t) k] = false;   // (before the push: the thread sets it when the copy fails)
-                ring_push(it);
+                ring_bad[(size_t) k] = false;   // (before the push: the ring thread sets it when the copy fails)
+                ring_push_l(it);
                 s.layer = j;
                 s.expert = e;
                 s.used = true;
@@ -7863,14 +7887,14 @@ struct Model::Impl {
             }
         }
     }
-    // request end / shutdown: every copy done, every slot given back
-    // (the host thread: the queued fills synced and reaped, then the frees queued and synced; the frees' table writes are on ring_st, so
-    // the barrier also orders them before the next request)
+    // (the host thread at request end and at shutdown: queued fills synced and reaped, then the frees queued and synced; the frees' table
+    // writes are on ring_st, so the barrier orders them before the next request)
     void ring_drain() {
         if (!ring_on) return;
         ring_barrier();
         {
             std::lock_guard<std::mutex> lk(ring_mu);
+            std::lock_guard<std::mutex> qk(ring_qmu);
             ring_reap();
             for (int k = 0; k < ring_n; ++k)
                 if (ring_s[(size_t) k].used) ring_free_slot(k);
@@ -7879,9 +7903,9 @@ struct Model::Impl {
     }
     void ring_print() const {
         std::fprintf(stderr,
-                     "ds4: request: ring: %llu copies, %llu landed in time, %llu used, %llu late, %llu unused, %llu throttled, %llu not in the store\n",
+                     "ds4: request: ring: %llu copies, %llu landed in time, %llu used, %llu late, %llu unused, %llu throttled, %llu not in the store, %llu skipped (busy)\n",
                      (unsigned long long) rc_issued, (unsigned long long) rc_landed, (unsigned long long) rc_used, (unsigned long long) rc_late,
-                     (unsigned long long) rc_unused, (unsigned long long) rc_throttled, (unsigned long long) rc_nostore);
+                     (unsigned long long) rc_unused, (unsigned long long) rc_throttled, (unsigned long long) rc_nostore, (unsigned long long) rc_skipped);
     }
 
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the

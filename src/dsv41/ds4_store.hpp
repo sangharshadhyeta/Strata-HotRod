@@ -72,6 +72,9 @@ public:
         std::function<void(void* host)> unpin_chunk;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
+        // (DS4_RING_PIN) the whole arena grown at construction, and no chunk after it: a registration (pin_chunk) is a CUDA call, and the
+        // CPU lane's thread must make none
+        bool force_pregrow = false;
     };
 
     bool init(const Cfg& c, const std::vector<LayerGeo>& layers, const std::vector<os::fd_t>& dfds, const std::vector<os::fd_t>& pfds) {
@@ -106,9 +109,10 @@ public:
 #else
         const bool pregrow = std::getenv("DS4_STORE_PREGROW") != nullptr && std::atoi(std::getenv("DS4_STORE_PREGROW")) != 0;
 #endif
-        if (pregrow)
+        if (pregrow || cfg_.force_pregrow)
             while (grow()) {
             }
+        frozen_ = cfg_.force_pregrow;
         return true;
     }
     ~ExpertStore() {
@@ -533,7 +537,7 @@ private:
         sp.state.store(kReady, std::memory_order_release);
     }
     bool grow() {
-        if (nalloc_ >= nmax_) return false;
+        if (nalloc_ >= nmax_ || frozen_) return false;
         const size_t n = std::min(kChunk, nmax_ - nalloc_);
         const size_t bytes = n * slot_bytes_;
         const uint64_t avail = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
@@ -584,6 +588,7 @@ private:
     std::vector<LayerGeo> geo_;
     std::vector<os::fd_t> dfds_, pfds_;
     size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
+    bool frozen_ = false;   // no chunk after the construction's (Cfg::force_pregrow)
     uint8_t* arena_ = nullptr;
     size_t shrunk_ = 0;
     std::unique_ptr<Slot[]> slots_;
