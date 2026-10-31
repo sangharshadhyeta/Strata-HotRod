@@ -75,3 +75,20 @@ Every switch, flag and server key: [FEATURES-deepseek.md](FEATURES-deepseek.md).
 
 Answers read by hand (degeneration and degradation reported apart). Never compile during a speed leg. One model on the GPU at a time.
 No regex, no pattern matching on tokens. A switch becomes a default only when it wins its A/B and the answers stay clean.
+
+## DS4_LEND (Avalon point 1)
+
+Why: measured 1 Nov, the chunked prompt pass's buffers (`alloc_chunks`) take about 1.76 GB of the RTX 3060. Without them (`--prefill-chunk 0`)
+475 experts fit on the card instead of 270, and answers ran 5.9 tok/s instead of 4.7. Those bytes sit idle while no prompt pass runs.
+
+How (opt-in, `DS4_LEND=1`; unset or any other value leaves the engine as it was): the chunk buffers of the trunk's device are carved from
+one arena (measured first, one `cudaMalloc`, zeroed). While no chunked pass runs, the arena holds experts: `lend_request` plans them (the
+trunk's experts the cards do not hold, hottest first, as many as the arena takes), the lend thread copies each blob in (`parts_to_blob`,
+the cache's own layout, on its own stream), and `cache_tick_swaps` publishes the copies into `vram_tab` between windows. Before a chunked
+pass (`feed` / `feed_mark`, and again in `forward_chunks` after the warm-up lock) `lend_reclaim` stops the fill, zeroes the table entries
+that are still the arena's, and zeroes the arena. After the pass `lend_request` plans again. The swaps and the ring skip lent experts.
+Off when: not a CUDA build, more than one device, no chunked path, the expert cache off, or a trunk layer's experts in a group (said once
+as `ds4: DS4_LEND: off (...)`). MXFP4 layers are not lent. Logged: `ds4: DS4_LEND: ... experts lent (...) on top of the N in VRAM` at the
+first publish, and `ds4: request: lend <lent>/<planned> experts` at each request end.
+
+State: untested until measured. Not yet done: counting the picks served from lent experts.

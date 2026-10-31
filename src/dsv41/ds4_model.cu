@@ -1211,6 +1211,31 @@ struct Model::Impl {
     std::deque<RingItem> ring_q;
     uint64_t ring_pushed = 0, ring_handled = 0;
     bool ring_qquit = false;
+    // DS4_LEND=1 (Avalon point 1): the chunked prompt pass's buffers (the big chain of alloc_chunks) live in one arena, and while no
+    // prompt pass runs the arena holds experts. lend_on: the switch is on and the arena is in use; lend_carve: dalloc carves from the
+    // arena; lend_measure: dalloc only sums the bytes. Experts in the arena are published in vram_tab between windows (cache_tick_swaps),
+    // taken back before a chunked pass (lend_reclaim) and planned again after it (lend_request). Every CUDA call of the fill is on lend_th.
+    bool lend_on = false, lend_carve = false, lend_measure = false;
+    uint8_t* lend_base = nullptr;
+    size_t lend_bytes = 0, lend_off = 0;
+    struct LendEnt { int layer = 0, expert = 0; uint8_t* ptr = nullptr; };
+    std::vector<LendEnt> lend_ents;             // published: their vram_tab entries point into the arena
+    std::vector<std::vector<int>> lend_of;      // [layer][expert] -> index in lend_ents, -1 (none), -2 (planned or in flight)
+    std::thread lend_th;
+    std::mutex lend_mu;                         // lend_of, lend_plan, lend_ready, the fill's reads of hh/slot/swap_pending, the arena's use
+    std::condition_variable lend_cv;
+    bool lend_want = false, lend_quit = false, lend_dirty = false;  // (lend_mu): dirty = a copy landed in the arena since it was zeroed
+    std::atomic<bool> lend_stop{false};         // the fill in progress stops at its next expert
+    std::atomic<int> lend_busy{0};              // 1 while the fill runs (set under lend_mu together with lend_want's clear)
+    std::vector<LendEnt> lend_ready;            // copied, not yet published (lend_mu)
+    std::vector<std::pair<int, int>> lend_plan; // (layer, expert) to fill, in order (lend_mu)
+    size_t lend_plan_n = 0, lend_plan_bytes = 0;   // the last plan: experts and bytes
+    uint64_t lend_published = 0;
+    bool lend_pub_said = false, lend_mx_said = false, lend_arena_said = false;
+    cudaStream_t lend_st = nullptr;
+    uint8_t* lend_stage = nullptr;              // pinned: one expert's blob, parts_to_blob's output
+    unsigned long long* lend_pin = nullptr;     // pinned: [0, ntot) the publishes' table values, [ntot, 2 ntot) the reclaims' zeros
+    size_t lend_ntot = 0;
     bool ring_pin_on = false;   // DS4_RING_PIN=1: the store's chunks page-locked (true async DMA); else the store as it is (staged by the driver)
     std::unique_ptr<std::atomic<bool>[]> ring_bad;   // [ring_n]: the slot's blob copy failed (its table entry was not written)
     std::unique_ptr<std::atomic<int>[]> ring_landed; // [ring_n]: 1 once the slot's copies have run on ring_st (set by a stream callback)
@@ -1557,6 +1582,7 @@ struct Model::Impl {
             ring_drain();
             ring_print();
         }
+        if (lend_on) lend_print();   // (DS4_LEND: the experts lent now, of the last plan)
     }
 
     ~Impl() {
@@ -1593,6 +1619,20 @@ struct Model::Impl {
         }
         quit.store(true);
         if (warm_bg.joinable()) warm_bg.join();   // (the warm-up uses the BLAS handles destroyed below)
+        if (lend_th.joinable()) {   // (DS4_LEND: the fill stops and its thread joins before the arena's streams and the devices go)
+            {
+                std::lock_guard<std::mutex> lk(lend_mu);
+                lend_quit = true;
+                lend_stop.store(true);
+            }
+            lend_cv.notify_all();
+            lend_th.join();
+        }
+        if (lend_st != nullptr) {
+            cudaSetDevice(devs[0].id);
+            cudaStreamDestroy(lend_st);
+            lend_st = nullptr;
+        }
         eg_io.stop();   // (its threads write into h_eg)
         for (auto& w : workers) w->stop();
         for (size_t i = 0; i < chunks.size(); ++i)
@@ -1647,6 +1687,23 @@ struct Model::Impl {
 
     template <class T>
     bool dalloc(Dev& d, T*& p, size_t n, std::string& err, size_t* acct = nullptr) {
+        if (lend_carve) {   // (DS4_LEND: the chunk buffers carved from the arena; the measure pass only sums them)
+            const size_t b = align256(n * sizeof(T));
+            if (lend_measure) {
+                lend_bytes += b;
+                p = nullptr;
+                return true;
+            }
+            if (lend_base == nullptr || lend_off + b > lend_bytes) {
+                err = "DS4_LEND: the chunk arena is too small";
+                return false;
+            }
+            p = (T*) (lend_base + lend_off);
+            lend_off += b;
+            if (acct) *acct += b;
+            else d.scratch += b;
+            return true;
+        }
         void* v = nullptr;
         cudaSetDevice(d.id);
         const size_t b = align256(n * sizeof(T));
@@ -3074,6 +3131,7 @@ struct Model::Impl {
             }
         }
 
+        lend_check();   // (DS4_LEND=1: whether the chunk buffers can be one arena that holds experts between prompt passes)
         // the chunked prompt path's buffers (before the experts: they take what is left)
         if (chunk > 0) {
             // recommend, never force: a chunk the cards cannot hold in buffers is halved (down to 256 rows) and then the
@@ -3105,6 +3163,8 @@ struct Model::Impl {
                     host_allocs.pop_back();
                 }
                 chunks.clear();
+                lend_base = nullptr;   // (DS4_LEND: the arena was in the allocs freed above)
+                lend_bytes = lend_off = 0;
                 if (slab_auto_grew_) {   // the automatic slab did not fit: the 0.2.6 slab first, the chunk only if that does not fit either
                     slab_auto_grew_ = false;
                     slab_force_base_ = true;
@@ -3129,6 +3189,7 @@ struct Model::Impl {
                 aerr.clear();
             }
             if (chunk > 0 && aerr.empty()) err.clear();
+            if (chunk <= 0) lend_on = false;   // (DS4_LEND: no chunk buffers, nothing to lend from)
         }
         // the CPU lane's experts read in place (decided above): how much of them the load reads ahead, from what VRAM
         // now leaves over
@@ -3308,6 +3369,7 @@ struct Model::Impl {
             cudaSetDevice(d.id);
             CK(cudaStreamSynchronize(d.st));
         }
+        lend_init();   // (DS4_LEND: the arena's fill thread and its streams; the first fill is asked for once the warm-up is done)
         la_init();   // (STRATA_LA_LEARN: the learner, on the trunk's GPU; off unless the env var or the saved file says on)
         standin_init();
         if (par || chunk > 0)   // (the windows' threads; the prompt path's, whatever mode the windows take)
@@ -3549,13 +3611,17 @@ struct Model::Impl {
     std::atomic<bool> flow_used{false};
     std::thread warm_bg;
     void start_warm() {
-        if (chunk <= 0 || (std::getenv("DS4_WARM") && std::atoi(std::getenv("DS4_WARM")) == 0)) return;
+        if (chunk <= 0 || (std::getenv("DS4_WARM") && std::atoi(std::getenv("DS4_WARM")) == 0)) {
+            if (lend_on) lend_request();   // (DS4_LEND: no warm-up to wait for: the first fill now)
+            return;
+        }
         warm_bg = std::thread([this] {
             std::lock_guard<std::mutex> lk(warm_mu);
             if (flow_used.load() || quit.load()) return;
             const double tw = now_ms();
-            warm_flow();
+            warm_flow();   // (it writes the chunk buffers: the arena's fills start after it)
             if (o.verbose) std::fprintf(stderr, "ds4: prompt path warmed up in %.0f ms\n", now_ms() - tw);
+            if (lend_on) lend_request();
         });
     }
     // ---- the chunked prompt path
@@ -3682,7 +3748,9 @@ struct Model::Impl {
                         stride = std::max(stride, align256(unit(member(l, m))));
                     }
             const size_t A = (size_t) c.A, AI = (size_t) c.AI, ss = (size_t) o.max_context + 64;
-            bool ok = dalloc(d, c.h, C * H * D, err) && dalloc(d, c.x, C * D, err) && dalloc(d, c.acc, C * D, err) &&
+            // (the chain as a function: DS4_LEND runs it twice on the arena, measure then carve)
+            auto big = [&]() -> bool {
+                return dalloc(d, c.h, C * H * D, err) && dalloc(d, c.x, C * D, err) && dalloc(d, c.acc, C * D, err) &&
                       dalloc(d, c.x16, C * D, err) && dalloc(d, c.qr, C * g.q_lora, err) &&
                       dalloc(d, c.qr16, C * g.q_lora, err) && dalloc(d, c.kvr, C * HD, err) &&
                       dalloc(d, c.ckr, C * HD, err) && dalloc(d, c.cgr, C * HD, err) &&
@@ -3701,7 +3769,42 @@ struct Model::Impl {
                       dalloc(d, c.row_tok, C * kPicks, err) && dalloc(d, c.pos, C * kPicks, err) &&
                       dalloc(d, c.sg, C * FF, err) && dalloc(d, c.su, C * FF, err) && dalloc(d, c.sh16, C * FF, err) &&
                       dalloc(d, c.h16, (C + kH16Pad) * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
-                      halloc(c.bounds_pin, 2048, err);
+                      (lend_measure || halloc(c.bounds_pin, 2048, err));   // (the measure pass allocates nothing)
+            };
+            // DS4_LEND: the chain's buffers of device 0 in one arena: measured, one cudaMalloc (its allocation is d.allocs' like the
+            // others, freed with them), zeroed, then carved. An arena that does not allocate turns DS4_LEND off (said once) and the
+            // chain takes its own buffers as it always did.
+            bool arena = lend_on && di == 0;
+            if (arena) {
+                lend_bytes = lend_off = 0;
+                lend_base = nullptr;
+                lend_carve = lend_measure = true;
+                (void) big();
+                lend_carve = lend_measure = false;
+                if (lend_bytes > 0 && cudaMalloc((void**) &lend_base, lend_bytes) == cudaSuccess) {
+                    d.allocs.push_back(lend_base);
+                    if (cudaMemsetAsync(lend_base, 0, lend_bytes, d.st) != cudaSuccess || cudaStreamSynchronize(d.st) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        err = "zeroing the chunk arena (" + std::to_string(lend_bytes >> 20) + " MiB)";
+                        return false;
+                    }
+                    if (!lend_arena_said)
+                        std::fprintf(stderr, "ds4: DS4_LEND: the chunked pass's buffers in one %.2f GB arena: experts in it while no prompt pass runs\n",
+                                     (double) lend_bytes / 1e9);
+                    lend_arena_said = true;
+                } else {
+                    (void) cudaGetLastError();
+                    lend_base = nullptr;
+                    lend_bytes = 0;
+                    lend_on = false;
+                    arena = false;
+                    std::fprintf(stderr, "ds4: DS4_LEND: off (the chunk buffers' arena would not allocate)\n");
+                }
+            }
+            lend_carve = arena;
+            lend_off = 0;
+            const bool ok = big();
+            lend_carve = false;
             if (!ok) return false;
             if (has_first && !dalloc(d, c.emb, C * D, err)) return false;
             if (has_eg) {
@@ -7463,6 +7566,8 @@ struct Model::Impl {
         if (!o.expert_cache || cache_ths.empty()) return;
         std::unique_lock<std::mutex> rlk(ring_mu, std::defer_lock);   // (DS4_RING: the ring's table entries are the host thread's too)
         if (ring_on) rlk.lock();
+        std::unique_lock<std::mutex> llk(lend_mu, std::defer_lock);   // (DS4_LEND: the fill reads the layers' hh, slots and pending swaps under it)
+        if (lend_on) llk.lock();
         std::vector<Swap> ready;
         std::vector<RamSwap> rready;
         {
@@ -7503,6 +7608,8 @@ struct Model::Impl {
                 l.ram[(size_t) sw.in] = -1;
             }
             l.slot[(size_t) sw.in] = l.spare_vram;
+            if (lend_on && lend_of[(size_t) sw.layer][(size_t) sw.in] != -1)   // (DS4_LEND: the swap's table entry stands; a lent copy is unused)
+                lend_of[(size_t) sw.layer][(size_t) sw.in] = -1;
             if (!l.zc.empty() && l.zc[(size_t) sw.in]) {   // (VRAM's now: not the store's to compute any more)
                 l.zc[(size_t) sw.in] = 0;
                 if (l.zc_tab != nullptr) {   // (the device's table too: its entry pointed into the slot the store now reuses - when `in` left VRAM later,
@@ -7540,6 +7647,7 @@ struct Model::Impl {
             --sw_inflight;
             ++st.swaps;
         }
+        if (lend_on) lend_publish();   // (DS4_LEND: the copies the fill made, into the table - between windows, as the swaps)
         decay_tokens += T;
         if (decay_tokens >= 256) {   // older use counts less: x0.9 every 256 tokens
             decay_tokens = 0;
@@ -7553,7 +7661,7 @@ struct Model::Impl {
             hits.swap(l.cpu_hits);
             int best = -1, vin = -1;
             for (int e : hits)
-                if (l.slot[(size_t) e] < 0 && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best])) best = e;
+                if (l.slot[(size_t) e] < 0 && !lend_has(l.il, e) && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best])) best = e;
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
                 int cold = -1;
                 for (int e = 0; e < l.n_exp; ++e)
@@ -7572,7 +7680,7 @@ struct Model::Impl {
             if (l.ram.empty() || ram_free.empty() || ram_inflight >= kMaxSwaps) continue;
             int rb = -1;   // RAM: the hottest read from the file, in place of the layer's coldest held (or a free slot)
             for (int e : hits)
-                if (e != vin && l.slot[(size_t) e] < 0 && l.ram[(size_t) e] < 0 &&
+                if (e != vin && l.slot[(size_t) e] < 0 && l.ram[(size_t) e] < 0 && !lend_has(l.il, e) &&
                     (rb < 0 || l.heat[(size_t) e] > l.heat[(size_t) rb]))
                     rb = e;
             if (rb < 0) continue;
@@ -8067,6 +8175,7 @@ struct Model::Impl {
                 const int e = r.ahead[0][off + i];
                 if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                 if (n.slot[(size_t) e] >= 0 || n.swap_pending || ring_own[(size_t) j][(size_t) e] >= 0) continue;
+                if (lend_has(j, e)) continue;   // (DS4_LEND: lent or planned: the copy is in the arena, or coming)
                 const int rl = ring_cost ? ring_rl[(size_t) j] : ring_ranks;   // (DS4_RING_RANKS, or DS4_RING_COST's R_j: only the guesses ranked below it are filled; the stand-ins cover the rest)
                 if (rl > 0 && i >= rl) {
                     ++rc_beyond;
@@ -8172,6 +8281,239 @@ struct Model::Impl {
         if (ring_move) std::fprintf(stderr, ", %llu moved", (unsigned long long) rc_moved);
         if (ring_cost) std::fprintf(stderr, ", cost %.2f..%.2f us/MB, mean R %.2f", ring_cmin, ring_cmax, ring_rmean);
         std::fprintf(stderr, "\n");
+    }
+
+    // ---- DS4_LEND (Avalon point 1): the chunk buffers' arena holds experts while no chunked prompt pass runs.
+    // Measured 1 Nov: the chunk buffers take ~1.76 GB of the card; without them 475 experts fit instead of 270. Here the same bytes
+    // hold experts between passes: lend_request plans them (hottest first, the trunk's experts the cards do not hold), the lend thread
+    // copies them in, cache_tick_swaps publishes the copies into vram_tab between windows, and lend_reclaim takes the arena back
+    // before a chunked pass (fill stopped, the published entries zeroed, the arena zeroed) - the pass then runs as it always did.
+    // DS4_LEND=1 only; anything else leaves the engine as it was.
+    void lend_check() {
+        lend_on = false;
+        const char* env = std::getenv("DS4_LEND");
+        if (env == nullptr || std::strcmp(env, "1") != 0) return;
+        const char* why = nullptr;
+#if defined(STRATA_METAL)
+        why = "a Metal build";
+#else
+        if (devs.size() != 1) why = "more than one device";
+        else if (chunk <= 0) why = "no chunked prompt path";
+        else if (!o.expert_cache) why = "the expert cache is off";
+        else
+            for (const Layer& l : L)
+                if (!l.mtp && l.n_exp > 0 && l.nm != 1) {
+                    why = "a trunk layer's experts are in a group";
+                    break;
+                }
+#endif
+        if (why != nullptr) {
+            std::fprintf(stderr, "ds4: DS4_LEND: off (%s)\n", why);
+            return;
+        }
+        lend_on = true;
+    }
+    // after the expert cache's threads (the layers' experts are placed): the bookkeeping, the fill's stream and staging, the fill thread.
+    // The first plan is asked for by start_warm, once the warm-up has run (it writes the same buffers).
+    void lend_init() {
+        if (!lend_on) return;
+        cudaSetDevice(devs[0].id);
+        std::string err;
+        size_t maxb = 0;
+        lend_ntot = 0;
+        lend_of.assign(L.size(), std::vector<int>());
+        for (size_t il = 0; il < L.size(); ++il) {
+            const Layer& l = L[il];
+            lend_of[il].assign((size_t) l.n_exp, -1);
+            lend_ntot += (size_t) l.n_exp;
+            if (!l.mtp) maxb = std::max(maxb, l.blob);
+        }
+        if (!halloc(lend_stage, maxb, err) || !halloc(lend_pin, 2 * lend_ntot + 2, err) ||
+            cudaStreamCreateWithFlags(&lend_st, cudaStreamNonBlocking) != cudaSuccess) {
+            (void) cudaGetLastError();
+            lend_on = false;
+            std::fprintf(stderr, "ds4: DS4_LEND: off (the fill's staging or stream would not allocate)\n");
+            return;
+        }
+        lend_th = std::thread([this] { lend_loop(); });
+    }
+    // the fill thread: each planned expert's blob is built from its host parts (parts_to_blob, the cache's own layout) into the staging
+    // buffer and copied into the arena on lend_st. Between two copies it looks at lend_stop; lend_reclaim waits for lend_busy to fall.
+    void lend_loop() {
+        cudaSetDevice(devs[0].id);
+        for (;;) {
+            std::vector<std::pair<int, int>> plan;
+            {
+                std::unique_lock<std::mutex> lk(lend_mu);
+                lend_cv.wait(lk, [this] { return lend_quit || lend_want; });
+                if (lend_quit) return;
+                lend_want = false;
+                plan.swap(lend_plan);
+                lend_busy.store(1);
+            }
+            size_t off = 0;
+            for (const std::pair<int, int>& pe : plan) {
+                if (lend_stop.load()) break;
+                const int il = pe.first, e = pe.second;
+                Layer& l = L[(size_t) il];
+                bool go = false;
+                {   // (the host's hh / slot / swap_pending writes are under lend_mu too: cache_tick_swaps)
+                    std::lock_guard<std::mutex> lk(lend_mu);
+                    go = lend_of[(size_t) il][(size_t) e] == -2 && l.slot[(size_t) e] < 0 && !l.swap_pending;
+                    for (int X = 0; go && X < NH; ++X) go = l.hh[(size_t) e][(size_t) X] != nullptr;
+                    if (go) parts_to_blob(l, l.hh[(size_t) e], lend_stage);
+                    else if (lend_of[(size_t) il][(size_t) e] == -2) lend_of[(size_t) il][(size_t) e] = -1;
+                }
+                if (!go) continue;
+                const size_t need = align256(l.blob);
+                if (off + need > lend_bytes) break;   // (the plan was cut to the arena: a guard)
+                uint8_t* dst = lend_base + off;
+                if (cudaMemcpyAsync(dst, lend_stage, l.blob, cudaMemcpyHostToDevice, lend_st) != cudaSuccess ||
+                    cudaStreamSynchronize(lend_st) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    std::lock_guard<std::mutex> lk(lend_mu);
+                    if (lend_of[(size_t) il][(size_t) e] == -2) lend_of[(size_t) il][(size_t) e] = -1;
+                    continue;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(lend_mu);
+                    lend_ready.push_back({il, e, dst});
+                    lend_dirty = true;
+                }
+                off += need;
+            }
+            lend_busy.store(0);
+        }
+    }
+    // the host: the next fill's plan - the trunk's experts the cards do not hold (not the ring's, not planned, not lent), hottest first,
+    // as many as the arena takes; they are marked -2 (planned). Nothing is planned while a plan, a fill or a lent set is still there.
+    void lend_request() {
+        if (!lend_on) return;
+        std::unique_lock<std::mutex> rlk(ring_mu, std::defer_lock);   // (DS4_RING: the ring's ownership of the experts)
+        if (ring_on) rlk.lock();
+        std::lock_guard<std::mutex> lk(lend_mu);
+        if (lend_want || lend_busy.load() != 0 || !lend_plan.empty() || !lend_ents.empty() || !lend_ready.empty()) return;
+        struct Cand {
+            float heat;
+            int il, e;
+        };
+        std::vector<Cand> cand;
+        for (size_t il = 0; il < L.size(); ++il) {
+            const Layer& l = L[il];
+            if (l.mtp || l.cpu_only || l.n_exp <= 0) continue;
+            if (l.lay.fmt == gg::kFmtMXFP4) {   // (its swap path differs: not lent)
+                if (!lend_mx_said) {
+                    lend_mx_said = true;
+                    std::fprintf(stderr, "ds4: DS4_LEND: the GGUF's MXFP4 experts are not lent (layer %d and the others of its kind)\n", l.il);
+                }
+                continue;
+            }
+            for (int e = 0; e < l.n_exp; ++e) {
+                if (l.slot[(size_t) e] >= 0 || lend_of[il][(size_t) e] != -1) continue;
+                if (ring_on && ring_own[il][(size_t) e] != -1) continue;
+                cand.push_back({l.heat[(size_t) e], (int) il, e});
+            }
+        }
+        std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.heat > b.heat; });
+        size_t tot = 0;
+        for (const Cand& c : cand) {
+            const size_t need = align256(L[(size_t) c.il].blob);
+            if (tot + need > lend_bytes) break;
+            tot += need;
+            lend_plan.push_back({c.il, c.e});
+            lend_of[(size_t) c.il][(size_t) c.e] = -2;
+        }
+        lend_plan_n = lend_plan.size();
+        lend_plan_bytes = tot;
+        if (!lend_plan.empty()) {
+            lend_want = true;
+            lend_cv.notify_one();
+        }
+    }
+    // the host, before a chunked pass: the fill stops at its next expert and is waited for; the published entries leave vram_tab (zeroed on
+    // devs[0].st - only those still theirs: a swap that took the expert since keeps its table entry); the plan and the copies not yet
+    // published are dropped; the arena is zeroed as at load. The pass then owns the arena.
+    void lend_reclaim() {
+        if (!lend_on) return;
+        {
+            std::lock_guard<std::mutex> lk(lend_mu);
+            lend_want = false;
+            lend_stop.store(true);
+        }
+        while (lend_busy.load() != 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
+        lend_stop.store(false);
+        std::vector<std::pair<int, int>> zero;
+        bool dirty = false;   // (a fill wrote the arena since it was last zeroed)
+        {
+            std::lock_guard<std::mutex> lk(lend_mu);
+            dirty = lend_dirty;
+            lend_dirty = false;
+            for (size_t i = 0; i < lend_ents.size(); ++i) {
+                const LendEnt& x = lend_ents[i];
+                if (lend_of[(size_t) x.layer][(size_t) x.expert] == (int) i) zero.push_back({x.layer, x.expert});
+            }
+            lend_ents.clear();
+            lend_plan.clear();
+            lend_ready.clear();
+            for (std::vector<int>& v : lend_of) std::fill(v.begin(), v.end(), -1);
+        }
+        if (!zero.empty()) {
+            cudaSetDevice(devs[0].id);
+            for (size_t k = 0; k < zero.size(); ++k) {
+                lend_pin[lend_ntot + k] = 0ull;
+                (void) cudaMemcpyAsync(L[(size_t) zero[k].first].vram_tab + zero[k].second, &lend_pin[lend_ntot + k], 8,
+                                       cudaMemcpyHostToDevice, devs[0].st);
+            }
+        }
+        cudaSetDevice(devs[0].id);
+        if (cudaStreamSynchronize(devs[0].st) != cudaSuccess) (void) cudaGetLastError();
+        if (cudaStreamSynchronize(lend_st) != cudaSuccess) (void) cudaGetLastError();
+        if (ring_on) ring_barrier();   // (the ring's own work: queued before, done now)
+        if (dirty && lend_base != nullptr && lend_bytes > 0) {
+            (void) cudaMemsetAsync(lend_base, 0, lend_bytes, devs[0].st);
+            if (cudaStreamSynchronize(devs[0].st) != cudaSuccess) (void) cudaGetLastError();
+        }
+    }
+    // (cache_tick_swaps, under lend_mu and ring_mu when DS4_RING): the copies that landed go into vram_tab, unless their expert got onto the
+    // card another way meanwhile (a swap, the ring) - then the copy is simply unused
+    void lend_publish() {
+        if (lend_ready.empty()) return;
+        cudaSetDevice(devs[0].id);
+        std::vector<LendEnt> ready;
+        ready.swap(lend_ready);
+        for (const LendEnt& r : ready) {
+            Layer& l = L[(size_t) r.layer];
+            const size_t e = (size_t) r.expert;
+            const bool took = l.slot[e] >= 0 || (ring_on && ring_own[(size_t) r.layer][e] != -1);
+            if (took) {
+                lend_of[(size_t) r.layer][e] = -1;
+                continue;
+            }
+            const size_t i = lend_ents.size();
+            lend_pin[i] = (unsigned long long) r.ptr;
+            (void) cudaMemcpyAsync(l.vram_tab + e, &lend_pin[i], 8, cudaMemcpyHostToDevice, devs[0].st);
+            lend_of[(size_t) r.layer][e] = (int) i;
+            lend_ents.push_back(r);
+            ++lend_published;
+        }
+        if (!lend_pub_said && !lend_ents.empty()) {
+            lend_pub_said = true;
+            double gb = 0;
+            size_t inv = 0;
+            for (const LendEnt& x : lend_ents) gb += (double) L[(size_t) x.layer].blob;
+            for (const Layer& l : L)
+                if (!l.mtp)
+                    for (int e = 0; e < l.n_exp; ++e) inv += l.slot[(size_t) e] >= 0;
+            std::fprintf(stderr, "ds4: DS4_LEND: %zu experts lent (%.2f GB) on top of the %zu in VRAM\n", lend_ents.size(), gb / 1e9, inv);
+        }
+    }
+    // a lent expert is not a swap candidate (its copy is in the arena, not in a slot): lend_on only
+    bool lend_has(int il, int e) const { return lend_on && lend_of[(size_t) il][(size_t) e] != -1; }
+    void lend_print() {
+        std::lock_guard<std::mutex> lk(lend_mu);
+        double gb = 0;
+        for (const LendEnt& x : lend_ents) gb += (double) L[(size_t) x.layer].blob;
+        std::fprintf(stderr, "ds4: request: lend %zu/%zu experts (%.2f GB)\n", lend_ents.size(), lend_plan_n, gb / 1e9);
     }
 
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
@@ -8296,7 +8638,8 @@ struct Model::Impl {
                             st.ahead_hit += (fl[e] & 6) != 0;
                             st.ahead_hit2 += (fl[e] >> 2) & 1;
                         }
-                        const bool cpu_pick = ring_on ? !r.gpu[t][i] : l.slot[(size_t) e] < 0;   // (DS4_RING: the device's own choice)
+                        // (DS4_RING / DS4_LEND: the device's own choice - a lent expert's table entry is set, so the device computes it)
+                        const bool cpu_pick = (ring_on || lend_on) ? !r.gpu[t][i] : l.slot[(size_t) e] < 0;
                         if (cpu_pick) {
                             l.cpu_hits.push_back(e);
                             if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
@@ -10129,6 +10472,7 @@ struct Model::Impl {
         if (n < 1) return true;
         flow_used.store(true);
         std::lock_guard<std::mutex> warm_lk(warm_mu);   // (the warm-up, if it is running, finishes first)
+        if (lend_on) lend_reclaim();   // (DS4_LEND: the warm-up's end may have asked for a fill after the feed's reclaim: stopped before the pass writes the arena)
         if (pos + n > o.max_context) {
             err = "the context is full";
             return false;
@@ -11575,8 +11919,10 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "feed n %d chunk %d chunk_min %d\n", n, p.chunk, p.chunk_min);
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
-        const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err)
-                                                             : p.feed_windows(tokens, n, logits_rows, err);
+        const bool chunked = logits_rows > kWin || p.pick_path(n);
+        if (chunked && p.lend_on) p.lend_reclaim();   // (DS4_LEND: the arena is the pass's while it runs)
+        const bool ok = chunked ? p.forward_chunks(tokens, n, logits_rows, err) : p.feed_windows(tokens, n, logits_rows, err);
+        if (chunked && p.lend_on) p.lend_request();   // (DS4_LEND: the experts again, after the pass, failed or not)
         if (ok) p.path_done(now_ms() - t0);
         return ok;
     }
@@ -11588,7 +11934,9 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     p.halted = false;
     const double t0 = now_ms();
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
+        if (p.lend_on) p.lend_reclaim();   // (DS4_LEND: as feed's)
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
+        if (p.lend_on) p.lend_request();
         if (ok) p.path_done(now_ms() - t0);
         return ok;
     }
