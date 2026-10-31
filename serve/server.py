@@ -3838,6 +3838,9 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
+        if v is None or str(v) == "":                # blank: the engine's own default (an inherited value is dropped too)
+            env.pop(str(k), None)
+            continue
         env[str(k)] = str(v)
     if (cfg.get("arch") or "") == "deepseek41":      # (only this engine reads these; Qwen's environment is untouched)
         deepseek_slot_env(env, cfg)
