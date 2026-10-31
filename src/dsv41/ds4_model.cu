@@ -1145,10 +1145,31 @@ struct Model::Impl {
     struct RingSlot {
         int layer = -1, expert = -1;
         bool used = false, done = false, counted = false;   // done: the copy has landed (its flag is set); counted: its layer's request came
+        uint64_t fill_tok = 0;   // the token counter when the fill was issued
     };
     bool ring_want = false, ring_on = false;
     int ring_n = 0, ring_inflight_max = 12;
     int ring_ranks = 0;   // DS4_RING_RANKS=n (read at ring start): only guesses ranked below n are filled (0: every guess)
+    // DS4_RING_STICKY=1 (read at ring start): a landed slot stays (its table entry set) until a fill needs its room. A fill with no free slot
+    // evicts the landed slot of a layer before the request's, the least recently picked (ring_last). DS4_RING_MOVE=1 (needs sticky): a
+    // landed expert's RAM-store slot is given back (store->drop), so the store's room goes to other experts.
+    bool ring_sticky = false, ring_move = false;
+    // DS4_RING_COST=1 (read at ring start, with or without sticky): each layer's live CPU cost c_l (us per MB per expert: the CPU lane's
+    // compute after its reads, single-token windows) as an EMA (alpha 0.05) in ring_cost_ema/ring_cost_n (one writer per layer: the CPU lane,
+    // plain atomics). serve_lane (ring_cost_snapshot, each ring_request) turns them into ring_cl (c_l, the median of the measured layers
+    // until a layer has kCostMin samples), ring_rl (the layer's rank limit R_l = base + round(extra (c_l - c_min) / (c_max - c_min))) and
+    // the eviction's cost. base = DS4_RING_RANKS, or 2 when unset.
+    bool ring_cost = false;
+    double ring_cost_extra = 2.0;   // DS4_RING_COST_EXTRA
+    static constexpr int kCostMin = 32;
+    std::unique_ptr<std::atomic<double>[]> ring_cost_ema;
+    std::unique_ptr<std::atomic<int>[]> ring_cost_n;
+    std::vector<double> ring_cl;
+    std::vector<int> ring_rl;
+    double ring_cmin = 1.0, ring_cmax = 1.0, ring_rmean = 0.0;
+    uint64_t ring_tok = 0;   // the token counter: bumped at each token's first trunk layer (serve_lane only)
+    std::unique_ptr<std::atomic<uint64_t>[]> ring_last;   // [ring_n]: the token a slot's expert was last picked (sticky)
+    uint64_t rc_reused = 0, rc_evicted = 0, rc_moved = 0;
     size_t ring_stride = 0;
     uint8_t* ring_buf = nullptr;
     cudaStream_t ring_st = nullptr;
@@ -1566,7 +1587,7 @@ struct Model::Impl {
         quit.store(true);
         if (service.joinable()) service.join();
         if (ring_on) {   // (DS4_RING: the copies done, the slots freed, the report)
-            ring_drain();
+            ring_drain(true);
             ring_print();
         }
         ring_stop();     // (the ring thread joined before its streams, events and slots are freed)
@@ -7643,9 +7664,19 @@ struct Model::Impl {
         ring_s.assign((size_t) n, RingSlot{});
         ring_bad.reset(new std::atomic<bool>[(size_t) n]);
         ring_landed.reset(new std::atomic<int>[(size_t) n]);
+        ring_last.reset(new std::atomic<uint64_t>[(size_t) n]);
+        ring_cost_ema.reset(new std::atomic<double>[(size_t) g.nl]);
+        ring_cost_n.reset(new std::atomic<int>[(size_t) g.nl]);
+        for (int il = 0; il < g.nl; ++il) {
+            ring_cost_ema[(size_t) il] = 0.0;
+            ring_cost_n[(size_t) il] = 0;
+        }
+        ring_cl.assign((size_t) g.nl, 1.0);
+        ring_rl.assign((size_t) g.nl, 0);
         for (int k = 0; k < n; ++k) {
             ring_bad[(size_t) k] = false;
             ring_landed[(size_t) k] = 0;
+            ring_last[(size_t) k] = 0;
         }
         ring_pin_on = std::getenv("DS4_RING_PIN") != nullptr && std::atoi(std::getenv("DS4_RING_PIN")) != 0;
         std::string err;
@@ -7672,6 +7703,14 @@ struct Model::Impl {
             return;
         }
         if (const char* v = std::getenv("DS4_RING_RANKS")) ring_ranks = std::max(0, std::atoi(v));   // (read once here; <= 0: every guess)
+        if (const char* v = std::getenv("DS4_RING_STICKY")) ring_sticky = std::atoi(v) != 0;
+        if (const char* v = std::getenv("DS4_RING_MOVE")) ring_move = std::atoi(v) != 0;
+        if (ring_move && !ring_sticky) {
+            std::fprintf(stderr, "ds4: ring: DS4_RING_MOVE needs DS4_RING_STICKY=1: off\n");
+            ring_move = false;
+        }
+        if (const char* v = std::getenv("DS4_RING_COST")) ring_cost = std::atoi(v) != 0;
+        if (const char* v = std::getenv("DS4_RING_COST_EXTRA")) ring_cost_extra = std::max(0.0, std::atof(v));
         ring_on = true;
         ring_th = std::thread([this] { ring_loop(); });
         std::fprintf(stderr,
@@ -7680,6 +7719,49 @@ struct Model::Impl {
                      ring_pin_on ? "pinned store, DMA (DS4_RING_PIN=1: the store's whole arena grown and registered at start, none after it)"
                                  : "the store as it is, staged by the driver on the ring thread");
         if (ring_ranks > 0) std::fprintf(stderr, "ds4: ring: guesses ranked below %d only (DS4_RING_RANKS)\n", ring_ranks);
+        if (ring_sticky || ring_move || ring_cost) {
+            std::string line = "ds4: ring: ";
+            if (ring_sticky) line += "sticky (slots kept until needed)";
+            if (ring_move) line += std::string(ring_sticky ? ", " : "") + "moves (the store's copy given back)";
+            if (ring_cost)
+                line += std::string(ring_sticky || ring_move ? ", " : "") + "cost-weighted (live CPU us/MB per layer)";
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
+    // (DS4_RING_COST; serve_lane's thread) the live costs and rank limits: c_l (the layer's EMA once it has kCostMin samples, else the
+    // median of the measured layers, or 1.0), c_min / c_max over the measured layers, R_l = base + round(extra (c_l - c_min) / (c_max - c_min))
+    static double ring_median(std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        const size_t n = v.size();
+        return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    }
+    void ring_cost_snapshot() {
+        const int nl = (int) ring_cl.size();
+        std::vector<double> meas;
+        for (int il = 0; il < nl; ++il)
+            if (ring_cost_n[(size_t) il].load(std::memory_order_relaxed) >= kCostMin) meas.push_back(ring_cost_ema[(size_t) il].load(std::memory_order_relaxed));
+        const double med = meas.empty() ? 1.0 : ring_median(meas);
+        ring_cmin = meas.empty() ? med : *std::min_element(meas.begin(), meas.end());
+        ring_cmax = meas.empty() ? med : *std::max_element(meas.begin(), meas.end());
+        const int base = ring_ranks > 0 ? ring_ranks : 2;
+        double sum = 0.0;
+        for (int il = 0; il < nl; ++il) {
+            const bool m = ring_cost_n[(size_t) il].load(std::memory_order_relaxed) >= kCostMin;
+            const double c = m ? ring_cost_ema[(size_t) il].load(std::memory_order_relaxed) : med;
+            ring_cl[(size_t) il] = c;
+            int R = base;
+            if (ring_cmax > ring_cmin) R = base + (int) std::lround(ring_cost_extra * (c - ring_cmin) / (ring_cmax - ring_cmin));
+            ring_rl[(size_t) il] = R;
+            sum += R;
+        }
+        ring_rmean = nl > 0 ? sum / nl : (double) base;
+    }
+    // the CPU lane's sample (its thread; one writer per layer): us per MB per expert, EMA alpha 0.05 (the first sample as it is)
+    void ring_cost_add(int il, double us_per_mb) {
+        const int n = ring_cost_n[(size_t) il].load(std::memory_order_relaxed);
+        const double old = ring_cost_ema[(size_t) il].load(std::memory_order_relaxed);
+        ring_cost_ema[(size_t) il].store(n == 0 ? us_per_mb : old + 0.05 * (us_per_mb - old), std::memory_order_relaxed);
+        ring_cost_n[(size_t) il].store(n + 1, std::memory_order_relaxed);
     }
     // the ring thread: every CUDA call of the ring (fills, frees, barriers) runs here, in queue order, on ring_st
     void ring_loop() {
@@ -7774,7 +7856,26 @@ struct Model::Impl {
             const int e = s.expert;
             const std::vector<char> one(1, 1);
             store->release(s.layer, &e, 1, one);
+            if (ring_move && store->drop(s.layer, e)) ++rc_moved;   // (DS4_RING_MOVE: landed, so the copy is done; the store's slot back)
         }
+    }
+    // (DS4_RING_STICKY; caller holds ring_mu) the slot a fill of layer li may take over: landed, of a layer before li (its expert kernels
+    // for this token are done, and the next token reaches it only a pass later), the least recently picked. -1: none.
+    // With DS4_RING_COST the key is c_layer / (1 + age in tokens) (the cheapest to recompute and the least recently used first).
+    int ring_evict_pick(int li) const {
+        int best = -1;
+        double bv = 0.0;
+        for (int k = 0; k < ring_n; ++k) {
+            const RingSlot& s = ring_s[(size_t) k];
+            if (!s.used || !s.done || s.layer >= li) continue;
+            const double last = (double) ring_last[(size_t) k].load(std::memory_order_relaxed);
+            const double v = ring_cost ? ring_cl[(size_t) s.layer] / (1.0 + ((double) ring_tok - last)) : last;
+            if (best < 0 || v < bv) {
+                best = k;
+                bv = v;
+            }
+        }
+        return best;
     }
     // the slot k is free again (its copies landed, its layer is done): the expert's table entry goes back to its VRAM slot, or 0. Always
     // a queued item (the ring thread clears the slot's flag with it); the write itself only when the expert is still the slot's.
@@ -7804,6 +7905,8 @@ struct Model::Impl {
     // picks the device took from the ring are counted; the slots of the layers before li are given back; the guesses for the next two
     // layers are queued (decode windows only).
     void ring_request(int li, const Req& r, int T) {
+        if (li == 0) ++ring_tok;   // (serve_lane's thread only: the token's first trunk layer)
+        if (ring_cost) ring_cost_snapshot();
         std::unique_lock<std::mutex> lk(ring_mu, std::try_to_lock);
         if (!lk.owns_lock()) {
             ++rc_skipped;
@@ -7828,9 +7931,22 @@ struct Model::Impl {
             if (picked) ++rc_used;
             else if (s.done) ++rc_unused;
         }
-        for (int k = 0; k < ring_n; ++k) {
-            const RingSlot& s = ring_s[(size_t) k];
-            if (s.used && s.done && (li == 0 || s.layer < li)) ring_free_slot(k);
+        if (ring_sticky) {   // (the landed slots stay: a pick of layer li's expert is its use now, the last one is its eviction's order)
+            for (int k = 0; k < ring_n; ++k) {
+                const RingSlot& s = ring_s[(size_t) k];
+                if (!s.used || s.layer != li) continue;
+                bool picked = false;
+                for (int t = 0; t < T; ++t)
+                    for (int i = 0; i < l.k_exp; ++i) picked = picked || r.ids[t][i] == s.expert;
+                if (!picked) continue;
+                ring_last[(size_t) k].store(ring_tok, std::memory_order_relaxed);
+                if (s.done && !ring_bad[(size_t) k] && s.fill_tok < ring_tok) ++rc_reused;
+            }
+        } else {
+            for (int k = 0; k < ring_n; ++k) {
+                const RingSlot& s = ring_s[(size_t) k];
+                if (s.used && s.done && (li == 0 || s.layer < li)) ring_free_slot(k);
+            }
         }
         if (T != 1 || ahead_mode <= 0) return;
         int inflight = 0;
@@ -7844,7 +7960,8 @@ struct Model::Impl {
                 const int e = r.ahead[0][off + i];
                 if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                 if (n.slot[(size_t) e] >= 0 || n.swap_pending || ring_own[(size_t) j][(size_t) e] >= 0) continue;
-                if (ring_ranks > 0 && i >= ring_ranks) {   // (DS4_RING_RANKS: only the guesses ranked below n are filled; the stand-ins cover the rest)
+                const int rl = ring_cost ? ring_rl[(size_t) j] : ring_ranks;   // (DS4_RING_RANKS, or DS4_RING_COST's R_j: only the guesses ranked below it are filled; the stand-ins cover the rest)
+                if (rl > 0 && i >= rl) {
                     ++rc_beyond;
                     continue;
                 }
@@ -7860,10 +7977,17 @@ struct Model::Impl {
                     ++rc_throttled;
                     continue;
                 }
-                int k = -1;
+                int k = -1, kev = -1;
                 for (int c = 0; c < ring_n && k < 0; ++c)
                     if (!ring_s[(size_t) c].used) k = c;
-                if (k < 0) break;
+                if (k < 0) {
+                    if (!ring_sticky) break;
+                    kev = ring_evict_pick(li);   // (sticky: the room of a landed slot of a layer before li, or none: this fill is dropped)
+                    if (kev < 0) {
+                        ++rc_throttled;
+                        continue;
+                    }
+                }
                 // the store's slot pinned while the copy is in flight (begin: no read, the slot is ready or not found here)
                 std::vector<char> ok;
                 std::vector<int> sl;
@@ -7872,6 +7996,11 @@ struct Model::Impl {
                     const std::vector<char> one(1, 1);
                     store->release(j, &e, 1, one);
                     continue;
+                }
+                if (kev >= 0) {   // (the eviction is queued before this fill's copy: the table entry back, then the copy, on ring_st)
+                    ring_free_slot(kev);
+                    ++rc_evicted;
+                    k = kev;
                 }
                 RingSlot& s = ring_s[(size_t) k];
                 RingItem it;
@@ -7888,6 +8017,11 @@ struct Model::Impl {
                 s.used = true;
                 s.done = false;
                 s.counted = false;
+                s.fill_tok = ring_tok;
+                if (ring_sticky) {   // (the slot's last use's callback has fired: its flag down here, before the reap can see the old 1)
+                    ring_landed[(size_t) k].store(0, std::memory_order_release);
+                    ring_last[(size_t) k].store(ring_tok, std::memory_order_relaxed);
+                }
                 ring_own[(size_t) j][(size_t) e] = k;
                 ++rc_issued;
                 ++inflight;
@@ -7896,15 +8030,17 @@ struct Model::Impl {
     }
     // (the host thread at request end and at shutdown: queued fills synced and reaped, then the frees queued and synced; the frees' table
     // writes are on ring_st, so the barrier orders them before the next request)
-    void ring_drain() {
+    // (all: the shutdown's; with sticky the request ends keep the landed slots, so only all frees them then)
+    void ring_drain(bool all = false) {
         if (!ring_on) return;
         ring_barrier();
         {
             std::lock_guard<std::mutex> lk(ring_mu);
             std::lock_guard<std::mutex> qk(ring_qmu);
             ring_reap();
-            for (int k = 0; k < ring_n; ++k)
-                if (ring_s[(size_t) k].used) ring_free_slot(k);
+            if (all || !ring_sticky)
+                for (int k = 0; k < ring_n; ++k)
+                    if (ring_s[(size_t) k].used) ring_free_slot(k);
         }
         ring_barrier();
     }
@@ -7913,7 +8049,10 @@ struct Model::Impl {
                      "ds4: request: ring: %llu copies, %llu landed in time, %llu used, %llu late, %llu unused, %llu throttled, %llu not in the store, %llu skipped (busy)",
                      (unsigned long long) rc_issued, (unsigned long long) rc_landed, (unsigned long long) rc_used, (unsigned long long) rc_late,
                      (unsigned long long) rc_unused, (unsigned long long) rc_throttled, (unsigned long long) rc_nostore, (unsigned long long) rc_skipped);
-        if (ring_ranks > 0) std::fprintf(stderr, ", %llu beyond the ranks", (unsigned long long) rc_beyond);
+        if (ring_ranks > 0 || ring_cost) std::fprintf(stderr, ", %llu beyond the ranks", (unsigned long long) rc_beyond);
+        if (ring_sticky) std::fprintf(stderr, ", %llu reused, %llu evicted", (unsigned long long) rc_reused, (unsigned long long) rc_evicted);
+        if (ring_move) std::fprintf(stderr, ", %llu moved", (unsigned long long) rc_moved);
+        if (ring_cost) std::fprintf(stderr, ", cost %.2f..%.2f us/MB, mean R %.2f", ring_cmin, ring_cmax, ring_rmean);
         std::fprintf(stderr, "\n");
     }
 
@@ -8113,7 +8252,15 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
+                    // (DS4_RING_COST: the compute after the reads, i.e. the window less the store's wait; single-token windows)
+                    const auto tc0 = std::chrono::steady_clock::now();
+                    const int64_t cw0 = ring_cost && store ? store->stats().wait_ns.load(std::memory_order_relaxed) : 0;
                     cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+                    if (ring_cost && store && T == 1 && nslots > 0) {
+                        const int64_t all = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tc0).count();
+                        const int64_t comp = std::max<int64_t>(0, all - (store->stats().wait_ns.load(std::memory_order_relaxed) - cw0));
+                        ring_cost_add(li, ((double) comp / 1e3) / nslots / ((double) unit(l) / 1e6));
+                    }
                     const int D = g.dim;
                     for (int t = 0; t < T; ++t) {
                         bool any = false;

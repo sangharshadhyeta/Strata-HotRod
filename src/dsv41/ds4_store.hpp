@@ -219,6 +219,22 @@ public:
                 if (s >= 0 && slots_[(size_t) s].pin > 0) slots_[(size_t) s].pin--;
             }
     }
+    /// Gives the slot of (layer, e) back: the expert is no longer findable and its slot is free for the next fill (DS4_RING_MOVE: a
+    /// landed ring expert's copy).  Only a ready slot nobody holds (no pin, not GPU-visible); false otherwise, and the slot stays.
+    bool drop(int layer, int e) {
+        if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return false;
+        std::lock_guard<std::mutex> lk(mu_);
+        const int s = where_[(size_t) layer][(size_t) e];
+        if (s < 0) return false;
+        Slot& sp = slots_[(size_t) s];
+        if (sp.pin > 0 || sp.visible || sp.state.load() != kReady) return false;
+        where_[(size_t) layer][(size_t) e] = -1;
+        sp.layer = sp.expert = -1;
+        sp.prefetch = false;
+        sp.state.store(kFree, std::memory_order_release);
+        free_hint_ = std::min(free_hint_, (size_t) s);
+        return true;
+    }
     /// Starts reading (layer, e) if it is neither here nor on its way (a guess: unpinned, may be given up before it is used).
     void prefetch(int layer, int e) {
         if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return;
