@@ -88,7 +88,7 @@ the cache's own layout, on its own stream), and `cache_tick_swaps` publishes the
 pass (`feed` / `feed_mark`, and again in `forward_chunks` after the warm-up lock) `lend_reclaim` stops the fill, zeroes the table entries
 that are still the arena's, and zeroes the arena. After the pass `lend_request` plans again. The swaps and the ring skip lent experts.
 Off when: not a CUDA build, more than one device, no chunked path, the expert cache off, or a trunk layer's experts in a group (said once
-as `ds4: DS4_LEND: off (...)`). MXFP4 layers are not lent. Logged: `ds4: DS4_LEND: ... experts lent (...) on top of the N in VRAM` at the
+as `ds4: DS4_LEND: off (...)`). GGUF (MXFP4) expert layers are lent, read from their file as `swap_in_mx` reads them; under copy mode they are not. Logged: `ds4: DS4_LEND: ... experts lent (...) on top of the N in VRAM` at the
 first publish, and `ds4: request: lend <lent>/<planned> experts` at each request end.
 
 State: untested until measured. Not yet done: counting the picks served from lent experts.

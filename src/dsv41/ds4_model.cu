@@ -8326,7 +8326,7 @@ struct Model::Impl {
             const Layer& l = L[il];
             lend_of[il].assign((size_t) l.n_exp, -1);
             lend_ntot += (size_t) l.n_exp;
-            if (!l.mtp) maxb = std::max(maxb, l.blob);
+            if (!l.mtp) maxb = std::max(maxb, lend_esize(l));
         }
         if (!halloc(lend_stage, maxb, err) || !halloc(lend_pin, 2 * lend_ntot + 2, err) ||
             cudaStreamCreateWithFlags(&lend_st, cudaStreamNonBlocking) != cudaSuccess) {
@@ -8361,22 +8361,35 @@ struct Model::Impl {
                 {   // (the host's hh / slot / swap_pending writes are under lend_mu too: cache_tick_swaps)
                     std::lock_guard<std::mutex> lk(lend_mu);
                     go = lend_of[(size_t) il][(size_t) e] == -2 && l.slot[(size_t) e] < 0 && !l.swap_pending;
-                    for (int X = 0; go && X < NH; ++X) go = l.hh[(size_t) e][(size_t) X] != nullptr;
-                    if (go) parts = l.hh[(size_t) e];   // (snapshot: the blob is built outside the lock - a cold file page may fault)
-                    else if (lend_of[(size_t) il][(size_t) e] == -2) lend_of[(size_t) il][(size_t) e] = -1;
-                }
-                if (!go) continue;
-                parts_to_blob(l, parts, lend_stage);   // (no lock held: lend_mu is taken by cache_tick_swaps between windows)
-                {   // re-check: the expert may have moved (a swap, a drop) while its blob was built
-                    std::lock_guard<std::mutex> lk(lend_mu);
-                    go = lend_of[(size_t) il][(size_t) e] == -2 && l.slot[(size_t) e] < 0 && !l.swap_pending && l.hh[(size_t) e] == parts;
+                    // a GGUF layer (MXFP4) is read from its file as swap_in_mx does (read_mx_file: pread into the caller's buffer, reentrant)
+                    const bool mx = l.lay.fmt == gg::kFmtMXFP4;
+                    if (go && !mx)
+                        for (int X = 0; go && X < NH; ++X) go = l.hh[(size_t) e][(size_t) X] != nullptr;
+                    if (go && !mx) parts = l.hh[(size_t) e];   // (snapshot: the blob is built outside the lock - a cold file page may fault)
                     if (!go && lend_of[(size_t) il][(size_t) e] == -2) lend_of[(size_t) il][(size_t) e] = -1;
                 }
                 if (!go) continue;
-                const size_t need = align256(l.blob);
+                if (l.lay.fmt == gg::kFmtMXFP4) {
+                    if (!read_mx_file(l, e, lend_stage)) {
+                        std::lock_guard<std::mutex> lk(lend_mu);
+                        if (lend_of[(size_t) il][(size_t) e] == -2) lend_of[(size_t) il][(size_t) e] = -1;
+                        continue;
+                    }
+                } else {
+                    parts_to_blob(l, parts, lend_stage);   // (no lock held: lend_mu is taken by cache_tick_swaps between windows)
+                }
+                {   // re-check: the expert may have moved (a swap, a drop) while its blob was built
+                    std::lock_guard<std::mutex> lk(lend_mu);
+                    go = lend_of[(size_t) il][(size_t) e] == -2 && l.slot[(size_t) e] < 0 && !l.swap_pending &&
+                         (l.lay.fmt == gg::kFmtMXFP4 || l.hh[(size_t) e] == parts);
+                    if (!go && lend_of[(size_t) il][(size_t) e] == -2) lend_of[(size_t) il][(size_t) e] = -1;
+                }
+                if (!go) continue;
+                const size_t bytes = lend_esize(l);
+                const size_t need = align256(bytes);
                 if (off + need > lend_bytes) break;   // (the plan was cut to the arena: a guard)
                 uint8_t* dst = lend_base + off;
-                if (cudaMemcpyAsync(dst, lend_stage, l.blob, cudaMemcpyHostToDevice, lend_st) != cudaSuccess ||
+                if (cudaMemcpyAsync(dst, lend_stage, bytes, cudaMemcpyHostToDevice, lend_st) != cudaSuccess ||
                     cudaStreamSynchronize(lend_st) != cudaSuccess) {
                     (void) cudaGetLastError();
                     std::lock_guard<std::mutex> lk(lend_mu);
@@ -8409,10 +8422,10 @@ struct Model::Impl {
         for (size_t il = 0; il < L.size(); ++il) {
             const Layer& l = L[il];
             if (l.mtp || l.cpu_only || l.n_exp <= 0) continue;
-            if (l.lay.fmt == gg::kFmtMXFP4) {   // (its swap path differs: not lent)
+            if (copy_mode && l.lay.fmt == gg::kFmtMXFP4) {   // (copy mode: read_mx reads the RAM slots the cache's RAM swaps move)
                 if (!lend_mx_said) {
                     lend_mx_said = true;
-                    std::fprintf(stderr, "ds4: DS4_LEND: the GGUF's MXFP4 experts are not lent (layer %d and the others of its kind)\n", l.il);
+                    std::fprintf(stderr, "ds4: DS4_LEND: copy mode's GGUF layers are not lent\n");
                 }
                 continue;
             }
@@ -8425,7 +8438,7 @@ struct Model::Impl {
         std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.heat > b.heat; });
         size_t tot = 0;
         for (const Cand& c : cand) {
-            const size_t need = align256(L[(size_t) c.il].blob);
+            const size_t need = align256(lend_esize(L[(size_t) c.il]));
             if (tot + need > lend_bytes) break;
             tot += need;
             lend_plan.push_back({c.il, c.e});
@@ -8508,7 +8521,7 @@ struct Model::Impl {
             lend_pub_said = true;
             double gb = 0;
             size_t inv = 0;
-            for (const LendEnt& x : lend_ents) gb += (double) L[(size_t) x.layer].blob;
+            for (const LendEnt& x : lend_ents) gb += (double) lend_esize(L[(size_t) x.layer]);
             for (const Layer& l : L)
                 if (!l.mtp)
                     for (int e = 0; e < l.n_exp; ++e) inv += l.slot[(size_t) e] >= 0;
@@ -8517,10 +8530,12 @@ struct Model::Impl {
     }
     // a lent expert is not a swap candidate (its copy is in the arena, not in a slot): lend_on only
     bool lend_has(int il, int e) const { return lend_on && lend_of[(size_t) il][(size_t) e] != -1; }
+    // bytes of one lent expert in the arena: a GGUF layer's (MXFP4) is what swap_in_mx copies into a slot, else its blob
+    static size_t lend_esize(const Layer& l) { return l.lay.fmt == gg::kFmtMXFP4 ? unit(l) : l.blob; }
     void lend_print() {
         std::lock_guard<std::mutex> lk(lend_mu);
         double gb = 0;
-        for (const LendEnt& x : lend_ents) gb += (double) L[(size_t) x.layer].blob;
+        for (const LendEnt& x : lend_ents) gb += (double) lend_esize(L[(size_t) x.layer]);
         std::fprintf(stderr, "ds4: request: lend %zu/%zu experts (%.2f GB)\n", lend_ents.size(), lend_plan_n, gb / 1e9);
     }
 
