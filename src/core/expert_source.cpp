@@ -5023,8 +5023,27 @@ uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float
             const PinSeg* s = seg_of(complement_offsets_[p.second], layer_blob_bytes_[p.second / (size_t) n_expert_]);
             return s == nullptr || !s->reg;
         };
-        std::stable_partition(held.begin(), held.end(), unlocked);
-        std::stable_partition(held_promo.begin(), held_promo.end(), unlocked);
+        // the locked places (in each group) by segment: the segments' total usage coldest first, then each segment's places
+        // coldest first, so the loop drains one segment before it unlocks the next
+        auto by_segment = [&](std::vector<std::pair<float, size_t>>& v) {
+            const auto split = std::stable_partition(v.begin(), v.end(), unlocked);
+            std::vector<double> seg_use(pin_segs_.size(), 0.0);
+            for (auto it = split; it != v.end(); ++it) {
+                const int s = pin_seg_index(complement_offsets_[it->second], layer_blob_bytes_[it->second / (size_t) n_expert_]);
+                if (s >= 0) seg_use[(size_t) s] += (double) it->first;
+            }
+            std::stable_sort(split, v.end(), [&](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+                const int sa = pin_seg_index(complement_offsets_[a.second], layer_blob_bytes_[a.second / (size_t) n_expert_]);
+                const int sb = pin_seg_index(complement_offsets_[b.second], layer_blob_bytes_[b.second / (size_t) n_expert_]);
+                if (sa != sb) {
+                    if (seg_use[(size_t) sa] != seg_use[(size_t) sb]) return seg_use[(size_t) sa] < seg_use[(size_t) sb];
+                    return sa < sb;
+                }
+                return a.first < b.first;
+            });
+        };
+        by_segment(held);
+        by_segment(held_promo);
     }
     held.insert(held.end(), held_promo.begin(), held_promo.end());
     // the promotions take no free place while places are released and madvise'd here (the io thread checks this under
@@ -5109,6 +5128,12 @@ uint64_t FileExpertSource::give_back_ram(uint64_t bytes, const std::vector<float
         } else if (b4 > a4) {
             (void) madvise((void*) a4, (size_t) (b4 - a4), MADV_DONTNEED);
         }
+    }
+    if (pin_segs_on_) {
+        int locked = 0;
+        for (const PinSeg& s : pin_segs_) locked += s.reg ? 1 : 0;
+        std::fprintf(stderr, "FileExpertSource: STRATA_PIN_SEGS: %d of %zu segments page-locked after the give-back\n",
+                     locked, pin_segs_.size());
     }
     return given;
 #else
