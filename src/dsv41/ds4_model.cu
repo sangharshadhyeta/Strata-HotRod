@@ -1150,6 +1150,10 @@ struct Model::Impl {
     };
     bool ring_want = false, ring_on = false;
     int ring_n = 0, ring_inflight_max = 12;
+    // DS4_LEND_RING (with DS4_LEND): the ring's own slots are [0, ring_n0) (ring_buf); the slots from ring_n0 up are the chunk arena's
+    // (lend_base), which the ring takes while no chunked pass runs (ring_x_on). Without DS4_LEND_RING ring_n0 == ring_n, always.
+    int ring_n0 = 0;
+    std::atomic<bool> ring_x_on{true};   // (DS4_LEND_RING) false while the chunked pass owns the arena: no fill takes a slot >= ring_n0
     int ring_ranks = 0;   // DS4_RING_RANKS=n (read at ring start): only guesses ranked below n are filled (0: every guess)
     // DS4_RING_STICKY=1 (read at ring start): a landed slot stays (its table entry set) until a fill needs its room. A fill with no free slot
     // evicts the landed slot of a layer before the request's, the least recently picked (ring_last). DS4_RING_MOVE=1 (needs sticky): a
@@ -1190,7 +1194,8 @@ struct Model::Impl {
     std::deque<AheadRec> ring_aq;
     uint64_t ring_aseq = 0;   // (under ring_aq_mu) the records' seqs
     std::unique_ptr<std::atomic<uint64_t>[]> ring_ev_ready;   // [ring_n]: the seq of the slot's last evict-ahead event recorded
-    uint64_t rc_issued = 0, rc_landed = 0, rc_used = 0, rc_late = 0, rc_unused = 0, rc_throttled = 0, rc_nostore = 0, rc_skipped = 0, rc_beyond = 0;
+    uint64_t rc_issued = 0, rc_landed = 0, rc_used = 0, rc_late = 0, rc_unused = 0, rc_throttled = 0, rc_noslot = 0, rc_nostore = 0, rc_skipped = 0, rc_beyond = 0;
+    uint64_t rc_xfill = 0;   // (DS4_LEND_RING) the fills that went into the arena's slots (>= ring_n0)
     uint64_t rc_evicted_ahead = 0;
     std::mutex ring_mu;   // the ring's bookkeeping (the slots, ring_own, the table entries' decisions) and cache_tick_swaps; never held in a CUDA call
     // The ring's CUDA work is on ring_th (ring_loop): serve_lane and the host thread only queue items.  Items run in order; ring_handled
@@ -1216,6 +1221,7 @@ struct Model::Impl {
     // arena; lend_measure: dalloc only sums the bytes. Experts in the arena are published in vram_tab between windows (cache_tick_swaps),
     // taken back before a chunked pass (lend_reclaim) and planned again after it (lend_request). Every CUDA call of the fill is on lend_th.
     bool lend_on = false, lend_carve = false, lend_measure = false;
+    bool lend_ring = false;   // DS4_LEND_RING: the arena's slots are the ring's (ring_start); no fixed experts are planned
     uint8_t* lend_base = nullptr;
     size_t lend_bytes = 0, lend_off = 0;
     struct LendEnt { int layer = 0, expert = 0; uint8_t* ptr = nullptr; };
@@ -3527,7 +3533,7 @@ struct Model::Impl {
         }
         // DS4_RING: its slots are planned use taken after the placement, not headroom the load lacked - counted back as free, so the
         // next start does not keep fewer experts on the card for them (the ring itself starts only with 256 MiB left over; single GPU)
-        const size_t ring_bytes = ring_buf != nullptr ? (size_t) ring_n * ring_stride : 0;
+        const size_t ring_bytes = ring_buf != nullptr ? (size_t) ring_n0 * ring_stride : 0;   // (the ring's own buffer; DS4_LEND_RING's slots are the chunk arena's, counted there)
         low += ring_bytes;
         const int64_t free_mib = (int64_t) (low >> 20), old = o.reserve_mib;
         int64_t now = old;
@@ -7750,6 +7756,12 @@ struct Model::Impl {
         if (ring_buf != nullptr) cudaFree(ring_buf);
         ring_buf = nullptr;
         ring_n = 0;
+        ring_n0 = 0;
+    }
+    // the address of ring slot k: the ring's own buffer, or (DS4_LEND_RING) the chunk arena's slot k - ring_n0. Without DS4_LEND_RING
+    // ring_n0 == ring_n, so every k is ring_buf's: the old address.
+    uint8_t* ring_dst(size_t k) const {
+        return k < (size_t) ring_n0 ? ring_buf + k * ring_stride : lend_base + (k - (size_t) ring_n0) * ring_stride;
     }
     void ring_setup() {
         const char* env = std::getenv("DS4_RING");
@@ -7793,6 +7805,7 @@ struct Model::Impl {
             return;
         }
         ring_n = n;
+        ring_n0 = n;
         ring_stride = stride;
         ring_s.assign((size_t) n, RingSlot{});
         ring_bad.reset(new std::atomic<bool>[(size_t) n]);
@@ -7841,6 +7854,39 @@ struct Model::Impl {
         if (ring_move && !ring_sticky) {
             std::fprintf(stderr, "ds4: ring: DS4_RING_MOVE needs DS4_RING_STICKY=1: off\n");
             ring_move = false;
+        }
+        // DS4_LEND_RING=1 (with DS4_LEND): the chunk arena's slots become ring slots [ring_n0, ring_n0 + ring_nx). Every per-slot array is
+        // sized here, before the sticky event block and the ring thread (started below) use ring_n. The old ring_pin stays allocated (in
+        // host_allocs, freed at shutdown) and unused: the new one replaces it.
+        if (lend_on && std::getenv("DS4_LEND_RING") != nullptr && std::atoi(std::getenv("DS4_LEND_RING")) == 1) {
+            const int nx = lend_base != nullptr && ring_stride > 0 ? (int) (lend_bytes / ring_stride) : 0;
+            std::string perr;
+            unsigned long long* np = nullptr;
+            if (nx <= 0) {
+                std::fprintf(stderr, "ds4: DS4_LEND_RING: off (the arena holds no slot)\n");
+                lend_on = false;
+            } else if (!halloc(np, (size_t) 3 * (size_t) (ring_n + nx), perr)) {
+                std::fprintf(stderr, "ds4: DS4_LEND_RING: off (the ring's table staging would not allocate)\n");
+                lend_on = false;
+            } else {
+                const int n0 = ring_n, n = ring_n + nx;
+                ring_n0 = n0;
+                ring_n = n;
+                lend_ring = true;
+                ring_x_on.store(false, std::memory_order_release);   // (the warm-up writes the arena: the first lend_request gives the slots to the ring)
+                ring_s.assign((size_t) n, RingSlot{});
+                ring_bad.reset(new std::atomic<bool>[(size_t) n]);
+                ring_landed.reset(new std::atomic<int>[(size_t) n]);
+                ring_last.reset(new std::atomic<uint64_t>[(size_t) n]);
+                for (int k = 0; k < n; ++k) {
+                    ring_bad[(size_t) k] = false;
+                    ring_landed[(size_t) k] = 0;
+                    ring_last[(size_t) k] = 0;
+                }
+                ring_pin = np;
+                std::fprintf(stderr, "ds4: DS4_LEND_RING: the ring takes the chunk arena too: %d + %d slots (%.2f GB more)\n", n0, nx,
+                             (double) nx * (double) ring_stride / 1e9);
+            }
         }
         if (ring_sticky) {   // (the evict-aheads' events: one per slot, on the compute stream's order)
             cudaSetDevice(devs[0].id);
@@ -7941,7 +7987,11 @@ struct Model::Impl {
                 if (ring_ev_ready[k].load(std::memory_order_acquire) < it.wait_seq) return;   // (shutdown: the record never came)
                 if (cudaStreamWaitEvent(ring_st, ring_ev[k], 0) != cudaSuccess) (void) cudaGetLastError();
             }
-            uint8_t* dst = ring_buf + k * ring_stride;
+            uint8_t* dst = ring_dst(k);
+            if (k >= (size_t) ring_n0) {   // (DS4_LEND_RING: an arena slot is written: the arena is zeroed again before a chunked pass)
+                std::lock_guard<std::mutex> lk(lend_mu);
+                lend_dirty = true;
+            }
             ring_pin[it.k] = (unsigned long long) (uintptr_t) dst;   // (the previous use of this entry landed: its flag was seen before the slot was reused)
             const bool copied = cudaMemcpyAsync(dst, it.src, it.bytes, cudaMemcpyHostToDevice, ring_st) == cudaSuccess;
             bool ok = copied;
@@ -8020,6 +8070,7 @@ struct Model::Impl {
         int best = -1, btier = 0;
         double bv = 0.0;
         for (int k = 0; k < ring_n; ++k) {
+            if (k >= ring_n0 && !ring_x_on.load(std::memory_order_relaxed)) continue;   // (DS4_LEND_RING: the arena is the pass's)
             const RingSlot& s = ring_s[(size_t) k];
             if (!s.used || !s.done || s.layer == j) continue;
             if (s.layer >= li && !ahead_ok) continue;
@@ -8166,6 +8217,7 @@ struct Model::Impl {
         if (T != 1 || ahead_mode <= 0) return;
         int inflight = 0;
         for (const RingSlot& s : ring_s) inflight += s.used && !s.done;
+        bool full = false;   // (non-sticky: no free slot this request - every later guess of it is counted in rc_noslot, none is queued)
         for (int q = 0; q < 2; ++q) {   // the guesses 1 and 2 layers ahead (ahead_ask's q)
             const int j = li + q + 1;
             if (j >= g.nl) break;
@@ -8185,6 +8237,10 @@ struct Model::Impl {
                     ++rc_nostore;
                     continue;
                 }
+                if (full) {   // (no free slot earlier in this request: this guess would have been filled had one been free)
+                    ++rc_noslot;
+                    continue;
+                }
                 if (inflight >= ring_inflight_max) {
                     ++rc_throttled;
                     continue;
@@ -8196,9 +8252,13 @@ struct Model::Impl {
                 int k = -1, kev = -1;
                 uint64_t aseq = 0;   // (an evict-ahead's record: the fill waits for it on the ring thread)
                 for (int c = 0; c < ring_n && k < 0; ++c)
-                    if (!ring_s[(size_t) c].used) k = c;
+                    if (!ring_s[(size_t) c].used && (c < ring_n0 || ring_x_on.load(std::memory_order_acquire))) k = c;
                 if (k < 0) {
-                    if (!ring_sticky) break;
+                    if (!ring_sticky) {   // (the rest of this request's guesses: counted, not queued - the break's behaviour)
+                        full = true;
+                        ++rc_noslot;
+                        continue;
+                    }
                     kev = ring_evict_pick(li, j, ahead_ok);   // (sticky: the room of a landed slot (layers before li first), or none: this fill is dropped)
                     if (kev < 0) {
                         ++rc_throttled;
@@ -8233,6 +8293,7 @@ struct Model::Impl {
                 it.wait_seq = aseq;
                 it.bytes = unit(n);
                 it.src = store->blob(sl[0]);
+                if (k >= ring_n0) ++rc_xfill;   // (DS4_LEND_RING: an arena slot; host counter only)
                 // the slot's landed flag down before the fill is queued: the ring thread sets it only after this fill's copy, and a flag
                 // still 1 from the slot's last copy would let ring_reap drop the store's pin before this copy has run
                 ring_landed[(size_t) k].store(0, std::memory_order_release);
@@ -8271,15 +8332,16 @@ struct Model::Impl {
     }
     void ring_print() const {
         std::fprintf(stderr,
-                     "ds4: request: ring: %llu copies, %llu landed in time, %llu used, %llu late, %llu unused, %llu throttled, %llu not in the store, %llu skipped (busy)",
+                     "ds4: request: ring: %llu copies, %llu landed in time, %llu used, %llu late, %llu unused, %llu throttled, %llu no free slot, %llu not in the store, %llu skipped (busy)",
                      (unsigned long long) rc_issued, (unsigned long long) rc_landed, (unsigned long long) rc_used, (unsigned long long) rc_late,
-                     (unsigned long long) rc_unused, (unsigned long long) rc_throttled, (unsigned long long) rc_nostore, (unsigned long long) rc_skipped);
+                     (unsigned long long) rc_unused, (unsigned long long) rc_throttled, (unsigned long long) rc_noslot, (unsigned long long) rc_nostore, (unsigned long long) rc_skipped);
         if (ring_ranks > 0 || ring_cost) std::fprintf(stderr, ", %llu beyond the ranks", (unsigned long long) rc_beyond);
         if (ring_sticky)
             std::fprintf(stderr, ", %llu reused, %llu evicted, %llu evicted ahead", (unsigned long long) rc_reused, (unsigned long long) rc_evicted,
                          (unsigned long long) rc_evicted_ahead);
         if (ring_move) std::fprintf(stderr, ", %llu moved", (unsigned long long) rc_moved);
         if (ring_cost) std::fprintf(stderr, ", cost %.2f..%.2f us/MB, mean R %.2f", ring_cmin, ring_cmax, ring_rmean);
+        if (lend_ring) std::fprintf(stderr, " x %llu", (unsigned long long) rc_xfill);   // (DS4_LEND_RING: fills into the chunk arena's slots)
         std::fprintf(stderr, "\n");
     }
 
@@ -8410,6 +8472,10 @@ struct Model::Impl {
     // as many as the arena takes; they are marked -2 (planned). Nothing is planned while a plan, a fill or a lent set is still there.
     void lend_request() {
         if (!lend_on) return;
+        if (lend_ring) {   // (DS4_LEND_RING: the arena is the ring's again; no fixed experts are planned)
+            ring_x_on.store(true, std::memory_order_release);
+            return;
+        }
         std::unique_lock<std::mutex> rlk(ring_mu, std::defer_lock);   // (DS4_RING: the ring's ownership of the experts)
         if (ring_on) rlk.lock();
         std::lock_guard<std::mutex> lk(lend_mu);
@@ -8454,6 +8520,47 @@ struct Model::Impl {
     // the host, before a chunked pass: the fill stops at its next expert and is waited for; the published entries leave vram_tab (zeroed on
     // devs[0].st - only those still theirs: a swap that took the expert since keeps its table entry); the plan and the copies not yet
     // published are dropped; the arena is zeroed as at load. The pass then owns the arena.
+    // (DS4_LEND_RING) the host, before a chunked pass: no fill takes an arena slot any more (ring_x_on), and the arena's slots in use are freed
+    // as their copies land (ring_reap, then ring_free_slot: their table entries go back on the ring thread). Waits up to 5 s; then a barrier
+    // syncs the ring's copies (every issued copy has landed) and whatever is still in use is freed. Lock order as ring_drain: ring_mu, ring_qmu.
+    void ring_x_release() {
+        {
+            std::lock_guard<std::mutex> lk(ring_mu);
+            ring_x_on.store(false, std::memory_order_release);
+        }
+        ring_ahead_drain(true);   // (the queued evict-aheads of the arena's slots: their records first)
+        const auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            bool busy = false;
+            {
+                std::lock_guard<std::mutex> lk(ring_mu);
+                std::lock_guard<std::mutex> qk(ring_qmu);
+                ring_reap();
+                for (int k = ring_n0; k < ring_n; ++k) {
+                    if (!ring_s[(size_t) k].used) continue;
+                    if (ring_landed[(size_t) k].load(std::memory_order_acquire) == 1) ring_free_slot(k);
+                    else busy = true;
+                }
+            }
+            if (!busy) break;
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
+                std::fprintf(stderr, "ds4: DS4_LEND_RING: a copy into the arena did not land in 5 s: a barrier, then the rest are freed\n");
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        ring_barrier();   // (the ring thread's queue done and ring_st synced: every copy issued has landed)
+        {
+            std::lock_guard<std::mutex> lk(ring_mu);
+            std::lock_guard<std::mutex> qk(ring_qmu);
+            ring_reap();
+            for (int k = ring_n0; k < ring_n; ++k)
+                if (ring_s[(size_t) k].used) ring_free_slot(k);
+        }
+        ring_barrier();   // (the frees' table writes done)
+        cudaSetDevice(devs[0].id);
+        if (cudaStreamSynchronize(devs[0].st) != cudaSuccess) (void) cudaGetLastError();
+    }
     void lend_reclaim() {
         if (!lend_on) return;
         {
@@ -8463,6 +8570,7 @@ struct Model::Impl {
         }
         while (lend_busy.load() != 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
         lend_stop.store(false);
+        if (lend_ring) ring_x_release();   // (DS4_LEND_RING: the arena's ring slots given back first - the zeroing below follows)
         std::vector<std::pair<int, int>> zero;
         bool dirty = false;   // (a fill wrote the arena since it was last zeroed)
         {

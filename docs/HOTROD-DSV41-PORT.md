@@ -92,3 +92,10 @@ as `ds4: DS4_LEND: off (...)`). GGUF (MXFP4) expert layers are lent, read from t
 first publish, and `ds4: request: lend <lent>/<planned> experts` at each request end.
 
 State: untested until measured. Not yet done: counting the picks served from lent experts.
+
+Measured 1 Nov: DS4_LEND with 117 fixed experts in the 1.02 GB arena gave no gain (5.2 against 4.95 tok/s, inside the spread). The
+profile shows DeepSeek's routing is flat, so a fixed hot set adds about 3 points of picks. Its variant, `DS4_LEND_RING=1` (with
+`DS4_LEND=1` and `DS4_RING`), takes the arena's bytes as ring slots instead: the ring grows by the arena's whole slots of ring_stride
+(about 99 of 10.3 MB on top of the 32), the ring's fills may take them, and a chunked pass takes them back first (no fill is in flight
+when the pass starts) and gives them back after. No fixed experts are planned in this mode. The ring's line then ends with ` x <n>`, the
+fills that went into arena slots. Untested until measured.
