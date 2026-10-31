@@ -22,6 +22,11 @@
 
 <p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
 
+> **Strata-HotRod, DeepSeek branch.** This branch (`upstream-dsv41`) is upstream Strata 0.2.7.1's DeepSeek engine with the
+> Strata-HotRod features ported, run on one RTX 3060 12 GB with 31 GB of RAM: DeepSeek-V4.1-Flash at about 5.2-5.4 tokens/s
+> with its VRAM ring and stand-ins. What was ported, the measurements and how to run it:
+> [docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md). The rest of this page is upstream's.
+
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
 ## Models
