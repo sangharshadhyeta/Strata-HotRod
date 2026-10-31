@@ -1148,13 +1148,14 @@ struct Model::Impl {
     };
     bool ring_want = false, ring_on = false;
     int ring_n = 0, ring_inflight_max = 12;
+    int ring_ranks = 0;   // DS4_RING_RANKS=n (read at ring start): only guesses ranked below n are filled (0: every guess)
     size_t ring_stride = 0;
     uint8_t* ring_buf = nullptr;
     cudaStream_t ring_st = nullptr;
     std::vector<RingSlot> ring_s;
     std::vector<std::vector<int>> ring_own;   // trunk layer -> expert -> its ring slot (-1: none)
     unsigned long long* ring_pin = nullptr;   // pinned: [0, ring_n) the fills' table entries, [ring_n, 2 ring_n) the frees'
-    uint64_t rc_issued = 0, rc_landed = 0, rc_used = 0, rc_late = 0, rc_unused = 0, rc_throttled = 0, rc_nostore = 0, rc_skipped = 0;
+    uint64_t rc_issued = 0, rc_landed = 0, rc_used = 0, rc_late = 0, rc_unused = 0, rc_throttled = 0, rc_nostore = 0, rc_skipped = 0, rc_beyond = 0;
     std::mutex ring_mu;   // the ring's bookkeeping (the slots, ring_own, the table entries' decisions) and cache_tick_swaps; never held in a CUDA call
     // The ring's CUDA work is on ring_th (ring_loop): serve_lane and the host thread only queue items.  Items run in order; ring_handled
     // is the seq of the last one done.  A barrier item syncs ring_st (ring_barrier).
@@ -7670,6 +7671,7 @@ struct Model::Impl {
             ring_free_mem();
             return;
         }
+        if (const char* v = std::getenv("DS4_RING_RANKS")) ring_ranks = std::max(0, std::atoi(v));   // (read once here; <= 0: every guess)
         ring_on = true;
         ring_th = std::thread([this] { ring_loop(); });
         std::fprintf(stderr,
@@ -7677,6 +7679,7 @@ struct Model::Impl {
                      ring_n, (double) ring_n * (double) ring_stride / 1e9,
                      ring_pin_on ? "pinned store, DMA (DS4_RING_PIN=1: the store's whole arena grown and registered at start, none after it)"
                                  : "the store as it is, staged by the driver on the ring thread");
+        if (ring_ranks > 0) std::fprintf(stderr, "ds4: ring: guesses ranked below %d only (DS4_RING_RANKS)\n", ring_ranks);
     }
     // the ring thread: every CUDA call of the ring (fills, frees, barriers) runs here, in queue order, on ring_st
     void ring_loop() {
@@ -7841,6 +7844,10 @@ struct Model::Impl {
                 const int e = r.ahead[0][off + i];
                 if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                 if (n.slot[(size_t) e] >= 0 || n.swap_pending || ring_own[(size_t) j][(size_t) e] >= 0) continue;
+                if (ring_ranks > 0 && i >= ring_ranks) {   // (DS4_RING_RANKS: only the guesses ranked below n are filled; the stand-ins cover the rest)
+                    ++rc_beyond;
+                    continue;
+                }
                 if (store->find(j, e) < 0) {   // (not read yet: the read-ahead's, a later guess may find it)
                     ++rc_nostore;
                     continue;
@@ -7903,9 +7910,11 @@ struct Model::Impl {
     }
     void ring_print() const {
         std::fprintf(stderr,
-                     "ds4: request: ring: %llu copies, %llu landed in time, %llu used, %llu late, %llu unused, %llu throttled, %llu not in the store, %llu skipped (busy)\n",
+                     "ds4: request: ring: %llu copies, %llu landed in time, %llu used, %llu late, %llu unused, %llu throttled, %llu not in the store, %llu skipped (busy)",
                      (unsigned long long) rc_issued, (unsigned long long) rc_landed, (unsigned long long) rc_used, (unsigned long long) rc_late,
                      (unsigned long long) rc_unused, (unsigned long long) rc_throttled, (unsigned long long) rc_nostore, (unsigned long long) rc_skipped);
+        if (ring_ranks > 0) std::fprintf(stderr, ", %llu beyond the ranks", (unsigned long long) rc_beyond);
+        std::fprintf(stderr, "\n");
     }
 
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
