@@ -3131,6 +3131,9 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
+        if v is None or str(v) == "":                # blank: the engine's own default (an inherited value is dropped too)
+            env.pop(str(k), None)
+            continue
         env[str(k)] = str(v)
     env.setdefault("STRATA_RESIDENCY_FILE", RESIDENCY_FILE)   # the engine's expert map for the Monitor (residency_view)
     env.setdefault("STRATA_TIMELINE_FILE", TIMELINE_FILE)     # the Monitor's decode timeline (timeline_view), off until switched on
