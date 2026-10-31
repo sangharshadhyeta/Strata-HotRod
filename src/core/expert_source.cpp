@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -5569,16 +5570,28 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.fs != nullptr) d.fs->at_layer.store(d.layers, std::memory_order_release);   // STRATA_RING's refill guard
     if (d.gpu_pred != nullptr && d.fs != nullptr && d.fs->ring && d.host_res != nullptr && n_tok <= 8) {
         // the GPU look-ahead's picks for the next two layers (computed on this layer's input, before the doorbell this dispatch followed)
+        // STRATA_RING_COST: each target's depth is its R_l, and the guesses are copied in order of the target's cost c_l (higher first,
+        // stable); off, the order and the depth are the ones of the loop this replaces.
+        static thread_local std::vector<std::pair<int64_t, int32_t>> guesses;
+        guesses.clear();
         for (int dist = 1; dist <= 2; ++dist) {
             const int64_t target = d.layers + dist;
             if (target >= d.fs->n_layers) break;
+            const int ranks = d.fs->ring_depth(target, d.gpu_pred_ranks);
             for (int64_t t = 0; t < n_tok; ++t)
-                for (int r = 0; r < d.gpu_pred_ranks && r < 10; ++r) {
+                for (int r = 0; r < ranks && r < 10; ++r) {
                     const int32_t e = d.gpu_pred[(((size_t) target * kRoutePredDists + (size_t) route_pred_slot(dist)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
-                    d.fs->predict(d.src, target, e);
-                    ++d.pred_fed;
+                    guesses.emplace_back(target, e);
                 }
+        }
+        if (d.fs->ring_cost)
+            std::stable_sort(guesses.begin(), guesses.end(), [&](const auto& a, const auto& b) {
+                return d.fs->ring_cost_of(a.first) > d.fs->ring_cost_of(b.first);
+            });
+        for (const auto& g : guesses) {
+            d.fs->predict(d.src, g.first, g.second);
+            ++d.pred_fed;
         }
     }
     if (d.gpu_pred != nullptr && d.gpu_pred_warm && d.host_res != nullptr && n_tok <= 8 && d.src != nullptr) {
@@ -5959,8 +5972,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.plan != nullptr) d.plan->cpu_jobs = njobs;
     pt("run", njobs);
     if (njobs > 0) {
+        const auto cr0 = std::chrono::steady_clock::now();   // STRATA_RING_COST: the CPU's compute only (the blobs were taken above)
         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+        if (d.fs != nullptr && d.fs->ring_cost && n_tok == 1) {   // decode windows only; us per CPU-miss expert per MB of the layer's blob
+            const double bb = (double) lay.blob_bytes(d.layers);
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - cr0).count();
+            if (bb > 0.0) d.fs->ring_cost_sample(d.layers, us / (double) njobs / (bb / 1e6));
+        }
     }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
@@ -7107,6 +7126,7 @@ bool ForesightSwap::fetch_now(ExpertSource* src, int64_t layer, int32_t expert, 
         if (s < 0) {   // not on its way: take a slot of the layer (the router of this layer has run: its flags can change)
             int best = -1;
             uint64_t best_ref = ~0ull;
+            double best_score = std::numeric_limits<double>::infinity();
             for (int q = 0; q < slots; ++q) {
                 Slot& sl = slot[(size_t) (layer * slots + q)];
                 if (sl.loading) {
@@ -7119,6 +7139,11 @@ bool ForesightSwap::fetch_now(ExpertSource* src, int64_t layer, int32_t expert, 
                 if (sl.expert < 0) { best = q; break; }
                 if (host_res != nullptr && host_res[(size_t) (layer * n_expert + sl.expert)] >= 0) { best = q; break; }
                 if (sl.last_ref + (uint64_t) depth > now) continue;   // a plan of the last windows may still read it
+                if (ring_cost) {   // STRATA_RING_COST: the lowest c_l / (1 + age) goes first (the slots of a layer share its c_l)
+                    const double sc = evict_score(layer, sl.last_ref, now);
+                    if (sc < best_score) { best_score = sc; best = q; }
+                    continue;
+                }
                 if (sl.last_ref < best_ref) { best_ref = sl.last_ref; best = q; }
             }
             if (best < 0) { ++now_none; return false; }
@@ -7184,6 +7209,74 @@ bool ForesightSwap::fetch_now(ExpertSource* src, int64_t layer, int32_t expert, 
 void ForesightSwap::ring_skip_plan() {
     std::lock_guard<std::mutex> smu_lk(smu_);
     ++ring_skipped;
+}
+
+// STRATA_RING_COST (opt-in, with the ring): per-layer live cost c_l, written by the dispatch thread where the CPU computes its misses
+// (expert_pool_dispatch_multi, decode windows) and read without a lock by the ring's guesses and evictions.
+void ForesightSwap::cost_setup(int64_t layers) {
+    const size_t n = (size_t) (layers > 0 ? layers : 0);
+    cost_ema_ = std::vector<std::atomic<double>>(n);
+    cost_eff_ = std::vector<std::atomic<double>>(n);
+    cost_n_ = std::vector<std::atomic<uint32_t>>(n);
+    for (auto& a : cost_ema_) a.store(0.0, std::memory_order_relaxed);
+    for (auto& a : cost_eff_) a.store(1.0, std::memory_order_relaxed);
+    for (auto& a : cost_n_) a.store(0, std::memory_order_relaxed);
+    cost_min_.store(1.0, std::memory_order_relaxed);
+    cost_max_.store(1.0, std::memory_order_relaxed);
+}
+
+void ForesightSwap::ring_cost_sample(int64_t layer, double us_per_mb) {
+    if (!ring_cost || layer < 0 || (size_t) layer >= cost_n_.size() || !std::isfinite(us_per_mb) || us_per_mb < 0.0) return;
+    auto& ema = cost_ema_[(size_t) layer];
+    auto& n = cost_n_[(size_t) layer];
+    const uint32_t k = n.load(std::memory_order_relaxed);
+    const double prev = ema.load(std::memory_order_relaxed);
+    ema.store(k == 0 ? us_per_mb : prev + 0.05 * (us_per_mb - prev), std::memory_order_relaxed);   // alpha 0.05
+    n.store(k + 1, std::memory_order_relaxed);
+    cost_refresh();
+}
+
+void ForesightSwap::cost_refresh() {
+    constexpr uint32_t kMinSamples = 32;
+    std::vector<double> measured;
+    for (size_t l = 0; l < cost_n_.size(); ++l)
+        if (cost_n_[l].load(std::memory_order_relaxed) >= kMinSamples) measured.push_back(cost_ema_[l].load(std::memory_order_relaxed));
+    double med = 1.0;   // no layer measured yet: 1.0
+    if (!measured.empty()) {
+        std::sort(measured.begin(), measured.end());
+        const size_t m = measured.size();
+        med = m % 2 ? measured[m / 2] : 0.5 * (measured[m / 2 - 1] + measured[m / 2]);
+    }
+    double lo = 0.0, hi = 0.0;
+    for (size_t l = 0; l < cost_eff_.size(); ++l) {
+        const bool ok = cost_n_[l].load(std::memory_order_relaxed) >= kMinSamples;
+        const double c = ok ? cost_ema_[l].load(std::memory_order_relaxed) : med;
+        cost_eff_[l].store(c, std::memory_order_relaxed);
+        if (l == 0 || c < lo) lo = c;
+        if (l == 0 || c > hi) hi = c;
+    }
+    if (!cost_eff_.empty()) {
+        cost_min_.store(lo, std::memory_order_relaxed);
+        cost_max_.store(hi, std::memory_order_relaxed);
+    }
+}
+
+double ForesightSwap::ring_cost_of(int64_t layer) const {
+    if (!ring_cost || layer < 0 || (size_t) layer >= cost_eff_.size()) return 1.0;
+    return cost_eff_[(size_t) layer].load(std::memory_order_relaxed);
+}
+
+int ForesightSwap::ring_depth(int64_t layer, int base) const {
+    if (!ring_cost) return base;
+    const double lo = cost_min_.load(std::memory_order_relaxed), hi = cost_max_.load(std::memory_order_relaxed);
+    if (!(hi > lo)) return base;
+    const double f = std::min(std::max((ring_cost_of(layer) - lo) / (hi - lo), 0.0), 1.0);
+    return base + (int) std::lround(f * std::max(0.0, ring_cost_extra));
+}
+
+double ForesightSwap::evict_score(int64_t layer, uint64_t last_ref, uint64_t now) const {
+    const uint64_t age = last_ref < now ? now - last_ref : 0;
+    return ring_cost_of(layer) / (1.0 + (double) age);
 }
 
 bool ForesightSwap::take(int64_t layer, int32_t expert, unsigned long long& ptr) {
@@ -7290,6 +7383,7 @@ void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t exp
         const bool may_evict = layer >= cur + 2;
         int best = -1;
         uint64_t best_ref = ~0ull;
+        double best_score = std::numeric_limits<double>::infinity();
         bool fresh_only = true;
         for (int s = 0; s < slots; ++s) {
             Slot& sl = slot[(size_t) (layer * slots + s)];
@@ -7305,6 +7399,11 @@ void ForesightSwap::request_locked(ExpertSource* src, int64_t layer, int32_t exp
             if (!may_evict) continue;
             if (sl.last_ref >= now) continue;   // asked for (or predicted) in this window
             fresh_only = false;
+            if (ring_cost) {   // STRATA_RING_COST: the lowest c_l / (1 + age) goes first (the slots of a layer share its c_l)
+                const double sc = evict_score(layer, sl.last_ref, now);
+                if (sc < best_score) { best_score = sc; best = s; }
+                continue;
+            }
             if (sl.last_ref < best_ref) { best_ref = sl.last_ref; best = s; }
         }
         if (best < 0) {
@@ -7398,6 +7497,11 @@ std::string ForesightSwap::report() const {
                                        "(cumulative since start; the plan never waits)",
                       (unsigned long long) ring_taken, (unsigned long long) ring_skipped, (unsigned long long) now_none);
         r += buf;
+        if (ring_cost) {
+            std::snprintf(buf, sizeof buf, "; cost %.2f..%.2f us/MB", cost_min_.load(std::memory_order_relaxed),
+                          cost_max_.load(std::memory_order_relaxed));
+            r += buf;
+        }
     }
     if (dropped > 0) r += ", " + std::to_string(dropped) + " dropped by exchanges";
     if (verify) r += ", verified " + std::to_string(verify_ok) + " ok / " + std::to_string(verify_bad) + " BAD";
@@ -7432,19 +7536,25 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     f->admit = env_int("STRATA_FS_ADMIT", 1, 1);
     f->depth = env_int("STRATA_FS_DEPTH", ring ? 2 : 4, 2);
     f->verify = env_int("STRATA_FS_VERIFY", 0, 0) != 0;
+    const char* rc = std::getenv("STRATA_RING_COST");   // STRATA_RING_COST=1: the ring's copies and evictions by each layer's live CPU cost
+    f->ring_cost = ring && rc != nullptr && std::atoi(rc) != 0;
+    if (const char* ce = std::getenv("STRATA_RING_COST_EXTRA")) f->ring_cost_extra = std::max(0.0, std::atof(ce));
     std::string err;
     if (!f->init(std::min(slots, 64), layers, experts, card_of_layer, devices, err)) {
         std::fprintf(stderr, "strata serve: foresight swap: %s - swap space off\n", err.c_str());
         delete f;
         return nullptr;
     }
+    if (f->ring_cost) f->cost_setup(layers);
     std::fprintf(stderr, "strata serve: foresight swap: %d slots per layer on %zu card(s), up to %d copies per card and "
                          "window, admit after %d miss(es), reuse after %d windows%s\n",
                  f->slots, devices.size(), f->budget, f->admit, f->depth,
                  ring ? (f->ring_wait ? " - LOOK-AHEAD RING: predicted experts read from the file tier, a late one waited for (no CPU)"
                                  : " - LOOK-AHEAD RING (hybrid): predicted experts read from the file tier, a late one left to the CPU")
                  : "");
-    if (ring) std::fprintf(stderr, "strata serve: look-ahead ring: %d filler threads\n", f->ring_threads);
+    if (ring)
+        std::fprintf(stderr, "strata serve: look-ahead ring: %d filler threads%s\n", f->ring_threads,
+                     f->ring_cost ? ", cost-weighted (live CPU us/MB per layer)" : "");
     return f;
 }
 

@@ -80,7 +80,13 @@ struct ForesightSwap {
     bool ring = false;
     bool ring_wait = true;                   ///< STRATA_RING=1: fetch_now is tried at the plan (never waits: a copy not landed is a CPU miss); STRATA_RING=2: not tried
     int ring_threads = 4;
-    uint8_t* ready_dev = nullptr;            ///< the router's ring table (route_ring_ptr), n_layers x n_expert bytes
+    // STRATA_RING_COST=1 (with the ring; unset = nothing here is used): the ring weighs its guesses and its evictions by each layer's
+    // live CPU cost per MB (c_l = us of CPU compute per CPU-miss expert / blob MB, EMA alpha 0.05 over decode windows).  Layers
+    // with fewer than 32 samples use the median of the measured layers (1.0 if none).  The guesses of a plan are copied in order of
+    // c_l (higher first) and a layer's guess depth is R_l = base + round(STRATA_RING_COST_EXTRA * (c_l - c_min) / (c_max - c_min)).
+    bool ring_cost = false;
+    double ring_cost_extra = 2.0;            ///< STRATA_RING_COST_EXTRA: the most guesses a layer gains over the base depth
+    uint8_t* ready_dev = nullptr;           ///< the router's ring table (route_ring_ptr), n_layers x n_expert bytes
     const int32_t* host_res = nullptr;       ///< the cache's residency (n_layers x n_expert, slot or -1): a ring slot whose expert it holds is free
     std::atomic<int64_t> at_layer{-1};       ///< the layer the pool works on (set first thing in each dispatch)
     std::atomic<uint64_t> ring_reads{0}, ring_read_fail{0};
@@ -107,6 +113,14 @@ struct ForesightSwap {
     bool fetch_now(ExpertSource* src, int64_t layer, int32_t expert, unsigned long long& ptr);
     /// STRATA_RING, the plan: counts one expert of this plan that the ring did not serve landed (-> "skipped" in report()).
     void ring_skip_plan();
+    /// STRATA_RING_COST: allocates the per-layer cost state (after init; `layers` = n_layers).
+    void cost_setup(int64_t layers);
+    /// STRATA_RING_COST, the dispatch thread: one decode window's CPU-miss compute of `layer`, as us per MB of its blob.
+    void ring_cost_sample(int64_t layer, double us_per_mb);
+    /// STRATA_RING_COST: the effective c_l of `layer` (us/MB; read without a lock).
+    double ring_cost_of(int64_t layer) const;
+    /// STRATA_RING_COST: the guess depth of `layer` (R_l above); `base` when the switch is off.
+    int ring_depth(int64_t layer, int base) const;
     /// The router look-ahead (any thread), for an expert the next layer's router predicts and no cache holds: maybe copy
     /// it into a slot of that layer now, so that the copy has landed when the layer's plan is made.  One prefetch design
     /// with note_miss (the same slots, budget and reuse rule); a prediction only ever moves bytes, the plan is still made
@@ -122,6 +136,12 @@ struct ForesightSwap {
 
 private:
     void request_locked(ExpertSource* src, int64_t layer, int32_t expert, bool predicted);
+    void cost_refresh();                     ///< STRATA_RING_COST: the effective c_l of every layer, their min and max (dispatch thread)
+    /// STRATA_RING_COST: the eviction score of a slot of `layer` last read at `last_ref` (lower is evicted first): c_l / (1 + age).
+    double evict_score(int64_t layer, uint64_t last_ref, uint64_t now) const;
+    std::vector<std::atomic<double>> cost_ema_, cost_eff_;   // per layer (dispatch thread writes)
+    std::vector<std::atomic<uint32_t>> cost_n_;              // per layer: decode windows sampled
+    std::atomic<double> cost_min_{1.0}, cost_max_{1.0};
     std::mutex smu_;                         ///< slot, where, card_* and the counters: the pool thread and the look-ahead thread
     std::mutex mu_;
     std::condition_variable cv_;
