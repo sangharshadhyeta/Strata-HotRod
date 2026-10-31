@@ -8010,6 +8010,9 @@ struct Model::Impl {
                 it.k = k;
                 it.bytes = unit(n);
                 it.src = store->blob(sl[0]);
+                // the slot's landed flag down before the fill is queued: the ring thread sets it only after this fill's copy, and a flag
+                // still 1 from the slot's last copy would let ring_reap drop the store's pin before this copy has run
+                ring_landed[(size_t) k].store(0, std::memory_order_release);
                 ring_bad[(size_t) k] = false;   // (before the push: the ring thread sets it when the copy fails)
                 ring_push_l(it);
                 s.layer = j;
@@ -8018,10 +8021,7 @@ struct Model::Impl {
                 s.done = false;
                 s.counted = false;
                 s.fill_tok = ring_tok;
-                if (ring_sticky) {   // (the slot's last use's callback has fired: its flag down here, before the reap can see the old 1)
-                    ring_landed[(size_t) k].store(0, std::memory_order_release);
-                    ring_last[(size_t) k].store(ring_tok, std::memory_order_relaxed);
-                }
+                if (ring_sticky) ring_last[(size_t) k].store(ring_tok, std::memory_order_relaxed);
                 ring_own[(size_t) j][(size_t) e] = k;
                 ++rc_issued;
                 ++inflight;
