@@ -8357,12 +8357,20 @@ struct Model::Impl {
                 const int il = pe.first, e = pe.second;
                 Layer& l = L[(size_t) il];
                 bool go = false;
+                std::array<uint8_t*, 4> parts{};
                 {   // (the host's hh / slot / swap_pending writes are under lend_mu too: cache_tick_swaps)
                     std::lock_guard<std::mutex> lk(lend_mu);
                     go = lend_of[(size_t) il][(size_t) e] == -2 && l.slot[(size_t) e] < 0 && !l.swap_pending;
                     for (int X = 0; go && X < NH; ++X) go = l.hh[(size_t) e][(size_t) X] != nullptr;
-                    if (go) parts_to_blob(l, l.hh[(size_t) e], lend_stage);
+                    if (go) parts = l.hh[(size_t) e];   // (snapshot: the blob is built outside the lock - a cold file page may fault)
                     else if (lend_of[(size_t) il][(size_t) e] == -2) lend_of[(size_t) il][(size_t) e] = -1;
+                }
+                if (!go) continue;
+                parts_to_blob(l, parts, lend_stage);   // (no lock held: lend_mu is taken by cache_tick_swaps between windows)
+                {   // re-check: the expert may have moved (a swap, a drop) while its blob was built
+                    std::lock_guard<std::mutex> lk(lend_mu);
+                    go = lend_of[(size_t) il][(size_t) e] == -2 && l.slot[(size_t) e] < 0 && !l.swap_pending && l.hh[(size_t) e] == parts;
+                    if (!go && lend_of[(size_t) il][(size_t) e] == -2) lend_of[(size_t) il][(size_t) e] = -1;
                 }
                 if (!go) continue;
                 const size_t need = align256(l.blob);
