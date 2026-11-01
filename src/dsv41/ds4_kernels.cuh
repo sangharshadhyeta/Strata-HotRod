@@ -233,6 +233,20 @@ struct Req {
     // orig: the router's pick before any stand-in (its rank is the pick's index r). The arrays are host-mapped with the rest of Req.
     unsigned char sub[kWin][kPicks];
     short orig[kWin][kPicks];
+    // DS4_PCIE_BALANCE: 1 = the pick's blob is copied into this use's staging (PcieRoute) and computed on the device after the copy's flag
+    unsigned char pcie[kWin][kPicks];
+};
+/// DS4_PCIE_BALANCE, per layer use (decode tokens of the trunk): the host decides `allow` before the route (the staging of the use is free and the
+/// copy queue has room; else 0 and nothing is marked). The device marks the last m of the token's eligible misses in routing order (el: the expert
+/// is in the RAM store, a copy source; mt[n]: m for n eligible misses, from the layer's fit); a marked pick's plan entry is stage + r * blob, and
+/// *need gets the marks' count (the wait on the copy's flag returns at once when it is 0).
+struct PcieRoute {
+    int allow = 0;
+    const unsigned char* el = nullptr;   // [n_exp] device
+    const int* mt = nullptr;             // [9] device
+    unsigned long long stage = 0;        // device address of this use's staging (pick r at stage + r * blob)
+    unsigned blob = 0;
+    int* need = nullptr;                 // device: the marks of the token (0 when not allowed)
 };
 struct Resp {
     unsigned seq;
@@ -261,7 +275,11 @@ struct Standin {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, int na0 = 0, int na1 = 0, int na2 = 0, Standin* standin = nullptr);
+                   unsigned vl = 0, int na0 = 0, int na1 = 0, int na2 = 0, Standin* standin = nullptr,
+                   const PcieRoute* pc = nullptr);
+/// DS4_PCIE_BALANCE's device wait: returns at once when *need is 0; else spins until *seq_ptr == seq (the copy's flag), and writes the cycles it spun
+/// to *wait_cyc (device). Enqueued after route_publish on the stream, before the expert kernels.
+void wait_pcie(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc, cudaStream_t s);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);

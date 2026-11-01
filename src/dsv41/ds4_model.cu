@@ -1118,6 +1118,55 @@ struct Model::Impl {
     // tail_thr (atomic: set on the host thread at each window, read by ahead_ask).
     bool tail3_on = false;
     std::atomic<float> tail_thr{0.5f};
+    // DS4_PCIE_BALANCE=1 (opt-in; with the ring and the RAM store): a decode token's CPU-lane misses that the store holds are split per layer between
+    // the CPU lane and a PCIe copy (store blob -> this use's staging, the device computes it after the copy's flag). See pcie_window().
+    bool pcie_on = false;
+    static constexpr int kPcSlots = 256;   // the uses per parity whose cycles and events are kept
+    struct PcFit {                         // Qwen's PcieModel, per layer: the CPU lane's a + c n_c + d n_p, the GPU's g0 + g n_p (lam 0.995)
+        double A[9] = {}, B[3] = {}, C[4] = {}, D[2] = {};
+        double a = 0, c = 0, d = 0, g0 = 0, g = 0;
+        int nc = 0, ng = 0;
+        bool cok = false, gok = false;
+    };
+    std::vector<PcFit> pc_fit;
+    size_t pc_blob = 0, pc_nexp = 0;
+    uint8_t* pc_stage = nullptr;        // device: 2 parities x kPicks blobs (pick r of a use at (parity * kPicks + r) * pc_blob)
+    uint8_t* pc_hstage = nullptr;       // pinned host: the same, for a use whose blob is not in the store (the layer's host parts)
+    unsigned* pc_done = nullptr;        // host-mapped: [parity] the seq of its last copy's flag
+    int* pc_need = nullptr;             // device: the marks of the token (written by the route kernel)
+    unsigned long long* pc_wait = nullptr;   // device: [parity * kPcSlots + use index] the cycles a use's wait spun; [2 kPcSlots]: the dummy
+    int* pc_mt = nullptr;               // device: [layer][9] m by the number of eligible misses
+    unsigned char* pc_el = nullptr;     // device: [layer][pc_nexp] the expert is in the store (a copy source)
+    std::vector<unsigned char> pc_el_h; // host mirror of pc_el (written at each window's end)
+    uint64_t pc_use[2] = {0, 0};        // the allowed uses per parity (their index % kPcSlots)
+    cudaEvent_t pc_last[2] = {nullptr, nullptr};   // the MoE end of each parity's last allowed use
+    struct PcUse {
+        int layer = 0, par = 0, n_c = 0, n_p = 0;
+        unsigned seq = 0;
+        size_t idx = 0;
+        double cpu_ms = -1.0;
+        cudaEvent_t t0 = nullptr, t1 = nullptr, prev = nullptr;
+    };
+    std::mutex pc_mu;                   // pc_uses: the layer thread (push, finish), the serve thread (its fields)
+    std::vector<PcUse> pc_uses;
+    struct PcPin {                      // serve thread only: a store slot pinned for a copy until the copy's flag
+        int layer, expert, slot;
+        unsigned* flag;
+        unsigned seq;
+    };
+    std::vector<PcPin> pc_pins;
+    struct PcCb {
+        unsigned* flag;
+        unsigned seq;
+    };
+    static void pcie_done_cb(void* p) {   // (a host function: no CUDA call in it)
+        PcCb* c = static_cast<PcCb*>(p);
+        std::atomic_thread_fence(std::memory_order_release);
+        *(volatile unsigned*) c->flag = c->seq;
+        delete c;
+    }
+    uint64_t pc_sent = 0, pc_late = 0, pc_landed = 0, pc_fail = 0, pc_m_n = 0, pc_m_sum = 0;
+    int pc_khz = 1000000;
     // card_n[layer]: the experts of the layer whose table entry (vram_tab) is set now: the resident slots, the ring's landed slots, DS4_LEND's
     // published copies. Kept at each change (card_init; ring_reap / ring_free_slot / ring_evict_ahead_slot; lend_publish / lend_reclaim; the
     // swap-in of a lent expert). Read unlocked by serve_lane (an int, the ring_own pattern). A stand-in can only use a card-held expert, so the
@@ -1242,6 +1291,13 @@ struct Model::Impl {
         unsigned long long value = 0;     // free: the table entry to write
         int slot_seen = -1;               // free: the expert's VRAM slot when the free was decided (a swap since: its write stands)
         uint64_t seq = 0;
+        // DS4_PCIE_BALANCE: a copy of a store blob (or of the layer's host parts when src is null: zeros) to the device address dst_dev,
+        // after wait_ev (the previous use's MoE end), then the flag pc_flag = pc_seq
+        bool pc = false;
+        unsigned* pc_flag = nullptr;
+        unsigned pc_seq = 0;
+        cudaEvent_t wait_ev = nullptr;
+        unsigned long long dst_dev = 0;
     };
     std::thread ring_th;
     std::mutex ring_qmu;
@@ -1622,7 +1678,8 @@ struct Model::Impl {
             ring_print();
         }
         if (lend_on) lend_print();   // (DS4_LEND: the experts lent now, of the last plan)
-        if (tail3_on) tail_print();  // (STRATA_LA_TAIL_READ=3: the read threshold, the reads, the stand-in failures)
+        if (tail3_on) tail_print();
+        if (pcie_on) pcie_print();  // (STRATA_LA_TAIL_READ=3: the read threshold, the reads, the stand-in failures)
     }
 
     ~Impl() {
@@ -3610,6 +3667,273 @@ struct Model::Impl {
                      la_tail_read == 2 ? "the exact ranks only" : la_tail_read == 3 ? "the ranks below the floor, the rest where the stand-in would fail" : "every guess");
     }
     // card_n at the placement: the resident experts of each layer (the slots placed); the ring and the arena add and remove theirs as they change
+    // ---- DS4_PCIE_BALANCE (see the members). Per decode token of a trunk layer (the routed MoE path, the lead member): the layer's use takes
+    // the PCIe lane when its staging parity is free (the last use's MoE ended) and the copy queue has room; the route kernel marks the last m of
+    // the eligible misses (m = mt[their number]); the host copies each marked blob (serve thread enqueues, the ring thread copies and sets the
+    // flag); the device waits for the flag before the expert kernels (wait_pcie). mt: the fit's optimum max(GPU, CPU) per count; until both
+    // fits have 16 samples, m = 1 when a token has >= 2 eligible misses.
+    static bool pc_solve(int n, const double* M, const double* b, double* x) {   // M: n x n (stride n), Gauss-Jordan with pivoting
+        double m[3][4] = {};
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) m[i][j] = M[i * n + j];
+            m[i][n] = b[i];
+        }
+        for (int col = 0; col < n; ++col) {
+            int piv = col;
+            for (int r = col + 1; r < n; ++r)
+                if (std::fabs(m[r][col]) > std::fabs(m[piv][col])) piv = r;
+            if (std::fabs(m[piv][col]) < 1e-12) return false;
+            for (int j = 0; j <= n; ++j) std::swap(m[col][j], m[piv][j]);
+            for (int r = 0; r < n; ++r)
+                if (r != col) {
+                    const double f = m[r][col] / m[col][col];
+                    for (int j = col; j <= n; ++j) m[r][j] -= f * m[col][j];
+                }
+        }
+        for (int i = 0; i < n; ++i) x[i] = m[i][n] / m[i][i];
+        return true;
+    }
+    static void pc_sample(PcFit& f, int n_c, int n_p, double cpu_ms, double gpu_ms) {
+        constexpr double lam = 0.995;
+        if (n_c > 0) {
+            const double x[3] = {1.0, (double) n_c, (double) n_p};
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) f.A[i * 3 + j] = lam * f.A[i * 3 + j] + x[i] * x[j];
+                f.B[i] = lam * f.B[i] + x[i] * cpu_ms;
+            }
+            if (++f.nc >= 16) {
+                double s[3];
+                if (pc_solve(3, f.A, f.B, s)) {
+                    f.a = s[0];
+                    f.c = s[1];
+                    f.d = s[2];
+                    f.cok = true;
+                }
+            }
+        }
+        const double y[2] = {1.0, (double) n_p};
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) f.C[i * 2 + j] = lam * f.C[i * 2 + j] + y[i] * y[j];
+            f.D[i] = lam * f.D[i] + y[i] * gpu_ms;
+        }
+        if (++f.ng >= 16) {
+            double s[2];
+            if (pc_solve(2, f.C, f.D, s)) {
+                f.g0 = s[0];
+                f.g = s[1];
+                f.gok = true;
+            }
+        }
+    }
+    // mt[n] for a layer: the m in [0, n] minimizing max(GPU(m), CPU(n - m, m)), CPU(k, m) = a + c k + d m (0 with no CPU pick), GPU(m) = g0 + g m;
+    // the fixed rule (m = 1 from 2 eligible misses) until both fits are ready
+    void pc_table(size_t il, int* mt) const {
+        const PcFit& f = pc_fit[il];
+        for (int n = 0; n <= kPicks; ++n) {
+            if (!(f.cok && f.gok)) {
+                mt[n] = n >= 2 ? 1 : 0;
+                continue;
+            }
+            int best = 0;
+            double bt = 1e300;
+            for (int k = 0; k <= n; ++k) {
+                const double cpu = n - k > 0 ? f.a + f.c * (n - k) + f.d * k : 0.0;
+                const double t = std::max(cpu, f.g0 + f.g * k);
+                if (t < bt - 1e-9) {
+                    bt = t;
+                    best = k;
+                }
+            }
+            mt[n] = best;
+        }
+    }
+    void pcie_upload_mt() {
+        std::vector<int> mt(L.size() * 9, 0);
+        for (size_t il = 0; il < L.size(); ++il) pc_table(il, &mt[il * 9]);
+        (void) cudaMemcpy(pc_mt, mt.data(), mt.size() * sizeof(int), cudaMemcpyHostToDevice);
+    }
+    // after the ring's start (DS4_PCIE_BALANCE=1): the staging, the flags, the tables; off with a reason otherwise
+    void pcie_init() {
+        const char* v = std::getenv("DS4_PCIE_BALANCE");
+        if (v == nullptr || std::atoi(v) != 1) return;
+        if (!ring_on || store == nullptr) {
+            std::fprintf(stderr, "ds4: DS4_PCIE_BALANCE: off (no ring or RAM store)\n");
+            return;
+        }
+        if (devs.size() != 1) {
+            std::fprintf(stderr, "ds4: DS4_PCIE_BALANCE: off (more than one device)\n");
+            return;
+        }
+        size_t blob = 0, nexp = 0;
+        for (const Layer& l : L) {
+            if (l.mtp) continue;
+            if (l.nm != 1) {
+                std::fprintf(stderr, "ds4: DS4_PCIE_BALANCE: off (a trunk layer's experts are in a group)\n");
+                return;
+            }
+            blob = std::max(blob, l.blob);
+            nexp = std::max(nexp, (size_t) l.n_exp);
+        }
+        if (blob == 0 || nexp == 0) return;
+        blob = (blob + 255) & ~(size_t) 255;
+        cudaSetDevice(devs[0].id);
+        std::string err;
+        const bool ok = cudaMalloc((void**) &pc_stage, 2 * kPicks * blob) == cudaSuccess && halloc(pc_hstage, 2 * kPicks * blob, err) &&
+                        hmap(pc_done, 2, err) && cudaMalloc((void**) &pc_need, sizeof(int)) == cudaSuccess &&
+                        cudaMalloc((void**) &pc_wait, sizeof(unsigned long long) * (2 * kPcSlots + 1)) == cudaSuccess &&
+                        cudaMalloc((void**) &pc_mt, sizeof(int) * L.size() * 9) == cudaSuccess &&
+                        cudaMalloc((void**) &pc_el, L.size() * nexp) == cudaSuccess;
+        if (!ok) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "ds4: DS4_PCIE_BALANCE: off (the staging would not allocate: %.2f GB)\n", 2.0 * kPicks * (double) blob / 1e9);
+            return;
+        }
+        (void) cudaMemset(pc_need, 0, sizeof(int));
+        (void) cudaMemset(pc_wait, 0, sizeof(unsigned long long) * (2 * kPcSlots + 1));
+        (void) cudaMemset(pc_el, 0, L.size() * nexp);
+        pc_blob = blob;
+        pc_nexp = nexp;
+        pc_fit.assign(L.size(), PcFit{});
+        pc_done[0] = pc_done[1] = 0u - 1u;   // (a flag below every seq: a use waits for its own copy's flag, seq 0 included)
+        pc_el_h.assign(L.size() * nexp, 0);
+        int khz = 0;
+        if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, devs[0].id) == cudaSuccess && khz > 0) pc_khz = khz;
+        pcie_upload_mt();
+        pcie_on = true;
+        std::fprintf(stderr, "ds4: DS4_PCIE_BALANCE: on (the misses the store holds may take a PCIe copy; staging %.2f GB)\n",
+                     2.0 * kPicks * (double) blob / 1e9);
+    }
+    // the window's end (host thread): the uses whose MoE ended are read (their waits, their times: the fits), the store's residency is mirrored to
+    // the device, the tables are refreshed
+    void pcie_window() {
+        std::vector<PcUse> done;
+        {
+            std::lock_guard<std::mutex> lk(pc_mu);
+            for (size_t i = 0; i < pc_uses.size();) {
+                if (cudaEventQuery(pc_uses[i].t1) == cudaSuccess) {   // (the uses finish in order)
+                    done.push_back(pc_uses[i]);
+                    pc_uses.erase(pc_uses.begin() + (long) i);
+                } else
+                    ++i;
+            }
+        }
+        if (!done.empty()) {
+            std::vector<unsigned long long> wv(2 * kPcSlots + 1, 0ull);
+            (void) cudaMemcpy(wv.data(), pc_wait, wv.size() * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+            for (const PcUse& u : done) {
+                float ms = 0.0f;
+                (void) cudaEventElapsedTime(&ms, u.t0, u.t1);
+                const double wait_ms = (double) wv[(size_t) u.par * kPcSlots + u.idx] / (double) pc_khz;
+                if (u.n_p > 0) {
+                    if (wait_ms > 0.1) ++pc_late;
+                    else ++pc_landed;
+                }
+                pc_m_sum += (uint64_t) u.n_p;
+                ++pc_m_n;
+                pc_sample(pc_fit[(size_t) u.layer], u.cpu_ms >= 0.0 ? u.n_c : 0, u.n_p, u.cpu_ms >= 0.0 ? u.cpu_ms : 0.0, (double) ms);
+                if (u.prev != nullptr) cudaEventDestroy(u.prev);   // (the previous use ended: its event is done with)
+                cudaEventDestroy(u.t0);
+            }
+            pcie_upload_mt();
+        }
+        // the store's residency for the device's copy sources
+        for (size_t il = 0; il < L.size(); ++il) {
+            const Layer& l = L[il];
+            if (l.mtp) continue;
+            for (int e = 0; e < l.n_exp; ++e) pc_el_h[il * pc_nexp + (size_t) e] = store->find((int) il, e) >= 0 ? 1 : 0;
+        }
+        (void) cudaMemcpy(pc_el, pc_el_h.data(), pc_el_h.size(), cudaMemcpyHostToDevice);
+    }
+    // serve thread (no CUDA call): the copies of this use's PCIe picks, into this use's staging. A blob the store holds is pinned for the copy
+    // (released once its flag is seen); else the layer's host parts are built (pc_hstage). The copy waits for the previous use's MoE end.
+    void pcie_enqueue(int li, const Req& r, unsigned seq) {
+        const int par = li & 1;
+        for (size_t i = 0; i < pc_pins.size();) {   // the pins of the copies that landed
+            if ((int) (*(volatile unsigned*) pc_pins[i].flag - pc_pins[i].seq) >= 0) {
+                const std::vector<char> one(1, 1);
+                store->release(pc_pins[i].layer, &pc_pins[i].expert, 1, one);
+                pc_pins.erase(pc_pins.begin() + (long) i);
+            } else
+                ++i;
+        }
+        bool any = false;
+        for (int i = 0; i < L[(size_t) li].k_exp && i < kPicks; ++i) any = any || r.pcie[0][i] != 0;
+        if (!any) return;
+        cudaEvent_t prev = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(pc_mu);
+            for (size_t i = pc_uses.size(); i-- > 0;)
+                if (pc_uses[i].layer == li && pc_uses[i].seq == seq) {
+                    prev = pc_uses[i].prev;
+                    break;
+                }
+        }
+        Layer& l = L[(size_t) li];
+        for (int i = 0; i < l.k_exp && i < kPicks; ++i) {
+            if (!r.pcie[0][i]) continue;
+            const int e = r.ids[0][i];
+            if (e < 0 || e >= l.n_exp) continue;
+            uint8_t* dst = pc_stage + (size_t) (par * kPicks + i) * pc_blob;
+            const uint8_t* src = nullptr;
+            int pin = -1;
+            if (store->find(li, e) >= 0) {   // a hit: pinned now (begin does not read a resident slot)
+                std::vector<char> ok;
+                std::vector<int> sl;
+                store->begin(li, &e, 1, ok, sl);
+                if (sl[0] >= 0 && store->find(li, e) == sl[0] && store->loaded(sl[0])) {
+                    src = store->blob(sl[0]);
+                    pin = sl[0];
+                } else if (sl[0] >= 0) {
+                    const std::vector<char> one(1, 1);
+                    store->release(li, &e, 1, one);
+                }
+            }
+            if (src == nullptr && !l.hh.empty() && l.hh[(size_t) e][0] != nullptr) {   // the layer's host parts (the store lost it)
+                uint8_t* hs = pc_hstage + (size_t) (par * kPicks + i) * pc_blob;
+                parts_to_blob(l, l.hh[(size_t) e], hs);
+                src = hs;
+            }
+            RingItem it;
+            it.pc = true;
+            it.layer = li;
+            it.expert = e;
+            it.bytes = l.blob;
+            it.src = src;   // (null: zeros, so the device computes nothing wrong and never waits forever)
+            it.dst_dev = (unsigned long long) (uintptr_t) dst;
+            it.pc_flag = &pc_done[par];
+            it.pc_seq = seq;
+            it.wait_ev = prev;
+            {
+                std::lock_guard<std::mutex> qk(ring_qmu);
+                ring_push_l(it);
+            }
+            if (pin >= 0) pc_pins.push_back({li, e, pin, &pc_done[par], seq});
+            ++pc_sent;
+        }
+    }
+    // serve thread, at the publish: the use's counts (the CPU lane's picks, the PCIe picks, the eligible ones) and its CPU time
+    void pcie_publish(int li, const Req& r, unsigned seq, int n_c, std::chrono::steady_clock::time_point t0) {
+        const double cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        int n_p = 0;
+        for (int i = 0; i < L[(size_t) li].k_exp && i < kPicks; ++i) n_p += r.pcie[0][i] != 0;
+        std::lock_guard<std::mutex> lk(pc_mu);
+        for (size_t i = pc_uses.size(); i-- > 0;)
+            if (pc_uses[i].layer == li && pc_uses[i].seq == seq) {
+                pc_uses[i].n_c = n_c;
+                pc_uses[i].n_p = n_p;
+                pc_uses[i].cpu_ms = cpu_ms;
+                break;
+            }
+    }
+    void pcie_print() {
+        int ready = 0;
+        for (const PcFit& f : pc_fit) ready += f.cok && f.gok ? 1 : 0;
+        std::fprintf(stderr,
+                     "ds4: request: pcie-balance: %llu picks sent, %llu landed in time, %llu late (waited > 0.1 ms), %llu copies failed, "
+                     "last m mean %.2f per use, fits ready %d of %zu\n",
+                     (unsigned long long) pc_sent, (unsigned long long) pc_landed, (unsigned long long) pc_late, (unsigned long long) pc_fail,
+                     pc_m_n ? (double) pc_m_sum / (double) pc_m_n : 0.0, ready, pc_fit.size());
+    }
     void card_init() {
         card_n.assign(L.size(), 0);
         for (size_t il = 0; il < L.size(); ++il)
@@ -7632,6 +7956,7 @@ struct Model::Impl {
         store_sync();
         store_watch();
         tail_adapt();   // (STRATA_LA_TAIL_READ=3: the read threshold from the store's queue; host thread)
+        if (pcie_on) pcie_window();   // (DS4_PCIE_BALANCE: the uses ended, the fits, the store's residency)
         residency_write();
     }
     // STRATA_RESIDENCY_FILE=<path> (the server sets it for the Monitor's experts map; Strata-HotRod's format v 1): at most every 2 s,
@@ -8042,6 +8367,7 @@ struct Model::Impl {
         if (const char* v = std::getenv("DS4_RING_COST_EXTRA")) ring_cost_extra = std::max(0.0, std::atof(v));
         ring_on = true;
         ring_th = std::thread([this] { ring_loop(); });
+        pcie_init();   // (DS4_PCIE_BALANCE: the copies run on the ring thread, so after it)
         std::fprintf(stderr,
                      "ds4: ring: %d VRAM slots (%.2f GB) filled ahead from the RAM store (guesses 1-2 layers ahead), %s; a pick uses its slot only if the copy landed before its layer\n",
                      ring_n, (double) ring_n * (double) ring_stride / 1e9,
@@ -8113,6 +8439,26 @@ struct Model::Impl {
     void ring_do(const RingItem& it) {
         if (it.barrier) {
             if (cudaStreamSynchronize(ring_st) != cudaSuccess) (void) cudaGetLastError();
+            return;
+        }
+        if (it.pc) {   // DS4_PCIE_BALANCE: the copy into the use's staging, then its flag (the device waits for it)
+            if (it.wait_ev != nullptr) (void) cudaStreamWaitEvent(ring_st, it.wait_ev, 0);   // (the previous use's MoE: the staging is free)
+            uint8_t* dst = (uint8_t*) (uintptr_t) it.dst_dev;
+            bool ok = it.src != nullptr ? cudaMemcpyAsync(dst, it.src, it.bytes, cudaMemcpyHostToDevice, ring_st) == cudaSuccess
+                                        : cudaMemsetAsync(dst, 0, it.bytes, ring_st) == cudaSuccess;
+            if (!ok) {
+                (void) cudaGetLastError();
+                ++pc_fail;
+                (void) cudaMemsetAsync(dst, 0, it.bytes, ring_st);   // (the device computes zeros for it: no hang, no stale blob)
+            }
+            PcCb* cb = new PcCb{it.pc_flag, it.pc_seq};
+            if (cudaLaunchHostFunc(ring_st, pcie_done_cb, cb) != cudaSuccess) {
+                (void) cudaGetLastError();
+                delete cb;
+                (void) cudaStreamSynchronize(ring_st);
+                std::atomic_thread_fence(std::memory_order_release);
+                *(volatile unsigned*) it.pc_flag = it.pc_seq;
+            }
             return;
         }
         Layer& l = L[(size_t) it.layer];
@@ -8924,8 +9270,10 @@ struct Model::Impl {
             Resp& rp = resps[next % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
             for (int t = 0; t < T; ++t) rp.cpu[t] = 0;
+            const auto pc_t0 = std::chrono::steady_clock::now();
             if (li >= 0 && li < (int) L.size()) {
                 Layer& l = L[(size_t) li];
+                if (pcie_on && !l.mtp) pcie_enqueue(li, r, next);   // (DS4_PCIE_BALANCE: the PCIe picks' copies, before the CPU lane's work)
                 uint32_t* pr = prof.data() + (size_t) li * g.n_exp;
                 ents.clear();
                 // the Monitor's timeline (ds4_timeline.hpp): this layer's stamps, the trunk's layers only (no effect on the work)
@@ -9100,6 +9448,7 @@ struct Model::Impl {
                     tlt[5] = std::min(tlt[6], tlt[4] + std::max<int64_t>(0, wait));
                     tl::layer(li, T, mis, nslots, tlt);
                 }
+                if (pcie_on && !l.mtp) pcie_publish(li, r, next, (int) picks.size(), pc_t0);
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
@@ -11881,9 +12230,49 @@ struct Model::Impl {
                     route_ahead(d.glog_a + (size_t) 2 * kWin * 1024, n4->gate_bias, n4->n_exp, m, T, reqs + slot, kAhead1 + kPicks, s);
                     na[2] = m;
                 }
+            // DS4_PCIE_BALANCE: this use may take the PCIe lane (decode token, the routed MoE path, the lead member); the staging of its parity must be
+            // free (the last use's MoE ended) and the copy queue short - else nothing is marked. need is written by the route either way.
+            PcieRoute pr;
+            const bool pc_try = pcie_on && T == 1 && moe_token_path && lead && !l.mtp && mi == 0 && nm == 1;
+            bool pc_allowed = false;
+            const int pc_par = l.il & 1;
+            cudaEvent_t pc_t1 = nullptr;
+            size_t pc_slot = 2 * (size_t) kPcSlots;   // (the dummy cycles slot when the use takes no PCIe lane)
+            if (pc_try) {
+                pr.need = pc_need;
+                bool room = false;
+                {
+                    std::lock_guard<std::mutex> qk(ring_qmu);
+                    room = ring_q.size() < 4 * (size_t) ring_n;
+                }
+                const bool staging_free = pc_last[pc_par] == nullptr || cudaEventQuery(pc_last[pc_par]) == cudaSuccess;
+                if (room && staging_free) {
+                    pc_allowed = true;
+                    pr.allow = 1;
+                    pr.el = pc_el + (size_t) l.il * pc_nexp;
+                    pr.mt = pc_mt + (size_t) l.il * 9;
+                    pr.stage = (unsigned long long) (uintptr_t) (pc_stage + (size_t) pc_par * kPicks * pc_blob);
+                    pr.blob = (unsigned) pc_blob;
+                    PcUse u;
+                    u.layer = l.il;
+                    u.par = pc_par;
+                    u.seq = sq;
+                    u.idx = (size_t) (pc_use[pc_par] % kPcSlots);
+                    ++pc_use[pc_par];
+                    u.prev = pc_last[pc_par];
+                    (void) cudaEventCreate(&u.t0);
+                    (void) cudaEventCreate(&u.t1);
+                    (void) cudaEventRecord(u.t0, s);
+                    pc_t1 = u.t1;
+                    pc_last[pc_par] = u.t1;
+                    pc_slot = (size_t) pc_par * kPcSlots + u.idx;
+                    std::lock_guard<std::mutex> lk(pc_mu);
+                    pc_uses.push_back(u);
+                }
+            }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr);   // (stand-ins: decode tokens of the trunk only)
+                          na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr);   // (stand-ins: decode tokens of the trunk only)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
@@ -11916,6 +12305,7 @@ struct Model::Impl {
                     });
                 }
                 const double m0 = tlog2 ? now_ms() : 0.0;
+                if (pc_try) wait_pcie(pc_need, &pc_done[pc_par], sq, pc_wait + pc_slot, s);   // (the PCIe copies' flag, before the gate_up reads them)
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
                 const double m1 = tlog2 ? now_ms() : 0.0;
@@ -11926,6 +12316,7 @@ struct Model::Impl {
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 if (tlog2) { t_moe_gu += m1 - m0; t_moe_wait += m2 - m1; t_moe_dn += now_ms() - m2; ++t_moe_n; }
+                if (pc_allowed) (void) cudaEventRecord(pc_t1, s);   // (DS4_PCIE_BALANCE: this use's end: the next use of the parity waits for it)
             } else {   // each distinct expert read once for the window's tokens
                 gf::MoeWin mw;
                 mw.plan_ptr = d.plan_ptr;

@@ -1588,7 +1588,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
                                                             const float* __restrict__ bias_vl, unsigned vl,
-                                                            Standin* __restrict__ sti) {
+                                                            Standin* __restrict__ sti, PcieRoute pc) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1688,17 +1688,35 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 sti->risk[t] += risk;
             }
         }
+        // DS4_PCIE_BALANCE: the eligible misses (vram 0, in the store, after any stand-in) of a decode token; the last m of them in routing order
+        // are marked for the PCIe lane (stage + r * blob, computed on the device after the copy's flag)
+        int pmark[kPicks];
+        int npc = 0;
+        for (int r = 0; r < k; ++r) pmark[r] = 0;
+        if (pc.allow && t == 0 && pc.el != nullptr && pc.mt != nullptr) {
+            int el = 0;
+            for (int r = 0; r < k; ++r) el += vram[pick[r]] == 0ull && pc.el[pick[r]] != 0;
+            int m = pc.mt[el < 8 ? el : 8];
+            for (int r = k - 1; r >= 0 && m > 0; --r)
+                if (vram[pick[r]] == 0ull && pc.el[pick[r]] != 0) {
+                    pmark[r] = 1;
+                    --m;
+                    ++npc;
+                }
+        }
+        if (pc.need != nullptr && t == 0) *pc.need = npc;
         int cpu = 0;
         for (int r = 0; r < k; ++r) {
             const float wv = wk[r];
             idx[(size_t) t * kPicks + r] = pick[r];
             w[(size_t) t * kPicks + r] = wv;
-            plan_ptr[(size_t) t * kPicks + r] = vram[pick[r]];
-            cpu |= vram[pick[r]] == 0ull;
+            plan_ptr[(size_t) t * kPicks + r] = pmark[r] ? pc.stage + (unsigned long long) r * pc.blob : vram[pick[r]];
+            cpu |= vram[pick[r]] == 0ull && !pmark[r];
             if (req != nullptr) {
                 req->ids[t][r] = pick[r];
                 req->w[t][r] = wv;
-                req->gpu[t][r] = vram[pick[r]] != 0ull;
+                req->gpu[t][r] = vram[pick[r]] != 0ull || pmark[r];
+                req->pcie[t][r] = (unsigned char) pmark[r];
                 // the stand-in outcome (learning only; no routing decision reads it): 0 when the stand-ins were not evaluated
                 req->sub[t][r] = sti == nullptr ? 0 : pick[r] != orig[r] ? 1 : vram[pick[r]] == 0ull ? 2 : 0;
                 req->orig[t][r] = (short) orig[r];
@@ -1805,6 +1823,23 @@ __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, 
     *(volatile unsigned*) &req->seq = seq;
 }
 
+// DS4_PCIE_BALANCE's wait: one thread; returns at once when no pick of the token took the PCIe lane (*need 0); else spins until the copy's flag
+// carries the use's seq, and writes the cycles it spun (the host reads them: the late copies)
+__global__ void wait_pcie_kernel(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc) {
+    if (threadIdx.x != 0) return;
+    if (*(volatile const int*) need == 0) {
+        *wait_cyc = 0ull;
+        return;
+    }
+    const long long t0 = clock64();
+    while ((int) (*(volatile const unsigned*) seq_ptr - seq) < 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(200);
+#endif
+    }
+    __threadfence_system();
+    *wait_cyc = (unsigned long long) (clock64() - t0);
+}
 __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
     if (threadIdx.x != 0) return;
     while (*(volatile const unsigned*) seq_ptr != seq) {
@@ -2196,10 +2231,18 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 }
 }  // namespace
 
+void wait_pcie(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    (void) need; (void) seq_ptr; (void) seq; (void) wait_cyc; (void) s;
+#else
+    wait_pcie_kernel<<<1, 32, 0, s>>>(need, seq_ptr, seq, wait_cyc);
+#endif
+}
+
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1, int na2, Standin* standin) {
+                   unsigned vl, int na0, int na1, int na2, Standin* standin, const PcieRoute* pc) {
 #if defined(STRATA_METAL)
     // selection only: the prefetch schedule (req) is published by the CUDA kernel, and is turned on separately here
     if (strata::dsv41::metal_host::route_publish(logits, bias, n, k, T, route_scale, vram, idx, w, plan_ptr,
@@ -2209,8 +2252,9 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
         return;
     }
 #endif
+    static const PcieRoute no_pcie{};
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl, standin);
+                                           vl != 0 ? bias_vl : nullptr, vl, standin, pc != nullptr ? *pc : no_pcie);
     if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, na2);
 }
 void logit_top2(const float* logits, int n, float* out, cudaStream_t s) {
