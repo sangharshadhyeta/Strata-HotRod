@@ -228,6 +228,11 @@ struct Req {
     int ahead[kWin][kAhead];
     float x[kWin][kMaxDim];
     unsigned char gpu[kWin][kPicks];   // 1: the pick's table entry was set when the router ran (the device computes it; DS4_RING's host check)
+    // STRATA_LA_TAIL_READ=3's learning: the outcome of each pick's stand-in decision (written only when the stand-ins were evaluated for the
+    // token; 0 otherwise): 1 the router's pick was off the card and a stand-in replaced it, 2 it was off the card and stayed (the CPU lane).
+    // orig: the router's pick before any stand-in (its rank is the pick's index r). The arrays are host-mapped with the rest of Req.
+    unsigned char sub[kWin][kPicks];
+    short orig[kWin][kPicks];
 };
 struct Resp {
     unsigned seq;

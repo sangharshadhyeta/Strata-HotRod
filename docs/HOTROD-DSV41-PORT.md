@@ -102,3 +102,10 @@ fills that went into arena slots. Untested until measured.
 
 **RAM store under pressure (`ds4_store.hpp`):** below 4 GB free the store gives back its idle chunk with the least use (use: the reads it
 served, x0.5 per shrink), not the last one; a given-back chunk is taken back once 6 GB are free (one per 16-window check). Untested here.
+
+**Read-ahead by stand-in failure (`STRATA_LA_TAIL_READ=3`, untested):** mode 2 reads into the RAM store only the guesses ranked below the
+stand-in floor. Mode 3 also reads a guess at or above the floor when its stand-in would likely fail (the CPU lane would compute it from
+the drive): the kernel records each pick's stand-in outcome (`Req::sub`, `Req::orig`, written only when the stand-ins were evaluated), the
+serve thread learns per rank, per card bucket of the layer (`card_n`: the experts with a table entry set now, in buckets 0-7, 8-11,
+12-19, 20+) and per expert, and the threshold follows the store's read queue (up 0.02 above half its limit, down below a
+quarter). Falls back to mode 2 without the learner, the stand-ins, or the store. Report: `ds4: request: tail-read3: ...`.

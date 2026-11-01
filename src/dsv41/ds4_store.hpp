@@ -137,6 +137,9 @@ public:
     }
     const Stats& stats() const { return st_; }
     double busy_ms() const { return io_ ? io_->busy_ms() : 0.0; }
+    /// The read queue's depth (jobs waiting for a thread; takes the queue's lock) and its limit: the scale STRATA_LA_TAIL_READ=3's threshold reads.
+    size_t io_depth() { return io_ ? io_->depth() : 0; }
+    size_t io_limit() const { return 4 * (size_t) std::max(1, cfg_.threads); }
     static constexpr size_t kSlack = 8192;
 
     /// The slot holding (layer, e) ready to read, or -1.  (Any thread; a slot found stays valid while it is pinned or visible.)

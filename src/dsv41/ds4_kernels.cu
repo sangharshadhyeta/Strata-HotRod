@@ -1667,6 +1667,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         for (int r = 0; r < k; ++r) s += sc[pick[r]];
         float wk[kPicks];
         for (int r = 0; r < k; ++r) wk[r] = sc[pick[r]] / (s + 1e-20f) * route_scale;
+        int orig[kPicks];   // (the router's picks before any stand-in: Req::orig, Req::sub)
+        for (int r = 0; r < k; ++r) orig[r] = pick[r];
         if (sti != nullptr) {   // the weights stay the picks' own; the ids swap where the rule allows, nearest rank first
             int c = 0, took = 0;
             float risk = 0.0f;
@@ -1697,6 +1699,9 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 req->ids[t][r] = pick[r];
                 req->w[t][r] = wv;
                 req->gpu[t][r] = vram[pick[r]] != 0ull;
+                // the stand-in outcome (learning only; no routing decision reads it): 0 when the stand-ins were not evaluated
+                req->sub[t][r] = sti == nullptr ? 0 : pick[r] != orig[r] ? 1 : vram[pick[r]] == 0ull ? 2 : 0;
+                req->orig[t][r] = (short) orig[r];
             }
         }
         on_cpu = cpu;

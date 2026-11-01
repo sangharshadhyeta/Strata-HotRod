@@ -176,6 +176,11 @@ public:
         const uint64_t seen = done_;
         done_cv_.wait_for(lk, std::chrono::microseconds(us), [&] { return done_ != seen; });
     }
+    /// Jobs queued and not yet taken by a thread (both queues; the reads in flight are not counted)
+    size_t depth() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return q_.size() + ql_.size();
+    }
     double busy_ms() const { return busy_us_.load(std::memory_order_relaxed) / 1000.0; }
     uint64_t direct_bytes() const { return direct_.load(std::memory_order_relaxed); }
     uint64_t buffered_bytes() const { return buffered_.load(std::memory_order_relaxed); }

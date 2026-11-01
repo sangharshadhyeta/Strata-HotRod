@@ -1111,6 +1111,24 @@ struct Model::Impl {
     // store, only those ranked below the stand-in floor (standin_floor); 1 every guess (upstream's reading); 0 none (upstream's default
     // with the store).  DS4_AHEAD, when set, decides as before.
     int la_tail_read = 2, standin_floor = 0;
+    // STRATA_LA_TAIL_READ=3 (with the learner, the stand-ins and the store; else mode 2): the ranks below the floor as mode 2; a guess at or
+    // above the floor is read ahead when its predicted stand-in failure p (the guessed expert's own rate once it has 8 samples, else the
+    // rank's) is above tail_thr, which moves with the store's read queue. Learned live from the picks' stand-in outcomes (Req::sub): tail_sfail
+    // [layer][rank] (EMA, alpha 1/64, from 0.5) and tail_efail [layer][2 * expert] (ok, fail counts, halved at 255). Serve thread only, except
+    // tail_thr (atomic: set on the host thread at each window, read by ahead_ask).
+    bool tail3_on = false;
+    std::atomic<float> tail_thr{0.5f};
+    // card_n[layer]: the experts of the layer whose table entry (vram_tab) is set now: the resident slots, the ring's landed slots, DS4_LEND's
+    // published copies. Kept at each change (card_init; ring_reap / ring_free_slot / ring_evict_ahead_slot; lend_publish / lend_reclaim; the
+    // swap-in of a lent expert). Read unlocked by serve_lane (an int, the ring_own pattern). A stand-in can only use a card-held expert, so the
+    // stand-in failure rate depends on it: tail_sfail[layer][bucket * kAhead1 + rank], bucket = card_bucket(card_n), tail_bcount[layer][bucket]
+    // the samples of a bucket, tail_pool[layer][rank] the EMA over all buckets (the fallback while a bucket has < 16 samples).
+    std::vector<int> card_n;
+    std::vector<std::vector<float>> tail_sfail;
+    std::vector<std::vector<uint32_t>> tail_bcount;
+    std::vector<std::vector<float>> tail_pool;
+    std::vector<std::vector<uint8_t>> tail_efail;
+    uint64_t tail_g = 0, tail_gr = 0, tail_off = 0, tail_fail = 0;   // guesses at/above the floor seen / read; off-card picks at/above it / that stayed
     // STRATA_KV_HOST (Strata-HotRod's K/V streaming, this model's way): unset = on when --max-context is above 131072, 1 on, 0 off.  The
     // compressed K/V rows (288 bytes a row) go to host-mapped RAM instead of the card: the sparse attention reads only the top-k rows each
     // query picks (a few MB a token over PCIe), the compressor writes a row every `ratio` positions through the same pointer, and the card
@@ -1150,6 +1168,11 @@ struct Model::Impl {
     };
     bool ring_want = false, ring_on = false;
     int ring_n = 0, ring_inflight_max = 12;
+    // DS4_RING_INFLIGHT=auto: the in-flight cap adapts (AIMD, ring_inflight_adjust, every 16 tokens, serve thread under ring_mu): +2 while the
+    // throttle bites and the late share is under 0.15, x3/4 (at least 4) above 0.30. The cap and its range since start are on the request line.
+    bool ring_inflight_auto = false;
+    int ring_inflight_min_seen = 12, ring_inflight_max_seen = 12;
+    uint64_t ring_adj_tok = 0, ring_adj_landed = 0, ring_adj_late = 0, ring_adj_thr = 0;   // the counters at the last adjustment
     // DS4_LEND_RING (with DS4_LEND): the ring's own slots are [0, ring_n0) (ring_buf); the slots from ring_n0 up are the chunk arena's
     // (lend_base), which the ring takes while no chunked pass runs (ring_x_on). Without DS4_LEND_RING ring_n0 == ring_n, always.
     int ring_n0 = 0;
@@ -1589,6 +1612,7 @@ struct Model::Impl {
             ring_print();
         }
         if (lend_on) lend_print();   // (DS4_LEND: the experts lent now, of the last plan)
+        if (tail3_on) tail_print();  // (STRATA_LA_TAIL_READ=3: the read threshold, the reads, the stand-in failures)
     }
 
     ~Impl() {
@@ -3239,6 +3263,7 @@ struct Model::Impl {
         }
         // the experts: VRAM slots in what each device has left, the rest on the host
         if (!place_experts(err)) return false;
+        card_init();   // (the resident experts: card_n's start; the ring's and DS4_LEND's changes follow)
         if (!load_experts(err)) return false;
         if (pk.gguf) make_pools();
         if (chunk > 0) {
@@ -3553,11 +3578,85 @@ struct Model::Impl {
                      (long long) free_mib, ring_bytes != 0 ? " (the ring's slots counted as free)" : "", (long long) now, (long long) old);
     }
     void tail_read_init() {
-        if (const char* v = std::getenv("STRATA_LA_TAIL_READ")) la_tail_read = std::max(0, std::min(2, std::atoi(v)));
+        if (const char* v = std::getenv("STRATA_LA_TAIL_READ")) la_tail_read = std::max(0, std::min(3, std::atoi(v)));
+        if (la_tail_read == 3 && (!la_on || d_standin == nullptr || !store)) {
+            std::fprintf(stderr, "ds4: STRATA_LA_TAIL_READ=3 needs the learner, the stand-ins and the RAM store: mode 2\n");
+            la_tail_read = 2;
+        }
         if (!la_on || d_standin == nullptr || !store || la_tail_read == 0 || std::getenv("DS4_AHEAD") != nullptr || ahead_mode != 0) return;
+        if (la_tail_read == 3) {   // (the learning tables: a prior of 0.5 for every rank and bucket, no outcome seen for any expert)
+            tail_sfail.assign(L.size(), std::vector<float>((size_t) 4 * kAhead1, 0.5f));
+            tail_bcount.assign(L.size(), std::vector<uint32_t>(4, 0));
+            tail_pool.assign(L.size(), std::vector<float>((size_t) kAhead1, 0.5f));
+            tail_efail.assign(L.size(), std::vector<uint8_t>());
+            for (size_t il = 0; il < L.size(); ++il) tail_efail[il].assign((size_t) L[il].n_exp * 2, 0);
+            tail3_on = true;
+        }
         ahead_mode = 1;   // (the store reads the guesses: the page-cache prefetch thread is not needed)
         std::fprintf(stderr, "ds4: read-ahead: the learned guesses into the RAM store (%s)\n",
-                     la_tail_read == 2 ? "the exact ranks only" : "every guess");
+                     la_tail_read == 2 ? "the exact ranks only" : la_tail_read == 3 ? "the ranks below the floor, the rest where the stand-in would fail" : "every guess");
+    }
+    // card_n at the placement: the resident experts of each layer (the slots placed); the ring and the arena add and remove theirs as they change
+    void card_init() {
+        card_n.assign(L.size(), 0);
+        for (size_t il = 0; il < L.size(); ++il)
+            for (int e = 0; e < L[il].n_exp && e < (int) L[il].slot.size(); ++e) card_n[il] += L[il].slot[(size_t) e] >= 0;
+    }
+    // the card's bucket of a layer's count of card-held experts: 0 under 8, 1 under 12, 2 under 20, 3 from there on
+    static int card_bucket(int n) { return n < 8 ? 0 : n < 12 ? 1 : n < 20 ? 2 : 3; }
+    // STRATA_LA_TAIL_READ=3: the probability that a guess (layer j, expert e, rank i >= the floor) would stay on the CPU lane (its stand-in
+    // failing): the expert's own rate once it has 8 outcomes; else the rate of the layer's current card bucket if that bucket has 16 samples;
+    // else the layer's pooled rate for the rank (0.5 until sampled). Serve thread (ahead_ask).
+    float tail_pred(int j, int e, int i) const {
+        const uint8_t* c = tail_efail[(size_t) j].data() + 2 * (size_t) e;
+        if (c[0] + c[1] >= 8) return (float) c[1] / (float) (c[0] + c[1]);
+        const int b = card_bucket(card_n[(size_t) j]);
+        if (tail_bcount[(size_t) j][(size_t) b] >= 16) return tail_sfail[(size_t) j][(size_t) b * kAhead1 + (size_t) i];
+        return tail_pool[(size_t) j][(size_t) i];
+    }
+    // STRATA_LA_TAIL_READ=3: one pick's stand-in outcome (sub 1 or 2) at rank i >= the floor, of the router's expert orig in layer li, under the
+    // layer's card bucket at this token's routing (card_n read now). Serve thread.
+    void tail_learn(int li, int orig, int i, unsigned char sub) {
+        const float x = sub == 2 ? 1.0f : 0.0f;
+        const size_t b = (size_t) card_bucket(card_n[(size_t) li]);
+        float& s = tail_sfail[(size_t) li][b * kAhead1 + (size_t) i];
+        s += (x - s) / 64.0f;
+        float& p = tail_pool[(size_t) li][(size_t) i];
+        p += (x - p) / 64.0f;
+        ++tail_bcount[(size_t) li][b];
+        uint8_t* c = tail_efail[(size_t) li].data() + 2 * (size_t) orig;
+        const int k = sub == 2 ? 1 : 0;
+        if (c[k] == 255) {   // (saturating: both halved, the ratio kept)
+            c[0] >>= 1;
+            c[1] >>= 1;
+        }
+        ++c[k];
+        ++tail_off;
+        if (sub == 2) ++tail_fail;
+    }
+    // STRATA_LA_TAIL_READ=3: the read threshold follows the store's read queue (host thread, once per window): above half its limit it rises
+    // 0.02 (to 0.95), below a quarter it falls 0.02 (to 0.05).
+    void tail_adapt() {
+        if (!tail3_on || !store) return;
+        const size_t d = store->io_depth(), lim = store->io_limit();
+        float t = tail_thr.load(std::memory_order_relaxed);
+        if (2 * d > lim) t = std::min(0.95f, t + 0.02f);
+        else if (4 * d < lim) t = std::max(0.05f, t - 0.02f);
+        tail_thr.store(t, std::memory_order_relaxed);
+    }
+    void tail_print() const {
+        double sum = 0.0;
+        size_t n = 0;
+        for (size_t il = 0; il < L.size(); ++il)
+            if (!L[il].mtp) {
+                sum += (double) card_n[il];
+                ++n;
+            }
+        std::fprintf(stderr,
+                     "ds4: request: tail-read3: thr %.2f, read %llu of %llu rank>=floor guesses, stand-in failed %.0f%% of off-card picks at ranks >= floor, "
+                     "card %.1f experts per layer (mean)\n",
+                     (double) tail_thr.load(std::memory_order_relaxed), (unsigned long long) tail_gr, (unsigned long long) tail_g,
+                     tail_off != 0 ? 100.0 * (double) tail_fail / (double) tail_off : 0.0, n ? sum / (double) n : 0.0);
     }
     // the learner's stage for trunk layer l on its stream s (a decode token, after the router's GEMV): its label, then for each
     // distance the next layer's plain logits on this layer's FFN input (rows of glog_a) and the learner's forward, which corrects them
@@ -7519,6 +7618,7 @@ struct Model::Impl {
         cache_tick_swaps(T);
         store_sync();
         store_watch();
+        tail_adapt();   // (STRATA_LA_TAIL_READ=3: the read threshold from the store's queue; host thread)
         residency_write();
     }
     // STRATA_RESIDENCY_FILE=<path> (the server sets it for the Monitor's experts map; Strata-HotRod's format v 1): at most every 2 s,
@@ -7623,8 +7723,11 @@ struct Model::Impl {
                 l.ram[(size_t) sw.in] = -1;
             }
             l.slot[(size_t) sw.in] = l.spare_vram;
-            if (lend_on && lend_of[(size_t) sw.layer][(size_t) sw.in] != -1)   // (DS4_LEND: the swap's table entry stands; a lent copy is unused)
+            if (lend_on && lend_of[(size_t) sw.layer][(size_t) sw.in] != -1) {   // (DS4_LEND: the swap's table entry stands; a lent copy is unused)
+                // card_n: the lent copy's entry is replaced by the swap's (the resident +1 of `in` and the -1 of `out` cancel out)
+                if (lend_of[(size_t) sw.layer][(size_t) sw.in] >= 0) card_n[(size_t) sw.layer] -= 1;
                 lend_of[(size_t) sw.layer][(size_t) sw.in] = -1;
+            }
             if (!l.zc.empty() && l.zc[(size_t) sw.in]) {   // (VRAM's now: not the store's to compute any more)
                 l.zc[(size_t) sw.in] = 0;
                 if (l.zc_tab != nullptr) {   // (the device's table too: its entry pointed into the slot the store now reuses - when `in` left VRAM later,
@@ -7844,7 +7947,15 @@ struct Model::Impl {
         }
         ring_own.assign((size_t) g.nl, std::vector<int>());
         for (int il = 0; il < g.nl; ++il) ring_own[(size_t) il].assign((size_t) L[(size_t) il].n_exp, -1);
-        if (const char* v = std::getenv("DS4_RING_INFLIGHT")) ring_inflight_max = std::max(1, std::atoi(v));
+        if (const char* v = std::getenv("DS4_RING_INFLIGHT")) {
+            if (std::strcmp(v, "auto") == 0) {   // (the cap starts at 12 and adapts)
+                ring_inflight_auto = true;
+                ring_inflight_max = 12;
+            } else {
+                ring_inflight_max = std::max(1, std::atoi(v));
+            }
+        }
+        ring_inflight_min_seen = ring_inflight_max_seen = ring_inflight_max;
         ring_want = true;
 #endif
     }
@@ -8064,6 +8175,7 @@ struct Model::Impl {
             if (!s.used || s.done) continue;
             if (ring_landed[k].load(std::memory_order_acquire) == 0) continue;
             s.done = true;
+            card_n[(size_t) s.layer] += 1;   // (card_n: the landed slot's expert is card-held; ring_mu held by the callers)
             const int e = s.expert;
             const std::vector<char> one(1, 1);
             store->release(s.layer, &e, 1, one);
@@ -8118,6 +8230,7 @@ struct Model::Impl {
             it.clear_only = true;
         }
         ring_push_l(it);
+        if (s.done) card_n[(size_t) s.layer] -= 1;   // (card_n: the landed slot leaves the card)
         s.used = s.done = s.counted = false;
         s.layer = s.expert = -1;
     }
@@ -8141,6 +8254,7 @@ struct Model::Impl {
         r.slot_seen = sl;
         r.seq = ++ring_aseq;
         ring_aq.push_back(r);
+        if (s.done) card_n[(size_t) s.layer] -= 1;   // (card_n: the evicted landed slot leaves the card; its write-back is queued)
         s.used = s.done = s.counted = false;
         s.layer = s.expert = -1;
         return r.seq;
@@ -8176,6 +8290,25 @@ struct Model::Impl {
             ring_aq.pop_front();
         }
     }
+    // (DS4_RING_INFLIGHT=auto; caller holds ring_mu; serve thread) the in-flight cap from the counters since the last adjustment: the copies that
+    // landed in time, the late ones and the throttled fills. Throttled and late share under 0.15: +2 (at most ring_n). Late share over 0.30: x3/4
+    // (at least 4). Else unchanged.
+    void ring_inflight_adjust() {
+        const uint64_t dl = rc_landed - ring_adj_landed, dd = rc_late - ring_adj_late, dt = rc_throttled - ring_adj_thr;
+        ring_adj_landed = rc_landed;
+        ring_adj_late = rc_late;
+        ring_adj_thr = rc_throttled;
+        ring_adj_tok = ring_tok;
+        const double late_share = (double) dd / (double) std::max<uint64_t>(1, dl + dd);
+        int c = ring_inflight_max;
+        if (dt > 0 && late_share < 0.15) c = std::min(ring_n, c + 2);
+        else if (late_share > 0.30) c = std::max(4, c * 3 / 4);
+        if (c != ring_inflight_max) {
+            ring_inflight_max = c;
+            ring_inflight_min_seen = std::min(ring_inflight_min_seen, c);
+            ring_inflight_max_seen = std::max(ring_inflight_max_seen, c);
+        }
+    }
     void ring_request(int li, const Req& r, int T) {
         if (li == 0) ++ring_tok;   // (serve_lane's thread only: the token's first trunk layer)
         if (ring_cost) ring_cost_snapshot();
@@ -8192,6 +8325,7 @@ struct Model::Impl {
             return;
         }
         ring_reap();
+        if (ring_inflight_auto && ring_tok - ring_adj_tok >= 16) ring_inflight_adjust();   // (DS4_RING_INFLIGHT=auto: every 16 tokens, ring_mu held)
         Layer& l = L[(size_t) li];
         for (int k = 0; k < ring_n; ++k) {
             RingSlot& s = ring_s[(size_t) k];
@@ -8351,6 +8485,8 @@ struct Model::Impl {
         if (ring_move) std::fprintf(stderr, ", %llu moved", (unsigned long long) rc_moved);
         if (ring_cost) std::fprintf(stderr, ", cost %.2f..%.2f us/MB, mean R %.2f", ring_cmin, ring_cmax, ring_rmean);
         if (lend_ring) std::fprintf(stderr, " x %llu", (unsigned long long) rc_xfill);   // (DS4_LEND_RING: fills into the chunk arena's slots)
+        if (ring_inflight_auto)
+            std::fprintf(stderr, " cap %d (min %d, max %d)", ring_inflight_max, ring_inflight_min_seen, ring_inflight_max_seen);   // (DS4_RING_INFLIGHT=auto)
         std::fprintf(stderr, "\n");
     }
 
@@ -8583,12 +8719,17 @@ struct Model::Impl {
         std::vector<std::pair<int, int>> zero;
         bool dirty = false;   // (a fill wrote the arena since it was last zeroed)
         {
+            std::unique_lock<std::mutex> rlk(ring_mu, std::defer_lock);   // (card_n: the ring's writes are under ring_mu; the order ring_mu, lend_mu as elsewhere)
+            if (ring_on) rlk.lock();
             std::lock_guard<std::mutex> lk(lend_mu);
             dirty = lend_dirty;
             lend_dirty = false;
             for (size_t i = 0; i < lend_ents.size(); ++i) {
                 const LendEnt& x = lend_ents[i];
-                if (lend_of[(size_t) x.layer][(size_t) x.expert] == (int) i) zero.push_back({x.layer, x.expert});
+                if (lend_of[(size_t) x.layer][(size_t) x.expert] == (int) i) {
+                    zero.push_back({x.layer, x.expert});
+                    card_n[(size_t) x.layer] -= 1;   // (card_n: its table entry is zeroed below)
+                }
             }
             lend_ents.clear();
             lend_plan.clear();
@@ -8631,6 +8772,7 @@ struct Model::Impl {
             lend_pin[i] = (unsigned long long) r.ptr;
             (void) cudaMemcpyAsync(l.vram_tab + e, &lend_pin[i], 8, cudaMemcpyHostToDevice, devs[0].st);
             lend_of[(size_t) r.layer][e] = (int) i;
+            card_n[(size_t) r.layer] += 1;   // (card_n: the published copy's entry is set above)
             lend_ents.push_back(r);
             ++lend_published;
         }
@@ -8681,8 +8823,16 @@ struct Model::Impl {
                     if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                     fl[e] |= a == 4 ? 16 : a == 2 ? 4 : (i < n.k_exp ? 3 : 2);   // (16: 4 layers before)
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
-                    if (i >= lim || (fl[e] & 8) || !file_read(n, e)) continue;
+                    if (i >= lim || (fl[e] & 8)) continue;
+                    // STRATA_LA_TAIL_READ=3: a guess at or above the floor is read only when its stand-in would likely fail
+                    const bool tail_gate = tail3_on && i >= standin_floor;
+                    if (tail_gate) {
+                        ++tail_g;
+                        if (!(tail_pred(j, e, i) > tail_thr.load(std::memory_order_relaxed))) continue;
+                    }
+                    if (!file_read(n, e)) continue;
                     fl[e] |= 8;
+                    if (tail_gate) ++tail_gr;
                     if (store) store->prefetch(j, e);
                     else
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
@@ -8778,6 +8928,8 @@ struct Model::Impl {
                             st.ahead_hit += (fl[e] & 6) != 0;
                             st.ahead_hit2 += (fl[e] >> 2) & 1;
                         }
+                        if (tail3_on && r.sub[t][i] != 0 && i >= standin_floor && !l.mtp && r.orig[t][i] >= 0 && r.orig[t][i] < l.n_exp)
+                            tail_learn(li, r.orig[t][i], i, r.sub[t][i]);   // (STRATA_LA_TAIL_READ=3: the stand-in outcome of this pick)
                         // (DS4_RING / DS4_LEND: the device's own choice - a lent expert's table entry is set, so the device computes it)
                         const bool cpu_pick = (ring_on || lend_on) ? !r.gpu[t][i] : l.slot[(size_t) e] < 0;
                         if (cpu_pick) {
