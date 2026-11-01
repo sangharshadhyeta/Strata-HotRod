@@ -227,10 +227,31 @@ its default and what it does: [docs/FEATURES-qwen.md](docs/FEATURES-qwen.md) (ge
 <div align="justify">
 
 The same ideas ported to upstream Strata's DeepSeek engine run **DeepSeek-V4.1-Flash** (Starw1's uncensored GSQ-RCO
-IQ2_XXS backbone with DeepSeek's MXFP8 Engram, 341 GB of files) on this same PC: about **5.2-5.4 tokens/s** with its
-VRAM ring and stand-ins against 4.8-5.0 without them. It lives on the
-[`upstream-dsv41`](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41) branch, release
-[`v0.2.7.1-hotrod.1`](https://github.com/sangharshadhyeta/Strata-HotRod/releases/tag/v0.2.7.1-hotrod.1).
+IQ2_XXS backbone with DeepSeek's MXFP8 Engram, 341 GB of files) on this same PC at **about 5 tokens/s** (4.7-5.5 on the
+calibration prompts; 4.8-5.0 without the ring and stand-ins). It lives on the
+[`upstream-dsv41`](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41) branch (upstream Strata 0.2.7.1
+plus this fork's DeepSeek work), with its own engine, `strata-dsv41`; the two branches are kept apart and ported by hand.
+
+What it adds to upstream's DeepSeek engine, on by default when the ring is on (`=0` turns each off):
+
+- **A VRAM ring** (`DS4_RING=32`): the learned look-ahead's guesses for the next 1-2 layers are copied from a page-locked
+  RAM store into card slots; a pick uses its slot only if the copy has landed in time.
+- **Sticky ring** (`DS4_RING_STICKY`): a landed copy stays until its slot is needed, so a later token that picks the same
+  expert reuses it (about 80,000 reuses in one answer).
+- **The prompt pass's buffers as ring slots** (`DS4_LEND`, `DS4_LEND_RING`): the 1 GB the chunked prompt pass keeps on
+  the card holds 99-100 more ring slots while the model answers, and is handed back before a long prompt.
+- **A self-adjusting copy limit** (`DS4_RING_INFLIGHT`, auto): copies in flight follow the measured decode speed
+  (128-token averages, a 3% dead band; it settles at 11-12 on this PC). `=fixed` keeps 12.
+- **Stand-ins with their re-check and self-tuning budget**, the learned look-ahead and the learned VRAM reserve, as on Qwen.
+- **The RAM store gives back its coldest idle chunk** (unpinned first) when RAM runs short, and takes chunks back later.
+- **Pictures**: with Unsloth's `mmproj-BF16.gguf` in the pack (`--mmproj` to `pack_gguf.py`) and `--vision on`, the
+  engine's own vision tower reads images (319 MiB of VRAM; checked on a known picture: shapes, colours, positions and text
+  right). Known issue: with the tower on, the RAM store is sized 0 and the ring turns off (a free-RAM drop is taken for a
+  unified-memory machine); the fix is pending.
+
+Measured and left opt-in: `STRATA_LA_TAIL_READ=3` (a learned read-ahead of lower-ranked guesses: 23% slower, the drive is
+already at its limit here) and `DS4_PCIE_BALANCE=1` (Qwen's dynamic balance ported: its copies arrive too late and it is
+not yet safe - do not turn it on). DeepSeek's limit on this PC is the NVMe at about 2.8 GB/s.
 
 </div>
 
@@ -283,6 +304,83 @@ When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095`. 
 <div align="justify">
 
 **Update:** `scl enable gcc-toolset-13 -- ./update.sh --build` (new code, engine rebuilt where it changed, model kept).
+
+</div>
+
+### DeepSeek-V4.1-Flash
+
+<div align="justify">
+
+About **345 GB free on an NVMe** (139 GB of model, the 203 GB Engram table, 1 GB for pictures), the
+same toolchain, and the Qwen checkout above (the DeepSeek engine builds against its `third_party/llama.cpp`). These are
+the commands this PC was set up with; the branch's own `setup.py --model Starw1-2.00bpw-MXFP8` downloads the same files
+and makes the pack, but that route is untested here.
+
+</div>
+
+```bash
+# the DeepSeek branch beside the Qwen checkout (run from inside Strata-HotRod, where the Qwen install left you)
+git fetch origin upstream-dsv41 && git worktree add ../Strata-HotRod-ds upstream-dsv41
+cd ../Strata-HotRod-ds
+PY=../Strata-HotRod/.venv/bin/python   # the Qwen install's venv runs this branch's server and tools too
+
+# the engine (sm_86 = RTX 30-series; set yours)
+scl enable gcc-toolset-13 -- bash -c 'cmake -G Ninja -S . -B build-dsv41 -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_DSV41=ON -DSTRATA_NATIVE_EXPERTS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=86-real -DSTRATA_GGML_DIR=$PWD/../Strata-HotRod/third_party/llama.cpp \
+  && ninja -C build-dsv41 strata-dsv41'
+
+# the model (M: the folder for the files): Starw1's 4 shards + the MXFP8 Engram, Unsloth's metadata shard,
+# and for pictures Unsloth's mmproj-BF16.gguf in $M/..
+M=/mnt/nvme/models/deepseek41-flash/GSQ-RCO-IQ2_XXS
+$PY - "$M" <<'EOF'
+import sys
+from huggingface_hub import hf_hub_download, snapshot_download
+m = sys.argv[1]
+snapshot_download("Starw1/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-IQ2_XXS-MXFP8-Engram-GGUF", local_dir=m)
+hf_hub_download("unsloth/DeepSeek-V4.1-Flash-1017-GGUF", "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf",
+                local_dir=m + "/unsloth")
+hf_hub_download("unsloth/DeepSeek-V4.1-Flash-1017-GGUF", "mmproj-BF16.gguf", local_dir=m + "/..")
+EOF
+
+# the pack (a few MB of index beside the files; no weights are copied)
+$PY tools/dsv41/pack_gguf.py --model $M \
+  --shards DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000{1,2,3,4}-of-00004.gguf \
+  --engram $M/DeepSeek-V4.1-Flash-Engram-MXFP8.gguf \
+  --engram-meta $M/unsloth/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf \
+  --mmproj $M/../mmproj-BF16.gguf --out /mnt/nvme/strata-data/packs/ds41v
+cp data/dsv41/profile-2.00.bin /mnt/nvme/strata-data/packs/ds41v/expert-profile.bin
+```
+
+<div align="justify">
+
+**The config** `strata-ds41.json` (the ring and stand-ins are switched on here; everything above follows from them):
+
+</div>
+
+```json
+{
+ "exe": "/path/to/Strata-HotRod-ds/build-dsv41/strata-dsv41",
+ "args": ["--pack", "/mnt/nvme/strata-data/packs/ds41v", "--max-context", "262144", "--eos", "1",
+          "--vision", "on", "--dspark", "auto"],
+ "cwd": "/path/to/Strata-HotRod-ds",
+ "tokenizer": "/mnt/nvme/strata-data/packs/ds41v/tokenizer",
+ "model_name": "deepseek-v4.1-flash",
+ "arch": "deepseek41",
+ "engine_ready_s": 3600,
+ "env": {"DS4_RING": "32", "DS4_RING_PIN": "1", "STRATA_STANDIN": "1"},
+ "answer_room": false,
+ "reasoning_budget_tokens": 0
+}
+```
+
+<div align="justify">
+
+- `"answer_room": false` and `"reasoning_budget_tokens": 0`: no limit but the context (otherwise DeepSeek's thinking
+  stops at 32,768 tokens and a client's cap keeps a quarter for the answer).
+- `--vision off` (or leaving out `--mmproj` when packing) gives text only, and today the faster setup (see the known issue).
+- **Run** it as Qwen, in the same memory limit, from `Strata-HotRod-ds` with `$PY serve/server.py --engine strata --config strata-ds41.json`. The first start at a new context size
+  learns its VRAM reserve; if it prints `ring: off (... would not fit)`, start it once more.
 
 </div>
 
