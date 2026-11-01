@@ -3958,10 +3958,11 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     uint64_t pace_reserve = 0;  ///< the RAM left above every paced step (STRATA_PIN_RESERVE_GIB); set below when bytes > 0
-    // STRATA_PIN_SEGS (read once): a pageable arena is allocated page-aligned, and its blobs are page-locked in segments
+    // STRATA_PIN_SEGS (read once; on by default, =0 off): a pageable arena is allocated page-aligned, and its blobs are
+    // page-locked in segments.  Unset or blank: on.
     static const bool pin_segs_env = [] {
         const char* v = std::getenv("STRATA_PIN_SEGS");
-        return v != nullptr && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     std::string note;
     auto release = [&]() {

@@ -1363,7 +1363,7 @@ private:
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
-    /// STRATA_PIN_SEGS (opt-in): the pageable RAM copy page-locked in place, in segments of whole blobs (pin_segs_build).
+    /// STRATA_PIN_SEGS (on by default; =0 off): the pageable RAM copy page-locked in place, in segments of whole blobs (pin_segs_build).
     /// [lo, hi) is the registered range (page-aligned); `reg`: registered now (give_back_ram unlocks a segment before it
     /// madvise's a place in it); `parked`: the places give_back_ram parked in it (registered again when none is left).
     struct PinSeg { uint64_t lo = 0, hi = 0; const uint8_t* dev = nullptr; bool reg = false; int parked = 0; };

@@ -3683,13 +3683,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
     }
-    // STRATA_PCIE_BALANCE=1 (opt-in): each verify layer's PCIe count from measured costs (Verifier::set_pcie_balance)
-    // instead of the probe's fixed share above - the CPU's speed sets the right share as much as the link's.  IQ2_XS,
-    // one AVX2 pool worker (emulated on an RTX 5090 + 9950X3D): 16.8-17.2 -> 12.8-13.0 ms a round; the 9950X3D's own
-    // 16 workers: 12.2 either way.  One GPU, no batch slots, no --pcie-frac.
+    // STRATA_PCIE_BALANCE (on by default; =0 off): each verify layer's PCIe count from measured costs
+    // (Verifier::set_pcie_balance) instead of the probe's fixed share above - the CPU's speed sets the right share as much
+    // as the link's.  IQ2_XS, one AVX2 pool worker (emulated on an RTX 5090 + 9950X3D): 16.8-17.2 -> 12.8-13.0 ms a round;
+    // the 9950X3D's own 16 workers: 12.2 either way.  One GPU, no batch slots, no --pcie-frac.  Measured on the RTX 3060 PC
+    // with STRATA_PIN_SEGS=1: 39.7 vs 36.5 tok/s (+9%), no copy failures.
     auto pcie_balance = [&]() {
         const char* e = std::getenv("STRATA_PCIE_BALANCE");
-        return !pcie_given && native_pack && !multi_gpu && o.batch <= 0 && e != nullptr && std::strcmp(e, "1") == 0;
+        return !pcie_given && native_pack && !multi_gpu && o.batch <= 0 && (e == nullptr || std::strcmp(e, "0") != 0);
     };
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) {

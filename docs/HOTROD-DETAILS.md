@@ -185,6 +185,8 @@ The opt-in switches for the top two ranks stay in the engine for testing: `STRAT
 | --- | --- |
 | `STRATA_ROUTE_BUDGET_AUTO`, `STRATA_FRAGILE_RECHECK`, `STRATA_FRAGILE_BRAKE` | the self-tuning stand-ins |
 | `STRATA_LA_LEARN`, `STRATA_LA_TAIL_READ=2` | the learned look-ahead, need-only read-ahead |
+| `STRATA_PIN_SEGS` | the pageable RAM tier page-locked in 1 GiB segments (no extra RAM; a give-back unlocks a segment first). With `STRATA_PCIE_BALANCE`: 39.7 vs 36.5 tok/s (+9%), 38.2 pinned alone, no copy failures (RTX 3060 PC) |
+| `STRATA_PCIE_BALANCE` | each verify layer's PCIe count from measured CPU and GPU costs (one GPU, native pack, no batch slots) |
 
 | Opt-in, measured and left off | Why |
 | --- | --- |
@@ -194,7 +196,6 @@ The opt-in switches for the top two ranks stay in the engine for testing: `STRAT
 | `STRATA_LA_EDGE_SKIP=1`, `STRATA_LA_MODEL=<file>` | superseded by the learned look-ahead |
 | `STRATA_GDN_LOOP=1` | looped middle layers: 10% slower, no clear accuracy gain |
 | `STRATA_ROUTER_FUSED=1`, `STRATA_GR_DOWN_WPC=4\|2` | byte-identical outputs; alone and together within run-to-run spread: no gain |
-| `STRATA_PIN_SEGS=1` | untested until measured: the pageable RAM tier page-locked in 1 GiB segments (no extra RAM; a give-back unlocks a segment first) |
 
 ## Earlier speed tables (moved from the README)
 
