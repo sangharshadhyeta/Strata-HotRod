@@ -3590,7 +3590,10 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: STRATA_LA_TAIL_READ=3 needs the learner, the stand-ins and the RAM store: mode 2\n");
             la_tail_read = 2;
         }
-        if (!la_on || d_standin == nullptr || !store || la_tail_read == 0 || std::getenv("DS4_AHEAD") != nullptr || ahead_mode != 0) return;
+        // (ahead_mode is not a bail: with the ring on it stays at its default 1 - the ring's guesses need it (ring_request reads r.ahead, and
+        // the layer's gate guesses come from ahead_mode >= 1) - and the learned read decision applies on top; only an explicit DS4_AHEAD, or a
+        // missing part, turns this off)
+        if (!la_on || d_standin == nullptr || !store || la_tail_read == 0 || std::getenv("DS4_AHEAD") != nullptr) return;
         if (la_tail_read == 3) {   // (the learning tables: a prior of 0.5 for every rank and bucket, no outcome seen for any expert)
             tail_sfail.assign(L.size(), std::vector<float>((size_t) 4 * kAhead1, 0.5f));
             tail_bcount.assign(L.size(), std::vector<uint32_t>(4, 0));
