@@ -7986,16 +7986,16 @@ struct Model::Impl {
             return;
         }
         if (const char* v = std::getenv("DS4_RING_RANKS")) ring_ranks = std::max(0, std::atoi(v));   // (read once here; <= 0: every guess)
-        if (const char* v = std::getenv("DS4_RING_STICKY")) ring_sticky = std::atoi(v) != 0;
+        ring_sticky = on_with_ring("DS4_RING_STICKY");   // (on with the ring: DS4_RING_STICKY=0 for the old ring)
         if (const char* v = std::getenv("DS4_RING_MOVE")) ring_move = std::atoi(v) != 0;
         if (ring_move && !ring_sticky) {
             std::fprintf(stderr, "ds4: ring: DS4_RING_MOVE needs DS4_RING_STICKY=1: off\n");
             ring_move = false;
         }
-        // DS4_LEND_RING=1 (with DS4_LEND): the chunk arena's slots become ring slots [ring_n0, ring_n0 + ring_nx). Every per-slot array is
-        // sized here, before the sticky event block and the ring thread (started below) use ring_n. The old ring_pin stays allocated (in
-        // host_allocs, freed at shutdown) and unused: the new one replaces it.
-        if (lend_on && std::getenv("DS4_LEND_RING") != nullptr && std::atoi(std::getenv("DS4_LEND_RING")) == 1) {
+        // DS4_LEND_RING (with DS4_LEND; on with the ring, DS4_LEND_RING=0 for the fixed-expert lend): the chunk arena's slots become ring slots
+        // [ring_n0, ring_n0 + ring_nx). Every per-slot array is sized here, before the sticky event block and the ring thread (started below) use
+        // ring_n. The old ring_pin stays allocated (in host_allocs, freed at shutdown) and unused: the new one replaces it.
+        if (lend_on && on_with_ring("DS4_LEND_RING")) {
             const int nx = lend_base != nullptr && ring_stride > 0 ? (int) (lend_bytes / ring_stride) : 0;
             std::string perr;
             unsigned long long* np = nullptr;
@@ -8544,11 +8544,20 @@ struct Model::Impl {
     // hold experts between passes: lend_request plans them (hottest first, the trunk's experts the cards do not hold), the lend thread
     // copies them in, cache_tick_swaps publishes the copies into vram_tab between windows, and lend_reclaim takes the arena back
     // before a chunked pass (fill stopped, the published entries zeroed, the arena zeroed) - the pass then runs as it always did.
-    // DS4_LEND=1 only; anything else leaves the engine as it was.
+    // Default: on with the ring (DS4_RING asks for it; DS4_LEND=0 turns it off); with the ring off it is off unless DS4_LEND=1.
+    static bool ring_requested() {
+        const char* r = std::getenv("DS4_RING");
+        return r != nullptr && std::atoi(r) > 0;
+    }
+    // a switch that is on with the ring: unset = on when the ring is asked for, "0" = off, any other value = on
+    static bool on_with_ring(const char* name) {
+        const char* v = std::getenv(name);
+        return v != nullptr ? std::atoi(v) != 0 : ring_requested();
+    }
     void lend_check() {
         lend_on = false;
         const char* env = std::getenv("DS4_LEND");
-        if (env == nullptr || std::strcmp(env, "1") != 0) return;
+        if (env != nullptr ? std::strcmp(env, "1") != 0 : !ring_requested()) return;
         const char* why = nullptr;
 #if defined(STRATA_METAL)
         why = "a Metal build";

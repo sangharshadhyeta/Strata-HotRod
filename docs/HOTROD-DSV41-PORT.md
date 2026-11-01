@@ -14,6 +14,7 @@ Starw1-2.00bpw-MXFP8`. The PC: RTX 3060 12 GB, i5-12400F, 31 GB RAM, PCIe 3.0 NV
 | --- | ---: |
 | Upstream as it ships (the learner off) | 5.05 |
 | **The default here: the VRAM ring + stand-ins** (`DS4_RING=32 DS4_RING_PIN=1 STRATA_STANDIN=1`) | **5.2 / 5.3 / 5.4** in three runs, against 4.8-5.0 in the same sessions |
+| **The default with the ring on: + sticky, the chunk arena as ring slots, in-flight auto** (see Running it, 2) | **4.66-5.01** (auto in-flight 4.88) in the same session set |
 | The learner alone (on once its file exists) | 4.9-5.03 (no measurable gain) |
 | The ring alone (plain / pinned copies) | 3.4 / 3.6 |
 | Stand-ins alone (with the re-check, the tuner, the exact read-ahead) | 3.9-4.2 |
@@ -59,6 +60,11 @@ Every switch, flag and server key: [FEATURES-deepseek.md](FEATURES-deepseek.md).
    (setup never deletes your files; it checks them against Starw1's pins). The pack is a few MB beside the files: no weights copied.
 2. In the config setup writes, the default set: `"env": { "DS4_RING": "32", "DS4_RING_PIN": "1", "STRATA_STANDIN": "1" }` (a blank
    value means the engine's default). The drafter: a pack made with `--dspark-gguf`, `--dspark on`, and `DS4_DSPARK_VRAM=0.05`.
+   With `DS4_RING` set, these are on by default (each turned off with `=0`): `DS4_RING_STICKY` (landed slots kept until needed),
+   `DS4_LEND` and `DS4_LEND_RING` (the chunk arena's bytes become ring slots, no fixed experts), and `DS4_RING_INFLIGHT=auto` (the
+   in-flight cap climbs on decode speed; a number or `fixed` keeps a fixed cap). `DS4_RING_INFLIGHT=fixed` is the old 12.
+   Rule 3 (`STRATA_LA_TAIL_READ=3`, the learned read-ahead) stays opt-in: today's numbers do not show a gain for it.
+   Best measured setup on this PC: 4.66-5.01 tok/s; with `auto` in-flight 4.88 (the spread of the runs, same prompts).
 3. The learned VRAM reserve counts the ring's slots as planned use (they are taken after the expert placement), so it does not grow
    because of them: 270 experts stay on the card start after start. A reserve raised by an engine before this fix (e.g. 1244 MiB)
    comes down only slowly; set its line in `<pack>/vram-reserve.txt` back once (926 MiB on a 3060 at 32K).
