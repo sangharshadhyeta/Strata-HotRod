@@ -3847,11 +3847,12 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
     env.setdefault("STRATA_TIMELINE_FILE", TIMELINE_FILE)     # the Monitor's decode timeline (timeline_view), off until switched on
     env.setdefault("STRATA_TIMELINE_CTL", TIMELINE_CTL)
     env.setdefault("STRATA_RESIDENCY_FILE", RESIDENCY_FILE)   # the Monitor's expert map (residency_view), written per swap round
-    if cfg.get("timeline") is not False:           # the Monitor's timeline runs from the start (config "timeline": false: off until switched on)
-        try:
-            set_timeline(True)
-        except OSError:
-            pass                                    # (the Monitor's switch still works)
+    # The Monitor's timeline is off until the Monitor's Record switches it on (config "timeline": true: on from the start), as on
+    # Qwen (Strata-HotRod main): always on, it cost Qwen 5-13% of the answer speed on 30 Oct.
+    try:
+        set_timeline(cfg.get("timeline") is True)
+    except OSError:
+        pass                                        # (the Monitor's switch still works)
     # Strict offline reaches children through the environment, because a tool subprocess or a model
     # loader is code this server does not own. Applied last so a profile's own `env` cannot remove
     # the policy by naming the same variable.
