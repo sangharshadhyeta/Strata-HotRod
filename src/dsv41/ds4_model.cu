@@ -1175,8 +1175,11 @@ struct Model::Impl {
     bool ring_inflight_auto = false;
     int ring_inflight_min_seen = 12, ring_inflight_max_seen = 12;
     int ring_dir = 1;
-    bool ring_have_prev = false, ring_have_base = false;
-    double ring_prev_tps = 0.0, ring_last_tps = 0.0;
+    bool ring_have_base = false;
+    double ring_last_tps = 0.0;
+    double ring_win[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // the last 8 measured windows' tokens/s (a ring: ring_wpos is the next slot)
+    int ring_wpos = 0, ring_nwin = 0;                 // the windows held (<= 8); cleared after each step
+    int ring_flips = 0, ring_base_step = 2, ring_last_step = 0;
     uint64_t ring_adj_tok = 0, ring_adj_chunk = 0;   // the token counter and the prompt-pass counter at the window's start
     std::chrono::steady_clock::time_point ring_adj_t0;
     std::atomic<uint64_t> prompt_passes{0};   // the prompt passes (forward_chunks, feed of 2+ tokens) so far: a window with one is not measured
@@ -7957,13 +7960,17 @@ struct Model::Impl {
         }
         ring_own.assign((size_t) g.nl, std::vector<int>());
         for (int il = 0; il < g.nl; ++il) ring_own[(size_t) il].assign((size_t) L[(size_t) il].n_exp, -1);
-        if (const char* v = std::getenv("DS4_RING_INFLIGHT")) {
-            if (std::strcmp(v, "auto") == 0) {   // (the cap starts at 12 and adapts)
-                ring_inflight_auto = true;
-                ring_inflight_max = 12;
-            } else {
-                ring_inflight_max = std::max(1, std::atoi(v));
-            }
+        // DS4_RING_INFLIGHT: unset or "auto" = the cap adapts (from 12); a number = that fixed cap; "fixed" = 12, fixed
+        const char* inv = std::getenv("DS4_RING_INFLIGHT");
+        if (inv == nullptr || std::strcmp(inv, "auto") == 0) {
+            ring_inflight_auto = true;
+            ring_inflight_max = 12;
+        } else if (std::strcmp(inv, "fixed") == 0) {
+            ring_inflight_auto = false;
+            ring_inflight_max = 12;
+        } else {
+            ring_inflight_auto = false;
+            ring_inflight_max = std::max(1, std::atoi(inv));
         }
         ring_inflight_min_seen = ring_inflight_max_seen = ring_inflight_max;
         ring_want = true;
@@ -8300,9 +8307,11 @@ struct Model::Impl {
             ring_aq.pop_front();
         }
     }
-    // (DS4_RING_INFLIGHT=auto; caller holds ring_mu; serve thread) the in-flight cap climbs on decode speed: every 32 decode tokens, the window's
-    // tokens/s (steady_clock). A window with a prompt pass in it is not measured: the baseline restarts. Else: dir flips when the window's tokens/s
-    // is under 0.98 of the previous window's; cap += 2 dir, kept in [8, ring_n].
+    // (DS4_RING_INFLIGHT=auto; caller holds ring_mu; serve thread) the in-flight cap climbs on decode speed. Every 32 decode tokens a window's
+    // tokens/s (steady_clock) is held in ring_win (the last 8). A window with a prompt pass in it is not measured: the baseline restarts. With 8
+    // held: avg_now = the mean of the last 4, avg_prev = the mean of the 4 before. |avg_now / avg_prev - 1| < 0.03 holds. Else a fall flips dir
+    // (the base step halves at each flip, to 1); cap += step dir, kept in [8, ring_n], and the 8 windows are cleared (the next comparison is at
+    // the new cap).
     void ring_inflight_adjust() {
         const auto now = std::chrono::steady_clock::now();
         const uint64_t passes = prompt_passes.load(std::memory_order_acquire);
@@ -8321,16 +8330,33 @@ struct Model::Impl {
         if (secs <= 0.0 || toks == 0) return;
         const double tps = (double) toks / secs;
         ring_last_tps = tps;
-        if (ring_have_prev && tps < ring_prev_tps * 0.98) ring_dir = -ring_dir;
-        ring_prev_tps = tps;
-        ring_have_prev = true;
-        int c = ring_inflight_max + 2 * ring_dir;
+        ring_win[ring_wpos] = tps;
+        ring_wpos = (ring_wpos + 1) % 8;
+        if (ring_nwin < 8) ++ring_nwin;
+        if (ring_nwin < 8) return;
+        double avg_now = 0.0, avg_prev = 0.0;
+        for (int k = 1; k <= 4; ++k) {
+            avg_now += ring_win[(ring_wpos - k + 8) % 8];
+            avg_prev += ring_win[(ring_wpos - k - 4 + 16) % 8];
+        }
+        avg_now /= 4.0;
+        avg_prev /= 4.0;
+        if (avg_prev <= 0.0 || std::fabs(avg_now / avg_prev - 1.0) < 0.03) return;   // (the dead band: hold)
+        if (avg_now < avg_prev) {
+            ring_dir = -ring_dir;
+            ++ring_flips;
+            ring_base_step = std::max(1, ring_base_step / 2);
+        }
+        const int step = std::max(1, ring_base_step);
+        int c = ring_inflight_max + step * ring_dir;
         c = std::min(ring_n, std::max(8, c));
         if (c != ring_inflight_max) {
             ring_inflight_max = c;
             ring_inflight_min_seen = std::min(ring_inflight_min_seen, c);
             ring_inflight_max_seen = std::max(ring_inflight_max_seen, c);
         }
+        ring_last_step = step;
+        ring_nwin = 0;   // (the next comparison uses 8 fresh windows at the new cap)
     }
     void ring_request(int li, const Req& r, int T) {
         if (li == 0) ++ring_tok;   // (serve_lane's thread only: the token's first trunk layer)
@@ -8509,7 +8535,7 @@ struct Model::Impl {
         if (ring_cost) std::fprintf(stderr, ", cost %.2f..%.2f us/MB, mean R %.2f", ring_cmin, ring_cmax, ring_rmean);
         if (lend_ring) std::fprintf(stderr, " x %llu", (unsigned long long) rc_xfill);   // (DS4_LEND_RING: fills into the chunk arena's slots)
         if (ring_inflight_auto)
-            std::fprintf(stderr, " cap %d (min %d, max %d, last window %.2f tok/s)", ring_inflight_max, ring_inflight_min_seen, ring_inflight_max_seen, ring_last_tps);   // (DS4_RING_INFLIGHT=auto)
+            std::fprintf(stderr, " cap %d (min %d, max %d, last window %.2f tok/s, step %d)", ring_inflight_max, ring_inflight_min_seen, ring_inflight_max_seen, ring_last_tps, ring_last_step);   // (DS4_RING_INFLIGHT=auto)
         std::fprintf(stderr, "\n");
     }
 
