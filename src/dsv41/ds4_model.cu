@@ -6242,7 +6242,15 @@ struct Model::Impl {
         if (avail == ~uint64_t{0}) return gb;
         // (the prompt buffers and the context's caches are touched after this point and, on such a machine, take RAM too: measured on
         // Strix Halo about 0.11 MB a token of context beyond 16384, a 40960 context ending 2.5 GB lower than a 16384 one)
-        const bool uma = avail0_ != ~uint64_t{0} && avail0_ > avail && (double) (avail0_ - avail) / 1e9 >= 4.0;
+        // (a unified-memory machine is the device's own answer - cudaDeviceProp.integrated - and the RAM drop only confirms it: on a
+        // discrete card the vision tower's host weights dropped free RAM by 4 GB and more, so the store was sized 0 at 262144 and
+        // the ring turned off, 1 Nov)
+        bool integrated = false;
+        if (!devs.empty()) {
+            cudaDeviceProp ip{};
+            integrated = cudaGetDeviceProperties(&ip, devs[0].id) == cudaSuccess && ip.integrated != 0;
+        }
+        const bool uma = integrated && avail0_ != ~uint64_t{0} && avail0_ > avail && (double) (avail0_ - avail) / 1e9 >= 4.0;
         const double ctx_gb = uma ? 1.1e-4 * std::max(0.0, (double) o.max_context - 16384.0) : 0.0;
         const double room = (double) avail / 1e9 - 12.0 - ctx_gb;
         const double now = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
