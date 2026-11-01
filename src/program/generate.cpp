@@ -319,7 +319,7 @@ cudaError_t adapt_copy_h2d(void* dst, const void* src, size_t bytes, cudaStream_
         (void) cudaGetLastError();   // not registered / not mapped: the ordinary copy
     }
 #endif
-    return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, st);
+    return strata::core::h2d_split(dst, src, bytes, st);   // a blob at a STRATA_PIN_SEGS segment's edge: copied in runs
 }
 int pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*>& live) {
     int failed = 0;   // ranges left pageable (a copy from them still works, through the driver's staging)

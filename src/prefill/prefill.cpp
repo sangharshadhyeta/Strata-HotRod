@@ -2,6 +2,7 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/dma_batch.hpp"   // h2d_split (the expert copies)
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
@@ -2793,7 +2794,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         static std::atomic<int> n_copy{0};
         const bool inject = fault_at > 0 && n_copy.fetch_add(1) + 1 == fault_at;
         if (inject) std::fprintf(stderr, "prefill: STRATA_PREFILL_FAULT_COPY=%d: this expert copy is made to fail (a test)\n", fault_at);
-        note_copy(cudaMemcpyAsync(inject ? nullptr : dst, src, bytes, cudaMemcpyHostToDevice, st));
+        // an expert blob may sit at a STRATA_PIN_SEGS segment's edge (part locked): h2d_split copies it in runs
+        note_copy(strata::core::h2d_split(inject ? nullptr : dst, src, bytes, st));
     };
     err.clear();
     // force_chunk is for this run only: taken before any early return can leave it to the next one

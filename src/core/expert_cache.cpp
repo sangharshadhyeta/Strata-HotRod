@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/dma_batch.hpp"   // h2d_split: a blob at a STRATA_PIN_SEGS segment's edge
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -684,8 +685,7 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
-                                          (cudaStream_t) stream);
+    const cudaError_t e = strata::core::h2d_split(dst, host_blob, n, (cudaStream_t) stream);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
         return false;
@@ -715,7 +715,12 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     std::memcpy(blocking_staging_, host_blob, n);
     const cudaError_t e = cudaMemcpy(dst, blocking_staging_, n, cudaMemcpyHostToDevice);
 #else
-    const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
+    cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
+    if (e == cudaErrorInvalidValue) {   // a blob at a STRATA_PIN_SEGS segment's edge: copied in runs, then waited for
+        (void) cudaGetLastError();
+        e = strata::core::h2d_split(dst, host_blob, n, (cudaStream_t) 0);
+        if (e == cudaSuccess) e = cudaStreamSynchronize((cudaStream_t) 0);
+    }
 #endif
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
@@ -733,7 +738,7 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
                              : "ExpertCache::fill_slot_queued: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    const cudaError_t e = strata::core::h2d_split(dst, host_blob, n, (cudaStream_t) 0);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
         return false;
@@ -755,8 +760,7 @@ bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, in
         return false;
     }
     for (int i = 0; i < n; ++i) {
-        const cudaError_t e = cudaMemcpyAsync(dst + parts[i].at, parts[i].p, (size_t) parts[i].n, cudaMemcpyHostToDevice,
-                                              (cudaStream_t) 0);
+        const cudaError_t e = strata::core::h2d_split(dst + parts[i].at, parts[i].p, (size_t) parts[i].n, (cudaStream_t) 0);
         if (e != cudaSuccess) {
             err = std::string("ExpertCache::fill_slot_queued_parts: ") + cudaGetErrorString(e);
             return false;

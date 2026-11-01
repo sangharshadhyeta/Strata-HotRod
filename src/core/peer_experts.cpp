@@ -2,6 +2,7 @@
 #include "strata/core/peer_experts.hpp"
 
 #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+#include "strata/core/dma_batch.hpp"   // h2d_split: a blob at a STRATA_PIN_SEGS segment's edge
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -358,8 +359,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         const int32_t slot = res_[out];
         const uint8_t* b = src_->blob(s.layer, s.in);
         if (slot < 0 || b == nullptr) continue;
-        if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(s.layer), cudaMemcpyHostToDevice,
-                                refill_), "refill", err))
+        if (!ck(strata::core::h2d_split(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(s.layer), refill_), "refill", err))
             return false;
         res_[out] = kNotResident;              // evicted now: the CPU computes it meanwhile
         pending_.emplace_back((int32_t) in, slot);

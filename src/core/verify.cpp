@@ -3898,7 +3898,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     // copied.
     const int batch_mode = strata::core::dma_batch_mode();
     if (batch_mode == 0) {
-        for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
+        for (int i = 0; i < n; ++i) strata::core::h2d_split(stage + (size_t) i * bytes, src[i], bytes, v->copy_);
     } else {
         const auto copied = strata::core::copy_expert_blobs(stage, src, n, bytes, v->copy_, batch_mode);
         if (copied != cudaSuccess) {
