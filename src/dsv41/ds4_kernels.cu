@@ -1825,7 +1825,10 @@ __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, 
 
 // DS4_PCIE_BALANCE's wait: one thread; returns at once when no pick of the token took the PCIe lane (*need 0); else spins until the copy's flag
 // carries the use's seq, and writes the cycles it spun (the host reads them: the late copies)
-__global__ void wait_pcie_kernel(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc) {
+// (bounded: after max_cyc cycles the wait gives up, counts an error in *err (the host prints it at the window's end and the picks are wrong
+// for that step - a loud error, not a freeze) and returns)
+__global__ void wait_pcie_kernel(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc, int* err,
+                                 long long max_cyc) {
     if (threadIdx.x != 0) return;
     if (*(volatile const int*) need == 0) {
         *wait_cyc = 0ull;
@@ -1833,6 +1836,10 @@ __global__ void wait_pcie_kernel(const int* need, const unsigned* seq_ptr, unsig
     }
     const long long t0 = clock64();
     while ((int) (*(volatile const unsigned*) seq_ptr - seq) < 0) {
+        if (clock64() - t0 > max_cyc) {
+            atomicAdd(err, 1);
+            break;
+        }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
@@ -2231,11 +2238,12 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 }
 }  // namespace
 
-void wait_pcie(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc, cudaStream_t s) {
+void wait_pcie(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc, int* err, long long max_cyc,
+               cudaStream_t s) {
 #if defined(STRATA_METAL)
-    (void) need; (void) seq_ptr; (void) seq; (void) wait_cyc; (void) s;
+    (void) need; (void) seq_ptr; (void) seq; (void) wait_cyc; (void) err; (void) max_cyc; (void) s;
 #else
-    wait_pcie_kernel<<<1, 32, 0, s>>>(need, seq_ptr, seq, wait_cyc);
+    wait_pcie_kernel<<<1, 32, 0, s>>>(need, seq_ptr, seq, wait_cyc, err, max_cyc);
 #endif
 }
 

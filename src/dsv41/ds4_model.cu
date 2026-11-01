@@ -1155,6 +1155,14 @@ struct Model::Impl {
         unsigned seq;
     };
     std::vector<PcPin> pc_pins;
+    std::thread pc_th;                  // the copies' thread: its own stream and queue (never the ring's)
+    cudaStream_t pc_st = nullptr;
+    std::mutex pc_qmu;
+    std::condition_variable pc_qcv;
+    bool pc_qquit = false;
+    int* pc_err = nullptr;              // device: the waits that gave up (the bound: pc_maxcyc cycles)
+    long long pc_maxcyc = 0;
+    uint64_t pc_timeouts = 0;
     struct PcCb {
         unsigned* flag;
         unsigned seq;
@@ -1299,10 +1307,59 @@ struct Model::Impl {
         cudaEvent_t wait_ev = nullptr;
         unsigned long long dst_dev = 0;
     };
+    // ---- DS4_PCIE_BALANCE copies (their own thread, stream and queue: a copy never waits behind a ring fill - the ring's fills wait for layers the
+    // copy's flag would be needed to reach, so sharing a queue deadlocked). Its only wait is the previous use's MoE end, which depends on that
+    // use's copy only and on earlier layers, all enqueued already.
+    void pc_do(const RingItem& it) {
+        if (it.wait_ev != nullptr) (void) cudaStreamWaitEvent(pc_st, it.wait_ev, 0);   // (the previous use's MoE: the staging is free)
+        uint8_t* dst = (uint8_t*) (uintptr_t) it.dst_dev;
+        bool ok = it.src != nullptr ? cudaMemcpyAsync(dst, it.src, it.bytes, cudaMemcpyHostToDevice, pc_st) == cudaSuccess
+                                    : cudaMemsetAsync(dst, 0, it.bytes, pc_st) == cudaSuccess;
+        if (!ok) {
+            (void) cudaGetLastError();
+            ++pc_fail;
+            (void) cudaMemsetAsync(dst, 0, it.bytes, pc_st);   // (the device computes zeros for it: no hang, no stale blob)
+        }
+        PcCb* cb = new PcCb{it.pc_flag, it.pc_seq};
+        if (cudaLaunchHostFunc(pc_st, pcie_done_cb, cb) != cudaSuccess) {
+            (void) cudaGetLastError();
+            delete cb;
+            (void) cudaStreamSynchronize(pc_st);
+            std::atomic_thread_fence(std::memory_order_release);
+            *(volatile unsigned*) it.pc_flag = it.pc_seq;
+        }
+        return;
+    }
+    void pc_loop() {
+        cudaSetDevice(devs[0].id);
+        std::unique_lock<std::mutex> lk(pc_qmu);
+        for (;;) {
+            pc_qcv.wait(lk, [this] { return !pc_q.empty() || pc_qquit; });
+            if (pc_q.empty()) break;
+            const RingItem it = pc_q.front();
+            pc_q.pop_front();
+            lk.unlock();
+            pc_do(it);
+            lk.lock();
+        }
+    }
+    // the PCIe copy thread's stop (at shutdown: nothing is queued then)
+    void pc_stop() {
+        if (!pc_th.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lk(pc_qmu);
+            pc_qquit = true;
+        }
+        pc_qcv.notify_all();
+        pc_th.join();
+        if (pc_st != nullptr) cudaStreamDestroy(pc_st);
+        pc_st = nullptr;
+    }
     std::thread ring_th;
     std::mutex ring_qmu;
     std::condition_variable ring_qcv, ring_donecv;
     std::deque<RingItem> ring_q;
+    std::deque<RingItem> pc_q;   // DS4_PCIE_BALANCE: the copies' queue (pc_loop); after RingItem
     uint64_t ring_pushed = 0, ring_handled = 0;
     bool ring_qquit = false;
     // DS4_LEND=1 (Avalon point 1): the chunked prompt pass's buffers (the big chain of alloc_chunks) live in one arena, and while no
@@ -1716,6 +1773,7 @@ struct Model::Impl {
         }
         quit.store(true);
         if (warm_bg.joinable()) warm_bg.join();   // (the warm-up uses the BLAS handles destroyed below)
+        pc_stop();   // (DS4_PCIE_BALANCE: the copies' thread and stream)
         if (lend_th.joinable()) {   // (DS4_LEND: the fill stops and its thread joins before the arena's streams and the devices go)
             {
                 std::lock_guard<std::mutex> lk(lend_mu);
@@ -3750,7 +3808,7 @@ struct Model::Impl {
     void pcie_upload_mt() {
         std::vector<int> mt(L.size() * 9, 0);
         for (size_t il = 0; il < L.size(); ++il) pc_table(il, &mt[il * 9]);
-        (void) cudaMemcpy(pc_mt, mt.data(), mt.size() * sizeof(int), cudaMemcpyHostToDevice);
+        (void) cudaMemcpyAsync(pc_mt, mt.data(), mt.size() * sizeof(int), cudaMemcpyHostToDevice, devs[0].st);
     }
     // after the ring's start (DS4_PCIE_BALANCE=1): the staging, the flags, the tables; off with a reason otherwise
     void pcie_init() {
@@ -3782,13 +3840,19 @@ struct Model::Impl {
                         hmap(pc_done, 2, err) && cudaMalloc((void**) &pc_need, sizeof(int)) == cudaSuccess &&
                         cudaMalloc((void**) &pc_wait, sizeof(unsigned long long) * (2 * kPcSlots + 1)) == cudaSuccess &&
                         cudaMalloc((void**) &pc_mt, sizeof(int) * L.size() * 9) == cudaSuccess &&
-                        cudaMalloc((void**) &pc_el, L.size() * nexp) == cudaSuccess;
+                        cudaMalloc((void**) &pc_el, L.size() * nexp) == cudaSuccess && cudaMalloc((void**) &pc_err, sizeof(int)) == cudaSuccess;
         if (!ok) {
             (void) cudaGetLastError();
             std::fprintf(stderr, "ds4: DS4_PCIE_BALANCE: off (the staging would not allocate: %.2f GB)\n", 2.0 * kPicks * (double) blob / 1e9);
             return;
         }
         (void) cudaMemset(pc_need, 0, sizeof(int));
+        (void) cudaMemset(pc_err, 0, sizeof(int));
+        if (cudaStreamCreateWithFlags(&pc_st, cudaStreamNonBlocking) != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "ds4: DS4_PCIE_BALANCE: off (the copy stream would not create)\n");
+            return;
+        }
         (void) cudaMemset(pc_wait, 0, sizeof(unsigned long long) * (2 * kPcSlots + 1));
         (void) cudaMemset(pc_el, 0, L.size() * nexp);
         pc_blob = blob;
@@ -3799,6 +3863,8 @@ struct Model::Impl {
         int khz = 0;
         if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, devs[0].id) == cudaSuccess && khz > 0) pc_khz = khz;
         pcie_upload_mt();
+        pc_maxcyc = (long long) (0.05 * (double) pc_khz * 1000.0);   // 50 ms of SM cycles
+        pc_th = std::thread([this] { pc_loop(); });
         pcie_on = true;
         std::fprintf(stderr, "ds4: DS4_PCIE_BALANCE: on (the misses the store holds may take a PCIe copy; staging %.2f GB)\n",
                      2.0 * kPicks * (double) blob / 1e9);
@@ -3807,6 +3873,17 @@ struct Model::Impl {
     // the device, the tables are refreshed
     void pcie_window() {
         std::vector<PcUse> done;
+        if (cudaStreamSynchronize(devs[0].st) != cudaSuccess) (void) cudaGetLastError();   // (the window's work is done: the reads below are safe)
+        {
+            int errs = 0;
+            (void) cudaMemcpy(&errs, pc_err, sizeof(int), cudaMemcpyDeviceToHost);
+            if (errs > 0) {
+                pc_timeouts += (uint64_t) errs;
+                std::fprintf(stderr, "ds4: DS4_PCIE_BALANCE: ERROR: %d copy wait(s) passed their %.0f ms bound (the picks taken over PCIe in them are wrong)\n",
+                             errs, 1000.0 * (double) pc_maxcyc / ((double) pc_khz * 1000.0));
+                (void) cudaMemset(pc_err, 0, sizeof(int));
+            }
+        }
         {
             std::lock_guard<std::mutex> lk(pc_mu);
             for (size_t i = 0; i < pc_uses.size();) {
@@ -3842,7 +3919,7 @@ struct Model::Impl {
             if (l.mtp) continue;
             for (int e = 0; e < l.n_exp; ++e) pc_el_h[il * pc_nexp + (size_t) e] = store->find((int) il, e) >= 0 ? 1 : 0;
         }
-        (void) cudaMemcpy(pc_el, pc_el_h.data(), pc_el_h.size(), cudaMemcpyHostToDevice);
+        (void) cudaMemcpyAsync(pc_el, pc_el_h.data(), pc_el_h.size(), cudaMemcpyHostToDevice, devs[0].st);
     }
     // serve thread (no CUDA call): the copies of this use's PCIe picks, into this use's staging. A blob the store holds is pinned for the copy
     // (released once its flag is seen); else the layer's host parts are built (pc_hstage). The copy waits for the previous use's MoE end.
@@ -3904,9 +3981,10 @@ struct Model::Impl {
             it.pc_seq = seq;
             it.wait_ev = prev;
             {
-                std::lock_guard<std::mutex> qk(ring_qmu);
-                ring_push_l(it);
+                std::lock_guard<std::mutex> qk(pc_qmu);
+                pc_q.push_back(it);
             }
+            pc_qcv.notify_one();
             if (pin >= 0) pc_pins.push_back({li, e, pin, &pc_done[par], seq});
             ++pc_sent;
         }
@@ -3930,9 +4008,9 @@ struct Model::Impl {
         for (const PcFit& f : pc_fit) ready += f.cok && f.gok ? 1 : 0;
         std::fprintf(stderr,
                      "ds4: request: pcie-balance: %llu picks sent, %llu landed in time, %llu late (waited > 0.1 ms), %llu copies failed, "
-                     "last m mean %.2f per use, fits ready %d of %zu\n",
+                     "last m mean %.2f per use, fits ready %d of %zu, timeouts %llu\n",
                      (unsigned long long) pc_sent, (unsigned long long) pc_landed, (unsigned long long) pc_late, (unsigned long long) pc_fail,
-                     pc_m_n ? (double) pc_m_sum / (double) pc_m_n : 0.0, ready, pc_fit.size());
+                     pc_m_n ? (double) pc_m_sum / (double) pc_m_n : 0.0, ready, pc_fit.size(), (unsigned long long) pc_timeouts);
     }
     void card_init() {
         card_n.assign(L.size(), 0);
@@ -8441,26 +8519,6 @@ struct Model::Impl {
             if (cudaStreamSynchronize(ring_st) != cudaSuccess) (void) cudaGetLastError();
             return;
         }
-        if (it.pc) {   // DS4_PCIE_BALANCE: the copy into the use's staging, then its flag (the device waits for it)
-            if (it.wait_ev != nullptr) (void) cudaStreamWaitEvent(ring_st, it.wait_ev, 0);   // (the previous use's MoE: the staging is free)
-            uint8_t* dst = (uint8_t*) (uintptr_t) it.dst_dev;
-            bool ok = it.src != nullptr ? cudaMemcpyAsync(dst, it.src, it.bytes, cudaMemcpyHostToDevice, ring_st) == cudaSuccess
-                                        : cudaMemsetAsync(dst, 0, it.bytes, ring_st) == cudaSuccess;
-            if (!ok) {
-                (void) cudaGetLastError();
-                ++pc_fail;
-                (void) cudaMemsetAsync(dst, 0, it.bytes, ring_st);   // (the device computes zeros for it: no hang, no stale blob)
-            }
-            PcCb* cb = new PcCb{it.pc_flag, it.pc_seq};
-            if (cudaLaunchHostFunc(ring_st, pcie_done_cb, cb) != cudaSuccess) {
-                (void) cudaGetLastError();
-                delete cb;
-                (void) cudaStreamSynchronize(ring_st);
-                std::atomic_thread_fence(std::memory_order_release);
-                *(volatile unsigned*) it.pc_flag = it.pc_seq;
-            }
-            return;
-        }
         Layer& l = L[(size_t) it.layer];
         const size_t k = (size_t) it.k;
         if (it.fill) {
@@ -12242,8 +12300,8 @@ struct Model::Impl {
                 pr.need = pc_need;
                 bool room = false;
                 {
-                    std::lock_guard<std::mutex> qk(ring_qmu);
-                    room = ring_q.size() < 4 * (size_t) ring_n;
+                    std::lock_guard<std::mutex> qk(pc_qmu);   // (the copies' own queue: copies are never dropped, so a full one means no use)
+                    room = pc_q.size() < 64;
                 }
                 const bool staging_free = pc_last[pc_par] == nullptr || cudaEventQuery(pc_last[pc_par]) == cudaSuccess;
                 if (room && staging_free) {
@@ -12305,7 +12363,7 @@ struct Model::Impl {
                     });
                 }
                 const double m0 = tlog2 ? now_ms() : 0.0;
-                if (pc_try) wait_pcie(pc_need, &pc_done[pc_par], sq, pc_wait + pc_slot, s);   // (the PCIe copies' flag, before the gate_up reads them)
+                if (pc_try) wait_pcie(pc_need, &pc_done[pc_par], sq, pc_wait + pc_slot, pc_err, pc_maxcyc, s);   // (the PCIe copies' flag, before the gate_up reads them)
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
                 const double m1 = tlog2 ? now_ms() : 0.0;

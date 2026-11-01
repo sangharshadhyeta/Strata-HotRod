@@ -279,7 +279,8 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const PcieRoute* pc = nullptr);
 /// DS4_PCIE_BALANCE's device wait: returns at once when *need is 0; else spins until *seq_ptr == seq (the copy's flag), and writes the cycles it spun
 /// to *wait_cyc (device). Enqueued after route_publish on the stream, before the expert kernels.
-void wait_pcie(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc, cudaStream_t s);
+void wait_pcie(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc, int* err, long long max_cyc,
+               cudaStream_t s);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
