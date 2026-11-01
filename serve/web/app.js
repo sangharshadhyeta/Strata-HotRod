@@ -784,7 +784,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   } else if (live.state === "generating") {
     label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
     delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
+    // the total is max_tokens (the rest of the context when the client sends no cap); a log scale - fast at first, slower towards
+    // the end, full exactly at the total (of 262144: 100 tokens 37%, 1000 55%, 10000 74%, 100000 92%)
+    pct = live.max_tokens ? Math.min(100, (100 * Math.log1p(live.generated || 0)) / Math.log1p(live.max_tokens)) : 0;
     detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
   } else if (live.state === "unloaded") {
     label = "Unloaded";
