@@ -1168,11 +1168,18 @@ struct Model::Impl {
     };
     bool ring_want = false, ring_on = false;
     int ring_n = 0, ring_inflight_max = 12;
-    // DS4_RING_INFLIGHT=auto: the in-flight cap adapts (AIMD, ring_inflight_adjust, every 16 tokens, serve thread under ring_mu): +2 while the
-    // throttle bites and the late share is under 0.15, x3/4 (at least 4) above 0.30. The cap and its range since start are on the request line.
+    // DS4_RING_INFLIGHT=auto: the in-flight cap climbs on decode speed (ring_inflight_adjust, every 32 decode tokens, serve thread under ring_mu):
+    // a hill climb - the step is 2 in dir, and dir flips when the window's tokens/s fell under 0.98 of the previous window's. A window with a
+    // prompt pass in it (forward_chunks, or a feed of 2+ tokens) is not measured: its baseline is reset. The cap and its range since start,
+    // and the last window's tokens/s, are on the request line.
     bool ring_inflight_auto = false;
     int ring_inflight_min_seen = 12, ring_inflight_max_seen = 12;
-    uint64_t ring_adj_tok = 0, ring_adj_landed = 0, ring_adj_late = 0, ring_adj_thr = 0;   // the counters at the last adjustment
+    int ring_dir = 1;
+    bool ring_have_prev = false, ring_have_base = false;
+    double ring_prev_tps = 0.0, ring_last_tps = 0.0;
+    uint64_t ring_adj_tok = 0, ring_adj_chunk = 0;   // the token counter and the prompt-pass counter at the window's start
+    std::chrono::steady_clock::time_point ring_adj_t0;
+    std::atomic<uint64_t> prompt_passes{0};   // the prompt passes (forward_chunks, feed of 2+ tokens) so far: a window with one is not measured
     // DS4_LEND_RING (with DS4_LEND): the ring's own slots are [0, ring_n0) (ring_buf); the slots from ring_n0 up are the chunk arena's
     // (lend_base), which the ring takes while no chunked pass runs (ring_x_on). Without DS4_LEND_RING ring_n0 == ring_n, always.
     int ring_n0 = 0;
@@ -8290,19 +8297,32 @@ struct Model::Impl {
             ring_aq.pop_front();
         }
     }
-    // (DS4_RING_INFLIGHT=auto; caller holds ring_mu; serve thread) the in-flight cap from the counters since the last adjustment: the copies that
-    // landed in time, the late ones and the throttled fills. Throttled and late share under 0.15: +2 (at most ring_n). Late share over 0.30: x3/4
-    // (at least 4). Else unchanged.
+    // (DS4_RING_INFLIGHT=auto; caller holds ring_mu; serve thread) the in-flight cap climbs on decode speed: every 32 decode tokens, the window's
+    // tokens/s (steady_clock). A window with a prompt pass in it is not measured: the baseline restarts. Else: dir flips when the window's tokens/s
+    // is under 0.98 of the previous window's; cap += 2 dir, kept in [8, ring_n].
     void ring_inflight_adjust() {
-        const uint64_t dl = rc_landed - ring_adj_landed, dd = rc_late - ring_adj_late, dt = rc_throttled - ring_adj_thr;
-        ring_adj_landed = rc_landed;
-        ring_adj_late = rc_late;
-        ring_adj_thr = rc_throttled;
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t passes = prompt_passes.load(std::memory_order_acquire);
+        if (!ring_have_base || passes != ring_adj_chunk) {   // (no baseline yet, or a prompt pass ran in the window: start a new one)
+            ring_have_base = true;
+            ring_adj_chunk = passes;
+            ring_adj_tok = ring_tok;
+            ring_adj_t0 = now;
+            return;
+        }
+        const double secs = std::chrono::duration<double>(now - ring_adj_t0).count();
+        const uint64_t toks = ring_tok - ring_adj_tok;
         ring_adj_tok = ring_tok;
-        const double late_share = (double) dd / (double) std::max<uint64_t>(1, dl + dd);
-        int c = ring_inflight_max;
-        if (dt > 0 && late_share < 0.15) c = std::min(ring_n, c + 2);
-        else if (late_share > 0.30) c = std::max(4, c * 3 / 4);
+        ring_adj_t0 = now;
+        ring_adj_chunk = passes;
+        if (secs <= 0.0 || toks == 0) return;
+        const double tps = (double) toks / secs;
+        ring_last_tps = tps;
+        if (ring_have_prev && tps < ring_prev_tps * 0.98) ring_dir = -ring_dir;
+        ring_prev_tps = tps;
+        ring_have_prev = true;
+        int c = ring_inflight_max + 2 * ring_dir;
+        c = std::min(ring_n, std::max(8, c));
         if (c != ring_inflight_max) {
             ring_inflight_max = c;
             ring_inflight_min_seen = std::min(ring_inflight_min_seen, c);
@@ -8325,7 +8345,7 @@ struct Model::Impl {
             return;
         }
         ring_reap();
-        if (ring_inflight_auto && ring_tok - ring_adj_tok >= 16) ring_inflight_adjust();   // (DS4_RING_INFLIGHT=auto: every 16 tokens, ring_mu held)
+        if (ring_inflight_auto && ring_tok - ring_adj_tok >= 32) ring_inflight_adjust();   // (DS4_RING_INFLIGHT=auto: every 32 decode tokens, ring_mu held)
         Layer& l = L[(size_t) li];
         for (int k = 0; k < ring_n; ++k) {
             RingSlot& s = ring_s[(size_t) k];
@@ -8486,7 +8506,7 @@ struct Model::Impl {
         if (ring_cost) std::fprintf(stderr, ", cost %.2f..%.2f us/MB, mean R %.2f", ring_cmin, ring_cmax, ring_rmean);
         if (lend_ring) std::fprintf(stderr, " x %llu", (unsigned long long) rc_xfill);   // (DS4_LEND_RING: fills into the chunk arena's slots)
         if (ring_inflight_auto)
-            std::fprintf(stderr, " cap %d (min %d, max %d)", ring_inflight_max, ring_inflight_min_seen, ring_inflight_max_seen);   // (DS4_RING_INFLIGHT=auto)
+            std::fprintf(stderr, " cap %d (min %d, max %d, last window %.2f tok/s)", ring_inflight_max, ring_inflight_min_seen, ring_inflight_max_seen, ring_last_tps);   // (DS4_RING_INFLIGHT=auto)
         std::fprintf(stderr, "\n");
     }
 
@@ -10762,6 +10782,7 @@ struct Model::Impl {
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
         if (n < 1) return true;
+        prompt_passes.fetch_add(1, std::memory_order_acq_rel);   // (DS4_RING_INFLIGHT=auto: the window with it is not measured)
         flow_used.store(true);
         std::lock_guard<std::mutex> warm_lk(warm_mu);   // (the warm-up, if it is running, finishes first)
         if (lend_on) lend_reclaim();   // (DS4_LEND: the warm-up's end may have asked for a fill after the feed's reclaim: stopped before the pass writes the arena)
@@ -12208,6 +12229,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
     p.pm.last = -1;
     p.halted = false;
+    if (n >= 2) p.prompt_passes.fetch_add(1, std::memory_order_acq_rel);   // (DS4_RING_INFLIGHT=auto: a multi-token feed is a prompt's, not decode)
     if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "feed n %d chunk %d chunk_min %d\n", n, p.chunk, p.chunk_min);
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
@@ -12224,6 +12246,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     Impl& p = *p_;
     p.pm.last = -1;
     p.halted = false;
+    if (n >= 2) p.prompt_passes.fetch_add(1, std::memory_order_acq_rel);   // (as feed: a prompt's run)
     const double t0 = now_ms();
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
         if (p.lend_on) p.lend_reclaim();   // (DS4_LEND: as feed's)
