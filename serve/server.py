@@ -2318,6 +2318,13 @@ def vision_start_error(line: str, log=None) -> str:
     return "the vision encoder did not start: " + text
 
 
+#: The picture formats Pillow may open (docs/DETAILS.md: JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF; a phone's MPO file is
+#: opened by the JPEG entry).  Pillow picks the decoder from the file's first bytes, so without this list a crafted JPEG 2000
+#: (GHSA-78g4-xqwv-q3g8: OpenJPEG heap overflow in Pillow 11.1.0 to 12.3.0) was reachable from a picture request.
+#: Port of upstream 8181522f1 (the DeepSeek reader's list is not in this fork).
+PICTURE_FORMATS = ("JPEG", "PNG", "GIF", "BMP", "WEBP", "TIFF", "AVIF")
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -2481,7 +2488,7 @@ class Vision:
         try:
             import io
             from PIL import Image
-            with Image.open(io.BytesIO(data)) as im:
+            with Image.open(io.BytesIO(data), formats=PICTURE_FORMATS) as im:
                 return im.getexif().get(0x0112, 1) not in (None, 0, 1)
         except Exception:  # noqa: BLE001 - any failure leaves the image as it was sent
             return False
@@ -2501,7 +2508,7 @@ class Vision:
             raise ValueError("this image format needs Pillow (python -m pip install pillow); JPEG, PNG, BMP and "
                              "GIF work without it") from None
         try:
-            im = Image.open(io.BytesIO(data))
+            im = Image.open(io.BytesIO(data), formats=PICTURE_FORMATS)
             im.load()
             from PIL import ImageOps
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
