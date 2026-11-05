@@ -1278,6 +1278,7 @@ struct Model::Impl {
     // past 256). sf_off / sf_fail: the stand-in outcomes by the router's pick rank (Req::sub: 1 replaced, 2 stayed off the card = a failure),
     // sfail[r] = (sf_fail + 1) / (sf_off + 2), decayed past 1024. Measured live; no routing decision reads them.
     bool ring_worth2 = false;
+    int ring_only_mask = 7;   // DS4_RING_ONLY: bit q = pass q (1, 2, 4 ahead) may fill; 7 (unset): every pass
     double cw_n[3][kAhead1] = {}, cw_val[3][kAhead1] = {};
     double sf_off[kPicks] = {}, sf_fail[kPicks] = {};
     // DS4_RING_STICKY=1 (read at ring start): a landed slot stays (its table entry set) until a fill needs its room. A fill with no free slot
@@ -8441,6 +8442,16 @@ struct Model::Impl {
         if (const char* v = std::getenv("DS4_RING_FAR")) ring_far = std::atoi(v) != 0;   // (DS4_RING_FAR=1: the guesses 4 layers ahead too)
         if (const char* v = std::getenv("DS4_RING_WORTH")) ring_worth = std::atoi(v) != 0;   // (DS4_RING_WORTH=1: the passes by measured worth; implies the far pass)
         if (ring_worth) ring_far = true;
+        // DS4_RING_ONLY=<distances> (opt-in; unset: every pass): the ring copies only the guesses of the distances named - "4": only the
+        // 4-ahead ones (implies the far pass), "1,4", "2,4"... (6 Nov: 4-ahead copies paid 46-58%, next-layer ones 22-27%)
+        if (const char* v = std::getenv("DS4_RING_ONLY")) {
+            ring_only_mask = 0;
+            for (const char* c = v; *c; ++c) ring_only_mask |= *c == '1' ? 1 : *c == '2' ? 2 : *c == '4' ? 4 : 0;
+            if (ring_only_mask == 0) ring_only_mask = 7;
+            if (ring_only_mask & 4) ring_far = true;
+            std::fprintf(stderr, "ds4: ring: copies only from the guesses %s%s%s layers ahead (DS4_RING_ONLY)\n", ring_only_mask & 1 ? "1 " : "",
+                         ring_only_mask & 2 ? "2 " : "", ring_only_mask & 4 ? "4 " : "");
+        }
         ring_worth2 = ring_worth && std::atoi(std::getenv("DS4_RING_WORTH")) == 2;   // (=2: every guess ranked by its own cell)
         ring_sticky = on_with_ring("DS4_RING_STICKY");   // (on with the ring: DS4_RING_STICKY=0 for the old ring)
         if (const char* v = std::getenv("DS4_RING_MOVE")) ring_move = std::atoi(v) != 0;
@@ -9065,7 +9076,7 @@ struct Model::Impl {
             int nc = 0;
             const bool explore = ++ring_wreq % 8 == 0;
             for (int q = 0; q < np; ++q) {
-                if (r.na[q] <= 0 || li + (q == 2 ? 4 : q + 1) >= g.nl) continue;
+                if (r.na[q] <= 0 || li + (q == 2 ? 4 : q + 1) >= g.nl || !(ring_only_mask & (1 << q))) continue;
                 const int m = std::min(r.na[q], q == 0 ? kAhead1 : kPicks);
                 for (int i = 0; i < m; ++i) {
                     const double cn = cw_n[q][i];
@@ -9081,7 +9092,8 @@ struct Model::Impl {
                 }
             for (int c = 0; c < nc; ++c) fill(cs[c].q, cs[c].i, cs[c].i + 1);
         } else {
-            for (int pi = 0; pi < np; ++pi) fill(order[pi], 0, kAhead1);
+            for (int pi = 0; pi < np; ++pi)
+                if (ring_only_mask & (1 << order[pi])) fill(order[pi], 0, kAhead1);   // (DS4_RING_ONLY: the passes it names only)
         }
     }
     // (the host thread at request end and at shutdown: queued fills synced and reaped, then the frees queued and synced; the frees' table
