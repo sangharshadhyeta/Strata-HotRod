@@ -45,19 +45,28 @@ Nothing leaves your PC.</p>
 
 <div align="justify">
 
-A fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). For Qwen, Strata keeps the
-experts in RAM, so its setup asks for 64 GB. This fork spreads them over the card, RAM and the SSD, and reads what does
-not fit from the SSD, so the 78 GB IQ3_S runs on 30 GB. It also makes that path faster and keeps answers correct while
-doing it.
+A fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). Strata keeps Qwen's experts in
+RAM and reads from the SSD when RAM is short; its docs call that path much slower. This fork works on that path: it
+spreads the experts over the card, RAM and the SSD and guesses ahead which ones to read, so the 78 GB IQ3_S runs on 30 GB
+of RAM at 50-70 tokens/s.
 
 </div>
 
-<table width="100%">
-<tr><th align="left"></th><th align="left">Strata (Qwen)</th><th align="left">Strata-HotRod</th></tr>
-<tr><td align="left"><b>Where the experts live</b></td><td align="left">in RAM</td><td align="left">card, then RAM, then SSD</td></tr>
-<tr><td align="left"><b>RAM the setup asks for</b></td><td align="left">64 GB</td><td align="left">30 GB (what it was run on)</td></tr>
-<tr><td align="left"><b>A model bigger than RAM</b></td><td align="left">no</td><td align="left">yes: 78 GB of files on 30 GB</td></tr>
-</table>
+## Can Qwen3.8-Flash-Next run on an RTX 3060 12 GB with low RAM?
+
+<div align="justify">
+
+**Yes.** On one RTX 3060 12 GB with 30 GB of RAM and an NVMe SSD, this fork runs Qwen3.8-Flash-Next (Qwen 3.8 Flash Next,
+125B) as the 78 GB IQ3_S at **50-70 tokens/s** (131K context; 262K fits). The experts that do not fit in RAM are read from
+the SSD, and a look-ahead guesses ahead which ones. Measured on one PC: see [How fast](#how-fast) and the "Not tested"
+list at the bottom.
+
+**How much RAM does it need?** This fork was measured on 30 GB. Strata's setup recommends 64 GB for IQ3_S and says that
+with less RAM it reads the rest from the SSD, much slower.
+
+**Does it need a cloud service?** No. Everything runs on your PC. Setup downloads the model once from Hugging Face.
+
+</div>
 
 > **Tested on one machine, with one model.** Other cards, AMD, Windows, macOS and other model sizes may work in upstream
 > Strata; we have not run them, so we do not describe them here.
