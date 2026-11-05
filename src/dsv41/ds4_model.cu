@@ -1092,6 +1092,9 @@ struct Model::Impl {
     // picks by rank on Sun: 97 91 81 70 57 41 %, past the top 6 29 20 %: reads wasted on an SSD-bound PC).
     int ahead_mode = std::getenv("DS4_AHEAD") ? std::atoi(std::getenv("DS4_AHEAD")) : 1;
     int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
+    // DS4_LA_AHEAD2=1 (opt-in): with the learner's stage on a layer, the guesses 2 layers ahead are published too (la_stage already computes
+    // that row of glog_a for every layer; only the top-k pass over it is added) - for the ring's pass 1 and the store's read-ahead
+    bool la_ahead2 = std::getenv("DS4_LA_AHEAD2") != nullptr && std::atoi(std::getenv("DS4_LA_AHEAD2")) != 0;
     // STRATA_LA_LEARN (ds4_lalearn.cuh): the learned look-ahead.  la_on: the learner is up; la_win: this window is a decode token that
     // runs the learner's stages (set in forward); la_toks: the decode tokens counted for the periodic save
     bool la_on = false, la_win = false;
@@ -8875,8 +8878,13 @@ struct Model::Impl {
         const int np = ring_far ? 3 : 2;
         int order[3] = {0, 1, 2};
         if (ring_worth) {
-            bool warm = true;   // (until every pass has 32 counts: the fixed order)
-            for (int d = 0; d < 3; ++d) warm = warm && rw_n[d] >= 32.0;
+            // (until every pass that has guesses this request has 32 counts: the fixed order; a pass with none - e.g. no 2-ahead guesses
+            // without DS4_LA_AHEAD2 - is not waited for: 6 Nov, rw1 never left the fixed order because pass 1 made no copies)
+            bool live[3] = {false, false, false}, warm = false;
+            for (int d = 0; d < np; ++d) live[d] = r.na[d] > 0;
+            for (int d = 0; d < np; ++d)
+                if (live[d]) warm = true;
+            for (int d = 0; d < np; ++d) warm = warm && (!live[d] || rw_n[d] >= 32.0);
             if (warm) {
                 const double w[3] = {rw_n[0] < 1.0 ? 0.0 : rw_pay[0] / rw_n[0], rw_n[1] < 1.0 ? 0.0 : rw_pay[1] / rw_n[1],
                                      rw_n[2] < 1.0 ? 0.0 : rw_pay[2] / rw_n[2]};
@@ -8887,9 +8895,10 @@ struct Model::Impl {
                         order[b] = tmp;
                     }
                 if (++ring_wreq % 8 == 0) {   // (exploration: the pass with the fewest counts goes first, the rest keep the worth order)
-                    int lo = 0;
-                    for (int d = 1; d < 3; ++d)
-                        if (rw_n[d] < rw_n[lo]) lo = d;
+                    int lo = -1;   // (among the passes with guesses this request)
+                    for (int d = 0; d < np; ++d)
+                        if (live[d] && (lo < 0 || rw_n[d] < rw_n[lo])) lo = d;
+                    if (lo < 0) lo = order[0];
                     int pos = 0;
                     while (order[pos] != lo) ++pos;
                     for (; pos > 0; --pos) order[pos] = order[pos - 1];
@@ -12383,7 +12392,8 @@ struct Model::Impl {
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
             int na[3] = {0, 0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
-            for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+            const int a_max = la_lay && la_ahead2 && ahead_mode > 0 ? 2 : std::min(2, ahead_mode);   // (DS4_LA_AHEAD2: the learner's 2-ahead row too)
+            for (int a = 1; lead && a <= a_max; ++a) {
                 const Layer* nx = ahead_layer(L0, a);
                 if (nx == nullptr) break;
                 const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
