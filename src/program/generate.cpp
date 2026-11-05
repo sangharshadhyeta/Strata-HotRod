@@ -16700,6 +16700,11 @@ int main(int argc, char** argv) {
                                      (unsigned long long) (ic.pf_dropped - ic_prev.pf_dropped), stale_txt,
                                      (double) (ic.crit_us - ic_prev.crit_us) / 1e3,
                                      (unsigned long long) (ic.crit_n - ic_prev.crit_n));
+                    // STRATA_IO_PF_THREADS=auto: the guess cap now and its range since start (opt-in, untested)
+                    if (src.io_guess_auto())
+                        std::fprintf(stderr, "; guess reads cap %llu (min %llu, max %llu, %llu moves)", (unsigned long long) ic.guess_cap,
+                                     (unsigned long long) ic.guess_cap_min, (unsigned long long) ic.guess_cap_max,
+                                     (unsigned long long) ic.guess_moves);
                     // STRATA_IO_TIMERS=1: where the host's fetch time went this request (totals; divide by the decode windows of the timing line)
                     if (ic.blob_us != ic_prev.blob_us || ic.pf_fill_us != ic_prev.pf_fill_us)
                         std::fprintf(stderr, "; blob() %llu calls %.1f ms (lock %.1f, waits on fills %.1f); prefetch %llu calls: residency "

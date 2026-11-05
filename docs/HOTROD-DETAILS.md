@@ -24,6 +24,9 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
   threads, the next layer's first** (`STRATA_IO_PF_THREADS`, `STRATA_IO_EDF=0` for the old way): only about 3,000 of
   25,000 experts read ahead per answer were used, and 8 threads' wasted reads queued in front of the decode's own.
   +8% code, +15% reasoning, +8% prose, drive wait 3.8-4.7 s down to 2.8-3.0 s (two runs each, all answers right).
+- **STRATA_IO_PF_THREADS=auto (opt-in, untested).** Eight read-ahead workers start, and the guesses in flight (from 2, 1-8)
+  follow the decode's own file reads: every 64 reads, above 1.5 times the lowest us-per-MB seen one guess less, below 1.2
+  times with a guess held back one more. Demand reads are never capped. Not measured on this box yet.
 - **Starting the answer warm.** The experts the end of the prompt used most are put on the card before the first word
   of the answer, so decode does not start cold.
 - **Picking up a conversation.** A long conversation's state is saved to the SSD, and its next turn reloads it instead of

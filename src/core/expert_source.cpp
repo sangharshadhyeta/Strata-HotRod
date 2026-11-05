@@ -674,6 +674,10 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     c.pf_stale = io_pf_stale_.load(std::memory_order_relaxed);
     c.pf_used = io_pf_used_.load(std::memory_order_relaxed);
     c.pf_unused = io_pf_unused_.load(std::memory_order_relaxed);
+    c.guess_cap = (uint64_t) io_guess_cap_.load(std::memory_order_relaxed);
+    c.guess_cap_min = (uint64_t) io_guess_cap_min_.load(std::memory_order_relaxed);
+    c.guess_cap_max = (uint64_t) io_guess_cap_max_.load(std::memory_order_relaxed);
+    c.guess_moves = io_guess_moves_.load(std::memory_order_relaxed);
     c.ra_held = ra_held_.load(std::memory_order_relaxed);
     c.ra_issued = ra_issued_total_.load(std::memory_order_relaxed);
     for (int di = 0; di < 3; ++di)
@@ -722,7 +726,24 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     // default 2 since 24 Oct (was 8): of ~25,000 guesses read ahead only ~3,000 were used, and 8 threads' wasted reads queued in
     // front of the decode's own reads on the drive; 2 threads: +8% code, +15% reasoning, +8% prose, drive wait 3.8-4.7 -> 2.5-3.3 s
     // (two runs each, IQ3_S on the 3060 box's NVMe).  STRATA_IO_PF_THREADS=<n> sets it
-    io_threads_ = threads > 0 ? threads : 2;
+    // STRATA_IO_PF_THREADS=auto (opt-in, untested): eight workers, and the guesses in flight follow the decode's read times (auto_read)
+    const char* pft = std::getenv("STRATA_IO_PF_THREADS");
+    io_auto_ = pft != nullptr && std::strcmp(pft, "auto") == 0;
+    io_threads_ = io_auto_ ? 8 : (threads > 0 ? threads : 2);
+    io_guess_busy_ = 0;
+    io_guess_held_ = false;
+    io_guess_cap_.store(2, std::memory_order_relaxed);
+    io_guess_cap_min_.store(2, std::memory_order_relaxed);
+    io_guess_cap_max_.store(2, std::memory_order_relaxed);
+    io_guess_moves_.store(0, std::memory_order_relaxed);
+    auto_n_.store(0, std::memory_order_relaxed);
+    auto_us_.store(0, std::memory_order_relaxed);
+    auto_bytes_.store(0, std::memory_order_relaxed);
+    auto_floor_ = 0.0;
+    auto_moves_said_ = 0;
+    auto_said_ = std::chrono::steady_clock::time_point{};
+    if (io_auto_)
+        std::fprintf(stderr, "FileExpertSource: guess reads in flight set by the decode's read times (STRATA_IO_PF_THREADS=auto, 1-8)\n");
     if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::atoi(v) != 0;
     if (const char* v = std::getenv("STRATA_IO_DEMAND_FIRST")) io_demand_first_ = std::atoi(v) != 0;
     if (const char* v = std::getenv("STRATA_IO_EDF")) io_edf_ = std::atoi(v) != 0;
@@ -783,6 +804,7 @@ void FileExpertSource::io_stop() {
 #endif
     io_fds_.clear();
     io_pf_ = false;
+    io_auto_ = false;   // STRATA_IO_PF_THREADS=auto: the cap's hooks follow io_pf_
     io_quit_ = false;
 }
 
@@ -1028,7 +1050,12 @@ void FileExpertSource::io_worker() {
             std::unique_lock<std::mutex> lk(io_mu_);
             // a guess may start: one is queued and (STRATA_IO_PF_YIELD) the decode is not reading its own blobs right now
             auto guess_ok = [&] {
-                return !io_q_.empty() && !(io_yield_ && io_demand_active_.load(std::memory_order_relaxed) > 0);
+                if (io_q_.empty() || (io_yield_ && io_demand_active_.load(std::memory_order_relaxed) > 0)) return false;
+                if (io_auto_ && io_guess_busy_ >= io_guess_cap_.load(std::memory_order_relaxed)) {   // STRATA_IO_PF_THREADS=auto: the cap holds it
+                    io_guess_held_ = true;
+                    return false;
+                }
+                return true;
             };
             bool picked = false;
             while (!picked) {
@@ -1073,7 +1100,21 @@ void FileExpertSource::io_worker() {
                     picked = true;
                 }
             }
+            if (io_auto_ && !demand) ++io_guess_busy_;   // a guess in flight: given back by GuessSlot when its read ends
         }
+        // STRATA_IO_PF_THREADS=auto: the guess's place is given back on every path out of this iteration
+        struct GuessSlot {
+            FileExpertSource* s;
+            bool on;
+            ~GuessSlot() {
+                if (!on) return;
+                {
+                    std::lock_guard<std::mutex> lk(s->io_mu_);
+                    --s->io_guess_busy_;
+                }
+                s->io_cv_.notify_all();
+            }
+        } guess_slot{this, io_auto_ && !demand};
         struct Busy {   // counted busy for the whole read (every path out of this iteration)
             std::atomic<int>& b;
             explicit Busy(std::atomic<int>& x) : b(x) { b.fetch_add(1, std::memory_order_relaxed); }
@@ -1785,6 +1826,7 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
     if (ok) {
         file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
         file_blob_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+        if (io_auto_) auto_read(us, layer_blob_bytes_[(size_t) layer]);   // STRATA_IO_PF_THREADS=auto: the decode's file reads set the guess cap
     }
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -1795,6 +1837,46 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
         }
     }
     stage_cv_.notify_all();
+}
+
+// STRATA_IO_PF_THREADS=auto: one of the decode's own file reads (publish_stage: fill_stage's reads on the decode thread or its fill
+// helpers).  Every 64 reads the window's mean us per MB moves the guess cap.  The sums are atomics, so a read takes no lock; the
+// 64th read takes io_mu_ for the look.  A read whose sums land between the look's reset and its count joins the next look.
+void FileExpertSource::auto_read(double us, uint64_t bytes) {
+    auto_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
+    auto_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    if (auto_n_.fetch_add(1, std::memory_order_relaxed) + 1 < 64) return;
+    std::lock_guard<std::mutex> lk(io_mu_);
+    if (auto_n_.load(std::memory_order_relaxed) < 64) return;   // another thread took this window's look
+    const uint64_t sum_us = auto_us_.exchange(0, std::memory_order_relaxed);
+    const uint64_t sum_b = auto_bytes_.exchange(0, std::memory_order_relaxed);
+    auto_n_.store(0, std::memory_order_relaxed);
+    const bool held = io_guess_held_;
+    io_guess_held_ = false;
+    if (sum_b == 0) return;
+    const double mean = (double) sum_us / ((double) sum_b / 1048576.0);   // us per MB
+    if (auto_floor_ <= 0.0 || mean < auto_floor_) auto_floor_ = mean;
+    const int was = io_guess_cap_.load(std::memory_order_relaxed);
+    int cap = was;
+    if (mean > 1.5 * auto_floor_) cap = std::max(1, cap - 1);                 // the decode's reads wait on the drive: one guess less
+    else if (mean < 1.2 * auto_floor_ && held) cap = std::min(8, cap + 1);   // they hardly do, and a guess waited: one more
+    auto_floor_ *= 1.01;                                                      // re-learns: a floor no read has reached again rises
+    if (cap != was) {
+        io_guess_cap_.store(cap, std::memory_order_relaxed);
+        io_guess_moves_.fetch_add(1, std::memory_order_relaxed);
+        ++auto_moves_said_;
+        if (cap < io_guess_cap_min_.load(std::memory_order_relaxed)) io_guess_cap_min_.store(cap, std::memory_order_relaxed);
+        if (cap > io_guess_cap_max_.load(std::memory_order_relaxed)) io_guess_cap_max_.store(cap, std::memory_order_relaxed);
+        if (cap > was) io_cv_.notify_all();   // room for the guesses that waited
+    }
+    // one line at most every 30 s while the cap moves
+    const auto now = std::chrono::steady_clock::now();
+    if (auto_moves_said_ > 0 && (auto_said_ == std::chrono::steady_clock::time_point{} || now - auto_said_ >= std::chrono::seconds(30))) {
+        std::fprintf(stderr, "FileExpertSource: guess reads cap %d (%llu moves; demand reads %.0f us/MB, floor %.0f)\n", cap,
+                     (unsigned long long) auto_moves_said_, mean, auto_floor_);
+        auto_moves_said_ = 0;
+        auto_said_ = now;
+    }
 }
 
 void FileExpertSource::note_async_read(const uint8_t* blob, void* stream) {

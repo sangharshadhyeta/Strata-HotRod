@@ -1095,7 +1095,10 @@ public:
         uint64_t arr[2][6] = {};                             ///< STRATA_IO_ARRIVAL: [layers 0-1 | the rest][IoArrival]
         uint64_t ra_held = 0, ra_issued = 0;                 ///< STRATA_IO_GATE: guesses held back by the gate, read ahead (totals)
         uint64_t ra_used_d[3] = {}, ra_issued_d[3] = {};     ///< STRATA_IO_GATE: the decayed used and read-ahead counts by dist (1, 2, 4), summed over ranks
+        uint64_t guess_cap = 0, guess_cap_min = 0, guess_cap_max = 0, guess_moves = 0;   ///< STRATA_IO_PF_THREADS=auto: the guess cap now, its range since start, moves
     };
+    /// STRATA_IO_PF_THREADS=auto (opt-in, untested): the guess reads in flight move with the decode's own read times
+    bool io_guess_auto() const { return io_pf_ && io_auto_; }
     /// STRATA_IO_ARRIVAL: what the read-ahead had done for a blob when its decode layer asked for it
     enum IoArrival { kArrLanded = 0, kArrInFlight, kArrQueued, kArrLost, kArrUnpredicted, kArrStagedDemand };
     bool io_arrival() const { return io_pf_ && io_arrival_; }
@@ -1231,6 +1234,20 @@ private:
     // STRATA_IO_PF_YIELD=1: no guess starts while the decode's own demand reads (prefetch) are in flight
     bool io_yield_ = false;
     std::atomic<int> io_demand_active_{0};
+    // STRATA_IO_PF_THREADS=auto (opt-in, untested): the guesses in flight are set by the decode's own read times.  Eight workers
+    // start; a guess starts only while io_guess_busy_ < io_guess_cap_ (1..8, starts 2).  Every 64 of the decode's file reads
+    // (publish_stage) the mean us per MB moves the cap: above 1.5 x the floor one guess less, below 1.2 x the floor and a guess
+    // held back one more.  The floor is the lowest mean seen, raised 1% per window.  Demand reads (io_dq_) are never capped.
+    bool io_auto_ = false;                            ///< STRATA_IO_PF_THREADS=auto (set_io_prefetch)
+    int io_guess_busy_ = 0;                           ///< guesses being read now (io_mu_; counted with io_auto_ only)
+    bool io_guess_held_ = false;                      ///< a worker found a guess queued and the cap reached, since the last look (io_mu_)
+    std::atomic<int> io_guess_cap_{2}, io_guess_cap_min_{2}, io_guess_cap_max_{2};   ///< the cap now, and its range since start
+    std::atomic<uint64_t> io_guess_moves_{0};         ///< cap moves since start
+    std::atomic<uint64_t> auto_n_{0}, auto_us_{0}, auto_bytes_{0};   ///< the decode's file reads in this window (publish_stage)
+    double auto_floor_ = 0.0;                         ///< us per MB, the lowest window mean (raised 1% a window) (io_mu_)
+    uint64_t auto_moves_said_ = 0;                    ///< cap moves since the last log line (io_mu_)
+    std::chrono::steady_clock::time_point auto_said_{};   ///< the last cap log line (io_mu_; zero: none yet)
+    void auto_read(double us, uint64_t bytes);        ///< one of the decode's file reads (publish_stage, io_auto_ only)
     std::atomic<int32_t> io_cur_layer_{-1};           ///< the layer the decode routes now (route_layer)
     std::atomic<uint32_t> io_win_{0};                 ///< counts decode windows (a layer below the previous one starts one)
     // STRATA_IO_ARRIVAL=1: each blob a decode layer reads from the file tier, by what the read-ahead had done for it
