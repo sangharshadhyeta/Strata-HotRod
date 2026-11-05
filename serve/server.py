@@ -4229,6 +4229,12 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        # the warm reads (POST /v1/prefill, /v1/messages/prefill, or "strata_prefill"): the config's "prefill_warm" turns them
+        # off; the live ones are in self.warms (guarded by warm_lock) so a real request can cancel the ones it does not continue
+        self.prefill_warm = True
+        self.warms: list[dict] = []
+        self.warm_lock = threading.Lock()
+        self.warm_noted: set = set()                  # the skips the log has said once (Service.warm_skip)
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -5496,6 +5502,79 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    def _supersede(self, ids):
+        """The live warm reads that a request with these ids does not continue are cancelled: a queued one, or a running one
+        the ids do not start with.  A running one the ids start with goes on (the request reads the rest).  A cancelled engine
+        read stops at its next chunk and keeps what it read."""
+        with self.warm_lock:
+            for w in self.warms:
+                if not (w["running"] and ids[:len(w["ids"])] == w["ids"]):
+                    w["cancel"].set()
+
+    def warm_refusal(self, messages) -> str | None:
+        """Why a warm read is not made for this conversation, or None: a batched engine (--parallel) and pictures (their
+        encodes are not prefix-reusable) take no warm reads."""
+        if getattr(self.engine, "batch", 0):
+            return "parallel"
+        if has_pictures(messages):
+            return "pictures"
+        return None
+
+    def warm_skip(self, reason: str) -> dict:
+        """The answer of a warm read that was not made.  The log says why once for the two standing reasons."""
+        if reason in ("parallel", "pictures") and reason not in self.warm_noted:
+            self.warm_noted.add(reason)
+            why = {"parallel": "batched serving (--parallel) takes no warm reads",
+                   "pictures": "the request has pictures: not read ahead"}[reason]
+            print(f"[strata] prefill warm: {why}; the request is answered as usual", flush=True)
+        return {"object": "prefill", "skipped": True, "reason": reason}
+
+    def warm_pin_into(self, req, messages, tools, kwargs, ids, force=None) -> None:
+        """The warm's checkpoint goes where the draft's stable text ends.  The warm also renders the same conversation with
+        " the" appended to the last user message: the two renderings part where that text ends, and the common start less one
+        token (the last word may re-tokenize) is pinned through "strata_prefix" ({"tokens": N}: the engine's pin=N, one pin at a
+        time).  Not set when the request already has a shared prefix (the system prompt's pin of Service.deepseek_shared_start)."""
+        probe = probe_messages(messages)
+        if probe is None:
+            return
+        try:
+            probe_ids, _, _ = self.prepare(probe, tools, dict(kwargs), 1, force=force, req=None)
+        except ValueError:
+            return
+        n = 0
+        for x, y in zip(ids, probe_ids):
+            if x != y:
+                break
+            n += 1
+        n -= 1
+        if n < 1 or n >= len(ids) - 1:
+            return
+        req["strata_prefix"] = {"tokens": n}
+
+    def warm(self, ids, thinking, tools, req, cancel, force=None) -> dict:
+        """POST /v1/prefill: the engine reads a draft conversation while the user types, so the real request reads only what
+        changed.  The read is max_new 1 (the engine stops after one token; a warm makes no answer), and it is not recorded in
+        the history, the totals, the latencies or the monitor, and writes no conversation file.  Answers are unchanged: the real
+        request is read as sent.  A warm that gets the turn while a real request waits, or was cancelled, is skipped (see _run)."""
+        ids = list(ids)
+        rec = {"ids": ids, "cancel": cancel, "running": False}
+        self._supersede(ids)
+        with self.warm_lock:
+            self.warms.append(rec)
+        t0, done = time.perf_counter(), None
+        try:
+            for kind, x in self.run(ids, thinking, tools, 1, dict(req, _strata_warm=rec), cancel, force=force,
+                                    declared_only=True):
+                if kind == "done":
+                    done = x
+        finally:
+            with self.warm_lock:
+                self.warms = [w for w in self.warms if w is not rec]
+        if done is None or done.get("finish") in ("skipped", "cancel"):
+            return self.warm_skip("cancelled" if done is None or done.get("finish") == "cancel" else "a request is waiting")
+        return {"object": "prefill", "prompt_tokens": len(ids), "reused": done.get("reused", 0),
+                "seconds": round(time.perf_counter() - t0, 3)}
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
@@ -5512,6 +5591,13 @@ class Service:
              declared_only=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        # a warm read (Service.warm) carries its record under "_strata_warm"; the engine never sees that key.  A real request
+        # first cancels the warm reads it does not continue
+        warm = sampling.get("_strata_warm") if isinstance(sampling, dict) else None
+        if warm is not None:
+            sampling = {k: v for k, v in sampling.items() if k != "_strata_warm"}
+        else:
+            self._supersede(ids)
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -5520,6 +5606,8 @@ class Service:
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        if warm is not None:
+            budget = None                               # a warm reads the prompt and makes one token: nothing to budget
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
             # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
             # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
@@ -5650,6 +5738,16 @@ class Service:
                     else:
                         yield "ping", None
             with turn:
+                if warm is not None:
+                    # a warm that gets the turn while a real request waits, or after its cancel, gives the turn up unread
+                    if cancel.is_set() or self.status["queued"] > 1:
+                        with self.status_lock:
+                            self.status["queued"] -= 1
+                            queued_counted = False
+                        yield "done", {"finish": "cancel" if cancel.is_set() else "skipped", "completion_tokens": 0,
+                                       "reused": 0, "timings": None, "reasoning_tokens": 0, "reasoning_recoveries": 0}
+                        return
+                    warm["running"] = True
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -5935,42 +6033,44 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
-                            self.history.append({
-                                "id": request_id,
-                                "projection": (sampling or {}).get("experimental_speed_projection") is not False
-                                if loaded else None,
-                                "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
-                                "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
-                                "first_engine_token_s": first_engine_token_s,
-                                # the request's whole prompt, and the tokens read of it (None: an older engine)
-                                "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
-                                "reasoning_recoveries": recovery_count,
-                                "reasoning_repeat_coverage": round(repeat_coverage, 3),
-                                "engine_generated": last.get("generated"),
-                                "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
-                                "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
-                                if n and (last.get("generated") or 0) >= 2 and last.get("decode_ms") else None,
-                                "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
-                                "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
-                                # #457: the speculative drafts from the DONE line (None: the engine did not say)
-                                "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
-                            t = self.totals
-                            t["requests"] += 1
-                            t["prompt_tokens"] += seen
-                            t["reused"] += last.get("reused") or 0
-                            t["output_tokens"] += n
-                            t["prompt_ms"] += last.get("prompt_ms") or 0.0
-                            t["decode_ms"] += last.get("decode_ms") or 0.0
-                            t["drafts_offered"] += last.get("drafts_offered") or 0
-                            t["drafts_accepted"] += last.get("drafts_accepted") or 0
-                            ft0 = st.get("first_token")             # this request's own (#465: one per request)
-                            self.latencies.observe(ft0 - started if ft0 else None, n,
-                                                   (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
+                            if not warm:    # a warm read is no request for the history, the totals or the latencies
+                                self.history.append({
+                                    "id": request_id,
+                                    "projection": (sampling or {}).get("experimental_speed_projection") is not False
+                                    if loaded else None,
+                                    "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
+                                    "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
+                                    "first_engine_token_s": first_engine_token_s,
+                                    # the request's whole prompt, and the tokens read of it (None: an older engine)
+                                    "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                    "reasoning_recoveries": recovery_count,
+                                    "reasoning_repeat_coverage": round(repeat_coverage, 3),
+                                    "engine_generated": last.get("generated"),
+                                    "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                                    "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
+                                    if n and (last.get("generated") or 0) >= 2 and last.get("decode_ms") else None,
+                                    "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
+                                    "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
+                                    # #457: the speculative drafts from the DONE line (None: the engine did not say)
+                                    "drafts_offered": last.get("drafts_offered"),
+                                    "drafts_accepted": last.get("drafts_accepted")})
+                                t = self.totals
+                                t["requests"] += 1
+                                t["prompt_tokens"] += seen
+                                t["reused"] += last.get("reused") or 0
+                                t["output_tokens"] += n
+                                t["prompt_ms"] += last.get("prompt_ms") or 0.0
+                                t["decode_ms"] += last.get("decode_ms") or 0.0
+                                t["drafts_offered"] += last.get("drafts_offered") or 0
+                                t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                                ft0 = st.get("first_token")             # this request's own (#465: one per request)
+                                self.latencies.observe(ft0 - started if ft0 else None, n,
+                                                       (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                                 timings = request_timings(seen, n, last)
-                                self.last_timings = dict(timings, at=int(time.time())) if timings else None
+                                if not warm:
+                                    self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
                             now = time.time()
                             el = now - st.get("started", now)
@@ -5980,9 +6080,10 @@ class Service:
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             rate_txt = f"{rate:.1f} tok/s" if rate is not None else "no speed"
-                            print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
-                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
-                            if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
+                            if warm is None:            # (a warm read is no answer: nothing about its speed or budget)
+                                print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
+                                      f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                            if warm is None and finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
                                       "strata-<model>.json for every request) leaves room to answer", flush=True)
@@ -6050,6 +6151,55 @@ class Service:
         if rejected:
             done["rejected_tool_calls"] = rejected
         yield "done", done
+
+
+IMAGE_BLOCKS = ("image", "image_url", "input_image")          # the converted messages' picture parts (serve/frontend.py)
+ANTHROPIC_BLOCKS = ("tool_use", "tool_result", "image", "thinking", "redacted_thinking")
+
+
+def has_pictures(messages) -> bool:
+    """True when a message carries a picture part (a warm read is not made for those)."""
+    for m in messages or []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") in IMAGE_BLOCKS for b in c):
+            return True
+    return False
+
+
+def probe_messages(messages):
+    """The messages with " the" appended to the last user message's last text part (None when there is no such text, or a
+    picture anywhere).  See Service.warm_pin_into."""
+    if has_pictures(messages):
+        return None
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return messages[:i] + [{**m, "content": c + " the"}] + messages[i + 1:]
+        if isinstance(c, list):
+            j = next((k for k in range(len(c) - 1, -1, -1)
+                      if isinstance(c[k], dict) and c[k].get("type", "text") == "text" and isinstance(c[k].get("text"), str)), None)
+            if j is None:
+                return None
+            blocks = list(c)
+            blocks[j] = {**blocks[j], "text": blocks[j]["text"] + " the"}
+            return messages[:i] + [{**m, "content": blocks}] + messages[i + 1:]
+        return None
+    return None
+
+
+def is_anthropic_body(req: dict) -> bool:
+    """POST /v1/prefill takes either dialect: a top-level "system" or "thinking", or content blocks of Anthropic's own types
+    (OpenAI's content parts are text and image_url, and its system text is a message)."""
+    if "system" in req or "thinking" in req:
+        return True
+    for m in req.get("messages") or []:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") in ANTHROPIC_BLOCKS for b in content):
+            return True
+    return False
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -6784,6 +6934,7 @@ class BadBody(Exception):
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
+        disable_nagle_algorithm = True                      # each SSE chunk is a small write: send it now, not after the last ACK
         timeout = CLIENT_TIMEOUT_S                          # a stalled client (not reading or not sending) is dropped, not waited for
 
         record = None                                       # #332: this request's monitor record, if kept
@@ -7486,7 +7637,7 @@ def make_handler(svc: Service):
                 return
             reserved = False
             try:
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/prefill", "/v1/messages/prefill"):
                     reserved = svc.reserve_inference()
                     if reserved is None:
                         error = {"type": "server_error", "code": "server_draining",
@@ -7505,6 +7656,7 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                req.pop("_strata_warm", None)                # only Service.warm sets it: a client's body cannot make a warm
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -7554,6 +7706,18 @@ def make_handler(svc: Service):
                         raise ValueError("on: true or false")
                     set_timeline(on)
                     self._json(200, {"on": on})
+                    return
+                # a warm read (Service.warm): POST /v1/prefill or /v1/messages/prefill (the dialect of a /v1/prefill body is read
+                # from it: is_anthropic_body), or the usual chat endpoint with "strata_prefill": true or X-Strata-Prefill: 1.
+                # It answers the prefill JSON whatever "stream" says, and is not in the request monitor.
+                warm = path in ("/v1/prefill", "/v1/messages/prefill") or (
+                    path in ("/v1/chat/completions", "/v1/messages") and (
+                        req.get("strata_prefill") is True or self.headers.get("X-Strata-Prefill") == "1"))
+                if warm:
+                    self.record = None
+                    anthropic = path in ("/v1/messages", "/v1/messages/prefill") or (
+                        path == "/v1/prefill" and is_anthropic_body(req))
+                    (self._anthropic if anthropic else self._openai)(req, warm=True)
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
@@ -7868,7 +8032,9 @@ def make_handler(svc: Service):
             finally:
                 items.close()
 
-        def _openai(self, req):
+        def _openai(self, req, warm=False):
+            if warm and not svc.prefill_warm:                # the config's "prefill_warm": false
+                return self._json(200, {"object": "prefill", "skipped": True, "reason": "disabled"})
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
@@ -7880,8 +8046,12 @@ def make_handler(svc: Service):
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
+            if warm and svc.warm_refusal(messages):
+                return self._json(200, svc.warm_skip(svc.warm_refusal(messages)))
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            if warm:
+                max_new = 1                                   # a warm reads the prompt and makes one token, then stops
             # No cap of our own on the reply's length when logprobs are asked for: the reply is already bounded by
             # max_tokens (by the rest of the context when it is not sent), which is the only bound OpenAI and vLLM
             # put on it either.  A reply that is not streamed does hold every entry (its token, bytes and up to 20
@@ -7917,8 +8087,13 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            if not warm:
+                self._watch_client(cancel)                   # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            if warm:                                         # not watched: a warm goes on when its client aborts
+                if req.get("strata_prefix") is None:         # the checkpoint where the draft's stable text ends
+                    svc.warm_pin_into(req, messages, tools, kw, ids, force)
+                return self._json(200, svc.warm(ids, thinking, tools, req, cancel, force=force))
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
@@ -8140,21 +8315,32 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
 
-        def _anthropic(self, req):
+        def _anthropic(self, req, warm=False):
+            if warm and not svc.prefill_warm:                # as _openai
+                return self._json(200, {"object": "prefill", "skipped": True, "reason": "disabled"})
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
+            if warm and svc.warm_refusal(messages):
+                return self._json(200, svc.warm_skip(svc.warm_refusal(messages)))
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))        # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            if warm:
+                max_new = 1                                   # a warm reads the prompt and makes one token, then stops
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            if not warm:
+                self._watch_client(cancel)                   # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            if warm:
+                if req.get("strata_prefix") is None:         # the checkpoint where the draft's stable text ends
+                    svc.warm_pin_into(req, messages, tools, kw, ids, force)
+                return self._json(200, svc.warm(ids, thinking, tools, req, cancel, force=force))
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
@@ -9366,6 +9552,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.before_load_strict = cfg.get("before_load_strict") is True
     # --slot-save-path is relative to the working directory the server was started in; the config's slot_save_path
     # to the config's "cwd" (the engine's folder) when it has one.  Either way the engine gets an absolute path.
+    svc.prefill_warm = cfg.get("prefill_warm") is not False     # the chat page reads the draft while it is typed (POST /v1/prefill)
     if a.slot_save_path or cfg.get("slot_save_path"):
         try:
             svc.slot_save_path = slot_save_dir(a.slot_save_path) if a.slot_save_path else \
