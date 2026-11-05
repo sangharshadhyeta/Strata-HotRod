@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <condition_variable>
 #include <cstdint>
@@ -152,14 +153,30 @@ public:
         std::atomic<bool>* cancel = nullptr;   // set before the job starts: it is dropped unread (bad is set, left counted down)
         int tl_layer = -1;              // the Monitor's timeline (ds4_timeline.hpp): the read's layer (-1: not stamped)
         bool tl_demand = false;         // a demand read (the CPU lane waits for it), else a guess
+        std::chrono::steady_clock::time_point t_push{};   // (set by push: the demand reads' queue wait drives the auto cap)
     };
     explicit IoQueue(int n) {
-        // DS4_IO_GUESS_MAX=N (opt-in; unset or 0: no cap, as before): at most N guess jobs (the low queue) on the drive at once, so a
-        // demand read always finds a thread free instead of waiting behind guesses that took every thread - Qwen's 24 Oct lesson
-        // (STRATA_IO_PF_THREADS=2: its 8 read-ahead threads' wasted reads queued in front of the decode's own; +8-15%).  An expert is
-        // 3 jobs (its parts), so N = 6 is two guessed experts in flight.
-        if (const char* v = std::getenv("DS4_IO_GUESS_MAX")) low_max_ = std::max(0, std::atoi(v));
+        // DS4_IO_GUESS_MAX: at most N guess jobs (the low queue) on the drive at once, so a demand read always finds a thread free
+        // instead of waiting behind guesses that took every thread - Qwen's 24 Oct lesson (STRATA_IO_PF_THREADS=2: its 8 read-ahead
+        // threads' wasted reads queued in front of the decode's own; +8-15%).  An expert is 3 jobs (its parts).
+        //   unset or "auto" (the default): the cap sets itself - it starts at 6 (two guessed experts) and every 64 demand reads looks at
+        //     their mean wait in the queue: above 0.3 ms one expert less (3 jobs, not below 3), else - when the cap held a guess back
+        //     meanwhile - one expert more (up to every thread's 3 jobs); otherwise it holds
+        //   a number: that cap, fixed;  0: no cap (all threads may read guesses, as before 2 Nov)
+        const char* v = std::getenv("DS4_IO_GUESS_MAX");
+        if (v == nullptr || v[0] == '\0' || std::strcmp(v, "auto") == 0) {
+            auto_ = true;
+            low_max_ = 6;
+            low_cap_hi_ = std::max(3, 3 * n);
+        } else {
+            low_max_ = std::max(0, std::atoi(v));
+        }
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
+    }
+    /// the guess cap now (0: none) - for the request line
+    int guess_cap() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return low_max_;
     }
     ~IoQueue() {
         {
@@ -172,8 +189,13 @@ public:
     /// low: a read that can wait (a guess) - the jobs of the first queue are all taken before any of this one's
     void push(const Job* jobs, int n, bool low = false) {
         {
+            const auto now = auto_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::lock_guard<std::mutex> lk(mu_);
-            for (int i = 0; i < n; ++i) (low ? ql_ : q_).push_back(jobs[i]);
+            for (int i = 0; i < n; ++i) {
+                (low ? ql_ : q_).push_back(jobs[i]);
+                if (auto_) (low ? ql_ : q_).back().t_push = now;
+            }
+            if (auto_ && low && low_inflight_ >= low_max_) held_ = true;   // (the cap holds guesses back now: room to grow, if demand reads do not wait)
         }
         if (n == 1) cv_.notify_one();
         else cv_.notify_all();
@@ -208,6 +230,7 @@ private:
                 std::deque<Job>& qq = low ? ql_ : q_;
                 j = qq.front();
                 qq.pop_front();
+                if (auto_ && !low) auto_demand(j);   // (a demand read's wait in the queue: the auto cap's signal)
                 low = low && low_max_ > 0;   // (counted only with a cap: without one the path is as before)
                 if (low) ++low_inflight_;
             }
@@ -273,6 +296,34 @@ private:
     uint64_t done_ = 0;
     bool quit_ = false;
     int low_max_ = 0, low_inflight_ = 0;   // DS4_IO_GUESS_MAX (0: no cap) and the guess jobs on the drive now (both under mu_)
+    // the auto cap (under mu_): 64 demand reads' queue wait per look; held_ = the cap held a guess back since the last look
+    bool auto_ = false, held_ = false;
+    int low_cap_hi_ = 24, aw_n_ = 0, moves_ = 0;
+    double aw_us_ = 0.0;
+    std::chrono::steady_clock::time_point said_{};   // the last cap line (0: none yet)
+    void auto_demand(const Job& j) {
+        aw_us_ += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - j.t_push).count();
+        if (++aw_n_ < 64) return;
+        const double mean = aw_us_ / aw_n_;
+        const int was = low_max_;
+        // a dead band between the two: down above 0.3 ms, up only below 0.15 ms (6 Nov: with one threshold it hopped 6 <-> 9 at every
+        // look, 459 times in 4 minutes)
+        if (mean > 300.0) low_max_ = std::max(3, low_max_ - 3);                            // demand reads wait: one guessed expert less
+        else if (mean < 150.0 && held_) low_max_ = std::min(low_cap_hi_, low_max_ + 3);    // they hardly do, and guesses wait: one more
+        aw_us_ = 0.0;
+        aw_n_ = 0;
+        held_ = false;
+        if (low_max_ != was) ++moves_;
+        // one line at most every 30 s: the cap now, its moves since the last line and the last look's wait
+        const auto now = std::chrono::steady_clock::now();
+        if (moves_ > 0 && now - said_ >= std::chrono::seconds(30)) {
+            std::fprintf(stderr, "ds4: read-ahead cap: %d guess reads in flight (%d moves in the last %s; demand reads waited %.0f us)\n",
+                         low_max_, moves_, said_.time_since_epoch().count() == 0 ? "start" : "30 s+", mean);
+            moves_ = 0;
+            said_ = now;
+        }
+        if (low_max_ > was) cv_.notify_all();   // (room for the guesses that waited)
+    }
     // a guess job is done: its place for the next guess, and a thread that waits for one may take it (only with a cap: without one
     // nothing waits on the count)
     void low_done() {
