@@ -2,14 +2,24 @@
 
 <h1 align="center">Strata-HotRod</h1>
 
-<p align="center"><b>A 125-billion-parameter model on a 12 GB gaming card.</b><br>
-Qwen3.8-Flash-Next on one RTX 3060 with 30 GB of RAM. Nothing leaves your PC.</p>
+<h2 align="center">78 GB of model. 30 GB of RAM. Zero cloud.</h2>
+
+<p align="center"><b>A 125-billion-parameter AI on one gaming card, running straight from your SSD.</b><br>
+Nothing leaves your PC.</p>
+
+<p align="center">
+🔥 <b>hot experts</b> on the card &nbsp;→&nbsp; 🌡️ <b>warm</b> in RAM &nbsp;→&nbsp; ❄️ <b>cold</b> on the SSD
+</p>
+
+<p align="center">
+  <img alt="Runs from SSD" src="https://img.shields.io/badge/RUNS%20FROM-SSD-1c7ed6?style=for-the-badge">
+  <img alt="30 GB RAM, 78 GB model" src="https://img.shields.io/badge/30%20GB%20RAM-78%20GB%20MODEL-d6336c?style=for-the-badge">
+  <img alt="Decode: 50-70 tokens/s" src="https://img.shields.io/badge/50--70-TOK%2FS-e8590c?style=for-the-badge">
+</p>
 
 <p align="center">
   <img alt="GPU: RTX 3060 12 GB" src="https://img.shields.io/badge/GPU-RTX%203060%2012%20GB-76b900?style=flat-square">
-  <img alt="Model: 125B MoE" src="https://img.shields.io/badge/model-125B%20MoE%20%C2%B7%20IQ3__S-8a2be2?style=flat-square">
   <img alt="Context: 262K" src="https://img.shields.io/badge/context-262K%20tokens-0a7ea4?style=flat-square">
-  <img alt="Decode: 50-70 tokens/s" src="https://img.shields.io/badge/decode-50--70%20tok%2Fs-e8590c?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-555?style=flat-square"></a>
 </p>
 
@@ -23,25 +33,33 @@ Qwen3.8-Flash-Next on one RTX 3060 with 30 GB of RAM. Nothing leaves your PC.</p
 
 ---
 
+<table>
+<tr>
+<td align="center" width="25%"><h2>🧊 78 GB</h2>of model on a <b>30 GB</b> PC</td>
+<td align="center" width="25%"><h2>🔥 50-70</h2>tokens/s on one RTX 3060</td>
+<td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash at about 5 tokens/s (DeepSeek branch)</td>
+<td align="center" width="25%"><h2>⚡ 0.4 s</h2>to pick up a 45K-token conversation</td>
+</tr>
+</table>
+
 <div align="justify">
 
-A fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). Strata runs a model that normally
-needs a server by keeping the most-used parts on the graphics card and streaming the rest from the SSD. This fork makes
-that path faster and keeps answers correct while doing it.
+A fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). For Qwen, Strata keeps the
+experts in RAM, so its setup asks for 64 GB. This fork spreads them over the card, RAM and the SSD, and reads what does
+not fit from the SSD, so the 78 GB IQ3_S runs on 30 GB. It also makes that path faster and keeps answers correct while
+doing it.
 
 </div>
 
+<table width="100%">
+<tr><th align="left"></th><th align="left">Strata (Qwen)</th><th align="left">Strata-HotRod</th></tr>
+<tr><td align="left"><b>Where the experts live</b></td><td align="left">in RAM</td><td align="left">card, then RAM, then SSD</td></tr>
+<tr><td align="left"><b>RAM the setup asks for</b></td><td align="left">64 GB</td><td align="left">30 GB (what it was run on)</td></tr>
+<tr><td align="left"><b>A model bigger than RAM</b></td><td align="left">no</td><td align="left">yes: 78 GB of files on 30 GB</td></tr>
+</table>
+
 > **Tested on one machine, with one model.** Other cards, AMD, Windows, macOS and other model sizes may work in upstream
 > Strata; we have not run them, so we do not describe them here.
-
-<table>
-<tr>
-<td align="center" width="25%"><h3>50-70</h3>tokens/s writing code, reasoning and prose</td>
-<td align="center" width="25%"><h3>262K</h3>tokens of context on a 12 GB card</td>
-<td align="center" width="25%"><h3>0.4 s</h3>to pick up a 45K-token conversation</td>
-<td align="center" width="25%"><h3>85-88%</h3>of the needed experts guessed a layer ahead</td>
-</tr>
-</table>
 
 ## How fast
 
@@ -201,7 +219,8 @@ and kept across restarts.
 <div align="justify">
 
 Every change and its measurement: [docs/HOTROD-DETAILS.md](docs/HOTROD-DETAILS.md) · the predictor study:
-[docs/PREDICTOR-EXPERIMENTS.md](docs/PREDICTOR-EXPERIMENTS.md) · the full log of ideas tried: [docs/perf-ideas.md](docs/perf-ideas.md).
+[docs/PREDICTOR-EXPERIMENTS.md](docs/PREDICTOR-EXPERIMENTS.md) · the full log of ideas tried: [docs/perf-ideas.md](docs/perf-ideas.md) ·
+earlier experiments from a separate fork: [docs/EARLIER-EXPERIMENTS.md](docs/EARLIER-EXPERIMENTS.md).
 
 **New in v0.1.45-hotrod.2 (31 Oct):** the learned look-ahead v2 (trained with a rank-weighted loss) is the one setup
 downloads; the expert placement comes from routing traces (`tools/placement/solve.py`); the Monitor's decode timeline
