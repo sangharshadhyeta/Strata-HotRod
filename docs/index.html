@@ -12,6 +12,12 @@
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sangharshadhyeta.github.io/Strata-HotRod/">
 <meta property="og:image" content="https://sangharshadhyeta.github.io/Strata-HotRod/Neon%20Fire%20and%20Ice%20Hot%20Rod%20Logo.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Qwen3.8-Flash-Next on an RTX 3060 12 GB with 30 GB RAM: 50-70 tok/s">
+<meta name="twitter:description" content="A 78 GB, 125-billion-parameter model on one RTX 3060 12 GB and 30 GB of RAM, streaming experts from the SSD.">
+<meta name="twitter:image" content="https://sangharshadhyeta.github.io/Strata-HotRod/Neon%20Fire%20and%20Ice%20Hot%20Rod%20Logo.png">
+<meta name="theme-color" content="#0b0d10">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%A5%3C/text%3E%3C/svg%3E">
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
@@ -54,7 +60,21 @@
 </script>
 <style>
 :root{--bg:#0b0d10;--card:#14181d;--border:#262c34;--text:#e8ebef;--muted:#9aa4af;--fire:#ff6a2b;--ice:#4dabf7;}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
 *{box-sizing:border-box}
+::selection{background:var(--fire);color:#1a0d05}
+.topnav{position:sticky;top:0;z-index:20;background:rgba(11,13,16,.85);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+.topnav .in{max-width:52rem;margin:0 auto;padding:.6rem 1.25rem;display:flex;gap:1.1rem;align-items:center;flex-wrap:wrap}
+.topnav .brand{font-weight:700;color:var(--text);text-decoration:none;margin-right:auto}
+.topnav a{text-decoration:none;color:var(--muted);font-size:.95rem}
+.topnav a:hover{color:var(--text)}
+h2{scroll-margin-top:4rem}
+.pills{display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center;margin:.8rem 0}
+.pill{border:1px solid var(--border);background:var(--card);color:var(--muted);border-radius:999px;padding:.2rem .75rem;font-size:.85rem}
+.cap{color:var(--muted);font-size:.88rem;margin:.2rem 0 1rem}
+pre{background:#0e1013;border:1px solid var(--border);border-radius:10px;padding:.8rem 1rem;overflow-x:auto;margin:.8rem 0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.88rem}
 body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 main{max-width:52rem;margin:0 auto;padding:2rem 1.25rem 4rem}
 a{color:var(--ice)}
@@ -79,7 +99,15 @@ footer{color:var(--muted);font-size:.9rem;margin-top:3rem}
 </style>
 </head>
 <body>
-<main>
+<nav class="topnav" aria-label="Page sections"><div class="in">
+<a class="brand" href="#top">Strata-HotRod</a>
+<a href="#faq">FAQ</a>
+<a href="#speed">Speed</a>
+<a href="#run-it">Run it</a>
+<a href="#not-tested">Not tested</a>
+<a href="https://github.com/sangharshadhyeta/Strata-HotRod">GitHub</a>
+</div></nav>
+<main id="top">
 <img class="logo" src="Neon%20Fire%20and%20Ice%20Hot%20Rod%20Logo.png" alt="Strata-HotRod: the Strata hexagon in fire and ice">
 
 <h1>Qwen3.8-Flash-Next (125B) on an RTX 3060 12 GB with 30 GB RAM</h1>
@@ -87,6 +115,13 @@ footer{color:var(--muted);font-size:.9rem;margin-top:3rem}
 50-70 tokens/s on one gaming PC. Nothing leaves your PC.</p>
 
 <p class="tiers">🔥 <b>hot experts</b> on the card &nbsp;→&nbsp; 🌡️ <b>warm</b> in RAM &nbsp;→&nbsp; ❄️ <b>cold</b> on the SSD</p>
+
+<div class="pills">
+<span class="pill">MIT licensed</span>
+<span class="pill">fork of Strata</span>
+<span class="pill">NVIDIA CUDA</span>
+<span class="pill">tested on Linux (Rocky 9)</span>
+</div>
 
 <div class="stats">
 <div class="stat"><b>78 GB</b><span>of model on a 30 GB PC</span></div>
@@ -98,7 +133,7 @@ footer{color:var(--muted);font-size:.9rem;margin-top:3rem}
 <p class="note"><b>Tested on one machine, with one model.</b> Other cards, AMD, Windows, macOS and other model sizes may work in
 upstream Strata; they were not run here, so they are not described.</p>
 
-<h2>Can Qwen3.8-Flash-Next run on an RTX 3060 12 GB with low RAM?</h2>
+<h2 id="faq">Can Qwen3.8-Flash-Next run on an RTX 3060 12 GB with low RAM?</h2>
 <p><b>Yes.</b> On one RTX 3060 12 GB with 30 GB of RAM and an NVMe SSD, Strata-HotRod runs Qwen3.8-Flash-Next
 (Qwen 3.8 Flash Next, 125B) as the 78 GB IQ3_S at <b>50-70 tokens/s</b> (131K context; 262K fits). The experts that do not fit
 in RAM are read from the SSD, and a look-ahead guesses ahead which ones.</p>
@@ -114,7 +149,8 @@ the rest of the experts from the SSD, which its docs call much slower. Strata-Ho
 <p>Yes. The 78 GB IQ3_S runs on a 30 GB PC. A separate DeepSeek-V4.1-Flash branch (341 GB of files) runs at about 5 tokens/s on
 the same PC, limited by the NVMe at about 2.8 GB/s.</p>
 
-<h2>How fast is it?</h2>
+<h2 id="speed">How fast is it?</h2>
+<p class="cap">Measured on the machine below. Every answer in these runs was read and checked.</p>
 <table>
 <tr><th>Answer (131K context)</th><th class="r">tokens/s</th></tr>
 <tr><td>Code (a Python function, 500-650 tokens)</td><td class="r">52 - 55</td></tr>
@@ -141,7 +177,21 @@ already read.</p>
 </table>
 </details>
 
-<details>
+<h2 id="run-it">Run it the way it was measured</h2>
+<p>An NVIDIA card, Linux (Rocky 9 was tested; other distributions are untested), CUDA 13, and an NVMe with room for the
+78 GB of model files plus the draft layer.</p>
+<pre><code>sudo dnf install -y git gcc-toolset-13
+git clone https://github.com/sangharshadhyeta/Strata-HotRod.git
+cd Strata-HotRod
+scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build --yes --no-start</code></pre>
+<p>Then run it inside a memory limit (94% of RAM; two uncapped runs once froze the test PC):</p>
+<pre><code>systemd-run --scope -p MemoryMax=$(awk '/MemTotal/ {printf "%dK", $2 * 0.94}' /proc/meminfo) -p MemorySwapMax=0 \
+  .venv/bin/python serve/server.py --engine strata --config strata-iq3_s.json --port 8095</code></pre>
+<p class="cap">When it prints <code>ready: http://127.0.0.1:8095/v1</code>, any OpenAI-compatible client works with that address.
+<code>--build</code> compiles this fork's engine; without it setup downloads upstream's, which lacks these changes. Full steps and
+the DeepSeek install are in the GitHub README.</p>
+
+<details id="not-tested">
 <summary>Not tested</summary>
 <ul>
 <li>Any other graphics card, any AMD card, Windows, macOS or another Linux.</li>
