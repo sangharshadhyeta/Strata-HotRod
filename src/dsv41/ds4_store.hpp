@@ -49,6 +49,7 @@ public:
     struct Stats {
         std::atomic<int64_t> hits{0}, misses{0}, prefetched{0}, prefetch_used{0}, prefetch_wasted{0}, evictions{0}, fails{0};
         std::atomic<int64_t> bytes_read{0}, wait_ns{0}, no_slot{0}, cancelled{0}, put{0};
+        std::atomic<int64_t> protect_drop{0}, protect_forced{0};   // (DS4_STORE_PROTECT: a guess read given up for want, a demand read that took a wanted slot)
     };
     struct Vis {                 // a slot the GPU may read from now on (dev != 0), or no longer (dev == 0)
         int layer = 0, e = 0;
@@ -243,18 +244,39 @@ public:
         where_[(size_t) layer][(size_t) e] = -1;
         sp.layer = sp.expert = -1;
         sp.prefetch = false;
+        sp.want = 0;
         sp.state.store(kFree, std::memory_order_release);
         free_hint_ = std::min(free_hint_, (size_t) s);
         return true;
     }
     /// Starts reading (layer, e) if it is neither here nor on its way (a guess: unpinned, may be given up before it is used).
-    void prefetch(int layer, int e) {
+    /// want_pos (DS4_STORE_PROTECT; 0: none): the position the guess is for - the slot, here or read now, is kept until then (see want).
+    void prefetch(int layer, int e, uint64_t want_pos = 0) {
         if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return;
-        if (where_[(size_t) layer][(size_t) e] >= 0) return;
+        if (where_[(size_t) layer][(size_t) e] >= 0) {
+            if (want_pos != 0) want(layer, e, want_pos);
+            return;
+        }
         std::lock_guard<std::mutex> lk(mu_);
-        if (where_[(size_t) layer][(size_t) e] >= 0) return;
-        if (start_fill(layer, e, false) >= 0) st_.prefetched.fetch_add(1, std::memory_order_relaxed);
+        int s = where_[(size_t) layer][(size_t) e];
+        if (s < 0) {
+            s = start_fill(layer, e, false);
+            if (s < 0) return;
+            st_.prefetched.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (want_pos > slots_[(size_t) s].want) slots_[(size_t) s].want = want_pos;
     }
+    /// (DS4_STORE_PROTECT) a guess for (layer, e) that is for position pos: if the expert is here, its slot is kept until then (a slot
+    /// with a want at or past the current position is given up only when no other can be).
+    void want(int layer, int e, uint64_t pos) {
+        if (layer < 0 || layer >= (int) where_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        const int s = where_[(size_t) layer][(size_t) e];
+        if (s >= 0 && pos > slots_[(size_t) s].want) slots_[(size_t) s].want = pos;
+    }
+    /// (DS4_STORE_PROTECT) the decode position now: serve thread, once per layer request. set_protect turns the protection on (before serving).
+    void set_pos(uint64_t p) { now_pos_.store(p, std::memory_order_relaxed); }
+    void set_protect(bool on) { protect_ = on; }
     /// Reads the experts of `list` (layer, expert; hottest first) into free slots and returns when they are in (a start that
     /// is already warm: the profile's hottest, so the first tokens find them).  The first `list.size()` fit the arena less
     /// `leave` slots; returns how many were read.
@@ -301,7 +323,7 @@ public:
         if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return nullptr;
         std::lock_guard<std::mutex> lk(mu_);
         if (where_[(size_t) layer][(size_t) e] >= 0) return nullptr;
-        const int s = take_slot(false);
+        const int s = take_slot(true);   // (not a guess: a give-back the CPU lane needs now may take a wanted slot)
         if (s < 0) return nullptr;
         Slot& sp = slots_[(size_t) s];
         if (sp.layer >= 0 && sp.expert >= 0) {
@@ -316,6 +338,7 @@ public:
         sp.visible = false;
         sp.tick = ++clock_;
         sp.use = 0.0f;
+        sp.want = 0;
         sp.bad.store(false);
         sp.cancel.store(false);
         sp.left.store(1, std::memory_order_release);
@@ -336,6 +359,7 @@ public:
         } else {
             where_[(size_t) layer][(size_t) e] = -1;
             sp.layer = sp.expert = -1;
+            sp.want = 0;
             sp.left.store(0, std::memory_order_release);
             sp.state.store(kFree, std::memory_order_release);
             free_hint_ = std::min<size_t>(free_hint_, (size_t) s);
@@ -483,6 +507,7 @@ public:
                 sp.pin = 0;
                 sp.prefetch = sp.visible = false;
                 sp.use = 0.0f;
+                sp.want = 0;
                 sp.state.store(kFree, std::memory_order_release);
             }
             gone_[c] = 0;
@@ -525,6 +550,7 @@ private:
         std::atomic<int> state{kFree}, left{0};
         std::atomic<bool> bad{false}, cancel{false};
         uint64_t tick = 0;
+        uint64_t want = 0;   // (DS4_STORE_PROTECT) the position until which a guess wants it; 0: none
     };
 
     static int vis_hash(int layer, int e) { return (int) (((unsigned) layer * 2654435761u + (unsigned) e * 40503u) >> 7) % 100; }
@@ -557,6 +583,7 @@ private:
         sp.visible = false;
         sp.tick = ++clock_;
         sp.use = 0.0f;
+        sp.want = 0;
         sp.state.store(kLoading, std::memory_order_release);
         sp.bad.store(false);
         sp.cancel.store(false);
@@ -601,6 +628,7 @@ private:
             sp.layer = sp.expert = -1;
             sp.state.store(kFree, std::memory_order_release);
             sp.prefetch = false;
+            sp.want = 0;
             if (sp.cancel.load()) st_.cancelled.fetch_add(1, std::memory_order_relaxed);
             else st_.fails.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -620,6 +648,7 @@ private:
             sp.layer = sp.expert = -1;
             sp.prefetch = false;
             sp.use = 0.0f;
+            sp.want = 0;
             sp.state.store(kGone, std::memory_order_release);
             sp.base = nullptr;
         }
@@ -656,8 +685,9 @@ private:
                 return (int) i;
             }
         if (grow()) return take_slot(demand);
-        int best = -1;
-        double bv = 0;
+        int best = -1, best_w = -1;
+        double bv = 0, bw = 0;
+        const uint64_t now = now_pos_.load(std::memory_order_relaxed);
         for (size_t i = 0; i < nalloc_; ++i) {
             Slot& sp = slots_[i];
             if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
@@ -670,12 +700,27 @@ private:
             }
             if (sp.pin > 0 || sp.visible || sp.state.load(std::memory_order_acquire) != kReady) continue;
             const double v = score(sp);
+            if (protect_ && sp.want != 0 && sp.want >= now) {   // (DS4_STORE_PROTECT: a guess wants it - given up only when nothing else can be)
+                if (best_w < 0 || v < bw) {
+                    best_w = (int) i;
+                    bw = v;
+                }
+                continue;
+            }
             if (best < 0 || v < bv) {
                 best = (int) i;
                 bv = v;
             }
         }
-        if (best < 0) return -1;
+        if (best < 0) {
+            if (best_w < 0) return -1;
+            if (!demand) {   // a guess read is dropped unread rather than evict a slot a guess wants
+                st_.protect_drop.fetch_add(1, std::memory_order_relaxed);
+                return -1;
+            }
+            st_.protect_forced.fetch_add(1, std::memory_order_relaxed);
+            best = best_w;
+        }
         free_hint_ = std::min<size_t>(free_hint_, (size_t) best);
         return best;
     }
@@ -696,6 +741,8 @@ private:
     std::vector<std::vector<float>> heat_;
     std::vector<uint64_t> hits_in_layer_;
     uint64_t clock_ = 0;
+    std::atomic<uint64_t> now_pos_{0};   // (DS4_STORE_PROTECT) the decode position now, set by the serve thread
+    bool protect_ = false;               // (DS4_STORE_PROTECT) set_protect: wanted slots are kept
     std::mutex mu_;
     std::unique_ptr<IoQueue> io_;
     Stats st_;

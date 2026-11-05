@@ -1115,6 +1115,11 @@ struct Model::Impl {
     // not only below the stand-in floor. rc_early counts the reads started beyond the mode-2 ranks (the request line's ` early <n>`).
     int store_early = 0;
     std::atomic<uint64_t> rc_early{0};
+    // DS4_STORE_PROTECT=1 (opt-in; unset: as now): the RAM store keeps the experts the guesses (ahead_ask) want for the positions ahead
+    // (store->want; set_pos once per layer request, serve thread). prot_tok: the token counter of the serve thread, bumped at each token's
+    // first trunk layer (ring_tok only moves with the ring on, so it is not used).
+    bool store_protect = false;
+    uint64_t prot_tok = 0;
     // STRATA_LA_TAIL_READ=3 (with the learner, the stand-ins and the store; else mode 2): the ranks below the floor as mode 2; a guess at or
     // above the floor is read ahead when its predicted stand-in failure p (the guessed expert's own rate once it has 8 samples, else the
     // rank's) is above tail_thr, which moves with the store's read queue. Learned live from the picks' stand-in outcomes (Req::sub): tail_sfail
@@ -1215,7 +1220,7 @@ struct Model::Impl {
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
     std::vector<uint8_t> ahead_fl;     // [layer][1024]: 1 the top-k guess, 2 any guess, a layer before; 4 two layers before;
-                                       // 8 asked for (prefetch)
+                                       // 8 asked for (prefetch); 32 wanted by the store (DS4_STORE_PROTECT, once per request)
     std::vector<uint8_t> ahead_rank;   // [layer][1024]: 1 + the expert's rank in the guess a layer before (0: not guessed)
     std::vector<unsigned> ahead_for;   // [layer]: the request (seq) its flags are for
     // DS4_RING=<slots> (opt-in): a ring of VRAM slots filled ahead from the RAM store with the next layers' guessed experts, on a copy
@@ -6373,6 +6378,11 @@ struct Model::Impl {
             return;
         }
         store = std::move(st);
+        if (const char* pv = std::getenv("DS4_STORE_PROTECT"); pv != nullptr && std::atoi(pv) != 0) {   // (DS4_STORE_PROTECT=1: a guess's slot kept until its position)
+            store_protect = true;
+            store->set_protect(true);
+            std::fprintf(stderr, "ds4: DS4_STORE_PROTECT=1: the RAM store keeps the experts the guesses want until their layer\n");
+        }
         // (the router lookahead's guesses are not read ahead with the store: measured 4.5 against 4.7 tok/s, 62% of the guesses are right and
         // the SSD is the narrow part; DS4_AHEAD=1 turns them on)
         if (std::getenv("DS4_AHEAD") == nullptr && !ring_want) ahead_mode = 0;
@@ -9027,6 +9037,8 @@ struct Model::Impl {
             std::fprintf(stderr, " order %d,%d,%d", ring_order[0] == 2 ? 4 : ring_order[0] + 1, ring_order[1] == 2 ? 4 : ring_order[1] + 1,
                          ring_order[2] == 2 ? 4 : ring_order[2] + 1);   // (DS4_RING_WORTH: the distances in the last request's pass order)
         if (store_early > 0) std::fprintf(stderr, " early %llu", (unsigned long long) rc_early.load(std::memory_order_relaxed));   // (DS4_STORE_EARLY)
+        if (store_protect && store)   // (DS4_STORE_PROTECT: guess reads given up for a want, demand reads that took a wanted slot)
+            std::fprintf(stderr, " protect drop %lld forced %lld", (long long) store->stats().protect_drop.load(), (long long) store->stats().protect_forced.load());
         std::fprintf(stderr, "\n");
     }
 
@@ -9352,11 +9364,14 @@ struct Model::Impl {
     std::vector<std::pair<const void*, size_t>> pf_want;
     void ahead_ask(int li, const Req& r, unsigned seq, int T) {
         pf_want.clear();
+        // DS4_STORE_PROTECT: each guess is for its layer's position in the token it is made in (past the last trunk layer: the next token's)
+        const bool prot = store_protect && store && !L[(size_t) li].mtp;
         for (int q = 0; q < 3; ++q) {   // the guesses 1, 2 and (the learner's) 4 layers ahead
             const int a = q == 2 ? 4 : q + 1, off = q == 0 ? 0 : q == 1 ? kAhead1 : kAhead1 + kPicks;
             const int m = std::min(r.na[q], q == 0 ? kAhead1 : kPicks), j = li + a;
             if (m <= 0 || j >= (int) L.size()) continue;
             const Layer& n = L[(size_t) j];
+            const uint64_t wpos = prot_tok * (uint64_t) g.nl + (uint64_t) j;
             uint8_t* fl = ahead_fl.data() + (size_t) j * 1024;
             uint8_t* rk = ahead_rank.data() + (size_t) j * 1024;
             if (ahead_for[(size_t) j] != seq + (unsigned) a) {
@@ -9374,6 +9389,10 @@ struct Model::Impl {
                     if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                     fl[e] |= a == 4 ? 16 : a == 2 ? 4 : (i < n.k_exp ? 3 : 2);   // (16: 4 layers before)
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
+                    if (prot && !(fl[e] & 32)) {   // (once per expert and request: its slot, if it has one, is kept until the position)
+                        fl[e] |= 32;
+                        store->want(j, e, wpos);
+                    }
                     if (i >= lim_new || (fl[e] & 8)) continue;
                     // STRATA_LA_TAIL_READ=3: a guess at or above the floor is read only when its stand-in would likely fail
                     const bool tail_gate = tail3_on && i >= standin_floor;
@@ -9385,7 +9404,7 @@ struct Model::Impl {
                     fl[e] |= 8;
                     if (i >= lim) rc_early.fetch_add(1, std::memory_order_relaxed);   // (DS4_STORE_EARLY: a read beyond the mode-2 ranks)
                     if (tail_gate) ++tail_gr;
-                    if (store) store->prefetch(j, e);
+                    if (store) store->prefetch(j, e, prot ? wpos : 0);
                     else
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
                     ++st.ahead_pf;
@@ -9430,6 +9449,10 @@ struct Model::Impl {
                 int64_t tl_w0 = 0, tl_m0 = 0;
                 if (tlo) tlt[0] = tlt[1] = tlt[2] = tl::ns();
                 if (store && li > 0 && li < g.nl) store->cancel_stale(li - 1);   // (guesses for layers the token has passed: dropped unread)
+                if (store_protect && store && !l.mtp && li < g.nl) {   // (DS4_STORE_PROTECT: this layer's position; the token's first trunk layer counts the token)
+                    if (li == 0) ++prot_tok;
+                    store->set_pos(prot_tok * (uint64_t) g.nl + (uint64_t) li);
+                }
                 // lookahead: the guesses made for this layer (when they are for this request), counted on decode
                 const uint8_t* fl = T == 1 && !ahead_for.empty() && ahead_for[(size_t) li] == next
                                         ? ahead_fl.data() + (size_t) li * 1024 : nullptr;
