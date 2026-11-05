@@ -6,8 +6,10 @@
 // of the current one; idle workers spin for a while, then sleep on a condition variable.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -152,6 +154,11 @@ public:
         bool tl_demand = false;         // a demand read (the CPU lane waits for it), else a guess
     };
     explicit IoQueue(int n) {
+        // DS4_IO_GUESS_MAX=N (opt-in; unset or 0: no cap, as before): at most N guess jobs (the low queue) on the drive at once, so a
+        // demand read always finds a thread free instead of waiting behind guesses that took every thread - Qwen's 24 Oct lesson
+        // (STRATA_IO_PF_THREADS=2: its 8 read-ahead threads' wasted reads queued in front of the decode's own; +8-15%).  An expert is
+        // 3 jobs (its parts), so N = 6 is two guessed experts in flight.
+        if (const char* v = std::getenv("DS4_IO_GUESS_MAX")) low_max_ = std::max(0, std::atoi(v));
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
     }
     ~IoQueue() {
@@ -189,15 +196,23 @@ private:
     void loop() {
         for (;;) {
             Job j;
+            bool low = false;
             {
                 std::unique_lock<std::mutex> lk(mu_);
-                cv_.wait(lk, [&] { return quit_ || !q_.empty() || !ql_.empty(); });
+                // (a guess is taken only while fewer than low_max_ guesses are in flight; a demand read always)
+                auto low_ok = [&] { return !ql_.empty() && (quit_ || low_max_ <= 0 || low_inflight_ < low_max_); };   // (no cap at quit)
+                cv_.wait(lk, [&] { return quit_ || !q_.empty() || low_ok(); });
                 if (quit_ && q_.empty() && ql_.empty()) return;
-                std::deque<Job>& qq = q_.empty() ? ql_ : q_;
+                if (q_.empty() && !low_ok()) continue;   // (quit with guesses left that the cap holds back: around again, the predicate ends it)
+                low = q_.empty();
+                std::deque<Job>& qq = low ? ql_ : q_;
                 j = qq.front();
                 qq.pop_front();
+                low = low && low_max_ > 0;   // (counted only with a cap: without one the path is as before)
+                if (low) ++low_inflight_;
             }
             if (j.cancel != nullptr && j.cancel->load(std::memory_order_acquire)) {   // (dropped unread)
+                if (low) low_done();
                 if (j.bad != nullptr) j.bad->store(true, std::memory_order_release);
                 if (j.left != nullptr) j.left->fetch_sub(1, std::memory_order_acq_rel);
                 {
@@ -241,6 +256,7 @@ private:
             busy_us_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now() - t0).count(),
                                std::memory_order_relaxed);
+            if (low) low_done();
             if (!ok && j.bad != nullptr) j.bad->store(true, std::memory_order_release);
             if (j.left != nullptr) j.left->fetch_sub(1, std::memory_order_acq_rel);
             {
@@ -256,6 +272,16 @@ private:
     std::deque<Job> q_, ql_;
     uint64_t done_ = 0;
     bool quit_ = false;
+    int low_max_ = 0, low_inflight_ = 0;   // DS4_IO_GUESS_MAX (0: no cap) and the guess jobs on the drive now (both under mu_)
+    // a guess job is done: its place for the next guess, and a thread that waits for one may take it (only with a cap: without one
+    // nothing waits on the count)
+    void low_done() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            --low_inflight_;
+        }
+        cv_.notify_one();
+    }
     std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};
 };
 
