@@ -1111,6 +1111,10 @@ struct Model::Impl {
     // store, only those ranked below the stand-in floor (standin_floor); 1 every guess (upstream's reading); 0 none (upstream's default
     // with the store).  DS4_AHEAD, when set, decides as before.
     int la_tail_read = 2, standin_floor = 0;
+    // DS4_STORE_EARLY=N (opt-in; unset or 0: as now): the guesses 2 and 4 layers ahead are read into the RAM store for ranks i < N (ahead_ask),
+    // not only below the stand-in floor. rc_early counts the reads started beyond the mode-2 ranks (the request line's ` early <n>`).
+    int store_early = 0;
+    std::atomic<uint64_t> rc_early{0};
     // STRATA_LA_TAIL_READ=3 (with the learner, the stand-ins and the store; else mode 2): the ranks below the floor as mode 2; a guess at or
     // above the floor is read ahead when its predicted stand-in failure p (the guessed expert's own rate once it has 8 samples, else the
     // rank's) is above tail_thr, which moves with the store's read queue. Learned live from the picks' stand-in outcomes (Req::sub): tail_sfail
@@ -1245,6 +1249,11 @@ struct Model::Impl {
     int ring_n0 = 0;
     std::atomic<bool> ring_x_on{true};   // (DS4_LEND_RING) false while the chunked pass owns the arena: no fill takes a slot >= ring_n0
     int ring_ranks = 0;   // DS4_RING_RANKS=n (read at ring start): only guesses ranked below n are filled (0: every guess)
+    // DS4_RING_FAR=1 (opt-in, read at ring start; unset: as now): ring_request also fills from the learner's guesses 4 layers ahead (layer li + 4),
+    // after the near guesses (li + 1, li + 2) of the same request. A far fill takes only a slot of a layer before li (never an ahead slot), so the
+    // near guesses keep theirs. rc_far counts the far fills (the request line's ` far <n>`).
+    bool ring_far = false;
+    uint64_t rc_far = 0;
     // DS4_RING_STICKY=1 (read at ring start): a landed slot stays (its table entry set) until a fill needs its room. A fill with no free slot
     // evicts the landed slot of a layer before the request's, the least recently picked (ring_last). DS4_RING_MOVE=1 (needs sticky): a
     // landed expert's RAM-store slot is given back (store->drop), so the store's room goes to other experts.
@@ -3704,6 +3713,7 @@ struct Model::Impl {
     }
     void tail_read_init() {
         if (const char* v = std::getenv("STRATA_LA_TAIL_READ")) la_tail_read = std::max(0, std::min(3, std::atoi(v)));
+        if (const char* v = std::getenv("DS4_STORE_EARLY")) store_early = std::max(0, std::atoi(v));   // (DS4_STORE_EARLY=N: unset or 0 as now)
         if (la_tail_read == 3 && (!la_on || d_standin == nullptr || !store)) {
             std::fprintf(stderr, "ds4: STRATA_LA_TAIL_READ=3 needs the learner, the stand-ins and the RAM store: mode 2\n");
             la_tail_read = 2;
@@ -8397,6 +8407,7 @@ struct Model::Impl {
             return;
         }
         if (const char* v = std::getenv("DS4_RING_RANKS")) ring_ranks = std::max(0, std::atoi(v));   // (read once here; <= 0: every guess)
+        if (const char* v = std::getenv("DS4_RING_FAR")) ring_far = std::atoi(v) != 0;   // (DS4_RING_FAR=1: the guesses 4 layers ahead too)
         ring_sticky = on_with_ring("DS4_RING_STICKY");   // (on with the ring: DS4_RING_STICKY=0 for the old ring)
         if (const char* v = std::getenv("DS4_RING_MOVE")) ring_move = std::atoi(v) != 0;
         if (ring_move && !ring_sticky) {
@@ -8460,6 +8471,7 @@ struct Model::Impl {
                      ring_pin_on ? "pinned store, DMA (DS4_RING_PIN=1: the store's whole arena grown and registered at start, none after it)"
                                  : "the store as it is, staged by the driver on the ring thread");
         if (ring_ranks > 0) std::fprintf(stderr, "ds4: ring: guesses ranked below %d only (DS4_RING_RANKS)\n", ring_ranks);
+        if (ring_far) std::fprintf(stderr, "ds4: ring: the guesses 4 layers ahead are filled too, after the near ones (DS4_RING_FAR)\n");
         if (ring_sticky || ring_move || ring_cost) {
             std::string line = "ds4: ring: ";
             if (ring_sticky) line += "sticky (slots kept until needed)";
@@ -8822,11 +8834,11 @@ struct Model::Impl {
         int inflight = 0;
         for (const RingSlot& s : ring_s) inflight += s.used && !s.done;
         bool full = false;   // (non-sticky: no free slot this request - every later guess of it is counted in rc_noslot, none is queued)
-        for (int q = 0; q < 2; ++q) {   // the guesses 1 and 2 layers ahead (ahead_ask's q)
-            const int j = li + q + 1;
+        for (int q = 0; q < (ring_far ? 3 : 2); ++q) {   // the guesses 1 and 2 layers ahead (ahead_ask's q), and (DS4_RING_FAR) 4 ahead, last
+            const int j = li + (q == 2 ? 4 : q + 1);
             if (j >= g.nl) break;
             Layer& n = L[(size_t) j];
-            const int m = std::min(r.na[q], q == 0 ? kAhead1 : kPicks), off = q == 0 ? 0 : kAhead1;
+            const int m = std::min(r.na[q], q == 0 ? kAhead1 : kPicks), off = q == 0 ? 0 : q == 1 ? kAhead1 : kAhead1 + kPicks;
             for (int i = 0; i < m; ++i) {
                 const int e = r.ahead[0][off + i];
                 if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
@@ -8863,7 +8875,8 @@ struct Model::Impl {
                         ++rc_noslot;
                         continue;
                     }
-                    kev = ring_evict_pick(li, j, ahead_ok);   // (sticky: the room of a landed slot (layers before li first), or none: this fill is dropped)
+                    // (a far fill, q 2, takes only a slot of a layer before li: an ahead slot is a nearer guess's, kept)
+                    kev = ring_evict_pick(li, j, ahead_ok && q < 2);   // (sticky: the room of a landed slot (layers before li first), or none: this fill is dropped)
                     if (kev < 0) {
                         ++rc_throttled;
                         continue;
@@ -8913,6 +8926,7 @@ struct Model::Impl {
                 if (ring_sticky) ring_last[(size_t) k].store(ring_tok, std::memory_order_relaxed);
                 ring_own[(size_t) j][(size_t) e] = k;
                 ++rc_issued;
+                if (q == 2) ++rc_far;   // (DS4_RING_FAR: a fill from the guesses 4 layers ahead)
                 ++inflight;
             }
         }
@@ -8948,6 +8962,8 @@ struct Model::Impl {
         if (lend_ring) std::fprintf(stderr, " x %llu", (unsigned long long) rc_xfill);   // (DS4_LEND_RING: fills into the chunk arena's slots)
         if (ring_inflight_auto)
             std::fprintf(stderr, " cap %d (min %d, max %d, last window %.2f tok/s, step %d)", ring_inflight_max, ring_inflight_min_seen, ring_inflight_max_seen, ring_last_tps, ring_last_step);   // (DS4_RING_INFLIGHT=auto)
+        if (ring_far) std::fprintf(stderr, " far %llu", (unsigned long long) rc_far);   // (DS4_RING_FAR: the fills from the guesses 4 layers ahead)
+        if (store_early > 0) std::fprintf(stderr, " early %llu", (unsigned long long) rc_early.load(std::memory_order_relaxed));   // (DS4_STORE_EARLY)
         std::fprintf(stderr, "\n");
     }
 
@@ -9287,13 +9303,15 @@ struct Model::Impl {
             }
             // STRATA_LA_TAIL_READ=2 with the stand-ins on: only the guesses ranked below the floor are read (the rest are counted)
             const int lim = d_standin != nullptr && la_tail_read == 2 && standin_floor > 0 ? std::min(m, standin_floor) : m;
+            // DS4_STORE_EARLY=N: the guesses 2 and 4 layers ahead (not the next layer's) read ranks i < N as well (lim_new >= lim)
+            const int lim_new = store_early > 0 && a != 1 ? std::max(lim, std::min(m, store_early)) : lim;
             for (int t = 0; t < T; ++t)
                 for (int i = 0; i < m; ++i) {
                     const int e = r.ahead[t][off + i];
                     if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                     fl[e] |= a == 4 ? 16 : a == 2 ? 4 : (i < n.k_exp ? 3 : 2);   // (16: 4 layers before)
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
-                    if (i >= lim || (fl[e] & 8)) continue;
+                    if (i >= lim_new || (fl[e] & 8)) continue;
                     // STRATA_LA_TAIL_READ=3: a guess at or above the floor is read only when its stand-in would likely fail
                     const bool tail_gate = tail3_on && i >= standin_floor;
                     if (tail_gate) {
@@ -9302,6 +9320,7 @@ struct Model::Impl {
                     }
                     if (!file_read(n, e)) continue;
                     fl[e] |= 8;
+                    if (i >= lim) rc_early.fetch_add(1, std::memory_order_relaxed);   // (DS4_STORE_EARLY: a read beyond the mode-2 ranks)
                     if (tail_gate) ++tail_gr;
                     if (store) store->prefetch(j, e);
                     else

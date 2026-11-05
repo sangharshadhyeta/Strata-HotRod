@@ -115,3 +115,14 @@ the drive): the kernel records each pick's stand-in outcome (`Req::sub`, `Req::o
 serve thread learns per rank, per card bucket of the layer (`card_n`: the experts with a table entry set now, in buckets 0-7, 8-11,
 12-19, 20+) and per expert, and the threshold follows the store's read queue (up 0.02 above half its limit, down below a
 quarter). Falls back to mode 2 without the learner, the stand-ins, or the store. Report: `ds4: request: tail-read3: ...`.
+
+**DS4_RING_FAR=1 (opt-in, untested):** with the ring on, `ring_request` also fills from the learner's guesses 4 layers ahead (layer li + 4,
+the `Req::ahead` slots after the 1- and 2-ahead ones), after the near guesses of the same request, so the near guesses keep priority. A far
+fill takes only a slot of a layer before li (never an ahead slot), so the sticky evict-ahead tiers are unchanged for the near fills. The
+slot stays "ahead" until li reaches its layer, and its late/used accounting is per layer as for the near fills. The ring's line ends with
+` far <n>`, the fills from the far guesses. Untested until measured.
+
+**DS4_STORE_EARLY=N (opt-in, untested):** `ahead_ask` reads into the RAM store, for the guesses 2 and 4 layers ahead only (not the next
+layer's), the ranks i < N instead of only the ranks below the stand-in floor (`STRATA_LA_TAIL_READ=2`). Unset or 0: as before. The reads
+it starts beyond the mode-2 ranks are counted in ` early <n>` on the ring's request line. These are guess reads, so the auto read-ahead cap
+governs them. Untested until measured.
