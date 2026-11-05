@@ -4,7 +4,7 @@
 
 <h2 align="center">78 GB of model. 30 GB of RAM. 12 GB of VRAM. Zero cloud.</h2>
 
-<p align="center"><b>A 125-billion-parameter AI on one gaming card, running straight from your SSD.</b><br>
+<p align="center"><b>A 125-billion-parameter AI on one gaming card, streaming from your SSD.</b><br>
 Nothing leaves your PC.</p>
 
 <p align="center">
@@ -12,7 +12,7 @@ Nothing leaves your PC.</p>
 </p>
 
 <p align="center">
-  <img alt="Runs from SSD" src="https://img.shields.io/badge/RUNS%20FROM-SSD-1c7ed6?style=for-the-badge">
+  <img alt="Streams from SSD" src="https://img.shields.io/badge/STREAMS%20FROM-SSD-1c7ed6?style=for-the-badge">
   <img alt="30 GB RAM, 78 GB model" src="https://img.shields.io/badge/30%20GB%20RAM-78%20GB%20MODEL-d6336c?style=for-the-badge">
   <img alt="12 GB VRAM" src="https://img.shields.io/badge/12%20GB-VRAM-76b900?style=for-the-badge">
   <img alt="Decode: 50-70 tokens/s" src="https://img.shields.io/badge/50--70-TOK%2FS-e8590c?style=for-the-badge">
