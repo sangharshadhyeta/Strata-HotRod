@@ -1,3 +1,33 @@
+<p align="center"><img src="docs/media/hotrod-hero.gif" width="380" alt="Strata Hot Rod: the Strata hexagon in fire and ice"></p>
+
+<h1 align="center">Strata-HotRod</h1>
+
+<h2 align="center">A 341 GB model. 31 GB of RAM. 12 GB of VRAM. Zero cloud.</h2>
+
+<p align="center"><b>DeepSeek-V4.1-Flash on one gaming card, streaming from your SSD, at about 5 tokens/s.</b><br>
+Nothing leaves your PC.</p>
+
+<p align="center">
+🔥 <b>hot experts</b> on the card &nbsp;→&nbsp; 🌡️ <b>warm</b> in RAM &nbsp;→&nbsp; ❄️ <b>cold</b> on the SSD
+</p>
+
+<p align="center">
+  <img alt="Streams from SSD" src="https://img.shields.io/badge/STREAMS%20FROM-SSD-1c7ed6?style=for-the-badge">
+  <img alt="31 GB RAM, 341 GB model" src="https://img.shields.io/badge/31%20GB%20RAM-341%20GB%20MODEL-d6336c?style=for-the-badge">
+  <img alt="12 GB VRAM" src="https://img.shields.io/badge/12%20GB-VRAM-76b900?style=for-the-badge">
+  <img alt="About 5 tokens per second" src="https://img.shields.io/badge/~5-TOK%2FS-e8590c?style=for-the-badge">
+</p>
+
+<table>
+<tr>
+<td align="center" width="33%"><h2>🐋 341 GB</h2>of DeepSeek-V4.1-Flash files on a <b>31 GB</b> PC</td>
+<td align="center" width="33%"><h2>⚡ about 5</h2>tokens/s on one RTX 3060 12 GB</td>
+<td align="center" width="33%"><h2>💾 2.8 GB/s</h2>the NVMe is the limit: each token still reads about 2 GB of experts</td>
+</tr>
+</table>
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
