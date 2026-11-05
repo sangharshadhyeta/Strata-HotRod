@@ -1226,6 +1226,7 @@ struct Model::Impl {
         bool used = false, done = false, counted = false;   // done: the copy has landed (its flag is set); counted: its layer's request came
         uint64_t fill_tok = 0;   // the token counter when the fill was issued
         bool picked_once = false;   // sticky: some request picked its expert since the fill (the eviction's first tier is the others)
+        int8_t dq = 0;   // the pass q that filled it (0: 1 layer ahead, 1: 2 ahead, 2: 4 ahead)
     };
     bool ring_want = false, ring_on = false;
     int ring_n = 0, ring_inflight_max = 12;
@@ -1254,6 +1255,14 @@ struct Model::Impl {
     // near guesses keep theirs. rc_far counts the far fills (the request line's ` far <n>`).
     bool ring_far = false;
     uint64_t rc_far = 0;
+    // DS4_RING_WORTH=1 (opt-in, read at ring start; implies ring_far): ring_request runs its passes (q 0, 1, 2) in the order of each pass's
+    // worth (rw_pay / rw_n, a decayed window per pass), once every pass has 32 counts; else the order is 0, 1, 2. Per-distance counters (always
+    // on, logging only): rd_n (copies counted, by the pass that filled them), rd_pay (picked and landed in time: paid), rd_late_pick (picked, late).
+    bool ring_worth = false;
+    uint64_t rd_n[3] = {0, 0, 0}, rd_pay[3] = {0, 0, 0}, rd_late_pick[3] = {0, 0, 0};
+    double rw_n[3] = {0.0, 0.0, 0.0}, rw_pay[3] = {0.0, 0.0, 0.0};   // (halved together when rw_n exceeds 512)
+    uint64_t ring_wreq = 0;   // the worth-ordered requests (every 8th: the pass with the fewest counts goes first)
+    int ring_order[3] = {0, 1, 2};   // the pass order of the last request (the request line's ` order`)
     // DS4_RING_STICKY=1 (read at ring start): a landed slot stays (its table entry set) until a fill needs its room. A fill with no free slot
     // evicts the landed slot of a layer before the request's, the least recently picked (ring_last). DS4_RING_MOVE=1 (needs sticky): a
     // landed expert's RAM-store slot is given back (store->drop), so the store's room goes to other experts.
@@ -8408,6 +8417,8 @@ struct Model::Impl {
         }
         if (const char* v = std::getenv("DS4_RING_RANKS")) ring_ranks = std::max(0, std::atoi(v));   // (read once here; <= 0: every guess)
         if (const char* v = std::getenv("DS4_RING_FAR")) ring_far = std::atoi(v) != 0;   // (DS4_RING_FAR=1: the guesses 4 layers ahead too)
+        if (const char* v = std::getenv("DS4_RING_WORTH")) ring_worth = std::atoi(v) != 0;   // (DS4_RING_WORTH=1: the passes by measured worth; implies the far pass)
+        if (ring_worth) ring_far = true;
         ring_sticky = on_with_ring("DS4_RING_STICKY");   // (on with the ring: DS4_RING_STICKY=0 for the old ring)
         if (const char* v = std::getenv("DS4_RING_MOVE")) ring_move = std::atoi(v) != 0;
         if (ring_move && !ring_sticky) {
@@ -8472,6 +8483,7 @@ struct Model::Impl {
                                  : "the store as it is, staged by the driver on the ring thread");
         if (ring_ranks > 0) std::fprintf(stderr, "ds4: ring: guesses ranked below %d only (DS4_RING_RANKS)\n", ring_ranks);
         if (ring_far) std::fprintf(stderr, "ds4: ring: the guesses 4 layers ahead are filled too, after the near ones (DS4_RING_FAR)\n");
+        if (ring_worth) std::fprintf(stderr, "ds4: ring: the passes run in the order of their measured worth (DS4_RING_WORTH, far pass on)\n");
         if (ring_sticky || ring_move || ring_cost) {
             std::string line = "ds4: ring: ";
             if (ring_sticky) line += "sticky (slots kept until needed)";
@@ -8811,6 +8823,21 @@ struct Model::Impl {
             else ++rc_late;
             if (picked) ++rc_used;
             else if (s.done) ++rc_unused;
+            // per distance: the pass that filled the slot; paid = the copy was picked and had landed (the rest of the picked are right but late)
+            const int dq = s.dq;
+            const bool paid = picked && s.done && !ring_bad[(size_t) k];
+            ++rd_n[dq];
+            rw_n[dq] += 1.0;
+            if (paid) {
+                ++rd_pay[dq];
+                rw_pay[dq] += 1.0;
+            } else if (picked) {
+                ++rd_late_pick[dq];
+            }
+            if (rw_n[dq] > 512.0) {
+                rw_n[dq] *= 0.5;
+                rw_pay[dq] *= 0.5;
+            }
         }
         if (ring_sticky) {   // (the landed slots stay: a pick of layer li's expert is its use now, the last one is its eviction's order)
             for (int k = 0; k < ring_n; ++k) {
@@ -8834,9 +8861,37 @@ struct Model::Impl {
         int inflight = 0;
         for (const RingSlot& s : ring_s) inflight += s.used && !s.done;
         bool full = false;   // (non-sticky: no free slot this request - every later guess of it is counted in rc_noslot, none is queued)
-        for (int q = 0; q < (ring_far ? 3 : 2); ++q) {   // the guesses 1 and 2 layers ahead (ahead_ask's q), and (DS4_RING_FAR) 4 ahead, last
+        // the passes' order: 0, 1, 2 (the guesses 1 and 2 layers ahead, and (DS4_RING_FAR) 4 ahead); DS4_RING_WORTH: by worth, see ring_worth
+        const int np = ring_far ? 3 : 2;
+        int order[3] = {0, 1, 2};
+        if (ring_worth) {
+            bool warm = true;   // (until every pass has 32 counts: the fixed order)
+            for (int d = 0; d < 3; ++d) warm = warm && rw_n[d] >= 32.0;
+            if (warm) {
+                const double w[3] = {rw_n[0] < 1.0 ? 0.0 : rw_pay[0] / rw_n[0], rw_n[1] < 1.0 ? 0.0 : rw_pay[1] / rw_n[1],
+                                     rw_n[2] < 1.0 ? 0.0 : rw_pay[2] / rw_n[2]};
+                for (int a = 1; a < 3; ++a)   // (insertion sort by worth, descending; a pass moves up only past a strictly lower one: stable)
+                    for (int b = a; b > 0 && w[order[b - 1]] < w[order[b]]; --b) {
+                        const int tmp = order[b - 1];
+                        order[b - 1] = order[b];
+                        order[b] = tmp;
+                    }
+                if (++ring_wreq % 8 == 0) {   // (exploration: the pass with the fewest counts goes first, the rest keep the worth order)
+                    int lo = 0;
+                    for (int d = 1; d < 3; ++d)
+                        if (rw_n[d] < rw_n[lo]) lo = d;
+                    int pos = 0;
+                    while (order[pos] != lo) ++pos;
+                    for (; pos > 0; --pos) order[pos] = order[pos - 1];
+                    order[0] = lo;
+                }
+            }
+            for (int pi = 0; pi < 3; ++pi) ring_order[pi] = order[pi];
+        }
+        for (int pi = 0; pi < np; ++pi) {
+            const int q = order[pi];   // (the pass's own q: its layer offset, guess offset, count and the eviction's restriction)
             const int j = li + (q == 2 ? 4 : q + 1);
-            if (j >= g.nl) break;
+            if (j >= g.nl) continue;   // (continue, not break: with the worth order a later pass may still have a layer)
             Layer& n = L[(size_t) j];
             const int m = std::min(r.na[q], q == 0 ? kAhead1 : kPicks), off = q == 0 ? 0 : q == 1 ? kAhead1 : kAhead1 + kPicks;
             for (int i = 0; i < m; ++i) {
@@ -8918,6 +8973,7 @@ struct Model::Impl {
                 ring_push_l(it);
                 s.layer = j;
                 s.expert = e;
+                s.dq = (int8_t) q;
                 s.used = true;
                 s.done = false;
                 s.counted = false;
@@ -8963,6 +9019,13 @@ struct Model::Impl {
         if (ring_inflight_auto)
             std::fprintf(stderr, " cap %d (min %d, max %d, last window %.2f tok/s, step %d)", ring_inflight_max, ring_inflight_min_seen, ring_inflight_max_seen, ring_last_tps, ring_last_step);   // (DS4_RING_INFLIGHT=auto)
         if (ring_far) std::fprintf(stderr, " far %llu", (unsigned long long) rc_far);   // (DS4_RING_FAR: the fills from the guesses 4 layers ahead)
+        for (int d = 0; d < 3; ++d)   // (per distance, the pass that filled the copies: 1, 2 or 4 layers ahead)
+            if (rd_n[d] > 0)
+                std::fprintf(stderr, " d%d %llu/%llu paid (%llu right but late)", d == 2 ? 4 : d + 1, (unsigned long long) rd_pay[d],
+                             (unsigned long long) rd_n[d], (unsigned long long) rd_late_pick[d]);
+        if (ring_worth)
+            std::fprintf(stderr, " order %d,%d,%d", ring_order[0] == 2 ? 4 : ring_order[0] + 1, ring_order[1] == 2 ? 4 : ring_order[1] + 1,
+                         ring_order[2] == 2 ? 4 : ring_order[2] + 1);   // (DS4_RING_WORTH: the distances in the last request's pass order)
         if (store_early > 0) std::fprintf(stderr, " early %llu", (unsigned long long) rc_early.load(std::memory_order_relaxed));   // (DS4_STORE_EARLY)
         std::fprintf(stderr, "\n");
     }

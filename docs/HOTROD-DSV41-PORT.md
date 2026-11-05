@@ -122,6 +122,17 @@ fill takes only a slot of a layer before li (never an ahead slot), so the sticky
 slot stays "ahead" until li reaches its layer, and its late/used accounting is per layer as for the near fills. The ring's line ends with
 ` far <n>`, the fills from the far guesses. Untested until measured.
 
+**Per-distance ring counters (always on, logging only):** each ring slot records the pass that filled it (`RingSlot::dq`: 1, 2 or 4 layers
+ahead). When its layer's request comes, the slot is counted per distance: `rd_n` (counted), `rd_pay` (picked and landed in time: the copy
+paid off) and `rd_late_pick` (picked but late). The ring's line ends with ` d<1|2|4> <pay>/<n> paid (<late> right but late)` for each distance
+with a count. A decayed window per distance (`rw_n`, `rw_pay`, halved together past 512) gives its worth, rw_pay / rw_n.
+
+**DS4_RING_WORTH=1 (opt-in, untested):** implies DS4_RING_FAR. `ring_request` runs its three passes in the order of their worth, highest
+first (ties keep 0, 1, 2). Until every pass has 32 counts the order is the fixed 0, 1, 2. Every 8th such request the pass with the fewest
+counts goes first, so a last-placed distance keeps being measured. Inside a pass nothing changes: its own q keys the layer offset, the guess
+offset, the count and the eviction restriction (`ahead_ok && q < 2`). The request line adds ` order <a>,<b>,<c>` (the distances in the last
+order used). Untested until measured.
+
 **DS4_STORE_EARLY=N (opt-in, untested):** `ahead_ask` reads into the RAM store, for the guesses 2 and 4 layers ahead only (not the next
 layer's), the ranks i < N instead of only the ranks below the stand-in floor (`STRATA_LA_TAIL_READ=2`). Unset or 0: as before. The reads
 it starts beyond the mode-2 ranks are counted in ` early <n>` on the ring's request line. These are guess reads, so the auto read-ahead cap
