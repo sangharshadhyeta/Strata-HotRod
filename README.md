@@ -28,202 +28,216 @@ Nothing leaves your PC.</p>
 
 ---
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
-  </picture>
-</p>
+<div align="justify">
 
-<h3 align="center">Run powerful AI on your own computer.</h3>
-<p align="center">Chat, code and work with images, locally.</p>
+This is the **DeepSeek branch** (`upstream-dsv41`) of Strata-HotRod: upstream [Strata](https://github.com/Niko1221/Strata)
+0.2.7.1's DeepSeek engine (`strata-dsv41`) with the Strata-HotRod features ported. The Qwen3.8-Flash-Next page is on
+[`main`](https://github.com/sangharshadhyeta/Strata-HotRod). What was ported, with every measurement:
+[docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md). Upstream's own README for this branch is kept in the history
+([the last version](https://github.com/sangharshadhyeta/Strata-HotRod/blob/6c02a2e1/README.md)).
 
-<p align="center">
-  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
-  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
-</p>
+</div>
 
-<p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
-</p>
+> **Tested on one machine, with one model.** Other cards, AMD, Windows, macOS and other model sizes may work in upstream
+> Strata; we have not run them, so we do not describe them here.
 
-<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
+## How fast
 
-> **Strata-HotRod, DeepSeek branch.** This branch (`upstream-dsv41`) is upstream Strata 0.2.7.1's DeepSeek engine with the
-> Strata-HotRod features ported, run on one RTX 3060 12 GB with 31 GB of RAM: DeepSeek-V4.1-Flash at about 5.2-5.4 tokens/s
-> with its VRAM ring and stand-ins. What was ported, the measurements and how to run it:
-> [docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md). The rest of this page is upstream's.
+<div align="justify">
 
-**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
+Measured on the machine below (answer tokens/s, the same 3 questions, 32K context, every answer read by hand).
 
-## Models
+</div>
 
-We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
+<table width="100%">
+<tr><th align="left">Setting</th><th align="right">tokens/s</th></tr>
+<tr><td align="left">The default here: the VRAM ring + stand-ins</td><td align="right"><b>5.2 / 5.3 / 5.4</b> (three runs)</td></tr>
+<tr><td align="left">The same sessions without the ring and stand-ins</td><td align="right">4.8 - 5.0</td></tr>
+</table>
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+<div align="justify">
 
-| Provider | Choices |
-| --- | --- |
-| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
-| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
-| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+Why it is not faster: 270 of the 15,360 routed experts (2.65 GB) fit the card next to 6.2 GB of dense weights, so about 75% of
+the picks are computed on the CPU lane, from the RAM store or in place from the files. Each token still needs about 2 GB of
+expert weights from RAM and the NVMe, and the NVMe (about 2.8 GB/s) is the limit on this PC. All the rows, including what did
+not help: [docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md).
 
-[Compare sizes, memory needs and compatibility](docs/MODELS.md).
-
-</details>
+</div>
 
 <details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+<summary><b>The machine and the files</b></summary>
 
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
-
-[Model guide and compatibility](docs/QWEN36.md).
-
+<table width="100%">
+<tr><th align="left"></th><th align="left"></th></tr>
+<tr><td align="left"><b>Graphics card</b></td><td align="left">NVIDIA GeForce RTX 3060, 12 GB</td></tr>
+<tr><td align="left"><b>Processor, RAM</b></td><td align="left">Intel Core i5-12400F, 31 GB</td></tr>
+<tr><td align="left"><b>Disk</b></td><td align="left">NVMe on a PCIe 3.0 link (about 2.8 GB/s); the model files live on it</td></tr>
+<tr><td align="left"><b>Model</b></td><td align="left">Starw1's DeepSeek-V4.1-Flash-1017 uncensored: the GSQ-RCO IQ2_XXS backbone (138.6 GB) with DeepSeek's MXFP8 Engram (202.8 GB), which is the 341 GB; plus the DSpark drafter (8.0 GB, a separate file) and a 5.8 MB metadata shard from Unsloth</td></tr>
+<tr><td align="left"><b>Engine</b></td><td align="left">Strata 0.2.7.1 (upstream) plus this fork's DeepSeek work, release <code>v0.2.7.1-hotrod.2</code></td></tr>
+</table>
 </details>
 
-<details>
-<summary><img src="docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>
+## What this branch adds
 
-In the **desktop app** and the **Terminal**. What does not fit in memory is read from your SSD, so it needs a lot of free
-disk space.
+<div align="justify">
 
-| Set (IST-DAS) | Download | Free disk needed |
-| --- | ---: | ---: |
-| 1.75 bpw | 239 GB | about 245 GB |
-| 2.00 bpw | 257 GB | about 265 GB |
-| 2.25 bpw | 274 GB | about 280 GB |
+To upstream's DeepSeek engine, on by default when the ring is on (`=0` turns each off):
 
-Runs on NVIDIA RTX 30, 40 and 50 series (Windows and Linux), AMD Radeon AI PRO R9700 (Linux), AMD Ryzen AI Max — Strix Halo
-(Windows), and Apple Silicon Macs with 64 GB or more, text only ([Mac](docs/DEEPSEEK_MAC.md)). Setup downloads the files and the DeepSeek engine, then starts the model.
+- **A VRAM ring** (`DS4_RING=32`): the learned look-ahead's guesses for the next 1-2 layers are copied from a page-locked
+  RAM store into card slots; a pick uses its slot only if the copy has landed in time.
+- **Sticky ring** (`DS4_RING_STICKY`): a landed copy stays until its slot is needed, so a later token that picks the same
+  expert reuses it (about 80,000 reuses in one answer).
+- **The prompt pass's buffers as ring slots** (`DS4_LEND`, `DS4_LEND_RING`): the 1 GB the chunked prompt pass keeps on
+  the card holds 99-100 more ring slots while the model answers, and is handed back before a long prompt.
+- **A self-adjusting copy limit** (`DS4_RING_INFLIGHT`, auto): copies in flight follow the measured decode speed
+  (128-token averages, a 3% dead band; it settles at 11-12 on this PC). `=fixed` keeps 12.
+- **Stand-ins with their re-check and self-tuning budget**, the learned look-ahead and the learned VRAM reserve.
+- **The RAM store gives back its coldest idle chunk** (unpinned first) when RAM runs short, and takes chunks back later.
+- **Pictures**: with Unsloth's `mmproj-BF16.gguf` in the pack (`--mmproj` to `pack_gguf.py`) and `--vision on`, the
+  engine's own vision tower reads images (319 MiB of VRAM; checked on a known picture: shapes, colours, positions and text
+  right). Known issue: with the tower on, the RAM store is sized 0 and the ring turns off (a free-RAM drop is taken for a
+  unified-memory machine); the fix is pending.
 
-```sh
-strata launch --family deepseek41 --model ist-das-2.00bpw --plan
-```
+Measured and left opt-in: `STRATA_LA_TAIL_READ=3` (a learned read-ahead of lower-ranked guesses: 23% slower, the drive is
+already at its limit here) and `DS4_PCIE_BALANCE=1` (Qwen's dynamic balance ported: its copies arrive too late and it is
+not yet safe - do not turn it on).
 
-Measured with the 2.00 bpw set on Strata 0.2.5 (Strix Halo: 0.2.7). Output is the speed of the answer, prompt is how fast Strata reads your input.
-
-| Hardware | Output | Prompt |
-| --- | ---: | ---: |
-| RTX 5070 12 GB, 64 GB RAM | 4 to 6 tokens/s | about 110 tokens/s (4K) |
-| RTX 3060 12 GB, 46 GB RAM | 9 to 11 tokens/s | about 155 tokens/s (4K) |
-| 1x Radeon AI PRO R9700, 251 GB RAM | 21 to 25 tokens/s | 320 to 360 tokens/s (8K) |
-| 4x Radeon AI PRO R9700 | 74 to 77 tokens/s | 400 to 450 tokens/s (8K) |
-| Ryzen AI Max+ 395 (Strix Halo), 128 GB unified | 19 to 21 tokens/s (code), 11 (chat) | 87 tokens/s (4K), 125 tokens/s (8K) |
-
-[Memory, disk and details](docs/DEEPSEEK41.md) · [Release notes](https://github.com/Niko1221/Strata/releases)
-
-</details>
-
-<a id="the-other-sizes"></a>
-
-Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
+</div>
 
 ## Install
 
-<a id="option-a-the-strata-app"></a>
+<div align="justify">
 
-### Desktop app
+About **345 GB free on an NVMe** (139 GB of model, the 203 GB Engram table, 1 GB for pictures), a recent NVIDIA driver, the
+CUDA 13 toolkit and gcc-toolset-13 (Rocky Linux 9; other distributions are untested). The DeepSeek engine builds against the
+`third_party/llama.cpp` of the Qwen checkout on [`main`](https://github.com/sangharshadhyeta/Strata-HotRod), so clone that first.
+These are the commands this PC was set up with; the branch's own `setup.py --model Starw1-2.00bpw-MXFP8` downloads the same files
+and makes the pack, but that route is untested here.
 
-**[Download Strata for Windows, Linux or Mac →](https://github.com/Niko1221/Strata/releases/latest)**
+</div>
 
-Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
-downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
+```bash
+# the DeepSeek branch beside the Qwen checkout (run from inside Strata-HotRod, where the Qwen install left you)
+git fetch origin upstream-dsv41 && git worktree add ../Strata-HotRod-ds upstream-dsv41
+cd ../Strata-HotRod-ds
+PY=../Strata-HotRod/.venv/bin/python   # the Qwen install's venv runs this branch's server and tools too
 
-<sub>Files: `Strata-0.2.7-windows-x64-setup.exe` · `Strata-0.2.7-linux-x86_64.AppImage` · `Strata-0.2.7-macos-arm64.dmg`</sub>
+# the engine (sm_86 = RTX 30-series; set yours)
+scl enable gcc-toolset-13 -- bash -c 'cmake -G Ninja -S . -B build-dsv41 -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_DSV41=ON -DSTRATA_NATIVE_EXPERTS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=86-real -DSTRATA_GGML_DIR=$PWD/../Strata-HotRod/third_party/llama.cpp \
+  && ninja -C build-dsv41 strata-dsv41'
 
-<p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
-  <br><sub>Chat, files and a live preview in one window.</sub>
-</p>
+# the model (M: the folder for the files): Starw1's 4 shards + the MXFP8 Engram, Unsloth's metadata shard,
+# and for pictures Unsloth's mmproj-BF16.gguf in $M/..
+M=/mnt/nvme/models/deepseek41-flash/GSQ-RCO-IQ2_XXS
+$PY - "$M" <<'EOF'
+import sys
+from huggingface_hub import hf_hub_download, snapshot_download
+m = sys.argv[1]
+snapshot_download("Starw1/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-IQ2_XXS-MXFP8-Engram-GGUF", local_dir=m)
+hf_hub_download("unsloth/DeepSeek-V4.1-Flash-1017-GGUF", "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf",
+                local_dir=m + "/unsloth")
+hf_hub_download("unsloth/DeepSeek-V4.1-Flash-1017-GGUF", "mmproj-BF16.gguf", local_dir=m + "/..")
+EOF
 
-<a id="option-b-the-terminal-one-line"></a>
-
-### Terminal app
-
-Prefer the terminal? Install Strata, then run **`strata launch`**.
-
-<details open>
-<summary><b>Install commands</b></summary>
-
-**Linux / Mac**
-
-```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+# the pack (a few MB of index beside the files; no weights are copied)
+$PY tools/dsv41/pack_gguf.py --model $M \
+  --shards DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000{1,2,3,4}-of-00004.gguf \
+  --engram $M/DeepSeek-V4.1-Flash-Engram-MXFP8.gguf \
+  --engram-meta $M/unsloth/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf \
+  --mmproj $M/../mmproj-BF16.gguf --out /mnt/nvme/strata-data/packs/ds41v
+cp data/dsv41/profile-2.00.bin /mnt/nvme/strata-data/packs/ds41v/expert-profile.bin
 ```
 
-**Windows PowerShell**
+<div align="justify">
 
-```powershell
-irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+**The config** `strata-ds41.json` (the ring and stand-ins are switched on here; everything above follows from them):
+
+</div>
+
+```json
+{
+ "exe": "/path/to/Strata-HotRod-ds/build-dsv41/strata-dsv41",
+ "args": ["--pack", "/mnt/nvme/strata-data/packs/ds41v", "--max-context", "262144", "--eos", "1",
+          "--vision", "on", "--dspark", "auto"],
+ "cwd": "/path/to/Strata-HotRod-ds",
+ "tokenizer": "/mnt/nvme/strata-data/packs/ds41v/tokenizer",
+ "model_name": "deepseek-v4.1-flash",
+ "arch": "deepseek41",
+ "engine_ready_s": 3600,
+ "env": {"DS4_RING": "32", "DS4_RING_PIN": "1", "STRATA_STANDIN": "1"},
+ "answer_room": false,
+ "reasoning_budget_tokens": 0
+}
 ```
 
-On Windows, open a new terminal afterwards. Then:
+<div align="justify">
 
-```sh
-strata launch
+- `"answer_room": false` and `"reasoning_budget_tokens": 0`: no limit but the context (otherwise DeepSeek's thinking
+  stops at 32,768 tokens and a client's cap keeps a quarter for the answer).
+- `--vision off` (or leaving out `--mmproj` when packing) gives text only, and today the faster setup (see the known issue).
+
+**Run** it inside a memory limit (94% of RAM; two uncapped runs once froze this PC), from `Strata-HotRod-ds`:
+
+</div>
+
+```bash
+systemd-run --scope -p MemoryMax=$(awk '/MemTotal/ {printf "%dK", $2 * 0.94}' /proc/meminfo) -p MemorySwapMax=0 \
+  $PY serve/server.py --engine strata --config strata-ds41.json --port 8095 --host 0.0.0.0 --api-key YOUR_KEY
 ```
 
-Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL_LAUNCH.md).
+<div align="justify">
 
+The first start at a new context size learns its VRAM reserve; if it prints `ring: off (... would not fit)`, start it once
+more. When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095`. For this PC only, leave out `--host`
+and `--api-key`.
+
+</div>
+
+## Using it
+
+<div align="justify">
+
+Any OpenAI-compatible client works with **`http://127.0.0.1:8095/v1`** and your API key:
+
+</div>
+
+```bash
+curl http://127.0.0.1:8095/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"strata","temperature":1.0,"top_p":0.95,"max_tokens":300,
+       "messages":[{"role":"user","content":"Name the three largest cities in India."}]}'
+```
+
+<div align="justify">
+
+Pictures (optional): add a `"vision"` section to the config; a message can then carry an `image_url`
+([docs/IMAGES.md](docs/IMAGES.md)). Every switch, flag and server key: [docs/FEATURES-deepseek.md](docs/FEATURES-deepseek.md).
+Upstream's reference for the rest: [docs/DETAILS.md](docs/DETAILS.md) (it covers more than we tested).
+
+</div>
+
+<details>
+<summary><b>Not tested</b></summary>
+
+<div align="justify">
+
+- Any other graphics card, any AMD card, Windows, macOS or another Linux.
+- Any other DeepSeek set or size.
+- Several requests at once, or two graphics cards.
+
+</div>
 </details>
 
-<p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata terminal app showing model activity, speed, memory and recent requests">
-  <br><sub>Watch your model and hardware while it runs.</sub>
-</p>
+## Credits and license
 
-<a id="build-from-source"></a>
+<div align="justify">
 
-[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
+The model is DeepSeek-V4.1-Flash by DeepSeek, compressed by Starw1 (the GSQ-RCO IQ2_XXS backbone with DeepSeek's MXFP8
+Engram), with metadata and the picture projector from Unsloth. Strata is by Niko1221 and its contributors; the DeepSeek
+engine comes from Project Maya's maya-ds4. This fork keeps Strata's [MIT License](LICENSE) and copyright notice. The engine
+uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). A few parts and every model have their own
+licenses: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#license). Security: [SECURITY.md](SECURITY.md).
 
-<a id="what-you-need"></a>
-
-## Hardware
-
-| Supported hardware | Guide |
-| --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 series** | [NVIDIA setup](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD setup](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · experimental** | [RX 6000 setup](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
-| **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
-
-<a id="using-it"></a>
-
-## Tools
-
-**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, and more through the OpenAI- and Anthropic-compatible APIs.
-
-Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
-
-<a id="guides"></a>
-<a id="how-fast-is-it"></a>
-<a id="how-does-it-work"></a>
-<a id="something-went-wrong"></a>
-
-## Help
-
-[All guides](docs) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Report a bug](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [How it works](docs/HOW_IT_WORKS.md) · [Contribute](CONTRIBUTING.md)
-
-## Support Strata
-
-**Help keep local AI open to everyone.** A coffee helps fund development and testing on more hardware.
-
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
-
-[MIT license](LICENSE) · [Credits and model licenses](docs/HOW_IT_WORKS.md#credits) · [Privacy](docs/SAFETY.md)
-
-<a id="option-c-let-your-ai-set-it-up"></a>
-
-<sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
-
-**Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
-
+</div>
