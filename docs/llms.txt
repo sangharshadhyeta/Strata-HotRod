@@ -1,0 +1,20 @@
+# Strata-HotRod
+
+> Strata-HotRod is a fork of Strata (by Niko1221, MIT) that runs Qwen3.8-Flash-Next (125B) on one RTX 3060 12 GB with 30 GB of RAM, reading the experts that do not fit from the SSD, at 50-70 tokens/s. Measured on one PC. Nothing leaves the PC.
+
+## Key facts
+- Model: Qwen3.8-Flash-Next, the 78 GB IQ3_S (about 3.5 bits per weight), by ISTA-DASLab.
+- Machine: RTX 3060 12 GB, Intel i5-12400F, 30 GB RAM, PCIe 3.0 NVMe, Rocky Linux 9.6.
+- Speed: 52-55 tokens/s on code, 66-71 on reasoning, 50-53 on prose (131K context). 262K context fits.
+- Long prompts: 8,554 tokens read in 16.9 s; 45,398 tokens in 67-68 s; the next turn of a 45K conversation resumes in 0.4-0.5 s.
+- RAM: measured on 30 GB. Strata's setup recommends 64 GB for IQ3_S and reads the rest from the SSD, which its docs call much slower.
+- DeepSeek-V4.1-Flash (341 GB of files) runs at about 5 tokens/s on the same PC (a separate branch), limited by the NVMe at about 2.8 GB/s.
+- Not tested: other GPUs, AMD, Windows, macOS, other model sizes, several requests at once, two cards.
+- No cloud service is needed to run it. Setup downloads the model once from Hugging Face.
+
+## Links
+- [Project page](https://sangharshadhyeta.github.io/Strata-HotRod/): the question "Can Qwen3.8-Flash-Next run on an RTX 3060 12 GB with low RAM?" answered with measured numbers.
+- [GitHub repository](https://github.com/sangharshadhyeta/Strata-HotRod): code, install steps, measurements.
+- [DeepSeek branch](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41)
+- [Write-up on dev.to](https://dev.to/sumit_sodhi/a-125b-model-at-50-toks-on-a-12-gb-gaming-card-what-i-changed-in-strata-2cig)
+- [Strata, the project this is forked from](https://github.com/Niko1221/Strata)
