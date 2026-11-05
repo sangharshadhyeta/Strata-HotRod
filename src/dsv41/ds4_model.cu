@@ -1235,6 +1235,7 @@ struct Model::Impl {
         uint64_t fill_tok = 0;   // the token counter when the fill was issued
         bool picked_once = false;   // sticky: some request picked its expert since the fill (the eviction's first tier is the others)
         int8_t dq = 0;   // the pass q that filled it (0: 1 layer ahead, 1: 2 ahead, 2: 4 ahead)
+        int8_t rk = 0;   // the guess's rank i within its pass (0-based): DS4_RING_WORTH's cell (dq, rk)
     };
     bool ring_want = false, ring_on = false;
     int ring_n = 0, ring_inflight_max = 12;
@@ -1271,6 +1272,14 @@ struct Model::Impl {
     double rw_n[3] = {0.0, 0.0, 0.0}, rw_pay[3] = {0.0, 0.0, 0.0};   // (halved together when rw_n exceeds 512)
     uint64_t ring_wreq = 0;   // the worth-ordered requests (every 8th: the pass with the fewest counts goes first)
     int ring_order[3] = {0, 1, 2};   // the pass order of the last request (the request line's ` order`)
+    // DS4_RING_WORTH=2 (read at ring start; ring_worth stays set): every guess is ranked on its own. A cell (dq, rank) gets, per copy counted
+    // at its layer's request, the value 1 when the copy was paid (picked, landed in time) and needed: need = 1 for a pick ranked below the
+    // stand-in floor (or with the stand-ins off), else sfail[pick rank]. cw_val / cw_n is the cell's paid-and-needed worth (decayed: halved
+    // past 256). sf_off / sf_fail: the stand-in outcomes by the router's pick rank (Req::sub: 1 replaced, 2 stayed off the card = a failure),
+    // sfail[r] = (sf_fail + 1) / (sf_off + 2), decayed past 1024. Measured live; no routing decision reads them.
+    bool ring_worth2 = false;
+    double cw_n[3][kAhead1] = {}, cw_val[3][kAhead1] = {};
+    double sf_off[kPicks] = {}, sf_fail[kPicks] = {};
     // DS4_RING_STICKY=1 (read at ring start): a landed slot stays (its table entry set) until a fill needs its room. A fill with no free slot
     // evicts the landed slot of a layer before the request's, the least recently picked (ring_last). DS4_RING_MOVE=1 (needs sticky): a
     // landed expert's RAM-store slot is given back (store->drop), so the store's room goes to other experts.
@@ -8432,6 +8441,7 @@ struct Model::Impl {
         if (const char* v = std::getenv("DS4_RING_FAR")) ring_far = std::atoi(v) != 0;   // (DS4_RING_FAR=1: the guesses 4 layers ahead too)
         if (const char* v = std::getenv("DS4_RING_WORTH")) ring_worth = std::atoi(v) != 0;   // (DS4_RING_WORTH=1: the passes by measured worth; implies the far pass)
         if (ring_worth) ring_far = true;
+        ring_worth2 = ring_worth && std::atoi(std::getenv("DS4_RING_WORTH")) == 2;   // (=2: every guess ranked by its own cell)
         ring_sticky = on_with_ring("DS4_RING_STICKY");   // (on with the ring: DS4_RING_STICKY=0 for the old ring)
         if (const char* v = std::getenv("DS4_RING_MOVE")) ring_move = std::atoi(v) != 0;
         if (ring_move && !ring_sticky) {
@@ -8496,7 +8506,8 @@ struct Model::Impl {
                                  : "the store as it is, staged by the driver on the ring thread");
         if (ring_ranks > 0) std::fprintf(stderr, "ds4: ring: guesses ranked below %d only (DS4_RING_RANKS)\n", ring_ranks);
         if (ring_far) std::fprintf(stderr, "ds4: ring: the guesses 4 layers ahead are filled too, after the near ones (DS4_RING_FAR)\n");
-        if (ring_worth) std::fprintf(stderr, "ds4: ring: the passes run in the order of their measured worth (DS4_RING_WORTH, far pass on)\n");
+        if (ring_worth && !ring_worth2) std::fprintf(stderr, "ds4: ring: the passes run in the order of their measured worth (DS4_RING_WORTH, far pass on)\n");
+        if (ring_worth2) std::fprintf(stderr, "ds4: ring: every guess is ranked by its measured paid-and-needed worth (DS4_RING_WORTH=2, far pass on)\n");
         if (ring_sticky || ring_move || ring_cost) {
             std::string line = "ds4: ring: ";
             if (ring_sticky) line += "sticky (slots kept until needed)";
@@ -8825,6 +8836,19 @@ struct Model::Impl {
         ring_reap();
         if (ring_inflight_auto && ring_tok - ring_adj_tok >= 32) ring_inflight_adjust();   // (DS4_RING_INFLIGHT=auto: every 32 decode tokens, ring_mu held)
         Layer& l = L[(size_t) li];
+        if (ring_worth) {   // (DS4_RING_WORTH: the stand-in outcomes by the router's pick rank, once per layer request; Req::sub is 0 without stand-ins)
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < l.k_exp && i < kPicks; ++i) {
+                    const int sb = r.sub[t][i];
+                    if (sb == 0) continue;
+                    sf_off[i] += 1.0;
+                    if (sb == 2) sf_fail[i] += 1.0;
+                    if (sf_off[i] > 1024.0) {
+                        sf_off[i] *= 0.5;
+                        sf_fail[i] *= 0.5;
+                    }
+                }
+        }
         for (int k = 0; k < ring_n; ++k) {
             RingSlot& s = ring_s[(size_t) k];
             if (!s.used || s.layer != li || s.counted) continue;
@@ -8850,6 +8874,29 @@ struct Model::Impl {
             if (rw_n[dq] > 512.0) {
                 rw_n[dq] *= 0.5;
                 rw_pay[dq] *= 0.5;
+            }
+            if (ring_worth) {   // (DS4_RING_WORTH=2's cell (dq, rank): the copy's worth = paid and needed; the pick's rank is its router's rank)
+                const int rk = s.rk;
+                double v = 0.0;
+                if (paid) {
+                    int pr = -1;   // (the router's pick: Req::orig; a stand-in's pick has its ids entry, which is what picked means)
+                    for (int t = 0; t < T && pr < 0; ++t)
+                        for (int i = 0; i < l.k_exp && pr < 0; ++i)
+                            if (r.orig[t][i] == s.expert) pr = i;
+                    for (int t = 0; t < T && pr < 0; ++t)
+                        for (int i = 0; i < l.k_exp && pr < 0; ++i)
+                            if (r.ids[t][i] == s.expert) pr = i;
+                    if (pr >= 0) {
+                        if (d_standin == nullptr || pr < standin_floor) v = 1.0;
+                        else v = (sf_fail[pr] + 1.0) / (sf_off[pr] + 2.0);
+                    }
+                }
+                cw_n[dq][rk] += 1.0;
+                cw_val[dq][rk] += v;
+                if (cw_n[dq][rk] > 256.0) {
+                    cw_n[dq][rk] *= 0.5;
+                    cw_val[dq][rk] *= 0.5;
+                }
             }
         }
         if (ring_sticky) {   // (the landed slots stay: a pick of layer li's expert is its use now, the last one is its eviction's order)
@@ -8877,7 +8924,7 @@ struct Model::Impl {
         // the passes' order: 0, 1, 2 (the guesses 1 and 2 layers ahead, and (DS4_RING_FAR) 4 ahead); DS4_RING_WORTH: by worth, see ring_worth
         const int np = ring_far ? 3 : 2;
         int order[3] = {0, 1, 2};
-        if (ring_worth) {
+        if (ring_worth && !ring_worth2) {
             // (until every pass that has guesses this request has 32 counts: the fixed order; a pass with none - e.g. no 2-ahead guesses
             // without DS4_LA_AHEAD2 - is not waited for: 6 Nov, rw1 never left the fixed order because pass 1 made no copies)
             bool live[3] = {false, false, false}, warm = false;
@@ -8907,13 +8954,14 @@ struct Model::Impl {
             }
             for (int pi = 0; pi < 3; ++pi) ring_order[pi] = order[pi];
         }
-        for (int pi = 0; pi < np; ++pi) {
-            const int q = order[pi];   // (the pass's own q: its layer offset, guess offset, count and the eviction's restriction)
+        // fill(q, i0, i1): the guesses i0 .. i1-1 of pass q (its own q keys the layer offset, guess offset, count and the eviction's
+        // restriction). The body is the same for every ordering; a continue skips that guess, a return that pass.
+        auto fill = [&](int q, int i0, int i1) {
             const int j = li + (q == 2 ? 4 : q + 1);
-            if (j >= g.nl) continue;   // (continue, not break: with the worth order a later pass may still have a layer)
+            if (j >= g.nl) return;   // (not break: with the worth order a later pass may still have a layer)
             Layer& n = L[(size_t) j];
             const int m = std::min(r.na[q], q == 0 ? kAhead1 : kPicks), off = q == 0 ? 0 : q == 1 ? kAhead1 : kAhead1 + kPicks;
-            for (int i = 0; i < m; ++i) {
+            for (int i = i0; i < i1 && i < m; ++i) {
                 const int e = r.ahead[0][off + i];
                 if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                 if (n.slot[(size_t) e] >= 0 || n.swap_pending || ring_own[(size_t) j][(size_t) e] >= 0) continue;
@@ -8993,6 +9041,7 @@ struct Model::Impl {
                 s.layer = j;
                 s.expert = e;
                 s.dq = (int8_t) q;
+                s.rk = (int8_t) i;
                 s.used = true;
                 s.done = false;
                 s.counted = false;
@@ -9004,6 +9053,35 @@ struct Model::Impl {
                 if (q == 2) ++rc_far;   // (DS4_RING_FAR: a fill from the guesses 4 layers ahead)
                 ++inflight;
             }
+        };
+        if (ring_worth2) {
+            // DS4_RING_WORTH=2: every guess of every live pass, each by its own cell (cw_val / cw_n; under 16 counts: 0.5, so such cells keep the
+            // order 0, 1, 2 then rank among themselves, the sort being stable). Every 8th request the least counted guesses go first.
+            struct Cand {
+                int q, i;
+                double sc;
+            };
+            Cand cs[kAhead1 + 2 * kPicks];
+            int nc = 0;
+            const bool explore = ++ring_wreq % 8 == 0;
+            for (int q = 0; q < np; ++q) {
+                if (r.na[q] <= 0 || li + (q == 2 ? 4 : q + 1) >= g.nl) continue;
+                const int m = std::min(r.na[q], q == 0 ? kAhead1 : kPicks);
+                for (int i = 0; i < m; ++i) {
+                    const double cn = cw_n[q][i];
+                    const double sc = explore ? -cn : cn < 16.0 ? 0.5 : cw_val[q][i] / cn;
+                    cs[nc++] = Cand{q, i, sc};
+                }
+            }
+            for (int a = 1; a < nc; ++a)   // (insertion sort, descending; a guess moves up only past a strictly lower one: stable)
+                for (int b = a; b > 0 && cs[b - 1].sc < cs[b].sc; --b) {
+                    const Cand tmp = cs[b - 1];
+                    cs[b - 1] = cs[b];
+                    cs[b] = tmp;
+                }
+            for (int c = 0; c < nc; ++c) fill(cs[c].q, cs[c].i, cs[c].i + 1);
+        } else {
+            for (int pi = 0; pi < np; ++pi) fill(order[pi], 0, kAhead1);
         }
     }
     // (the host thread at request end and at shutdown: queued fills synced and reaped, then the frees queued and synced; the frees' table
@@ -9042,9 +9120,28 @@ struct Model::Impl {
             if (rd_n[d] > 0)
                 std::fprintf(stderr, " d%d %llu/%llu paid (%llu right but late)", d == 2 ? 4 : d + 1, (unsigned long long) rd_pay[d],
                              (unsigned long long) rd_n[d], (unsigned long long) rd_late_pick[d]);
-        if (ring_worth)
+        if (ring_worth && !ring_worth2)
             std::fprintf(stderr, " order %d,%d,%d", ring_order[0] == 2 ? 4 : ring_order[0] + 1, ring_order[1] == 2 ? 4 : ring_order[1] + 1,
-                         ring_order[2] == 2 ? 4 : ring_order[2] + 1);   // (DS4_RING_WORTH: the distances in the last request's pass order)
+                         ring_order[2] == 2 ? 4 : ring_order[2] + 1);   // (DS4_RING_WORTH=1: the distances in the last request's pass order)
+        if (ring_worth2) {   // (DS4_RING_WORTH=2: the five best warm cells (16+ counts) by worth, then the stand-in failure rate by pick rank)
+            bool taken[3][kAhead1] = {};
+            for (int b = 0; b < 5; ++b) {
+                int bq = -1, bi = -1;
+                double bs = -1.0;
+                for (int q = 0; q < 3; ++q)
+                    for (int i = 0; i < (q == 0 ? kAhead1 : kPicks); ++i)
+                        if (!taken[q][i] && cw_n[q][i] >= 16.0 && cw_val[q][i] / cw_n[q][i] > bs) {
+                            bs = cw_val[q][i] / cw_n[q][i];
+                            bq = q;
+                            bi = i;
+                        }
+                if (bq < 0) break;
+                taken[bq][bi] = true;
+                std::fprintf(stderr, " best d%dr%d %.2f", bq == 2 ? 4 : bq + 1, bi + 1, bs);
+            }
+            std::fprintf(stderr, " sfail");
+            for (int rk = 0; rk < kPicks; ++rk) std::fprintf(stderr, " %.2f", (sf_fail[rk] + 1.0) / (sf_off[rk] + 2.0));
+        }
         if (store_early > 0) std::fprintf(stderr, " early %llu", (unsigned long long) rc_early.load(std::memory_order_relaxed));   // (DS4_STORE_EARLY)
         if (store_protect && store)   // (DS4_STORE_PROTECT: guess reads given up for a want, demand reads that took a wanted slot)
             std::fprintf(stderr, " protect drop %lld forced %lld", (long long) store->stats().protect_drop.load(), (long long) store->stats().protect_forced.load());

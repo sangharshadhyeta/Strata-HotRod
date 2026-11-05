@@ -133,6 +133,15 @@ counts goes first, so a last-placed distance keeps being measured. Inside a pass
 offset, the count and the eviction restriction (`ahead_ok && q < 2`). The request line adds ` order <a>,<b>,<c>` (the distances in the last
 order used). Untested until measured.
 
+**DS4_RING_WORTH=2 (opt-in, untested):** implies DS4_RING_FAR. Why: measured 6 Nov, `=1` with DS4_LA_AHEAD2=1 fell from 6.41 to 5.99 tok/s;
+its paid shares were d1 24%, d2 35%, d4 54%. Sorting whole passes copies a distance's weak ranks before another distance's strong ones.
+So every candidate guess is ranked on its own: each cell (distance, guess rank) has a decayed paid-and-needed worth, cw_val / cw_n (a copy
+picked and landed in time is worth its need: 1 for a pick ranked below the stand-in floor or with the stand-ins off, else the stand-in
+failure rate `sfail` for that pick's rank, learned from `Req::sub`; an unpicked or late copy is worth 0). `ring_request` collects the guesses of all live passes, sorts them by their cell
+(stable; cells under 16 counts score 0.5 and keep the order 0, 1, 2 then rank), and fills each with the same body as before. Every 8th
+request the least counted guesses go first. The request line adds ` best d<1|2|4>r<rank> <worth>` for the five best warm cells and
+` sfail <r0> ... <r7>`. Unset or `=1`: as before. Untested until measured.
+
 **DS4_STORE_EARLY=N (opt-in, untested):** `ahead_ask` reads into the RAM store, for the guesses 2 and 4 layers ahead only (not the next
 layer's), the ranks i < N instead of only the ranks below the stand-in floor (`STRATA_LA_TAIL_READ=2`). Unset or 0: as before. The reads
 it starts beyond the mode-2 ranks are counted in ` early <n>` on the ring's request line. These are guess reads, so the auto read-ahead cap
