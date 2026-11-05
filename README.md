@@ -38,7 +38,7 @@ Nothing leaves your PC.</p>
 <tr>
 <td align="center" width="25%"><h2>🧊 78 GB</h2>of model on a <b>30 GB</b> PC</td>
 <td align="center" width="25%"><h2>🔥 50-70</h2>tokens/s on one RTX 3060</td>
-<td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash at about 5 tokens/s on this PC (upstream's engine: 5.05; this fork's DeepSeek branch: 5.2-5.4)</td>
+<td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash at about 5 tokens/s on this PC</td>
 <td align="center" width="25%"><h2>⚡ 0.4 s</h2>to pick up a 45K-token conversation</td>
 </tr>
 </table>
