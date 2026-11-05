@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="msvalidate.01" content="28F77845BA2217F8FD32376C38F992AC" />
+<title>Run a 125B model on a 12 GB GPU with 30 GB of RAM | Strata-HotRod</title>
+<meta name="description" content="How a 125B mixture-of-experts model (Qwen3.8-Flash-Next, 78 GB) runs at 50-70 tokens/s on one RTX 3060 12 GB with 30 GB of RAM by streaming experts from the SSD. Measured numbers and setup.">
+<link rel="canonical" href="https://sangharshadhyeta.github.io/Strata-HotRod/run-125b-model-on-12gb-gpu/">
+<meta property="og:title" content="Run a 125B model on a 12 GB GPU with 30 GB of RAM | Strata-HotRod">
+<meta property="og:description" content="How a 125B mixture-of-experts model (Qwen3.8-Flash-Next, 78 GB) runs at 50-70 tokens/s on one RTX 3060 12 GB with 30 GB of RAM by streaming experts from the SSD. Measured numbers and setup.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://sangharshadhyeta.github.io/Strata-HotRod/run-125b-model-on-12gb-gpu/">
+<meta property="og:image" content="https://sangharshadhyeta.github.io/Strata-HotRod/Neon%20Fire%20and%20Ice%20Hot%20Rod%20Logo.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0b0d10">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%A5%3C/text%3E%3C/svg%3E">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Can I run a 125B model on a 12 GB GPU?","acceptedAnswer":{"@type":"Answer","text":"Yes, if it is a mixture-of-experts model. Qwen3.8-Flash-Next (125B, 78 GB IQ3_S) ran at 50-70 tokens/s on one RTX 3060 12 GB with 30 GB of RAM and an NVMe SSD using Strata-HotRod. Measured on one PC."}},{"@type":"Question","name":"How can a model bigger than my RAM run at all?","acceptedAnswer":{"@type":"Answer","text":"A mixture-of-experts model uses only a few experts per token. The hot experts stay on the GPU, warm ones in RAM and cold ones on the SSD, and a learned look-ahead reads the next experts early."}},{"@type":"Question","name":"Is 30 GB of RAM enough?","acceptedAnswer":{"@type":"Answer","text":"It was enough on the test PC: 50-70 tokens/s. Strata recommends 64 GB for this size and says less RAM means more reads from the SSD, which it calls much slower."}}]}</script>
+<style>
+:root{--bg:#0b0d10;--card:#14181d;--border:#262c34;--text:#e8ebef;--muted:#9aa4af;--fire:#ff6a2b;--ice:#4dabf7;}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+*{box-sizing:border-box}
+::selection{background:var(--fire);color:#1a0d05}
+.topnav{position:sticky;top:0;z-index:20;background:rgba(11,13,16,.85);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+.topnav .in{max-width:52rem;margin:0 auto;padding:.6rem 1.25rem;display:flex;gap:1.1rem;align-items:center;flex-wrap:wrap}
+.topnav .brand{font-weight:700;color:var(--text);text-decoration:none;margin-right:auto}
+.topnav a{text-decoration:none;color:var(--muted);font-size:.95rem}
+.topnav a:hover{color:var(--text)}
+h2{scroll-margin-top:4rem}
+.pills{display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center;margin:.8rem 0}
+.pill{border:1px solid var(--border);background:var(--card);color:var(--muted);border-radius:999px;padding:.2rem .75rem;font-size:.85rem}
+.cap{color:var(--muted);font-size:.88rem;margin:.2rem 0 1rem}
+pre{background:#0e1013;border:1px solid var(--border);border-radius:10px;padding:.8rem 1rem;overflow-x:auto;margin:.8rem 0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.88rem}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:52rem;margin:0 auto;padding:2rem 1.25rem 4rem}
+a{color:var(--ice)}
+h1{font-size:2rem;line-height:1.2;margin:.5rem 0}
+h2{font-size:1.35rem;margin:2.2rem 0 .6rem;border-bottom:1px solid var(--border);padding-bottom:.3rem}
+.logo{display:block;margin:0 auto 1rem;max-width:260px;width:60%;height:auto}
+.sub{color:var(--muted);font-size:1.1rem;margin-top:0}
+.tiers{text-align:center;margin:1.2rem 0;font-size:1.05rem}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));gap:.8rem;margin:1.4rem 0}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;text-align:center}
+.stat b{display:block;font-size:1.6rem;color:var(--fire)}
+.stat span{color:var(--muted);font-size:.92rem}
+table{width:100%;border-collapse:collapse;margin:.8rem 0;background:var(--card);border-radius:10px;overflow:hidden}
+th,td{padding:.55rem .8rem;border-bottom:1px solid var(--border);text-align:left}
+th{color:var(--muted);font-weight:600}
+td.r,th.r{text-align:right}
+.note{border-left:3px solid var(--fire);background:var(--card);padding:.7rem 1rem;border-radius:0 8px 8px 0;color:var(--muted)}
+details{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:.6rem 1rem;margin:.6rem 0}
+summary{cursor:pointer;font-weight:600}
+.links a{display:inline-block;margin:.3rem .6rem .3rem 0}
+footer{color:var(--muted);font-size:.9rem;margin-top:3rem}
+</style>
+</head>
+<body>
+<nav class="topnav" aria-label="Page sections"><div class="in">
+<a class="brand" href="../">Strata-HotRod</a>
+<a href="../#speed">Speed</a>
+<a href="../#run-it">Run it</a>
+<a href="https://github.com/sangharshadhyeta/Strata-HotRod">GitHub</a>
+</div></nav>
+<main>
+<h1>Run a 125B model on a 12 GB GPU with 30 GB of RAM</h1>
+<p><b>Short answer:</b> yes, if it is a mixture-of-experts (MoE) model. Qwen3.8-Flash-Next has 125 billion parameters; its 78 GB IQ3_S files ran at 50-70 tokens/s on one RTX 3060 12 GB with 30 GB of RAM and an NVMe SSD. Nothing leaves the PC.</p>
+<p class="cap">The machine: RTX 3060 12 GB, Intel i5-12400F, 30 GB RAM, a 500 GB PCIe 3.0 NVMe (WD Blue SN5000), Rocky Linux 9.6.</p>
+<h2>Why a 78 GB model fits in 12 GB of video memory and 30 GB of RAM</h2>
+<p>An MoE model uses only a few of its experts for each token, so most of it can wait somewhere slower. Strata-HotRod keeps the hot experts on the GPU, the warm ones in RAM and the cold ones on the SSD. A look-ahead that learns while it runs guesses which experts the next layers will want and starts reading them early: 85-88% of the needed experts one layer ahead, against 77-79% for the router's own guess. When an expert is not on the card, a close one that is can stand in for it, and tokens that a stand-in could flip are recomputed exactly.</p>
+<h2>Measured speed</h2>
+<table>
+<tr><th>Answer (131K context)</th><th class="r">tokens/s</th></tr>
+<tr><td>Code</td><td class="r">52-55</td></tr>
+<tr><td>Reasoning</td><td class="r">66-71</td></tr>
+<tr><td>Prose</td><td class="r">50-53</td></tr>
+</table>
+<p class="cap">Long prompts: 8,554 tokens read in 16.9 s; 45,398 tokens in 67-68 s; the next turn of a 45K conversation resumes in 0.4-0.5 s. 262K context fits.</p>
+<h2>How much RAM does it need?</h2>
+<p>This was measured on 30 GB. Strata's own setup recommends 64 GB for the IQ3_S size and says that with less RAM it reads the rest of the experts from the SSD, which its docs call much slower. On this PC the learned look-ahead and the RAM tier are what make 30 GB work. A faster or slower drive will change the numbers.</p>
+<h2>Run it</h2>
+<p>An NVIDIA card, Linux (Rocky 9 was tested), CUDA 13, and an NVMe with room for the 78 GB of model files.</p>
+<pre><code>sudo dnf install -y git gcc-toolset-13
+git clone https://github.com/sangharshadhyeta/Strata-HotRod.git
+cd Strata-HotRod
+scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build --yes --no-start</code></pre>
+<p>Run it inside a memory limit (94% of RAM; two uncapped runs once froze the test PC):</p>
+<pre><code>systemd-run --scope -p MemoryMax=$(awk '/MemTotal/ {printf "%dK", $2 * 0.94}' /proc/meminfo) -p MemorySwapMax=0 \
+  .venv/bin/python serve/server.py --engine strata --config strata-iq3_s.json --port 8095</code></pre>
+<p class="cap">When it prints <code>ready: http://127.0.0.1:8095/v1</code>, any OpenAI-compatible client works with that address.</p>
+<h2>Not tested</h2>
+<p>Other GPUs, AMD, Windows, macOS, other model sizes, several requests at once and two cards. Dense models do not work this way.</p>
+<h2>More</h2>
+<p><a href="../">Project page</a> &middot; <a href="../run-125b-model-on-12gb-gpu/">Run a 125B model on a 12 GB GPU</a> &middot;
+<a href="../run-moe-models-from-ssd/">Run MoE models from an SSD</a> &middot;
+<a href="https://github.com/sangharshadhyeta/Strata-HotRod">GitHub</a></p>
+<p class="cap">Strata-HotRod is a fork of <a href="https://github.com/Niko1221/Strata">Strata</a> by Niko1221 (MIT). All numbers were measured on one PC.</p>
+</main>
+</body>
+</html>

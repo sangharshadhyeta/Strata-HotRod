@@ -14,6 +14,8 @@
 
 ## Links
 - [Project page](https://sangharshadhyeta.github.io/Strata-HotRod/): the question "Can Qwen3.8-Flash-Next run on an RTX 3060 12 GB with low RAM?" answered with measured numbers.
+- [Run a 125B model on a 12 GB GPU with 30 GB of RAM](https://sangharshadhyeta.github.io/Strata-HotRod/run-125b-model-on-12gb-gpu/): how it works, measured speeds, setup, limits.
+- [Run a mixture-of-experts model from an SSD](https://sangharshadhyeta.github.io/Strata-HotRod/run-moe-models-from-ssd/): Qwen3.8-Flash-Next (78 GB) and DeepSeek-V4.1-Flash (341 GB) on the same PC.
 - [GitHub repository](https://github.com/sangharshadhyeta/Strata-HotRod): code, install steps, measurements.
 - [DeepSeek branch](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41)
 - [Write-up on dev.to](https://dev.to/sumit_sodhi/a-125b-model-at-50-toks-on-a-12-gb-gaming-card-what-i-changed-in-strata-2cig)
