@@ -2,7 +2,7 @@
 
 <h1 align="center">Strata-HotRod</h1>
 
-<h2 align="center">78 GB of model. 30 GB of RAM. Zero cloud.</h2>
+<h2 align="center">78 GB of model. 30 GB of RAM. 12 GB of VRAM. Zero cloud.</h2>
 
 <p align="center"><b>A 125-billion-parameter AI on one gaming card, running straight from your SSD.</b><br>
 Nothing leaves your PC.</p>
@@ -14,6 +14,7 @@ Nothing leaves your PC.</p>
 <p align="center">
   <img alt="Runs from SSD" src="https://img.shields.io/badge/RUNS%20FROM-SSD-1c7ed6?style=for-the-badge">
   <img alt="30 GB RAM, 78 GB model" src="https://img.shields.io/badge/30%20GB%20RAM-78%20GB%20MODEL-d6336c?style=for-the-badge">
+  <img alt="12 GB VRAM" src="https://img.shields.io/badge/12%20GB-VRAM-76b900?style=for-the-badge">
   <img alt="Decode: 50-70 tokens/s" src="https://img.shields.io/badge/50--70-TOK%2FS-e8590c?style=for-the-badge">
 </p>
 
@@ -37,7 +38,7 @@ Nothing leaves your PC.</p>
 <tr>
 <td align="center" width="25%"><h2>🧊 78 GB</h2>of model on a <b>30 GB</b> PC</td>
 <td align="center" width="25%"><h2>🔥 50-70</h2>tokens/s on one RTX 3060</td>
-<td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash at about 5 tokens/s (DeepSeek branch)</td>
+<td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash at about 5 tokens/s on this PC (upstream's engine: 5.05; this fork's DeepSeek branch: 5.2-5.4)</td>
 <td align="center" width="25%"><h2>⚡ 0.4 s</h2>to pick up a 45K-token conversation</td>
 </tr>
 </table>
