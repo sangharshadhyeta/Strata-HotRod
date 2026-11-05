@@ -1855,7 +1855,10 @@ void FileExpertSource::auto_read(double us, uint64_t bytes) {
     io_guess_held_ = false;
     if (sum_b == 0) return;
     const double mean = (double) sum_us / ((double) sum_b / 1048576.0);   // us per MB
-    if (auto_floor_ <= 0.0 || mean < auto_floor_) auto_floor_ = mean;
+    // the floor follows the windows' lower edge: a faster window pulls it a tenth of the way down (6 Nov review: as the minimum seen,
+    // one window of page-cache hits would set it far below any drive read, and every later window would push the cap to 1)
+    if (auto_floor_ <= 0.0) auto_floor_ = mean;
+    else if (mean < auto_floor_) auto_floor_ += 0.1 * (mean - auto_floor_);
     const int was = io_guess_cap_.load(std::memory_order_relaxed);
     int cap = was;
     if (mean > 1.5 * auto_floor_) cap = std::max(1, cap - 1);                 // the decode's reads wait on the drive: one guess less
