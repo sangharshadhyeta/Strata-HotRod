@@ -191,6 +191,28 @@ combine and writes no per-slot outputs, so the learner is off there).
 
 State: untested until measured.
 
+## DS4_STANDIN_BALANCE (opt-in, untested)
+
+Why: a stand-in's cost is its measured error, not the logit gap, and keeping an expert fast costs reads only where it is picked often and
+misses. The balance decides both per (layer, e) from measurements, with no hand-set thresholds.
+
+How (opt-in, `DS4_STANDIN_BALANCE=1`, needs `DS4_STANDIN_LEARN`; unset leaves the engine as it was): a pair (layer, e, s) with 32 samples
+has err = sqrt((ee - 2 c num + c^2 den) / ee), the corrected stand-in's relative output error from the learner's decayed sums (`ee`, the
+true expert's energy, is the one new sum). `route_publish_kernel` exposes a ready pair's stand-in by its err (`d_pair_err`, [layer][e][s],
+-1 until ready): its risk is weight x err and, from the floor on, the budget is checked against weight x err; the edge rule at floor - 1
+keeps the gap. Every 256 decode tokens (`bal_round`, between tokens) the host ranks each layer's experts by value / cost: value = use(e) x
+the best stand-in's err (the router-weighted decode picks, halved each round), cost = the read cost (the store's demand wait per demand
+miss, decayed) x the expert's misses (`ExpertStore::miss_counts`). The top decile moves up one state (+1: the store's eviction score is
+raised by `set_prio`, and the ring fills its guesses for that expert at any rank); the bottom decile moves down (-1: its score is lowered,
+so its slot goes first). Back to 0 only after two rounds on the other side. A stand-in at the soft state needs no separate rule: a
+card-absent pick at rank floor - 1 or beyond is already a stand-in candidate under the err rule.
+
+Units: err is a relative output error, the gap a router-score difference, so the budget (tuned by the flip re-check) now compares different
+quantities for measured pairs; the tuner adapts it only when the tuner runs. Request line: `ds4: request: balance: <a> pairs measured, <s>
+swapped in, <m> soft-masked, read cost <ms> ms/miss`.
+
+State: untested until measured.
+
 ## Measured 6 Nov (vision server, 262K, the three calibration questions; answers read by hand, all correct)
 
 The ring opt-ins above, after the auto read-ahead cap became the default. Single runs first, then 3 alternated rounds of every arm

@@ -1246,6 +1246,7 @@ struct Model::Impl {
     std::vector<float> learn_ye;                      // [D] host: the CPU lane's y_e
     struct LearnPair {
         double num = 0.0, den = 0.0;
+        double ee = 0.0;   // (DS4_STANDIN_BALANCE: the true expert's energy, y_e . y_e, decayed like num and den)
         int n = 0;
         float c = 1.0f;
         uint64_t used = 0;
@@ -1254,6 +1255,28 @@ struct Model::Impl {
     std::vector<int> learn_count;                          // the pairs held per layer
     uint64_t learn_tick = 0;
     long long learn_samples_req = 0;
+    // DS4_STANDIN_BALANCE=1 (opt-in; needs DS4_STANDIN_LEARN; unset: as now): the stand-in or the swap is decided per (layer, e). A pair's error
+    // err(l,e,s) = sqrt((ee - 2 c num + c^2 den) / ee) of the corrected stand-in (the pair's decayed sums), -1 until the pair is ready; the kernel
+    // exposes a stand-in by it (d_pair_err [nl][n][n]). Every kBalRound decode tokens (bal_round, between tokens): value = use(e) x best(e), best
+    // the lowest err over the ready s, use the router-weighted decode picks; cost = the read cost (the store's demand wait per miss, decayed) x the
+    // expert's misses (decayed). Per layer the experts are ranked by value / cost: the top decile is kept fast (state +1: its store priority
+    // raised, the ring fills its guesses at any rank), the bottom decile gives its slot up (-1: store priority lowered). One step a round; back to 0
+    // only after 2 rounds on the other side (bal_opp).
+    static constexpr int kBalRound = 256;
+    bool bal_on = false;
+    float* d_pair_err = nullptr;                    // [nl][n][n] device (on the trunk's GPU): the measured error per pair, -1 not ready
+    std::vector<float> bal_err_h, bal_err_new;      // [nl][n][n] host: the table the device holds / the round's values
+    std::unique_ptr<std::atomic<float>[]> bal_use;  // [nl][n]: router-weighted decode picks, halved each round (the serve lane adds)
+    std::unique_ptr<std::atomic<int>[]> bal_state;  // [nl][n]: -1 soft, 0 as it was, +1 kept fast (read by the ring's fills)
+    std::vector<double> bal_miss;                   // [nl][n]: the expert's store misses, decayed
+    std::vector<uint32_t> bal_miss_last, bal_mc;    // [nl][n]: the store's counts at the last round / a copy of one layer's
+    std::vector<int> bal_opp, bal_want;             // [nl][n] rounds on the other side / [n] this layer's desire (+1, -1, 0)
+    std::vector<std::pair<double, int>> bal_rank;   // (value / cost, e) of a layer's ranked experts
+    int64_t bal_wait_last = 0, bal_misses_last = 0; // the store's wait (ns) and demand misses at the last round
+    double bal_cw = 0.0, bal_cm = 0.0;              // decayed store wait (ns) and misses
+    double bal_cost_ms = 0.0;                       // the read cost of the last round (ms per miss)
+    int bal_ready = 0;                              // the ready pairs of the last round
+    long long bal_toks = 0;
     long la_toks = 0;
     std::string la_path;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
@@ -1793,6 +1816,7 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: request: stand-ins: %lld decode tokens took them, %lld re-checked exactly, %lld of those changed the top token\n",
                              fr_used, fr_checks, fr_flips);
             if (learn_on) learn_print();
+            if (bal_on) bal_print();
             if (tune_on) {
                 std::fprintf(stderr, "ds4: request: the budget's search: %s\n", tune.stats().c_str());
                 if (!tune.save(tune_path)) std::fprintf(stderr, "ds4: stand-ins: %s not written\n", tune_path.c_str());
@@ -3810,6 +3834,7 @@ struct Model::Impl {
             }
         }
         if (fr_on) learn_init();   // (DS4_STANDIN_LEARN: the flip re-check gives its samples)
+        bal_init();                // (DS4_STANDIN_BALANCE: needs the learner)
     }
     // ---- the learned VRAM reserve (Strata-HotRod): <pack>/vram-reserve.txt, "<key> <MiB>" a line.  The key: the first GPU's name (spaces as
     // _), its total MiB, the context, where the compressed K/V rows live (STRATA_KV_HOST: ram / card) and whether the drafter loads.
@@ -9117,7 +9142,9 @@ struct Model::Impl {
                 if (n.slot[(size_t) e] >= 0 || n.swap_pending || ring_own[(size_t) j][(size_t) e] >= 0) continue;
                 if (lend_has(j, e)) continue;   // (DS4_LEND: lent or planned: the copy is in the arena, or coming)
                 const int rl = ring_cost ? ring_rl[(size_t) j] : ring_ranks;   // (DS4_RING_RANKS, or DS4_RING_COST's R_j: only the guesses ranked below it are filled; the stand-ins cover the rest)
-                if (rl > 0 && i >= rl) {
+                // (DS4_STANDIN_BALANCE: an expert the balance keeps fast, state +1, is filled at any rank)
+                const bool pref = bal_on && bal_state[(size_t) j * g.n_exp + (size_t) e].load(std::memory_order_relaxed) > 0;
+                if (rl > 0 && i >= rl && !pref) {
                     ++rc_beyond;
                     continue;
                 }
@@ -9762,6 +9789,10 @@ struct Model::Impl {
                         if (e < 0 || e >= l.n_exp) continue;
                         ++pr[e];
                         l.heat[(size_t) e] += 1.0f;
+                        if (bal_on && T == 1 && !l.mtp && li < g.nl) {   // (DS4_STANDIN_BALANCE: the decode picks' router weights; the serve lane is the only writer)
+                            std::atomic<float>& u = bal_use[(size_t) li * g.n_exp + (size_t) e];
+                            u.store(u.load(std::memory_order_relaxed) + r.w[t][i], std::memory_order_relaxed);
+                        }
                         if (fl != nullptr) {
                             ++st.ahead_picks;
                             st.ahead_hit_k += fl[e] & 1;
@@ -10386,10 +10417,12 @@ struct Model::Impl {
         cudaFree(d_ys);
         cudaFree(d_ye);
         cudaFree(d_pair_c);
+        cudaFree(d_pair_err);   // (DS4_STANDIN_BALANCE's table: the balance is on only with the learner)
         d_cap_rec = d_want = nullptr;
         d_ys = d_ye = nullptr;
-        d_pair_c = nullptr;
+        d_pair_c = d_pair_err = nullptr;
         learn_on = false;
+        bal_on = false;
     }
     // the layer's down outputs of the stand-in pass (1) or the re-run (2): the record's slot (pass 1) or d_want's, copied to d_ys / d_ye
     void learn_capture(int il, cudaStream_t s) {
@@ -10440,10 +10473,11 @@ struct Model::Impl {
         } else {   // (the true expert was neither computed here nor on the device: no sample)
             return true;
         }
-        double sxy = 0.0, sxx = 0.0;
+        double sxy = 0.0, sxx = 0.0, syy = 0.0;
         for (int d = 0; d < D; ++d) {
             sxy += (double) ys[(size_t) d] * ye[(size_t) d];
             sxx += (double) ys[(size_t) d] * ys[(size_t) d];
+            syy += (double) ye[(size_t) d] * ye[(size_t) d];
         }
         if (!std::isfinite(sxy) || !std::isfinite(sxx) || !(sxx > 0.0)) return true;
         const uint64_t key = ((uint64_t) il << 40) | ((uint64_t) e << 20) | (uint64_t) s;
@@ -10470,6 +10504,7 @@ struct Model::Impl {
         LearnPair& p = it->second;
         p.num = 0.98 * p.num + sxy;
         p.den = 0.98 * p.den + sxx;
+        p.ee = 0.98 * p.ee + syy;
         p.used = ++learn_tick;
         ++p.n;
         ++learn_samples_req;
@@ -10482,6 +10517,152 @@ struct Model::Impl {
             }
         }
         return true;
+    }
+    // ---- DS4_STANDIN_BALANCE (see the members): the device table, the host's round (bal_round, between tokens) and its report
+    void bal_init() {
+        const char* on = std::getenv("DS4_STANDIN_BALANCE");
+        if (on == nullptr || std::atoi(on) == 0) return;
+        if (!learn_on) {
+            std::fprintf(stderr, "ds4: stand-ins: balance off (it needs DS4_STANDIN_LEARN)\n");
+            return;
+        }
+        const int nl = g.nl, n = g.n_exp;
+        const size_t cnt = (size_t) nl * n * n;
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        if (cudaMalloc(&d_pair_err, sizeof(float) * cnt) != cudaSuccess) {
+            (void) cudaGetLastError();
+            d_pair_err = nullptr;
+            std::fprintf(stderr, "ds4: stand-ins: balance off (no device memory)\n");
+            return;
+        }
+        bal_err_h.assign(cnt, -1.0f);
+        bal_err_new.assign(cnt, -1.0f);
+        if (cudaMemcpy(d_pair_err, bal_err_h.data(), sizeof(float) * cnt, cudaMemcpyHostToDevice) != cudaSuccess) {
+            (void) cudaGetLastError();
+            cudaFree(d_pair_err);
+            d_pair_err = nullptr;
+            std::fprintf(stderr, "ds4: stand-ins: balance off (the table did not upload)\n");
+            return;
+        }
+        const size_t ne = (size_t) nl * n;
+        bal_use.reset(new std::atomic<float>[ne]);
+        bal_state.reset(new std::atomic<int>[ne]);
+        for (size_t k = 0; k < ne; ++k) {
+            bal_use[k].store(0.0f, std::memory_order_relaxed);
+            bal_state[k].store(0, std::memory_order_relaxed);
+        }
+        bal_miss.assign(ne, 0.0);
+        bal_miss_last.assign(ne, 0u);
+        bal_opp.assign(ne, 0);
+        bal_want.assign((size_t) n, 0);
+        bal_rank.reserve((size_t) n);
+        bal_on = true;
+        std::fprintf(stderr, "ds4: stand-ins: balance on (every %d decode tokens: the stand-ins by measured error, the top decile of each layer kept "
+                             "in the store, the bottom decile given up; table %.0f MB)\n", kBalRound, (double) (sizeof(float) * cnt) / 1048576.0);
+    }
+    // one round (between tokens; the serve lane has finished the last token's records): the errors of the ready pairs (rows of a changed layer
+    // are uploaded), the read cost, the misses and use halved, then per layer the ranking and the one-step moves with their store priorities
+    bool bal_round(std::string& err) {
+        const int nl = g.nl, n = g.n_exp;
+        const size_t nn = (size_t) n * n;
+        Dev& ld = devs[(size_t) L[0].dev];
+        cudaSetDevice(ld.id);
+        bal_err_new.assign((size_t) nl * nn, -1.0f);
+        bal_ready = 0;
+        for (const auto& kv : learn_pairs) {
+            const LearnPair& p = kv.second;
+            if (p.n < kLearnReady || !(p.ee > 0.0) || !std::isfinite(p.ee)) continue;
+            const int il = (int) (kv.first >> 40), e = (int) ((kv.first >> 20) & 0xFFFFFu), s = (int) (kv.first & 0xFFFFFu);
+            if (il >= nl || e >= n || s >= n) continue;
+            const double c = p.c;
+            const double q = (p.ee - 2.0 * c * p.num + c * c * p.den) / p.ee;
+            bal_err_new[((size_t) il * n + e) * n + s] = (float) std::sqrt(std::max(0.0, q));
+            ++bal_ready;
+        }
+        for (int il = 0; il < nl; ++il) {   // (only the layers whose values changed go to the device)
+            const size_t off = (size_t) il * nn;
+            if (std::memcmp(bal_err_new.data() + off, bal_err_h.data() + off, nn * sizeof(float)) == 0) continue;
+            std::memcpy(bal_err_h.data() + off, bal_err_new.data() + off, nn * sizeof(float));
+            CK(cudaMemcpyAsync(d_pair_err + off, bal_err_h.data() + off, nn * sizeof(float), cudaMemcpyHostToDevice, ld.st));
+        }
+        CK(cudaStreamSynchronize(ld.st));
+        // the read cost: the store's demand wait per demand miss, both halved each round
+        if (store) {
+            const auto& st = store->stats();
+            const int64_t w = st.wait_ns.load(), m = st.misses.load();
+            bal_cw = 0.5 * bal_cw + (double) (w - bal_wait_last);
+            bal_cm = 0.5 * bal_cm + (double) (m - bal_misses_last);
+            bal_wait_last = w;
+            bal_misses_last = m;
+        }
+        bal_cost_ms = bal_cm > 0.0 ? bal_cw / bal_cm / 1e6 : 0.0;
+        for (int il = 0; il < nl; ++il) {
+            const size_t base = (size_t) il * n;
+            if (store) {
+                store->miss_counts(il, bal_mc);
+                for (int e = 0; e < n && (size_t) e < bal_mc.size(); ++e) {
+                    const size_t k = base + (size_t) e;
+                    bal_miss[k] = 0.5 * bal_miss[k] + (double) (bal_mc[(size_t) e] - bal_miss_last[k]);
+                    bal_miss_last[k] = bal_mc[(size_t) e];
+                }
+            }
+            // the ranking: experts with a ready pair only; value / cost, the top and bottom tenth get a desire
+            bal_rank.clear();
+            for (int e = 0; e < n; ++e) {
+                const size_t k = base + (size_t) e;
+                bal_want[(size_t) e] = 0;
+                const float* row = bal_err_h.data() + ((size_t) il * n + e) * n;
+                float best = -1.0f;
+                for (int s = 0; s < n; ++s)
+                    if (row[s] >= 0.0f && (best < 0.0f || row[s] < best)) best = row[s];
+                if (best < 0.0f) continue;
+                const double value = (double) bal_use[k].load(std::memory_order_relaxed) * (double) best;
+                const double cost = bal_cost_ms * bal_miss[k];
+                bal_rank.push_back({value / (cost + 1e-9), e});
+            }
+            std::sort(bal_rank.begin(), bal_rank.end(), [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            const size_t m = bal_rank.size() / 10;
+            for (size_t i = 0; i < m; ++i) {
+                bal_want[(size_t) bal_rank[i].second] = 1;
+                bal_want[(size_t) bal_rank[bal_rank.size() - 1 - i].second] = -1;
+            }
+            for (int e = 0; e < n; ++e) {
+                const size_t k = base + (size_t) e;
+                const int d = bal_want[(size_t) e];
+                const int st0 = bal_state[k].load(std::memory_order_relaxed);
+                int st1 = st0;
+                if (d == 0) {
+                    bal_opp[k] = 0;
+                } else if (st0 == 0) {
+                    st1 = d;
+                    bal_opp[k] = 0;
+                } else if (d == st0) {
+                    bal_opp[k] = 0;
+                } else if (++bal_opp[k] >= 2) {   // (back to 0 only after two rounds on the other side)
+                    st1 = 0;
+                    bal_opp[k] = 0;
+                }
+                if (st1 != st0) {
+                    bal_state[k].store(st1, std::memory_order_relaxed);
+                    if (store) store->set_prio(il, e, st1);
+                }
+            }
+        }
+        for (size_t k = 0; k < (size_t) nl * n; ++k)
+            bal_use[k].store(0.5f * bal_use[k].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return true;
+    }
+    void bal_print() const {
+        long long up = 0, down = 0;
+        for (size_t k = 0; k < (size_t) g.nl * g.n_exp; ++k) {
+            const int s = bal_state[k].load(std::memory_order_relaxed);
+            up += s > 0;
+            down += s < 0;
+        }
+        std::fprintf(stderr, "ds4: request: balance: %d pairs measured, %lld swapped in, %lld soft-masked, read cost %.3f ms/miss\n", bal_ready,
+                     up, down, bal_cost_ms);
     }
     void learn_print() {
         int ready = 0;
@@ -10499,6 +10680,7 @@ struct Model::Impl {
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
     bool step(int token, bool want_logits, std::string& err) {
         if (!fr_on || !want_logits || d_standin == nullptr) return forward(&token, 1, want_logits ? 1 : 0, err);
+        if (bal_on && ++bal_toks % kBalRound == 0 && !bal_round(err)) return false;   // (DS4_STANDIN_BALANCE: between tokens)
         const int64_t p0 = pos;
         const double t_step = now_ms();
         bool rc = false, flipped = false;
@@ -12906,7 +13088,8 @@ struct Model::Impl {
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
                           na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr, &rmp,
-                          lrn ? d_pair_c + (size_t) l.il * g.n_exp * g.n_exp : nullptr, lrn ? d_cap_rec + (size_t) 4 * l.il : nullptr);   // (stand-ins: decode tokens of the trunk only)
+                          lrn ? d_pair_c + (size_t) l.il * g.n_exp * g.n_exp : nullptr, lrn ? d_cap_rec + (size_t) 4 * l.il : nullptr,
+                          lrn && bal_on ? d_pair_err + (size_t) l.il * g.n_exp * g.n_exp : nullptr);   // (stand-ins: decode tokens of the trunk only)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;

@@ -1651,7 +1651,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             unsigned long long* plan_ptr, Req* req,
                                                             const float* __restrict__ bias_vl, unsigned vl,
                                                             Standin* __restrict__ sti, PcieRoute pc, const RouteMask rm,
-                                                            const float* __restrict__ pair_c, int* cap_rec) {
+                                                            const float* __restrict__ pair_c, int* cap_rec,
+                                                            const float* __restrict__ pair_err) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1749,14 +1750,18 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 if (vram[pick[r]] != 0ull) continue;
                 atomicAdd(&sti->offered[r], 1ull);
                 const float gap = fmaxf(0.0f, logits[pick[r]] - logits[cand[c]]);
-                const bool ok = r < sti->floor ? gap <= sti->edge : wk[r] * gap <= sti->budget;
+                // DS4_STANDIN_BALANCE (pair_err, opt-in): a pair with a measured error (ready: >= 0) is exposed by that error (the corrected
+                // stand-in's relative output error) instead of the logit gap; the edge rule (rank floor - 1) keeps the gap
+                const float pe = pair_err != nullptr ? pair_err[(size_t) orig[r] * n + cand[c]] : -1.0f;
+                const float xr = pe >= 0.0f ? pe : gap;
+                const bool ok = r < sti->floor ? gap <= sti->edge : wk[r] * xr <= sti->budget;
                 if (!ok) continue;
                 atomicAdd(&sti->taken[r], 1ull);
                 pick[r] = cand[c++];
                 if (pair_c != nullptr) csc[r] = pair_c[(size_t) orig[r] * n + pick[r]];
                 if (first_r < 0) first_r = r, first_e = orig[r], first_s = pick[r];
                 took = 1;
-                risk += wk[r] * gap;
+                risk += wk[r] * xr;
             }
             if (t < kWin && took) {   // (over the token's layers: the host clears them when a decode token starts)
                 sti->used[t] = 1;
@@ -2336,7 +2341,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
                    unsigned vl, int na0, int na1, int na2, Standin* standin, const PcieRoute* pc, const RouteMask* rmask,
-                   float* pair_c, int* cap_rec) {
+                   float* pair_c, int* cap_rec, const float* pair_err) {
 #if defined(STRATA_METAL)
     // selection only: the prefetch schedule (req) is published by the CUDA kernel, and is turned on separately here
     // (the Metal selection has no DS4_MASK: rmask is for the CUDA kernels only)
@@ -2351,7 +2356,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     static const RouteMask no_mask{};
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
                                            vl != 0 ? bias_vl : nullptr, vl, standin, pc != nullptr ? *pc : no_pcie,
-                                           rmask != nullptr ? *rmask : no_mask, pair_c, cap_rec);
+                                           rmask != nullptr ? *rmask : no_mask, pair_c, cap_rec, pair_err);
     if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, na2);
 }
 /// STRATA_STANDIN_LEARN: dst[e] = part[r][e] for the slot r the device's record names (sel[0]; -1: nothing copied), part the per-slot

@@ -95,10 +95,12 @@ public:
         slots_.reset(new Slot[nmax_]);
         where_.resize(geo_.size());
         heat_.resize(geo_.size());
+        miss_n_.resize(geo_.size());
         hits_in_layer_.assign(geo_.size(), 0);
         for (size_t l = 0; l < geo_.size(); ++l) {
             where_[l].assign((size_t) geo_[l].n_exp, -1);
             heat_[l].assign((size_t) geo_[l].n_exp, 0.0f);
+            miss_n_[l].assign((size_t) geo_[l].n_exp, 0u);
         }
         io_.reset(new IoQueue(std::max(1, c.threads)));
         grow();   // (the first chunk now: whether the GPU can map it is known from the start)
@@ -143,6 +145,25 @@ public:
     size_t io_limit() const { return 4 * (size_t) std::max(1, cfg_.threads); }
     static constexpr size_t kSlack = 8192;
 
+    /// (DS4_STANDIN_BALANCE) the eviction priority of (layer, e): dir +1 keeps its slot longer (the score is raised by kPrioStep), -1 gives it
+    /// up first, 0 as it was. The bias is a property of the expert, so it holds while the expert is not in the store. Any thread.
+    void set_prio(int layer, int e, int dir) {
+        if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (prio_.size() != geo_.size()) {
+            prio_.resize(geo_.size());
+            for (size_t l = 0; l < geo_.size(); ++l) prio_[l].assign((size_t) geo_[l].n_exp, 0.0);
+        }
+        prio_[(size_t) layer][(size_t) e] = (double) dir * kPrioStep;
+        prio_on_ = true;
+    }
+    /// (DS4_STANDIN_BALANCE) the demand misses of each expert of `layer` so far (cumulative), copied into out (its size is the experts).
+    void miss_counts(int layer, std::vector<uint32_t>& out) {
+        out.clear();
+        if (layer < 0 || layer >= (int) geo_.size()) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        out = miss_n_[(size_t) layer];
+    }
     /// The slot holding (layer, e) ready to read, or -1.  (Any thread; a slot found stays valid while it is pinned or visible.)
     int find(int layer, int e) const {
         if (layer < 0 || layer >= (int) where_.size()) return -1;   // (a layer the store does not cover: the DSpark drafter's)
@@ -192,6 +213,7 @@ public:
                 continue;
             }
             st_.misses.fetch_add(1, std::memory_order_relaxed);
+            ++miss_n_[(size_t) layer][(size_t) e];   // (DS4_STANDIN_BALANCE reads the per-expert count; a plain increment under mu_)
             s = start_fill(layer, e, true);
             sl[(size_t) i] = s;
         }
@@ -554,9 +576,11 @@ private:
     };
 
     static int vis_hash(int layer, int e) { return (int) (((unsigned) layer * 2654435761u + (unsigned) e * 40503u) >> 7) % 100; }
+    static constexpr double kPrioStep = 1e12;   // (DS4_STANDIN_BALANCE: a priority class is larger than any tick or heat, so it orders the eviction first)
     double score(const Slot& sp) const {
-        if (cfg_.policy == kLru) return (double) sp.tick;
-        return (double) heat_[(size_t) sp.layer][(size_t) sp.expert] + 1e-9 * (double) sp.tick;
+        const double b = prio_on_ ? prio_[(size_t) sp.layer][(size_t) sp.expert] : 0.0;
+        if (cfg_.policy == kLru) return (double) sp.tick + b;
+        return (double) heat_[(size_t) sp.layer][(size_t) sp.expert] + 1e-9 * (double) sp.tick + b;
     }
     void touch_heat(int layer, int e) {
         heat_[(size_t) layer][(size_t) e] += 1.0f;
@@ -739,6 +763,9 @@ private:
     size_t gone_slots_ = 0, regrown_ = 0;
     std::vector<std::vector<int>> where_;
     std::vector<std::vector<float>> heat_;
+    std::vector<std::vector<uint32_t>> miss_n_;   // [layer][e]: demand misses (begin), cumulative
+    std::vector<std::vector<double>> prio_;       // [layer][e]: the eviction bias (set_prio); sized on first use
+    bool prio_on_ = false;
     std::vector<uint64_t> hits_in_layer_;
     uint64_t clock_ = 0;
     std::atomic<uint64_t> now_pos_{0};   // (DS4_STORE_PROTECT) the decode position now, set by the serve thread

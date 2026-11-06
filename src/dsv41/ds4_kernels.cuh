@@ -287,7 +287,11 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
                    unsigned vl = 0, int na0 = 0, int na1 = 0, int na2 = 0, Standin* standin = nullptr,
                    const PcieRoute* pc = nullptr, const RouteMask* rmask = nullptr,
-                   float* pair_c = nullptr, int* cap_rec = nullptr);
+                   float* pair_c = nullptr, int* cap_rec = nullptr,
+                   const float* pair_err = nullptr);
+/// DS4_STANDIN_BALANCE (opt-in, with pair_c): pair_err [n][n] (the layer's measured relative error per true expert e and stand-in s, -1 until
+/// the pair is ready). A ready pair's stand-in is exposed by its error: its risk is weight x error, and at ranks from the floor on the budget
+/// is checked against weight x error (the edge rule at floor - 1 keeps the logit gap). Null: the gap, as before.
 /// STRATA_STANDIN_LEARN (opt-in): pair_c [n][n] (the layer's correction per true expert e and stand-in s, read where a stand-in is taken)
 /// and cap_rec [4] (written: the first stand-in's slot, true expert, stand-in; slot -1 for none) for a decode token of the trunk.
 /// standin_capture: dst[e] = part[r * dim + e] where r = *sel (a device int; -1: nothing), part a token's per-slot down outputs.
