@@ -218,3 +218,10 @@ Short prompts, seconds until the first word (10 Oct 2026, before the 0.1.45 merg
   default (2 threads) 34.7 tok/s, auto 32.7 (-5.6%). The cap climbed to 5-7 on the long reasoning answer, where it lost 4-17%: the
   decode's reads slowed only ~22% per MB (under the 1.5x step-down) while the decode lost ~10%, so read time per MB does not see
   what extra guesses cost on Qwen. A variant worth building: step the cap by answer speed itself (as DeepSeek's DS4_RING_INFLIGHT=auto).
+
+- **STRATA_MASK=<share> (opt-in, changes the output).** Per layer, the least-used experts of the expert profile (the pairs it ranks
+  last, or does not rank) are masked at the router. After the top-10, a masked pick of rank >= STRATA_ROUTE_RESIDENT_RANKS lo moves
+  to the best unmasked expert the token did not pick; rank lo-1 moves only within STRATA_ROUTE_RESIDENT_EDGE; ranks below lo-1 stay.
+  The look-ahead's guesses follow the target layer's mask. Each move adds its weight times the logit gap to the row's row_shift, so
+  STRATA_FRAGILE_RECHECK re-decides the close calls the mask makes; the re-check's exact re-run runs unmasked. Unset: nothing runs.
+  Request line: `strata serve: mask (STRATA_MASK): <seen> masked picks seen, <moved> moved`. Built, not run.

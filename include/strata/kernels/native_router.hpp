@@ -86,6 +86,15 @@ inline int route_pred_slot(int dist) { return dist == 1 ? 0 : dist == 2 ? 1 : di
 int32_t* route_pred_dev(int64_t target_layer, int dist);            ///< dist 1, 2 or 4: the slab of 8 x 10 ids, device alias
 float* route_pred_logits();                                          ///< scratch, 8 x 512 floats
 float* route_pred_weights();                                         ///< scratch, 8 x 10 floats
+/// STRATA_MASK (opt-in, changes the output): the per-layer mask of the least-used experts, device [layers][n_expert] (1 = masked),
+/// set once at start on the current GPU; lo / edge are the route-resident floor (RANKS lo, EDGE).  false: `msg` says why.
+bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int lo, float edge, std::string& msg);
+const uint8_t* route_mask_layer(int64_t layer, int64_t n_expert);   ///< the layer's mask; nullptr when unset or on another GPU
+/// Moves the layer's masked picks of the n_tok rows (ids / weights [n_tok][10], logits [n_tok][512]) by the rule above; row_shift (device,
+/// nullable) gets each move's w x gap.  The same call moves the look-ahead's guesses under the target layer's mask (no row_shift).
+void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream);
+/// The seen / moved counts since the last read (read and reset); false when no mask is set.
+bool route_mask_read(unsigned long long& seen, unsigned long long& moved);
 /// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear expert predictors, folded into one bf16 [512 x n_embd]
 /// matrix and a bias per target layer (tools/predictor/export_la_model.py writes the file).  Loaded once before graph capture;
 /// false (with the reason in `msg`) leaves the look-ahead on the routers.  The decode look-ahead's next-layer guess then applies

@@ -170,6 +170,7 @@ struct RouteResidentCfg {
     bool fragile_pend_explore = false;        ///< the pending cut is an explore cut
     bool fragile_pend_control = false;        ///< the pending cut is a control re-check (its verdict is the noise floor)
     bool fragile_exact = false;               ///< the next decode window runs ranks < lo exact (after a cut)
+    bool win_exact = false;                   ///< this window is a flip re-check's exact re-run (set by route_budget_window): no STRATA_MASK moves in it
     bool fragile_pend = false;                ///< a cut's row is waiting for the exact window that re-decides it
     int32_t fragile_pend_tok = 0;             ///< the stand-in window's top-1 id at the cut row (argmax, not the sampled token)
     float win_low = 0.0f, win_tail = 0.0f;   ///< the budgets (ranks < lo, ranks >= lo) the last window ran with
@@ -2549,6 +2550,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (la_learn_win) strata::kernels::la_learn_forward(l, dist, mixed_ + tb * N, n, s);
                     native_router_top10_multi(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
                                               strata::kernels::route_pred_weights(), n, s);
+                    // STRATA_MASK: the guesses follow the target layer's mask by the router's rule (no row_shift: a prefetch, not an output)
+                    if (NE == 512 && K == 10 && !route_resident_cfg().win_exact)
+                        if (const uint8_t* mk = strata::kernels::route_mask_layer(l + dist, g.n_expert))
+                            strata::kernels::native_route_mask(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
+                                                               strata::kernels::route_pred_weights(), mk, n, nullptr, s);
                     // STRATA_LA_EDGE_SKIP (decode windows: this node runs only for n <= 8): a predicted rank lo-1 pick that a resident
                     // stand-in within the edge would replace is not read ahead (its id becomes -1; route_pred_edge_skip)
                     if (la_edge_skip && hits_.d_res != nullptr)
@@ -2624,6 +2630,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+        // STRATA_MASK (opt-in, changes the output): the layer's masked picks move before the stand-ins see them; each move adds its w x gap to
+        // the row's row_shift (the flip re-check's risk).  The flip re-check's exact re-run (win_exact) runs unmasked.
+        if (NE == 512 && K == 10 && !route_resident_cfg().win_exact) {
+            if (const uint8_t* mk = strata::kernels::route_mask_layer(l, g.n_expert)) {
+                try {
+                    strata::kernels::native_route_mask(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, mk, n,
+                                                       n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr, cs);
+                } catch (const std::exception& e) { err = "verify mask: " + std::string(e.what()); return false; }
+            }
+        }
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
@@ -4265,6 +4281,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     // A cut's exact successor decides every rank exactly: before 25 Oct only ranks < lo were made exact here and the tail kept its
     // stand-ins, so a "re-decided" token could still be moved by a rank 3-9 stand-in.  A tail budget of ~0 lets only a stand-in that
     // the router scored at least as high as the pick through (gap <= 0), i.e. no change.
+    c.win_exact = decode && c.fragile_exact;   // STRATA_MASK: the exact re-run is unmasked too (its outputs are the re-decision)
     if (decode && c.fragile_exact) {
         b = 0.0f;
         tail = 1e-30f;

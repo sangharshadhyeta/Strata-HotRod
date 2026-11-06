@@ -126,6 +126,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <new>
 #include <charconv>
 #include <cmath>
+#include <numeric>
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
@@ -4551,6 +4552,39 @@ int main(int argc, char** argv) {
         if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        // STRATA_MASK=<share> (opt-in, changes the output): per layer the least-used experts of the profile are masked at the router (the
+        // profile ranks every pair; a pair it does not rank counts as the least used).  The floor and edge are route-resident's
+        // (STRATA_ROUTE_RESIDENT_RANKS, default 6-9; STRATA_ROUTE_RESIDENT_EDGE, default off).  Unset: nothing here runs.
+        if (const char* mv = std::getenv("STRATA_MASK")) {
+            const double share = std::min(0.95, std::atof(mv));
+            if (share > 0.0) {
+                int mlo = 6, mhi = 9;
+                if (const char* rv = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(rv, "%d-%d", &mlo, &mhi);
+                float medge = -1.0f;
+                if (const char* ev = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) medge = (float) std::atof(ev);
+                const int64_t nl = g.n_layers, ne = g.n_expert;
+                std::vector<int64_t> pos((size_t) (nl * ne), INT64_MAX);
+                for (size_t r = 0; r < profile.size(); ++r) {   // profile[r] = (layer, expert), hottest first
+                    const int64_t i = (int64_t) profile[r].first * ne + profile[r].second;
+                    if (i >= 0 && i < nl * ne && pos[(size_t) i] == INT64_MAX) pos[(size_t) i] = (int64_t) r;
+                }
+                std::vector<uint8_t> host((size_t) (nl * ne), 0);
+                const int64_t per = (int64_t) std::floor(share * (double) ne);
+                for (int64_t il = 0; il < nl; ++il) {
+                    std::vector<int> order((size_t) ne);
+                    std::iota(order.begin(), order.end(), 0);
+                    std::stable_sort(order.begin(), order.end(),
+                                     [&](int a, int b) { return pos[(size_t) (il * ne + b)] < pos[(size_t) (il * ne + a)]; });   // least used first
+                    for (int64_t q = 0; q < per; ++q) host[(size_t) (il * ne + order[(size_t) q])] = 1;
+                }
+                std::string merr;
+                if (strata::kernels::route_mask_set(host.data(), nl, ne, mlo, medge, merr))
+                    std::fprintf(stderr, "strata: STRATA_MASK=%.2f: %lld of %lld experts per layer masked (ranks below %d exact, edge %g; profile %s)\n",
+                                 share, (long long) per, (long long) ne, std::max(0, mlo - 1), (double) medge, o.expert_profile.c_str());
+                else
+                    std::fprintf(stderr, "strata: STRATA_MASK: off (%s)\n", merr.c_str());
+            }
         }
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the
         // file).  `--expert-cache 0` used to take the count the profile was built for; the profile now ranks
@@ -16621,6 +16655,12 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "\n");
                 }
+            }
+            {   // STRATA_MASK: this request's masked picks seen and the picks moved (takes and resets the counts)
+                unsigned long long mk_seen = 0, mk_moved = 0;
+                if (strata::kernels::route_mask_read(mk_seen, mk_moved))
+                    std::fprintf(stderr, "strata serve: mask (STRATA_MASK): %llu masked picks seen, %llu moved to the next unmasked expert\n",
+                                 mk_seen, mk_moved);
             }
             {   // STRATA_ROUTE_BUDGET_AUTO: the base budget the search ends this request at, and the tests it finished since the last line
                 float auto_b = 0.0f;

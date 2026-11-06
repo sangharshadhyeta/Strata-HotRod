@@ -744,6 +744,117 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
+// STRATA_MASK=<share> (opt-in, changes the output): the least-used experts of each layer (the tail of the expert profile) are masked.
+// After the router's top-10, a masked pick of rank >= lo moves to the best unmasked expert the token did not pick; rank lo-1 moves only
+// when that expert is within `edge` logits (edge > 0); ranks below lo-1 stay.  The rule and the settings are route-resident's.  A move is
+// a substitution: its w x gap (w the router's weight on the pick, gap the pick's logit minus the substitute's, >= 0) joins the row's
+// row_shift, so the flip re-check sees the close calls the mask makes.  The flip re-check's exact re-run is launched without the mask by
+// the verifier.  One warp per token; the weights are the softmax of the new picks when any moved (as route-resident does).
+static uint8_t* g_mask_dev = nullptr;                // device [layers][n_expert], 1 = masked
+static unsigned long long* g_mask_stats = nullptr;  // device [2]: masked picks seen, picks moved
+static int g_mask_dev_id = -1;
+static int64_t g_mask_layers = 0, g_mask_ne = 0;
+static int g_mask_lo = 6;
+static float g_mask_edge = -1.0f;
+namespace {
+__global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                             const uint8_t* __restrict__ mask, int n_tok, int lo, float edge, float* __restrict__ row_shift,
+                             unsigned long long* __restrict__ stats) {
+    const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
+    if (t >= n_tok) return;
+    const float* l = logits + (size_t) t * 512;
+    int32_t* id = ids + (size_t) t * 10;
+    int my[10];
+    for (int r = 0; r < 10; ++r) my[r] = id[r];
+    int seen = 0, moved = 0;
+    for (int r = 0; r < 10; ++r) {
+        const int e = my[r];
+        if (e < 0 || e >= 512 || mask[e] == 0) continue;   // uniform across the warp
+        ++seen;
+        if (r < lo - 1) continue;
+        float bv = -INFINITY;
+        int bi = -1;
+        for (int f = lane; f < 512; f += 32) {   // the best unmasked expert the token did not pick (a strictly greater logit wins; lowest id on ties)
+            if (mask[f] != 0) continue;
+            bool used = false;
+            for (int q = 0; q < 10; ++q) used |= my[q] == f;
+            if (used) continue;
+            if (bi < 0 || l[f] > bv) { bv = l[f]; bi = f; }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
+        }
+        if (bi < 0) continue;                                // uniform
+        const float gap = fmaxf(0.0f, l[e] - bv);
+        if (r == lo - 1 && !(edge > 0.0f && gap <= edge)) continue;
+        if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * gap);
+        my[r] = bi;
+        ++moved;
+    }
+    if (lane == 0 && stats != nullptr) {
+        atomicAdd(stats, (unsigned long long) seen);
+        atomicAdd(stats + 1, (unsigned long long) moved);
+    }
+    if (moved == 0) return;                                  // uniform: no move, the router's bits stay
+    if (lane == 0) {
+        float m = -INFINITY;
+        for (int r = 0; r < 10; ++r) m = fmaxf(m, l[my[r]]);
+        float ex[10], sum = 0.0f;
+        for (int r = 0; r < 10; ++r) { ex[r] = expf(l[my[r]] - m); sum += ex[r]; }
+        for (int r = 0; r < 10; ++r) { id[r] = my[r]; weights[(size_t) t * 10 + r] = ex[r] / sum; }
+    }
+}
+}  // namespace
+bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int lo, float edge, std::string& msg) {
+    if (g_mask_dev != nullptr) { msg = "already set"; return false; }
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); msg = "no CUDA device"; return false; }
+    const size_t n = (size_t) n_layers * (size_t) n_expert;
+    uint8_t* dm = nullptr;
+    unsigned long long* st = nullptr;
+    if (cudaMalloc((void**) &dm, n) != cudaSuccess || cudaMemcpy(dm, host, n, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMalloc((void**) &st, 2 * sizeof(unsigned long long)) != cudaSuccess ||
+        cudaMemset(st, 0, 2 * sizeof(unsigned long long)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (dm != nullptr) (void) cudaFree(dm);
+        if (st != nullptr) (void) cudaFree(st);
+        msg = "no room on the GPU for it";
+        return false;
+    }
+    g_mask_dev = dm;
+    g_mask_stats = st;
+    g_mask_dev_id = dev;
+    g_mask_layers = n_layers;
+    g_mask_ne = n_expert;
+    g_mask_lo = lo;
+    g_mask_edge = edge;
+    return true;
+}
+const uint8_t* route_mask_layer(int64_t layer, int64_t n_expert) {
+    if (g_mask_dev == nullptr || n_expert != g_mask_ne || layer < 0 || layer >= g_mask_layers) return nullptr;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return nullptr; }
+    return dev == g_mask_dev_id ? g_mask_dev + (size_t) layer * (size_t) n_expert : nullptr;   // another GPU's router keeps its own picks
+}
+void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream) {
+    if (!mask || !logits || !ids || !weights || n_tok < 1 || g_mask_stats == nullptr) return;
+    route_mask_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, mask, n_tok, g_mask_lo,
+                                                                              g_mask_edge, row_shift, g_mask_stats);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+bool route_mask_read(unsigned long long& seen, unsigned long long& moved) {   // the request's counts (read and reset; between requests)
+    if (g_mask_stats == nullptr) return false;
+    unsigned long long h[2] = {0, 0};
+    if (cudaMemcpy(h, g_mask_stats, sizeof h, cudaMemcpyDeviceToHost) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    (void) cudaMemset(g_mask_stats, 0, sizeof h);
+    seen = h[0];
+    moved = h[1];
+    return true;
+}
 static int32_t* g_pred_host = nullptr;
 static int32_t* g_pred_dev = nullptr;
 static float* g_pred_logits = nullptr;
