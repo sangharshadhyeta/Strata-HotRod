@@ -1126,7 +1126,9 @@ struct Model::Impl {
     // (0 base, 1 candidate), the arm on the device (-1: none yet), the direction state (as the budget test's: first direction, stage 0 / 1)
     bool mt_on = false;                     // a mask test runs: the levels are fixed (ml_update does not move p)
     int mt_d = -1, mt_cur = -1, mt_first = -1, mt_stage = 0;
-    int mt_win_d = 0;   // the direction of an unconfirmed mask-test win (0: none): a move needs two wins in a row (Qwen's 330a6dc3)
+    int mt_win_d = 0;
+    double mt_step = 1.0;   // the step's multiple: x2 after a move the same way as the last move (to 8), halved after a loss (Qwen's)
+    int mt_last_move = 0;   // the direction of an unconfirmed mask-test win (0: none): a move needs two wins in a row (Qwen's 330a6dc3)
     double mt_cand_p = 0.0, mt_cand_g = 0.0;
     std::vector<uint8_t> mt_lv[2];
     double ml_ag_ok = 0.0, ml_ag_tot = 0.0; // the re-checks: no change of the top token / all (decayed)
@@ -4124,8 +4126,8 @@ struct Model::Impl {
         if (!mask_learn_on || mt_on) return false;
         for (int tries = 0; tries < 2; ++tries) {   // the two directions of the stage machine: one of them may be at a bound
             const int d = mt_stage == 0 ? mt_first : -mt_first;
-            const double cp = std::min(kMlPMax, std::max(kMlPMin, mask_p + kMtStepP * d));
-            const double cg = std::min(1.0, std::max(0.0, ml_g + kMtStepG * d));
+            const double cp = std::min(kMlPMax, std::max(kMlPMin, mask_p + kMtStepP * mt_step * d));
+            const double cg = std::min(1.0, std::max(0.0, ml_g + kMtStepG * mt_step * d));
             if (cp != mask_p || cg != ml_g) {
                 mt_d = d;
                 mt_cand_p = cp;
@@ -4157,8 +4159,11 @@ struct Model::Impl {
             ml_g = mt_cand_g;
             moved = true;
             mt_win_d = 0;
+            if (mt_d == mt_last_move) mt_step = std::min(8.0, mt_step * 2.0);
+            mt_last_move = mt_d;
         } else {
             mt_win_d = r.won ? mt_d : 0;
+            if (!r.won) mt_step = std::max(1.0, mt_step * 0.5);
         }
         mt_next_stage(mt_first, mt_stage, r.won, mt_d);
         mt_on = false;
