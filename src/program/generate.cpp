@@ -16969,6 +16969,18 @@ int main(int argc, char** argv) {
                 helper_bytes_before = bytes;
             }
         }
+        // the look-ahead learners are saved at the end of the serve loop too (QUIT or stdin EOF): the 2-minute gate above is for
+        // the running server, and a restart used to lose up to 2 minutes of training. Once per process, so no per-request cost.
+        if (mtp_la_on && !mtp_la_path.empty()) {
+            std::string lm;
+            if (!strata::kernels::la_mtp_save(mtp_la_path.c_str(), lm))
+                std::fprintf(stderr, "strata serve: drafter look-ahead learner: cannot save %s (%s)\n", mtp_la_path.c_str(), lm.c_str());
+        }
+        if (strata::core::Verifier::la_learn_on()) {
+            std::string la_rep;
+            strata::core::Verifier::la_learn_request_end(la_learn_path, la_rep);
+            std::fputs(la_rep.c_str(), stderr);
+        }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
