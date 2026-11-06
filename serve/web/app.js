@@ -1295,7 +1295,7 @@ function updateAssistant(el, m, streaming) {
     if (settings.math) StrataMath.hydrate(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
-  el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? tr("chat.stopped", "Stopped") : "");
+  el.querySelector(".meta-text").textContent = m.meta || (streaming ? (m.liveMeta || "") : m.stopped ? tr("chat.stopped", "Stopped") : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
 }
 function renderChat() {
@@ -1384,9 +1384,9 @@ $("chat").addEventListener("toggle", (e) => {
   if (d.open && body.dataset.pending) { body.textContent = messages[+d.closest(".st-msg").dataset.i].reasoning; delete body.dataset.pending; }
 }, true);
 
-function apiMessages() {
+function apiMessages(draft) {       // draft: a user message not sent yet, read as the last one (the draft warm)
   const out = [];
-  for (const m of messages) {
+  for (const m of draft ? [...messages, draft] : messages) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
       const text = userText(m);
@@ -1538,19 +1538,10 @@ async function send(payload) {
   }
   return generateReply();
 }
-// an answer for the messages as they are: the last one is a user turn
-async function generateReply() {
-  const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
-  messages.push(m);
-  renderChat();
-  const el = $("chat").lastElementChild;
-  const controller = new AbortController();
-  busy = {controller, msg: m, cut: false, cutAfterTool: false};
-  setBusy(true);
-  paintLive();
-
-  const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
+// The body the page posts for the conversation (draft: a user message not sent yet). One function, so a warm (POST
+// /v1/prefill) reads the same prompt prefix as the real request.
+function requestBody(draft) {
+  const body = {model: health.model, messages: apiMessages(draft), stream: true, reasoning_effort: settings.thinking};
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
   } else if (!samplingUntouched(settings)) {
@@ -1560,6 +1551,78 @@ async function generateReply() {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  return body;
+}
+
+// ------------------------------------------------------------ reading the draft while you type (POST /v1/prefill)
+// The engine reads the conversation with the draft while you type, so Send reads only what changed. Nothing is shown:
+// the answer and the errors of a warm go to the console only.
+let warmTimer = null, warmCtl = null, warmKey = null, warmPasted = false;
+function cancelWarm() {
+  clearTimeout(warmTimer);
+  warmTimer = null;
+  if (warmCtl) warmCtl.abort();
+  warmCtl = null;
+}
+function warmDraft() {
+  warmTimer = null;
+  const text = $("input").value.trim();
+  // pictures are not warmed: their encodes are not prefix-reusable (the server says the same for them)
+  if (!text || busy || panel || attachments.some((a) => a.kind !== "file")) return;
+  const files = attachments.filter((a) => a.kind === "file");
+  const key = JSON.stringify([text, files.map((f) => f.name)]);
+  if (key === warmKey) return;
+  warmKey = key;
+  if (warmCtl) warmCtl.abort();
+  const controller = new AbortController();
+  warmCtl = controller;
+  const draft = {role: "user", text, images: [], files, time: Date.now()};
+  fetch("v1/prefill", {method: "POST", headers: headers(true), body: JSON.stringify(requestBody(draft)),
+                       signal: controller.signal})
+    .then((r) => r.json())
+    .then((j) => console.debug("prefill", j))
+    .catch((e) => console.debug("prefill", e && e.name))
+    .finally(() => { if (warmCtl === controller) warmCtl = null; });
+}
+function scheduleWarm(ms) {
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(warmDraft, ms);
+}
+
+// an answer for the messages as they are: the last one is a user turn
+async function generateReply() {
+  cancelWarm();                                      // the server keeps a warm read that the request continues (Service.warm)
+  warmKey = null;
+  const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
+  messages.push(m);
+  renderChat();
+  const el = $("chat").lastElementChild;
+  const controller = new AbortController();
+  busy = {controller, msg: m, cut: false, cutAfterTool: false};
+  setBusy(true);
+  paintLive();
+  // while it runs: under your message the prompt being read (then its read speed), under the answer the tokens so far and
+  // the live decode speed (the server's live numbers, /metrics)
+  const userEl = el.previousElementSibling, um0 = messages[messages.indexOf(m) - 1];
+  const liveTick = setInterval(() => {
+    const lv = (lastMetrics && lastMetrics.live) || {};
+    const ue = userEl && userEl.querySelector(".st-msg__meta");
+    if (lv.state === "reading") {
+      const tot = lv.prompt_total || lv.prompt_tokens;
+      if (ue && um0) ue.textContent = `${tr("chat.you", "You")} · ${timeStr(um0.time)} · reading the prompt` +
+        (lv.prompt_read != null && tot ? `: ${fmt(lv.prompt_read)} of ${fmt(tot)} tokens` : tot ? ` (${fmt(tot)} tokens)` : "") +
+        (lv.elapsed_s ? ` · ${fmt(lv.elapsed_s, 0)} s` : "");
+    } else if (lv.state === "generating") {
+      if (ue && um0 && lv.prompt_tokens)
+        ue.textContent = `${tr("chat.you", "You")} · ${timeStr(um0.time)} · prompt ${fmt(lv.prompt_tokens)} tokens` +
+          (lv.prefill_tok_s_mean ? ` read at ${fmt(lv.prefill_tok_s_mean, 1)} tok/s` : "");
+      const sp = lv.tok_s != null ? lv.tok_s : lv.tok_s_mean;
+      m.liveMeta = `${fmt(lv.generated || 0)} tokens${sp != null ? ` · decode ${fmt(sp, 1)} tok/s` : ""}`;
+      const ae = el.querySelector(".meta-text");
+      if (ae && !m.meta) ae.textContent = m.liveMeta;
+    }
+  }, 400);
+  const body = requestBody();
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -1615,6 +1678,10 @@ async function generateReply() {
     if (e.name === "AbortError") m.stopped = true;
     else { m.error = e.message || String(e); toast("error", tr("toast.requestFailed", "The request failed"), m.error, 6000); }
   }
+  clearInterval(liveTick);
+  m.liveMeta = "";
+  const ue0 = userEl && userEl.querySelector(".st-msg__meta");
+  if (ue0 && um0) ue0.textContent = `${tr("chat.you", "You")} · ${timeStr(um0.time)}`;
   const cut = busy.cut;                                      // an interjection ended it: kept as written, marked interrupted
   if (cut) m.interrupted = true;
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
@@ -1639,6 +1706,8 @@ async function generateReply() {
   saveChat();
   scrollDown();
   settlePending(cut, !m.stopped && !m.error);
+  // a draft typed while the answer ran was not read (warmDraft skips while busy): read it now, the answer just ended
+  if ($("input").value.trim()) scheduleWarm(0);
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -1648,6 +1717,14 @@ $("input").addEventListener("keydown", (e) => {
 });
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
 $("input").addEventListener("input", autosize);
+// the draft is read while it is typed: 1.2 s after the last keystroke, 0.3 s after a paste (its input event comes in the same
+// task, so it does not restart the timer)
+$("input").addEventListener("input", () => { if (!warmPasted) scheduleWarm(1200); });
+$("input").addEventListener("paste", () => {
+  warmPasted = true;
+  setTimeout(() => { warmPasted = false; }, 0);
+  scheduleWarm(300);
+});
 
 // one chat, as before: New chat clears it, with an Undo (with the saved-chats list on, its own New chat button does this job)
 $("new-btn").onclick = () => {
