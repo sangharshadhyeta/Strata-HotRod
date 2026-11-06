@@ -18,6 +18,9 @@ import struct
 import tempfile
 from pathlib import Path
 
+# The picture formats Pillow may open (upstream 8181522f1, GHSA-78g4-xqwv-q3g8: no format outside this list is decoded)
+PICTURE_FORMATS = ("JPEG", "PNG", "GIF", "BMP", "WEBP", "TIFF", "AVIF")
+
 PATCH = 14
 MERGE = 3
 MAX_TOKENS = 1024
@@ -138,7 +141,7 @@ class DsPictures:
         except ImportError:
             raise ValueError("DeepSeek reads pictures with Pillow, which is not installed here (python -m pip install pillow)") from None
         try:
-            im = Image.open(io.BytesIO(data))
+            im = Image.open(io.BytesIO(data), formats=PICTURE_FORMATS)
             im.load()
             im = ImageOps.exif_transpose(im)
         except Exception as e:  # noqa: BLE001 - any decoder failure is the picture's
