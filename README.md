@@ -112,7 +112,7 @@ To upstream's DeepSeek engine, on by default when the ring is on (`=0` turns eac
   kept in the pack (`standin-learn.bin`), so it fills over hours of use.
 - **`DS4_PROF=1`** prints after each request the card's time a token by stage and the CPU lane's read wait and store hit rate.
 
-New 6-7 Nov (opt-in, in our config's `"env"`): `DS4_MASK=learn` - the mask learns from the model's own output: each
+On by default since 7 Nov (with the stand-ins; `DS4_MASK=0` off): `DS4_MASK=learn` - the mask learns from the model's own output: each
 re-checked token measures how far the masked and substituted experts moved it (the divergence ISTA's coder variant was
 chosen by, here from your own use), the least harmful of the little-used experts are masked, the proven-harmless ones at
 every rank, and an alternating speed test sets how deep it goes (two wins in a row move it; it never adds flips). With it,
@@ -232,8 +232,8 @@ and `--api-key`.
   `hotrod-predictor.bin`. They hold this machine's values: when you move a pack to another PC, delete all but
   `hotrod-predictor.bin` (the look-ahead belongs to the model and carries over) and let them relearn. Setup downloads our
   trained look-ahead for Starw1-2.00bpw-MXFP8 and never overwrites one your PC has learned.
-- **The learning set** (opt-in, CUDA only): `"DS4_MASK": "learn"`, `"DS4_STANDIN_LEARN": "1"`, `"DS4_STANDIN_BALANCE": "1"`
-  in the config's `"env"`.
+- **The learned mask** and the look-ahead's weighting (`STRATA_LA_EXACT_W`, default 4) are on by default with the stand-ins;
+  `"DS4_MASK": "0"` turns the mask off. Opt-in: `"DS4_STANDIN_LEARN": "1"`, `"DS4_STANDIN_BALANCE": "1"`.
 - **What to watch** in the server log after a request: `auto mask test` and `the budget's search` (speeds and what was kept),
   `mask learn:` and `look-ahead learner:`; `DS4_PROF=1` adds the time a token by stage.
 - **Smaller machines:** lower `--max-context` first; `--vision off` saves 319 MiB of VRAM.
