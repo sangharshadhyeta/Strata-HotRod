@@ -9579,7 +9579,9 @@ struct Model::Impl {
                 int tok_of[kWin * kPicks];
                 int nslots = 0;
                 std::vector<std::pair<int, int>> picks;   // (expert, t * kPicks + i), CPU-lane only
-                if (trace_f != nullptr && !l.mtp) {   // DS4_TRACE=file: one record a route request: u8 layer, u8 T, T x k int16 expert ids
+                // (T <= 127 only: the header's T is 7 bits beside the guesses flag - a prompt chunk of more tokens wrapped it and broke every
+                //  record after it, 6 Nov)
+                if (trace_f != nullptr && !l.mtp && T <= 127) {   // DS4_TRACE=file: one record a route request: u8 layer, u8 T, T x k int16 expert ids
                     // DS4_TRACE_AHEAD=1: T has bit 7 set and the guesses follow: u8 na1, u8 na2, T x (na1 + na2) int16 (the
                     // next layer's likely picks by rank, then the one after's), as the lookahead made them for THIS layer's
                     // predecessors (the request carries the guesses for the layers after it)
