@@ -1767,7 +1767,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 atomicAdd(&sti->taken[r], 1ull);
                 if (mev != nullptr) {   // DS4_MASK=learn: the replaced pick (orig[r]) and its risk
                     const unsigned q = atomicAdd(&mev->n, 1u);
-                    if (q < kMaskEvCap) mev->e[q] = MaskEv{mev_layer, orig[r], wk[r] * xr};
+                    if (q < kMaskEvCap) mev->e[q] = MaskEv{mev_layer, orig[r], wk[r] * xr, 0};
                 }
                 pick[r] = cand[c++];
                 if (pair_c != nullptr) csc[r] = pair_c[(size_t) orig[r] * n + pick[r]];
@@ -1784,7 +1784,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                     took = 1;
                     if (mev != nullptr) {   // DS4_MASK=learn: the masked pick (premask[r]) and its risk
                         const unsigned q = atomicAdd(&mev->n, 1u);
-                        if (q < kMaskEvCap) mev->e[q] = MaskEv{mev_layer, premask[r], mx};
+                        if (q < kMaskEvCap) mev->e[q] = MaskEv{mev_layer, premask[r], mx, 1};
                     }
                 }
             if (t < kWin && took) {   // (over the token's layers: the host clears them when a decode token starts)

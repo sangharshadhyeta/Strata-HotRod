@@ -1121,6 +1121,9 @@ struct Model::Impl {
     std::vector<double> ml_harm, ml_expo;   // [nl][n_exp]: the harm and the exposure (decayed)
     std::vector<uint8_t> ml_lv;             // [nl][n_exp]: 0 unmasked, 1 masked (the rank rule), 2 masked at every rank
     double ml_ag_ok = 0.0, ml_ag_tot = 0.0; // the re-checks: no change of the top token / all (decayed)
+    // the re-checks split by whether the mask moved a pick in the token (flips, count; decayed): the share follows the flips the mask ADDS
+    // beyond the stand-ins' (6 Nov: re-checks are close calls, ~25% flip whatever the mask does, so raw agreement only ever shrank p)
+    double ml_fm = 0.0, ml_nm = 0.0, ml_fs = 0.0, ml_ns = 0.0;
     long long ml_tok = 0, ml_nrc = 0;       // the learning steps; the used tokens not re-checked (every 64th is sampled)
     double ml_dsum = 0.0;                   // this request's re-check D
     long long ml_dn = 0;
@@ -3893,6 +3896,7 @@ struct Model::Impl {
     static constexpr double kMlP0 = 0.05, kMlPMax = 0.95;
     static constexpr int kMlMaskEvery = 256, kMlDecayEvery = 8192, kMlSampleEvery = 64, kMlSaveEvery = 4096;
     static constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
+    static constexpr double kMlMinSide = 16.0, kMlPMin = 0.025;   // re-checks needed on each side of the comparison; the share's floor
     static constexpr int kMlMinPop = 8;
     std::string ml_path() const { return o.pack + "/mask-learn.bin"; }
     size_t ml_at(int il, int e) const { return (size_t) il * (size_t) g.n_exp + (size_t) e; }
@@ -3904,12 +3908,14 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: DS4_MASK=learn: %s not written\n", path.c_str());
             return;
         }
-        const uint32_t ver = 1;
+        const uint32_t ver = 2;   // 2: + the mask/stand-in split of the re-checks (ml_fm, ml_nm, ml_fs, ml_ns)
         const int32_t nl = g.nl, ne = g.n_exp;
         const long long tok = ml_tok;
+        const double split[4] = {ml_fm, ml_nm, ml_fs, ml_ns};
         bool ok = std::fwrite("MLRN", 1, 4, f) == 4 && std::fwrite(&ver, sizeof ver, 1, f) == 1 && std::fwrite(&nl, sizeof nl, 1, f) == 1 &&
                   std::fwrite(&ne, sizeof ne, 1, f) == 1 && std::fwrite(&mask_p, sizeof mask_p, 1, f) == 1 &&
                   std::fwrite(&ml_ag_ok, sizeof ml_ag_ok, 1, f) == 1 && std::fwrite(&ml_ag_tot, sizeof ml_ag_tot, 1, f) == 1 &&
+                  std::fwrite(split, sizeof(double), 4, f) == 4 &&
                   std::fwrite(&tok, sizeof tok, 1, f) == 1 && std::fwrite(ml_harm.data(), sizeof(double), ml_harm.size(), f) == ml_harm.size() &&
                   std::fwrite(ml_expo.data(), sizeof(double), ml_expo.size(), f) == ml_expo.size() &&
                   std::fwrite(ml_lv.data(), 1, ml_lv.size(), f) == ml_lv.size();
@@ -3925,10 +3931,12 @@ struct Model::Impl {
         int32_t nl = 0, ne = 0;
         double p = 0.0, ok = 0.0, tot = 0.0;
         long long tok = 0;
+        double split[4] = {0.0, 0.0, 0.0, 0.0};
         bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 &&
-                    ver == 1 && std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == g.nl && ne == g.n_exp &&
-                    std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 && std::fread(&tot, sizeof tot, 1, f) == 1 &&
-                    std::fread(&tok, sizeof tok, 1, f) == 1;
+                    (ver == 1 || ver == 2) && std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == g.nl &&
+                    ne == g.n_exp && std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 &&
+                    std::fread(&tot, sizeof tot, 1, f) == 1 && (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) &&
+                    std::fread(&tok, sizeof tok, 1, f) == 1;   // (version 1: the scores kept, the split starts empty)
         good = good && std::fread(ml_harm.data(), sizeof(double), ml_harm.size(), f) == ml_harm.size() &&
                std::fread(ml_expo.data(), sizeof(double), ml_expo.size(), f) == ml_expo.size() &&
                std::fread(ml_lv.data(), 1, ml_lv.size(), f) == ml_lv.size();
@@ -3937,9 +3945,13 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: DS4_MASK=learn: %s is not this model's table (version or shape): a fresh start\n", ml_path().c_str());
             return false;
         }
-        mask_p = std::min(kMlPMax, std::max(0.0, p));
+        mask_p = std::min(kMlPMax, std::max(kMlPMin, p));
         ml_ag_ok = ok;
         ml_ag_tot = tot;
+        ml_fm = split[0];
+        ml_nm = split[1];
+        ml_fs = split[2];
+        ml_ns = split[3];
         ml_tok = tok;
         return true;
     }
@@ -3950,6 +3962,7 @@ struct Model::Impl {
         ml_lv.assign(cnt, 0);
         mask_p = kMlP0;
         ml_ag_ok = ml_ag_tot = 0.0;
+        ml_fm = ml_nm = ml_fs = ml_ns = 0.0;
         ml_tok = 0;
         ml_nrc = 0;
         ml_dsum = 0.0;
@@ -4034,11 +4047,15 @@ struct Model::Impl {
         for (size_t i = 0; i < ml_lv.size(); ++i) mask_host[i] = ml_lv[i] != 0 ? 1 : 0;
     }
     // every kMlMaskEvery decode tokens: p follows the re-checks' agreement (>= 98%: up; < 95%: down), then the levels
+    // every kMlMaskEvery decode tokens: p follows the flips the mask adds - the flip rate of re-checked tokens with a mask move against
+    // those without one (the stand-ins' own rate): more than 2 standard errors above -> p -= 0.05; within 1 -> p += 0.025; else held.
+    // p never falls below kMlPMin, so mask moves keep coming and the comparison keeps its evidence.
     void ml_update() {
-        if (ml_ag_tot >= kMlMinAg) {
-            const double a = ml_ag_ok / ml_ag_tot;
-            if (a >= 0.98) mask_p = std::min(kMlPMax, mask_p + 0.025);
-            else if (a < 0.95) mask_p = std::max(0.0, mask_p - 0.05);
+        if (ml_nm >= kMlMinSide && ml_ns >= kMlMinSide) {
+            const double rm = ml_fm / ml_nm, rs = ml_fs / ml_ns, r = (ml_fm + ml_fs) / (ml_nm + ml_ns);
+            const double se = std::sqrt(std::max(1e-9, r * (1.0 - r) * (1.0 / ml_nm + 1.0 / ml_ns)));
+            if (rm - rs > 2.0 * se) mask_p = std::max(kMlPMin, mask_p - 0.05);
+            else if (rm - rs < se) mask_p = std::min(kMlPMax, mask_p + 0.025);
         }
         if (ml_relevel()) ml_upload();
     }
@@ -4050,6 +4067,10 @@ struct Model::Impl {
             for (double& v : ml_expo) v *= 0.5;
             ml_ag_ok *= 0.5;
             ml_ag_tot *= 0.5;
+            ml_fm *= 0.5;
+            ml_nm *= 0.5;
+            ml_fs *= 0.5;
+            ml_ns *= 0.5;
         }
         if (ml_tok % kMlMaskEvery == 0) ml_update();
         if (ml_tok % kMlSaveEvery == 0) ml_save();
@@ -4098,6 +4119,10 @@ struct Model::Impl {
         ml_expose(ev, 1.0);
         ml_ag_tot += 1.0;
         ml_ag_ok += flipped ? 0.0 : 1.0;
+        bool masked = false;
+        for (unsigned i = 0; i < n && !masked; ++i) masked = ev.e[i].kind == 1;
+        (masked ? ml_nm : ml_ns) += 1.0;
+        (masked ? ml_fm : ml_fs) += flipped ? 1.0 : 0.0;
         ml_dsum += (double) D;
         ++ml_dn;
     }
@@ -4117,8 +4142,9 @@ struct Model::Impl {
             scored += ml_expo[i] > 0.0;
         }
         const double dm = ml_dn > 0 ? ml_dsum / (double) ml_dn : 0.0;
-        std::fprintf(stderr, "ds4: request: mask learn: p %.3f, %d masked (%d at all ranks), re-check D mean %.4f (%lld), %lld experts scored\n",
-                     mask_p, m, a, dm, ml_dn, scored);
+        std::fprintf(stderr, "ds4: request: mask learn: p %.3f, %d masked (%d at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
+                     "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f\n",
+                     mask_p, m, a, dm, ml_dn, scored, ml_fm, ml_nm, ml_fs, ml_ns);
         ml_dsum = 0.0;
         ml_dn = 0;
     }

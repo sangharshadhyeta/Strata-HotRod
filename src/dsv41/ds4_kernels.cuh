@@ -289,6 +289,7 @@ struct MaskEv {
     int layer;
     int expert;
     float x;
+    int kind;   // 1: a mask move, 0: a stand-in swap (the share is tuned by the flips the mask adds beyond the stand-ins')
 };
 struct MaskEvs {
     unsigned n;
