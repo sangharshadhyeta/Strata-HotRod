@@ -1234,7 +1234,8 @@ struct Model::Impl {
     // route scales the stand-in's weight by c once the pair has kLearnReady samples (clipped to [0.5, 2]), 1 before. Per pair two numbers.
     static constexpr int kLearnMaxL = 128, kLearnPerLayer = 4096, kLearnReady = 32;
     bool learn_on = false;
-    int learn_pass = 0;                 // 1: the first pass of a token (captures y_s), 2: the exact re-run (captures y_e), 0: none
+    bool learn_observe = false;         // DS4_STANDIN_LEARN=observe: samples collected and saved, no correction applied
+    int learn_pass = 0;                // 1: the first pass of a token (captures y_s), 2: the exact re-run (captures y_e), 0: none
     int* d_cap_rec = nullptr;           // [nl][4] device: each trunk layer's first stand-in of the token (slot, true expert, stand-in; slot -1 none)
     int* d_want = nullptr;              // [nl] device: the slot the re-run captures in each layer (-1 none)
     float* d_pair_c = nullptr;          // [nl][n][n] device: the correction per (layer, e, s); 1 until the pair is ready
@@ -10373,7 +10374,10 @@ struct Model::Impl {
     // per-slot down outputs, gguf's moe_part) of one expert count on every trunk layer
     void learn_init() {
         const char* on = std::getenv("DS4_STANDIN_LEARN");
-        if (on == nullptr || std::atoi(on) == 0 || d_standin == nullptr || !fr_on) return;
+        // DS4_STANDIN_LEARN=observe: the samples are collected and the table saved, but no correction is applied (the answers stay the
+        // default's) - so a server always learns, and the corrections are switched on (=1) only once a test has shown they help
+        learn_observe = on != nullptr && std::strcmp(on, "observe") == 0;
+        if (on == nullptr || (!learn_observe && std::atoi(on) == 0) || d_standin == nullptr || !fr_on) return;
         const int nl = g.nl, n = g.n_exp, D = g.dim;
         bool gguf = nl > 0 && nl <= kLearnMaxL && n > 0 && D > 0;
         for (int il = 0; il < nl && gguf; ++il)
@@ -10408,7 +10412,8 @@ struct Model::Impl {
         learn_on = true;
         const size_t got = learn_load(one);
         if (got > 0 && cudaMemcpy(d_pair_c, one.data(), tab, cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
-        std::fprintf(stderr, "ds4: stand-ins: learn on (each stand-in's weight scaled by its pair's learned correction; table %.0f MB; "
+        std::fprintf(stderr, learn_observe ? "ds4: stand-ins: learn on, OBSERVE only (samples collected and saved, no correction applied; table %.0f MB; "
+                                           : "ds4: stand-ins: learn on (each stand-in's weight scaled by its pair's learned correction; table %.0f MB; "
                              "%zu pairs loaded from %s)\n", (double) tab / 1048576.0, got, learn_path().c_str());
     }
     // the learned pairs kept across runs (6 Nov: ~180 re-checks in 2,000 tokens - a pair needs 32 samples, so a fresh engine every run
@@ -10569,8 +10574,8 @@ struct Model::Impl {
     void bal_init() {
         const char* on = std::getenv("DS4_STANDIN_BALANCE");
         if (on == nullptr || std::atoi(on) == 0) return;
-        if (!learn_on) {
-            std::fprintf(stderr, "ds4: stand-ins: balance off (it needs DS4_STANDIN_LEARN)\n");
+        if (!learn_on || learn_observe) {   // (observe: the table learns, nothing acts on it)
+            std::fprintf(stderr, "ds4: stand-ins: balance off (it needs DS4_STANDIN_LEARN=1%s)\n", learn_observe ? "; =observe applies nothing" : "");
             return;
         }
         const int nl = g.nl, n = g.n_exp;
@@ -13149,7 +13154,7 @@ struct Model::Impl {
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
                           // (the flip re-check's exact re-run, standin_bypass, runs without the mask too: 6 Nov review - it was masked)
                           na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr, standin_bypass ? nullptr : &rmp,
-                          lrn ? d_pair_c + (size_t) l.il * g.n_exp * g.n_exp : nullptr, lrn ? d_cap_rec + (size_t) 4 * l.il : nullptr,
+                          lrn && !learn_observe ? d_pair_c + (size_t) l.il * g.n_exp * g.n_exp : nullptr, lrn ? d_cap_rec + (size_t) 4 * l.il : nullptr,
                           lrn && bal_on ? d_pair_err + (size_t) l.il * g.n_exp * g.n_exp : nullptr);   // (stand-ins: decode tokens of the trunk only)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
