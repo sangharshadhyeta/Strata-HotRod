@@ -764,35 +764,6 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
-// STRATA_STANDIN_LEARN (opt-in): the layer's down outputs of a window, per group of rows (parts [n][K][N], slot k = the router's rank k).
-// mode gate[0]: 1 copies, for each row i whose first stand-in is in this layer (rec[i][0] == layer), the output of the rank rec[i][1] (the
-// stand-in's y_s) into ys[i]; 2 copies row 0's output at rank gate[2] into ye when this layer is gate[1] (the exact re-run's y_e); 0 nothing.
-// Device-gated: the same launch is in every window's graph, and the host sets gate, rec and the buffers between windows only.
-namespace {
-__global__ void learn_capture_k(const float* __restrict__ parts, int K, int N, int n, int layer, const int32_t* __restrict__ gate,
-                                const int32_t* __restrict__ rec, float* __restrict__ ys, float* __restrict__ ye, int row0) {
-    const int i = (int) blockIdx.y;
-    const int d = (int) (blockIdx.x * blockDim.x + threadIdx.x);
-    if (d >= N || i >= n) return;
-    const int mode = gate[0];
-    if (mode == 1) {
-        const int32_t* r = rec + (size_t) i * 4;
-        if (r[0] != layer || r[1] < 0 || r[1] >= K) return;
-        ys[(size_t) i * N + d] = parts[((size_t) i * K + r[1]) * N + d];
-    } else if (mode == 2) {
-        if (!row0 || i != 0 || gate[1] != layer || gate[2] < 0 || gate[2] >= K) return;
-        ye[d] = parts[(size_t) gate[2] * N + d];
-    }
-}
-}  // namespace
-void native_learn_capture(const float* parts, int K, int N, int n, int layer, const int32_t* gate, const int32_t* rec, float* ys,
-                          float* ye, bool row0, void* stream) {
-    if (!parts || !gate || !rec || !ys || !ye || n < 1 || N < 1 || K < 1 || !stream) return;
-    const dim3 grid((unsigned) ((N + 255) / 256), (unsigned) n);
-    learn_capture_k<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(parts, K, N, n, layer, gate, rec, ys, ye, row0 ? 1 : 0);
-    const auto error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-}
 // STRATA_MASK=<share> (opt-in, changes the output): the least-used experts of each layer (the tail of the expert profile) are masked.
 // After the router's top-10, a masked pick of rank >= lo moves to the best unmasked expert the token did not pick; rank lo-1 moves only
 // when that expert is within `edge` logits (edge > 0); ranks below lo-1 stay.  The rule and the settings are route-resident's.  A move is

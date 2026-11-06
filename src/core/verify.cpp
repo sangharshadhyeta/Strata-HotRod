@@ -3252,7 +3252,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 && lrn_gate_ == nullptr &&
+            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
             if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
@@ -3262,29 +3262,44 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
-        if (lrn_gate_ != nullptr) {   // STRATA_STANDIN_LEARN: this layer's per-rank outputs of the group's rows (device-gated; parts_ is whole here)
-            try {
-                strata::kernels::native_learn_capture(parts_ + (size_t) tb * K * N, (int) K, (int) N, n, (int) l, lrn_gate_,
-                                                      lrn_rec_ + (size_t) tb * 4, lrn_ys_ + (size_t) tb * N, lrn_ye_, tb == 0, cs);
-            } catch (const std::exception& e) { err = "verify learn capture: " + std::string(e.what()); return false; }
-        }
+        // STRATA_STANDIN_LEARN: the combine kernels copy the learner's y_s / y_e from the parts they already read (learn_tap.hpp).
+        // The tap is built per call's first row; the kernels' row index is the call's own.  Null when learning is off.
+        const bool learn = lrn_gate_ != nullptr;
+        auto learn_tap_at = [&](int row) {
+            strata::kernels::MoeLearnTap t;
+            t.ys = lrn_ys_ + (size_t) row * N; t.ye = lrn_ye_; t.rec = lrn_rec_ + (size_t) row * 4; t.gate = lrn_gate_;
+            t.layer = (int32_t) l; t.row0 = row == 0 ? 1 : 0;
+            return t;
+        };
+        const strata::kernels::MoeLearnTap tap_grp = learn ? learn_tap_at(tb) : strata::kernels::MoeLearnTap{};
+        const strata::kernels::MoeLearnTap* tap_p = learn ? &tap_grp : nullptr;
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
-                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs, tap_p);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (hits_in_combine) {
             try {
                 native_moe_combine_multi_hits_added(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
-                                                    shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                                                    shared_ + tb * N, bo_ + tb * N, N, K, n, cs, tap_p);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
-                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs, tap_p);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
+            if (learn) {   // one row at a time, the same combine as moe_combine_parts with the row's tap
+                const strata::kernels::MoeLearnTap tt = learn_tap_at(t);
+                try {
+                    if (native_moe_combine_enabled())
+                        strata::kernels::native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, bo_ + t * N, g.n_embd, K, cs, &tt);
+                    else
+                        strata::kernels::moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, bo_ + t * N, g.n_embd, K, cs, &tt);
+                } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+                continue;
+            }
             MoEBuffers mb = ss.moe;
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;

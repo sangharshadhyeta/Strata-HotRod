@@ -16,6 +16,7 @@
 
 #include <cstdint>
 
+#include "strata/kernels/learn_tap.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
 namespace strata::kernels {
@@ -101,7 +102,8 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
 /// One thread per output element, k accumulations each; k is 10 at the real geometry.  This is where the CPU
 /// expert pool's outputs are summed: `ExpertPool` carries a `weight` per job and deliberately does NOT apply
 /// it, because the sum has to happen once over all k and not once per worker.
+/// tap (STRATA_STANDIN_LEARN; nullptr: none): this call's row's raw parts copied as learn_tap.hpp says (row 0 = the tap's row).
 void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
-                 int64_t k, void* stream);
+                 int64_t k, void* stream, const MoeLearnTap* tap = nullptr);
 
 }  // namespace strata::kernels

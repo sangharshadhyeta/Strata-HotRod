@@ -144,13 +144,19 @@ __global__ void native_scalar_sigmoid_multi_kernel(float* gate) {   // thread t 
 /// The MoE block's final combination.  See the header for the two readings it exists to pin.
 __global__ void moe_combine_kernel(const float* __restrict__ parts, const float* __restrict__ weights,
                                    const float* __restrict__ shared, float* __restrict__ y, int n_embd,
-                                   int k, int has_shared) {
+                                   int k, int has_shared, MoeLearnTap tap) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n_embd) return;
     // Accumulate in DOUBLE, in the reference's own order (`for i in range(k): out[t] += w[t,i] * g[0]`).
     // f32 would be defensible for ten terms, but the reference is float64 and this is one line.
     double acc = 0.0;
-    for (int e = 0; e < k; ++e) acc += (double) weights[e] * (double) parts[(size_t) e * n_embd + j];
+    // STRATA_STANDIN_LEARN: the tap's row is this call's one row (row 0), its raw parts copied before their weights
+    const int ys_r = lrn_ys_rank(tap, 0), ye_r = lrn_ye_rank(tap, 0);
+    for (int e = 0; e < k; ++e) {
+        const float p = parts[(size_t) e * n_embd + j];
+        lrn_put(tap, ys_r, ye_r, 0, e, n_embd, j, p);
+        acc += (double) weights[e] * (double) p;
+    }
     // The SHARED output is added PLAIN - not router-weighted, not renormalised against the routed sum.
     if (has_shared) acc += (double) shared[j];
     y[j] = (float) acc;
@@ -396,7 +402,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
 }
 
 void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
-                 int64_t k, void* stream) {
+                 int64_t k, void* stream, const MoeLearnTap* tap) {
     if (n_embd <= 0 || k <= 0) return;
     // k > 64 is refused rather than truncated: silently summing the first 64 of a longer list would be a
     // wrong answer that looks like a right one, and no geometry in this artifact comes close to it.
@@ -406,7 +412,7 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
     }
     const unsigned grid = (unsigned) ((n_embd + THREADS - 1) / THREADS);
     moe_combine_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(parts, weights, shared, y, (int) n_embd,
-                                                                   (int) k, shared != nullptr);
+                                                                   (int) k, shared != nullptr, tap ? *tap : MoeLearnTap{});
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
