@@ -102,7 +102,8 @@ public:
             if (++rc_total_ % kKWindow == 0) k_update();
             brake_check();
         }
-        if (testing_ && n_[0] >= kAutoMin && n_[1] >= kAutoMin) test_done();
+        const long long need = mask_testing_ ? (long long) kMaskMin : (long long) kAutoMin;   // (a mask test: 4x, see kMaskMin)
+        if (testing_ && n_[0] >= need && n_[1] >= need) test_done();
     }
 
     // Writes the state to path (through a temp file, then renamed).  False when the file cannot be written.
@@ -163,7 +164,8 @@ public:
 private:
     // (kAutoMin counts tokens here: our Qwen engine's 96 were decode windows of several tokens each.  At 96 tokens an arm never reaches
     // kAutoTokMin or kCleanTok, so the quality gate and the clean ceiling would never act; 400 lets both act as they do there.)
-    enum { kAutoRun = 8, kAutoMin = 400, kAutoTokMin = 200, kCleanTok = 400 };
+    // kMaskMin: a mask test's tokens per arm, 4x the budget test's - shorter tests walked the mask's depth back and forth on noise (Qwen, 6 Nov)
+    enum { kAutoRun = 8, kAutoMin = 400, kAutoTokMin = 200, kCleanTok = 400, kMaskMin = 1600 };
     enum { kBrakeMin = 15, kBrakeWindows = 64, kBrakeTokMin = 100, kBrakeFlips = 3, kKWindow = 50 };
     static constexpr double kZ = 1.6448536;   // the Wilson score's z for 90%
 

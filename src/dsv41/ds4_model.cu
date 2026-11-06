@@ -1126,6 +1126,7 @@ struct Model::Impl {
     // (0 base, 1 candidate), the arm on the device (-1: none yet), the direction state (as the budget test's: first direction, stage 0 / 1)
     bool mt_on = false;                     // a mask test runs: the levels are fixed (ml_update does not move p)
     int mt_d = -1, mt_cur = -1, mt_first = -1, mt_stage = 0;
+    int mt_win_d = 0;   // the direction of an unconfirmed mask-test win (0: none): a move needs two wins in a row (Qwen's 330a6dc3)
     double mt_cand_p = 0.0, mt_cand_g = 0.0;
     std::vector<uint8_t> mt_lv[2];
     double ml_ag_ok = 0.0, ml_ag_tot = 0.0; // the re-checks: no change of the top token / all (decayed)
@@ -4148,9 +4149,16 @@ struct Model::Impl {
     // the verdict: a win keeps the candidate's (p, g); the levels are recomputed for the final (p, g) and uploaded; the table is saved
     void mask_test_end(const StandinTune::MaskEnd& r) {
         const double base_p = mask_p, base_g = ml_g;
-        if (r.won) {
+        // a move needs two wins in a row in the same direction: a first win is remembered and the next mask test repeats it against the
+        // same base; a loss forgets it (6 Nov night on Qwen: single short tests walked the depth back and forth on noise)
+        bool moved = false;
+        if (r.won && mt_win_d == mt_d) {
             mask_p = mt_cand_p;
             ml_g = mt_cand_g;
+            moved = true;
+            mt_win_d = 0;
+        } else {
+            mt_win_d = r.won ? mt_d : 0;
         }
         mt_next_stage(mt_first, mt_stage, r.won, mt_d);
         mt_on = false;
@@ -4158,9 +4166,10 @@ struct Model::Impl {
         ml_relevel();
         ml_upload();
         const double fc = r.tok[1] > 0 ? 100.0 * r.pc : 0.0, fb = r.tok[0] > 0 ? 100.0 * r.pb : 0.0;
-        std::fprintf(stderr, "ds4: request: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): %.1f vs %.1f tok/s over %lld+%lld tokens -> (%.3f,%.3f); "
+        std::fprintf(stderr, "ds4: request: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): %.1f vs %.1f tok/s over %lld+%lld tokens -> (%.3f,%.3f)%s; "
                      "flips/100 tok %.2f vs %.2f (%lld vs %lld re-checks)%s\n",
-                     mt_cand_p, mt_cand_g, base_p, base_g, r.sc, r.sb, r.tok[1], r.tok[0], r.won ? mask_p : base_p, r.won ? ml_g : base_g,
+                     mt_cand_p, mt_cand_g, base_p, base_g, r.sc, r.sb, r.tok[1], r.tok[0], mask_p, ml_g,
+                     r.won && !moved ? " (a first win: the next test repeats it)" : "",
                      fc, fb, r.rc[1], r.rc[0], r.quality ? "" : ", quality lost");
         ml_save();
     }
