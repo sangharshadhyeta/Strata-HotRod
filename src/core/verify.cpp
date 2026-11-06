@@ -1083,14 +1083,20 @@ namespace {
 constexpr int kLrnPerLayer = 4096, kLrnReady = 32;
 constexpr double kLrnDecay = 0.98;
 constexpr uint32_t kLrnMagic = 0x4C535453u;   // "STSL"
+// STRATA_STANDIN_LEARN=observe: the samples are collected and the table saved, but no correction is applied and the balance stays off
+// (the answers stay the default's) - so a server always learns; =1 applies the corrections
+bool standin_learn_observe_env() {
+    const char* e = std::getenv("STRATA_STANDIN_LEARN");
+    return e != nullptr && std::strcmp(e, "observe") == 0;
+}
 bool standin_balance_env() {
     const char* e = std::getenv("STRATA_STANDIN_BALANCE");
-    return e != nullptr && std::atoi(e) != 0;
+    return e != nullptr && std::atoi(e) != 0 && !standin_learn_observe_env();
 }
 constexpr int kLrnBalRound = 256;
 bool standin_learn_env() {
     const char* e = std::getenv("STRATA_STANDIN_LEARN");
-    return e != nullptr && std::atoi(e) != 0;
+    return e != nullptr && (std::atoi(e) != 0 || standin_learn_observe_env());
 }
 uint64_t lrn_key(int64_t l, int64_t e, int64_t s) { return ((uint64_t) l << 40) | ((uint64_t) e << 20) | (uint64_t) s; }
 }  // namespace
@@ -3039,7 +3045,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       n <= 8 ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr,
                                       rr_stats_ != nullptr ? rr_stats_ + 9 : nullptr,   // STRATA_ROUTE_BUDGET counters [9..11], STRATA_ROUTE_BUDGET_TAIL [12..13]
                                       n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr,   // STRATA_FRAGILE_RECHECK: this group's rows
-                                      lrn_c_ != nullptr ? lrn_c_ + (size_t) l * 512 * 512 : nullptr,   // STRATA_STANDIN_LEARN: the layer's corrections
+                                      lrn_c_ != nullptr && !standin_learn_observe_env() ? lrn_c_ + (size_t) l * 512 * 512 : nullptr,   // STRATA_STANDIN_LEARN: the layer's corrections (=observe: none applied)
                                       lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr, (int) l,
                                       lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
