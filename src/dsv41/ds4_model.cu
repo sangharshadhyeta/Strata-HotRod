@@ -3888,7 +3888,9 @@ struct Model::Impl {
     // divergence as harm; every replaced pick is exposure. A (layer, expert) harm rate = harm / exposure (both decayed). The masked experts
     // are the lowest-rate ones among the least-used (the profile seeds them), up to the share p; p follows the re-checks' agreement; an expert
     // with enough exposure and a rate under its layer's 10th percentile is masked at every rank (level 2). The table is in <pack>/mask-learn.bin.
-    static constexpr double kMlP0 = 0.05, kMlPMax = 0.5;
+    // (kMlPMax: no chosen ceiling - the re-checks' agreement decides how much is masked; 0.95 only keeps a layer more experts than a
+    // token picks: 19 of 384 at k 5 - the user, 6 Nov: "the masking itself will decide")
+    static constexpr double kMlP0 = 0.05, kMlPMax = 0.95;
     static constexpr int kMlMaskEvery = 256, kMlDecayEvery = 8192, kMlSampleEvery = 64, kMlSaveEvery = 4096;
     static constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
     static constexpr int kMlMinPop = 8;
