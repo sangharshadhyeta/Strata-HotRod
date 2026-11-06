@@ -1227,6 +1227,11 @@ struct Model::Impl {
     float fr_k = 4.0f;
     float* d_top2 = nullptr;
     long long fr_used = 0, fr_checks = 0, fr_flips = 0;
+    // the re-check study (6 Nov): fr_pc[prev close][this close] decode tokens, fr_pf[prev close] flips, fr_prev the last token's close
+    // call; fr_fl[8-layer bin][0 re-checks, 1 flips] by the re-checked token's first substituted layer (DS4_STANDIN_LEARN's record)
+    long long fr_pc[2][2] = {{0, 0}, {0, 0}}, fr_pf[2] = {0, 0}, fr_fl[8][2] = {};
+    long long fr_ff[2][2] = {{0, 0}, {0, 0}};   // [the last token flipped][0 tokens, 1 flips]: does an actual flip predict the next one
+    int fr_prev = 0, fr_prev_flip = 0;
     // DS4_STANDIN_LEARN=1 (opt-in; unset: as now): a stand-in's output differs from the true expert's, so each (layer, true expert e,
     // stand-in s) pair learns a correction from the flip re-checks: a re-checked token's first stand-in (its layer's inputs are the same in
     // both passes, the layers before it took none) gives y_s (pass 1, the stand-in's down output) and y_e (the exact re-run, the true
@@ -1814,9 +1819,22 @@ struct Model::Impl {
                     if (h.offered[r] > 0) line += " " + std::to_string(r) + ": " + std::to_string(h.taken[r]) + " / " + std::to_string(h.offered[r]);
                 std::fprintf(stderr, "%s\n", line.c_str());
             }
-            if (fr_on)
+            if (fr_on) {
                 std::fprintf(stderr, "ds4: request: stand-ins: %lld decode tokens took them, %lld re-checked exactly, %lld of those changed the top token\n",
                              fr_used, fr_checks, fr_flips);
+                // 6 Nov (cumulative): does the last token's close call predict this one's? (prev close / not -> tokens, close calls, flips),
+                // and where the re-checked tokens' first substitution falls (8-layer bins; flips in brackets): a re-run from there would
+                // skip the layers before it
+                std::string fl = "ds4: request: re-check study: after a close call " + std::to_string(fr_pc[1][0] + fr_pc[1][1]) + " tokens, " +
+                                 std::to_string(fr_pc[1][1]) + " close, " + std::to_string(fr_pf[1]) + " flips; after none " +
+                                 std::to_string(fr_pc[0][0] + fr_pc[0][1]) + " tokens, " + std::to_string(fr_pc[0][1]) + " close, " +
+                                 std::to_string(fr_pf[0]) + " flips; after a FLIP " + std::to_string(fr_ff[1][0]) + " tokens, " +
+                                 std::to_string(fr_ff[1][1]) + " flips; after no flip " + std::to_string(fr_ff[0][0]) + " tokens, " +
+                                 std::to_string(fr_ff[0][1]) + " flips; first substituted layer:";
+                for (int b = 0; b < 8; ++b)
+                    if (fr_fl[b][0] > 0) fl += " " + std::to_string(8 * b) + "-" + std::to_string(8 * b + 7) + ": " + std::to_string(fr_fl[b][0]) + " (" + std::to_string(fr_fl[b][1]) + ")";
+                std::fprintf(stderr, "%s\n", fl.c_str());
+            }
             if (learn_on) learn_print();
             if (bal_on) bal_print();
             if (tune_on) {
@@ -10807,7 +10825,17 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(&used, &d_standin->used[0], sizeof used, cudaMemcpyDeviceToHost, sd.st));
         CK(cudaMemcpyAsync(&risk, &d_standin->risk[0], sizeof risk, cudaMemcpyDeviceToHost, sd.st));
         CK(cudaStreamSynchronize(sd.st));
-        if (!used) return true;
+        // (the re-check study: a token that took no stand-in, or no close call, is "not close" and cannot flip)
+        auto study_quiet = [&] {
+            ++fr_pc[fr_prev][0];
+            ++fr_ff[fr_prev_flip][0];
+            fr_prev = 0;
+            fr_prev_flip = 0;
+        };
+        if (!used) {
+            study_quiet();
+            return true;
+        }
         ++fr_used;
         rk = risk;
         Dev& hd = devs[(size_t) head_dev];
@@ -10817,7 +10845,10 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(t2, d_top2, sizeof t2, cudaMemcpyDeviceToHost, hd.st));
         CK(cudaStreamSynchronize(hd.st));
         gap = t2[0] - t2[1];
-        if (gap >= fr_k * risk) return true;
+        if (gap >= fr_k * risk) {
+            study_quiet();
+            return true;
+        }
         rc = true;
         const int before = (int) t2[2];
         int lil = -1, le = -1, ls = -1;   // (DS4_STANDIN_LEARN: this token's sample, when the record has a stand-in)
@@ -10846,6 +10877,17 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(hd.st));
         flipped = (int) t2[2] != before;
         fr_flips += flipped;
+        // the re-check study: this token was a close call (and flipped or not)
+        ++fr_pc[fr_prev][1];
+        fr_pf[fr_prev] += flipped;
+        ++fr_ff[fr_prev_flip][0];
+        fr_ff[fr_prev_flip][1] += flipped;
+        if (lil >= 0) {
+            ++fr_fl[std::min(7, lil / 8)][0];
+            fr_fl[std::min(7, lil / 8)][1] += flipped;
+        }
+        fr_prev = 1;
+        fr_prev_flip = flipped ? 1 : 0;
         return true;
     }
 
