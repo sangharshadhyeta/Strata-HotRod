@@ -168,6 +168,41 @@ M of the T masked on the card`. Request end: `ds4: request: mask: p=0.25 F 3 E 1
 
 State: untested until measured.
 
+## DS4_MASK=learn (opt-in, untested)
+
+Why: the mask above chooses by the profile's pick counts alone. RCO (ISTA) chooses the experts to drop by the KL divergence between the pruned and
+the full model's outputs; here the engine measures that divergence on the user's own traffic, from its flip re-checks, and learns the choice.
+
+How (`DS4_MASK=learn`; needs the stand-ins and their flip re-check on, else it says it is off): a fragile token runs twice, first with the
+stand-ins and the mask, then exactly. Before the exact run the first pass's head logits are copied (`d_logit0`, on the head's GPU), and
+`logit_kl_kernel` gives D = KL(exact || first pass) over the whole vocab (one block, double accumulators, log-sum-exp with the maxima
+subtracted; a few microseconds against a forward pass of tens of milliseconds, not measured). `route_publish_kernel` appends each replaced pick of
+a decode token to a device list (`MaskEvs`, 512 entries, the trunk's GPU): a mask move or a stand-in swap, with the replaced expert and its
+risk (weight x gap). The first trunk layer of a token resets the list (`mev_reset`); the exact run writes none. On a re-checked token the list
+is read back (one small copy): each entry takes D x (its weight x gap) / (the list's sum) as harm, and every distinct (layer, expert) in the
+list takes one exposure. A used token that is not re-checked is read on every 64th time, its exposures counted 64 times (the only other read).
+
+Scores: harm rate = harm / max(1, exposure) per (layer, expert), both halved every 8192 learning steps. Masks move every 256 decode tokens per
+layer: the candidates are the 2p x n least-used experts by the profile (the seed), the masked are the lowest rates among them, up to the share p.
+p starts at 0.05 and follows the re-checks' agreement (no change of the top token): 98% or more raises it by 0.025, under 95% lowers it by
+0.05 (both within 0..0.5; no move before 32 re-checks in the window). An expert with at least 256 exposures and a rate under its layer's 10th
+percentile (of the experts with 256 exposures; at least 8 of them) is masked at every rank (level 2, the router's rule for it is "move at any
+rank"); above the layer's median it falls back to level 1 (the rank rule). Level 2 experts count toward the share, and the lowest-rate ones
+are kept when there are too many.
+
+Persistence: `<pack>/mask-learn.bin` (magic `MLRN`, version 1, the shape, p, the agreement sums, the token count, then harm, exposure and levels),
+written with the stand-in tune file's saves (every 4096 learning steps, each request's end, the engine's end) and read at start when its shape
+matches the model.
+
+Request line: `ds4: request: mask learn: p <p>, <m> masked (<a> at all ranks), re-check D mean <d> (<n>), <k> experts scored`.
+Start line: `ds4: DS4_MASK=learn: the saved table | a fresh table, p 0.050 (<pack>/mask-learn.bin)`.
+
+Limits: an expert that is never replaced has no exposure, so its rate is 0 and it is a candidate by its low use; it is learned only once it is
+masked. The exposure counts re-checked tokens too (the spec counted only the others, which would bias the rate upward). The engine's "auto"
+share does not exist in this tree, so p's self-tuning is this mode's own.
+
+State: untested until measured.
+
 ## DS4_STANDIN_LEARN (opt-in, untested)
 
 Why: a stand-in replaces an off-card pick with a resident expert, so its output differs from the true expert's. A correction learned live per

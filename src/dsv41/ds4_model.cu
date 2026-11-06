@@ -1113,6 +1113,17 @@ struct Model::Impl {
     double mask_p = 0.0;
     int mask_floor = 3;
     float mask_edge = 1.0f;
+    // DS4_MASK=learn (mask_init, the ml_* functions): the buffers and the learned table (see the comment above mask_init)
+    bool mask_learn_on = false;
+    MaskEvs* d_mev = nullptr;               // device (trunk GPU): the decode token's replaced picks (route_publish writes them)
+    float* d_logit0 = nullptr;              // device (head GPU) [vocab]: a re-checked token's first-pass logits
+    float* d_kl = nullptr;                  // device (head GPU) [1]: the re-check's KL
+    std::vector<double> ml_harm, ml_expo;   // [nl][n_exp]: the harm and the exposure (decayed)
+    std::vector<uint8_t> ml_lv;             // [nl][n_exp]: 0 unmasked, 1 masked (the rank rule), 2 masked at every rank
+    double ml_ag_ok = 0.0, ml_ag_tot = 0.0; // the re-checks: no change of the top token / all (decayed)
+    long long ml_tok = 0, ml_nrc = 0;       // the learning steps; the used tokens not re-checked (every 64th is sampled)
+    double ml_dsum = 0.0;                   // this request's re-check D
+    long long ml_dn = 0;
     // STRATA_FRAGILE_RECHECK (on with the stand-ins; 0: off): a decode token that took stand-ins is a close call when its top-two logit
     // gap is under fr_k (STRATA_FRAGILE_K0, 4) x its risk (the sum of weight x logit gap its stand-ins carried); a close call is run
     // again exactly at the same position (step(); standin_bypass), and the exact run's logits are the ones sampled.  The ring row,
@@ -1863,6 +1874,11 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: request: mask: p=%.2f F %d E %.2f, %llu picks moved to the next unmasked expert\n", mask_p,
                              mask_floor, (double) mask_edge, mvd);
         }
+        if (mask_learn_on) {   // (DS4_MASK=learn: the request's line, and the table saved with the stand-in tune file's saves)
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            ml_print();
+            ml_save();
+        }
         if (lend_on) lend_print();   // (DS4_LEND: the experts lent now, of the last plan)
         if (tail3_on) tail_print();
         if (pcie_on) pcie_print();  // (STRATA_LA_TAIL_READ=3: the read threshold, the reads, the stand-in failures)
@@ -1893,6 +1909,18 @@ struct Model::Impl {
                 cudaFree(d_top2);
                 d_top2 = nullptr;
             }
+        }
+        if (mask_learn_on) {   // DS4_MASK=learn: the table, then its buffers
+            ml_save();
+            cudaSetDevice(devs[(size_t) head_dev].id);
+            if (d_logit0 != nullptr) cudaFree(d_logit0);
+            if (d_kl != nullptr) cudaFree(d_kl);
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            if (d_mev != nullptr) cudaFree(d_mev);
+            d_logit0 = nullptr;
+            d_kl = nullptr;
+            d_mev = nullptr;
+            mask_learn_on = false;
         }
         if (d_mask != nullptr || d_mask_moved != nullptr) {   // DS4_MASK's blocks (the counter printed by request_end)
             cudaSetDevice(devs[(size_t) L[0].dev].id);
@@ -3732,8 +3760,13 @@ struct Model::Impl {
     // The masks are one device block on the trunk's GPU (a single-GPU trunk only, as the stand-ins); the rule is route_mask_apply's.
     void mask_init() {
         const char* on = std::getenv("DS4_MASK");
-        const double p0 = on != nullptr ? std::atof(on) : 0.0;
+        const bool learn = on != nullptr && std::strcmp(on, "learn") == 0;   // (DS4_MASK=learn: the scores decide, see ml_*)
+        const double p0 = learn ? kMlP0 : (on != nullptr ? std::atof(on) : 0.0);
         if (!(p0 > 0.0)) return;
+        if (learn && (!fr_on || d_standin == nullptr)) {
+            std::fprintf(stderr, "ds4: DS4_MASK=learn: off (it learns from the stand-ins' flip re-checks: STRATA_STANDIN on, the re-check on)\n");
+            return;
+        }
         const double p = std::min(0.95, p0);
         for (int il = 0; il < g.nl; ++il)
             if (L[(size_t) il].dev != L[0].dev || L[(size_t) il].nm != 1) {
@@ -3754,21 +3787,30 @@ struct Model::Impl {
             return;
         }
         std::vector<unsigned char> host((size_t) g.nl * ne, 0);
-        int masked = 0, on_card = 0;
-        for (int il = 0; il < g.nl; ++il) {
-            const uint32_t* pr = prof.data() + (size_t) il * ne;
-            uint64_t sum = 0;
-            for (int e = 0; e < ne; ++e) sum += pr[e];
-            if (sum == 0) continue;   // (no counts for this layer: nothing says which of its experts are unused)
-            std::vector<int> order((size_t) ne);
-            std::iota(order.begin(), order.end(), 0);
-            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return pr[a] < pr[b]; });   // fewest picks first
-            for (int q = 0; q < per; ++q) {
-                host[(size_t) il * ne + (size_t) order[(size_t) q]] = 1;
-                on_card += L[(size_t) il].slot[(size_t) order[(size_t) q]] >= 0;
-                ++masked;
+        if (learn) {
+            ml_init();   // the saved scores (or none) and the levels they give now; the profile's counts seed the candidates
+            host = ml_lv;
+        } else {
+            for (int il = 0; il < g.nl; ++il) {
+                const uint32_t* pr = prof.data() + (size_t) il * ne;
+                uint64_t sum = 0;
+                for (int e = 0; e < ne; ++e) sum += pr[e];
+                if (sum == 0) continue;   // (no counts for this layer: nothing says which of its experts are unused)
+                std::vector<int> order((size_t) ne);
+                std::iota(order.begin(), order.end(), 0);
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return pr[a] < pr[b]; });   // fewest picks first
+                for (int q = 0; q < per; ++q) host[(size_t) il * ne + (size_t) order[(size_t) q]] = 1;
             }
         }
+        int masked = 0, on_card = 0, all_ranks = 0;
+        for (int il = 0; il < g.nl; ++il)
+            for (int e = 0; e < ne; ++e) {
+                const unsigned char v = host[(size_t) il * ne + (size_t) e];
+                if (v == 0) continue;
+                ++masked;
+                all_ranks += v == 2;
+                on_card += L[(size_t) il].slot[(size_t) e] >= 0;
+            }
         mask_host = host;   // (the Monitor's expert map shows the masked experts)
         cudaSetDevice(devs[(size_t) L[0].dev].id);
         unsigned char* dm = nullptr;
@@ -3783,12 +3825,45 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: DS4_MASK: off (no device memory)\n");
             return;
         }
+        // DS4_MASK=learn's buffers: the first pass's logits of a re-checked token and its KL (the head's GPU), the token's list of replaced
+        // picks (the trunk's GPU)
+        float* l0 = nullptr;
+        float* kl = nullptr;
+        MaskEvs* mev = nullptr;
+        if (learn) {
+            cudaSetDevice(devs[(size_t) head_dev].id);
+            if (cudaMalloc(&l0, sizeof(float) * (size_t) g.vocab) != cudaSuccess || cudaMalloc(&kl, sizeof(float)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (l0 != nullptr) cudaFree(l0);
+                cudaSetDevice(devs[(size_t) L[0].dev].id);
+                cudaFree(dm);
+                cudaFree(mv);
+                std::fprintf(stderr, "ds4: DS4_MASK=learn: off (no device memory for the re-check's logits)\n");
+                return;
+            }
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            if (cudaMalloc(&mev, sizeof(MaskEvs)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                cudaFree(l0);
+                cudaFree(kl);
+                cudaFree(dm);
+                cudaFree(mv);
+                std::fprintf(stderr, "ds4: DS4_MASK=learn: off (no device memory for the replaced picks)\n");
+                return;
+            }
+        }
         d_mask = dm;
         d_mask_moved = mv;
-        mask_p = p;
+        mask_p = learn ? mask_p : p;
         mask_floor = floor_r;
         mask_edge = edge;
         for (int il = 0; il < g.nl; ++il) L[(size_t) il].route_mask = dm + (size_t) il * ne;
+        if (learn) {
+            d_logit0 = l0;
+            d_kl = kl;
+            d_mev = mev;
+            mask_learn_on = true;
+        }
         char rk[160];
         if (floor_r == 0)
             std::snprintf(rk, sizeof rk, "every rank may move");
@@ -3796,10 +3871,254 @@ struct Model::Impl {
             std::snprintf(rk, sizeof rk, "rank %d within %.2f logits", floor_r - 1, (double) edge);
         else
             std::snprintf(rk, sizeof rk, "rank %d exact", floor_r - 1);
-        std::fprintf(stderr,
-                     "ds4: DS4_MASK=%.2f: per layer the %d least-picked experts masked (ranks below %d exact, %s, from rank %d moved; "
-                     "profile %s), %d of the %d masked on the card\n",
-                     p, per, std::max(0, floor_r - 1), rk, floor_r, pf.c_str(), on_card, masked);
+        if (learn)
+            std::fprintf(stderr,
+                         "ds4: DS4_MASK=learn: p %.3f at the start (the scores move the masks every %d decode tokens; all ranks from %d exposures), "
+                         "%s, from rank %d moved; profile %s, %d masked (%d at all ranks), %d of them on the card\n",
+                         mask_p, kMlMaskEvery, (int) kMlMinExpo, rk, floor_r, pf.c_str(), masked, all_ranks, on_card);
+        else
+            std::fprintf(stderr,
+                         "ds4: DS4_MASK=%.2f: per layer the %d least-picked experts masked (ranks below %d exact, %s, from rank %d moved; "
+                         "profile %s), %d of the %d masked on the card\n",
+                         p, per, std::max(0, floor_r - 1), rk, floor_r, pf.c_str(), on_card, masked);
+    }
+    // ---- DS4_MASK=learn (opt-in): the mask learns from the model's own divergence on the user's traffic. A flip re-check runs a fragile token
+    // twice (the stand-ins, then exactly): KL(exact || stand-in run) over the vocab is RCO's objective on real traffic (ml_recheck). Each
+    // replaced pick of the token (route_publish's list: the mask's moves and the stand-ins' swaps, with weight x gap) takes its share of that
+    // divergence as harm; every replaced pick is exposure. A (layer, expert) harm rate = harm / exposure (both decayed). The masked experts
+    // are the lowest-rate ones among the least-used (the profile seeds them), up to the share p; p follows the re-checks' agreement; an expert
+    // with enough exposure and a rate under its layer's 10th percentile is masked at every rank (level 2). The table is in <pack>/mask-learn.bin.
+    static constexpr double kMlP0 = 0.05, kMlPMax = 0.5;
+    static constexpr int kMlMaskEvery = 256, kMlDecayEvery = 8192, kMlSampleEvery = 64, kMlSaveEvery = 4096;
+    static constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
+    static constexpr int kMlMinPop = 8;
+    std::string ml_path() const { return o.pack + "/mask-learn.bin"; }
+    size_t ml_at(int il, int e) const { return (size_t) il * (size_t) g.n_exp + (size_t) e; }
+    // the file: "MLRN", version 1, nl, ne, p, the agreement's two sums, the token count, then harm and exposure (double) and the levels (bytes)
+    void ml_save() const {
+        const std::string path = ml_path(), tmp = path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (f == nullptr) {
+            std::fprintf(stderr, "ds4: DS4_MASK=learn: %s not written\n", path.c_str());
+            return;
+        }
+        const uint32_t ver = 1;
+        const int32_t nl = g.nl, ne = g.n_exp;
+        const long long tok = ml_tok;
+        bool ok = std::fwrite("MLRN", 1, 4, f) == 4 && std::fwrite(&ver, sizeof ver, 1, f) == 1 && std::fwrite(&nl, sizeof nl, 1, f) == 1 &&
+                  std::fwrite(&ne, sizeof ne, 1, f) == 1 && std::fwrite(&mask_p, sizeof mask_p, 1, f) == 1 &&
+                  std::fwrite(&ml_ag_ok, sizeof ml_ag_ok, 1, f) == 1 && std::fwrite(&ml_ag_tot, sizeof ml_ag_tot, 1, f) == 1 &&
+                  std::fwrite(&tok, sizeof tok, 1, f) == 1 && std::fwrite(ml_harm.data(), sizeof(double), ml_harm.size(), f) == ml_harm.size() &&
+                  std::fwrite(ml_expo.data(), sizeof(double), ml_expo.size(), f) == ml_expo.size() &&
+                  std::fwrite(ml_lv.data(), 1, ml_lv.size(), f) == ml_lv.size();
+        ok = std::fclose(f) == 0 && ok;
+        if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) std::fprintf(stderr, "ds4: DS4_MASK=learn: %s not written\n", path.c_str());
+    }
+    // the saved table, when its shape and version are this model's (else the start is fresh)
+    bool ml_load() {
+        std::FILE* f = std::fopen(ml_path().c_str(), "rb");
+        if (f == nullptr) return false;
+        char magic[4] = {0, 0, 0, 0};
+        uint32_t ver = 0;
+        int32_t nl = 0, ne = 0;
+        double p = 0.0, ok = 0.0, tot = 0.0;
+        long long tok = 0;
+        bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 &&
+                    ver == 1 && std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == g.nl && ne == g.n_exp &&
+                    std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 && std::fread(&tot, sizeof tot, 1, f) == 1 &&
+                    std::fread(&tok, sizeof tok, 1, f) == 1;
+        good = good && std::fread(ml_harm.data(), sizeof(double), ml_harm.size(), f) == ml_harm.size() &&
+               std::fread(ml_expo.data(), sizeof(double), ml_expo.size(), f) == ml_expo.size() &&
+               std::fread(ml_lv.data(), 1, ml_lv.size(), f) == ml_lv.size();
+        std::fclose(f);
+        if (!good) {
+            std::fprintf(stderr, "ds4: DS4_MASK=learn: %s is not this model's table (version or shape): a fresh start\n", ml_path().c_str());
+            return false;
+        }
+        mask_p = std::min(kMlPMax, std::max(0.0, p));
+        ml_ag_ok = ok;
+        ml_ag_tot = tot;
+        ml_tok = tok;
+        return true;
+    }
+    void ml_init() {
+        const size_t cnt = (size_t) g.nl * (size_t) g.n_exp;
+        ml_harm.assign(cnt, 0.0);
+        ml_expo.assign(cnt, 0.0);
+        ml_lv.assign(cnt, 0);
+        mask_p = kMlP0;
+        ml_ag_ok = ml_ag_tot = 0.0;
+        ml_tok = 0;
+        ml_nrc = 0;
+        ml_dsum = 0.0;
+        ml_dn = 0;
+        const bool loaded = ml_load();
+        ml_relevel();
+        std::fprintf(stderr, "ds4: DS4_MASK=learn: %s, p %.3f (%s)\n", loaded ? "the saved table" : "a fresh table", mask_p, ml_path().c_str());
+    }
+    // the levels of every trunk layer from the scores (the least-used pool by the profile, the lowest rates within it); true when one changed
+    bool ml_relevel() {
+        const int ne = g.n_exp;
+        const int per = (int) std::floor(mask_p * ne + 1e-9);
+        const int pool_n = std::min(ne, 2 * per);
+        bool changed = false;
+        std::vector<double> rate((size_t) ne), pop;
+        std::vector<int> ord((size_t) ne);
+        std::vector<uint8_t> nlv((size_t) ne);
+        for (int il = 0; il < g.nl; ++il) {
+            uint8_t* lv = ml_lv.data() + (size_t) il * ne;
+            const double* hm = ml_harm.data() + (size_t) il * ne;
+            const double* ex = ml_expo.data() + (size_t) il * ne;
+            const uint32_t* pr = prof.data() + (size_t) il * ne;
+            uint64_t sum = 0;
+            for (int e = 0; e < ne; ++e) sum += pr[e];
+            std::fill(nlv.begin(), nlv.end(), 0);
+            if (sum > 0) {   // (no counts for the layer: nothing says which of its experts are unused - none masked, as mask_init)
+                pop.clear();
+                for (int e = 0; e < ne; ++e) {
+                    rate[(size_t) e] = hm[e] / std::max(1.0, ex[e]);
+                    if (ex[e] >= kMlMinExpo) pop.push_back(rate[(size_t) e]);
+                }
+                const bool grad = (int) pop.size() >= kMlMinPop;
+                double p10 = 0.0, med = 0.0;
+                if (grad) {
+                    std::sort(pop.begin(), pop.end());
+                    p10 = pop[pop.size() / 10];
+                    med = pop[pop.size() / 2];
+                }
+                int masked = 0;
+                // the all-ranks masks stay, the lowest rates first, up to the share; above the layer's median one falls back to the rank rule
+                std::vector<int> keep;
+                for (int e = 0; e < ne; ++e)
+                    if (lv[e] == 2) keep.push_back(e);
+                std::stable_sort(keep.begin(), keep.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+                for (int e : keep) {
+                    if (masked >= per) break;
+                    nlv[(size_t) e] = grad && rate[(size_t) e] > med ? 1 : 2;
+                    ++masked;
+                }
+                // the rest: the pool's least-used experts, the lowest rates first (ties: the fewer picks, then the lower id)
+                for (int e = 0; e < ne; ++e) ord[(size_t) e] = e;
+                std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] < pr[b]; });
+                std::vector<int> cand;
+                for (int q = 0; q < pool_n; ++q)
+                    if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
+                std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+                for (int e : cand) {
+                    if (masked >= per) break;
+                    nlv[(size_t) e] = 1;
+                    ++masked;
+                }
+                if (grad)   // graduation: enough exposure and a rate under the 10th percentile, masked at every rank
+                    for (int e = 0; e < ne; ++e)
+                        if (nlv[(size_t) e] == 1 && ex[e] >= kMlMinExpo && rate[(size_t) e] < p10) nlv[(size_t) e] = 2;
+            }
+            for (int e = 0; e < ne; ++e)
+                if (lv[e] != nlv[(size_t) e]) {
+                    lv[e] = nlv[(size_t) e];
+                    changed = true;
+                }
+        }
+        return changed;
+    }
+    // the table to the device (the rows the router reads) and the Monitor's map
+    void ml_upload() {
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        if (cudaMemcpy(d_mask, ml_lv.data(), ml_lv.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "ds4: DS4_MASK=learn: the table not uploaded\n");
+            return;
+        }
+        for (size_t i = 0; i < ml_lv.size(); ++i) mask_host[i] = ml_lv[i] != 0 ? 1 : 0;
+    }
+    // every kMlMaskEvery decode tokens: p follows the re-checks' agreement (>= 98%: up; < 95%: down), then the levels
+    void ml_update() {
+        if (ml_ag_tot >= kMlMinAg) {
+            const double a = ml_ag_ok / ml_ag_tot;
+            if (a >= 0.98) mask_p = std::min(kMlPMax, mask_p + 0.025);
+            else if (a < 0.95) mask_p = std::max(0.0, mask_p - 0.05);
+        }
+        if (ml_relevel()) ml_upload();
+    }
+    // the decode token's end (step(): every learning step): the decays, the mask's moves, the saves
+    void ml_end() {
+        ++ml_tok;
+        if (ml_tok % kMlDecayEvery == 0) {
+            for (double& v : ml_harm) v *= 0.5;
+            for (double& v : ml_expo) v *= 0.5;
+            ml_ag_ok *= 0.5;
+            ml_ag_tot *= 0.5;
+        }
+        if (ml_tok % kMlMaskEvery == 0) ml_update();
+        if (ml_tok % kMlSaveEvery == 0) ml_save();
+    }
+    // the token's list (the first pass's: the exact re-run writes none); the copy is small
+    void ml_events(MaskEvs& ev) {
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        ev = MaskEvs{};
+        if (cudaMemcpy(&ev, d_mev, sizeof ev, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ev.n = 0;
+        }
+    }
+    // exposure: each (layer, expert) the list names, once per token, by w
+    void ml_expose(const MaskEvs& ev, double w) {
+        const unsigned n = std::min<unsigned>(ev.n, (unsigned) kMaskEvCap);
+        for (unsigned i = 0; i < n; ++i) {
+            const MaskEv& a = ev.e[i];
+            if (a.layer < 0 || a.layer >= g.nl || a.expert < 0 || a.expert >= g.n_exp) continue;
+            bool dup = false;
+            for (unsigned j = 0; j < i && !dup; ++j) dup = ev.e[j].layer == a.layer && ev.e[j].expert == a.expert;
+            if (!dup) ml_expo[ml_at(a.layer, a.expert)] += w;
+        }
+    }
+    // a re-checked token: D = KL(exact || first pass) on the head's GPU; its harm split over the list by weight x gap; the agreement; the request's mean
+    void ml_recheck(bool flipped) {
+        Dev& hd = devs[(size_t) head_dev];
+        cudaSetDevice(hd.id);
+        logit_kl(hd.logits, d_logit0, g.vocab, d_kl, hd.st);
+        float D = 0.0f;
+        if (cudaMemcpyAsync(&D, d_kl, sizeof D, cudaMemcpyDeviceToHost, hd.st) != cudaSuccess || cudaStreamSynchronize(hd.st) != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "ds4: DS4_MASK=learn: the re-check's divergence not read\n");
+            return;
+        }
+        MaskEvs ev;
+        ml_events(ev);
+        const unsigned n = std::min<unsigned>(ev.n, (unsigned) kMaskEvCap);
+        double sx = 0.0;
+        for (unsigned i = 0; i < n; ++i) sx += std::max(0.0f, ev.e[i].x);
+        for (unsigned i = 0; i < n; ++i) {
+            const MaskEv& a = ev.e[i];
+            if (sx > 0.0 && a.layer >= 0 && a.layer < g.nl && a.expert >= 0 && a.expert < g.n_exp)
+                ml_harm[ml_at(a.layer, a.expert)] += (double) D * std::max(0.0f, a.x) / sx;
+        }
+        ml_expose(ev, 1.0);
+        ml_ag_tot += 1.0;
+        ml_ag_ok += flipped ? 0.0 : 1.0;
+        ml_dsum += (double) D;
+        ++ml_dn;
+    }
+    // a used token that is not re-checked: every kMlSampleEvery-th one stands for kMlSampleEvery (its list read, its exposure only)
+    void ml_sample() {
+        MaskEvs ev;
+        ml_events(ev);
+        ml_expose(ev, (double) kMlSampleEvery);
+    }
+    // the request's line: the share, the masks, the re-check divergence, the experts with exposure
+    void ml_print() {
+        int m = 0, a = 0;
+        long long scored = 0;
+        for (size_t i = 0; i < ml_lv.size(); ++i) {
+            m += ml_lv[i] != 0;
+            a += ml_lv[i] == 2;
+            scored += ml_expo[i] > 0.0;
+        }
+        const double dm = ml_dn > 0 ? ml_dsum / (double) ml_dn : 0.0;
+        std::fprintf(stderr, "ds4: request: mask learn: p %.3f, %d masked (%d at all ranks), re-check D mean %.4f (%lld), %lld experts scored\n",
+                     mask_p, m, a, dm, ml_dn, scored);
+        ml_dsum = 0.0;
+        ml_dn = 0;
     }
     // the mask and the rule for one trunk layer's router (no mask: the router as it was); the picks moved are counted in d_mask_moved
     RouteMask route_mask_of(const Layer& l) const {
@@ -10785,6 +11104,12 @@ struct Model::Impl {
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
     bool step(int token, bool want_logits, std::string& err) {
         if (!fr_on || !want_logits || d_standin == nullptr) return forward(&token, 1, want_logits ? 1 : 0, err);
+        struct MlEnd {   // (DS4_MASK=learn: the token's end, whichever way the step ends)
+            Impl* m;
+            ~MlEnd() {
+                if (m->mask_learn_on) m->ml_end();
+            }
+        } mle{this};
         if (bal_on && ++bal_toks % kBalRound == 0 && !bal_round(err)) return false;   // (DS4_STANDIN_BALANCE: between tokens)
         const int64_t p0 = pos;
         const double t_step = now_ms();
@@ -10850,6 +11175,7 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(hd.st));
         gap = t2[0] - t2[1];
         if (gap >= fr_k * risk) {
+            if (mask_learn_on && ++ml_nrc % kMlSampleEvery == 0) ml_sample();
             study_quiet();
             return true;
         }
@@ -10861,6 +11187,11 @@ struct Model::Impl {
         if (!lerr.empty()) {
             err = lerr;
             return false;
+        }
+        if (mask_learn_on) {   // DS4_MASK=learn: the first pass's logits, kept before the exact run overwrites them
+            cudaSetDevice(hd.id);
+            CK(cudaMemcpyAsync(d_logit0, hd.logits, sizeof(float) * (size_t) g.vocab, cudaMemcpyDeviceToDevice, hd.st));
+            CK(cudaStreamSynchronize(hd.st));
         }
         pos = p0;   // the same position again, exactly (forward appends the token again)
         toks.resize((size_t) p0);
@@ -10881,6 +11212,7 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(hd.st));
         flipped = (int) t2[2] != before;
         fr_flips += flipped;
+        if (mask_learn_on) ml_recheck(flipped);
         // the re-check study: this token was a close call (and flipped or not)
         ++fr_pc[fr_prev][1];
         fr_pf[fr_prev] += flipped;
@@ -13210,12 +13542,14 @@ struct Model::Impl {
             }
             const RouteMask rmp = route_mask_of(l);   // (DS4_MASK: the trunk layer's mask; none when off)
             const bool lrn = learn_on && T == 1 && !l.mtp && !standin_bypass;   // (DS4_STANDIN_LEARN: the layer's pair table and record)
+            const bool mlv = mask_learn_on && T == 1 && !l.mtp && !standin_bypass;   // (DS4_MASK=learn: this layer's replaced picks)
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
                           // (the flip re-check's exact re-run, standin_bypass, runs without the mask too: 6 Nov review - it was masked)
                           na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr, standin_bypass ? nullptr : &rmp,
                           lrn && !learn_observe ? d_pair_c + (size_t) l.il * g.n_exp * g.n_exp : nullptr, lrn ? d_cap_rec + (size_t) 4 * l.il : nullptr,
-                          lrn && bal_on ? d_pair_err + (size_t) l.il * g.n_exp * g.n_exp : nullptr);   // (stand-ins: decode tokens of the trunk only)
+                          lrn && bal_on ? d_pair_err + (size_t) l.il * g.n_exp * g.n_exp : nullptr,   // (stand-ins: decode tokens of the trunk only)
+                          mlv ? d_mev : nullptr, l.il, l.il == 0);   // (DS4_MASK=learn: the first trunk layer resets the token's list)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;

@@ -549,10 +549,12 @@ __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ 
         for (int r = 0; r < k && c < *n_mc; ++r) {
             const int p = pick[r];
             if (p < 0 || p >= n || rm.m[p] == 0) continue;
-            if (r < rm.floor - 1) continue;
-            if (r == rm.floor - 1) {
-                const float gap = fmaxf(0.0f, logits[p] - logits[mcand[c]]);
-                if (!(rm.edge > 0.0f && gap <= rm.edge)) continue;
+            if (rm.m[p] == 1) {   // (2: masked at every rank - DS4_MASK=learn's graduation - moves at any rank)
+                if (r < rm.floor - 1) continue;
+                if (r == rm.floor - 1) {
+                    const float gap = fmaxf(0.0f, logits[p] - logits[mcand[c]]);
+                    if (!(rm.edge > 0.0f && gap <= rm.edge)) continue;
+                }
             }
             pick[r] = mcand[c++];
             ++mv;
@@ -1652,7 +1654,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             const float* __restrict__ bias_vl, unsigned vl,
                                                             Standin* __restrict__ sti, PcieRoute pc, const RouteMask rm,
                                                             const float* __restrict__ pair_c, int* cap_rec,
-                                                            const float* __restrict__ pair_err) {
+                                                            const float* __restrict__ pair_err, MaskEvs* __restrict__ mev,
+                                                            int mev_layer, bool mev_reset) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1663,6 +1666,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     const int t = blockIdx.x;
     logits += (size_t) t * 1024;
     if (bias_vl != nullptr && ((vl >> t) & 1u)) bias = bias_vl;
+    if (mev != nullptr && mev_reset && threadIdx.x == 0 && t == 0) mev->n = 0u;   // (DS4_MASK=learn: this token's list starts empty)
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float l = logits[i];
         const float sp = l > 20.0f ? l : log1pf(expf(l));
@@ -1761,6 +1765,10 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 const bool ok = r < sti->floor ? gap <= sti->edge : wk[r] * xr <= sti->budget;
                 if (!ok) continue;
                 atomicAdd(&sti->taken[r], 1ull);
+                if (mev != nullptr) {   // DS4_MASK=learn: the replaced pick (orig[r]) and its risk
+                    const unsigned q = atomicAdd(&mev->n, 1u);
+                    if (q < kMaskEvCap) mev->e[q] = MaskEv{mev_layer, orig[r], wk[r] * xr};
+                }
                 pick[r] = cand[c++];
                 if (pair_c != nullptr) csc[r] = pair_c[(size_t) orig[r] * n + pick[r]];
                 if (first_r < 0) first_r = r, first_e = orig[r], first_s = pick[r];
@@ -1771,8 +1779,13 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             // catches the close calls the mask makes (6 Nov review: mask moves were invisible to it)
             for (int r = 0; r < k; ++r)
                 if (orig[r] != premask[r]) {
-                    risk += wk[r] * fmaxf(0.0f, logits[premask[r]] - logits[orig[r]]);
+                    const float mx = wk[r] * fmaxf(0.0f, logits[premask[r]] - logits[orig[r]]);
+                    risk += mx;
                     took = 1;
+                    if (mev != nullptr) {   // DS4_MASK=learn: the masked pick (premask[r]) and its risk
+                        const unsigned q = atomicAdd(&mev->n, 1u);
+                        if (q < kMaskEvCap) mev->e[q] = MaskEv{mev_layer, premask[r], mx};
+                    }
                 }
             if (t < kWin && took) {   // (over the token's layers: the host clears them when a decode token starts)
                 sti->used[t] = 1;
@@ -2352,7 +2365,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
                    unsigned vl, int na0, int na1, int na2, Standin* standin, const PcieRoute* pc, const RouteMask* rmask,
-                   float* pair_c, int* cap_rec, const float* pair_err) {
+                   float* pair_c, int* cap_rec, const float* pair_err, MaskEvs* mev, int mev_layer, bool mev_reset) {
 #if defined(STRATA_METAL)
     // selection only: the prefetch schedule (req) is published by the CUDA kernel, and is turned on separately here
     // (the Metal selection has no DS4_MASK: rmask is for the CUDA kernels only)
@@ -2367,7 +2380,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     static const RouteMask no_mask{};
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
                                            vl != 0 ? bias_vl : nullptr, vl, standin, pc != nullptr ? *pc : no_pcie,
-                                           rmask != nullptr ? *rmask : no_mask, pair_c, cap_rec, pair_err);
+                                           rmask != nullptr ? *rmask : no_mask, pair_c, cap_rec, pair_err, mev, mev_layer, mev_reset);
     if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, na2);
 }
 /// STRATA_STANDIN_LEARN: dst[e] = part[r][e] for the slot r the device's record names (sel[0]; -1: nothing copied), part the per-slot
@@ -2383,6 +2396,64 @@ void standin_capture(const float* part, int dim, const int* sel, float* dst, cud
 }
 void logit_top2(const float* logits, int n, float* out, cudaStream_t s) {
     strata_ds4_launch(logit_top2_kernel, 1, 1024, 0, s, logits, n, out);
+}
+// DS4_MASK=learn: KL(p || q) with p = softmax(e), q = softmax(f): KL = sum p (e - f) - lse(e) + lse(f). One block of 1024 threads reads the row
+// three times (the maxima, then the sums); the sums are double.
+__device__ double logit_kl_block_sum(double v, double* sh) {
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    const double r = sh[0];
+    __syncthreads();
+    return r;
+}
+__global__ void __launch_bounds__(1024) logit_kl_kernel(const float* __restrict__ e, const float* __restrict__ f, int n,
+                                                        float* __restrict__ out) {
+    __shared__ float shf[1024];
+    __shared__ double shd[1024];
+    const int tid = threadIdx.x;
+    float me = -FLT_MAX, mf = -FLT_MAX;
+    for (int i = tid; i < n; i += blockDim.x) {
+        me = fmaxf(me, e[i]);
+        mf = fmaxf(mf, f[i]);
+    }
+    shf[tid] = me;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) shf[tid] = fmaxf(shf[tid], shf[tid + s]);
+        __syncthreads();
+    }
+    me = shf[0];
+    __syncthreads();
+    shf[tid] = mf;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) shf[tid] = fmaxf(shf[tid], shf[tid + s]);
+        __syncthreads();
+    }
+    mf = shf[0];
+    __syncthreads();
+    double se = 0.0, sf = 0.0, st = 0.0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float ei = e[i], fi = f[i];
+        const double a = expf(ei - me), b = expf(fi - mf);
+        se += a;
+        sf += b;
+        st += a * (double) (ei - fi);
+    }
+    se = logit_kl_block_sum(se, shd);
+    sf = logit_kl_block_sum(sf, shd);
+    st = logit_kl_block_sum(st, shd);
+    if (tid == 0) {
+        const double kl = st / se - ((double) me + log(se)) + ((double) mf + log(sf));
+        out[0] = (float) (kl > 0.0 ? kl : 0.0);
+    }
+}
+void logit_kl(const float* exact, const float* first, int n, float* out, cudaStream_t s) {
+    strata_ds4_launch(logit_kl_kernel, 1, 1024, 0, s, exact, first, n, out);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s,
                  const RouteMask* rmask) {

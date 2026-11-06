@@ -107,6 +107,7 @@ struct VlBits {
 /// A masked pick moves by the rule of route_mask_apply: ranks below floor - 1 stay; rank floor - 1 moves only when edge > 0 and the
 /// candidate's logit gap is at most edge (the stand-ins' rank); ranks from floor on always move. The candidate is the best unmasked
 /// expert the token did not pick, by the router's selection score. moved: device counter of the picks moved (null: not counted).
+/// m[e] = 2 (DS4_MASK=learn's graduation): masked at every rank, the floor and the edge rule do not apply to it.
 struct RouteMask {
     const unsigned char* m = nullptr;
     int floor = 3;
@@ -280,6 +281,20 @@ struct Standin {
     int used[kWin];
     float risk[kWin];
 };
+/// DS4_MASK=learn (opt-in): one decode token's replaced picks, written by route_publish (the mask's moves and the stand-ins' swaps): one entry
+/// per replaced pick - its layer, the replaced expert, and its risk (weight x gap, the same term the token's risk takes). n counts every
+/// replaced pick (entries past kMaskEvCap are not kept). The first trunk layer of a token resets n (mev_reset).
+constexpr int kMaskEvCap = 512;
+struct MaskEv {
+    int layer;
+    int expert;
+    float x;
+};
+struct MaskEvs {
+    unsigned n;
+    unsigned pad;
+    MaskEv e[kMaskEvCap];
+};
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
 /// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
@@ -288,7 +303,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    unsigned vl = 0, int na0 = 0, int na1 = 0, int na2 = 0, Standin* standin = nullptr,
                    const PcieRoute* pc = nullptr, const RouteMask* rmask = nullptr,
                    float* pair_c = nullptr, int* cap_rec = nullptr,
-                   const float* pair_err = nullptr);
+                   const float* pair_err = nullptr, MaskEvs* mev = nullptr, int mev_layer = 0, bool mev_reset = false);
 /// DS4_STANDIN_BALANCE (opt-in, with pair_c): pair_err [n][n] (the layer's measured relative error per true expert e and stand-in s, -1 until
 /// the pair is ready). A ready pair's stand-in is exposed by its error: its risk is weight x error, and at ranks from the floor on the budget
 /// is checked against weight x error (the edge rule at floor - 1 keeps the logit gap). Null: the gap, as before.
@@ -312,6 +327,9 @@ void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long
 /// The row's largest and second largest logits and the largest one's id (as a float; ids below 2^24): out[0..2] = v1, v2, id.  One
 /// block (the stand-ins' flip re-check reads it after a decode token).
 void logit_top2(const float* logits, int n, float* out, cudaStream_t s);
+/// DS4_MASK=learn: out[0] = KL(softmax(exact) || softmax(first)) over the row's n logits (one block, double accumulators, log-sum-exp
+/// with the row maxima subtracted; clamped at 0). The flip re-check's divergence between the exact re-run and the first pass.
+void logit_kl(const float* exact, const float* first, int n, float* out, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
 /// A chunk's routed experts as sorted rows: the picks (t, i < k) of T tokens (idx rows kPicks apart) by the virtual
