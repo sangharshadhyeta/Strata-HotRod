@@ -225,3 +225,18 @@ Short prompts, seconds until the first word (10 Oct 2026, before the 0.1.45 merg
   The look-ahead's guesses follow the target layer's mask. Each move adds its weight times the logit gap to the row's row_shift, so
   STRATA_FRAGILE_RECHECK re-decides the close calls the mask makes; the re-check's exact re-run runs unmasked. Unset: nothing runs.
   Request line: `strata serve: mask (STRATA_MASK): <seen> masked picks seen, <moved> moved`. Built, not run.
+
+- **STRATA_STANDIN_LEARN=1 (opt-in, changes the output).** Each stand-in learns a correction for its (layer, true expert, stand-in)
+  pair from the flip re-checks. A cut window keeps the row's first stand-in output y_s (a device copy per layer, gated by the host
+  between windows); the exact successor's row 0 gives the true expert's y_e at the same layer and rank. Per pair, a decayed least
+  squares over the channels (c = num / den, clipped to [0.5, 2], used after 32 samples) scales the stand-in's routing weight in the
+  route-resident kernel. Pairs (LRU 4096 per layer) persist in standin-learn-<fp>.bin beside standin-tune.txt. Needs
+  STRATA_FRAGILE_RECHECK and the whole model on one GPU; otherwise off. Request line: `strata serve: stand-in learn: <n> pairs ready,
+  <s> samples this request, mean |c-1| <v>`. Built, not run.
+
+- **STRATA_STANDIN_BALANCE=1 (opt-in, needs STRATA_STANDIN_LEARN, changes the output).** A ready pair's risk in the re-check is its
+  weight times the logit gap times clip(err / mean err, 0.25, 4), where err = sqrt((ee - 2c num + c^2 den) / ee) and the mean is over the
+  layer's ready pairs. Every 256 committed decode tokens each layer ranks its experts by use x best err / (decayed demand misses + 1).
+  The top decile gets an eviction factor of 4 (kept in the RAM tier), the bottom decile 0.25 (given up first); one step a round, and back
+  to 1 only after two rounds on the other side. The factors scale FileExpertSource's coldest-resident choice and the refill's cold list.
+  Request line: `strata serve: stand-in balance: <r> rounds, <k> experts kept fast, <g> given up`. Built, not run.

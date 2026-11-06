@@ -649,6 +649,10 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// STRATA_STANDIN_BALANCE: demand misses per (layer, expert) in decode windows (sized by the caller; empty = off), and the eviction
+    /// factor per (layer, expert) that the balance sets (1 = as is, >1 kept, <1 given up first; FileExpertSource::set_keep_bias).
+    std::vector<float> miss;
+    std::vector<float> keep_bias;
     /// The adaptive tier's evictions reach the device's table before the next window, not when the round's copies
     /// land: until then doorbell_publish_res can skip a layer's activation while the pool computes an evicted expert
     /// from the one published before.  The driver sets it where the tier does not wait for its copies
@@ -818,6 +822,9 @@ public:
     /// `usage` (the adaptive tier's; may be empty) is read by the io workers as a heuristic (racy reads, acceptable: it only
     /// decides whether to read ahead); set it only after its last assign.  Off: nothing.
     void set_lookahead_promote(bool on, const std::vector<float>* usage);
+    /// STRATA_STANDIN_BALANCE: the per-(layer, expert) eviction factors (flat, as usage; null: none).  The coldest RAM-held expert of a layer is
+    /// the one with the least usage x factor.  Serve thread only, set once; the vector's contents may change between windows.
+    void set_keep_bias(const std::vector<float>* bias) { keep_bias_ = bias; }
     bool lookahead_promote() const { return promo_on_.load(std::memory_order_acquire); }
     /// Serve thread, between windows, with no adaptive round in flight and nothing staged.  `busy` is indexed layer *
     /// n_expert + expert (true: on a GPU).  Returns the number of experts published.  Every queued entry is consumed.
@@ -1365,6 +1372,7 @@ private:
     std::atomic<int64_t> conv_fill_queued_{0}, conv_fill_done_{0};   ///< candidates handed in / promoted into a place (queued for publish)
     std::atomic<bool> promo_on_{false};
     std::atomic<const std::vector<float>*> promo_usage_{nullptr};
+    const std::vector<float>* keep_bias_ = nullptr;   ///< STRATA_STANDIN_BALANCE: the eviction factors (null: none)
     mutable std::mutex promo_mu_;
     std::deque<Promo> promo_q_;                  ///< written into a place, not yet published (publish_promotions takes them all)
     std::vector<char> promo_busy_;               ///< per (layer, expert): queued or being read (cleared when published / dropped)

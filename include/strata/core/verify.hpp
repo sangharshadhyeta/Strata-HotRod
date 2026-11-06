@@ -273,8 +273,15 @@ public:
     void standin_learn_cut(int row);
     void standin_learn_settle(bool exact_ok);
     std::string standin_learn_report();
+    /// STRATA_STANDIN_BALANCE=1 (opt-in; needs STRATA_STANDIN_LEARN): the stand-ins' risk per pair and the per-expert keep / give-up decision.
+    /// standin_balance_on(): the switch.  standin_balance_commit(n, use, miss, keep): n committed decode tokens; every 256 of them one round:
+    /// per layer, experts ranked by use x best err / (decayed demand misses + 1); the top decile gets factor 4 (kept), the bottom decile 0.25
+    /// (given up first), one step a round, back to 1 only after 2 rounds on the other side.  Writes keep (flat [layers][512]).  True when a round ran.
+    static bool standin_balance_on();
+    bool standin_balance_commit(int n_tok, const std::vector<float>& use, const std::vector<float>& miss, std::vector<float>& keep);
 private:
     void standin_learn_fill_table();
+    void standin_learn_pe_layer(int64_t l);
     void standin_learn_begin_window(bool decode, bool exact);
 public:
     /// STRATA_LA_LEARN unset (auto): the serve start reports whether a learned predictor file exists, before init allocates
@@ -757,6 +764,7 @@ private:
     float* lrn_ys_ = nullptr;          ///< device [T][N]: the cut window's stand-in down output per row (y_s)
     float* lrn_ye_ = nullptr;          ///< device [N]: the exact re-run's true-expert down output (y_e) at the pending layer
     int32_t* lrn_gate_ = nullptr;      ///< device [4]: mode (0 off, 1 capture y_s, 2 capture y_e), layer, rank
+    float* lrn_pe_ = nullptr;          ///< device [n_layers][512][512] (STRATA_STANDIN_BALANCE): the risk factor per pair (1 until ready)
     struct StandinLearnState;
     std::shared_ptr<StandinLearnState> lrn_st_;   ///< host: the pairs, the pending sample, this request's counts (verify.cpp)
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself

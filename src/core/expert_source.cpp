@@ -4777,7 +4777,8 @@ int64_t FileExpertSource::coldest_resident_expert(int64_t layer, const std::vect
         bool staged_in = false;
         for (const Exchange& x : staged_) staged_in = staged_in || x.in == i;
         if (staged_in) continue;
-        const float u = i < usage.size() ? usage[i] : 0.0f;
+        float u = i < usage.size() ? usage[i] : 0.0f;
+        if (keep_bias_ != nullptr && i < keep_bias_->size()) u *= (*keep_bias_)[i];   // STRATA_STANDIN_BALANCE: the eviction factor
         if (best < 0 || u < best_u) {
             best = e;
             best_u = u;
@@ -5054,7 +5055,7 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
                 if (!override_.empty() && override_[j] != nullptr) continue;
                 if (promo_flag_[j].load(std::memory_order_relaxed) != 0) continue;
                 if (j >= usage.size() || usage[j] >= 1.0f) continue;
-                cold.emplace_back(usage[j], e);
+                cold.emplace_back(keep_bias_ != nullptr && j < keep_bias_->size() ? usage[j] * (*keep_bias_)[j] : usage[j], e);
             }
             std::sort(cold.begin(), cold.end());
             int left = std::min(starved, 4);
@@ -6033,7 +6034,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
-                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
+                    !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) {
+                    ++nmiss;
+                    if (!d.miss.empty() && n_tok <= 8) d.miss[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] += 1.0f;   // STRATA_STANDIN_BALANCE
+                }
             }
         }
         // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes

@@ -6901,6 +6901,11 @@ int main(int argc, char** argv) {
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
     drive.d.src = srcp;
+    if (strata::core::Verifier::standin_balance_on()) {   // STRATA_STANDIN_BALANCE: the decode misses per expert and the eviction factors
+        drive.d.miss.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        drive.d.keep_bias.assign((size_t) (g.n_layers * g.n_expert), 1.0f);
+        if (auto* fsrc = dynamic_cast<strata::core::FileExpertSource*>(srcp)) fsrc->set_keep_bias(&drive.d.keep_bias);
+    }
     drive.d.n_expert = g.n_expert;
     drive.d.n_layers = g.n_layers;
     drive.d.jobs.resize((size_t) K);
@@ -16097,6 +16102,9 @@ int main(int argc, char** argv) {
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (fr_cut >= 1) a = std::min(a, fr_cut - 1);   // STRATA_FRAGILE_RECHECK: rows fr_cut.. are re-decided, not kept
+                // STRATA_STANDIN_BALANCE: the committed decode tokens count toward the round (every 256; one round per count)
+                if (!merged && strata::core::Verifier::standin_balance_on())
+                    ver.standin_balance_commit(a + 1, drive.d.usage, drive.d.miss, drive.d.keep_bias);
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)

@@ -1083,6 +1083,11 @@ namespace {
 constexpr int kLrnPerLayer = 4096, kLrnReady = 32;
 constexpr double kLrnDecay = 0.98;
 constexpr uint32_t kLrnMagic = 0x4C535453u;   // "STSL"
+bool standin_balance_env() {
+    const char* e = std::getenv("STRATA_STANDIN_BALANCE");
+    return e != nullptr && std::atoi(e) != 0;
+}
+constexpr int kLrnBalRound = 256;
 bool standin_learn_env() {
     const char* e = std::getenv("STRATA_STANDIN_LEARN");
     return e != nullptr && std::atoi(e) != 0;
@@ -1108,7 +1113,112 @@ struct Verifier::StandinLearnState {
     bool table_ready = false;    // the device table holds the pairs' scales (filled at the first decode window)
     int64_t dim = 0, layers = 0;
     long long samples_req = 0;   // this request's samples (the stats line takes them)
+    // STRATA_STANDIN_BALANCE
+    bool bal_on = false;
+    std::vector<int8_t> bal_state;     // [layers][512]: -1 given up first, 0 as it was, +1 kept
+    std::vector<uint8_t> bal_opp;      // [layers][512]: rounds on the other side of the current state
+    std::vector<float> miss_dec, miss_last;   // [layers][512]: decayed demand misses; the counts at the last round
+    int tok_since = 0;                 // committed decode tokens since the last round
+    long long bal_rounds = 0;
 };
+
+// The risk factor of the layer's ready pairs: err = sqrt((ee - 2c num + c^2 den) / ee), factor = clip(err / mean err, 0.25, 4); 1 otherwise.
+void Verifier::standin_learn_pe_layer(int64_t l) {
+    StandinLearnState& st = *lrn_st_;
+    std::vector<float> host((size_t) 512 * 512, 1.0f);
+    std::vector<std::pair<int64_t, double>> errs;
+    double sum = 0.0;
+    for (const auto& kv : st.pairs) {
+        if ((int64_t) (kv.first >> 40) != l) continue;
+        const StandinLearnState::Pair& p = kv.second;
+        if (p.n < kLrnReady || !(p.ee > 0.0)) continue;
+        const double c = p.c;
+        double e2 = (p.ee - 2.0 * c * p.num + c * c * p.den) / p.ee;
+        if (!(e2 > 0.0)) e2 = 0.0;
+        const double err = std::sqrt(e2);
+        const int64_t e = (int64_t) ((kv.first >> 20) & 0xFFFFFu), s = (int64_t) (kv.first & 0xFFFFFu);
+        errs.emplace_back(e * 512 + s, err);
+        sum += err;
+    }
+    if (!errs.empty() && sum > 0.0) {
+        const double mean = sum / (double) errs.size();
+        for (const auto& x : errs) host[(size_t) x.first] = (float) std::min(4.0, std::max(0.25, x.second / mean));
+    }
+    const OnDevice on(device_);
+    if (cudaMemcpy(lrn_pe_ + (size_t) l * 512 * 512, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
+        (void) cudaGetLastError();
+}
+
+bool Verifier::standin_balance_on() { return standin_balance_env() && standin_learn_env(); }
+
+// One round every kLrnBalRound committed decode tokens.  Value = use x the best err of the expert's ready pairs; cost = its decayed misses
+// + 1 (the read cost is one number per layer, so it does not change the ranking inside a layer).  Layers with fewer than 10 ranked experts
+// make no decision.  Top decile desires +1, bottom decile -1; a state moves one step a round, and leaves +1 / -1 for 0 only after 2 rounds
+// on the other side.  Experts outside the ranking keep their state.
+bool Verifier::standin_balance_commit(int n_tok, const std::vector<float>& use, const std::vector<float>& miss, std::vector<float>& keep) {
+    if (lrn_st_ == nullptr || !lrn_st_->bal_on || lrn_pe_ == nullptr || n_tok < 1) return false;
+    StandinLearnState& st = *lrn_st_;
+    st.tok_since += n_tok;
+    if (st.tok_since < kLrnBalRound) return false;
+    st.tok_since = 0;
+    const int64_t nl = st.layers, cnt = nl * 512;
+    if ((int64_t) use.size() < cnt || (int64_t) miss.size() < cnt) return false;
+    if ((int64_t) st.bal_state.size() != cnt) {
+        st.bal_state.assign((size_t) cnt, 0);
+        st.bal_opp.assign((size_t) cnt, 0);
+        st.miss_dec.assign((size_t) cnt, 0.0f);
+        st.miss_last.assign((size_t) cnt, 0.0f);
+    }
+    std::vector<double> best((size_t) cnt, -1.0);
+    for (const auto& kv : st.pairs) {
+        const StandinLearnState::Pair& p = kv.second;
+        if (p.n < kLrnReady || !(p.ee > 0.0)) continue;
+        const double c = p.c;
+        double e2 = (p.ee - 2.0 * c * p.num + c * c * p.den) / p.ee;
+        if (!(e2 > 0.0)) e2 = 0.0;
+        const double err = std::sqrt(e2);
+        const int64_t i = (int64_t) (kv.first >> 40) * 512 + (int64_t) ((kv.first >> 20) & 0xFFFFFu);
+        if (i < cnt && (best[(size_t) i] < 0.0 || err < best[(size_t) i])) best[(size_t) i] = err;
+    }
+    for (int64_t i = 0; i < cnt; ++i) {
+        const float dm = miss[(size_t) i] - st.miss_last[(size_t) i];
+        st.miss_dec[(size_t) i] = 0.5f * st.miss_dec[(size_t) i] + std::max(0.0f, dm);
+        st.miss_last[(size_t) i] = miss[(size_t) i];
+    }
+    keep.assign((size_t) cnt, 1.0f);
+    for (int64_t l = 0; l < nl; ++l) {
+        std::vector<std::pair<double, int>> rk;
+        for (int e = 0; e < 512; ++e) {
+            const int64_t i = l * 512 + e;
+            if (best[(size_t) i] < 0.0 || !(use[(size_t) i] > 0.0f)) continue;
+            const double value = (double) use[(size_t) i] * best[(size_t) i];
+            rk.emplace_back(value / ((double) st.miss_dec[(size_t) i] + 1.0), e);
+        }
+        if (rk.size() >= 10) {
+            std::sort(rk.begin(), rk.end(), [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            const size_t k = std::max<size_t>(1, rk.size() / 10);
+            for (size_t pos = 0; pos < rk.size(); ++pos) {
+                const int d = pos < k ? 1 : pos + k >= rk.size() ? -1 : 0;
+                const size_t i = (size_t) l * 512 + (size_t) rk[pos].second;
+                int8_t& s = st.bal_state[i];
+                uint8_t& op = st.bal_opp[i];
+                if (d == 0 || d == s) op = 0;
+                else if (s == 0) { s = (int8_t) d; op = 0; }
+                else if (++op >= 2) { s = 0; op = 0; }   // the opposite side for 2 rounds: back to 0
+            }
+        }
+    }
+    for (int64_t i = 0; i < cnt; ++i) {
+        const int8_t s = st.bal_state[(size_t) i];
+        keep[(size_t) i] = s > 0 ? 4.0f : s < 0 ? 0.25f : 1.0f;
+    }
+    ++st.bal_rounds;
+    return true;
+}
+
+
 
 // Sets the device table from the host pairs: 1 everywhere, the ready pairs' c.  Called once the table exists (the first decode window).
 void Verifier::standin_learn_fill_table() {
@@ -1123,6 +1233,8 @@ void Verifier::standin_learn_fill_table() {
     const OnDevice on(device_);
     if (cudaMemcpy(lrn_c_, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
     st.table_ready = true;
+    if (st.bal_on && lrn_pe_ != nullptr)
+        for (int64_t l = 0; l < nl; ++l) standin_learn_pe_layer(l);
 }
 
 bool Verifier::standin_learn_active() const { return lrn_st_ != nullptr && lrn_gate_ != nullptr; }
@@ -1237,6 +1349,7 @@ void Verifier::standin_learn_settle(bool exact_ok) {
             }
         }
     }
+    if (st.bal_on && lrn_pe_ != nullptr) standin_learn_pe_layer(l);
 }
 
 // The pairs kept across runs: "STSL", layers, experts, count (u32 each), then per pair key (u64), num, den, ee (f64), n (u32), c (f32).
@@ -1313,7 +1426,18 @@ std::string Verifier::standin_learn_report() {
     std::snprintf(buf, sizeof buf, "strata serve: stand-in learn: %d pairs ready, %lld samples this request, mean |c-1| %.4f\n", ready,
                   st.samples_req, ready > 0 ? dev / ready : 0.0);
     st.samples_req = 0;
-    return buf;
+    std::string out = buf;
+    if (st.bal_on) {
+        int kept = 0, soft = 0;
+        for (const int8_t s : st.bal_state) {
+            if (s > 0) ++kept;
+            else if (s < 0) ++soft;
+        }
+        char b2[160];
+        std::snprintf(b2, sizeof b2, "strata serve: stand-in balance: %lld rounds, %d experts kept fast, %d given up\n", st.bal_rounds, kept, soft);
+        out += b2;
+    }
+    return out;
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -1566,11 +1690,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         lrn_ys_ = b.take<float>(lrn_on ? T * N : 0);
         lrn_ye_ = b.take<float>(lrn_on ? N : 0);
         lrn_gate_ = b.take<int32_t>(lrn_on ? 4 : 0);
+        lrn_pe_ = b.take<float>(lrn_on && standin_balance_env() ? (uint64_t) g.n_layers * 512 * 512 : 0);
+        if (!(lrn_on && standin_balance_env())) lrn_pe_ = nullptr;
         if (!lrn_on) { lrn_c_ = nullptr; lrn_rec_ = nullptr; lrn_ys_ = nullptr; lrn_ye_ = nullptr; lrn_gate_ = nullptr; }
         if (lrn_on) {
             lrn_st_ = std::make_shared<StandinLearnState>();
             lrn_st_->dim = (int64_t) N;
             lrn_st_->layers = g.n_layers;
+            lrn_st_->bal_on = standin_balance_env();
         } else {
             lrn_st_.reset();
         }
@@ -2913,7 +3040,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       rr_stats_ != nullptr ? rr_stats_ + 9 : nullptr,   // STRATA_ROUTE_BUDGET counters [9..11], STRATA_ROUTE_BUDGET_TAIL [12..13]
                                       n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr,   // STRATA_FRAGILE_RECHECK: this group's rows
                                       lrn_c_ != nullptr ? lrn_c_ + (size_t) l * 512 * 512 : nullptr,   // STRATA_STANDIN_LEARN: the layer's corrections
-                                      lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr, (int) l);
+                                      lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr, (int) l,
+                                      lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (!stage_mark(cs, kStRouter, err)) return false;

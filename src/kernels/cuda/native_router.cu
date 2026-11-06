@@ -390,7 +390,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap, float cheap_margin,
                                  int cheap_rank0, int cheap_anytier, unsigned long long* __restrict__ bstats,
                                  float* __restrict__ row_shift, const float* __restrict__ pair_c,
-                                 int32_t* __restrict__ lrn_rec, int layer) {
+                                 int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -561,7 +561,9 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             if (lane == 0 && brank && bstats != nullptr && r < 3) atomicAdd(bstats + r, 1ull);   // budget replacements per rank 0-2
             // STRATA_FRAGILE_RECHECK: how far this row's picks moved (any rule): the replaced pick's router weight times its score gap to
             // the stand-in (the quantity the budget test uses), summed over the layers and the picks of the row (read by the host)
-            if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f));
+            // STRATA_STANDIN_BALANCE (pair_pe, opt-in): a ready pair's risk is scaled by its relative error (clip 0.25-4; 1 until ready)
+            const float pf = pair_pe != nullptr ? pair_pe[(size_t) orig[r] * 512 + bi] : 1.0f;
+            if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf);
             my[r] = bi;
             sub_s[r] = bi;
             ++swaps;
@@ -745,7 +747,7 @@ void mtp_zc_mark(const int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* 
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift,
-                           const float* pair_c, int32_t* lrn_rec, int layer) {
+                           const float* pair_c, int32_t* lrn_rec, int layer, const float* pair_pe) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     // STRATA_ROUTE_RAM_FLOOR's safety: the stand-in for a rank 0-1 pick must be within STRATA_ROUTE_RAM_FLOOR_MARGIN logits (default 1,
     // the margin SPEC E1 found sound for rank 1), and rank 0 is replaced only with STRATA_ROUTE_RAM_FLOOR_RANK0=1 (off: it leaked
@@ -758,7 +760,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
         n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier, bstats, row_shift,
-        pair_c, lrn_rec, layer);
+        pair_c, lrn_rec, layer, pair_pe);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
