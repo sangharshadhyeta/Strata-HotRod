@@ -319,6 +319,12 @@ class MockEngine:
 
 class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
+    restarts = True        # the engine is gone, so the next request starts it again; False for an error raised while the engine is left running (#3961)
+
+
+def died_note(e: Exception) -> str:
+    """What an API error says about an EngineDied: the cause, and that the next request restarts the engine - only where it really is ended."""
+    return f"{e}; the next request restarts it" if getattr(e, "restarts", True) else str(e)
 
 
 class EngineStarting(RuntimeError):
@@ -5479,8 +5485,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         print("[strata] a request ended without an answer and without a finish reason; it is answered as an error", flush=True)
         # the engine is ended so "the next request restarts it" is true - but only that engine process, and only while nobody is on it (the turn is taken
         # without waiting): this runs after the run released its turn, and a request admitted since must not be killed by it
-        svc.end_engine_if_unchanged(born)
-        raise EngineDied("the engine ended the request without an answer")
+        ended = svc.end_engine_if_unchanged(born)
+        lost = EngineDied("the engine ended the request without an answer")
+        lost.restarts = bool(ended)                 # "the next request restarts it" only where the engine really was ended (not with batch slots, replicas, another request on it)
+        raise lost
 
 
 def _is_json(text: str) -> bool:
@@ -6289,7 +6297,7 @@ def make_handler(svc: Service):
                                   "message": f"the request is malformed ({type(e).__name__}: {e})"}}
                 self._json(400, responses_error_body(body["error"]["message"]) if path == "/v1/responses" else body)
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                self._json(503, {"error": {"type": "server_error", "message": died_note(e)}})
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
@@ -6633,7 +6641,7 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                err = {"error": {"type": "server_error", "message": died_note(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
@@ -6705,7 +6713,7 @@ def make_handler(svc: Service):
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
                 except EngineDied as e:
-                    return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
+                    return self._json(503, responses_error_body(died_note(e), "server_error",
                                                                 code="server_error"))
                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
@@ -6738,7 +6746,7 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
-                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+                self._responses_failed(asm, died_note(e), "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -6869,7 +6877,7 @@ def make_handler(svc: Service):
                 cancel.set()
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                err = {"type": "error", "error": {"type": "api_error", "message": died_note(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
