@@ -997,6 +997,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        {   // DS4_PROF in serve mode (6 Nov: the one-shot run printed it, serving did not): this request's decode tokens, by stage
+            static double pm_prev[6] = {0, 0, 0, 0, 0, 0};
+            static double pt_prev = 0;
+            const double pt = (double) s.prof_tokens - pt_prev;
+            if (pt > 0) {
+                double v[6], sum = 0;
+                for (int i = 0; i < 6; ++i) {
+                    v[i] = (s.prof_ms[i] - pm_prev[i]) / pt;
+                    sum += v[i];
+                    pm_prev[i] = s.prof_ms[i];
+                }
+                pt_prev = (double) s.prof_tokens;
+                std::fprintf(stderr, "maya ds4 serve: GPU per token (DS4_PROF, %.0f tokens): %.2f ms - between layers %.2f, attention %.2f, "
+                                     "routing + shared expert %.2f, experts gate/up %.2f, waiting for the CPU lane %.2f, down + post %.2f\n",
+                             pt, sum, v[0], v[1], v[2], v[3], v[4], v[5]);
+            }
+        }
         m.request_end();
         m.save_profile();
     }
