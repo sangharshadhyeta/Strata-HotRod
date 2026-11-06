@@ -10406,8 +10406,55 @@ struct Model::Impl {
         learn_count.assign((size_t) nl, 0);
         learn_lane.store(true, std::memory_order_release);
         learn_on = true;
-        std::fprintf(stderr, "ds4: stand-ins: learn on (each stand-in's weight scaled by its pair's learned correction; table %.0f MB)\n",
-                     (double) tab / 1048576.0);
+        const size_t got = learn_load(one);
+        if (got > 0 && cudaMemcpy(d_pair_c, one.data(), tab, cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+        std::fprintf(stderr, "ds4: stand-ins: learn on (each stand-in's weight scaled by its pair's learned correction; table %.0f MB; "
+                             "%zu pairs loaded from %s)\n", (double) tab / 1048576.0, got, learn_path().c_str());
+    }
+    // the learned pairs kept across runs (6 Nov: ~180 re-checks in 2,000 tokens - a pair needs 32 samples, so a fresh engine every run
+    // would never get there): the pack's standin-learn.bin, written with the profile after each request
+    std::string learn_path() const { return o.pack + "/standin-learn.bin"; }
+    static constexpr uint32_t kLearnMagic = 0x4C534434u;   // "4DSL"
+    // fills learn_pairs / learn_count from the file and the ready pairs' corrections into c ([nl][n][n]); returns the pairs read
+    size_t learn_load(std::vector<float>& c) {
+        std::FILE* f = std::fopen(learn_path().c_str(), "rb");
+        if (f == nullptr) return 0;
+        uint32_t hd[4] = {0, 0, 0, 0};
+        size_t got = 0;
+        const int nl = g.nl, n = g.n_exp;
+        if (std::fread(hd, 4, 4, f) == 4 && hd[0] == kLearnMagic && (int) hd[1] == nl && (int) hd[2] == n) {
+            for (uint32_t i = 0; i < hd[3]; ++i) {
+                uint64_t key = 0;
+                LearnPair p;
+                if (std::fread(&key, 8, 1, f) != 1 || std::fread(&p.num, 8, 1, f) != 1 || std::fread(&p.den, 8, 1, f) != 1 ||
+                    std::fread(&p.ee, 8, 1, f) != 1 || std::fread(&p.n, 4, 1, f) != 1 || std::fread(&p.c, 4, 1, f) != 1)
+                    break;
+                const int il = (int) (key >> 40), e = (int) ((key >> 20) & 0xFFFFFu), s = (int) (key & 0xFFFFFu);
+                if (il >= nl || e >= n || s >= n || learn_count[(size_t) il] >= kLearnPerLayer || !std::isfinite(p.c)) continue;
+                p.used = ++learn_tick;
+                learn_pairs[key] = p;
+                ++learn_count[(size_t) il];
+                if (p.n >= kLearnReady) c[((size_t) il * n + e) * n + s] = p.c;
+                ++got;
+            }
+        }
+        std::fclose(f);
+        return got;
+    }
+    void learn_save() const {
+        if (!learn_on || learn_pairs.empty()) return;
+        const std::string path = learn_path(), tmp = path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (f == nullptr) return;
+        const uint32_t hd[4] = {kLearnMagic, (uint32_t) g.nl, (uint32_t) g.n_exp, (uint32_t) learn_pairs.size()};
+        bool ok = std::fwrite(hd, 4, 4, f) == 4;
+        for (const auto& kv : learn_pairs) {
+            const LearnPair& p = kv.second;
+            ok = ok && std::fwrite(&kv.first, 8, 1, f) == 1 && std::fwrite(&p.num, 8, 1, f) == 1 && std::fwrite(&p.den, 8, 1, f) == 1 &&
+                 std::fwrite(&p.ee, 8, 1, f) == 1 && std::fwrite(&p.n, 4, 1, f) == 1 && std::fwrite(&p.c, 4, 1, f) == 1;
+        }
+        std::fclose(f);
+        if (!ok || !os::replace_file(tmp, path)) std::remove(tmp.c_str());
     }
     void learn_free() {
         if (devs.empty() || L.empty()) return;
@@ -13427,6 +13474,7 @@ struct Model::Impl {
     }
 
     void save_profile() const {
+        learn_save();   // (DS4_STANDIN_LEARN: the learned pairs, with the profile after each request)
         if (o.profile.empty() || o.profile_readonly) return;   // (--profile-readonly: a test keeps the file it read)
         const std::string tmp = o.profile + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
