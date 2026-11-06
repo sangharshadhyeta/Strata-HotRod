@@ -298,7 +298,7 @@ private:
     int low_max_ = 0, low_inflight_ = 0;   // DS4_IO_GUESS_MAX (0: no cap) and the guess jobs on the drive now (both under mu_)
     // the auto cap (under mu_): 64 demand reads' queue wait per look; held_ = the cap held a guess back since the last look
     bool auto_ = false, held_ = false;
-    int low_cap_hi_ = 24, aw_n_ = 0, moves_ = 0;
+    int low_cap_hi_ = 24, aw_n_ = 0, moves_ = 0, vote_last_ = 0, vote_run_ = 0;   // (vote_*: the looks in a row that agree)
     double aw_us_ = 0.0;
     std::chrono::steady_clock::time_point said_{};   // the last cap line (0: none yet)
     void auto_demand(const Job& j) {
@@ -308,8 +308,16 @@ private:
         const int was = low_max_;
         // a dead band between the two: down above 0.3 ms, up only below 0.15 ms (6 Nov: with one threshold it hopped 6 <-> 9 at every
         // look, 459 times in 4 minutes)
-        if (mean > 300.0) low_max_ = std::max(3, low_max_ - 3);                            // demand reads wait: one guessed expert less
-        else if (mean < 150.0 && held_) low_max_ = std::min(low_cap_hi_, low_max_ + 3);    // they hardly do, and guesses wait: one more
+        // ... and a move only after 3 looks in a row agree (6 Nov, live: still 104-119 moves in 30 s between 3 and 6 - every look's noise
+        // moved the cap; a look is 64 demand reads, so 3 agreeing looks is ~190 reads of evidence)
+        const int vote = mean > 300.0 ? -1 : (mean < 150.0 && held_) ? 1 : 0;
+        vote_run_ = vote != 0 && vote == vote_last_ ? vote_run_ + 1 : (vote != 0 ? 1 : 0);
+        vote_last_ = vote;
+        if (vote_run_ >= 3) {
+            if (vote < 0) low_max_ = std::max(3, low_max_ - 3);                          // demand reads wait: one guessed expert less
+            else low_max_ = std::min(low_cap_hi_, low_max_ + 3);                         // they hardly do, and guesses wait: one more
+            vote_run_ = 0;
+        }
         aw_us_ = 0.0;
         aw_n_ = 0;
         held_ = false;
