@@ -103,8 +103,18 @@ constexpr int kVlRows = 8192;
 struct VlBits {
     uint32_t w[kVlRows / 32];
 };
+/// DS4_MASK (opt-in): one trunk layer's router logit mask. m: device [n_exp] bytes, 1 = masked (null: no mask, the router as it was).
+/// A masked pick moves by the rule of route_mask_apply: ranks below floor - 1 stay; rank floor - 1 moves only when edge > 0 and the
+/// candidate's logit gap is at most edge (the stand-ins' rank); ranks from floor on always move. The candidate is the best unmasked
+/// expert the token did not pick, by the router's selection score. moved: device counter of the picks moved (null: not counted).
+struct RouteMask {
+    const unsigned char* m = nullptr;
+    int floor = 3;
+    float edge = 1.0f;
+    unsigned long long* moved = nullptr;
+};
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
-           cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr);
+           cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr, const RouteMask* rmask = nullptr);
 
 /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
@@ -276,14 +286,16 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
                    unsigned vl = 0, int na0 = 0, int na1 = 0, int na2 = 0, Standin* standin = nullptr,
-                   const PcieRoute* pc = nullptr);
+                   const PcieRoute* pc = nullptr, const RouteMask* rmask = nullptr);
 /// DS4_PCIE_BALANCE's device wait: returns at once when *need is 0; else spins until *seq_ptr == seq (the copy's flag), and writes the cycles it spun
 /// to *wait_cyc (device). Enqueued after route_publish on the stream, before the expert kernels.
 void wait_pcie(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc, int* err, long long max_cyc,
                cudaStream_t s);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
-void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+/// (rmask: the target layer's DS4_MASK, applied to the guesses by the same rule as the router's picks; null: none.)
+void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s,
+                 const RouteMask* rmask = nullptr);
 /// The RAM store's picks for the device (a decode token's k plan pointers): those the VRAM table left at 0 whose expert zc_tab has (the
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,

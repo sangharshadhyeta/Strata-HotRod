@@ -149,6 +149,25 @@ governs them. Untested until measured.
 
 **DS4_STORE_PROTECT=1 (opt-in, untested):** the RAM store does not give up an expert that a guess says is about to be used. Why: measured 6 Nov, `DS4_STORE_EARLY=4` lost 11% and raised the ring's "not in the store" count (80K to 89K). The new guess reads evicted experts the next layers were about to use. `take_slot` gave up the lowest-score slot, and a `prefetch` of an expert already in the store did not refresh it, so an expert guessed for the very next layer could be the oldest and go to a guess four layers out. With the flag, `ahead_ask` gives each guessed expert the position it is for (`store->want`; the token count times the layers plus the layer; `set_pos` once per layer request on the serve thread), and `take_slot` skips a slot whose want is at or past the current position: a guess read is then dropped (`protect drop`), a demand read takes a wanted slot only when nothing else can be evicted (`protect forced`). The ring's request line adds ` protect drop <n> forced <n>`. Unset: as before. Untested until measured.
 
+## DS4_MASK (opt-in, untested)
+
+Why: measured 6 Nov, a decode token is about 70% the GPU waiting for the CPU lane, and about two thirds of the lane's time is waiting for
+the RAM store's reads: 8-33 misses a token, about 3.6 ms each (one ~10 MB expert at 2.8 GB/s). Experts the router never picks are never read.
+
+How (opt-in, `DS4_MASK=<fraction>`, e.g. 0.25; unset or 0 leaves the engine as it was): at start, per trunk layer, the fraction of experts
+with the fewest picks in the profile are masked (`mask_init`; the profile is the `prof` counts loaded from the pack's profile file, uint32 hits
+at `prof[layer * n_exp + expert]`; a layer with no counts is not masked, and with no counts at all the engine says so and runs unmasked). The masks
+are one device block on the trunk's GPU (a single-GPU trunk only, as the stand-ins). The router's top-k is taken on the unmasked scores as now,
+then a masked pick moves by the stand-ins' ranks (`STRATA_ROUTE_RESIDENT_RANKS`, default 3, and `STRATA_ROUTE_RESIDENT_EDGE`, default 1.0):
+ranks below floor - 1 stay; rank floor - 1 moves only when the edge is above 0 and the candidate's logit gap is within it; ranks from the
+floor on always move. The candidate is the best unmasked expert the token did not pick. The rule is `route_mask_apply`, used by
+`route_publish_kernel` (decode), `route_kernel` (the prompt path's router), and `route_ahead_kernel` (the guesses for a later layer, under that
+layer's mask). The learner's labels are the router's raw logits and are not changed (no CUDA call is added on the token path). The
+Metal selection and dispatch do not apply the mask. Start-up line: `ds4: DS4_MASK=0.25: per layer the N least-picked experts masked (...),
+M of the T masked on the card`. Request end: `ds4: request: mask: p=0.25 F 3 E 1.00, <n> picks moved to the next unmasked expert` (cumulative).
+
+State: untested until measured.
+
 ## Measured 6 Nov (vision server, 262K, the three calibration questions; answers read by hand, all correct)
 
 The ring opt-ins above, after the auto read-ahead cap became the default. Single runs first, then 3 alternated rounds of every arm

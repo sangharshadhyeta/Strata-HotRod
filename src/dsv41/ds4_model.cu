@@ -751,6 +751,7 @@ struct Layer {
     uint8_t* ring_bak = nullptr;
     float *c_snap = nullptr, *c_rows = nullptr;
     unsigned long long* vram_tab = nullptr;     // device [n_exp]
+    unsigned char* route_mask = nullptr;        // DS4_MASK: device [n_exp], 1 = masked (trunk layers, when on; else null)
     std::vector<uint8_t> zc;                    // (the RAM store) expert -> 1: its store slot is GPU-visible, the device computes it over PCIe
     unsigned long long* zc_tab = nullptr;       // device [n_exp]: those slots' device addresses (0: none) - the decode token's zc_stage reads it
     std::vector<std::array<x3::Mat, 3>> vm;     // expert -> its gate, up, down as EXL3 views of its VRAM blob
@@ -1104,6 +1105,14 @@ struct Model::Impl {
     // Its block is device memory on the trunk's GPU (null: off, the router as it was); a single-GPU trunk only (the members of a
     // tensor-parallel layer must make the same plan).
     Standin* d_standin = nullptr;
+    // DS4_MASK=<fraction> (opt-in; unset or 0: the router as it was): per trunk layer the least-picked experts of the profile are masked, and the
+    // router moves a masked pick by the stand-ins' ranks (STRATA_ROUTE_RESIDENT_RANKS / _EDGE, read as standin_init reads them; see RouteMask).
+    // d_mask: one device block [nl][n_exp] on the trunk's GPU (null: off); d_mask_moved: the picks moved so far (device counter).
+    unsigned char* d_mask = nullptr;
+    unsigned long long* d_mask_moved = nullptr;
+    double mask_p = 0.0;
+    int mask_floor = 3;
+    float mask_edge = 1.0f;
     // STRATA_FRAGILE_RECHECK (on with the stand-ins; 0: off): a decode token that took stand-ins is a close call when its top-two logit
     // gap is under fr_k (STRATA_FRAGILE_K0, 4) x its risk (the sum of weight x logit gap its stand-ins carried); a close call is run
     // again exactly at the same position (step(); standin_bypass), and the exact run's logits are the ones sampled.  The ring row,
@@ -1770,6 +1779,13 @@ struct Model::Impl {
             ring_drain();
             ring_print();
         }
+        if (d_mask_moved != nullptr) {   // (DS4_MASK: the picks moved so far, cumulative like the stand-ins' counts)
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            unsigned long long mvd = 0;
+            if (cudaMemcpy(&mvd, d_mask_moved, sizeof mvd, cudaMemcpyDeviceToHost) == cudaSuccess)
+                std::fprintf(stderr, "ds4: request: mask: p=%.2f F %d E %.2f, %llu picks moved to the next unmasked expert\n", mask_p,
+                             mask_floor, (double) mask_edge, mvd);
+        }
         if (lend_on) lend_print();   // (DS4_LEND: the experts lent now, of the last plan)
         if (tail3_on) tail_print();
         if (pcie_on) pcie_print();  // (STRATA_LA_TAIL_READ=3: the read threshold, the reads, the stand-in failures)
@@ -1799,6 +1815,14 @@ struct Model::Impl {
                 cudaFree(d_top2);
                 d_top2 = nullptr;
             }
+        }
+        if (d_mask != nullptr || d_mask_moved != nullptr) {   // DS4_MASK's blocks (the counter printed by request_end)
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            if (d_mask != nullptr) cudaFree(d_mask);
+            if (d_mask_moved != nullptr) cudaFree(d_mask_moved);
+            d_mask = nullptr;
+            d_mask_moved = nullptr;
+            for (Layer& l : L) l.route_mask = nullptr;
         }
         if (la_on) {   // the learner's report and its file, before the devices go
             cudaSetDevice(devs[(size_t) L[0].dev].id);
@@ -3564,6 +3588,7 @@ struct Model::Impl {
         lend_init();   // (DS4_LEND: the arena's fill thread and its streams; the first fill is asked for once the warm-up is done)
         la_init();   // (STRATA_LA_LEARN: the learner, on the trunk's GPU; off unless the env var or the saved file says on)
         standin_init();
+        mask_init();   // (DS4_MASK: after the placement, which says which experts are on the card; the profile is loaded by now)
         if (par || chunk > 0)   // (the windows' threads; the prompt path's, whatever mode the windows take)
             for (size_t di = 0; di < devs.size(); ++di) {
                 workers.push_back(std::make_unique<Worker>());
@@ -3623,6 +3648,90 @@ struct Model::Impl {
         }
         la_on = true;
         std::fprintf(stderr, "ds4: look-ahead learner: on (%s)\n", how.c_str());
+    }
+    // DS4_MASK's start: per trunk layer, the masked experts are the ones with the fewest picks in the profile (prof[il * n_exp + e], the
+    // hit counts the engine keeps and saves: the profile file's uint32 counts, read at start; a layer with no counts at all is not masked).
+    // The masks are one device block on the trunk's GPU (a single-GPU trunk only, as the stand-ins); the rule is route_mask_apply's.
+    void mask_init() {
+        const char* on = std::getenv("DS4_MASK");
+        const double p0 = on != nullptr ? std::atof(on) : 0.0;
+        if (!(p0 > 0.0)) return;
+        const double p = std::min(0.95, p0);
+        for (int il = 0; il < g.nl; ++il)
+            if (L[(size_t) il].dev != L[0].dev || L[(size_t) il].nm != 1) {
+                std::fprintf(stderr, "ds4: DS4_MASK: off (the trunk is not on one GPU)\n");
+                return;
+            }
+        auto envf = [](const char* k, float d) { const char* v = std::getenv(k); return v != nullptr ? (float) std::atof(v) : d; };
+        const int floor_r = std::max(0, (int) envf("STRATA_ROUTE_RESIDENT_RANKS", 3.0f));
+        const float edge = std::max(0.0f, envf("STRATA_ROUTE_RESIDENT_EDGE", 1.0f));
+        const int ne = g.n_exp;
+        const int per = (int) std::floor(p * ne);
+        const std::string pf = o.profile.empty() ? std::string("none") : o.profile;
+        bool any = false;
+        for (int il = 0; il < g.nl && !any; ++il)
+            for (int e = 0; e < ne && !any; ++e) any = prof[(size_t) il * ne + e] != 0;
+        if (!any) {
+            std::fprintf(stderr, "ds4: DS4_MASK=%.2f: no profile counts (%s), no mask\n", p, pf.c_str());
+            return;
+        }
+        std::vector<unsigned char> host((size_t) g.nl * ne, 0);
+        int masked = 0, on_card = 0;
+        for (int il = 0; il < g.nl; ++il) {
+            const uint32_t* pr = prof.data() + (size_t) il * ne;
+            uint64_t sum = 0;
+            for (int e = 0; e < ne; ++e) sum += pr[e];
+            if (sum == 0) continue;   // (no counts for this layer: nothing says which of its experts are unused)
+            std::vector<int> order((size_t) ne);
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return pr[a] < pr[b]; });   // fewest picks first
+            for (int q = 0; q < per; ++q) {
+                host[(size_t) il * ne + (size_t) order[(size_t) q]] = 1;
+                on_card += L[(size_t) il].slot[(size_t) order[(size_t) q]] >= 0;
+                ++masked;
+            }
+        }
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        unsigned char* dm = nullptr;
+        unsigned long long* mv = nullptr;
+        if (cudaMalloc(&dm, host.size()) != cudaSuccess ||
+            cudaMemcpy(dm, host.data(), host.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMalloc(&mv, sizeof(unsigned long long)) != cudaSuccess ||
+            cudaMemset(mv, 0, sizeof(unsigned long long)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (dm != nullptr) cudaFree(dm);
+            if (mv != nullptr) cudaFree(mv);
+            std::fprintf(stderr, "ds4: DS4_MASK: off (no device memory)\n");
+            return;
+        }
+        d_mask = dm;
+        d_mask_moved = mv;
+        mask_p = p;
+        mask_floor = floor_r;
+        mask_edge = edge;
+        for (int il = 0; il < g.nl; ++il) L[(size_t) il].route_mask = dm + (size_t) il * ne;
+        char rk[160];
+        if (floor_r == 0)
+            std::snprintf(rk, sizeof rk, "every rank may move");
+        else if (edge > 0.0f)
+            std::snprintf(rk, sizeof rk, "rank %d within %.2f logits", floor_r - 1, (double) edge);
+        else
+            std::snprintf(rk, sizeof rk, "rank %d exact", floor_r - 1);
+        std::fprintf(stderr,
+                     "ds4: DS4_MASK=%.2f: per layer the %d least-picked experts masked (ranks below %d exact, %s, from rank %d moved; "
+                     "profile %s), %d of the %d masked on the card\n",
+                     p, per, std::max(0, floor_r - 1), rk, floor_r, pf.c_str(), on_card, masked);
+    }
+    // the mask and the rule for one trunk layer's router (no mask: the router as it was); the picks moved are counted in d_mask_moved
+    RouteMask route_mask_of(const Layer& l) const {
+        RouteMask r;
+        if (l.route_mask != nullptr) {
+            r.m = l.route_mask;
+            r.floor = mask_floor;
+            r.edge = mask_edge;
+            r.moved = d_mask_moved;
+        }
+        return r;
     }
     void standin_init() {
         const char* on = std::getenv("STRATA_STANDIN");
@@ -10532,12 +10641,13 @@ struct Model::Impl {
         hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
         gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
+        const RouteMask rmk = route_mask_of(l);   // (DS4_MASK: the trunk layer's mask; none when off)
         for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
             const int nr = std::min(kVlRows, T - r0);
             VlBits vb;
             const bool vl = l.gate_bias_vl != nullptr && vl_bits(p0 + r0, nr, vb);
             route(c.glog + (size_t) r0 * 1024, l.gate_bias, l.n_exp, l.k_exp, nr, g.route_scale,
-                  c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr);
+                  c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr, &rmk);
         }
         const int n_vs = L0.n_slots + (int) L0.host_list.size();
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
@@ -12515,7 +12625,8 @@ struct Model::Impl {
                 float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
                 if (!la_lay) gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
                                                                          // weights instead: the same hit rate)
-                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                const RouteMask nrm = route_mask_of(*nx);   // (DS4_MASK: the guesses follow the layer's mask)
+                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s, &nrm);
                 na[a - 1] = m;
             }
             // the learner's 4-layers-ahead guesses (row 2 of glog_a, corrected by la_stage) for the read-ahead: their reads start three
@@ -12523,7 +12634,8 @@ struct Model::Impl {
             if (lead && la_lay && ahead_mode > 0 && la_tail_read > 0)
                 if (const Layer* n4 = ahead_layer(L0, 4)) {
                     const int m = std::min(kPicks, n4->k_exp);
-                    route_ahead(d.glog_a + (size_t) 2 * kWin * 1024, n4->gate_bias, n4->n_exp, m, T, reqs + slot, kAhead1 + kPicks, s);
+                    const RouteMask n4m = route_mask_of(*n4);
+                    route_ahead(d.glog_a + (size_t) 2 * kWin * 1024, n4->gate_bias, n4->n_exp, m, T, reqs + slot, kAhead1 + kPicks, s, &n4m);
                     na[2] = m;
                 }
             // DS4_PCIE_BALANCE: this use may take the PCIe lane (decode token, the routed MoE path, the lead member); the staging of its parity must be
@@ -12566,9 +12678,10 @@ struct Model::Impl {
                     pc_uses.push_back(u);
                 }
             }
+            const RouteMask rmp = route_mask_of(l);   // (DS4_MASK: the trunk layer's mask; none when off)
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr);   // (stand-ins: decode tokens of the trunk only)
+                          na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr, &rmp);   // (stand-ins: decode tokens of the trunk only)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
@@ -12672,8 +12785,9 @@ struct Model::Impl {
         gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
+        const RouteMask rmr = route_mask_of(l);   // (DS4_MASK: the trunk layer's mask; none when off)
         route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
-              vb.w[0] != 0 ? &vb : nullptr);
+              vb.w[0] != 0 ? &vb : nullptr, &rmr);
         CK(cudaMemcpyAsync(h_idx, d.ridx, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_w, d.rw, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_x, d.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
