@@ -221,7 +221,7 @@ CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > co
 # turn for 16 minutes - the engine had finished in 45 s, the server sat in a socket write - and every request queued
 # behind it).  A write that cannot finish raises TimeoutError, an OSError: the stream's write handler cancels the
 # request and frees the turn.  A healthy stream writes far more often (tokens, keep-alives every KEEPALIVE_S).
-CLIENT_TIMEOUT_S = 60.0
+CLIENT_TIMEOUT_S = 600.0   # the config's "client_timeout_s" sets it (7 Nov: 60 s dropped a remote client's answer on a 1-minute stall)
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -2636,6 +2636,17 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
     print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
           "changing it keeps the cached conversation", flush=True)
     return ["--tail-role-token", str(role[0])]
+
+
+def client_timeout_s(cfg: dict) -> float:
+    """The config's "client_timeout_s": seconds a client may stop reading (or sending) before it is dropped (default CLIENT_TIMEOUT_S,
+    600).  ValueError for anything but a number > 0."""
+    v = cfg.get("client_timeout_s")
+    if v is None:
+        return CLIENT_TIMEOUT_S
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        raise ValueError(f'"client_timeout_s" must be a number of seconds > 0, not {v!r}')
+    return float(v)
 
 
 def engine_silence_s(cfg: dict) -> float:
@@ -7511,6 +7522,7 @@ def main() -> int:
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
+            globals()["CLIENT_TIMEOUT_S"] = client_timeout_s(cfg)   # (read by make_handler when the server starts)
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:
