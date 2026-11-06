@@ -344,11 +344,12 @@ When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095`. 
   `standin-learn-<id>.bin`, `predictor-<id>.bin`, plus `ram-reserve.json`. They hold this machine's values: when you move an
   install to another PC, delete all but `predictor-<id>.bin` (the look-ahead belongs to the model and carries over) and
   let them relearn.
-- **The learning set** (new 6-7 Nov; on in our config's `"env"`, CUDA only - leave them out on AMD or Apple):
-  `"STRATA_MASK": "learn"` (each re-checked token measures how much the masked experts changed the output; the least
-  harmful of the little-used experts are masked, the proven-harmless ones at every rank, and the depth follows the speed
-  test), `"STRATA_STANDIN_LEARN": "1"`, `"STRATA_STANDIN_BALANCE": "1"` and `"STRATA_LA_EXACT_W": "4"` (the look-ahead
-  learns the picks that cost a read 4x harder; experts the mask removed weigh nothing).
+- **The learned mask is on by default** (7 Nov, CUDA; with route-resident stand-ins configured): each re-checked token
+  measures how much the masked experts changed the output; the least harmful of the little-used experts are masked, the
+  proven-harmless ones at every rank, and the depth follows the speed test. The look-ahead learns the picks that cost a read
+  4x harder (`STRATA_LA_EXACT_W`, default 4) and gives the experts the mask removed no weight. `"STRATA_MASK": "0"` and
+  `"STRATA_LA_EXACT_W": "1"` turn them off (do so on AMD or Apple). Opt-in: `"STRATA_STANDIN_LEARN": "1"` and
+  `"STRATA_STANDIN_BALANCE": "1"` (no gain shown yet).
 - **What to watch** in the server log after a request: `auto mask test` and `auto budget test` (each test's speeds and
   what it kept), `mask learn:` (share, masked, at all ranks, re-check divergence) and `look-ahead learner:` (its guess rates
   against the plain router).
@@ -439,8 +440,8 @@ cp data/dsv41/profile-2.00.bin /mnt/nvme/strata-data/packs/ds41v/expert-profile.
   learns its VRAM reserve; if it prints `ring: off (... would not fit)`, start it once more.
 - **On your own PC** it fits itself to the machine as Qwen does (above); its learned files sit in the pack folder
   (`standin-tune.txt`, `vram-reserve.txt`, `mask-learn.bin`, `standin-learn.bin`, `hotrod-predictor.bin`) - when you move a
-  pack to another PC, delete all but `hotrod-predictor.bin`. The learning set: `"DS4_MASK": "learn"`, `"DS4_STANDIN_LEARN":
-  "1"`, `"DS4_STANDIN_BALANCE": "1"`.
+  pack to another PC, delete all but `hotrod-predictor.bin`. The learned mask and the look-ahead's weighting are on by default
+  with the stand-ins (`"DS4_MASK": "0"` turns the mask off); stand-in learning and balance are opt-in.
 
 </div>
 
