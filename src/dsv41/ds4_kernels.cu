@@ -1753,7 +1753,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 // DS4_STANDIN_BALANCE (pair_err, opt-in): a pair with a measured error (ready: >= 0) is exposed by that error (the corrected
                 // stand-in's relative output error) instead of the logit gap; the edge rule (rank floor - 1) keeps the gap
                 const float pe = pair_err != nullptr ? pair_err[(size_t) orig[r] * n + cand[c]] : -1.0f;
-                const float xr = pe >= 0.0f ? pe : gap;
+                const float xr = pe >= 0.0f ? gap * pe : gap;   // (pe: the pair's error relative to its layer's mean - the gap's units kept)
                 const bool ok = r < sti->floor ? gap <= sti->edge : wk[r] * xr <= sti->budget;
                 if (!ok) continue;
                 atomicAdd(&sti->taken[r], 1ull);

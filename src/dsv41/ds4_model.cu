@@ -10579,6 +10579,19 @@ struct Model::Impl {
             bal_err_new[((size_t) il * n + e) * n + s] = (float) std::sqrt(std::max(0.0, q));
             ++bal_ready;
         }
+        // (6 Nov review: the kernel scales the gap by the pair's error RELATIVE to its layer's mean, so the budget keeps the gap's units -
+        //  a raw output error in place of the gap made measured pairs look far safer than the budget was tuned for)
+        for (int il = 0; il < nl; ++il) {
+            float* row = bal_err_new.data() + (size_t) il * nn;
+            double sum = 0.0;
+            size_t cnt = 0;
+            for (size_t i = 0; i < nn; ++i)
+                if (row[i] >= 0.0f) sum += row[i], ++cnt;
+            if (cnt == 0) continue;
+            const double mean = std::max(1e-6, sum / (double) cnt);
+            for (size_t i = 0; i < nn; ++i)
+                if (row[i] >= 0.0f) row[i] = (float) std::min(4.0, std::max(0.25, (double) row[i] / mean));
+        }
         for (int il = 0; il < nl; ++il) {   // (only the layers whose values changed go to the device)
             const size_t off = (size_t) il * nn;
             if (std::memcmp(bal_err_new.data() + off, bal_err_h.data() + off, nn * sizeof(float)) == 0) continue;
