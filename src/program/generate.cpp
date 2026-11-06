@@ -4556,7 +4556,8 @@ int main(int argc, char** argv) {
         // STRATA_MASK=<share> (opt-in, changes the output): per layer the least-used experts of the profile are masked at the router (the
         // profile ranks every pair; a pair it does not rank counts as the least used).  The floor and edge are route-resident's
         // (STRATA_ROUTE_RESIDENT_RANKS, default 6-9; STRATA_ROUTE_RESIDENT_EDGE, default off).  Unset: nothing here runs.
-        if (const char* mv = std::getenv("STRATA_MASK")) {
+        // (default since 7 Nov: STRATA_MASK=learn when route-resident stand-ins are configured; =0 turns it off - strata::core::mask_env)
+        if (const char* mv = strata::core::mask_env()) {
             const bool mlearn = strata::core::mask_learn_env();   // STRATA_MASK=learn: the share is the learner's start (p0), see mask_learn_begin
             const double share = mlearn ? 0.05 : std::min(0.95, std::atof(mv));
             if (share > 0.0) {
@@ -16718,6 +16719,7 @@ int main(int argc, char** argv) {
                                  mk_seen, mk_moved);
             }
             if (ver.mask_learn_active()) std::fputs(strata::core::mask_learn_report().c_str(), stderr);   // STRATA_MASK=learn: the request's line
+            strata::core::mask_test_arm(0);   // a running mask test: the next request's prompt reads with the base levels (its windows re-upload theirs)
             {   // STRATA_ROUTE_BUDGET_AUTO: the base budget the search ends this request at, and the tests it finished since the last line
                 float auto_b = 0.0f;
                 long long auto_tests = 0;

@@ -889,6 +889,10 @@ void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_
 bool route_mask_update(const std::vector<uint8_t>& host) {
     if (g_mask_dev == nullptr || host.size() != g_mask_host.size()) return false;
     const size_t ne = (size_t) g_mask_ne;
+    if (host == g_mask_host) return true;   // nothing differs: no wait, no copy
+    // the look-ahead learner's batch reads these rows on its own non-blocking stream (la_b_grad_k): wait for all work before rewriting them
+    // (7 Nov review: a synchronous copy does not order against non-blocking streams).  Rare: a mask change, every 256 tokens at most.
+    if (cudaDeviceSynchronize() != cudaSuccess) { (void) cudaGetLastError(); return false; }
     for (int64_t il = 0; il < g_mask_layers; ++il) {
         const size_t o = (size_t) il * ne;
         if (std::equal(host.begin() + (ptrdiff_t) o, host.begin() + (ptrdiff_t) (o + ne), g_mask_host.begin() + (ptrdiff_t) o)) continue;
@@ -1895,7 +1899,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
     a.rinfo = s.rinfo; a.kst = s.kst; a.kacc = s.kacc;
     for (int i = 0; i < Nd; ++i) a.dist[i] = dist[i];
     a.L = s.L; a.H = s.H; a.lo = s.lo; a.n = n; a.Nd = Nd; a.Nsd = s.Nsd; a.Nset = s.Nset; a.timing = s.timing ? 1 : 0;
-    static const float exact_w = [] { const char* v = std::getenv("STRATA_LA_EXACT_W"); const float w = v != nullptr ? (float) std::atof(v) : 1.0f; return w > 0.0f ? w : 1.0f; }();
+    static const float exact_w = [] { const char* v = std::getenv("STRATA_LA_EXACT_W"); const float w = v != nullptr ? (float) std::atof(v) : 4.0f; return w > 0.0f ? w : 1.0f; }();   // (default 4 since 7 Nov: the weight v2 was trained with; =1 the old loss)
     a.exact_w = exact_w;
     cudaStream_t sd_s = s.side;
     // TIMING: a one-thread mark before and after each kernel, in launch order (la_b_mark_k: the per-kernel sums)

@@ -49,6 +49,11 @@ namespace strata::core {
 /// here).  _env: the switch is "learn".  _begin(nl, ne, pos): the state and the seed levels (pos = the profile rank of each pair, higher =
 /// less used; empty when off).  _open / _save: the table file of this model.  _report: the request's line (counts reset).
 bool mask_learn_env();
+/// STRATA_MASK as it applies: the env value, else "learn" when route-resident stand-ins are configured (STRATA_ROUTE_RESIDENT, which the
+/// learner needs), else nullptr (no mask).  "0" turns it off.  (Default since 7 Nov.)
+const char* mask_env();
+/// STRATA_MASK=learn's mask test: put this arm's levels on the device (0 base, 1 candidate; no-op when no test runs or it is there)
+void mask_test_arm(int arm);
 bool mask_learn_seeded();   ///< _begin ran: the state exists (the Verifier's buffers follow it)
 std::vector<uint8_t> mask_learn_begin(int64_t n_layers, int64_t n_expert, const std::vector<int64_t>& pos);
 bool mask_learn_open(const std::string& path, std::string& msg);

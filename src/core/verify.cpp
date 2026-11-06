@@ -6549,8 +6549,9 @@ void mlr_update(MaskLearnState& s) {
         if (rm - rs > 2.0 * se) s.p = std::max(kMlPMin, s.p - 0.05);
         else if (rm - rs < se) s.p = std::min(kMlPMax, s.p + 0.025);
     }
-    if (mlr_relevel(s) && !strata::kernels::route_mask_update(s.lv))
-        std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
+    // the upload is tried every round (it compares rows itself): a failed one is retried, not only when the levels change again
+    (void) mlr_relevel(s);
+    if (!strata::kernels::route_mask_update(s.lv)) std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
 }
 
 // The table file: "MLRN", version 3, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the kept token count, g, then harm
@@ -6647,8 +6648,15 @@ void mlr_expose_rows(MaskLearnState& s, const strata::kernels::MaskEvs& ev, int 
 
 }  // namespace
 
-bool mask_learn_env() {
+// STRATA_MASK as it applies (default since 7 Nov): unset -> "learn" when the route-resident stand-ins it learns from are configured.
+const char* mask_env() {
     const char* v = std::getenv("STRATA_MASK");
+    if (v != nullptr) return v;
+    return std::getenv("STRATA_ROUTE_RESIDENT") != nullptr ? "learn" : nullptr;
+}
+
+bool mask_learn_env() {
+    const char* v = mask_env();
     return v != nullptr && std::strcmp(v, "learn") == 0;
 }
 
