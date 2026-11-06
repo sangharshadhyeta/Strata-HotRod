@@ -1120,6 +1120,14 @@ struct Model::Impl {
     float* d_kl = nullptr;                  // device (head GPU) [1]: the re-check's KL
     std::vector<double> ml_harm, ml_expo;   // [nl][n_exp]: the harm and the exposure (decayed)
     std::vector<uint8_t> ml_lv;             // [nl][n_exp]: 0 unmasked, 1 masked (the rank rule), 2 masked at every rank
+    double ml_g = 0.25;                     // the mask's depth: the fraction of the masked experts allowed at level 2 (a mask test's second number)
+    std::vector<uint8_t> ml_dev_lv;         // the levels the device holds (host copy; an upload sends the rows that differ)
+    // the running mask test (STRATA_MASK=learn x STRATA_ROUTE_BUDGET_AUTO, mask_test_begin): its candidate (p, g) and direction, its arms' levels
+    // (0 base, 1 candidate), the arm on the device (-1: none yet), the direction state (as the budget test's: first direction, stage 0 / 1)
+    bool mt_on = false;                     // a mask test runs: the levels are fixed (ml_update does not move p)
+    int mt_d = -1, mt_cur = -1, mt_first = -1, mt_stage = 0;
+    double mt_cand_p = 0.0, mt_cand_g = 0.0;
+    std::vector<uint8_t> mt_lv[2];
     double ml_ag_ok = 0.0, ml_ag_tot = 0.0; // the re-checks: no change of the top token / all (decayed)
     // the re-checks split by whether the mask moved a pick in the token (flips, count; decayed): the share follows the flips the mask ADDS
     // beyond the stand-ins' (6 Nov: re-checks are close calls, ~25% flip whatever the mask does, so raw agreement only ever shrank p)
@@ -3815,6 +3823,7 @@ struct Model::Impl {
                 on_card += L[(size_t) il].slot[(size_t) e] >= 0;
             }
         mask_host = host;   // (the Monitor's expert map shows the masked experts)
+        ml_dev_lv = host;   // (what the device holds: the upload sends the rows that differ from it)
         cudaSetDevice(devs[(size_t) L[0].dev].id);
         unsigned char* dm = nullptr;
         unsigned long long* mv = nullptr;
@@ -3866,6 +3875,7 @@ struct Model::Impl {
             d_kl = kl;
             d_mev = mev;
             mask_learn_on = true;
+            tune.mask_learn([this] { return mask_test_begin(); }, [this](const StandinTune::MaskEnd& r) { mask_test_end(r); });
         }
         char rk[160];
         if (floor_r == 0)
@@ -3898,9 +3908,11 @@ struct Model::Impl {
     static constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
     static constexpr double kMlMinSide = 16.0, kMlPMin = 0.025;   // re-checks needed on each side of the comparison; the share's floor
     static constexpr int kMlMinPop = 8;
+    static constexpr double kMtStepP = 0.025, kMtStepG = 0.1;   // a mask test's candidate: one step of the share p and of the level-2 fraction g
     std::string ml_path() const { return o.pack + "/mask-learn.bin"; }
     size_t ml_at(int il, int e) const { return (size_t) il * (size_t) g.n_exp + (size_t) e; }
-    // the file: "MLRN", version 1, nl, ne, p, the agreement's two sums, the token count, then harm and exposure (double) and the levels (bytes)
+    // the file: "MLRN", version 3, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the token count, g, then harm and exposure
+    // (double) and the levels (bytes).  Versions 1 and 2 have no g: it is the loaded levels' level-2 share (0.25 when nothing is masked).
     void ml_save() const {
         const std::string path = ml_path(), tmp = path + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -3908,15 +3920,17 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: DS4_MASK=learn: %s not written\n", path.c_str());
             return;
         }
-        const uint32_t ver = 2;   // 2: + the mask/stand-in split of the re-checks (ml_fm, ml_nm, ml_fs, ml_ns)
+        const uint32_t ver = 3;   // 2: + the mask/stand-in split of the re-checks (ml_fm, ml_nm, ml_fs, ml_ns); 3: + g
         const int32_t nl = g.nl, ne = g.n_exp;
         const long long tok = ml_tok;
         const double split[4] = {ml_fm, ml_nm, ml_fs, ml_ns};
+        const double gf = ml_g;
         bool ok = std::fwrite("MLRN", 1, 4, f) == 4 && std::fwrite(&ver, sizeof ver, 1, f) == 1 && std::fwrite(&nl, sizeof nl, 1, f) == 1 &&
                   std::fwrite(&ne, sizeof ne, 1, f) == 1 && std::fwrite(&mask_p, sizeof mask_p, 1, f) == 1 &&
                   std::fwrite(&ml_ag_ok, sizeof ml_ag_ok, 1, f) == 1 && std::fwrite(&ml_ag_tot, sizeof ml_ag_tot, 1, f) == 1 &&
                   std::fwrite(split, sizeof(double), 4, f) == 4 &&
-                  std::fwrite(&tok, sizeof tok, 1, f) == 1 && std::fwrite(ml_harm.data(), sizeof(double), ml_harm.size(), f) == ml_harm.size() &&
+                  std::fwrite(&tok, sizeof tok, 1, f) == 1 && std::fwrite(&gf, sizeof gf, 1, f) == 1 &&
+                  std::fwrite(ml_harm.data(), sizeof(double), ml_harm.size(), f) == ml_harm.size() &&
                   std::fwrite(ml_expo.data(), sizeof(double), ml_expo.size(), f) == ml_expo.size() &&
                   std::fwrite(ml_lv.data(), 1, ml_lv.size(), f) == ml_lv.size();
         ok = std::fclose(f) == 0 && ok;
@@ -3932,11 +3946,12 @@ struct Model::Impl {
         double p = 0.0, ok = 0.0, tot = 0.0;
         long long tok = 0;
         double split[4] = {0.0, 0.0, 0.0, 0.0};
+        double gf = 0.0;
         bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 &&
-                    (ver == 1 || ver == 2) && std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == g.nl &&
+                    (ver == 1 || ver == 2 || ver == 3) && std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == g.nl &&
                     ne == g.n_exp && std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 &&
                     std::fread(&tot, sizeof tot, 1, f) == 1 && (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) &&
-                    std::fread(&tok, sizeof tok, 1, f) == 1;   // (version 1: the scores kept, the split starts empty)
+                    std::fread(&tok, sizeof tok, 1, f) == 1 && (ver < 3 || std::fread(&gf, sizeof gf, 1, f) == 1);   // (version 1: the split starts empty)
         good = good && std::fread(ml_harm.data(), sizeof(double), ml_harm.size(), f) == ml_harm.size() &&
                std::fread(ml_expo.data(), sizeof(double), ml_expo.size(), f) == ml_expo.size() &&
                std::fread(ml_lv.data(), 1, ml_lv.size(), f) == ml_lv.size();
@@ -3945,6 +3960,15 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: DS4_MASK=learn: %s is not this model's table (version or shape): a fresh start\n", ml_path().c_str());
             return false;
         }
+        if (ver < 3) {   // g: the loaded levels' level-2 share of the masked pairs (0.25 when nothing is masked)
+            long long masked = 0, level2 = 0;
+            for (uint8_t v : ml_lv) {
+                masked += v != 0;
+                level2 += v == 2;
+            }
+            gf = masked > 0 ? (double) level2 / (double) masked : 0.25;
+        }
+        ml_g = std::min(1.0, std::max(0.0, gf));
         mask_p = std::min(kMlPMax, std::max(kMlPMin, p));
         ml_ag_ok = ok;
         ml_ag_tot = tot;
@@ -3967,90 +3991,110 @@ struct Model::Impl {
         ml_nrc = 0;
         ml_dsum = 0.0;
         ml_dn = 0;
+        ml_g = 0.25;
+        mt_on = false;
+        mt_cur = -1;
+        mt_first = -1;   // (the first direction: shallower, as the budget test's)
+        mt_stage = 0;
         const bool loaded = ml_load();
         ml_relevel();
-        std::fprintf(stderr, "ds4: DS4_MASK=learn: %s, p %.3f (%s)\n", loaded ? "the saved table" : "a fresh table", mask_p, ml_path().c_str());
+        std::fprintf(stderr, "ds4: DS4_MASK=learn: %s, p %.3f, g %.3f (%s)\n", loaded ? "the saved table" : "a fresh table", mask_p, ml_g,
+                     ml_path().c_str());
     }
-    // the levels of every trunk layer from the scores (the least-used pool by the profile, the lowest rates within it); true when one changed
-    bool ml_relevel() {
+    // the levels of every trunk layer for the share and the level-2 fraction, from the scores (ml_lv only orders the keep set).  The masked set
+    // (share n per layer) keeps the current level-2 pairs first (the lowest rates first), then the pool's least-used experts (the fewest picks
+    // first, ties by the lower id; the lowest rates within it).  Level 2 goes to the graduated ones (enough exposure, a rate under the layer's
+    // 10th percentile), the lowest rates first, at most round(frac x the layer's masked count).  A layer with no profile counts gets none.
+    void ml_levels(double share, double frac, std::vector<uint8_t>& out) const {
         const int ne = g.n_exp;
-        const int per = (int) std::floor(mask_p * ne + 1e-9);
+        const int per = (int) std::floor(share * ne + 1e-9);
         const int pool_n = std::min(ne, 2 * per);
-        bool changed = false;
+        out.assign((size_t) g.nl * (size_t) ne, 0);
         std::vector<double> rate((size_t) ne), pop;
-        std::vector<int> ord((size_t) ne);
-        std::vector<uint8_t> nlv((size_t) ne);
+        std::vector<int> ord((size_t) ne), keep, cand, grad_set;
         for (int il = 0; il < g.nl; ++il) {
-            uint8_t* lv = ml_lv.data() + (size_t) il * ne;
+            const uint8_t* lv = ml_lv.data() + (size_t) il * ne;
+            uint8_t* nlv = out.data() + (size_t) il * ne;
             const double* hm = ml_harm.data() + (size_t) il * ne;
             const double* ex = ml_expo.data() + (size_t) il * ne;
             const uint32_t* pr = prof.data() + (size_t) il * ne;
             uint64_t sum = 0;
             for (int e = 0; e < ne; ++e) sum += pr[e];
-            std::fill(nlv.begin(), nlv.end(), 0);
-            if (sum > 0) {   // (no counts for the layer: nothing says which of its experts are unused - none masked, as mask_init)
-                pop.clear();
-                for (int e = 0; e < ne; ++e) {
-                    rate[(size_t) e] = hm[e] / std::max(1.0, ex[e]);
-                    if (ex[e] >= kMlMinExpo) pop.push_back(rate[(size_t) e]);
-                }
-                const bool grad = (int) pop.size() >= kMlMinPop;
-                double p10 = 0.0, med = 0.0;
-                if (grad) {
-                    std::sort(pop.begin(), pop.end());
-                    p10 = pop[pop.size() / 10];
-                    med = pop[pop.size() / 2];
-                }
-                int masked = 0;
-                // the all-ranks masks stay, the lowest rates first, up to the share; above the layer's median one falls back to the rank rule
-                std::vector<int> keep;
-                for (int e = 0; e < ne; ++e)
-                    if (lv[e] == 2) keep.push_back(e);
-                std::stable_sort(keep.begin(), keep.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
-                for (int e : keep) {
-                    if (masked >= per) break;
-                    nlv[(size_t) e] = grad && rate[(size_t) e] > med ? 1 : 2;
-                    ++masked;
-                }
-                // the rest: the pool's least-used experts, the lowest rates first (ties: the fewer picks, then the lower id)
-                for (int e = 0; e < ne; ++e) ord[(size_t) e] = e;
-                std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] < pr[b]; });
-                std::vector<int> cand;
-                for (int q = 0; q < pool_n; ++q)
-                    if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
-                std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
-                for (int e : cand) {
-                    if (masked >= per) break;
-                    nlv[(size_t) e] = 1;
-                    ++masked;
-                }
-                if (grad)   // graduation: enough exposure and a rate under the 10th percentile, masked at every rank
-                    for (int e = 0; e < ne; ++e)
-                        if (nlv[(size_t) e] == 1 && ex[e] >= kMlMinExpo && rate[(size_t) e] < p10) nlv[(size_t) e] = 2;
+            if (sum == 0) continue;   // (no counts for the layer: nothing says which of its experts are unused - none masked, as mask_init)
+            pop.clear();
+            for (int e = 0; e < ne; ++e) {
+                rate[(size_t) e] = hm[e] / std::max(1.0, ex[e]);
+                if (ex[e] >= kMlMinExpo) pop.push_back(rate[(size_t) e]);
             }
+            const bool grad = (int) pop.size() >= kMlMinPop;
+            double p10 = 0.0;
+            if (grad) {
+                std::sort(pop.begin(), pop.end());
+                p10 = pop[pop.size() / 10];
+            }
+            int masked = 0;
+            keep.clear();
             for (int e = 0; e < ne; ++e)
-                if (lv[e] != nlv[(size_t) e]) {
-                    lv[e] = nlv[(size_t) e];
-                    changed = true;
-                }
+                if (lv[e] == 2) keep.push_back(e);
+            std::stable_sort(keep.begin(), keep.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+            for (int e : keep) {
+                if (masked >= per) break;
+                nlv[(size_t) e] = 1;
+                ++masked;
+            }
+            for (int e = 0; e < ne; ++e) ord[(size_t) e] = e;
+            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] < pr[b]; });
+            cand.clear();
+            for (int q = 0; q < pool_n; ++q)
+                if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
+            std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+            for (int e : cand) {
+                if (masked >= per) break;
+                nlv[(size_t) e] = 1;
+                ++masked;
+            }
+            if (grad) {   // level 2: the graduated masked pairs, at most round(frac x masked), lowest first
+                grad_set.clear();
+                for (int e = 0; e < ne; ++e)
+                    if (nlv[(size_t) e] == 1 && ex[e] >= kMlMinExpo && rate[(size_t) e] < p10) grad_set.push_back(e);
+                std::stable_sort(grad_set.begin(), grad_set.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+                const int64_t cap = (int64_t) std::lround(frac * (double) masked);
+                for (size_t i = 0; i < grad_set.size() && (int64_t) i < cap; ++i) nlv[(size_t) grad_set[i]] = 2;
+            }
         }
+    }
+    // the levels for the table's (p, g); true when they changed
+    bool ml_relevel() {
+        std::vector<uint8_t> nlv;
+        ml_levels(mask_p, ml_g, nlv);
+        const bool changed = nlv != ml_lv;
+        ml_lv = std::move(nlv);
         return changed;
     }
-    // the table to the device (the rows the router reads) and the Monitor's map
-    void ml_upload() {
+    // the levels to the device (the rows the router reads) and the Monitor's map: only the layers whose row differs from the device's
+    void ml_upload_rows(const std::vector<uint8_t>& want) {
+        const size_t ne = (size_t) g.n_exp;
+        if (ml_dev_lv.size() != want.size()) ml_dev_lv.assign(want.size(), 0xFF);   // (unknown device rows: every row is sent)
         cudaSetDevice(devs[(size_t) L[0].dev].id);
-        if (cudaMemcpy(d_mask, ml_lv.data(), ml_lv.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
-            (void) cudaGetLastError();
-            std::fprintf(stderr, "ds4: DS4_MASK=learn: the table not uploaded\n");
-            return;
+        for (int il = 0; il < g.nl; ++il) {
+            const size_t off = (size_t) il * ne;
+            if (std::memcmp(ml_dev_lv.data() + off, want.data() + off, ne) == 0) continue;
+            if (cudaMemcpy(d_mask + off, want.data() + off, ne, cudaMemcpyHostToDevice) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "ds4: DS4_MASK=learn: the table not uploaded\n");
+                return;
+            }
+            std::memcpy(ml_dev_lv.data() + off, want.data() + off, ne);
+            for (size_t e = 0; e < ne; ++e) mask_host[off + e] = want[off + e] != 0 ? 1 : 0;
         }
-        for (size_t i = 0; i < ml_lv.size(); ++i) mask_host[i] = ml_lv[i] != 0 ? 1 : 0;
     }
+    void ml_upload() { ml_upload_rows(ml_lv); }
     // every kMlMaskEvery decode tokens: p follows the re-checks' agreement (>= 98%: up; < 95%: down), then the levels
     // every kMlMaskEvery decode tokens: p follows the flips the mask adds - the flip rate of re-checked tokens with a mask move against
     // those without one (the stand-ins' own rate): more than 2 standard errors above -> p -= 0.05; within 1 -> p += 0.025; else held.
     // p never falls below kMlPMin, so mask moves keep coming and the comparison keeps its evidence.
     void ml_update() {
+        if (mt_on) return;   // (a mask test runs: its arms' levels are fixed; the harm and exposure keep learning)
         if (ml_nm >= kMlMinSide && ml_ns >= kMlMinSide) {
             const double rm = ml_fm / ml_nm, rs = ml_fs / ml_ns, r = (ml_fm + ml_fs) / (ml_nm + ml_ns);
             const double se = std::sqrt(std::max(1e-9, r * (1.0 - r) * (1.0 / ml_nm + 1.0 / ml_ns)));
@@ -4058,6 +4102,67 @@ struct Model::Impl {
             else if (rm - rs < se) mask_p = std::min(kMlPMax, mask_p + 0.025);
         }
         if (ml_relevel()) ml_upload();
+    }
+    // ---- DS4_MASK=learn x STRATA_ROUTE_BUDGET_AUTO: the mask test (the budget test's method, on the mask's depth).  Every other test is one
+    // (StandinTune's mask_learn hooks).  Base = (p, g) now; the candidate one step deeper (p + 0.025, g + 0.1) or shallower (the minus signs),
+    // clamped; the direction starts shallower.  Both arms run at the request's budget.  The arms' levels are computed once, here; an arm's rows go
+    // to the device when the arm changes (mask_test_arm).  A win keeps the candidate's (p, g); the levels are recomputed and uploaded at the end.
+    // The direction state is the budget test's (a win keeps the direction, a loss tries the other, both lost: the other first next round).
+    static void mt_next_stage(int& first, int& stage, bool won, int d) {
+        if (won) {
+            first = d;
+            stage = 0;
+        } else if (stage == 0) {
+            stage = 1;
+        } else {
+            first = -first;
+            stage = 0;
+        }
+    }
+    bool mask_test_begin() {
+        if (!mask_learn_on || mt_on) return false;
+        for (int tries = 0; tries < 2; ++tries) {   // the two directions of the stage machine: one of them may be at a bound
+            const int d = mt_stage == 0 ? mt_first : -mt_first;
+            const double cp = std::min(kMlPMax, std::max(kMlPMin, mask_p + kMtStepP * d));
+            const double cg = std::min(1.0, std::max(0.0, ml_g + kMtStepG * d));
+            if (cp != mask_p || cg != ml_g) {
+                mt_d = d;
+                mt_cand_p = cp;
+                mt_cand_g = cg;
+                ml_levels(mask_p, ml_g, mt_lv[0]);
+                ml_levels(cp, cg, mt_lv[1]);
+                mt_cur = -1;   // the first window uploads its arm
+                mt_on = true;
+                return true;
+            }
+            mt_next_stage(mt_first, mt_stage, false, d);   // at both bounds: nothing to test this way
+        }
+        return false;
+    }
+    // the arm of the token being run: its levels on the device, only when the arm changes
+    void mask_test_arm(int arm) {
+        if (!mt_on || arm == mt_cur || (arm != 0 && arm != 1)) return;
+        mt_cur = arm;
+        ml_upload_rows(mt_lv[arm]);
+    }
+    // the verdict: a win keeps the candidate's (p, g); the levels are recomputed for the final (p, g) and uploaded; the table is saved
+    void mask_test_end(const StandinTune::MaskEnd& r) {
+        const double base_p = mask_p, base_g = ml_g;
+        if (r.won) {
+            mask_p = mt_cand_p;
+            ml_g = mt_cand_g;
+        }
+        mt_next_stage(mt_first, mt_stage, r.won, mt_d);
+        mt_on = false;
+        mt_cur = -1;
+        ml_relevel();
+        ml_upload();
+        const double fc = r.tok[1] > 0 ? 100.0 * r.pc : 0.0, fb = r.tok[0] > 0 ? 100.0 * r.pb : 0.0;
+        std::fprintf(stderr, "ds4: request: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): %.1f vs %.1f tok/s over %lld+%lld tokens -> (%.3f,%.3f); "
+                     "flips/100 tok %.2f vs %.2f (%lld vs %lld re-checks)%s\n",
+                     mt_cand_p, mt_cand_g, base_p, base_g, r.sc, r.sb, r.tok[1], r.tok[0], r.won ? mask_p : base_p, r.won ? ml_g : base_g,
+                     fc, fb, r.rc[1], r.rc[0], r.quality ? "" : ", quality lost");
+        ml_save();
     }
     // the decode token's end (step(): every learning step): the decays, the mask's moves, the saves
     void ml_end() {
@@ -4142,9 +4247,9 @@ struct Model::Impl {
             scored += ml_expo[i] > 0.0;
         }
         const double dm = ml_dn > 0 ? ml_dsum / (double) ml_dn : 0.0;
-        std::fprintf(stderr, "ds4: request: mask learn: p %.3f, %d masked (%d at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
+        std::fprintf(stderr, "ds4: request: mask learn: p %.3f, g %.3f, %d masked (%d at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
                      "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f\n",
-                     mask_p, m, a, dm, ml_dn, scored, ml_fm, ml_nm, ml_fs, ml_ns);
+                     mask_p, ml_g, m, a, dm, ml_dn, scored, ml_fm, ml_nm, ml_fs, ml_ns);
         ml_dsum = 0.0;
         ml_dn = 0;
     }
@@ -11147,6 +11252,7 @@ struct Model::Impl {
             if (p0 != tune_last_pos) tune.begin_request();
             const float b = tune.budget_for_next_token();
             fr_k = tune.k();
+            if (tune.mask_testing()) mask_test_arm(tune.arm());   // (DS4_MASK=learn: this arm's levels, when the arm changes)
             if (b != tune_b) {
                 tune_b = b;
                 Dev& sd = devs[(size_t) L[0].dev];

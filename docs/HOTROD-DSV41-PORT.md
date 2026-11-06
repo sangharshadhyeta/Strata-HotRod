@@ -190,12 +190,27 @@ percentile (of the experts with 256 exposures; at least 8 of them) is masked at 
 rank"); above the layer's median it falls back to level 1 (the rank rule). Level 2 experts count toward the share, and the lowest-rate ones
 are kept when there are too many.
 
-Persistence: `<pack>/mask-learn.bin` (magic `MLRN`, version 1, the shape, p, the agreement sums, the token count, then harm, exposure and levels),
-written with the stand-in tune file's saves (every 4096 learning steps, each request's end, the engine's end) and read at start when its shape
-matches the model.
+The mask's depth is two numbers: p (the share) and g, the fraction of the masked experts allowed at level 2 (all ranks). Level 2 now goes only to
+the graduated pairs, at most round(g x masked) per layer, the lowest rates first. g starts at the loaded table's level-2 share (so a restart
+changes nothing), else 0.25.
 
-Request line: `ds4: request: mask learn: p <p>, <m> masked (<a> at all ranks), re-check D mean <d> (<n>), <k> experts scored`.
-Start line: `ds4: DS4_MASK=learn: the saved table | a fresh table, p 0.050 (<pack>/mask-learn.bin)`.
+Depth balanced by a speed test (`STRATA_ROUTE_BUDGET_AUTO` on, the default with the stand-ins): with the mask learner on, budget tests and mask
+tests alternate (a mask test follows each budget test). A mask test is the budget test's method on (p, g): two interleaved arms over the same
+decode stretch at the request's budget, the base (p, g) against one step deeper or shallower (p +/- 0.025, g +/- 0.1, clamped to p 0.025..0.95,
+g 0..1), shallower first. Both arms run the same budget, so only the masks differ. The arms' levels are computed once at the test's start; each
+arm's rows go to the device when the arm changes (only the layers whose row differs; `mask_host` follows), and the exact re-run stays unmasked.
+A win (candidate at >= 1.02 x the base's speed, the same quality rule) keeps the candidate's (p, g); the test's end recomputes the levels and
+uploads them. While a mask test runs, p does not move (the harm and exposure keep learning). The stage machine is the budget test's: a win keeps
+the direction, a loss tries the other, both lost: the other direction first next round. A mask test does not move the budget b.
+
+Persistence: `<pack>/mask-learn.bin` (magic `MLRN`, version 3, the shape, p, the agreement sums, the re-checks' split, the token count, g, then
+harm, exposure and levels; versions 1 and 2 load with g computed from their levels), written with the stand-in tune file's saves (every 4096
+learning steps, each request's end, each mask test's end, the engine's end) and read at start when its shape matches the model.
+
+Request lines: `ds4: request: mask learn: p <p>, g <g>, <m> masked (<a> at all ranks), re-check D mean <d> (<n>), <k> experts scored`, and at each
+mask test's end `ds4: request: auto mask test (<p>,<g>) vs (<p>,<g>): <x> vs <y> tok/s over <a>+<b> tokens -> (<p>,<g>); flips/100 tok <f> vs <f>
+(<n> vs <n> re-checks)` (candidate first; a loss on quality adds `, quality lost`).
+Start line: `ds4: DS4_MASK=learn: the saved table | a fresh table, p 0.050, g 0.250 (<pack>/mask-learn.bin)`.
 
 Limits: an expert that is never replaced has no exposure, so its rate is 0 and it is a candidate by its low use; it is learned only once it is
 masked. The exposure counts re-checked tokens too (the spec counted only the others, which would bias the rate upward). The engine's "auto"

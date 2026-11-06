@@ -15,6 +15,9 @@
 //    candidate wins at >= 1.02 times the base's speed (tokens per second); then b moves to it.
 //  - The BRAKE gives each request its own budget req_b, which the arms scale.  Re-check flips in a request cut req_b (Wilson 90%
 //    bounds decide, so a few flips do not act); clean stretches grow it back.
+//  - With the mask learner on (DS4_MASK=learn), every other test is a MASK test: the same interleaved arms, both at req_b, the arms being
+//    the mask's levels for the base (p, g) and for a candidate one step deeper or shallower.  The model decides the step and what a win
+//    keeps (begin / end hooks); this header only schedules it and reports the verdict.  A mask test does not move b.
 // k (the close-call factor) learns from the flips of every 50 re-checks.
 //
 // State that outlives a process is kept in a text file (save / load): lines "budget", "k", "step", "clean", "tests", "lastwin".
@@ -24,7 +27,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
+#include <utility>
 
 namespace strata::ds4 {
 
@@ -55,8 +60,24 @@ public:
         return arm_budget();
     }
 
+    // STRATA_MASK=learn: mask tests alternate with the budget tests.  begin() starts a mask test when it can (false: none testable now,
+    // the budget test runs instead); end() gets the verdict (won: keep the candidate's (p, g)).  Call once, after configure().
+    struct MaskEnd {
+        bool won = false, quality = true;          ///< the speed rule (candidate >= 1.02 x base) and the quality rule
+        double sb = 0.0, sc = 0.0;                 ///< base and candidate tokens per second
+        double pb = 0.0, pc = 0.0;                 ///< base and candidate flips per token
+        long long tok[2] = {0, 0}, rc[2] = {0, 0}; ///< tokens and re-checks per arm (0 base, 1 candidate)
+    };
+    void mask_learn(std::function<bool()> begin, std::function<void(const MaskEnd&)> end) {
+        mask_begin_ = std::move(begin);
+        mask_end_ = std::move(end);
+        mask_ok_ = true;
+    }
+
     float k() const { return k_; }
     float b() const { return b_; }           ///< the base budget (the search's b)
+    bool mask_testing() const { return mask_testing_; }   ///< the running test is a mask test
+    int arm() const { return arm_; }                      ///< the arm of the token being run (valid after budget_for_next_token)
     float req_b() const { return req_b_; }   ///< this request's budget (the base arm's)
 
     // After a decode token.  secs: its wall time, a re-run included.  rechecked: stand-ins were taken and the gap test sent it to a
@@ -169,6 +190,13 @@ private:
     int run_left_ = 0;                 ///< tokens left in the current run
     int run_arm_ = 0;                  ///< the current run's arm
     int arm_ = 0;                      ///< the arm of the token being run (set by budget_for_next_token)
+    bool mask_testing_ = false;        ///< the running test is a mask test (both arms at req_b; the model's levels differ per arm)
+
+    // ---- the mask learner's hooks (mask_learn) ----
+    bool mask_ok_ = false;             ///< the mask learner is on: the tests alternate
+    bool mask_next_ = false;           ///< the next test is a mask test (set when a budget test ends)
+    std::function<bool()> mask_begin_;
+    std::function<void(const MaskEnd&)> mask_end_;
 
     // ---- the brake (per request) ----
     bool brake_on_ = true;
@@ -206,19 +234,24 @@ private:
 
     // The budget of the arm of the token being run: the base arm runs at req_b, the candidate at req_b * s^d (clamped; 0 stays 0).
     float arm_budget() const {
-        if (arm_ == 0 || req_b_ <= 0.0f) return req_b_;
+        if (arm_ == 0 || req_b_ <= 0.0f || mask_testing_) return req_b_;   // (a mask test runs both arms at req_b)
         return clamp_b((double) req_b_ * std::pow((double) step_, (double) dir_));
     }
 
-    // Starts a test of direction d at the base b: the arms' counts and times are cleared.
-    void begin_test(int d) {
-        dir_ = d;
-        cand_b_ = clamp_b((double) b_ * std::pow((double) step_, (double) d));
+    // Clears the arms' counts and times and starts the running test.
+    void reset_arms() {
         n_[0] = n_[1] = tok_[0] = tok_[1] = rc_[0] = rc_[1] = fl_[0] = fl_[1] = 0;
         secs_[0] = secs_[1] = 0.0;
         runs_ = 0;
         run_left_ = 0;
         testing_ = true;
+    }
+
+    // Starts a budget test of direction d at the base b.
+    void begin_test(int d) {
+        dir_ = d;
+        cand_b_ = clamp_b((double) b_ * std::pow((double) step_, (double) d));
+        reset_arms();
     }
 
     // The next direction: a win moves b to the candidate and tests that direction first next round; a loss tests the other direction
@@ -240,6 +273,13 @@ private:
     // clamps to the base is not tested, nor is one above the ceiling (2 * b_clean, or 2 * b0 while none is learned).  Each call tries
     // both directions at most once; when neither can be tested the token runs the base arm unscheduled.
     void schedule() {
+        if (!testing_ && mask_next_) {   // STRATA_MASK=learn: after a budget test, the mask's depth is tested when it can be now
+            mask_next_ = false;
+            if (mask_begin_ && mask_begin_()) {
+                mask_testing_ = true;
+                reset_arms();
+            }
+        }
         for (int tries = 0; !testing_ && tries < 2; ++tries) {
             const int d = stage_ == 0 ? first_ : -first_;
             const double cand = clamp_d((double) b_ * std::pow((double) step_, (double) d), 0.02, 4.0);
@@ -328,9 +368,27 @@ private:
         wilson90(fl_[1], tok_[1], cand_lo, cand_hi);
         const bool enough = tok_[0] >= kAutoTokMin && tok_[1] >= kAutoTokMin;
         const bool quality = !(enough && (cand_lo > base_hi || (pc > 1.5 * pb && fl_[1] >= kBrakeFlips)));
+        const bool won = sc >= sb * 1.02 && quality;
+        if (mask_testing_) {   // a mask test decides the mask's (p, g); the budget's state does not move
+            MaskEnd r;
+            r.won = won;
+            r.quality = quality;
+            r.sb = sb;
+            r.sc = sc;
+            r.pb = pb;
+            r.pc = pc;
+            for (int a = 0; a < 2; ++a) {
+                r.tok[a] = tok_[a];
+                r.rc[a] = rc_[a];
+            }
+            mask_testing_ = false;
+            testing_ = false;
+            mask_next_ = false;   // a budget test next
+            if (mask_end_) mask_end_(r);
+            return;
+        }
         if (tok_[1] >= kCleanTok && 100.0 * (double) fl_[1] <= 0.5 * (double) tok_[1] && (double) cand_b_ > b_clean_)
             b_clean_ = (double) cand_b_;
-        const bool won = sc >= sb * 1.02 && quality;
         if (won) {
             if (d == last_win_) step_ = std::min(step_ * 1.25f, 2.0f);
             last_win_ = d;
@@ -341,6 +399,7 @@ private:
         next_stage(won, d);
         testing_ = false;
         ++tests_;
+        mask_next_ = mask_ok_;   // with the mask learner on, the next test is a mask test
     }
 };
 
