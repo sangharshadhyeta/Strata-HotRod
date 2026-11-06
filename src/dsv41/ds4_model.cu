@@ -13147,7 +13147,8 @@ struct Model::Impl {
             const bool lrn = learn_on && T == 1 && !l.mtp && !standin_bypass;   // (DS4_STANDIN_LEARN: the layer's pair table and record)
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr, &rmp,
+                          // (the flip re-check's exact re-run, standin_bypass, runs without the mask too: 6 Nov review - it was masked)
+                          na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr, standin_bypass ? nullptr : &rmp,
                           lrn ? d_pair_c + (size_t) l.il * g.n_exp * g.n_exp : nullptr, lrn ? d_cap_rec + (size_t) 4 * l.il : nullptr,
                           lrn && bal_on ? d_pair_err + (size_t) l.il * g.n_exp * g.n_exp : nullptr);   // (stand-ins: decode tokens of the trunk only)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;

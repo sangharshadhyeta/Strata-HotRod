@@ -1693,6 +1693,10 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         }
         __syncthreads();
     }
+    __shared__ int premask[kPicks];   // (the router's own picks before the mask: a moved pick's risk below)
+    if (threadIdx.x == 0)
+        for (int r = 0; r < k; ++r) premask[r] = pick[r];
+    __syncthreads();
     if (rm.m != nullptr) {   // DS4_MASK: the masked picks move first; the stand-ins then see the router's picks as they are now
         route_mask_apply(rm, logits, n, k, bs, pick, bv, bi, mcand, &n_mc, &mwant, &mmoved);
         if (threadIdx.x == 0 && mmoved > 0 && rm.moved != nullptr) atomicAdd(rm.moved, (unsigned long long) mmoved);
@@ -1763,6 +1767,13 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 took = 1;
                 risk += wk[r] * xr;
             }
+            // DS4_MASK: a pick the mask moved is a substitution too - its w x gap joins the token's risk, so the flip re-check also
+            // catches the close calls the mask makes (6 Nov review: mask moves were invisible to it)
+            for (int r = 0; r < k; ++r)
+                if (orig[r] != premask[r]) {
+                    risk += wk[r] * fmaxf(0.0f, logits[premask[r]] - logits[orig[r]]);
+                    took = 1;
+                }
             if (t < kWin && took) {   // (over the token's layers: the host clears them when a decode token starts)
                 sti->used[t] = 1;
                 sti->risk[t] += risk;
