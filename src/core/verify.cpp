@@ -6426,6 +6426,9 @@ struct MaskLearnState {
     bool mt_on = false;
     int mt_d = -1, mt_cur = -1, mt_first = -1, mt_stage = 0;
     int mt_win_d = 0;                // the direction of an unconfirmed win (0: none): a move needs two wins in a row
+    double mt_step = 1.0;            // the step's multiple (p step kMtStepP x it, g step kMtStepG x it): x2 after a move in the same direction
+    int mt_last_move = 0;            // as the last move (to 8), halved after a loss (to 1) - the budget test's growing step (7 Nov: from 0.35 the
+                                     // fixed 0.025 steps needed ~44 winning tests to reach the depth the live run had found)
     double mt_cand_p = 0.0, mt_cand_g = 0.0;
     std::vector<uint8_t> mt_lv[2];
     double ag_ok = 0.0, ag_tot = 0.0;
@@ -6821,8 +6824,8 @@ bool mask_test_begin() {
     MaskLearnState& s = *g_mlr;
     for (int tries = 0; tries < 2; ++tries) {   // the two directions of the stage machine: one of them may be at a bound
         const int d = s.mt_stage == 0 ? s.mt_first : -s.mt_first;
-        const double cp = std::min(kMlPMax, std::max(kMlPMin, s.p + kMtStepP * d));
-        const double cg = std::min(1.0, std::max(0.0, s.g + kMtStepG * d));
+        const double cp = std::min(kMlPMax, std::max(kMlPMin, s.p + kMtStepP * s.mt_step * d));
+        const double cg = std::min(1.0, std::max(0.0, s.g + kMtStepG * s.mt_step * d));
         if (cp != s.p || cg != s.g) {
             s.mt_d = d;
             s.mt_cand_p = cp;
@@ -6863,8 +6866,11 @@ bool mask_test_end(bool won, double out[4]) {
         s.g = s.mt_cand_g;
         moved = true;
         s.mt_win_d = 0;
+        if (s.mt_d == s.mt_last_move) s.mt_step = std::min(8.0, s.mt_step * 2.0);   // a second move the same way: bigger steps
+        s.mt_last_move = s.mt_d;
     } else {
         s.mt_win_d = won ? s.mt_d : 0;
+        if (!won) s.mt_step = std::max(1.0, s.mt_step * 0.5);   // a loss: smaller steps near the best depth
     }
     mt_next_stage(s.mt_first, s.mt_stage, won, s.mt_d);   // (a win, confirmed or not, tests the same direction next)
     s.mt_on = false;
