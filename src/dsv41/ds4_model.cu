@@ -3746,8 +3746,15 @@ struct Model::Impl {
                 return;
             }
         cudaSetDevice(devs[(size_t) L[0].dev].id);
+        // STRATA_LA_EXACT_W (Qwen's la_learn_alloc reads it the same way; 1: off): the loss weight of a true pick below the stand-in floor,
+        // which is STRATA_ROUTE_RESIDENT_RANKS as standin_init reads it.  lo (3) is the learner's own scoring floor, unchanged.
+        const char* ew = std::getenv("STRATA_LA_EXACT_W");
+        float exact_w = ew != nullptr ? (float) std::atof(ew) : 1.0f;
+        if (!(exact_w > 0.0f)) exact_w = 1.0f;
+        const char* rr = std::getenv("STRATA_ROUTE_RESIDENT_RANKS");
+        const int exact_floor = std::max(0, rr != nullptr ? (int) std::atof(rr) : 3);
         std::string msg;
-        if (!la::alloc(g.nl, g.dim, g.n_exp, 3, msg)) {
+        if (!la::alloc(g.nl, g.dim, g.n_exp, 3, exact_floor, exact_w, msg)) {
             std::fprintf(stderr, "ds4: look-ahead learner: off (%s)\n", msg.c_str());
             return;
         }
@@ -13045,7 +13052,8 @@ struct Model::Impl {
         } else if (!forward_serial(p0, T, err)) return false;
         if (la_win) {   // the window's batch on the learner's side stream, after the window's last layer
             try {
-                la::post_launch(devs[(size_t) L[0].dev].st, 1);
+                // DS4_MASK=learn's levels (the base the mask updates in place); nullptr when not learning or no mask
+                la::post_launch(devs[(size_t) L[0].dev].st, 1, mask_learn_on && d_mask != nullptr ? d_mask : nullptr);
             } catch (const std::exception& e) {
                 err = std::string("look-ahead learner: ") + e.what();
                 return false;

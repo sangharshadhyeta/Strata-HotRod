@@ -212,6 +212,12 @@ mask test's end `ds4: request: auto mask test (<p>,<g>) vs (<p>,<g>): <x> vs <y>
 (<n> vs <n> re-checks)` (candidate first; a loss on quality adds `, quality lost`).
 Start line: `ds4: DS4_MASK=learn: the saved table | a fresh table, p 0.050, g 0.250 (<pack>/mask-learn.bin)`.
 
+The look-ahead learner's loss follows the same two rules as Qwen's (3829bb7e, `ds4_lalearn.cu` `la_b_grad_k`): `STRATA_LA_EXACT_W=<w>` (default 1,
+off) weighs a true top-32 pick below the stand-in floor (rank < `STRATA_ROUTE_RESIDENT_RANKS`, default 3: the ones a miss reads exactly) w times as
+much as the rest of the top 32; and under `DS4_MASK=learn` an expert at level 2 in its target layer (the layer whose router logits are the row's
+label, `m = s + dist`) gets no gradient, the device levels passed to `post_launch` in place. The floor is read as `standin_init` reads it; the
+learner's own scoring floor (3, `lo`) is unchanged. Unset and no `DS4_MASK=learn`: the training is bit-identical to before.
+
 Limits: an expert that is never replaced has no exposure, so its rate is 0 and it is a candidate by its low use; it is learned only once it is
 masked. The exposure counts re-checked tokens too (the spec counted only the others, which would bias the rate upward). The engine's "auto"
 share does not exist in this tree, so p's self-tuning is this mode's own.

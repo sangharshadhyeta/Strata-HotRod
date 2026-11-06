@@ -15,8 +15,10 @@ constexpr int kDist[] = {1, 2, 4};   // the look-ahead distances: 1 and 2 are pu
 constexpr int kNd = 3;               // entries in kDist
 
 // Allocates the learner for n_layers trunk layers of n_embd inputs and n_exp routed experts each (n_exp <= 512; the rows are padded
-// to 512 with experts that are never scored).  lo: the true top-k's floor (a true pick below it is scored).  The current device.
-bool alloc(int n_layers, int n_embd, int n_exp, int lo, std::string& msg);
+// to 512 with experts that are never scored).  lo: the true top-k's floor (a true pick below it is scored).  exact_floor: the stand-in
+// floor rank (STRATA_ROUTE_RESIDENT_RANKS); exact_w: STRATA_LA_EXACT_W, the loss weight of a true pick below exact_floor (1: off).
+// The current device.
+bool alloc(int n_layers, int n_embd, int n_exp, int lo, int exact_floor, float exact_w, std::string& msg);
 bool active();
 // Frees the learner's device memory, streams and events (the file is not written: save first).
 void release();
@@ -31,8 +33,9 @@ void forward(int s, int dist, const float* x, float* gl, int n, cudaStream_t cs)
 void label(int l, const float* glog, int n, cudaStream_t cs);
 // Before a decode window's first layer is enqueued on cs: waits for the previous window's batch.
 void pre_launch(cudaStream_t cs);
-// After a decode window's last layer is enqueued on cs: the batch on the side stream (after the window's end).
-void post_launch(cudaStream_t cs, int n);
+// After a decode window's last layer is enqueued on cs: the batch on the side stream (after the window's end).  mask: DS4_MASK=learn's
+// device levels [nl][n_exp] (the base; it is updated in place): an expert at level 2 in its target layer gets no loss weight.  nullptr: none.
+void post_launch(cudaStream_t cs, int n, const unsigned char* mask);
 
 // The per-(layer, dist) state: the leader slot, the picks and each slot's all-time hits (slot 0 is the plain router).
 // Waits for the last batch.  False when the learner is off or dist is not in kDist.

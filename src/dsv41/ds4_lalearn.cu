@@ -150,6 +150,10 @@ struct LaBatch {
     unsigned long long* rinfo;   // [Nsd][4]: the last reset's recent picks, plain hits, old leader's hits, old leader's slot
     int dist[kNd];
     int L, H, lo, n, Nd, Nsd, Nset;
+    float exact_w;               // STRATA_LA_EXACT_W: the weight of a true pick below the stand-in floor in the loss (1: as the rest)
+    int flo;                     // the stand-in floor rank (STRATA_ROUTE_RESIDENT_RANKS): the ranks below it are the ones read exactly
+    const unsigned char* mask;   // [L][E]: DS4_MASK's levels (ml_lv: 2 = masked at every rank); nullptr: no mask, or not learning
+    int E;                       // the mask's row stride (the real experts)
 };
 // the true rank of each expert (ties by index) and the true 32nd logit: grid (n, L), a thread per padded expert
 __global__ void la_b_rank_k(LaBatch a) {
@@ -217,6 +221,12 @@ __global__ void la_b_grad_k(LaBatch a) {   // grid (n, Nset), block 512
     const float mP = la_block_sum(top ? p : 0.0f, sh) / 32.0f;
     const float mT = la_block_sum(top ? tv : 0.0f, sh) / 32.0f;
     float g = top ? (2.0f / 32.0f) * ((p - mP) - (tv - mT)) : (p > a.thr[row] - 0.1f ? 1.0f / 480.0f : 0.0f);
+    // STRATA_LA_EXACT_W (a.exact_w, 1: off): the true picks below the stand-in floor (ranks 0 .. flo-1, the ones a miss reads from RAM or
+    // the SSD) weigh w times as much as the rest of the top 32 (Qwen's la_b_grad_k, the placement solver's rank weighting)
+    if (top && a.rk[row * kE + e] < a.flo) g *= a.exact_w;
+    // DS4_MASK=learn: an expert at level 2 (masked at every rank, never routed or read) has no weight in the loss.  m is the TARGET layer
+    // (the layer whose label row this is); level 1 stays in the loss.  Padding (e >= E) has no row in the mask: no gradient either way.
+    if (a.mask != nullptr && e < a.E && a.mask[(size_t) m * a.E + e] == 2) g = 0.0f;
     g /= (float) a.n;
     a.g[((size_t) z * kTok + t) * kE + e] = g;
     for (int k = 0; k < r; ++k) P[k][e] = g * a.B[c][(size_t) sd * kE * r + e * r + k];
@@ -370,6 +380,8 @@ __global__ void la_res_k(const unsigned long long* const* tabs, int* res, int E)
 
 struct LaLearn {
     int L = 0, H = 0, E = 0, lo = 3, Nd = kNd, Nsd = 0, Nset = 0;
+    float exact_w = 1.0f;        // STRATA_LA_EXACT_W (see la_b_grad_k)
+    int flo = 3;                 // the stand-in floor rank for exact_w
     bool pending = false;        // a batch was launched and its done event is not yet waited on by a launch
     bool tabs_set = false;       // set_resident_tables was called
     cudaStream_t side = nullptr; // the batch's stream (non-blocking): never the stream the host waits on at a window's end
@@ -427,7 +439,7 @@ void free_learner(LaLearn* s) {
 
 }  // namespace
 
-bool alloc(int n_layers, int n_embd, int n_exp, int lo, std::string& msg) {
+bool alloc(int n_layers, int n_embd, int n_exp, int lo, int exact_floor, float exact_w, std::string& msg) {
     if (g_la != nullptr) { msg = "already on"; return true; }
     if (n_layers <= 0 || n_embd <= 0 || n_exp <= 0 || n_exp > kE) { msg = "bad shape"; return false; }
     LaLearn* s = new LaLearn();
@@ -435,6 +447,8 @@ bool alloc(int n_layers, int n_embd, int n_exp, int lo, std::string& msg) {
     s->H = n_embd;
     s->E = n_exp;
     s->lo = lo;
+    s->flo = exact_floor;
+    s->exact_w = exact_w > 0.0f ? exact_w : 1.0f;
     s->Nsd = kNd * s->L;
     s->Nset = s->Nsd * kNSlots;
     bool ok = true;
@@ -577,7 +591,7 @@ void pre_launch(cudaStream_t cs) {
 }
 
 // after a learning window's graph is launched on cs: the batch on the side stream, which waits for the window's end and records done
-void post_launch(cudaStream_t cs, int n) {
+void post_launch(cudaStream_t cs, int n, const unsigned char* mask) {
     if (!active() || n < 1 || n > kTok || !g_la->tabs_set) return;
     LaLearn& s = *g_la;
     cudaEventRecord(s.ev_end, cs);
@@ -594,6 +608,7 @@ void post_launch(cudaStream_t cs, int n) {
     a.cnt = s.cnt; a.nwin = s.nwin; a.rinfo = s.rinfo;
     for (int i = 0; i < kNd; ++i) a.dist[i] = kDist[i];
     a.L = s.L; a.H = s.H; a.lo = s.lo; a.n = n; a.Nd = kNd; a.Nsd = s.Nsd; a.Nset = s.Nset;
+    a.exact_w = s.exact_w; a.flo = s.flo; a.mask = mask; a.E = s.E;
     strata_ds4_launch(la_b_rank_k, dim3(n, s.L), kE, 0, sd_s, a);
     strata_ds4_launch(la_b_score_k, dim3(n, s.Nsd, kSlots), kE, 0, sd_s, a);
     strata_ds4_launch(la_b_prep_k, dim3((s.Nset + 63) / 64), 64, 0, sd_s, a);
