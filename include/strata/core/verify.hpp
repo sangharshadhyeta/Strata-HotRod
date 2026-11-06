@@ -34,6 +34,7 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <memory>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -261,6 +262,21 @@ public:
     /// (false with msg when there is none); la_learn_request_end(path, report) saves it to path (when not empty) and returns the stats
     /// line(s) for the request's log.  Both are no-ops when the feature is off.
     static bool la_learn_on();
+    /// STRATA_STANDIN_LEARN=1 (opt-in; needs STRATA_FRAGILE_RECHECK; whole model on one GPU, else off): each stand-in learns a correction
+    /// for its (layer, true expert, stand-in) pair from the flip re-checks (y_s of the cut window, y_e of the exact successor).
+    /// standin_learn_active(): the buffers exist.  _open / _save: the pairs of this model (file in data/, see generate.cpp).  _cut(r): the
+    /// window was cut at row r (after route_fragile_cut).  _settle(exact_ok): after the exact successor (with route_fragile_settle).
+    /// _report: the request's stats line (and the counts reset).
+    bool standin_learn_active() const;
+    bool standin_learn_open(const std::string& path, std::string& msg);
+    bool standin_learn_save(const std::string& path, std::string& msg) const;
+    void standin_learn_cut(int row);
+    void standin_learn_settle(bool exact_ok);
+    std::string standin_learn_report();
+private:
+    void standin_learn_fill_table();
+    void standin_learn_begin_window(bool decode, bool exact);
+public:
     /// STRATA_LA_LEARN unset (auto): the serve start reports whether a learned predictor file exists, before init allocates
     static void la_learn_set_saved(bool saved);
     static bool la_learn_open(const std::string& path, std::string& msg);
@@ -735,6 +751,14 @@ private:
     float* dyn_gap_ = nullptr;         ///< STRATA_ROUTE_BUDGET_DYN: the head's top-1 minus top-2 raw logit per row (T floats; off: none)
     int32_t* dyn_top1_ = nullptr;      ///< STRATA_FRAGILE_RECHECK: the head's top-1 id per row (T ints; off: none); flips are judged on it
     float* row_shift_ = nullptr;       ///< STRATA_FRAGILE_RECHECK: per row, the stand-ins' moves this stage's layers made (T floats; off: none)
+    // STRATA_STANDIN_LEARN (opt-in, whole model on one GPU, needs STRATA_FRAGILE_RECHECK; null when off): the stand-in corrections
+    float* lrn_c_ = nullptr;           ///< device [n_layers][512][512]: the learned weight scale per (layer, true expert e, stand-in s); 1 until ready
+    int32_t* lrn_rec_ = nullptr;       ///< device [T][4]: each row's first stand-in (layer, rank, true expert, stand-in); layer -1 none (reset per decode window)
+    float* lrn_ys_ = nullptr;          ///< device [T][N]: the cut window's stand-in down output per row (y_s)
+    float* lrn_ye_ = nullptr;          ///< device [N]: the exact re-run's true-expert down output (y_e) at the pending layer
+    int32_t* lrn_gate_ = nullptr;      ///< device [4]: mode (0 off, 1 capture y_s, 2 capture y_e), layer, rank
+    struct StandinLearnState;
+    std::shared_ptr<StandinLearnState> lrn_st_;   ///< host: the pairs, the pending sample, this request's counts (verify.cpp)
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

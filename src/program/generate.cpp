@@ -12387,6 +12387,27 @@ int main(int argc, char** argv) {
             else
                 std::fprintf(stderr, "strata serve: drafter look-ahead learner: starts from the plain router (%s)\n", lm.c_str());
         }
+        // STRATA_STANDIN_LEARN: the learned stand-in corrections of this model (standin-learn-<hex>.bin beside the stand-in tuning), loaded
+        // before the first request and saved at each request's end
+        std::string standin_learn_file;
+        if (ver.standin_learn_active()) {
+            const std::string tune = standin_tune_path(o);
+            strata::core::SessionFileIdentity sid;
+            std::string se;
+            if (tune.empty())
+                std::fprintf(stderr, "strata serve: stand-in learn: nothing kept (no expert profile directory)\n");
+            else if (session_identity(sid, se, {})) {
+                char hex[17];
+                std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) sid.model);
+                standin_learn_file = (std::filesystem::path(tune).parent_path() / ("standin-learn-" + std::string(hex) + ".bin")).string();
+                std::string lm;
+                if (ver.standin_learn_open(standin_learn_file, lm))
+                    std::fprintf(stderr, "strata serve: stand-in learn: loaded %s (%s)\n", standin_learn_file.c_str(), lm.c_str());
+                else
+                    std::fprintf(stderr, "strata serve: stand-in learn: starts empty (%s)\n", lm.c_str());
+            } else
+                std::fprintf(stderr, "strata serve: stand-in learn: not kept (%s)\n", se.c_str());
+        }
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -16028,6 +16049,7 @@ int main(int argc, char** argv) {
                     int32_t ex_top1 = -1;
                     const bool ex_ok = ver.route_fragile_gaps(1, &ex_gap, &ex_top1);
                     strata::core::Verifier::route_fragile_settle(ex_ok, ex_top1);
+                    ver.standin_learn_settle(ex_ok);   // STRATA_STANDIN_LEARN: the exact successor's y_e makes the sample (no-op when off)
                     if (rb_on) {   // STRATA_ROLLBACK: a brake in this settle rewinds at this window's end (below)
                         int64_t bf = -1, bl = -1;
                         float bo = 0.0f, bn = 0.0f;
@@ -16052,6 +16074,7 @@ int main(int argc, char** argv) {
                         if (r >= 1) {
                             const float ratio = fr_shift[(size_t) r] > 0.0f ? fr_gap[(size_t) r] / fr_shift[(size_t) r] : 0.0f;
                             strata::core::Verifier::route_fragile_cut(ratio, fr_top1[(size_t) r], fr_explore, fr_control);
+                            ver.standin_learn_cut(r);   // STRATA_STANDIN_LEARN: the cut row's first stand-in and its y_s (no-op when off)
                             if (rb_on) strata::core::Verifier::route_fragile_pos(produced_n + r);   // STRATA_ROLLBACK: row r's token position
                             fr_cut = r;
                         }
@@ -16804,6 +16827,12 @@ int main(int argc, char** argv) {
                 std::string la_rep;
                 strata::core::Verifier::la_learn_request_end(la_learn_path, la_rep);
                 std::fputs(la_rep.c_str(), stderr);
+            }
+            if (ver.standin_learn_active()) {   // STRATA_STANDIN_LEARN: the pairs are saved, and the request's stats line
+                std::string lm;
+                if (!standin_learn_file.empty() && !ver.standin_learn_save(standin_learn_file, lm))
+                    std::fprintf(stderr, "strata serve: stand-in learn: cannot save %s (%s)\n", standin_learn_file.c_str(), lm.c_str());
+                std::fputs(ver.standin_learn_report().c_str(), stderr);
             }
             // STRATA_LA_EDGE_SKIP (opt-in =1 since 24 Oct): the decode look-ahead's rank lo-1 predictions that a resident stand-in
             // within the edge covers, not read ahead, since the previous request (the device counter is taken and zeroed here)

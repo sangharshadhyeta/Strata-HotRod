@@ -65,7 +65,12 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr,
                            const uint8_t* ring = nullptr, const uint8_t* cheap = nullptr, unsigned long long* bstats = nullptr,
-                           float* row_shift = nullptr);
+                           float* row_shift = nullptr, const float* pair_c = nullptr, int32_t* lrn_rec = nullptr, int layer = 0);
+/// STRATA_STANDIN_LEARN: pair_c = the layer's [512][512] correction (nullptr: none); lrn_rec = nullptr or the rows' [n][4] first-stand-in
+/// records (layer, rank, true expert, stand-in; layer -1 until set, the host resets them per window); layer = this layer's index.
+/// native_learn_capture: the layer's per-row down outputs for the learner, device-gated by gate[0..2] (see verify.cpp / native_router.cu).
+void native_learn_capture(const float* parts, int K, int N, int n, int layer, const int32_t* gate, const int32_t* rec, float* ys,
+                          float* ye, bool row0, void* stream);
 /// STRATA_FRAGILE_RECHECK: nullptr or n_tok floats, zeroed by the caller before the window; each replaced pick adds its router
 /// weight times max(gap, 0) to its row (gap: the pick's logit minus the stand-in's).  Off: nullptr, and the kernel adds nothing.
 /// STRATA_RING (the look-ahead ring): one byte per (layer, expert) on the device, 1 while a Foresight ring slot holds the expert and

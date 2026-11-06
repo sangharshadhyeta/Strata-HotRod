@@ -389,7 +389,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl,
                                  const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap, float cheap_margin,
                                  int cheap_rank0, int cheap_anytier, unsigned long long* __restrict__ bstats,
-                                 float* __restrict__ row_shift) {
+                                 float* __restrict__ row_shift, const float* __restrict__ pair_c,
+                                 int32_t* __restrict__ lrn_rec, int layer) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -463,6 +464,9 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     __syncwarp();   // lane 0's writes to the ids and weights are what the other lanes read next
     int32_t my[10];
     for (int r = 0; r < 10; ++r) my[r] = id[r];
+    // STRATA_STANDIN_LEARN: the router's picks (orig) and the stand-in each swapped rank took (sub_s, -1: none)
+    int32_t orig[10], sub_s[10];
+    for (int r = 0; r < 10; ++r) { orig[r] = my[r]; sub_s[r] = -1; }
     // STRATA_RING: an expert whose look-ahead ring copy has landed counts as resident (the host plan finds it in the ring)
     auto have = [&](int f) { return res[f] >= 0 || (ring != nullptr && ring[f] != 0); };
     int swaps = 0, tail = 0, before = 0;
@@ -559,7 +563,15 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             // the stand-in (the quantity the budget test uses), summed over the layers and the picks of the row (read by the host)
             if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f));
             my[r] = bi;
+            sub_s[r] = bi;
             ++swaps;
+            // STRATA_STANDIN_LEARN: this row's first stand-in (layer, rank, true expert, stand-in); the buffer is reset each decode window
+            if (lane == 0 && lrn_rec != nullptr && lrn_rec[(size_t) t * 4] < 0) {
+                lrn_rec[(size_t) t * 4] = layer;
+                lrn_rec[(size_t) t * 4 + 1] = r;
+                lrn_rec[(size_t) t * 4 + 2] = orig[r];
+                lrn_rec[(size_t) t * 4 + 3] = bi;
+            }
             if (lane == 0 && cheap != nullptr && r < 2) ++cheap_subs;
         }
     }
@@ -573,6 +585,10 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             float ex[10], sum = 0.0f;
             for (int r = 0; r < 10; ++r) { ex[r] = expf(l[my[r]] - m); sum += ex[r]; }
             for (int r = 0; r < 10; ++r) weights[(size_t) t * 10 + r] = ex[r] / sum;
+            // STRATA_STANDIN_LEARN: a stand-in's weight is scaled by its pair's learned correction (1 until the pair is ready)
+            if (pair_c != nullptr)
+                for (int r = 0; r < 10; ++r)
+                    if (sub_s[r] >= 0) weights[(size_t) t * 10 + r] *= pair_c[(size_t) orig[r] * 512 + sub_s[r]];
         }
         for (int r = 0; r < 10; ++r) id[r] = my[r];
         if (stats) {
@@ -728,7 +744,8 @@ void mtp_zc_mark(const int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* 
 }
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
-                           const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift) {
+                           const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift,
+                           const float* pair_c, int32_t* lrn_rec, int layer) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     // STRATA_ROUTE_RAM_FLOOR's safety: the stand-in for a rank 0-1 pick must be within STRATA_ROUTE_RAM_FLOOR_MARGIN logits (default 1,
     // the margin SPEC E1 found sound for rank 1), and rank 0 is replaced only with STRATA_ROUTE_RAM_FLOOR_RANK0=1 (off: it leaked
@@ -740,7 +757,37 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     static const int cheap_anytier = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_ANYTIER"); return v == nullptr || std::atoi(v) != 0 ? 1 : 0; }();
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
-        n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier, bstats, row_shift);
+        n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier, bstats, row_shift,
+        pair_c, lrn_rec, layer);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+// STRATA_STANDIN_LEARN (opt-in): the layer's down outputs of a window, per group of rows (parts [n][K][N], slot k = the router's rank k).
+// mode gate[0]: 1 copies, for each row i whose first stand-in is in this layer (rec[i][0] == layer), the output of the rank rec[i][1] (the
+// stand-in's y_s) into ys[i]; 2 copies row 0's output at rank gate[2] into ye when this layer is gate[1] (the exact re-run's y_e); 0 nothing.
+// Device-gated: the same launch is in every window's graph, and the host sets gate, rec and the buffers between windows only.
+namespace {
+__global__ void learn_capture_k(const float* __restrict__ parts, int K, int N, int n, int layer, const int32_t* __restrict__ gate,
+                                const int32_t* __restrict__ rec, float* __restrict__ ys, float* __restrict__ ye, int row0) {
+    const int i = (int) blockIdx.y;
+    const int d = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (d >= N || i >= n) return;
+    const int mode = gate[0];
+    if (mode == 1) {
+        const int32_t* r = rec + (size_t) i * 4;
+        if (r[0] != layer || r[1] < 0 || r[1] >= K) return;
+        ys[(size_t) i * N + d] = parts[((size_t) i * K + r[1]) * N + d];
+    } else if (mode == 2) {
+        if (!row0 || i != 0 || gate[1] != layer || gate[2] < 0 || gate[2] >= K) return;
+        ye[d] = parts[(size_t) gate[2] * N + d];
+    }
+}
+}  // namespace
+void native_learn_capture(const float* parts, int K, int N, int n, int layer, const int32_t* gate, const int32_t* rec, float* ys,
+                          float* ye, bool row0, void* stream) {
+    if (!parts || !gate || !rec || !ys || !ye || n < 1 || N < 1 || K < 1 || !stream) return;
+    const dim3 grid((unsigned) ((N + 255) / 256), (unsigned) n);
+    learn_capture_k<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(parts, K, N, n, layer, gate, rec, ys, ye, row0 ? 1 : 0);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

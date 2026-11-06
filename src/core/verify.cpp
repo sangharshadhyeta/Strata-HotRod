@@ -66,6 +66,7 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1072,6 +1073,249 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     return true;
 }
 
+// ---- STRATA_STANDIN_LEARN (opt-in).  A stand-in's output differs from the true expert's.  A flip re-check cuts the window at row r with
+// a stand-in (its first stand-in: layer l, rank k, true expert e, stand-in s).  The cut window captured y_s (the stand-in's down output at
+// layer l, rank k, per row); the exact successor (row 0, same position and prefix) captures y_e at the same layer and rank.  Per pair the
+// decayed least squares over the channels: num += y_s.y_e, den += y_s.y_s, ee += y_e.y_e (decay 0.98); c = num / den clipped to [0.5, 2],
+// used (the table's scale on the stand-in's weight) after kLrnReady samples, 1 before.  Pairs per layer: LRU of kLrnPerLayer.
+// The pairs persist across runs (standin-learn-<fp>.bin in data/).
+namespace {
+constexpr int kLrnPerLayer = 4096, kLrnReady = 32;
+constexpr double kLrnDecay = 0.98;
+constexpr uint32_t kLrnMagic = 0x4C535453u;   // "STSL"
+bool standin_learn_env() {
+    const char* e = std::getenv("STRATA_STANDIN_LEARN");
+    return e != nullptr && std::atoi(e) != 0;
+}
+uint64_t lrn_key(int64_t l, int64_t e, int64_t s) { return ((uint64_t) l << 40) | ((uint64_t) e << 20) | (uint64_t) s; }
+}  // namespace
+
+struct Verifier::StandinLearnState {
+    struct Pair {
+        double num = 0.0, den = 0.0, ee = 0.0;
+        int n = 0;
+        float c = 1.0f;
+        uint64_t used = 0;
+    };
+    struct Pending {   // the cut row's sample, copied at the cut (the next windows overwrite the device buffers)
+        bool valid = false;
+        int layer = -1, rank = -1, e = -1, s = -1;
+        std::vector<float> ys;
+    } pend;
+    std::unordered_map<uint64_t, Pair> pairs;
+    std::vector<int> count;      // pairs held per layer
+    uint64_t tick = 0;
+    bool table_ready = false;    // the device table holds the pairs' scales (filled at the first decode window)
+    int64_t dim = 0, layers = 0;
+    long long samples_req = 0;   // this request's samples (the stats line takes them)
+};
+
+// Sets the device table from the host pairs: 1 everywhere, the ready pairs' c.  Called once the table exists (the first decode window).
+void Verifier::standin_learn_fill_table() {
+    StandinLearnState& st = *lrn_st_;
+    const int64_t nl = st.layers;
+    std::vector<float> host((size_t) nl * 512 * 512, 1.0f);
+    for (const auto& kv : st.pairs) {
+        const StandinLearnState::Pair& p = kv.second;
+        const int64_t l = (int64_t) (kv.first >> 40), e = (int64_t) ((kv.first >> 20) & 0xFFFFFu), s = (int64_t) (kv.first & 0xFFFFFu);
+        if (p.n >= kLrnReady && l < nl && e < 512 && s < 512) host[((size_t) l * 512 + (size_t) e) * 512 + (size_t) s] = p.c;
+    }
+    const OnDevice on(device_);
+    if (cudaMemcpy(lrn_c_, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+    st.table_ready = true;
+}
+
+bool Verifier::standin_learn_active() const { return lrn_st_ != nullptr && lrn_gate_ != nullptr; }
+
+// Each decode window: the first-stand-in records are reset; the capture mode is 2 (the exact successor of a cut: y_e at the pending layer
+// and rank) or 1 (the stand-in windows: y_s per row).  Other windows: 0.  The gate is copied before the launch (device-gated, graph-safe).
+void Verifier::standin_learn_begin_window(bool decode, bool exact) {
+    if (lrn_st_ == nullptr) return;
+    StandinLearnState& st = *lrn_st_;
+    const OnDevice on(device_);
+    if (!st.table_ready) standin_learn_fill_table();
+    int32_t gate[4] = {0, 0, 0, 0};
+    if (decode) {
+        if (cudaMemset(lrn_rec_, 0xff, (size_t) max_t_ * 4 * sizeof(int32_t)) != cudaSuccess) (void) cudaGetLastError();
+        const bool y_e = exact && st.pend.valid;
+        gate[0] = y_e ? 2 : 1;
+        gate[1] = st.pend.layer;
+        gate[2] = st.pend.rank;
+    }
+    if (cudaMemcpy(lrn_gate_, gate, sizeof gate, cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+}
+
+// After a window cut at row `row` (the stand-in window, synced): the row's first stand-in and its y_s are kept on the host.
+void Verifier::standin_learn_cut(int row) {
+    if (lrn_st_ == nullptr || row < 0 || row >= max_t_) return;
+    StandinLearnState& st = *lrn_st_;
+    st.pend.valid = false;
+    const OnDevice on(device_);
+    int32_t rec[4] = {-1, -1, -1, -1};
+    if (cudaMemcpy(rec, lrn_rec_ + (size_t) row * 4, sizeof rec, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    if (rec[0] < 0) return;   // no stand-in in this row (a control re-check, or a window that moved none)
+    std::vector<float> ys((size_t) st.dim);
+    if (cudaMemcpy(ys.data(), lrn_ys_ + (size_t) row * st.dim, sizeof(float) * (size_t) st.dim, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    st.pend.valid = true;
+    st.pend.layer = rec[0];
+    st.pend.rank = rec[1];
+    st.pend.e = rec[2];
+    st.pend.s = rec[3];
+    st.pend.ys = std::move(ys);
+}
+
+// After the exact successor of a cut (its window ran, exact_ok): the sample (y_s, y_e) updates the pair.
+void Verifier::standin_learn_settle(bool exact_ok) {
+    if (lrn_st_ == nullptr) return;
+    StandinLearnState& st = *lrn_st_;
+    if (!st.pend.valid) return;
+    st.pend.valid = false;
+    if (!exact_ok) return;
+    const int64_t D = st.dim, n_exp = 512;
+    std::vector<float> ye((size_t) D);
+    {
+        const OnDevice on(device_);
+        if (cudaMemcpy(ye.data(), lrn_ye_, sizeof(float) * (size_t) D, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+    }
+    const std::vector<float>& ys = st.pend.ys;
+    double sxy = 0.0, sxx = 0.0, syy = 0.0;
+    for (int64_t d = 0; d < D; ++d) {
+        sxy += (double) ys[(size_t) d] * ye[(size_t) d];
+        sxx += (double) ys[(size_t) d] * ys[(size_t) d];
+        syy += (double) ye[(size_t) d] * ye[(size_t) d];
+    }
+    if (!std::isfinite(sxy) || !std::isfinite(sxx) || !std::isfinite(syy) || !(sxx > 0.0)) return;
+    const int64_t l = st.pend.layer, e = st.pend.e, s = st.pend.s;
+    if (l < 0 || l >= st.layers || e < 0 || e >= n_exp || s < 0 || s >= n_exp) return;
+    const uint64_t key = lrn_key(l, e, s);
+    if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
+    auto it = st.pairs.find(key);
+    if (it == st.pairs.end()) {
+        if (st.count[(size_t) l] >= kLrnPerLayer) {   // the layer's least recently used pair goes (its table entry back to 1)
+            auto old = st.pairs.end();
+            for (auto q = st.pairs.begin(); q != st.pairs.end(); ++q)
+                if ((int64_t) (q->first >> 40) == l && (old == st.pairs.end() || q->second.used < old->second.used)) old = q;
+            if (old != st.pairs.end()) {
+                if (old->second.n >= kLrnReady && st.table_ready) {
+                    const int64_t oe = (int64_t) ((old->first >> 20) & 0xFFFFFu), os = (int64_t) (old->first & 0xFFFFFu);
+                    const float one = 1.0f;
+                    const OnDevice on(device_);
+                    if (cudaMemcpy(lrn_c_ + ((size_t) l * 512 + (size_t) oe) * 512 + (size_t) os, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess)
+                        (void) cudaGetLastError();
+                }
+                st.pairs.erase(old);
+                --st.count[(size_t) l];
+            }
+        }
+        it = st.pairs.emplace(key, StandinLearnState::Pair{}).first;
+        ++st.count[(size_t) l];
+    }
+    StandinLearnState::Pair& p = it->second;
+    p.num = kLrnDecay * p.num + sxy;
+    p.den = kLrnDecay * p.den + sxx;
+    p.ee = kLrnDecay * p.ee + syy;
+    p.used = ++st.tick;
+    ++p.n;
+    ++st.samples_req;
+    if (p.n >= kLrnReady) {
+        const float c = (float) std::min(2.0, std::max(0.5, p.num / std::max(p.den, 1e-30)));
+        if (c != p.c) {
+            p.c = c;
+            if (st.table_ready) {
+                const OnDevice on(device_);
+                if (cudaMemcpy(lrn_c_ + ((size_t) l * 512 + (size_t) e) * 512 + (size_t) s, &c, sizeof c, cudaMemcpyHostToDevice) != cudaSuccess)
+                    (void) cudaGetLastError();
+            }
+        }
+    }
+}
+
+// The pairs kept across runs: "STSL", layers, experts, count (u32 each), then per pair key (u64), num, den, ee (f64), n (u32), c (f32).
+bool Verifier::standin_learn_open(const std::string& path, std::string& msg) {
+    if (lrn_st_ == nullptr) { msg = "not on"; return false; }
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) { msg = "no saved state yet"; return false; }
+    StandinLearnState& st = *lrn_st_;
+    uint32_t hd[4] = {0, 0, 0, 0};
+    bool ok = std::fread(hd, 4, 4, f) == 4 && hd[0] == kLrnMagic && (int64_t) hd[1] == st.layers && hd[2] == 512;
+    size_t got = 0;
+    if (ok) {
+        if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
+        for (uint32_t i = 0; i < hd[3]; ++i) {
+            uint64_t key = 0;
+            StandinLearnState::Pair p;
+            if (std::fread(&key, 8, 1, f) != 1 || std::fread(&p.num, 8, 1, f) != 1 || std::fread(&p.den, 8, 1, f) != 1 ||
+                std::fread(&p.ee, 8, 1, f) != 1 || std::fread(&p.n, 4, 1, f) != 1 || std::fread(&p.c, 4, 1, f) != 1)
+                break;
+            const int64_t l = (int64_t) (key >> 40), e = (int64_t) ((key >> 20) & 0xFFFFFu), s = (int64_t) (key & 0xFFFFFu);
+            if (l >= st.layers || e >= 512 || s >= 512 || !std::isfinite(p.c)) continue;
+            if (st.count[(size_t) l] >= kLrnPerLayer) continue;
+            p.used = ++st.tick;
+            st.pairs[key] = p;
+            ++st.count[(size_t) l];
+            ++got;
+        }
+    }
+    std::fclose(f);
+    if (!ok) { msg = "not this model's state"; return false; }
+    if (st.table_ready) standin_learn_fill_table();
+    msg = std::to_string(got) + " pairs";
+    return true;
+}
+
+bool Verifier::standin_learn_save(const std::string& path, std::string& msg) const {
+    if (lrn_st_ == nullptr) { msg = "not on"; return false; }
+    const StandinLearnState& st = *lrn_st_;
+    if (st.pairs.empty()) { msg = "no pairs"; return true; }
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { msg = "cannot open"; return false; }
+    const uint32_t hd[4] = {kLrnMagic, (uint32_t) st.layers, 512u, (uint32_t) st.pairs.size()};
+    bool ok = std::fwrite(hd, 4, 4, f) == 4;
+    for (const auto& kv : st.pairs) {
+        const StandinLearnState::Pair& p = kv.second;
+        ok = ok && std::fwrite(&kv.first, 8, 1, f) == 1 && std::fwrite(&p.num, 8, 1, f) == 1 && std::fwrite(&p.den, 8, 1, f) == 1 &&
+             std::fwrite(&p.ee, 8, 1, f) == 1 && std::fwrite(&p.n, 4, 1, f) == 1 && std::fwrite(&p.c, 4, 1, f) == 1;
+    }
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        msg = "write failed";
+        return false;
+    }
+    msg = "saved";
+    return true;
+}
+
+// The request's line: the ready pairs, this request's samples, and the mean |c - 1| of the ready pairs (the counts reset).
+std::string Verifier::standin_learn_report() {
+    if (lrn_st_ == nullptr) return "";
+    StandinLearnState& st = *lrn_st_;
+    int ready = 0;
+    double dev = 0.0;
+    for (const auto& kv : st.pairs)
+        if (kv.second.n >= kLrnReady) {
+            ++ready;
+            dev += std::fabs((double) kv.second.c - 1.0);
+        }
+    char buf[192];
+    std::snprintf(buf, sizeof buf, "strata serve: stand-in learn: %d pairs ready, %lld samples this request, mean |c-1| %.4f\n", ready,
+                  st.samples_req, ready > 0 ? dev / ready : 0.0);
+    st.samples_req = 0;
+    return buf;
+}
+
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
@@ -1314,6 +1558,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // a kernel that tests it for null writes into that buffer (row_shift_ into arg_scratch_ broke every token with the re-check off)
         if (!(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on)) { dyn_gap_ = nullptr; dyn_top1_ = nullptr; }
         if (!route_resident_cfg().fragile_on) row_shift_ = nullptr;
+        // STRATA_STANDIN_LEARN (opt-in): the whole model on one GPU, the flip re-check and route-resident on; else nothing is taken
+        const bool lrn_on = standin_learn_env() && route_resident_cfg().fragile_on && route_resident_cfg().margin > 0.0f && lb_ == 0 &&
+                            le_ >= g.n_layers && g.n_expert == 512 && ss.k == 10;
+        lrn_c_ = b.take<float>(lrn_on ? (uint64_t) g.n_layers * 512 * 512 : 0);
+        lrn_rec_ = b.take<int32_t>(lrn_on ? T * 4 : 0);
+        lrn_ys_ = b.take<float>(lrn_on ? T * N : 0);
+        lrn_ye_ = b.take<float>(lrn_on ? N : 0);
+        lrn_gate_ = b.take<int32_t>(lrn_on ? 4 : 0);
+        if (!lrn_on) { lrn_c_ = nullptr; lrn_rec_ = nullptr; lrn_ys_ = nullptr; lrn_ye_ = nullptr; lrn_gate_ = nullptr; }
+        if (lrn_on) {
+            lrn_st_ = std::make_shared<StandinLearnState>();
+            lrn_st_->dim = (int64_t) N;
+            lrn_st_->layers = g.n_layers;
+        } else {
+            lrn_st_.reset();
+        }
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
@@ -2651,7 +2911,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr,
                                       n <= 8 ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr,
                                       rr_stats_ != nullptr ? rr_stats_ + 9 : nullptr,   // STRATA_ROUTE_BUDGET counters [9..11], STRATA_ROUTE_BUDGET_TAIL [12..13]
-                                      n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr);   // STRATA_FRAGILE_RECHECK: this group's rows
+                                      n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr,   // STRATA_FRAGILE_RECHECK: this group's rows
+                                      lrn_c_ != nullptr ? lrn_c_ + (size_t) l * 512 * 512 : nullptr,   // STRATA_STANDIN_LEARN: the layer's corrections
+                                      lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr, (int) l);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (!stage_mark(cs, kStRouter, err)) return false;
@@ -2856,7 +3118,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
+            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 && lrn_gate_ == nullptr &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
             if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
@@ -2865,6 +3127,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
+        }
+        if (lrn_gate_ != nullptr) {   // STRATA_STANDIN_LEARN: this layer's per-rank outputs of the group's rows (device-gated; parts_ is whole here)
+            try {
+                strata::kernels::native_learn_capture(parts_ + (size_t) tb * K * N, (int) K, (int) N, n, (int) l, lrn_gate_,
+                                                      lrn_rec_ + (size_t) tb * 4, lrn_ys_ + (size_t) tb * N, lrn_ye_, tb == 0, cs);
+            } catch (const std::exception& e) { err = "verify learn capture: " + std::string(e.what()); return false; }
         }
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
@@ -4306,6 +4574,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     c.win_low = low;
     c.win_tail = tail;
     strata::kernels::route_cfg_set_budgets(low, tail);
+    if (lrn_gate_ != nullptr) standin_learn_begin_window(decode, c.win_exact);   // STRATA_STANDIN_LEARN: this window's record and capture mode
     la_tail_skip_update(c);
 }
 
