@@ -189,7 +189,9 @@ struct RouteResidentCfg {
     // next round starts with that direction.  A loss starts the other direction (stage 1) against the same base; a loss there keeps b, and
     // the next round starts with the other direction.  b is clamped to [0.02, 4].
     // The static STRATA_ROUTE_BUDGET / _TAIL / _DYN are ignored for decode (DYN is switched off); a prompt window keeps them.
-    enum { kAutoRun = 8, kAutoMin = 96 };
+    // kMaskMin: a mask test's windows per arm - 4x the budget test's: over 96 windows speed swings +-5-10% with the text, so the mask's
+    // depth walked back and forth on noise (6 Nov night, 17 tests in 15 minutes); a mask move also needs two wins in a row (mask_test_end)
+    enum { kAutoRun = 8, kAutoMin = 96, kMaskMin = 384 };
     bool auto_on = false;
     float auto_b = 0.1f, auto_b0 = 0.1f;      ///< the base budget of ranks < lo and of ranks >= lo; the start (STRATA_ROUTE_BUDGET_AUTO_B0)
     bool auto_testing = false;                ///< a test is running (its arms below)
@@ -4554,7 +4556,7 @@ bool Verifier::route_brake_on() { return route_resident_cfg().brake_on; }
 // none is testable now), its arm's levels on the device, and its end (won: the candidate's (p, g) is kept; out = base p, g, candidate p, g).
 bool mask_test_begin();
 void mask_test_arm(int arm);
-void mask_test_end(bool won, double out[4]);
+bool mask_test_end(bool won, double out[4]);
 namespace {
 void route_auto_schedule(RouteResidentCfg& c);   // defined with the test helpers below route_auto_window
 float route_auto_arm_b(const RouteResidentCfg& c, int arm);   // defined with the test helpers below route_auto_window
@@ -5201,10 +5203,11 @@ void route_auto_test_done(RouteResidentCfg& c) {
     const bool won = sc >= sb * 1.02 && quality;
     if (c.auto_mask) {   // STRATA_MASK=learn: a mask test decides the mask's (p, g); no budget state moves
         double pg[4] = {0.0, 0.0, 0.0, 0.0};
-        mask_test_end(won, pg);
-        std::fprintf(stderr, "strata serve: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): %.1f vs %.1f tok/s over %d+%d windows -> (%.3f,%.3f); "
+        const bool moved = mask_test_end(won, pg);
+        std::fprintf(stderr, "strata serve: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): %.1f vs %.1f tok/s over %d+%d windows -> (%.3f,%.3f)%s; "
                      "flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f%s\n",
-                     pg[2], pg[3], pg[0], pg[1], sc, sb, (int) c.auto_n[1], (int) c.auto_n[0], won ? pg[2] : pg[0], won ? pg[3] : pg[1],
+                     pg[2], pg[3], pg[0], pg[1], sc, sb, (int) c.auto_n[1], (int) c.auto_n[0], moved ? pg[2] : pg[0], moved ? pg[3] : pg[1],
+                     won && !moved ? " (a first win: the next test repeats it)" : "",
                      fc, fb, c.auto_rc[1], c.auto_rc[0], 100.0 * pc, 100.0 * pb, quality ? "" : ", quality lost");
         c.auto_mask = false;
         c.auto_mask_next = false;   // a budget test next
@@ -5252,7 +5255,8 @@ void Verifier::route_auto_window(int n_keep, std::chrono::steady_clock::time_poi
     c.auto_have_last = true;
     c.auto_tok[arm] += n_keep;
     if (c.auto_win_sched) ++c.auto_n[arm];
-    if (c.auto_testing && c.auto_n[0] >= RouteResidentCfg::kAutoMin && c.auto_n[1] >= RouteResidentCfg::kAutoMin && !c.fragile_exact)
+    const long long need = c.auto_mask ? (long long) RouteResidentCfg::kMaskMin : (long long) RouteResidentCfg::kAutoMin;
+    if (c.auto_testing && c.auto_n[0] >= need && c.auto_n[1] >= need && !c.fragile_exact)
         route_auto_test_done(c);
 }
 
@@ -6421,6 +6425,7 @@ struct MaskLearnState {
     // (-1: none yet), and the direction state (first direction, stage 0 / 1: as the budget test's)
     bool mt_on = false;
     int mt_d = -1, mt_cur = -1, mt_first = -1, mt_stage = 0;
+    int mt_win_d = 0;                // the direction of an unconfirmed win (0: none): a move needs two wins in a row
     double mt_cand_p = 0.0, mt_cand_g = 0.0;
     std::vector<uint8_t> mt_lv[2];
     double ag_ok = 0.0, ag_tot = 0.0;
@@ -6842,20 +6847,26 @@ void mask_test_arm(int arm) {
         std::fprintf(stderr, "strata: STRATA_MASK=learn: the test arm's mask rows not uploaded\n");
 }
 
-// The test's end: out = base p, base g, candidate p, candidate g.  A win keeps the candidate's (p, g); the levels are recomputed and uploaded;
-// the table is saved.
-void mask_test_end(bool won, double out[4]) {
-    if (!g_mlr) return;
+// The test's end: out = base p, base g, candidate p, candidate g.  A move needs two wins in a row in the same direction: a first win is
+// remembered and the next test repeats that direction against the same base; a second moves (p, g) to the candidate; a loss forgets it.
+// Returns whether (p, g) moved.  The levels are recomputed and uploaded; the table is saved.
+bool mask_test_end(bool won, double out[4]) {
+    if (!g_mlr) return false;
     MaskLearnState& s = *g_mlr;
     out[0] = s.p;
     out[1] = s.g;
     out[2] = s.mt_cand_p;
     out[3] = s.mt_cand_g;
-    if (won) {
+    bool moved = false;
+    if (won && s.mt_win_d == s.mt_d) {
         s.p = s.mt_cand_p;
         s.g = s.mt_cand_g;
+        moved = true;
+        s.mt_win_d = 0;
+    } else {
+        s.mt_win_d = won ? s.mt_d : 0;
     }
-    mt_next_stage(s.mt_first, s.mt_stage, won, s.mt_d);
+    mt_next_stage(s.mt_first, s.mt_stage, won, s.mt_d);   // (a win, confirmed or not, tests the same direction next)
     s.mt_on = false;
     s.mt_cur = -1;
     mlr_relevel(s);
@@ -6864,6 +6875,7 @@ void mask_test_end(bool won, double out[4]) {
         std::string msg;
         if (!mlr_save(s, s.path, msg)) std::fprintf(stderr, "strata: STRATA_MASK=learn: %s\n", msg.c_str());
     }
+    return moved;
 }
 
 }  // namespace strata::core
