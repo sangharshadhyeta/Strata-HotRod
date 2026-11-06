@@ -133,6 +133,8 @@ CUDA 13 toolkit and gcc-toolset-13 (Rocky Linux 9; other distributions are untes
 These are the commands this PC was set up with; the branch's own `setup.py --model Starw1-2.00bpw-MXFP8` downloads the same files
 and makes the pack, but that route is untested here.
 
+Setup also downloads the learned look-ahead's trained state for Starw1-2.00bpw-MXFP8 (8 MB, once, into the pack folder).
+
 </div>
 
 ```bash

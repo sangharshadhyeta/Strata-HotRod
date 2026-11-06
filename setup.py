@@ -8247,6 +8247,42 @@ def dsv41_cards(gpu: dict, all_cards: list | None, asked: bool) -> list:
     return list(all_cards)
 
 
+# The learned look-ahead's trained state for DeepSeek-V4.1-Flash Starw1-2.00bpw-MXFP8 (Strata-HotRod's release predictor-ds41-starw1-v1):
+# 8 MB, once.  The engine reads <pack>/hotrod-predictor.bin; this PC's own learning adds to it from there.
+HOTROD_PREDICTOR = "hotrod-predictor.bin"
+HOTROD_PREDICTOR_URL = ("https://github.com/sangharshadhyeta/Strata-HotRod/releases/download/predictor-ds41-starw1-v1/"
+                        "hotrod-predictor-ds41-starw1-v1.bin")
+HOTROD_PREDICTOR_SHA = "419278193eaab8c64bc5d273ef3561433e5253a7b68b412404fe92b067ed38d9"
+HOTROD_PREDICTOR_FAMILIES = ("deepseek41",)
+HOTROD_PREDICTOR_MODELS = ("Starw1-2.00bpw-MXFP8",)
+
+
+def fetch_hotrod_predictor(pack: Path, family: str, model: str) -> None:
+    """<pack>/hotrod-predictor.bin for DeepSeek-V4.1-Flash Starw1-2.00bpw-MXFP8: an 8 MB download, once, SHA-256 checked.  Kept as it is
+    when it is already there (it is what this PC has learned since).  A failed download only warns: the learner starts from scratch."""
+    if family not in HOTROD_PREDICTOR_FAMILIES or model not in HOTROD_PREDICTOR_MODELS:
+        return
+    dst = pack / HOTROD_PREDICTOR
+    if dst.is_file():
+        ok("learned look-ahead: kept (this PC's own learned state)")
+        return
+    tmp = dst.with_suffix(".download")
+    say("  The learned look-ahead's trained state for this model: an 8 MB download, once.")
+    try:
+        download(HOTROD_PREDICTOR_URL, tmp, "learned look-ahead")
+    except SystemExit:
+        warn("the learned look-ahead could not be downloaded: it starts from scratch on this PC")
+        return
+    h = hashlib.sha256(tmp.read_bytes()).hexdigest()
+    if h != HOTROD_PREDICTOR_SHA:
+        tmp.unlink(missing_ok=True)
+        warn(f"the learned look-ahead's download has the wrong SHA-256 ({h}): not used")
+        return
+    tmp.replace(dst)
+    tmp.with_name(tmp.name + ".done").unlink(missing_ok=True)   # the download's finish mark: the file itself now marks it
+    ok(f"learned look-ahead: {dst}")
+
+
 def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, all_cards=None):
     """Steps 2-7 for DeepSeek-V4.1-Flash (MULTI_FILE_FAMILIES): where it fits (strata_control/dsv41_fit.py, said plainly: a 508 GB
     download and a model larger than most computers' memory are warnings, never a refusal), the engine (strata-dsv41), the nine
@@ -8462,6 +8498,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         ok(f"pack: {pack}")
     if dsv41_context.problem(ctx, dsv41_context.read_limit(pack)):       # the pack's own limit (ds4.txt) is the last word; no file, no limit
         fail(dsv41_context.problem(ctx, dsv41_context.read_limit(pack)), f"choose a smaller --context (the pack in {pack} says what it reads)")
+    fetch_hotrod_predictor(pack, family, model)      # the learned look-ahead's trained state (Starw1 only), once the pack is complete
 
     step(7, "writing the start script")
     # --dspark auto, never off: "off" still LOADS the drafter, and its 7 GB of experts take the graphics memory (found 2026-10-23);
