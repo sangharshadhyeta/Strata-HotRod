@@ -3,6 +3,7 @@
 #include "strata/core/sm75_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include <cstring>
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
 #endif
@@ -1688,6 +1689,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // a kernel that tests it for null writes into that buffer (row_shift_ into arg_scratch_ broke every token with the re-check off)
         if (!(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on)) { dyn_gap_ = nullptr; dyn_top1_ = nullptr; }
         if (!route_resident_cfg().fragile_on) row_shift_ = nullptr;
+        // STRATA_MASK=learn (opt-in): the replaced picks of each decode row and the cut row's first-pass logits; the whole model on one GPU
+        const bool mlr_on = mask_learn_seeded() && route_resident_cfg().fragile_on && route_resident_cfg().margin > 0.0f && lb_ == 0 &&
+                            le_ >= g.n_layers && g.n_expert == 512 && ss.k == 10;
+        uint32_t* mev_raw = b.take<uint32_t>(mlr_on ? (sizeof(strata::kernels::MaskEvs) + 3) / 4 : 0);
+        mev_ = mlr_on ? reinterpret_cast<strata::kernels::MaskEvs*>(mev_raw) : nullptr;
+        mlr_logit0_ = b.take<float>(mlr_on ? (uint64_t) n_vocab_ : 0);
+        mlr_kl_ = b.take<float>(mlr_on ? 1 : 0);
+        if (!mlr_on) { mlr_logit0_ = nullptr; mlr_kl_ = nullptr; }
         // STRATA_STANDIN_LEARN (opt-in): the whole model on one GPU, the flip re-check and route-resident on; else nothing is taken
         const bool lrn_on = standin_learn_env() && route_resident_cfg().fragile_on && route_resident_cfg().margin > 0.0f && lb_ == 0 &&
                             le_ >= g.n_layers && g.n_expert == 512 && ss.k == 10;
@@ -3029,7 +3038,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (const uint8_t* mk = strata::kernels::route_mask_layer(l, g.n_expert)) {
                 try {
                     strata::kernels::native_route_mask(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, mk, n,
-                                                       n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr, cs);
+                                                       n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr, cs,
+                                                       n <= 8 ? mev_ : nullptr, (int) l, (int) tb);   // (STRATA_MASK=learn: the list)
                 } catch (const std::exception& e) { err = "verify mask: " + std::string(e.what()); return false; }
             }
         }
@@ -3047,7 +3057,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr,   // STRATA_FRAGILE_RECHECK: this group's rows
                                       lrn_c_ != nullptr && !standin_learn_observe_env() ? lrn_c_ + (size_t) l * 512 * 512 : nullptr,   // STRATA_STANDIN_LEARN: the layer's corrections (=observe: none applied)
                                       lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr, (int) l,
-                                      lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr);
+                                      lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr,
+                                      n <= 8 ? mev_ : nullptr, (int) tb);   // (STRATA_MASK=learn: this layer's replaced picks, by row)
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (!stage_mark(cs, kStRouter, err)) return false;
@@ -6330,6 +6341,357 @@ void Verifier::absorb_stats(Verifier& o) {
         for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
     prof_windows_ += o.prof_windows_;
     o.prof_windows_ = 0;
+}
+
+}  // namespace strata::core
+
+// ================================ STRATA_MASK=learn (opt-in) ================================
+// The mask learns from the model's own divergence on the user's traffic (the DeepSeek port, ds4 DS4_MASK=learn).  A flip re-check cuts a
+// decode window at its row r; the next window runs exact and its row 0 re-decides that position.  D = KL(exact || the cut row's first pass)
+// is shared over the row's replaced picks (w x gap) as harm; every replaced pick of a decode row is exposure.  A (layer, expert) harm rate
+// = harm / exposure (both decayed).  The masked experts are the lowest-rate ones among the least-used (the profile seeds them), up to the
+// share p; p follows the re-checks' agreement; an expert with enough exposure and a rate under its layer's 10th percentile is masked at
+// every rank (level 2).  The table is in mask-learn-<model>.bin beside the stand-in tuning file.
+namespace strata::core {
+namespace {
+constexpr double kMlP0 = 0.05, kMlPMax = 0.95;
+constexpr long long kMlMaskEvery = 256, kMlDecayEvery = 8192, kMlSampleEvery = 64, kMlSaveEvery = 4096;
+constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
+constexpr int kMlMinPop = 8;
+
+struct MaskLearnState {
+    struct Pick {
+        int64_t l, e;
+        double x;
+    };
+    int64_t nl = 0, ne = 0;
+    std::vector<int64_t> pos;        // [nl][ne] the profile rank of each pair (higher = less used; INT64_MAX: not ranked)
+    std::vector<double> harm, expo;  // [nl][ne] decayed
+    std::vector<uint8_t> lv;         // [nl][ne] 0 unmasked, 1 masked (the rank rule), 2 masked at every rank
+    std::vector<uint32_t> stamp;     // [nl][ne] dedup of one row's entries
+    uint32_t stamp_id = 0;
+    double p = kMlP0;
+    double ag_ok = 0.0, ag_tot = 0.0;
+    long long tok = 0, nrc = 0;      // the kept decode tokens; the non-cut windows (every kMlSampleEvery-th is read)
+    double dsum = 0.0;
+    long long dn = 0;
+    std::string path;
+    bool pend = false;               // the pending cut: its row's replaced picks, their risk sum, the stand-in window's top-1
+    int32_t pend_tok = -1;
+    std::vector<Pick> pend_picks;
+    double pend_sum = 0.0;
+};
+std::shared_ptr<MaskLearnState> g_mlr;
+
+size_t mlr_at(const MaskLearnState& s, int64_t l, int64_t e) { return (size_t) l * (size_t) s.ne + (size_t) e; }
+
+// The levels of every layer from the scores; true when one changed.  The pool is the least-used pairs by the profile (2 p n of them), the
+// lowest rates first; a layer with no ranked pair gets none.
+bool mlr_relevel(MaskLearnState& s) {
+    const int64_t ne = s.ne;
+    const int64_t per = (int64_t) std::floor(s.p * (double) ne + 1e-9);
+    const int64_t pool_n = std::min<int64_t>(ne, 2 * per);
+    bool changed = false;
+    std::vector<double> rate((size_t) ne), pop;
+    std::vector<int> ord((size_t) ne);
+    std::vector<uint8_t> nlv((size_t) ne);
+    for (int64_t il = 0; il < s.nl; ++il) {
+        uint8_t* lv = s.lv.data() + (size_t) il * (size_t) ne;
+        const double* hm = s.harm.data() + (size_t) il * (size_t) ne;
+        const double* ex = s.expo.data() + (size_t) il * (size_t) ne;
+        const int64_t* pr = s.pos.data() + (size_t) il * (size_t) ne;
+        bool ranked = false;
+        for (int64_t e = 0; e < ne; ++e) ranked = ranked || pr[e] != INT64_MAX;
+        std::fill(nlv.begin(), nlv.end(), 0);
+        if (ranked) {
+            pop.clear();
+            for (int64_t e = 0; e < ne; ++e) {
+                rate[(size_t) e] = hm[e] / std::max(1.0, ex[e]);
+                if (ex[e] >= kMlMinExpo) pop.push_back(rate[(size_t) e]);
+            }
+            const bool grad = (int) pop.size() >= kMlMinPop;
+            double p10 = 0.0, med = 0.0;
+            if (grad) {
+                std::sort(pop.begin(), pop.end());
+                p10 = pop[pop.size() / 10];
+                med = pop[pop.size() / 2];
+            }
+            int64_t masked = 0;
+            // the all-ranks masks stay, the lowest rates first, up to the share; above the layer's median one falls back to the rank rule
+            std::vector<int> keep;
+            for (int64_t e = 0; e < ne; ++e)
+                if (lv[e] == 2) keep.push_back((int) e);
+            std::stable_sort(keep.begin(), keep.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+            for (int e : keep) {
+                if (masked >= per) break;
+                nlv[(size_t) e] = grad && rate[(size_t) e] > med ? 1 : 2;
+                ++masked;
+            }
+            // the rest: the pool's least-used pairs (higher profile rank first; ties: the lower id), the lowest rates first
+            for (int64_t e = 0; e < ne; ++e) ord[(size_t) e] = (int) e;
+            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] > pr[b]; });
+            std::vector<int> cand;
+            for (int64_t q = 0; q < pool_n; ++q)
+                if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
+            std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+            for (int e : cand) {
+                if (masked >= per) break;
+                nlv[(size_t) e] = 1;
+                ++masked;
+            }
+            if (grad)   // graduation: enough exposure and a rate under the 10th percentile
+                for (int64_t e = 0; e < ne; ++e)
+                    if (nlv[(size_t) e] == 1 && ex[e] >= kMlMinExpo && rate[(size_t) e] < p10) nlv[(size_t) e] = 2;
+        }
+        for (int64_t e = 0; e < ne; ++e)
+            if (lv[e] != nlv[(size_t) e]) {
+                lv[e] = nlv[(size_t) e];
+                changed = true;
+            }
+    }
+    return changed;
+}
+
+// Every kMlMaskEvery kept tokens the masks move: p follows the re-checks' agreement (98% up, under 95% down), then the levels; the changed rows go
+// to the device.
+void mlr_update(MaskLearnState& s) {
+    if (s.ag_tot >= kMlMinAg) {
+        const double a = s.ag_ok / s.ag_tot;
+        if (a >= 0.98) s.p = std::min(kMlPMax, s.p + 0.025);
+        else if (a < 0.95) s.p = std::max(0.0, s.p - 0.05);
+    }
+    if (mlr_relevel(s) && !strata::kernels::route_mask_update(s.lv))
+        std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
+}
+
+// The table file: "MLRN", version 1, nl, ne, p, the agreement's two sums, the kept token count, then harm and exposure (double) and the levels.
+bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg) {
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+        msg = "cannot open " + tmp;
+        return false;
+    }
+    const uint32_t ver = 1;
+    const int32_t nl = (int32_t) s.nl, ne = (int32_t) s.ne;
+    const long long tok = s.tok;
+    bool ok = std::fwrite("MLRN", 1, 4, f) == 4 && std::fwrite(&ver, sizeof ver, 1, f) == 1 && std::fwrite(&nl, sizeof nl, 1, f) == 1 &&
+              std::fwrite(&ne, sizeof ne, 1, f) == 1 && std::fwrite(&s.p, sizeof s.p, 1, f) == 1 && std::fwrite(&s.ag_ok, sizeof s.ag_ok, 1, f) == 1 &&
+              std::fwrite(&s.ag_tot, sizeof s.ag_tot, 1, f) == 1 && std::fwrite(&tok, sizeof tok, 1, f) == 1 &&
+              std::fwrite(s.harm.data(), sizeof(double), s.harm.size(), f) == s.harm.size() &&
+              std::fwrite(s.expo.data(), sizeof(double), s.expo.size(), f) == s.expo.size() &&
+              std::fwrite(s.lv.data(), 1, s.lv.size(), f) == s.lv.size();
+    ok = std::fclose(f) == 0 && ok;
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        msg = "not written: " + path;
+        return false;
+    }
+    return true;
+}
+
+// The saved table, when its version and shape are this model's (else the fresh start stays).  Nothing is changed on a mismatch.
+bool mlr_load(MaskLearnState& s, const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    const size_t cnt = (size_t) s.nl * (size_t) s.ne;
+    char magic[4] = {0, 0, 0, 0};
+    uint32_t ver = 0;
+    int32_t nl = 0, ne = 0;
+    double p = 0.0, ok = 0.0, tot = 0.0;
+    long long tok = 0;
+    std::vector<double> harm(cnt), expo(cnt);
+    std::vector<uint8_t> lv(cnt);
+    bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 && ver == 1 &&
+                std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == s.nl && ne == s.ne &&
+                std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 && std::fread(&tot, sizeof tot, 1, f) == 1 &&
+                std::fread(&tok, sizeof tok, 1, f) == 1 && std::fread(harm.data(), sizeof(double), cnt, f) == cnt &&
+                std::fread(expo.data(), sizeof(double), cnt, f) == cnt && std::fread(lv.data(), 1, cnt, f) == cnt;
+    std::fclose(f);
+    if (!good) return false;
+    s.p = std::min(kMlPMax, std::max(0.0, p));
+    s.ag_ok = ok;
+    s.ag_tot = tot;
+    s.tok = tok;
+    s.harm = std::move(harm);
+    s.expo = std::move(expo);
+    s.lv = std::move(lv);
+    return true;
+}
+
+// Exposure: each row's replaced picks of a read list (layer and expert in range), each counted once per row, by w.
+void mlr_expose_rows(MaskLearnState& s, const strata::kernels::MaskEvs& ev, int rows, double w) {
+    for (int r = 0; r < rows && r < strata::kernels::kMaskEvRows; ++r) {
+        ++s.stamp_id;
+        const unsigned n = std::min<unsigned>(ev.n[r], (unsigned) strata::kernels::kMaskEvCap);
+        for (unsigned i = 0; i < n; ++i) {
+            const strata::kernels::MaskEv& a = ev.e[r][i];
+            if (a.layer < 0 || a.layer >= s.nl || a.expert < 0 || a.expert >= s.ne) continue;
+            const size_t k = mlr_at(s, a.layer, a.expert);
+            if (s.stamp[k] == s.stamp_id) continue;
+            s.stamp[k] = s.stamp_id;
+            s.expo[k] += w;
+        }
+    }
+}
+
+}  // namespace
+
+bool mask_learn_env() {
+    const char* v = std::getenv("STRATA_MASK");
+    return v != nullptr && std::strcmp(v, "learn") == 0;
+}
+
+bool mask_learn_seeded() { return g_mlr != nullptr; }
+
+std::vector<uint8_t> mask_learn_begin(int64_t n_layers, int64_t n_expert, const std::vector<int64_t>& pos) {
+    if (n_layers < 1 || n_expert < 1 || pos.size() != (size_t) (n_layers * n_expert)) return {};
+    auto s = std::make_shared<MaskLearnState>();
+    s->nl = n_layers;
+    s->ne = n_expert;
+    s->pos = pos;
+    const size_t cnt = (size_t) (n_layers * n_expert);
+    s->harm.assign(cnt, 0.0);
+    s->expo.assign(cnt, 0.0);
+    s->lv.assign(cnt, 0);
+    s->stamp.assign(cnt, 0u);
+    mlr_relevel(*s);   // from zero scores: the profile's least-used pairs at the share p0
+    g_mlr = s;
+    return s->lv;
+}
+
+bool mask_learn_open(const std::string& path, std::string& msg) {
+    if (!g_mlr) {
+        msg = "not on";
+        return false;
+    }
+    MaskLearnState& s = *g_mlr;
+    s.path = path;
+    const bool loaded = mlr_load(s, path);
+    mlr_relevel(s);
+    if (!strata::kernels::route_mask_update(s.lv)) {
+        msg = "the mask rows not uploaded";
+        return false;
+    }
+    msg = std::string(loaded ? "the saved table" : "a fresh table") + ", p " + std::to_string(s.p);
+    return loaded;
+}
+
+bool mask_learn_save(const std::string& path, std::string& msg) {
+    if (!g_mlr) {
+        msg = "not on";
+        return false;
+    }
+    return mlr_save(*g_mlr, path, msg);
+}
+
+std::string mask_learn_report() {
+    if (!g_mlr) return "";
+    MaskLearnState& s = *g_mlr;
+    long long m = 0, a = 0, scored = 0;
+    for (size_t i = 0; i < s.lv.size(); ++i) {
+        m += s.lv[i] != 0;
+        a += s.lv[i] == 2;
+        scored += s.expo[i] > 0.0;
+    }
+    const double dm = s.dn > 0 ? s.dsum / (double) s.dn : 0.0;
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "strata serve: mask learn: p %.3f, %lld masked (%lld at all ranks), re-check D mean %.4f (%lld), %lld experts scored\n",
+                  s.p, m, a, dm, s.dn, scored);
+    s.dsum = 0.0;
+    s.dn = 0;
+    return buf;
+}
+
+bool Verifier::mask_learn_active() const { return g_mlr != nullptr && mev_ != nullptr && mlr_logit0_ != nullptr && mlr_kl_ != nullptr && next_ == nullptr; }
+
+// A window cut at row `row` (after route_fragile_cut): the row's first-pass logits are kept, and its replaced picks wait for the settle.
+// Every row of the window is exposure.  A control re-check moves nothing, so it gives no credit.
+void Verifier::mask_learn_cut(int row, int32_t stand_top1, int T, bool control) {
+    if (!mask_learn_active() || row < 1 || row >= strata::kernels::kMaskEvRows || T < 1 || T > strata::kernels::kMaskEvRows) return;
+    MaskLearnState& s = *g_mlr;
+    const OnDevice on(device_);
+    if (cudaMemcpy(mlr_logit0_, head_logits_ + (size_t) row * (size_t) n_vocab_, sizeof(float) * (size_t) n_vocab_, cudaMemcpyDeviceToDevice) !=
+        cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    auto ev = std::make_unique<strata::kernels::MaskEvs>();
+    if (cudaMemcpy(ev.get(), mev_, sizeof(strata::kernels::MaskEvs), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    if (control) return;
+    mlr_expose_rows(s, *ev, T, 1.0);
+    s.pend = true;
+    s.pend_tok = stand_top1;
+    s.pend_picks.clear();
+    s.pend_sum = 0.0;
+    const unsigned n = std::min<unsigned>(ev->n[row], (unsigned) strata::kernels::kMaskEvCap);
+    for (unsigned i = 0; i < n; ++i) {
+        const strata::kernels::MaskEv& a = ev->e[row][i];
+        if (a.layer < 0 || a.layer >= s.nl || a.expert < 0 || a.expert >= s.ne) continue;
+        const double x = std::max(0.0, (double) a.x);
+        s.pend_picks.push_back({a.layer, a.expert, x});
+        s.pend_sum += x;
+    }
+}
+
+// The exact successor (the window that just ran): D = KL(exact row 0 || the cut row's first pass) on the device; the pending row's picks take
+// their share of D as harm; the agreement and the request's mean D count.
+void Verifier::mask_learn_settle(bool exact_ok, int32_t exact_top1) {
+    if (!mask_learn_active()) return;
+    MaskLearnState& s = *g_mlr;
+    if (!s.pend) return;
+    s.pend = false;
+    if (!exact_ok) return;
+    const OnDevice on(device_);
+    strata::kernels::logit_kl(head_logits_, mlr_logit0_, n_vocab_, mlr_kl_, cs_);
+    float D = 0.0f;
+    if (cs_ != nullptr && cudaStreamSynchronize(cs_) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    if (cudaMemcpy(&D, mlr_kl_, sizeof D, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    const bool flipped = exact_top1 != s.pend_tok;
+    if (s.pend_sum > 0.0)
+        for (const MaskLearnState::Pick& pk : s.pend_picks) s.harm[mlr_at(s, pk.l, pk.e)] += (double) D * pk.x / s.pend_sum;
+    s.ag_tot += 1.0;
+    s.ag_ok += flipped ? 0.0 : 1.0;
+    s.dsum += (double) D;
+    ++s.dn;
+}
+
+// After each decode window of n <= 8 rows (not merged): `kept` rows stand (a cut keeps rows 0..r-1).  Every kMlSampleEvery-th non-cut window
+// reads its list and counts it that many times.  Every kMlMaskEvery kept tokens the masks move; the table is saved every kMlSaveEvery.
+void Verifier::mask_learn_window(int T, int kept, bool cut) {
+    if (!mask_learn_active() || T < 1 || T > strata::kernels::kMaskEvRows) return;
+    MaskLearnState& s = *g_mlr;
+    const bool exact = route_resident_cfg().win_exact;   // the exact re-run: its rows are the re-decisions, no exposure of its own
+    if (!cut && !exact && ++s.nrc % kMlSampleEvery == 0) {
+        auto ev = std::make_unique<strata::kernels::MaskEvs>();
+        const OnDevice on(device_);
+        if (cudaMemcpy(ev.get(), mev_, sizeof(strata::kernels::MaskEvs), cudaMemcpyDeviceToHost) == cudaSuccess)
+            mlr_expose_rows(s, *ev, T, (double) kMlSampleEvery);
+        else
+            (void) cudaGetLastError();
+    }
+    if (kept < 1) return;
+    const long long before = s.tok;
+    s.tok += kept;
+    if (s.tok / kMlDecayEvery != before / kMlDecayEvery) {
+        for (double& v : s.harm) v *= 0.5;
+        for (double& v : s.expo) v *= 0.5;
+        s.ag_ok *= 0.5;
+        s.ag_tot *= 0.5;
+    }
+    if (s.tok / kMlMaskEvery != before / kMlMaskEvery) mlr_update(s);
+    if (s.tok / kMlSaveEvery != before / kMlSaveEvery && !s.path.empty()) {
+        std::string msg;
+        if (!mlr_save(s, s.path, msg)) std::fprintf(stderr, "strata: STRATA_MASK=learn: %s\n", msg.c_str());
+    }
 }
 
 }  // namespace strata::core

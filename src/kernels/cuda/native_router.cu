@@ -24,12 +24,14 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <atomic>
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <cstdio>
+#include <iterator>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -390,7 +392,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap, float cheap_margin,
                                  int cheap_rank0, int cheap_anytier, unsigned long long* __restrict__ bstats,
                                  float* __restrict__ row_shift, const float* __restrict__ pair_c,
-                                 int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe) {
+                                 int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe,
+                                 MaskEvs* __restrict__ mev, int row_base) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -564,6 +567,11 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             // STRATA_STANDIN_BALANCE (pair_pe, opt-in): a ready pair's risk is scaled by its relative error (clip 0.25-4; 1 until ready)
             const float pf = pair_pe != nullptr ? pair_pe[(size_t) orig[r] * 512 + bi] : 1.0f;
             if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf);
+            // STRATA_MASK=learn: the replaced pick (orig[r]) and its risk, in this row's list
+            if (lane == 0 && mev != nullptr && row_base + t < kMaskEvRows) {
+                const unsigned q = mev->n[row_base + t]++;
+                if (q < kMaskEvCap) mev->e[row_base + t][q] = MaskEv{layer, orig[r], weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f)};
+            }
             my[r] = bi;
             sub_s[r] = bi;
             ++swaps;
@@ -747,7 +755,7 @@ void mtp_zc_mark(const int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* 
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift,
-                           const float* pair_c, int32_t* lrn_rec, int layer, const float* pair_pe) {
+                           const float* pair_c, int32_t* lrn_rec, int layer, const float* pair_pe, MaskEvs* mev, int row_base) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     // STRATA_ROUTE_RAM_FLOOR's safety: the stand-in for a rank 0-1 pick must be within STRATA_ROUTE_RAM_FLOOR_MARGIN logits (default 1,
     // the margin SPEC E1 found sound for rank 1), and rank 0 is replaced only with STRATA_ROUTE_RAM_FLOOR_RANK0=1 (off: it leaked
@@ -760,7 +768,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
         n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier, bstats, row_shift,
-        pair_c, lrn_rec, layer, pair_pe);
+        pair_c, lrn_rec, layer, pair_pe, mev, row_base);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -780,9 +788,11 @@ static float g_mask_edge = -1.0f;
 namespace {
 __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                              const uint8_t* __restrict__ mask, int n_tok, int lo, float edge, float* __restrict__ row_shift,
-                             unsigned long long* __restrict__ stats) {
+                             unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset) {
     const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
     if (t >= n_tok) return;
+    const int row = row_base + t;
+    if (mev != nullptr && reset && lane == 0 && row < kMaskEvRows) mev->n[row] = 0u;   // (this row's list starts empty)
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
     int my[10];
@@ -792,7 +802,8 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
         const int e = my[r];
         if (e < 0 || e >= 512 || mask[e] == 0) continue;   // uniform across the warp
         ++seen;
-        if (r < lo - 1) continue;
+        const bool all = mask[e] == 2;   // level 2 (graduated, STRATA_MASK=learn): moves at every rank
+        if (!all && r < lo - 1) continue;
         float bv = -INFINITY;
         int bi = -1;
         for (int f = lane; f < 512; f += 32) {   // the best unmasked expert the token did not pick (a strictly greater logit wins; lowest id on ties)
@@ -810,8 +821,12 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
         }
         if (bi < 0) continue;                                // uniform
         const float gap = fmaxf(0.0f, l[e] - bv);
-        if (r == lo - 1 && !(edge > 0.0f && gap <= edge)) continue;
+        if (!all && r == lo - 1 && !(edge > 0.0f && gap <= edge)) continue;
         if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * gap);
+        if (lane == 0 && mev != nullptr && row < kMaskEvRows) {   // STRATA_MASK=learn: the replaced pick and its risk
+            const unsigned q = mev->n[row]++;
+            if (q < kMaskEvCap) mev->e[row][q] = MaskEv{layer, e, weights[(size_t) t * 10 + r] * gap};
+        }
         my[r] = bi;
         ++moved;
     }
@@ -862,12 +877,28 @@ const uint8_t* route_mask_layer(int64_t layer, int64_t n_expert) {
     return dev == g_mask_dev_id ? g_mask_dev + (size_t) layer * (size_t) n_expert : nullptr;   // another GPU's router keeps its own picks
 }
 const std::vector<uint8_t>* route_mask_host() { return &g_mask_host; }
-void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream) {
+void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream,
+                       MaskEvs* mev, int layer, int row_base) {
     if (!mask || !logits || !ids || !weights || n_tok < 1 || g_mask_stats == nullptr) return;
     route_mask_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, mask, n_tok, g_mask_lo,
-                                                                              g_mask_edge, row_shift, g_mask_stats);
+                                                                              g_mask_edge, row_shift, g_mask_stats, mev, layer, row_base,
+                                                                              layer == 0);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+bool route_mask_update(const std::vector<uint8_t>& host) {
+    if (g_mask_dev == nullptr || host.size() != g_mask_host.size()) return false;
+    const size_t ne = (size_t) g_mask_ne;
+    for (int64_t il = 0; il < g_mask_layers; ++il) {
+        const size_t o = (size_t) il * ne;
+        if (std::equal(host.begin() + (ptrdiff_t) o, host.begin() + (ptrdiff_t) (o + ne), g_mask_host.begin() + (ptrdiff_t) o)) continue;
+        if (cudaMemcpy(g_mask_dev + o, host.data() + o, ne, cudaMemcpyHostToDevice) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        std::copy(host.begin() + (ptrdiff_t) o, host.begin() + (ptrdiff_t) (o + ne), g_mask_host.begin() + (ptrdiff_t) o);
+    }
+    return true;
 }
 bool route_mask_read(unsigned long long& seen, unsigned long long& moved) {   // the request's counts (read and reset; between requests)
     if (g_mask_stats == nullptr) return false;

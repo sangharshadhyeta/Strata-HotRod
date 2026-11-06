@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -986,6 +987,68 @@ void logits_margin_rows(const float* logits, int n_rows, int n, float* gap, int3
     if (n_rows <= 0 || n <= 0) return;
     logits_margin_kernel<<<dim3((unsigned) n_rows), kMarginThreads, 0, (cudaStream_t) stream>>>(logits, n, gap, top1);
     check("logits_margin_rows");
+}
+
+// STRATA_MASK=learn: KL(p || q), p = softmax(e), q = softmax(f): sum p (e - f) - lse(e) + lse(f). One block of 1024 threads; the sums are double.
+namespace {
+__device__ double logit_kl_block_sum(double v, double* sh) {
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    const double r = sh[0];
+    __syncthreads();
+    return r;
+}
+__global__ void __launch_bounds__(1024) logit_kl_kernel(const float* __restrict__ e, const float* __restrict__ f, int n, float* __restrict__ out) {
+    __shared__ float shf[1024];
+    __shared__ double shd[1024];
+    const int tid = threadIdx.x;
+    float me = -FLT_MAX, mf = -FLT_MAX;
+    for (int i = tid; i < n; i += blockDim.x) {
+        me = fmaxf(me, e[i]);
+        mf = fmaxf(mf, f[i]);
+    }
+    shf[tid] = me;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) shf[tid] = fmaxf(shf[tid], shf[tid + s]);
+        __syncthreads();
+    }
+    me = shf[0];
+    __syncthreads();
+    shf[tid] = mf;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) shf[tid] = fmaxf(shf[tid], shf[tid + s]);
+        __syncthreads();
+    }
+    mf = shf[0];
+    __syncthreads();
+    double se = 0.0, sf = 0.0, st = 0.0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float ei = e[i], fi = f[i];
+        const double a = expf(ei - me), b = expf(fi - mf);
+        se += a;
+        sf += b;
+        st += a * (double) (ei - fi);
+    }
+    se = logit_kl_block_sum(se, shd);
+    sf = logit_kl_block_sum(sf, shd);
+    st = logit_kl_block_sum(st, shd);
+    if (tid == 0) {
+        const double kl = st / se - ((double) me + log(se)) + ((double) mf + log(sf));
+        out[0] = (float) (kl > 0.0 ? kl : 0.0);
+    }
+}
+}  // namespace
+
+void logit_kl(const float* exact, const float* first, int n, float* out, void* stream) {
+    if (n <= 0) return;
+    logit_kl_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(exact, first, n, out);
+    check("logit_kl");
 }
 
 bool multi_block_head_ops() {

@@ -4557,7 +4557,8 @@ int main(int argc, char** argv) {
         // profile ranks every pair; a pair it does not rank counts as the least used).  The floor and edge are route-resident's
         // (STRATA_ROUTE_RESIDENT_RANKS, default 6-9; STRATA_ROUTE_RESIDENT_EDGE, default off).  Unset: nothing here runs.
         if (const char* mv = std::getenv("STRATA_MASK")) {
-            const double share = std::min(0.95, std::atof(mv));
+            const bool mlearn = strata::core::mask_learn_env();   // STRATA_MASK=learn: the share is the learner's start (p0), see mask_learn_begin
+            const double share = mlearn ? 0.05 : std::min(0.95, std::atof(mv));
             if (share > 0.0) {
                 int mlo = 6, mhi = 9;
                 if (const char* rv = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(rv, "%d-%d", &mlo, &mhi);
@@ -4571,7 +4572,8 @@ int main(int argc, char** argv) {
                 }
                 std::vector<uint8_t> host((size_t) (nl * ne), 0);
                 const int64_t per = (int64_t) std::floor(share * (double) ne);
-                for (int64_t il = 0; il < nl; ++il) {
+                if (mlearn) host = strata::core::mask_learn_begin(nl, ne, pos);
+                if (!mlearn) for (int64_t il = 0; il < nl; ++il) {
                     std::vector<int> order((size_t) ne);
                     std::iota(order.begin(), order.end(), 0);
                     std::stable_sort(order.begin(), order.end(),
@@ -12396,6 +12398,23 @@ int main(int argc, char** argv) {
         }
         // STRATA_STANDIN_LEARN: the learned stand-in corrections of this model (standin-learn-<hex>.bin beside the stand-in tuning), loaded
         // before the first request and saved at each request's end
+        // STRATA_MASK=learn: the mask table of this model (mask-learn-<hex>.bin beside the stand-in tuning file), loaded before the first request
+        std::string mask_learn_file;
+        if (strata::core::mask_learn_env() && ver.mask_learn_active()) {
+            const std::string tune = standin_tune_path(o);
+            strata::core::SessionFileIdentity sid;
+            std::string se;
+            if (!tune.empty() && session_identity(sid, se, {})) {
+                char hex[17];
+                std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) sid.model);
+                mask_learn_file = (std::filesystem::path(tune).parent_path() / ("mask-learn-" + std::string(hex) + ".bin")).string();
+                std::string lm;
+                strata::core::mask_learn_open(mask_learn_file, lm);   // (the seed levels stand when the file is not this model's)
+                std::fprintf(stderr, "strata serve: mask learn: %s (%s)\n", mask_learn_file.c_str(), lm.c_str());
+            } else
+                std::fprintf(stderr, "strata serve: mask learn: not kept (%s)\n", tune.empty() ? "no expert profile directory" : se.c_str());
+        } else if (strata::core::mask_learn_env())
+            std::fprintf(stderr, "strata serve: mask learn: off (needs the flip re-check: STRATA_FRAGILE_RECHECK and route-resident)\n");
         std::string standin_learn_file;
         if (ver.standin_learn_active()) {
             const std::string tune = standin_tune_path(o);
@@ -16057,6 +16076,7 @@ int main(int argc, char** argv) {
                     const bool ex_ok = ver.route_fragile_gaps(1, &ex_gap, &ex_top1);
                     strata::core::Verifier::route_fragile_settle(ex_ok, ex_top1);
                     ver.standin_learn_settle(ex_ok);   // STRATA_STANDIN_LEARN: the exact successor's y_e makes the sample (no-op when off)
+                    ver.mask_learn_settle(ex_ok, ex_top1);   // STRATA_MASK=learn: D of the exact row 0 against the cut row's first pass
                     if (rb_on) {   // STRATA_ROLLBACK: a brake in this settle rewinds at this window's end (below)
                         int64_t bf = -1, bl = -1;
                         float bo = 0.0f, bn = 0.0f;
@@ -16082,11 +16102,13 @@ int main(int argc, char** argv) {
                             const float ratio = fr_shift[(size_t) r] > 0.0f ? fr_gap[(size_t) r] / fr_shift[(size_t) r] : 0.0f;
                             strata::core::Verifier::route_fragile_cut(ratio, fr_top1[(size_t) r], fr_explore, fr_control);
                             ver.standin_learn_cut(r);   // STRATA_STANDIN_LEARN: the cut row's first stand-in and its y_s (no-op when off)
+                            ver.mask_learn_cut(r, fr_top1[(size_t) r], T, fr_control);   // STRATA_MASK=learn: the first-pass logits, the row's picks
                             if (rb_on) strata::core::Verifier::route_fragile_pos(produced_n + r);   // STRATA_ROLLBACK: row r's token position
                             fr_cut = r;
                         }
                     }
                 }
+                if (!merged && ver.mask_learn_active()) ver.mask_learn_window(T, fr_cut >= 0 ? fr_cut : T, fr_cut >= 0);   // STRATA_MASK=learn
                 // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
                 // window to <path>.<n>, so the prompt paths (a peer card's share, a split) can be compared by KL
                 if (first_window) {
@@ -16695,6 +16717,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: mask (STRATA_MASK): %llu masked picks seen, %llu moved to the next unmasked expert\n",
                                  mk_seen, mk_moved);
             }
+            if (ver.mask_learn_active()) std::fputs(strata::core::mask_learn_report().c_str(), stderr);   // STRATA_MASK=learn: the request's line
             {   // STRATA_ROUTE_BUDGET_AUTO: the base budget the search ends this request at, and the tests it finished since the last line
                 float auto_b = 0.0f;
                 long long auto_tests = 0;
@@ -16841,6 +16864,10 @@ int main(int argc, char** argv) {
                 std::string la_rep;
                 strata::core::Verifier::la_learn_request_end(la_learn_path, la_rep);
                 std::fputs(la_rep.c_str(), stderr);
+            }
+            if (!mask_learn_file.empty()) {   // STRATA_MASK=learn: the table is saved at each request's end
+                std::string lm;
+                if (!strata::core::mask_learn_save(mask_learn_file, lm)) std::fprintf(stderr, "strata serve: mask learn: cannot save %s (%s)\n", mask_learn_file.c_str(), lm.c_str());
             }
             if (ver.standin_learn_active()) {   // STRATA_STANDIN_LEARN: the pairs are saved, and the request's stats line
                 std::string lm;

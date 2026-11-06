@@ -7,6 +7,19 @@
 #include <vector>
 
 namespace strata::kernels {
+/// STRATA_MASK=learn: the replaced picks of each decode row (a move of the mask, a stand-in swap): layer, the replaced expert, and its risk
+/// (w x gap). Row r's list is n[r] long (entries past kMaskEvCap are counted, not kept); layer 0's launch of a window resets the rows.
+constexpr int kMaskEvRows = 8;
+constexpr int kMaskEvCap = 1024;
+struct MaskEv {
+    int32_t layer;
+    int32_t expert;
+    float x;
+};
+struct MaskEvs {
+    unsigned n[kMaskEvRows];
+    MaskEv e[kMaskEvRows][kMaskEvCap];
+};
 // Configure before session capture. Existing graphs retain their selected kernels.
 // This experiment is off by default and does not modify the legacy router.
 void native_router_set_enabled(bool enabled);
@@ -67,7 +80,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                            unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr,
                            const uint8_t* ring = nullptr, const uint8_t* cheap = nullptr, unsigned long long* bstats = nullptr,
                            float* row_shift = nullptr, const float* pair_c = nullptr, int32_t* lrn_rec = nullptr, int layer = 0,
-                           const float* pair_pe = nullptr);
+                           const float* pair_pe = nullptr, MaskEvs* mev = nullptr, int row_base = 0);
 /// STRATA_STANDIN_BALANCE: pair_pe = the layer's [512][512] risk factor (clip(err / mean err, 0.25, 4) of a ready pair, 1 otherwise), or nullptr.
 /// STRATA_STANDIN_LEARN: pair_c = the layer's [512][512] correction (nullptr: none); lrn_rec = nullptr or the rows' [n][4] first-stand-in
 /// records (layer, rank, true expert, stand-in; layer -1 until set, the host resets them per window); layer = this layer's index.
@@ -100,7 +113,11 @@ const uint8_t* route_mask_layer(int64_t layer, int64_t n_expert);   ///< the lay
 const std::vector<uint8_t>* route_mask_host();
 /// Moves the layer's masked picks of the n_tok rows (ids / weights [n_tok][10], logits [n_tok][512]) by the rule above; row_shift (device,
 /// nullable) gets each move's w x gap.  The same call moves the look-ahead's guesses under the target layer's mask (no row_shift).
-void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream);
+/// mev (STRATA_MASK=learn): each move's layer, replaced expert and w x gap go to row (row_base + t) of the list; layer 0 resets the rows.
+void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream,
+                       MaskEvs* mev = nullptr, int layer = 0, int row_base = 0);
+/// STRATA_MASK=learn: copies the changed layers of `host` (same size as the set mask) to the device and the host copy. false: not set.
+bool route_mask_update(const std::vector<uint8_t>& host);
 /// The seen / moved counts since the last read (read and reset); false when no mask is set.
 bool route_mask_read(unsigned long long& seen, unsigned long long& moved);
 /// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear expert predictors, folded into one bf16 [512 x n_embd]

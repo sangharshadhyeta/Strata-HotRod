@@ -39,7 +39,21 @@
 #include <string>
 #include <vector>
 
+namespace strata::kernels {
+struct MaskEvs;
+}
+
 namespace strata::core {
+
+/// STRATA_MASK=learn (opt-in): the mask learns from the flip re-checks' divergence (the Verifier's mask_learn_* hooks; the state is kept
+/// here).  _env: the switch is "learn".  _begin(nl, ne, pos): the state and the seed levels (pos = the profile rank of each pair, higher =
+/// less used; empty when off).  _open / _save: the table file of this model.  _report: the request's line (counts reset).
+bool mask_learn_env();
+bool mask_learn_seeded();   ///< _begin ran: the state exists (the Verifier's buffers follow it)
+std::vector<uint8_t> mask_learn_begin(int64_t n_layers, int64_t n_expert, const std::vector<int64_t>& pos);
+bool mask_learn_open(const std::string& path, std::string& msg);
+bool mask_learn_save(const std::string& path, std::string& msg);
+std::string mask_learn_report();
 
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
@@ -272,6 +286,12 @@ public:
     bool standin_learn_save(const std::string& path, std::string& msg) const;
     void standin_learn_cut(int row);
     void standin_learn_settle(bool exact_ok);
+    /// STRATA_MASK=learn: the mask_learn_* hooks, after the window that ran (cut / settle as the stand-in learn's; window: every decode window
+    /// of n <= 8 rows with `kept` rows kept; cut: true when the window was cut at its row kept).  active: the buffers and the state exist.
+    bool mask_learn_active() const;
+    void mask_learn_cut(int row, int32_t stand_top1, int T, bool control);
+    void mask_learn_settle(bool exact_ok, int32_t exact_top1);
+    void mask_learn_window(int T, int kept, bool cut);
     std::string standin_learn_report();
     /// STRATA_STANDIN_BALANCE=1 (opt-in; needs STRATA_STANDIN_LEARN): the stand-ins' risk per pair and the per-expert keep / give-up decision.
     /// standin_balance_on(): the switch.  standin_balance_commit(n, use, miss, keep): n committed decode tokens; every 256 of them one round:
@@ -765,6 +785,9 @@ private:
     float* lrn_ye_ = nullptr;          ///< device [N]: the exact re-run's true-expert down output (y_e) at the pending layer
     int32_t* lrn_gate_ = nullptr;      ///< device [4]: mode (0 off, 1 capture y_s, 2 capture y_e), layer, rank
     float* lrn_pe_ = nullptr;          ///< device [n_layers][512][512] (STRATA_STANDIN_BALANCE): the risk factor per pair (1 until ready)
+    strata::kernels::MaskEvs* mev_ = nullptr;   ///< STRATA_MASK=learn: device, the replaced picks of each decode row (native_router.hpp)
+    float* mlr_logit0_ = nullptr;               ///< STRATA_MASK=learn: device [vocab] the cut row's first-pass logits (head stage)
+    float* mlr_kl_ = nullptr;                   ///< STRATA_MASK=learn: device [1] the re-check's KL
     struct StandinLearnState;
     std::shared_ptr<StandinLearnState> lrn_st_;   ///< host: the pairs, the pending sample, this request's counts (verify.cpp)
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself

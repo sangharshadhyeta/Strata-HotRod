@@ -226,6 +226,15 @@ Short prompts, seconds until the first word (10 Oct 2026, before the 0.1.45 merg
   STRATA_FRAGILE_RECHECK re-decides the close calls the mask makes; the re-check's exact re-run runs unmasked. Unset: nothing runs.
   Request line: `strata serve: mask (STRATA_MASK): <seen> masked picks seen, <moved> moved`. Built, not run.
 
+- **STRATA_MASK=learn (opt-in, untested).** The mask learns from the model's own divergence on the user's traffic (the DeepSeek port of
+  DS4_MASK=learn). It starts at a 5% share (the profile's least-used pairs). A flip re-check cuts a decode window at row r; the next
+  window runs exact, and the KL between its row 0 and the cut row's first pass (D) is shared over the row's replaced picks as harm; every
+  replaced pick of a decode row is exposure. Harm rate = harm / exposure, decayed by half every 8192 tokens. Every 256 decode tokens the
+  share follows the re-check agreement (98% or more: up 2.5 points; under 95%: down 5 points) and the masks move among the least-used
+  pairs by rate; a pair with 256 or more exposures and a rate under its layer's 10th percentile is masked at every rank. The table is
+  saved as `mask-learn-<model>.bin` beside the stand-in tuning file, every 4096 tokens and at each request's end. Needs the flip re-check
+  and route-resident. Request line: `strata serve: mask learn: p <p>, <m> masked (<a> at all ranks), re-check D mean <d> (<n>), <k> experts scored`.
+
 - **STRATA_STANDIN_LEARN=1 (opt-in, changes the output).** Each stand-in learns a correction for its (layer, true expert, stand-in)
   pair from the flip re-checks. A cut window keeps the row's first stand-in output y_s (a device copy per layer, gated by the host
   between windows); the exact successor's row 0 gives the true expert's y_e at the same layer and rank. Per pair, a decayed least
