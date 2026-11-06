@@ -6554,8 +6554,10 @@ void mlr_update(MaskLearnState& s) {
     if (!strata::kernels::route_mask_update(s.lv)) std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
 }
 
-// The table file: "MLRN", version 3, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the kept token count, g, then harm
-// and exposure (double) and the levels.  Versions 1 and 2 have no g (it is the loaded levels' level-2 share).
+// The table file: "MLRN", version 4, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the kept token count, g, the mask
+// test's progress (version 4: mt_step as a double, then mt_first, mt_stage, mt_win_d, mt_last_move as int32), then harm and exposure (double)
+// and the levels.  Versions 1 and 2 have no g (it is the loaded levels' level-2 share); versions 1 to 3 have no test progress (the defaults).
+// A running test (mt_on) is not saved: the direction state, the step and an unconfirmed win carry over, the test itself starts again.
 bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg) {
     const std::string tmp = path + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -6563,15 +6565,19 @@ bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg
         msg = "cannot open " + tmp;
         return false;
     }
-    const uint32_t ver = 3;   // 2: + the mask/stand-in split of the re-checks; 3: + g
+    const uint32_t ver = 4;   // 2: + the mask/stand-in split of the re-checks; 3: + g; 4: + the mask test's direction state, step and unconfirmed win
     const double split[4] = {s.fm, s.nm, s.fs, s.fsn};
     const int32_t nl = (int32_t) s.nl, ne = (int32_t) s.ne;
     const long long tok = s.tok;
     const double g = s.g;
+    const int32_t mt_first = s.mt_first, mt_stage = s.mt_stage, mt_win_d = s.mt_win_d, mt_last_move = s.mt_last_move;
     bool ok = std::fwrite("MLRN", 1, 4, f) == 4 && std::fwrite(&ver, sizeof ver, 1, f) == 1 && std::fwrite(&nl, sizeof nl, 1, f) == 1 &&
               std::fwrite(&ne, sizeof ne, 1, f) == 1 && std::fwrite(&s.p, sizeof s.p, 1, f) == 1 && std::fwrite(&s.ag_ok, sizeof s.ag_ok, 1, f) == 1 &&
               std::fwrite(&s.ag_tot, sizeof s.ag_tot, 1, f) == 1 && std::fwrite(split, sizeof(double), 4, f) == 4 && std::fwrite(&tok, sizeof tok, 1, f) == 1 &&
               std::fwrite(&g, sizeof g, 1, f) == 1 &&
+              std::fwrite(&s.mt_step, sizeof s.mt_step, 1, f) == 1 && std::fwrite(&mt_first, sizeof mt_first, 1, f) == 1 &&
+              std::fwrite(&mt_stage, sizeof mt_stage, 1, f) == 1 && std::fwrite(&mt_win_d, sizeof mt_win_d, 1, f) == 1 &&
+              std::fwrite(&mt_last_move, sizeof mt_last_move, 1, f) == 1 &&
               std::fwrite(s.harm.data(), sizeof(double), s.harm.size(), f) == s.harm.size() &&
               std::fwrite(s.expo.data(), sizeof(double), s.expo.size(), f) == s.expo.size() &&
               std::fwrite(s.lv.data(), 1, s.lv.size(), f) == s.lv.size();
@@ -6594,15 +6600,20 @@ bool mlr_load(MaskLearnState& s, const std::string& path) {
     double p = 0.0, ok = 0.0, tot = 0.0;
     long long tok = 0;
     double g = 0.0;
+    double mt_step = 1.0;
+    int32_t mt_first = -1, mt_stage = 0, mt_win_d = 0, mt_last_move = 0;   // (version 4 only; the defaults otherwise)
     std::vector<double> harm(cnt), expo(cnt);
     std::vector<uint8_t> lv(cnt);
     double split[4] = {0.0, 0.0, 0.0, 0.0};   // (version 1: the scores kept, the split starts empty)
     bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 &&
-                (ver == 1 || ver == 2 || ver == 3) &&
+                (ver == 1 || ver == 2 || ver == 3 || ver == 4) &&
                 std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == s.nl && ne == s.ne &&
                 std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 && std::fread(&tot, sizeof tot, 1, f) == 1 &&
                 (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) && std::fread(&tok, sizeof tok, 1, f) == 1 &&
                 (ver < 3 || std::fread(&g, sizeof g, 1, f) == 1) &&
+                (ver < 4 || (std::fread(&mt_step, sizeof mt_step, 1, f) == 1 && std::fread(&mt_first, sizeof mt_first, 1, f) == 1 &&
+                             std::fread(&mt_stage, sizeof mt_stage, 1, f) == 1 && std::fread(&mt_win_d, sizeof mt_win_d, 1, f) == 1 &&
+                             std::fread(&mt_last_move, sizeof mt_last_move, 1, f) == 1)) &&
                 std::fread(harm.data(), sizeof(double), cnt, f) == cnt && std::fread(expo.data(), sizeof(double), cnt, f) == cnt &&
                 std::fread(lv.data(), 1, cnt, f) == cnt;
     std::fclose(f);
@@ -6616,6 +6627,19 @@ bool mlr_load(MaskLearnState& s, const std::string& path) {
         g = masked > 0 ? (double) level2 / (double) masked : 0.25;
     }
     s.g = std::min(1.0, std::max(0.0, g));
+    if (ver >= 4) {   // the mask test's progress (a running test is not resumed: mt_on stays as it is)
+        s.mt_step = std::min(8.0, std::max(1.0, mt_step));
+        s.mt_first = mt_first == 1 || mt_first == -1 ? mt_first : -1;
+        s.mt_stage = mt_stage == 0 || mt_stage == 1 ? mt_stage : 0;
+        s.mt_win_d = mt_win_d == 0 || mt_win_d == 1 || mt_win_d == -1 ? mt_win_d : 0;
+        s.mt_last_move = mt_last_move == 0 || mt_last_move == 1 || mt_last_move == -1 ? mt_last_move : 0;
+    } else {
+        s.mt_step = 1.0;
+        s.mt_first = -1;
+        s.mt_stage = 0;
+        s.mt_win_d = 0;
+        s.mt_last_move = 0;
+    }
     s.p = std::min(kMlPMax, std::max(kMlPMin, p));
     s.ag_ok = ok;
     s.ag_tot = tot;
