@@ -45,22 +45,27 @@ This is the **DeepSeek branch** (`upstream-dsv41`) of Strata-HotRod: upstream [S
 
 <div align="justify">
 
-Measured on the machine below (answer tokens/s, the same 3 questions, 32K context, every answer read by hand).
+Measured on the machine below (answer tokens/s, the same 3 questions, every answer read by hand). Single runs swing by about
+±7%, so the default is the mean of 3 alternated rounds.
 
 </div>
 
 <table width="100%">
 <tr><th align="left">Setting</th><th align="right">tokens/s</th></tr>
-<tr><td align="left">The default here: the VRAM ring + stand-ins</td><td align="right"><b>5.2 / 5.3 / 5.4</b> (three runs)</td></tr>
-<tr><td align="left">The same sessions without the ring and stand-ins</td><td align="right">4.8 - 5.0</td></tr>
+<tr><td align="left">The default now (6 Nov): pictures on, 262K context, the ring, stand-ins and the self-setting read-ahead cap</td><td align="right"><b>6.33</b> (rounds 5.95 / 6.42 / 6.62)</td></tr>
+<tr><td align="left">The same before the read-ahead cap, the ring off with pictures on (5 Nov)</td><td align="right">4.7 - 5.0</td></tr>
+<tr><td align="left">The first ring + stand-ins default (1 Nov, 32K, no pictures)</td><td align="right">5.2 / 5.3 / 5.4</td></tr>
 </table>
 
 <div align="justify">
 
-Why it is not faster: 270 of the 15,360 routed experts (2.65 GB) fit the card next to 6.2 GB of dense weights, so about 75% of
-the picks are computed on the CPU lane, from the RAM store or in place from the files. Each token still needs about 2 GB of
-expert weights from RAM and the NVMe, and the NVMe (about 2.8 GB/s) is the limit on this PC. All the rows, including what did
-not help: [docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md).
+Where a token's time goes (`DS4_PROF=1`, 6 Nov): about 140 ms a token, of which about 70% is the card waiting for the CPU lane,
+and about two thirds of the lane's time is waiting for the RAM store's reads from the NVMe (8-33 misses a token, ~3.6 ms each:
+one 10 MB expert at about 2.8 GB/s). The card's own work - attention, routing, its experts - is about 43 ms. So copying more
+experts to the card does not help; fewer misses on the CPU lane's path does. 224 of the 15,360 routed experts fit the card next
+to 6.2 GB of dense weights. The engine picks 5 experts a token here ("faster mode", chosen for this hardware): 6 was measured
+4% slower on average and 13-16% slower on long answers, with the same answers on a hard set. All the rows, including what did not
+help: [docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md).
 
 </div>
 
@@ -95,12 +100,26 @@ To upstream's DeepSeek engine, on by default when the ring is on (`=0` turns eac
 - **The RAM store gives back its coldest idle chunk** (unpinned first) when RAM runs short, and takes chunks back later.
 - **Pictures**: with Unsloth's `mmproj-BF16.gguf` in the pack (`--mmproj` to `pack_gguf.py`) and `--vision on`, the
   engine's own vision tower reads images (319 MiB of VRAM; checked on a known picture: shapes, colours, positions and text
-  right). Known issue: with the tower on, the RAM store is sized 0 and the ring turns off (a free-RAM drop is taken for a
-  unified-memory machine); the fix is pending.
+  right). The ring stays on with the tower (fixed 5 Nov: a free-RAM drop was taken for a unified-memory machine).
+- **A self-setting read-ahead cap** (`DS4_IO_GUESS_MAX`, auto): guess reads in flight follow how long the decode's own reads
+  wait (down above 0.3 ms, up below 0.15 ms), so a needed read never queues behind guesses: +9% (6 Nov). `=N` fixes it.
+- **Reads the draft while you type** (the chat page, `prefill_warm`, on): a 3.3K-token prompt's first token in 0.1 s when it
+  was warmed, 2.0 s after 8 more words, 40.5 s cold. Live speeds under the messages.
+- **Conversations kept** (the engine's slots, in RAM and in a folder; set `STRATA_DS4_SLOT_DIR` to a lasting place): a chat's
+  next turn reads only what is new.
+- **Stand-ins that learn** (`DS4_STANDIN_LEARN=1`, on in our config, new 6 Nov): each (expert, stand-in) pair learns a
+  correction from the tokens the flip re-check already runs twice; a pair is used after 32 samples (0.5-2x) and the table is
+  kept in the pack (`standin-learn.bin`), so it fills over hours of use.
+- **`DS4_PROF=1`** prints after each request the card's time a token by stage and the CPU lane's read wait and store hit rate.
 
-Measured and left opt-in: `STRATA_LA_TAIL_READ=3` (a learned read-ahead of lower-ranked guesses: 23% slower, the drive is
-already at its limit here) and `DS4_PCIE_BALANCE=1` (Qwen's dynamic balance ported: its copies arrive too late and it is
-not yet safe - do not turn it on).
+New and being tested (opt-in): `DS4_MASK=<share>` (the least-used experts of each layer are never routed to, from rank 3; an
+offline estimate gave only ~5% fewer reads at 25%, since the misses are spread over the experts) and `DS4_STANDIN_BALANCE=1`
+(per expert, a stand-in or a swap into fast memory, from the measured stand-in error, how often it is picked and the read cost).
+
+Measured and left opt-in: `STRATA_LA_TAIL_READ=3` (23% slower, the drive is already at its limit here), `DS4_PCIE_BALANCE=1`
+(Qwen's dynamic balance: its copies arrive too late, -10%), and the ring orderings of 6 Nov - `DS4_RING_WORTH=1/2`,
+`DS4_RING_ONLY=4` (-15%), `DS4_LA_AHEAD2`, `DS4_STORE_PROTECT`, `DS4_STORE_EARLY` (-11%): none beat the default over 3
+alternated rounds.
 
 </div>
 
