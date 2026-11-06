@@ -1028,7 +1028,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
         }
         m.request_end();
-        m.save_profile();
+        {   // the expert profile (and the learned stand-in pairs) at most every 2 minutes, not after every request (6 Nov overhead
+            // audit); the engine's end still saves them
+            static auto prof_last = std::chrono::steady_clock::now() - std::chrono::hours(1);
+            if (std::chrono::steady_clock::now() - prof_last >= std::chrono::minutes(2)) {
+                prof_last = std::chrono::steady_clock::now();
+                m.save_profile();
+            }
+        }
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them

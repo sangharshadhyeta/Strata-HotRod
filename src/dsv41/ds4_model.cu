@@ -1843,7 +1843,11 @@ struct Model::Impl {
                 if (!tune.save(tune_path)) std::fprintf(stderr, "ds4: stand-ins: %s not written\n", tune_path.c_str());
             }
         }
-        if (la_on) {
+        // the learner's report (a device sync + reads) and its save (several MB) at most every 2 minutes, not after every request
+        // (6 Nov overhead audit: the largest per-request cost; it also saves every 4096 learning tokens and at the engine's end)
+        static auto la_last = std::chrono::steady_clock::now() - std::chrono::hours(1);
+        if (la_on && std::chrono::steady_clock::now() - la_last >= std::chrono::minutes(2)) {
+            la_last = std::chrono::steady_clock::now();
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             std::fputs(la::report().c_str(), stderr);
             la_save();
