@@ -1415,6 +1415,7 @@ struct LaBatch {
     int dist[kLaNd];
     int L, H, lo, n, Nd, Nsd, Nset, timing;
     float exact_w;               // STRATA_LA_EXACT_W: the weight of a true pick below the stand-in floor in the loss (1: as the rest)
+    const uint8_t* mask;         // [L][512]: the route mask's base (route_mask_layer(0, 512)); nullptr: no mask, or another GPU's
 };
 // the true rank of each expert (ties by index) and the true 32nd logit: grid (n, L), a thread per expert
 __global__ void la_b_rank_k(LaBatch a) {
@@ -1486,6 +1487,9 @@ __global__ void la_b_grad_k(LaBatch a) {   // grid (n, Nset), block 512
     // STRATA_LA_EXACT_W (a.exact_w, 1: off): the true picks below the stand-in floor (ranks 0 .. lo-1, the ones a miss reads from RAM or
     // the SSD) weigh w times as much as the rest of the top 32 - the placement solver's rank weighting, in the learner's loss
     if (top && a.rk[row * kLaE + e] < a.lo) g *= a.exact_w;
+    // STRATA_MASK=learn: an expert at level 2 (masked at every rank, never routed or read) has no weight in the loss.  m is the TARGET layer
+    // (the layer whose label row this is); level 1 stays in the loss (exact below its rank lo-1)
+    if (a.mask != nullptr && a.mask[(size_t) m * kLaE + e] == 2) g = 0.0f;
     g /= (float) a.n;
     a.g[((size_t) z * kLaTok + t) * kLaE + e] = g;
     for (int k = 0; k < r; ++k) P[k][e] = g * a.B[c][(size_t) sd * kLaE * r + e * r + k];
@@ -1866,24 +1870,26 @@ void la_learn_pre_launch(void* stream) {
 }
 
 // after a learning window's graph is launched on cs: the batch on the side stream, which waits for the window's end and records done
-static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd);
+static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd, const uint8_t* mask);
 void la_learn_post_launch(void* stream, const int* res, int n) {
     if (!la_learn_active() || n < 1 || n > kLaTok) return;
     LaLearn& s = *g_la;
     cudaStream_t cs = static_cast<cudaStream_t>(stream);
     cudaEventRecord(s.ev_end, cs);
     cudaStreamWaitEvent(s.side, s.ev_end, 0);
-    la_batch(s, res, n, kLaDist, kLaNd);
+    // the mask's base ([layers][512]; route_mask_layer(0) is the base): nullptr when no mask is set or it lives on another GPU
+    la_batch(s, res, n, kLaDist, kLaNd, route_mask_layer(0, kLaE));
 }
 // the batch of n token rows on the instance's side stream (the caller ordered it after the work it reads): the LaBatch from the instance,
 // the dists (Nd of them), every kernel in launch order, and the done event.  The main learner's post launch and the drafter's batch share it.
-static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd) {
+// mask: the route mask's base for the target layers (nullptr: none; the drafter's label is its own router, not a main layer, so it passes none).
+static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd, const uint8_t* mask) {
     LaBatch a{};
     for (int c = 1; c < kLaSlots; ++c) {
         a.A[c] = s.A[c]; a.B[c] = s.B[c]; a.mA[c] = s.mA[c]; a.vA[c] = s.vA[c]; a.mB[c] = s.mB[c]; a.vB[c] = s.vB[c];
     }
     a.x = s.x; a.u = s.u; a.pred = s.pred; a.lab = s.lab; a.res = res;
-    a.rk = s.rk; a.thr = s.thr; a.g = s.g; a.du = s.du; a.act = s.act; a.tstep = s.tstep;
+    a.rk = s.rk; a.thr = s.thr; a.mask = mask; a.g = s.g; a.du = s.du; a.act = s.act; a.tstep = s.tstep;
     a.steps = s.steps; a.live = s.live; a.lead = s.lead; a.frozen = s.frozen; a.reset = s.reset; a.tick = s.tick;
     a.cnt = s.cnt; a.st = s.st; a.tot_ns = s.tot_ns; a.wait_ns = s.wait_ns; a.nwin = s.nwin;
     a.rinfo = s.rinfo; a.kst = s.kst; a.kacc = s.kacc;
@@ -2331,7 +2337,7 @@ void la_mtp_label(const float* logits_row, void* stream) {
 void la_mtp_batch() {
     if (!la_mtp_active()) return;
     static const int kDist1[1] = {1};
-    la_batch(*g_lam, g_mla.res2, 1, kDist1, 1);
+    la_batch(*g_lam, g_mla.res2, 1, kDist1, 1, nullptr);
 }
 
 // before a window's graph is launched on its stream: the last batch is done, and the source copies are (the forward overwrites them)

@@ -233,7 +233,8 @@ Short prompts, seconds until the first word (10 Oct 2026, before the 0.1.45 merg
   share follows the re-check agreement (98% or more: up 2.5 points; under 95%: down 5 points) and the masks move among the least-used
   pairs by rate; a pair with 256 or more exposures and a rate under its layer's 10th percentile is masked at every rank. The table is
   saved as `mask-learn-<model>.bin` beside the stand-in tuning file, every 4096 tokens and at each request's end. Needs the flip re-check
-  and route-resident. Request line: `strata serve: mask learn: p <p>, g <g>, <m> masked (<a> at all ranks), re-check D mean <d> (<n>), <k> experts scored`.
+  and route-resident. The look-ahead learner's loss gives an expert masked at every rank no weight (its gradient is zero), so the learning
+  spends itself on the experts that can be needed. Request line: `strata serve: mask learn: p <p>, g <g>, <m> masked (<a> at all ranks), re-check D mean <d> (<n>), <k> experts scored`.
   The depth is two numbers: the share p and g, the fraction of the masked experts allowed at level 2 (all ranks): at most round(g x the
   layer's masked count) of a layer's graduated pairs, the lowest harm rates first. g starts at the loaded table's level-2 share (else 0.25).
   With STRATA_ROUTE_BUDGET_AUTO on, the budget tests alternate with mask tests (`STRATA_MASK=learn` x AUTO): the same interleaved arms, both
