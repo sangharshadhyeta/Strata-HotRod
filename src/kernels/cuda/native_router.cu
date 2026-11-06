@@ -570,7 +570,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             // STRATA_MASK=learn: the replaced pick (orig[r]) and its risk, in this row's list
             if (lane == 0 && mev != nullptr && row_base + t < kMaskEvRows) {
                 const unsigned q = mev->n[row_base + t]++;
-                if (q < kMaskEvCap) mev->e[row_base + t][q] = MaskEv{layer, orig[r], weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f)};
+                if (q < kMaskEvCap) mev->e[row_base + t][q] = MaskEv{layer, orig[r], weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f), 0};
             }
             my[r] = bi;
             sub_s[r] = bi;
@@ -825,7 +825,7 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
         if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * gap);
         if (lane == 0 && mev != nullptr && row < kMaskEvRows) {   // STRATA_MASK=learn: the replaced pick and its risk
             const unsigned q = mev->n[row]++;
-            if (q < kMaskEvCap) mev->e[row][q] = MaskEv{layer, e, weights[(size_t) t * 10 + r] * gap};
+            if (q < kMaskEvCap) mev->e[row][q] = MaskEv{layer, e, weights[(size_t) t * 10 + r] * gap, 1};
         }
         my[r] = bi;
         ++moved;

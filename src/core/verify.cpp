@@ -6357,6 +6357,7 @@ namespace {
 constexpr double kMlP0 = 0.05, kMlPMax = 0.95;
 constexpr long long kMlMaskEvery = 256, kMlDecayEvery = 8192, kMlSampleEvery = 64, kMlSaveEvery = 4096;
 constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
+constexpr double kMlMinSide = 16.0, kMlPMin = 0.025;   // re-checks needed on each side of the comparison; the share's floor
 constexpr int kMlMinPop = 8;
 
 struct MaskLearnState {
@@ -6372,6 +6373,9 @@ struct MaskLearnState {
     uint32_t stamp_id = 0;
     double p = kMlP0;
     double ag_ok = 0.0, ag_tot = 0.0;
+    // the re-checks split by whether the mask moved a pick in the cut row (flips, count; decayed): the share follows the flips the mask
+    // ADDS beyond the stand-ins' (6 Nov: re-checks are close calls that flip often whatever the mask does; raw agreement only shrank p)
+    double fm = 0.0, nm = 0.0, fs = 0.0, fsn = 0.0;
     long long tok = 0, nrc = 0;      // the kept decode tokens; the non-cut windows (every kMlSampleEvery-th is read)
     double dsum = 0.0;
     long long dn = 0;
@@ -6380,6 +6384,7 @@ struct MaskLearnState {
     int32_t pend_tok = -1;
     std::vector<Pick> pend_picks;
     double pend_sum = 0.0;
+    bool pend_masked = false;        // the pending row has a mask move
 };
 std::shared_ptr<MaskLearnState> g_mlr;
 
@@ -6455,10 +6460,12 @@ bool mlr_relevel(MaskLearnState& s) {
 // Every kMlMaskEvery kept tokens the masks move: p follows the re-checks' agreement (98% up, under 95% down), then the levels; the changed rows go
 // to the device.
 void mlr_update(MaskLearnState& s) {
-    if (s.ag_tot >= kMlMinAg) {
-        const double a = s.ag_ok / s.ag_tot;
-        if (a >= 0.98) s.p = std::min(kMlPMax, s.p + 0.025);
-        else if (a < 0.95) s.p = std::max(0.0, s.p - 0.05);
+    // the flip rate of re-checks with a mask move against those without (the stand-ins' own): > 2 SE above -> p -0.05; within 1 SE -> +0.025
+    if (s.nm >= kMlMinSide && s.fsn >= kMlMinSide) {
+        const double rm = s.fm / s.nm, rs = s.fs / s.fsn, r = (s.fm + s.fs) / (s.nm + s.fsn);
+        const double se = std::sqrt(std::max(1e-9, r * (1.0 - r) * (1.0 / s.nm + 1.0 / s.fsn)));
+        if (rm - rs > 2.0 * se) s.p = std::max(kMlPMin, s.p - 0.05);
+        else if (rm - rs < se) s.p = std::min(kMlPMax, s.p + 0.025);
     }
     if (mlr_relevel(s) && !strata::kernels::route_mask_update(s.lv))
         std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
@@ -6472,12 +6479,13 @@ bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg
         msg = "cannot open " + tmp;
         return false;
     }
-    const uint32_t ver = 1;
+    const uint32_t ver = 2;   // 2: + the mask/stand-in split of the re-checks
+    const double split[4] = {s.fm, s.nm, s.fs, s.fsn};
     const int32_t nl = (int32_t) s.nl, ne = (int32_t) s.ne;
     const long long tok = s.tok;
     bool ok = std::fwrite("MLRN", 1, 4, f) == 4 && std::fwrite(&ver, sizeof ver, 1, f) == 1 && std::fwrite(&nl, sizeof nl, 1, f) == 1 &&
               std::fwrite(&ne, sizeof ne, 1, f) == 1 && std::fwrite(&s.p, sizeof s.p, 1, f) == 1 && std::fwrite(&s.ag_ok, sizeof s.ag_ok, 1, f) == 1 &&
-              std::fwrite(&s.ag_tot, sizeof s.ag_tot, 1, f) == 1 && std::fwrite(&tok, sizeof tok, 1, f) == 1 &&
+              std::fwrite(&s.ag_tot, sizeof s.ag_tot, 1, f) == 1 && std::fwrite(split, sizeof(double), 4, f) == 4 && std::fwrite(&tok, sizeof tok, 1, f) == 1 &&
               std::fwrite(s.harm.data(), sizeof(double), s.harm.size(), f) == s.harm.size() &&
               std::fwrite(s.expo.data(), sizeof(double), s.expo.size(), f) == s.expo.size() &&
               std::fwrite(s.lv.data(), 1, s.lv.size(), f) == s.lv.size();
@@ -6501,16 +6509,22 @@ bool mlr_load(MaskLearnState& s, const std::string& path) {
     long long tok = 0;
     std::vector<double> harm(cnt), expo(cnt);
     std::vector<uint8_t> lv(cnt);
-    bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 && ver == 1 &&
+    double split[4] = {0.0, 0.0, 0.0, 0.0};   // (version 1: the scores kept, the split starts empty)
+    bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 &&
+                (ver == 1 || ver == 2) &&
                 std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == s.nl && ne == s.ne &&
                 std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 && std::fread(&tot, sizeof tot, 1, f) == 1 &&
-                std::fread(&tok, sizeof tok, 1, f) == 1 && std::fread(harm.data(), sizeof(double), cnt, f) == cnt &&
+                (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) && std::fread(&tok, sizeof tok, 1, f) == 1 && std::fread(harm.data(), sizeof(double), cnt, f) == cnt &&
                 std::fread(expo.data(), sizeof(double), cnt, f) == cnt && std::fread(lv.data(), 1, cnt, f) == cnt;
     std::fclose(f);
     if (!good) return false;
-    s.p = std::min(kMlPMax, std::max(0.0, p));
+    s.p = std::min(kMlPMax, std::max(kMlPMin, p));
     s.ag_ok = ok;
     s.ag_tot = tot;
+    s.fm = split[0];
+    s.nm = split[1];
+    s.fs = split[2];
+    s.fsn = split[3];
     s.tok = tok;
     s.harm = std::move(harm);
     s.expo = std::move(expo);
@@ -6594,9 +6608,10 @@ std::string mask_learn_report() {
         scored += s.expo[i] > 0.0;
     }
     const double dm = s.dn > 0 ? s.dsum / (double) s.dn : 0.0;
-    char buf[256];
-    std::snprintf(buf, sizeof buf, "strata serve: mask learn: p %.3f, %lld masked (%lld at all ranks), re-check D mean %.4f (%lld), %lld experts scored\n",
-                  s.p, m, a, dm, s.dn, scored);
+    char buf[384];
+    std::snprintf(buf, sizeof buf, "strata serve: mask learn: p %.3f, %lld masked (%lld at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
+                  "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f\n",
+                  s.p, m, a, dm, s.dn, scored, s.fm, s.nm, s.fs, s.fsn);
     s.dsum = 0.0;
     s.dn = 0;
     return buf;
@@ -6626,12 +6641,14 @@ void Verifier::mask_learn_cut(int row, int32_t stand_top1, int T, bool control) 
     s.pend_tok = stand_top1;
     s.pend_picks.clear();
     s.pend_sum = 0.0;
+    s.pend_masked = false;
     const unsigned n = std::min<unsigned>(ev->n[row], (unsigned) strata::kernels::kMaskEvCap);
     for (unsigned i = 0; i < n; ++i) {
         const strata::kernels::MaskEv& a = ev->e[row][i];
         if (a.layer < 0 || a.layer >= s.nl || a.expert < 0 || a.expert >= s.ne) continue;
         const double x = std::max(0.0, (double) a.x);
         s.pend_picks.push_back({a.layer, a.expert, x});
+        s.pend_masked = s.pend_masked || a.kind == 1;
         s.pend_sum += x;
     }
 }
@@ -6660,6 +6677,8 @@ void Verifier::mask_learn_settle(bool exact_ok, int32_t exact_top1) {
         for (const MaskLearnState::Pick& pk : s.pend_picks) s.harm[mlr_at(s, pk.l, pk.e)] += (double) D * pk.x / s.pend_sum;
     s.ag_tot += 1.0;
     s.ag_ok += flipped ? 0.0 : 1.0;
+    (s.pend_masked ? s.nm : s.fsn) += 1.0;
+    (s.pend_masked ? s.fm : s.fs) += flipped ? 1.0 : 0.0;
     s.dsum += (double) D;
     ++s.dn;
 }
@@ -6686,6 +6705,10 @@ void Verifier::mask_learn_window(int T, int kept, bool cut) {
         for (double& v : s.expo) v *= 0.5;
         s.ag_ok *= 0.5;
         s.ag_tot *= 0.5;
+        s.fm *= 0.5;
+        s.nm *= 0.5;
+        s.fs *= 0.5;
+        s.fsn *= 0.5;
     }
     if (s.tok / kMlMaskEvery != before / kMlMaskEvery) mlr_update(s);
     if (s.tok / kMlSaveEvery != before / kMlSaveEvery && !s.path.empty()) {

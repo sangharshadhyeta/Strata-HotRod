@@ -15,6 +15,7 @@ struct MaskEv {
     int32_t layer;
     int32_t expert;
     float x;
+    int32_t kind;   // 1: a mask move, 0: a stand-in swap (the share follows the flips the mask adds beyond the stand-ins')
 };
 struct MaskEvs {
     unsigned n[kMaskEvRows];
