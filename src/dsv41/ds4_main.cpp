@@ -1012,6 +1012,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::fprintf(stderr, "maya ds4 serve: GPU per token (DS4_PROF, %.0f tokens): %.2f ms - between layers %.2f, attention %.2f, "
                                      "routing + shared expert %.2f, experts gate/up %.2f, waiting for the CPU lane %.2f, down + post %.2f\n",
                              pt, sum, v[0], v[1], v[2], v[3], v[4], v[5]);
+                // the CPU lane's own split, this request: its time in cpu_experts, of which waiting for the RAM store's reads
+                static double cpu_prev = 0, sw_prev = 0;
+                static int64_t hit_prev = 0, mis_prev = 0;
+                const double cpu = (s.cpu_ms - cpu_prev) / pt, sw = (s.store_wait_ms - sw_prev) / pt;
+                const int64_t hits = s.store_hits - hit_prev, mis = s.store_misses - mis_prev;
+                cpu_prev = s.cpu_ms;
+                sw_prev = s.store_wait_ms;
+                hit_prev = s.store_hits;
+                mis_prev = s.store_misses;
+                std::fprintf(stderr, "maya ds4 serve: CPU lane per token (DS4_PROF): %.2f ms - waiting for the RAM store's reads %.2f, "
+                                     "the rest (compute, hand-offs) %.2f; store %lld hits, %lld misses this request (%.1f%% hit)\n",
+                             cpu, sw, cpu - sw, (long long) hits, (long long) mis,
+                             hits + mis > 0 ? 100.0 * (double) hits / (double) (hits + mis) : 0.0);
             }
         }
         m.request_end();
