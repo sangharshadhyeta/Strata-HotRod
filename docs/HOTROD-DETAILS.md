@@ -213,3 +213,8 @@ are already on the card):
 
 Short prompts, seconds until the first word (10 Oct 2026, before the 0.1.45 merge): 150-260 tokens 3.8-5.8 s, 430-500 tokens
 7.5-10.5 s, 1,600-2,100 tokens 14-16 s.
+
+- **STRATA_IO_PF_THREADS=auto, measured 6 Nov (lost, stays opt-in).** 3 alternated rounds at 131K, the three calibration questions:
+  default (2 threads) 34.7 tok/s, auto 32.7 (-5.6%). The cap climbed to 5-7 on the long reasoning answer, where it lost 4-17%: the
+  decode's reads slowed only ~22% per MB (under the 1.5x step-down) while the decode lost ~10%, so read time per MB does not see
+  what extra guesses cost on Qwen. A variant worth building: step the cap by answer speed itself (as DeepSeek's DS4_RING_INFLIGHT=auto).
