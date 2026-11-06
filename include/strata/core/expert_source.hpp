@@ -825,6 +825,9 @@ public:
     /// STRATA_STANDIN_BALANCE: the per-(layer, expert) eviction factors (flat, as usage; null: none).  The coldest RAM-held expert of a layer is
     /// the one with the least usage x factor.  Serve thread only, set once; the vector's contents may change between windows.
     void set_keep_bias(const std::vector<float>* bias) { keep_bias_ = bias; }
+    /// STRATA_MASK: the masked experts (flat [layers][n_expert], 1 = masked; null or empty: none).  A masked expert is the first victim of
+    /// its layer's RAM tier, before any usage order, so its place goes to an expert the router still picks.  Serve thread only, set once.
+    void set_mask_low(const std::vector<uint8_t>* mask) { mask_low_ = mask; }
     bool lookahead_promote() const { return promo_on_.load(std::memory_order_acquire); }
     /// Serve thread, between windows, with no adaptive round in flight and nothing staged.  `busy` is indexed layer *
     /// n_expert + expert (true: on a GPU).  Returns the number of experts published.  Every queued entry is consumed.
@@ -1373,6 +1376,8 @@ private:
     std::atomic<bool> promo_on_{false};
     std::atomic<const std::vector<float>*> promo_usage_{nullptr};
     const std::vector<float>* keep_bias_ = nullptr;   ///< STRATA_STANDIN_BALANCE: the eviction factors (null: none)
+    const std::vector<uint8_t>* mask_low_ = nullptr;  ///< STRATA_MASK: the masked experts, first to leave the RAM tier (null: none)
+    bool masked_low(size_t i) const { return mask_low_ != nullptr && i < mask_low_->size() && (*mask_low_)[i] != 0; }
     mutable std::mutex promo_mu_;
     std::deque<Promo> promo_q_;                  ///< written into a place, not yet published (publish_promotions takes them all)
     std::vector<char> promo_busy_;               ///< per (layer, expert): queued or being read (cleared when published / dropped)

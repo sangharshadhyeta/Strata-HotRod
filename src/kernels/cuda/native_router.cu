@@ -775,6 +775,7 @@ static unsigned long long* g_mask_stats = nullptr;  // device [2]: masked picks 
 static int g_mask_dev_id = -1;
 static int64_t g_mask_layers = 0, g_mask_ne = 0;
 static int g_mask_lo = 6;
+static std::vector<uint8_t> g_mask_host;            // the same mask on the host, [layers][n_expert] (the RAM tier reads it; empty: unset)
 static float g_mask_edge = -1.0f;
 namespace {
 __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
@@ -845,6 +846,7 @@ bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int
         return false;
     }
     g_mask_dev = dm;
+    g_mask_host.assign(host, host + n);
     g_mask_stats = st;
     g_mask_dev_id = dev;
     g_mask_layers = n_layers;
@@ -859,6 +861,7 @@ const uint8_t* route_mask_layer(int64_t layer, int64_t n_expert) {
     if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return nullptr; }
     return dev == g_mask_dev_id ? g_mask_dev + (size_t) layer * (size_t) n_expert : nullptr;   // another GPU's router keeps its own picks
 }
+const std::vector<uint8_t>* route_mask_host() { return &g_mask_host; }
 void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream) {
     if (!mask || !logits || !ids || !weights || n_tok < 1 || g_mask_stats == nullptr) return;
     route_mask_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, mask, n_tok, g_mask_lo,

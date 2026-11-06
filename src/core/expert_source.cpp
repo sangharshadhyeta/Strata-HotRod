@@ -4769,6 +4769,7 @@ int64_t FileExpertSource::coldest_resident_expert(int64_t layer, const std::vect
     if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || layer >= n_layers_) return -1;
     int64_t best = -1;
     float best_u = 0.0f;
+    bool best_m = false;
     for (int64_t e = 0; e < n_expert_; ++e) {
         const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) e;
         if (i >= complement_offsets_.size() || complement_offsets_[i] == kNoComplement) continue;   // not RAM-held
@@ -4779,9 +4780,12 @@ int64_t FileExpertSource::coldest_resident_expert(int64_t layer, const std::vect
         if (staged_in) continue;
         float u = i < usage.size() ? usage[i] : 0.0f;
         if (keep_bias_ != nullptr && i < keep_bias_->size()) u *= (*keep_bias_)[i];   // STRATA_STANDIN_BALANCE: the eviction factor
-        if (best < 0 || u < best_u) {
+        // STRATA_MASK: a masked expert is the victim before any unmasked one; within a kind, the least usage x factor goes
+        const bool m = masked_low(i);
+        if (best < 0 || (m && !best_m) || (m == best_m && u < best_u)) {
             best = e;
             best_u = u;
+            best_m = m;
         }
     }
     return best;
@@ -5047,7 +5051,8 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
         for (int64_t l = 0; l < n_layers_; ++l) {
             const int starved = promo_starved_[(size_t) l].exchange(0, std::memory_order_relaxed);
             if (starved <= 0 || usage.empty()) continue;
-            std::vector<std::pair<float, int64_t>> cold;
+            // key: (0 masked / 1 not, usage x factor): STRATA_MASK's experts give their places up first
+            std::vector<std::pair<std::pair<int, float>, int64_t>> cold;
             for (int64_t e = 0; e < n_expert_; ++e) {
                 const size_t j = (size_t) l * (size_t) n_expert_ + (size_t) e;
                 if (j >= complement_offsets_.size() || complement_offsets_[j] == kNoComplement) continue;
@@ -5055,12 +5060,13 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
                 if (!override_.empty() && override_[j] != nullptr) continue;
                 if (promo_flag_[j].load(std::memory_order_relaxed) != 0) continue;
                 if (j >= usage.size() || usage[j] >= 1.0f) continue;
-                cold.emplace_back(keep_bias_ != nullptr && j < keep_bias_->size() ? usage[j] * (*keep_bias_)[j] : usage[j], e);
+                const float u = keep_bias_ != nullptr && j < keep_bias_->size() ? usage[j] * (*keep_bias_)[j] : usage[j];
+                cold.push_back({{masked_low(j) ? 0 : 1, u}, e});
             }
             std::sort(cold.begin(), cold.end());
             int left = std::min(starved, 4);
-            for (const auto& [u, e] : cold) {
-                (void) u;
+            for (const auto& [key, e] : cold) {
+                (void) key;
                 if (left <= 0) break;
                 if (!release_resident_place(l, e)) break;   // staged state: nothing more may be given up now
                 --left;

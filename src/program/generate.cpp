@@ -6906,6 +6906,8 @@ int main(int argc, char** argv) {
         drive.d.keep_bias.assign((size_t) (g.n_layers * g.n_expert), 1.0f);
         if (auto* fsrc = dynamic_cast<strata::core::FileExpertSource*>(srcp)) fsrc->set_keep_bias(&drive.d.keep_bias);
     }
+    // STRATA_MASK: the masked experts leave the RAM tier first (empty mask: nothing changes)
+    if (auto* fsrc = dynamic_cast<strata::core::FileExpertSource*>(srcp)) fsrc->set_mask_low(strata::kernels::route_mask_host());
     drive.d.n_expert = g.n_expert;
     drive.d.n_layers = g.n_layers;
     drive.d.jobs.resize((size_t) K);

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::kernels {
 // Configure before session capture. Existing graphs retain their selected kernels.
@@ -95,6 +96,8 @@ float* route_pred_weights();                                         ///< scratc
 /// set once at start on the current GPU; lo / edge are the route-resident floor (RANKS lo, EDGE).  false: `msg` says why.
 bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int lo, float edge, std::string& msg);
 const uint8_t* route_mask_layer(int64_t layer, int64_t n_expert);   ///< the layer's mask; nullptr when unset or on another GPU
+/// The mask's host copy, flat [layers][n_expert] (1 = masked); empty until route_mask_set succeeds.  The RAM tier gives masked experts the lowest keep priority.
+const std::vector<uint8_t>* route_mask_host();
 /// Moves the layer's masked picks of the n_tok rows (ids / weights [n_tok][10], logits [n_tok][512]) by the rule above; row_shift (device,
 /// nullable) gets each move's w x gap.  The same call moves the look-ahead's guesses under the target layer's mask (no row_shift).
 void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream);
