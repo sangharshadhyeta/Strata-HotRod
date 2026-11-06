@@ -16826,14 +16826,18 @@ int main(int argc, char** argv) {
                     dc_prev = dc;
                 }
             }
-            // STRATA_LA_LEARN: the learned corrections are saved (their leaders, fp16) and the learner's stats line is logged
-            if (mtp_la_on) {   // STRATA_MTP_LA: the drafter learner's file and its stats line
+            // STRATA_LA_LEARN: the learned corrections are saved (their leaders, fp16) and the learner's stats line is logged - at most every
+            // 2 minutes, not after every request (6 Nov overhead audit: a device sync, reads and a file of several MB each time)
+            static auto la_last = std::chrono::steady_clock::now() - std::chrono::hours(1);
+            const bool la_due = std::chrono::steady_clock::now() - la_last >= std::chrono::minutes(2);
+            if (la_due) la_last = std::chrono::steady_clock::now();
+            if (la_due && mtp_la_on) {   // STRATA_MTP_LA: the drafter learner's file and its stats line
                 std::string lm;
                 if (!mtp_la_path.empty() && !strata::kernels::la_mtp_save(mtp_la_path.c_str(), lm))
                     std::fprintf(stderr, "strata serve: drafter look-ahead learner: cannot save %s (%s)\n", mtp_la_path.c_str(), lm.c_str());
                 std::fputs(strata::kernels::la_mtp_report().c_str(), stderr);
             }
-            if (strata::core::Verifier::la_learn_on()) {
+            if (la_due && strata::core::Verifier::la_learn_on()) {
                 std::string la_rep;
                 strata::core::Verifier::la_learn_request_end(la_learn_path, la_rep);
                 std::fputs(la_rep.c_str(), stderr);
