@@ -148,3 +148,22 @@ it starts beyond the mode-2 ranks are counted in ` early <n>` on the ring's requ
 governs them. Untested until measured.
 
 **DS4_STORE_PROTECT=1 (opt-in, untested):** the RAM store does not give up an expert that a guess says is about to be used. Why: measured 6 Nov, `DS4_STORE_EARLY=4` lost 11% and raised the ring's "not in the store" count (80K to 89K). The new guess reads evicted experts the next layers were about to use. `take_slot` gave up the lowest-score slot, and a `prefetch` of an expert already in the store did not refresh it, so an expert guessed for the very next layer could be the oldest and go to a guess four layers out. With the flag, `ahead_ask` gives each guessed expert the position it is for (`store->want`; the token count times the layers plus the layer; `set_pos` once per layer request on the serve thread), and `take_slot` skips a slot whose want is at or past the current position: a guess read is then dropped (`protect drop`), a demand read takes a wanted slot only when nothing else can be evicted (`protect forced`). The ring's request line adds ` protect drop <n> forced <n>`. Unset: as before. Untested until measured.
+
+## Measured 6 Nov (vision server, 262K, the three calibration questions; answers read by hand, all correct)
+
+The ring opt-ins above, after the auto read-ahead cap became the default. Single runs first, then 3 alternated rounds of every arm
+(the default ranged 5.95-6.62 tok/s across rounds, so only the alternated means count):
+
+| Arm | Mean of 3 rounds | vs default |
+| --- | ---: | ---: |
+| default | 6.33 | - |
+| `DS4_RING_WORTH=1` | 6.22 | -1.7% |
+| `DS4_RING_WORTH=2` | 6.38 | +0.9% (noise) |
+| `DS4_RING_WORTH=2` + `DS4_LA_AHEAD2=1` | 6.07 | -4.0% |
+| `DS4_RING_ONLY=4` | 5.41 | -14.6% |
+
+Single runs: `DS4_STORE_EARLY=4` 5.25 vs 5.92 (lost: the early reads crowded the store, "not in the store" rose 80K -> 89K);
+`DS4_STORE_PROTECT=1` changed nothing measurable (0 reads dropped, 0 forced). Per distance, a 4-ahead copy paid 46-62%, a next-layer
+copy 22-27%, yet copying only 4-ahead lost 15%: a missed next-layer expert lands on the CPU lane on the critical path, which a paid
+share per copy does not see. `DS4_RING_WORTH=2` raised the paid copies by a third without raising the speed: the ring is not where the
+token's time goes. All stay opt-in; none is re-run as it is. Next: a per-token time breakdown (card, CPU lane, drive waits, attention).
