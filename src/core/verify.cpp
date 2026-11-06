@@ -211,6 +211,11 @@ struct RouteResidentCfg {
     std::chrono::steady_clock::time_point auto_last_end{};
     long long auto_last_req = -1;
     long long auto_tests = 0, auto_tests_take = 0;   ///< tests finished; tests since the stats line took them
+    // STRATA_MASK=learn x AUTO: after each budget test the next one is a MASK test (the mask's depth (p, g), see mask_test_begin): the same
+    // interleaved arms, both at req_b; the arms are the mask's levels (uploaded when the arm changes).  Its state (p, g) lives in the learner.
+    bool auto_mask = false;                   ///< the running test is a mask test
+    bool auto_mask_next = false;              ///< the next test is a mask test (set when a budget test ends under STRATA_MASK=learn)
+    bool auto_mask_ok = false;                ///< the mask learner is active for this window (route_budget_window sets it before the scheduler)
     // Learned state across restarts (route_tune_open): standin-tune.txt beside the expert profile, keyed to the model fingerprint.
     // Written after each finished test and each k update; read once at serve start (AUTO / FRAGILE on).
     bool tune_open = false;                   ///< the file is kept (a model fingerprint and a path are known)
@@ -4545,6 +4550,11 @@ bool Verifier::route_brake_on() { return route_resident_cfg().brake_on; }
 // decode budget, a prompt window at STRATA_ROUTE_BUDGET or b_lo.  route_budget_after runs after a decode window's sync and before
 // its commit: it reads the gaps of the rows the window kept (0..n_keep-1, the bonus row among them) and sets the next decode
 // window's budget.  Both write the host-mapped RouteCfg between windows only, as route_cfg_set_floor does.
+// STRATA_MASK=learn x STRATA_ROUTE_BUDGET_AUTO (defined with the mask-learn section at the end of this file): the mask test's start (false:
+// none is testable now), its arm's levels on the device, and its end (won: the candidate's (p, g) is kept; out = base p, g, candidate p, g).
+bool mask_test_begin();
+void mask_test_arm(int arm);
+void mask_test_end(bool won, double out[4]);
 namespace {
 void route_auto_schedule(RouteResidentCfg& c);   // defined with the test helpers below route_auto_window
 float route_auto_arm_b(const RouteResidentCfg& c, int arm);   // defined with the test helpers below route_auto_window
@@ -4689,6 +4699,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
             c.auto_win_arm = c.auto_cut_arm;   // the exact successor of a cut: its cut window's arm, not a scheduled window
             c.auto_win_sched = false;
         } else {
+            c.auto_mask_ok = mask_learn_active();   // STRATA_MASK=learn: a mask test may start here
             route_auto_schedule(c);
         }
         b = route_auto_arm_b(c, c.auto_win_arm);   // the request's budget (base arm) or its scaled candidate
@@ -4710,6 +4721,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     // stand-ins, so a "re-decided" token could still be moved by a rank 3-9 stand-in.  A tail budget of ~0 lets only a stand-in that
     // the router scored at least as high as the pick through (gap <= 0), i.e. no change.
     c.win_exact = decode && c.fragile_exact;   // STRATA_MASK: the exact re-run is unmasked too (its outputs are the re-decision)
+    if (decode && c.auto_on && auto_ok && c.auto_mask && !c.win_exact) mask_test_arm(c.auto_win_arm);   // STRATA_MASK=learn: this arm's levels on the device
     if (decode && c.fragile_exact) {
         b = 0.0f;
         tail = 1e-30f;
@@ -5096,15 +5108,14 @@ namespace {
 float auto_clamp_b(double b) { return std::min(4.0f, std::max(0.02f, (float) b)); }
 
 // The decode budget of an arm's window: the base arm runs at the request's req_b, the candidate at req_b * s^d (clamped; 0 stays 0).
+// A mask test runs both arms at req_b.
 float route_auto_arm_b(const RouteResidentCfg& c, int arm) {
-    if (arm == 0 || c.req_b <= 0.0f) return c.req_b;
+    if (arm == 0 || c.req_b <= 0.0f || c.auto_mask) return c.req_b;
     return auto_clamp_b((double) c.req_b * std::pow((double) c.auto_step, (double) c.auto_dir));
 }
 
-// Starts a test of direction d at the base b (its arms' counts and times are cleared).
-void auto_begin_test(RouteResidentCfg& c, int d) {
-    c.auto_dir = d;
-    c.auto_cand_b = auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d));
+// Clears the running test's arms (counts and times) and starts it.
+void auto_reset_arms(RouteResidentCfg& c) {
     c.auto_n[0] = c.auto_n[1] = 0;
     c.auto_tok[0] = c.auto_tok[1] = 0;
     c.auto_secs[0] = c.auto_secs[1] = 0.0;
@@ -5113,6 +5124,14 @@ void auto_begin_test(RouteResidentCfg& c, int d) {
     c.auto_runs = 0;
     c.auto_run_left = 0;
     c.auto_testing = true;
+}
+
+// Starts a budget test of direction d at the base b.
+void auto_begin_test(RouteResidentCfg& c, int d) {
+    c.auto_dir = d;
+    c.auto_cand_b = auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d));
+    c.auto_mask = false;
+    auto_reset_arms(c);
 }
 
 // A direction whose candidate clamps to the base (b at a bound) is not tested: it counts as a loss at once.
@@ -5132,6 +5151,15 @@ void auto_next_stage(RouteResidentCfg& c, bool won, int d) {
 // The next scheduled window's arm: runs of kAutoRun windows; run r is arm (r % 2) ^ ((r / 2) % 2), so each pair of runs alternates which arm is first.
 void route_auto_schedule(RouteResidentCfg& c) {
     while (!c.auto_testing) {
+        // STRATA_MASK=learn: after a budget test the next test is the mask's depth (when the learner can test now; else a budget test)
+        if (c.auto_mask_next && c.auto_mask_ok) {
+            c.auto_mask_next = false;
+            if (mask_test_begin()) {
+                c.auto_mask = true;
+                auto_reset_arms(c);
+                break;
+            }
+        }
         const int d = c.auto_stage == 0 ? c.auto_first : -c.auto_first;
         const double cand = auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d));
         // the learned ceiling (b_clean; 2 x the start while none is learned): a candidate above it is not tested (a loss)
@@ -5170,10 +5198,22 @@ void route_auto_test_done(RouteResidentCfg& c) {
     route_wilson90(c.auto_fl[1], c.auto_tok[1], cand_lo, cand_hi);
     const bool enough = c.auto_tok[0] >= RouteResidentCfg::kAutoTokMin && c.auto_tok[1] >= RouteResidentCfg::kAutoTokMin;
     const bool quality = !(enough && (cand_lo > base_hi || (pc > 1.5 * pb && c.auto_fl[1] >= RouteResidentCfg::kBrakeFlips)));
+    const bool won = sc >= sb * 1.02 && quality;
+    if (c.auto_mask) {   // STRATA_MASK=learn: a mask test decides the mask's (p, g); no budget state moves
+        double pg[4] = {0.0, 0.0, 0.0, 0.0};
+        mask_test_end(won, pg);
+        std::fprintf(stderr, "strata serve: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): %.1f vs %.1f tok/s over %d+%d windows -> (%.3f,%.3f); "
+                     "flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f%s\n",
+                     pg[2], pg[3], pg[0], pg[1], sc, sb, (int) c.auto_n[1], (int) c.auto_n[0], won ? pg[2] : pg[0], won ? pg[3] : pg[1],
+                     fc, fb, c.auto_rc[1], c.auto_rc[0], 100.0 * pc, 100.0 * pb, quality ? "" : ", quality lost");
+        c.auto_mask = false;
+        c.auto_mask_next = false;   // a budget test next
+        c.auto_testing = false;
+        return;
+    }
     if (c.auto_tok[1] >= RouteResidentCfg::kCleanTok && 100.0 * (double) c.auto_fl[1] <= 0.5 * (double) c.auto_tok[1]
         && (double) c.auto_cand_b > c.b_clean)
         c.b_clean = (double) c.auto_cand_b;
-    const bool won = sc >= sb * 1.02 && quality;
     const float b_old = c.auto_b, cand = c.auto_cand_b, step = c.auto_step;   // step: the factor this test's candidate used
     // the step: a win in the same direction as the last win grows it (to 2); a loss shrinks it toward 1.1 (sqrt, floor 1.1)
     if (won) {
@@ -5190,6 +5230,7 @@ void route_auto_test_done(RouteResidentCfg& c) {
     c.auto_testing = false;
     ++c.auto_tests;
     ++c.auto_tests_take;
+    c.auto_mask_next = mask_learn_env();   // STRATA_MASK=learn: the next test is the mask's depth
     route_tune_write(c);
 }
 }  // namespace
@@ -6359,6 +6400,7 @@ constexpr long long kMlMaskEvery = 256, kMlDecayEvery = 8192, kMlSampleEvery = 6
 constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
 constexpr double kMlMinSide = 16.0, kMlPMin = 0.025;   // re-checks needed on each side of the comparison; the share's floor
 constexpr int kMlMinPop = 8;
+constexpr double kMtStepP = 0.025, kMtStepG = 0.1;   // a mask test's candidate: one step of the share p and of the level-2 fraction g
 
 struct MaskLearnState {
     struct Pick {
@@ -6372,6 +6414,15 @@ struct MaskLearnState {
     std::vector<uint32_t> stamp;     // [nl][ne] dedup of one row's entries
     uint32_t stamp_id = 0;
     double p = kMlP0;
+    // the depth of the mask at level 2: at most round(g x the layer's masked count) of a layer's graduated experts are level 2 (the lowest
+    // harm rates first); g is a mask test's second number (STRATA_MASK=learn x AUTO), starts at the loaded table's level-2 share (else 0.25)
+    double g = 0.25;
+    // the running mask test (mask_test_begin): its candidate (p, g) and direction, the arms' levels (0 base, 1 candidate), the arm on the device
+    // (-1: none yet), and the direction state (first direction, stage 0 / 1: as the budget test's)
+    bool mt_on = false;
+    int mt_d = -1, mt_cur = -1, mt_first = -1, mt_stage = 0;
+    double mt_cand_p = 0.0, mt_cand_g = 0.0;
+    std::vector<uint8_t> mt_lv[2];
     double ag_ok = 0.0, ag_tot = 0.0;
     // the re-checks split by whether the mask moved a pick in the cut row (flips, count; decayed): the share follows the flips the mask
     // ADDS beyond the stand-ins' (6 Nov: re-checks are close calls that flip often whatever the mask does; raw agreement only shrank p)
@@ -6390,76 +6441,99 @@ std::shared_ptr<MaskLearnState> g_mlr;
 
 size_t mlr_at(const MaskLearnState& s, int64_t l, int64_t e) { return (size_t) l * (size_t) s.ne + (size_t) e; }
 
-// The levels of every layer from the scores; true when one changed.  The pool is the least-used pairs by the profile (2 p n of them), the
-// lowest rates first; a layer with no ranked pair gets none.
-bool mlr_relevel(MaskLearnState& s) {
+// The levels of every layer for the share p and the level-2 fraction g, from the scores (s.lv only orders the keep set).  The pool is the
+// least-used pairs by the profile (2 p n of them), the lowest rates first; the masked set (p n per layer) keeps the current level-2 pairs
+// first.  Level 2 goes to the graduated ones (enough exposure, a rate under the layer's 10th percentile), the lowest rates first, at most
+// round(g x the layer's masked count) of them.  A layer with no ranked pair gets none.
+void mlr_levels(const MaskLearnState& s, double p, double g, std::vector<uint8_t>& out) {
     const int64_t ne = s.ne;
-    const int64_t per = (int64_t) std::floor(s.p * (double) ne + 1e-9);
+    const int64_t per = (int64_t) std::floor(p * (double) ne + 1e-9);
     const int64_t pool_n = std::min<int64_t>(ne, 2 * per);
-    bool changed = false;
+    out.assign((size_t) (s.nl * ne), 0);
     std::vector<double> rate((size_t) ne), pop;
-    std::vector<int> ord((size_t) ne);
-    std::vector<uint8_t> nlv((size_t) ne);
+    std::vector<int> ord((size_t) ne), keep, cand, grad_set;
     for (int64_t il = 0; il < s.nl; ++il) {
-        uint8_t* lv = s.lv.data() + (size_t) il * (size_t) ne;
+        const uint8_t* lv = s.lv.data() + (size_t) il * (size_t) ne;
+        uint8_t* nlv = out.data() + (size_t) il * (size_t) ne;
         const double* hm = s.harm.data() + (size_t) il * (size_t) ne;
         const double* ex = s.expo.data() + (size_t) il * (size_t) ne;
         const int64_t* pr = s.pos.data() + (size_t) il * (size_t) ne;
         bool ranked = false;
         for (int64_t e = 0; e < ne; ++e) ranked = ranked || pr[e] != INT64_MAX;
-        std::fill(nlv.begin(), nlv.end(), 0);
-        if (ranked) {
-            pop.clear();
-            for (int64_t e = 0; e < ne; ++e) {
-                rate[(size_t) e] = hm[e] / std::max(1.0, ex[e]);
-                if (ex[e] >= kMlMinExpo) pop.push_back(rate[(size_t) e]);
-            }
-            const bool grad = (int) pop.size() >= kMlMinPop;
-            double p10 = 0.0, med = 0.0;
-            if (grad) {
-                std::sort(pop.begin(), pop.end());
-                p10 = pop[pop.size() / 10];
-                med = pop[pop.size() / 2];
-            }
-            int64_t masked = 0;
-            // the all-ranks masks stay, the lowest rates first, up to the share; above the layer's median one falls back to the rank rule
-            std::vector<int> keep;
-            for (int64_t e = 0; e < ne; ++e)
-                if (lv[e] == 2) keep.push_back((int) e);
-            std::stable_sort(keep.begin(), keep.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
-            for (int e : keep) {
-                if (masked >= per) break;
-                nlv[(size_t) e] = grad && rate[(size_t) e] > med ? 1 : 2;
-                ++masked;
-            }
-            // the rest: the pool's least-used pairs (higher profile rank first; ties: the lower id), the lowest rates first
-            for (int64_t e = 0; e < ne; ++e) ord[(size_t) e] = (int) e;
-            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] > pr[b]; });
-            std::vector<int> cand;
-            for (int64_t q = 0; q < pool_n; ++q)
-                if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
-            std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
-            for (int e : cand) {
-                if (masked >= per) break;
-                nlv[(size_t) e] = 1;
-                ++masked;
-            }
-            if (grad)   // graduation: enough exposure and a rate under the 10th percentile
-                for (int64_t e = 0; e < ne; ++e)
-                    if (nlv[(size_t) e] == 1 && ex[e] >= kMlMinExpo && rate[(size_t) e] < p10) nlv[(size_t) e] = 2;
+        if (!ranked) continue;
+        pop.clear();
+        for (int64_t e = 0; e < ne; ++e) {
+            rate[(size_t) e] = hm[e] / std::max(1.0, ex[e]);
+            if (ex[e] >= kMlMinExpo) pop.push_back(rate[(size_t) e]);
         }
+        const bool grad = (int) pop.size() >= kMlMinPop;
+        double p10 = 0.0;
+        if (grad) {
+            std::sort(pop.begin(), pop.end());
+            p10 = pop[pop.size() / 10];
+        }
+        int64_t masked = 0;
+        // the masked set: the current level-2 pairs first (the lowest rates first), then the pool's least-used pairs (higher profile rank
+        // first; ties: the lower id), the lowest rates first
+        keep.clear();
         for (int64_t e = 0; e < ne; ++e)
-            if (lv[e] != nlv[(size_t) e]) {
-                lv[e] = nlv[(size_t) e];
-                changed = true;
-            }
+            if (lv[e] == 2) keep.push_back((int) e);
+        std::stable_sort(keep.begin(), keep.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+        for (int e : keep) {
+            if (masked >= per) break;
+            nlv[(size_t) e] = 1;
+            ++masked;
+        }
+        for (int64_t e = 0; e < ne; ++e) ord[(size_t) e] = (int) e;
+        std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] > pr[b]; });
+        cand.clear();
+        for (int64_t q = 0; q < pool_n; ++q)
+            if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+        for (int e : cand) {
+            if (masked >= per) break;
+            nlv[(size_t) e] = 1;
+            ++masked;
+        }
+        // level 2: the graduated masked pairs (enough exposure and a rate under the 10th percentile), at most round(g x masked), lowest first
+        if (grad) {
+            grad_set.clear();
+            for (int64_t e = 0; e < ne; ++e)
+                if (nlv[(size_t) e] == 1 && ex[e] >= kMlMinExpo && rate[(size_t) e] < p10) grad_set.push_back((int) e);
+            std::stable_sort(grad_set.begin(), grad_set.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+            const int64_t cap = (int64_t) std::lround(g * (double) masked);
+            for (size_t i = 0; i < grad_set.size() && (int64_t) i < cap; ++i) nlv[(size_t) grad_set[i]] = 2;
+        }
     }
+}
+
+// The levels for the state's (p, g); true when they changed.
+bool mlr_relevel(MaskLearnState& s) {
+    std::vector<uint8_t> nlv;
+    mlr_levels(s, s.p, s.g, nlv);
+    const bool changed = nlv != s.lv;
+    s.lv = std::move(nlv);
     return changed;
 }
 
+// STRATA_MASK=learn x AUTO: the mask test's direction state, as the budget test's (auto_next_stage): a win keeps the direction first;
+// a loss tries the other direction; both lost: the other direction first next round.
+void mt_next_stage(int& first, int& stage, bool won, int d) {
+    if (won) {
+        first = d;
+        stage = 0;
+    } else if (stage == 0) {
+        stage = 1;
+    } else {
+        first = -first;
+        stage = 0;
+    }
+}
+
 // Every kMlMaskEvery kept tokens the masks move: p follows the re-checks' agreement (98% up, under 95% down), then the levels; the changed rows go
-// to the device.
+// to the device.  While a mask test runs its arms' levels are fixed (the test's end relevels): the harm and exposure keep learning.
 void mlr_update(MaskLearnState& s) {
+    if (s.mt_on) return;
     // the flip rate of re-checks with a mask move against those without (the stand-ins' own): > 2 SE above -> p -0.05; within 1 SE -> +0.025
     if (s.nm >= kMlMinSide && s.fsn >= kMlMinSide) {
         const double rm = s.fm / s.nm, rs = s.fs / s.fsn, r = (s.fm + s.fs) / (s.nm + s.fsn);
@@ -6471,7 +6545,8 @@ void mlr_update(MaskLearnState& s) {
         std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
 }
 
-// The table file: "MLRN", version 1, nl, ne, p, the agreement's two sums, the kept token count, then harm and exposure (double) and the levels.
+// The table file: "MLRN", version 3, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the kept token count, g, then harm
+// and exposure (double) and the levels.  Versions 1 and 2 have no g (it is the loaded levels' level-2 share).
 bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg) {
     const std::string tmp = path + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -6479,13 +6554,15 @@ bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg
         msg = "cannot open " + tmp;
         return false;
     }
-    const uint32_t ver = 2;   // 2: + the mask/stand-in split of the re-checks
+    const uint32_t ver = 3;   // 2: + the mask/stand-in split of the re-checks; 3: + g
     const double split[4] = {s.fm, s.nm, s.fs, s.fsn};
     const int32_t nl = (int32_t) s.nl, ne = (int32_t) s.ne;
     const long long tok = s.tok;
+    const double g = s.g;
     bool ok = std::fwrite("MLRN", 1, 4, f) == 4 && std::fwrite(&ver, sizeof ver, 1, f) == 1 && std::fwrite(&nl, sizeof nl, 1, f) == 1 &&
               std::fwrite(&ne, sizeof ne, 1, f) == 1 && std::fwrite(&s.p, sizeof s.p, 1, f) == 1 && std::fwrite(&s.ag_ok, sizeof s.ag_ok, 1, f) == 1 &&
               std::fwrite(&s.ag_tot, sizeof s.ag_tot, 1, f) == 1 && std::fwrite(split, sizeof(double), 4, f) == 4 && std::fwrite(&tok, sizeof tok, 1, f) == 1 &&
+              std::fwrite(&g, sizeof g, 1, f) == 1 &&
               std::fwrite(s.harm.data(), sizeof(double), s.harm.size(), f) == s.harm.size() &&
               std::fwrite(s.expo.data(), sizeof(double), s.expo.size(), f) == s.expo.size() &&
               std::fwrite(s.lv.data(), 1, s.lv.size(), f) == s.lv.size();
@@ -6507,17 +6584,29 @@ bool mlr_load(MaskLearnState& s, const std::string& path) {
     int32_t nl = 0, ne = 0;
     double p = 0.0, ok = 0.0, tot = 0.0;
     long long tok = 0;
+    double g = 0.0;
     std::vector<double> harm(cnt), expo(cnt);
     std::vector<uint8_t> lv(cnt);
     double split[4] = {0.0, 0.0, 0.0, 0.0};   // (version 1: the scores kept, the split starts empty)
     bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 &&
-                (ver == 1 || ver == 2) &&
+                (ver == 1 || ver == 2 || ver == 3) &&
                 std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == s.nl && ne == s.ne &&
                 std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 && std::fread(&tot, sizeof tot, 1, f) == 1 &&
-                (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) && std::fread(&tok, sizeof tok, 1, f) == 1 && std::fread(harm.data(), sizeof(double), cnt, f) == cnt &&
-                std::fread(expo.data(), sizeof(double), cnt, f) == cnt && std::fread(lv.data(), 1, cnt, f) == cnt;
+                (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) && std::fread(&tok, sizeof tok, 1, f) == 1 &&
+                (ver < 3 || std::fread(&g, sizeof g, 1, f) == 1) &&
+                std::fread(harm.data(), sizeof(double), cnt, f) == cnt && std::fread(expo.data(), sizeof(double), cnt, f) == cnt &&
+                std::fread(lv.data(), 1, cnt, f) == cnt;
     std::fclose(f);
     if (!good) return false;
+    if (ver < 3) {   // g: the loaded levels' level-2 share of the masked pairs (0.25 when nothing is masked)
+        long long masked = 0, level2 = 0;
+        for (uint8_t v : lv) {
+            masked += v != 0;
+            level2 += v == 2;
+        }
+        g = masked > 0 ? (double) level2 / (double) masked : 0.25;
+    }
+    s.g = std::min(1.0, std::max(0.0, g));
     s.p = std::min(kMlPMax, std::max(kMlPMin, p));
     s.ag_ok = ok;
     s.ag_tot = tot;
@@ -6609,9 +6698,9 @@ std::string mask_learn_report() {
     }
     const double dm = s.dn > 0 ? s.dsum / (double) s.dn : 0.0;
     char buf[384];
-    std::snprintf(buf, sizeof buf, "strata serve: mask learn: p %.3f, %lld masked (%lld at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
+    std::snprintf(buf, sizeof buf, "strata serve: mask learn: p %.3f, g %.3f, %lld masked (%lld at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
                   "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f\n",
-                  s.p, m, a, dm, s.dn, scored, s.fm, s.nm, s.fs, s.fsn);
+                  s.p, s.g, m, a, dm, s.dn, scored, s.fm, s.nm, s.fs, s.fsn);
     s.dsum = 0.0;
     s.dn = 0;
     return buf;
@@ -6712,6 +6801,66 @@ void Verifier::mask_learn_window(int T, int kept, bool cut) {
     }
     if (s.tok / kMlMaskEvery != before / kMlMaskEvery) mlr_update(s);
     if (s.tok / kMlSaveEvery != before / kMlSaveEvery && !s.path.empty()) {
+        std::string msg;
+        if (!mlr_save(s, s.path, msg)) std::fprintf(stderr, "strata: STRATA_MASK=learn: %s\n", msg.c_str());
+    }
+}
+
+// STRATA_MASK=learn x STRATA_ROUTE_BUDGET_AUTO: the mask test (the budget test's method, on the mask's depth).  Every other budget test is
+// a mask test (route_auto_test_done).  Base = (p, g) now; candidate = one step deeper (p + 0.025, g + 0.1) or shallower (the minus signs),
+// clamped; the direction starts shallower (the live case was slowing).  Both arms run at the request's budget.  The arms' levels are
+// computed here, once; the arm's levels go to the device when the arm changes (mask_test_arm).  At the end the candidate's (p, g) is kept
+// on a win, and the levels are recomputed for the final (p, g).
+bool mask_test_begin() {
+    if (!g_mlr || g_mlr->mt_on) return false;
+    MaskLearnState& s = *g_mlr;
+    for (int tries = 0; tries < 2; ++tries) {   // the two directions of the stage machine: one of them may be at a bound
+        const int d = s.mt_stage == 0 ? s.mt_first : -s.mt_first;
+        const double cp = std::min(kMlPMax, std::max(kMlPMin, s.p + kMtStepP * d));
+        const double cg = std::min(1.0, std::max(0.0, s.g + kMtStepG * d));
+        if (cp != s.p || cg != s.g) {
+            s.mt_d = d;
+            s.mt_cand_p = cp;
+            s.mt_cand_g = cg;
+            mlr_levels(s, s.p, s.g, s.mt_lv[0]);
+            mlr_levels(s, cp, cg, s.mt_lv[1]);
+            s.mt_cur = -1;   // the first window uploads its arm
+            s.mt_on = true;
+            return true;
+        }
+        mt_next_stage(s.mt_first, s.mt_stage, false, d);   // at both bounds: nothing to test this way
+    }
+    return false;
+}
+
+// The arm's levels on the device (route_mask_update uploads only the rows that differ from the device's), only when the arm changes.
+void mask_test_arm(int arm) {
+    if (!g_mlr || !g_mlr->mt_on || arm == g_mlr->mt_cur) return;
+    MaskLearnState& s = *g_mlr;
+    s.mt_cur = arm;
+    if (!strata::kernels::route_mask_update(s.mt_lv[arm != 0 ? 1 : 0]))
+        std::fprintf(stderr, "strata: STRATA_MASK=learn: the test arm's mask rows not uploaded\n");
+}
+
+// The test's end: out = base p, base g, candidate p, candidate g.  A win keeps the candidate's (p, g); the levels are recomputed and uploaded;
+// the table is saved.
+void mask_test_end(bool won, double out[4]) {
+    if (!g_mlr) return;
+    MaskLearnState& s = *g_mlr;
+    out[0] = s.p;
+    out[1] = s.g;
+    out[2] = s.mt_cand_p;
+    out[3] = s.mt_cand_g;
+    if (won) {
+        s.p = s.mt_cand_p;
+        s.g = s.mt_cand_g;
+    }
+    mt_next_stage(s.mt_first, s.mt_stage, won, s.mt_d);
+    s.mt_on = false;
+    s.mt_cur = -1;
+    mlr_relevel(s);
+    if (!strata::kernels::route_mask_update(s.lv)) std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
+    if (!s.path.empty()) {
         std::string msg;
         if (!mlr_save(s, s.path, msg)) std::fprintf(stderr, "strata: STRATA_MASK=learn: %s\n", msg.c_str());
     }
