@@ -1417,14 +1417,18 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     check("moe_gate_up");
 }
 
+static thread_local float* g_part_override = nullptr;   // (moe_part_override)
+void moe_part_override(float* p) { g_part_override = p; }
+
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
     if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
     Scratch* sc = scratch(s);
     if (sc == nullptr) return;
+    float* const part = g_part_override != nullptr ? g_part_override : sc->part;   // (DS4_STANDIN_LEARN: the layer's own slice)
     MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit);
     m.plan_ptr = a.plan_ptr;
     m.h = const_cast<float*>(h);
-    m.part = sc->part;
+    m.part = part;
     m.hq = sc->hq;
     m.hd = sc->hd;
     q8_quant(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
@@ -1432,7 +1436,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
         iq::Args ia;
         if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return;
         ia.plan_ptr = a.plan_ptr;
-        ia.part = sc->part;
+        ia.part = part;
         ia.hq = sc->hq;
         ia.hd = sc->hd;
         iq::down(ia, a.k, 1, s);
@@ -1440,14 +1444,14 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
 #if defined(STRATA_METAL)
         // mx_down_kernel on the Metal dispatch; the launch below is the fallback
         if (!::strata::dsv41::metal_host::mx_dn(a.plan_ptr, nullptr, nullptr, nullptr, nullptr, a.lay.trellis, a.n_embd,
-                                                a.n_ff, sc->hq, sc->hd, sc->part, a.k))
+                                                a.n_ff, sc->hq, sc->hd, part, a.k))
 #endif
             launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
     }
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;
-    c.part = sc->part;
+    c.part = part;
     c.cpu_part = a.cpu_part;
     c.cpu_stride = (size_t) a.n_embd;
     c.cpu_flag = a.cpu_flag;

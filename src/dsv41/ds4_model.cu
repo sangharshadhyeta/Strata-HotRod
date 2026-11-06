@@ -1240,6 +1240,7 @@ struct Model::Impl {
     static constexpr int kLearnMaxL = 128, kLearnPerLayer = 4096, kLearnReady = 32;
     bool learn_on = false;
     bool learn_observe = false;         // DS4_STANDIN_LEARN=observe: samples collected and saved, no correction applied
+    int learn_slot = -1;                // the re-checked token's stand-in slot at its first substituted layer (learn_prepare)
     int learn_pass = 0;                // 1: the first pass of a token (captures y_s), 2: the exact re-run (captures y_e), 0: none
     int* d_cap_rec = nullptr;           // [nl][4] device: each trunk layer's first stand-in of the token (slot, true expert, stand-in; slot -1 none)
     int* d_want = nullptr;              // [nl] device: the slot the re-run captures in each layer (-1 none)
@@ -10427,7 +10428,7 @@ struct Model::Impl {
         std::vector<float> one((size_t) nl * n * n, 1.0f);
         const bool ok = cudaMalloc(&d_cap_rec, sizeof(int) * 4 * (size_t) nl) == cudaSuccess &&
                         cudaMalloc(&d_want, sizeof(int) * (size_t) nl) == cudaSuccess &&
-                        cudaMalloc(&d_ys, sizeof(float) * (size_t) nl * D) == cudaSuccess &&
+                        cudaMalloc(&d_ys, sizeof(float) * (size_t) nl * kPicks * D) == cudaSuccess &&   // ([nl][8][D]: the first pass's slices)
                         cudaMalloc(&d_ye, sizeof(float) * (size_t) nl * D) == cudaSuccess &&
                         cudaMalloc(&d_pair_c, tab) == cudaSuccess &&
                         cudaMemcpy(d_pair_c, one.data(), tab, cudaMemcpyHostToDevice) == cudaSuccess;
@@ -10531,6 +10532,7 @@ struct Model::Impl {
         if (il < 0) return false;
         e = rec[(size_t) il * 4 + 1];
         s = rec[(size_t) il * 4 + 2];
+        learn_slot = rec[(size_t) il * 4];   // (the stand-in's slot: its output in the first pass's slice of layer il)
         std::vector<int> want((size_t) g.nl, -1);
         want[(size_t) il] = rec[(size_t) il * 4];
         CK(cudaMemcpyAsync(d_want, want.data(), sizeof(int) * want.size(), cudaMemcpyHostToDevice, ld.st));
@@ -10546,7 +10548,9 @@ struct Model::Impl {
         Dev& ld = devs[(size_t) L[0].dev];
         cudaSetDevice(ld.id);
         std::vector<float> ys((size_t) D), ye((size_t) D);
-        CK(cudaMemcpyAsync(ys.data(), d_ys + (size_t) il * D, sizeof(float) * (size_t) D, cudaMemcpyDeviceToHost, ld.st));
+        if (learn_slot < 0 || learn_slot >= kPicks) return true;
+        CK(cudaMemcpyAsync(ys.data(), d_ys + ((size_t) il * kPicks + (size_t) learn_slot) * D, sizeof(float) * (size_t) D,
+                           cudaMemcpyDeviceToHost, ld.st));
         CK(cudaStreamSynchronize(ld.st));
         const int ye_from = learn_ye_ok.load(std::memory_order_acquire);
         if (ye_from == 1) {
@@ -10808,12 +10812,8 @@ struct Model::Impl {
                 if (++m->tune_toks % 4096 == 0) m->tune.save(m->tune_path);
             }
         } report{this, t_step, rc, gap, rk, flipped};
-        if (learn_on) {   // the token's record starts empty; this pass captures each layer's first stand-in's y_s
-            Dev& ld = devs[(size_t) L[0].dev];
-            cudaSetDevice(ld.id);
-            CK(cudaMemsetAsync(d_cap_rec, 0xff, sizeof(int) * 4 * (size_t) g.nl, ld.st));
-            learn_pass = 1;
-        }
+        // (the record needs no reset: this pass's router writes every trunk layer's entry - its first stand-in, or -1 - 6 Nov review)
+        if (learn_on) learn_pass = 1;   // this pass keeps each layer's per-slot down outputs in its own slice (gg::moe_part_override)
         const bool fwd1 = forward(&token, 1, 1, err);
         learn_pass = 0;
         if (!fwd1) return false;
@@ -13252,9 +13252,14 @@ struct Model::Impl {
                 if (lead) wait_seq(&resps[slot].seq, sq, s);
                 const double m2 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 4);
+                // DS4_STANDIN_LEARN, first pass: the layer's per-slot down outputs go to its own slice of d_ys (no copy afterwards: a
+                // re-check's sample reads the slice; 6 Nov - a copy kernel per layer on every token was the learner's only per-token cost)
+                const bool bank = learn_pass == 1 && mx && !l.mtp && l.il < g.nl;
+                if (bank) gg::moe_part_override(d_ys + (size_t) l.il * kPicks * g.dim);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
-                if (learn_pass != 0 && mx && !l.mtp && l.il < g.nl) learn_capture(l.il, s);   // (DS4_STANDIN_LEARN: this layer's down outputs, before the next layer's)
+                if (bank) gg::moe_part_override(nullptr);
+                if (learn_pass == 2 && mx && !l.mtp && l.il < g.nl) learn_capture(l.il, s);   // (the re-run only: its true expert's output)
                 if (tlog2) { t_moe_gu += m1 - m0; t_moe_wait += m2 - m1; t_moe_dn += now_ms() - m2; ++t_moe_n; }
                 if (pc_allowed) (void) cudaEventRecord(pc_t1, s);   // (DS4_PCIE_BALANCE: this use's end: the next use of the parity waits for it)
             } else {   // each distinct expert read once for the window's tokens

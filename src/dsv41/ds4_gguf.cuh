@@ -76,6 +76,9 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 /// The stream's per-slot down outputs of its last moe_down: [8][n_embd], slot i at i * n_embd (STRATA_STANDIN_LEARN's capture; null: none).
 float* moe_part(cudaStream_t s);
+/// DS4_STANDIN_LEARN: the next moe_down calls on this host thread write their per-slot outputs to p ([8][n_embd]) instead of the stream's
+/// scratch (null: the scratch again) - each layer of the first pass keeps its own, so no copy is needed for a re-check's sample
+void moe_part_override(float* p);
 bool win_experts(const x3::WinArgs& a, cudaStream_t s);
 void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s);
