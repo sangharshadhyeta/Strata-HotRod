@@ -1650,7 +1650,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
                                                             const float* __restrict__ bias_vl, unsigned vl,
-                                                            Standin* __restrict__ sti, PcieRoute pc, const RouteMask rm) {
+                                                            Standin* __restrict__ sti, PcieRoute pc, const RouteMask rm,
+                                                            const float* __restrict__ pair_c, int* cap_rec) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1736,6 +1737,11 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         for (int r = 0; r < k; ++r) wk[r] = sc[pick[r]] / (s + 1e-20f) * route_scale;
         int orig[kPicks];   // (the router's picks before any stand-in: Req::orig, Req::sub)
         for (int r = 0; r < k; ++r) orig[r] = pick[r];
+        // STRATA_STANDIN_LEARN (pair_c, opt-in): a stand-in's weight is scaled by its pair's correction (1 until the pair is ready);
+        // cap_rec (the learner's record of this layer's token): the first stand-in's slot, true expert and stand-in, slot -1 for none
+        float csc[kPicks];
+        for (int r = 0; r < k; ++r) csc[r] = 1.0f;
+        int first_r = -1, first_e = -1, first_s = -1;
         if (sti != nullptr) {   // the weights stay the picks' own; the ids swap where the rule allows, nearest rank first
             int c = 0, took = 0;
             float risk = 0.0f;
@@ -1747,6 +1753,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 if (!ok) continue;
                 atomicAdd(&sti->taken[r], 1ull);
                 pick[r] = cand[c++];
+                if (pair_c != nullptr) csc[r] = pair_c[(size_t) orig[r] * n + pick[r]];
+                if (first_r < 0) first_r = r, first_e = orig[r], first_s = pick[r];
                 took = 1;
                 risk += wk[r] * gap;
             }
@@ -1754,6 +1762,9 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                 sti->used[t] = 1;
                 sti->risk[t] += risk;
             }
+        }
+        if (cap_rec != nullptr) {
+            cap_rec[0] = first_r, cap_rec[1] = first_e, cap_rec[2] = first_s, cap_rec[3] = 0;
         }
         // DS4_PCIE_BALANCE: the eligible misses (vram 0, in the store, after any stand-in) of a decode token; the last m of them in routing order
         // are marked for the PCIe lane (stage + r * blob, computed on the device after the copy's flag)
@@ -1774,7 +1785,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         if (pc.need != nullptr && t == 0) *pc.need = npc;
         int cpu = 0;
         for (int r = 0; r < k; ++r) {
-            const float wv = wk[r];
+            const float wv = wk[r] * csc[r];
             idx[(size_t) t * kPicks + r] = pick[r];
             w[(size_t) t * kPicks + r] = wv;
             plan_ptr[(size_t) t * kPicks + r] = pmark[r] ? pc.stage + (unsigned long long) r * pc.blob : vram[pick[r]];
@@ -2324,7 +2335,8 @@ void wait_pcie(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned 
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1, int na2, Standin* standin, const PcieRoute* pc, const RouteMask* rmask) {
+                   unsigned vl, int na0, int na1, int na2, Standin* standin, const PcieRoute* pc, const RouteMask* rmask,
+                   float* pair_c, int* cap_rec) {
 #if defined(STRATA_METAL)
     // selection only: the prefetch schedule (req) is published by the CUDA kernel, and is turned on separately here
     // (the Metal selection has no DS4_MASK: rmask is for the CUDA kernels only)
@@ -2339,8 +2351,19 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     static const RouteMask no_mask{};
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
                                            vl != 0 ? bias_vl : nullptr, vl, standin, pc != nullptr ? *pc : no_pcie,
-                                           rmask != nullptr ? *rmask : no_mask);
+                                           rmask != nullptr ? *rmask : no_mask, pair_c, cap_rec);
     if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, na2);
+}
+/// STRATA_STANDIN_LEARN: dst[e] = part[r][e] for the slot r the device's record names (sel[0]; -1: nothing copied), part the per-slot
+/// down outputs of a token's experts (dim floats a slot).
+__global__ void standin_capture_kernel(const float* __restrict__ part, int dim, const int* __restrict__ sel, float* __restrict__ dst) {
+    const int r = *sel;
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < 0 || e >= dim) return;
+    dst[e] = part[(size_t) r * dim + e];
+}
+void standin_capture(const float* part, int dim, const int* sel, float* dst, cudaStream_t s) {
+    strata_ds4_launch(standin_capture_kernel, cdiv(dim, kThreads), kThreads, 0, s, part, dim, sel, dst);
 }
 void logit_top2(const float* logits, int n, float* out, cudaStream_t s) {
     strata_ds4_launch(logit_top2_kernel, 1, 1024, 0, s, logits, n, out);

@@ -1464,6 +1464,11 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     check("moe_down");
 }
 
+float* moe_part(cudaStream_t s) {
+    Scratch* sc = scratch(s);
+    return sc != nullptr ? sc->part : nullptr;
+}
+
 bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     if (a.T < 1 || a.T > kMaxEnt || !mx_geometry("win_experts", a.k, a.n_embd, a.n_ff) || a.h == nullptr ||
         a.part == nullptr || a.out == nullptr) {

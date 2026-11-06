@@ -1227,6 +1227,33 @@ struct Model::Impl {
     float fr_k = 4.0f;
     float* d_top2 = nullptr;
     long long fr_used = 0, fr_checks = 0, fr_flips = 0;
+    // DS4_STANDIN_LEARN=1 (opt-in; unset: as now): a stand-in's output differs from the true expert's, so each (layer, true expert e,
+    // stand-in s) pair learns a correction from the flip re-checks: a re-checked token's first stand-in (its layer's inputs are the same in
+    // both passes, the layers before it took none) gives y_s (pass 1, the stand-in's down output) and y_e (the exact re-run, the true
+    // expert's). Their least squares over the channels with decay 0.98: c = sum(num) / sum(den), num += y_s . y_e, den += y_s . y_s; the
+    // route scales the stand-in's weight by c once the pair has kLearnReady samples (clipped to [0.5, 2]), 1 before. Per pair two numbers.
+    static constexpr int kLearnMaxL = 128, kLearnPerLayer = 4096, kLearnReady = 32;
+    bool learn_on = false;
+    int learn_pass = 0;                 // 1: the first pass of a token (captures y_s), 2: the exact re-run (captures y_e), 0: none
+    int* d_cap_rec = nullptr;           // [nl][4] device: each trunk layer's first stand-in of the token (slot, true expert, stand-in; slot -1 none)
+    int* d_want = nullptr;              // [nl] device: the slot the re-run captures in each layer (-1 none)
+    float* d_pair_c = nullptr;          // [nl][n][n] device: the correction per (layer, e, s); 1 until the pair is ready
+    float* d_ys = nullptr;              // [nl][D] device: the stand-in's down output (pass 1)
+    float* d_ye = nullptr;              // [nl][D] device: the true expert's down output (re-run, GPU picks)
+    std::atomic<int> learn_want_r[kLearnMaxL] = {};   // the host's copy of d_want, read by the CPU lane (-1 none)
+    std::atomic<bool> learn_lane{false};              // set once learn_init has set learn_want_r (the lane reads it only then)
+    std::atomic<int> learn_ye_ok{0};                  // the CPU lane wrote learn_ye for the re-run's layer
+    std::vector<float> learn_ye;                      // [D] host: the CPU lane's y_e
+    struct LearnPair {
+        double num = 0.0, den = 0.0;
+        int n = 0;
+        float c = 1.0f;
+        uint64_t used = 0;
+    };
+    std::unordered_map<uint64_t, LearnPair> learn_pairs;   // key: layer << 40 | e << 20 | s
+    std::vector<int> learn_count;                          // the pairs held per layer
+    uint64_t learn_tick = 0;
+    long long learn_samples_req = 0;
     long la_toks = 0;
     std::string la_path;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
@@ -1765,6 +1792,7 @@ struct Model::Impl {
             if (fr_on)
                 std::fprintf(stderr, "ds4: request: stand-ins: %lld decode tokens took them, %lld re-checked exactly, %lld of those changed the top token\n",
                              fr_used, fr_checks, fr_flips);
+            if (learn_on) learn_print();
             if (tune_on) {
                 std::fprintf(stderr, "ds4: request: the budget's search: %s\n", tune.stats().c_str());
                 if (!tune.save(tune_path)) std::fprintf(stderr, "ds4: stand-ins: %s not written\n", tune_path.c_str());
@@ -1808,6 +1836,7 @@ struct Model::Impl {
                 std::fprintf(stderr, "stand-ins: the budget's search: %s\n", tune.stats().c_str());
                 if (!tune.save(tune_path)) std::fprintf(stderr, "ds4: stand-ins: %s not written\n", tune_path.c_str());
             }
+            learn_free();
             cudaFree(d_standin);
             d_standin = nullptr;
             if (d_top2 != nullptr) {
@@ -3780,6 +3809,7 @@ struct Model::Impl {
                 d_top2 = nullptr;
             }
         }
+        if (fr_on) learn_init();   // (DS4_STANDIN_LEARN: the flip re-check gives its samples)
     }
     // ---- the learned VRAM reserve (Strata-HotRod): <pack>/vram-reserve.txt, "<key> <MiB>" a line.  The key: the first GPU's name (spaces as
     // _), its total MiB, the context, where the compressed K/V rows live (STRATA_KV_HOST: ram / card) and whether the drafter loads.
@@ -9775,6 +9805,18 @@ struct Model::Impl {
                 if (ring_on && !l.mtp) ring_request(li, r, T);
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 std::sort(picks.begin(), picks.end());
+                // DS4_STANDIN_LEARN's re-run: the slot of the pick the learner wants from this layer (t 0, its rank), if this lane computes it
+                // (learn_ye_ok: 1 the lane's copy is in learn_ye; 2 the pick was computed on the device (its d_ye copy holds it); 0 neither)
+                int learn_sl = -1;
+                if (learn_lane.load(std::memory_order_acquire) && li >= 0 && li < kLearnMaxL) {
+                    const int lw = learn_want_r[li].load(std::memory_order_acquire);
+                    for (size_t q = 0; lw >= 0 && q < picks.size(); ++q)
+                        if (picks[q].second == lw) {
+                            learn_sl = (int) q;   // (slots are numbered in this sorted order)
+                            break;
+                        }
+                    if (lw >= 0 && learn_sl < 0 && r.gpu[0][lw] != 0) learn_ye_ok.store(2, std::memory_order_release);
+                }
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
                     en.e = picks[a].first;
@@ -9837,6 +9879,10 @@ struct Model::Impl {
                             for (int e = 0; e < D; ++e) o[e] += wv[sl] * y[e];
                         }
                         rp.cpu[t] = 1;
+                    }
+                    if (learn_sl >= 0) {   // (DS4_STANDIN_LEARN: the pick's own down output, before its weight; the host reads it after the layer's wait)
+                        std::memcpy(learn_ye.data(), c_yd.data() + (size_t) learn_sl * D, sizeof(float) * (size_t) D);
+                        learn_ye_ok.store(1, std::memory_order_release);
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
@@ -10292,6 +10338,164 @@ struct Model::Impl {
         slot_held = false;
     }
 
+    // ---- DS4_STANDIN_LEARN (see the members): the device blocks on the trunk's GPU; needs the flip re-check and the GGUF experts (their
+    // per-slot down outputs, gguf's moe_part) of one expert count on every trunk layer
+    void learn_init() {
+        const char* on = std::getenv("DS4_STANDIN_LEARN");
+        if (on == nullptr || std::atoi(on) == 0 || d_standin == nullptr || !fr_on) return;
+        const int nl = g.nl, n = g.n_exp, D = g.dim;
+        bool gguf = nl > 0 && nl <= kLearnMaxL && n > 0 && D > 0;
+        for (int il = 0; il < nl && gguf; ++il)
+            gguf = L[(size_t) il].lay.fmt == gg::kFmtMXFP4 && L[(size_t) il].n_exp == n && L[(size_t) il].nm == 1;
+        if (!gguf) {
+            std::fprintf(stderr, "ds4: stand-ins: learn off (it needs the GGUF experts, one expert count, up to %d layers)\n", kLearnMaxL);
+            return;
+        }
+        const size_t tab = (size_t) nl * n * n * sizeof(float);
+        if (tab > ((size_t) 512 << 20)) {
+            std::fprintf(stderr, "ds4: stand-ins: learn off (its table would be %.0f MB)\n", (double) tab / 1048576.0);
+            return;
+        }
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        std::vector<float> one((size_t) nl * n * n, 1.0f);
+        const bool ok = cudaMalloc(&d_cap_rec, sizeof(int) * 4 * (size_t) nl) == cudaSuccess &&
+                        cudaMalloc(&d_want, sizeof(int) * (size_t) nl) == cudaSuccess &&
+                        cudaMalloc(&d_ys, sizeof(float) * (size_t) nl * D) == cudaSuccess &&
+                        cudaMalloc(&d_ye, sizeof(float) * (size_t) nl * D) == cudaSuccess &&
+                        cudaMalloc(&d_pair_c, tab) == cudaSuccess &&
+                        cudaMemcpy(d_pair_c, one.data(), tab, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (!ok) {
+            (void) cudaGetLastError();
+            learn_free();
+            std::fprintf(stderr, "ds4: stand-ins: learn off (no device memory)\n");
+            return;
+        }
+        for (int il = 0; il < kLearnMaxL; ++il) learn_want_r[il].store(-1, std::memory_order_relaxed);
+        learn_ye.assign((size_t) D, 0.0f);
+        learn_count.assign((size_t) nl, 0);
+        learn_lane.store(true, std::memory_order_release);
+        learn_on = true;
+        std::fprintf(stderr, "ds4: stand-ins: learn on (each stand-in's weight scaled by its pair's learned correction; table %.0f MB)\n",
+                     (double) tab / 1048576.0);
+    }
+    void learn_free() {
+        if (devs.empty() || L.empty()) return;
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        cudaFree(d_cap_rec);
+        cudaFree(d_want);
+        cudaFree(d_ys);
+        cudaFree(d_ye);
+        cudaFree(d_pair_c);
+        d_cap_rec = d_want = nullptr;
+        d_ys = d_ye = nullptr;
+        d_pair_c = nullptr;
+        learn_on = false;
+    }
+    // the layer's down outputs of the stand-in pass (1) or the re-run (2): the record's slot (pass 1) or d_want's, copied to d_ys / d_ye
+    void learn_capture(int il, cudaStream_t s) {
+        float* part = gg::moe_part(s);
+        if (part == nullptr) return;
+        const int D = g.dim;
+        const int* sel = learn_pass == 1 ? d_cap_rec + (size_t) 4 * il : d_want + il;
+        float* dst = (learn_pass == 1 ? d_ys : d_ye) + (size_t) il * D;
+        standin_capture(part, D, sel, dst, s);
+    }
+    // the re-checked token's sample: its first layer with a stand-in (the record's first); sets the re-run's capture (d_want) and the CPU lane's
+    // (learn_want_r). false: no record (nothing to learn from).
+    bool learn_prepare(int& il, int& e, int& s, std::string& err) {
+        Dev& ld = devs[(size_t) L[0].dev];
+        cudaSetDevice(ld.id);
+        std::vector<int> rec((size_t) g.nl * 4, -1);
+        CK(cudaMemcpyAsync(rec.data(), d_cap_rec, sizeof(int) * rec.size(), cudaMemcpyDeviceToHost, ld.st));
+        CK(cudaStreamSynchronize(ld.st));
+        il = -1;
+        for (int i = 0; i < g.nl && il < 0; ++i)
+            if (rec[(size_t) i * 4] >= 0) il = i;
+        if (il < 0) return false;
+        e = rec[(size_t) il * 4 + 1];
+        s = rec[(size_t) il * 4 + 2];
+        std::vector<int> want((size_t) g.nl, -1);
+        want[(size_t) il] = rec[(size_t) il * 4];
+        CK(cudaMemcpyAsync(d_want, want.data(), sizeof(int) * want.size(), cudaMemcpyHostToDevice, ld.st));
+        CK(cudaStreamSynchronize(ld.st));
+        learn_ye_ok.store(0, std::memory_order_release);
+        learn_want_r[il].store(want[(size_t) il], std::memory_order_release);
+        return true;
+    }
+    // the sample of a re-checked token: y_s (pass 1) and y_e (the re-run: the CPU lane's copy, else the device's) for the pair
+    bool learn_finish(int il, int e, int s, std::string& err) {
+        learn_want_r[il].store(-1, std::memory_order_release);   // (the lane's capture for this layer is over)
+        const int D = g.dim, n = g.n_exp;
+        Dev& ld = devs[(size_t) L[0].dev];
+        cudaSetDevice(ld.id);
+        std::vector<float> ys((size_t) D), ye((size_t) D);
+        CK(cudaMemcpyAsync(ys.data(), d_ys + (size_t) il * D, sizeof(float) * (size_t) D, cudaMemcpyDeviceToHost, ld.st));
+        CK(cudaStreamSynchronize(ld.st));
+        const int ye_from = learn_ye_ok.load(std::memory_order_acquire);
+        if (ye_from == 1) {
+            ye = learn_ye;
+        } else if (ye_from == 2) {
+            CK(cudaMemcpyAsync(ye.data(), d_ye + (size_t) il * D, sizeof(float) * (size_t) D, cudaMemcpyDeviceToHost, ld.st));
+            CK(cudaStreamSynchronize(ld.st));
+        } else {   // (the true expert was neither computed here nor on the device: no sample)
+            return true;
+        }
+        double sxy = 0.0, sxx = 0.0;
+        for (int d = 0; d < D; ++d) {
+            sxy += (double) ys[(size_t) d] * ye[(size_t) d];
+            sxx += (double) ys[(size_t) d] * ys[(size_t) d];
+        }
+        if (!std::isfinite(sxy) || !std::isfinite(sxx) || !(sxx > 0.0)) return true;
+        const uint64_t key = ((uint64_t) il << 40) | ((uint64_t) e << 20) | (uint64_t) s;
+        auto it = learn_pairs.find(key);
+        if (it == learn_pairs.end()) {
+            if (learn_count[(size_t) il] >= kLearnPerLayer) {   // the layer's least recently used pair goes
+                auto old = learn_pairs.end();
+                for (auto q = learn_pairs.begin(); q != learn_pairs.end(); ++q)
+                    if ((q->first >> 40) == (uint64_t) il && (old == learn_pairs.end() || q->second.used < old->second.used)) old = q;
+                if (old != learn_pairs.end()) {
+                    if (old->second.n >= kLearnReady) {   // (its table entry goes back to 1)
+                        const int oe = (int) ((old->first >> 20) & 0xFFFFFu), os = (int) (old->first & 0xFFFFFu);
+                        const float one = 1.0f;
+                        CK(cudaMemcpyAsync(d_pair_c + ((size_t) il * n + oe) * n + os, &one, sizeof one, cudaMemcpyHostToDevice, ld.st));
+                        CK(cudaStreamSynchronize(ld.st));
+                    }
+                    learn_pairs.erase(old);
+                    --learn_count[(size_t) il];
+                }
+            }
+            it = learn_pairs.emplace(key, LearnPair{}).first;
+            ++learn_count[(size_t) il];
+        }
+        LearnPair& p = it->second;
+        p.num = 0.98 * p.num + sxy;
+        p.den = 0.98 * p.den + sxx;
+        p.used = ++learn_tick;
+        ++p.n;
+        ++learn_samples_req;
+        if (p.n >= kLearnReady) {
+            const float c = (float) std::min(2.0, std::max(0.5, p.num / std::max(p.den, 1e-30)));
+            if (c != p.c) {
+                p.c = c;
+                CK(cudaMemcpyAsync(d_pair_c + ((size_t) il * n + e) * n + s, &c, sizeof c, cudaMemcpyHostToDevice, ld.st));
+                CK(cudaStreamSynchronize(ld.st));
+            }
+        }
+        return true;
+    }
+    void learn_print() {
+        int ready = 0;
+        double dev = 0.0;
+        for (const auto& kv : learn_pairs)
+            if (kv.second.n >= kLearnReady) {
+                ++ready;
+                dev += std::fabs((double) kv.second.c - 1.0);
+            }
+        std::fprintf(stderr, "ds4: request: stand-in learn: %d pairs ready, %lld samples this request, mean |c-1| %.4f\n", ready,
+                     learn_samples_req, ready > 0 ? dev / ready : 0.0);
+        learn_samples_req = 0;
+    }
+
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
     bool step(int token, bool want_logits, std::string& err) {
         if (!fr_on || !want_logits || d_standin == nullptr) return forward(&token, 1, want_logits ? 1 : 0, err);
@@ -10325,7 +10529,15 @@ struct Model::Impl {
                 if (++m->tune_toks % 4096 == 0) m->tune.save(m->tune_path);
             }
         } report{this, t_step, rc, gap, rk, flipped};
-        if (!forward(&token, 1, 1, err)) return false;
+        if (learn_on) {   // the token's record starts empty; this pass captures each layer's first stand-in's y_s
+            Dev& ld = devs[(size_t) L[0].dev];
+            cudaSetDevice(ld.id);
+            CK(cudaMemsetAsync(d_cap_rec, 0xff, sizeof(int) * 4 * (size_t) g.nl, ld.st));
+            learn_pass = 1;
+        }
+        const bool fwd1 = forward(&token, 1, 1, err);
+        learn_pass = 0;
+        if (!fwd1) return false;
         // the stand-ins' flip re-check: did this token take any, and is its top-two gap a close call against their risk
         Dev& sd = devs[(size_t) L[0].dev];
         cudaSetDevice(sd.id);
@@ -10347,13 +10559,24 @@ struct Model::Impl {
         if (gap >= fr_k * risk) return true;
         rc = true;
         const int before = (int) t2[2];
+        int lil = -1, le = -1, ls = -1;   // (DS4_STANDIN_LEARN: this token's sample, when the record has a stand-in)
+        std::string lerr;
+        const bool lrn = learn_on && learn_prepare(lil, le, ls, lerr);
+        if (!lerr.empty()) {
+            err = lerr;
+            return false;
+        }
         pos = p0;   // the same position again, exactly (forward appends the token again)
         toks.resize((size_t) p0);
         ctoks.resize((size_t) p0);
         standin_bypass = true;
+        learn_pass = lrn ? 2 : 0;
         const bool ok = forward(&token, 1, 1, err);
+        learn_pass = 0;
         standin_bypass = false;
+        if (lrn) learn_want_r[lil].store(-1, std::memory_order_release);
         if (!ok) return false;
+        if (lrn && !learn_finish(lil, le, ls, err)) return false;
         --st.tokens;   // (one token, run twice)
         ++fr_checks;
         cudaSetDevice(hd.id);
@@ -12679,9 +12902,11 @@ struct Model::Impl {
                 }
             }
             const RouteMask rmp = route_mask_of(l);   // (DS4_MASK: the trunk layer's mask; none when off)
+            const bool lrn = learn_on && T == 1 && !l.mtp && !standin_bypass;   // (DS4_STANDIN_LEARN: the layer's pair table and record)
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr, &rmp);   // (stand-ins: decode tokens of the trunk only)
+                          na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr, &rmp,
+                          lrn ? d_pair_c + (size_t) l.il * g.n_exp * g.n_exp : nullptr, lrn ? d_cap_rec + (size_t) 4 * l.il : nullptr);   // (stand-ins: decode tokens of the trunk only)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
@@ -12724,6 +12949,7 @@ struct Model::Impl {
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (learn_pass != 0 && mx && !l.mtp && l.il < g.nl) learn_capture(l.il, s);   // (DS4_STANDIN_LEARN: this layer's down outputs, before the next layer's)
                 if (tlog2) { t_moe_gu += m1 - m0; t_moe_wait += m2 - m1; t_moe_dn += now_ms() - m2; ++t_moe_n; }
                 if (pc_allowed) (void) cudaEventRecord(pc_t1, s);   // (DS4_PCIE_BALANCE: this use's end: the next use of the parity waits for it)
             } else {   // each distinct expert read once for the window's tokens

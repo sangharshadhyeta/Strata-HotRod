@@ -286,7 +286,12 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
                    unsigned vl = 0, int na0 = 0, int na1 = 0, int na2 = 0, Standin* standin = nullptr,
-                   const PcieRoute* pc = nullptr, const RouteMask* rmask = nullptr);
+                   const PcieRoute* pc = nullptr, const RouteMask* rmask = nullptr,
+                   float* pair_c = nullptr, int* cap_rec = nullptr);
+/// STRATA_STANDIN_LEARN (opt-in): pair_c [n][n] (the layer's correction per true expert e and stand-in s, read where a stand-in is taken)
+/// and cap_rec [4] (written: the first stand-in's slot, true expert, stand-in; slot -1 for none) for a decode token of the trunk.
+/// standin_capture: dst[e] = part[r * dim + e] where r = *sel (a device int; -1: nothing), part a token's per-slot down outputs.
+void standin_capture(const float* part, int dim, const int* sel, float* dst, cudaStream_t s);
 /// DS4_PCIE_BALANCE's device wait: returns at once when *need is 0; else spins until *seq_ptr == seq (the copy's flag), and writes the cycles it spun
 /// to *wait_cyc (device). Enqueued after route_publish on the stream, before the expert kernels.
 void wait_pcie(const int* need, const unsigned* seq_ptr, unsigned seq, unsigned long long* wait_cyc, int* err, long long max_cyc,

@@ -168,6 +168,29 @@ M of the T masked on the card`. Request end: `ds4: request: mask: p=0.25 F 3 E 1
 
 State: untested until measured.
 
+## DS4_STANDIN_LEARN (opt-in, untested)
+
+Why: a stand-in replaces an off-card pick with a resident expert, so its output differs from the true expert's. A correction learned live per
+pair lets the stand-ins cover more picks at the same quality, without training the model.
+
+How (opt-in, `DS4_STANDIN_LEARN=1`; unset leaves the engine as it was): the flip re-check (`Impl::step`) already runs a close token again
+exactly. Its first pass captures, per trunk layer, the first stand-in's down output y_s (`learn_capture` after `gg::moe_down`, from gguf's
+`moe_part`, the per-slot outputs); the record (slot, true expert e, stand-in s) is written by `route_publish_kernel` into `cap_rec`. The
+exact re-run (`learn_pass` 2, `standin_bypass`) captures the true expert's y_e at the same slot: from the device when the pick was computed
+on the card, from the CPU lane (`serve_lane`, its `c_yd` slot before the weight) when it was not. One sample per re-checked token: the
+token's first layer with a stand-in, whose inputs are the same in both passes. The sample updates the pair (layer, e, s) with decay 0.98:
+num += y_s . y_e, den += y_s . y_s, c = num / den clipped to [0.5, 2], used after 32 samples. The spec's per-channel c[d] is summed over
+the channels: the sum of the per-channel num and den is the scalar pair state, so each pair holds two numbers (no 512 MB cap is needed).
+The correction is a scalar on the stand-in's routing weight (`csc`, read from the device table `d_pair_c` in `route_publish_kernel`), since
+the combine (`moe_combine`/`mx_combine_kernel`) sums per-slot weighted outputs and a per-channel scale there would be invasive. The table is
+[layer][e][s] (1 until ready), at most 4096 pairs a layer (the least recently used goes; its entry returns to 1). Request line:
+`ds4: request: stand-in learn: <n> pairs ready, <s> samples this request, mean |c-1| <v>`. Cost on the token path when on: one memset of
+the record and one small capture kernel per trunk layer of each decode token (a copy of one slot's D floats on the device), and the
+record/sample copies to the host only on re-checked tokens. Needs the flip re-check and GGUF experts on one GPU (the exl3 down fuses the
+combine and writes no per-slot outputs, so the learner is off there).
+
+State: untested until measured.
+
 ## Measured 6 Nov (vision server, 262K, the three calibration questions; answers read by hand, all correct)
 
 The ring opt-ins above, after the auto read-ahead cap became the default. Single runs first, then 3 alternated rounds of every arm
