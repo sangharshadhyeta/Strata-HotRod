@@ -1366,6 +1366,7 @@ struct Model::Impl {
     cudaStream_t ring_st = nullptr;
     std::vector<RingSlot> ring_s;
     std::vector<std::vector<int>> ring_own;   // trunk layer -> expert -> its ring slot (-1: none)
+    std::vector<unsigned char> mask_host;     // DS4_MASK: [nl][n_exp] 1 = masked (empty: no mask) - the Monitor's expert map
     unsigned long long* ring_pin = nullptr;   // pinned: [0, ring_n) the fills' table entries, [ring_n, 2 ring_n) the frees', [2 ring_n, 3 ring_n) the evict-aheads'
     // DS4_RING_STICKY: an evict-ahead (a slot of a layer >= the request's) is queued by serve_lane (ring_aq, try_lock only) and drained by the
     // layer thread at the start of a layer's enqueue (ring_ahead_drain): the table write-back on devs[0].st, then the slot's event (ring_ev[k]),
@@ -3745,6 +3746,7 @@ struct Model::Impl {
                 ++masked;
             }
         }
+        mask_host = host;   // (the Monitor's expert map shows the masked experts)
         cudaSetDevice(devs[(size_t) L[0].dev].id);
         unsigned char* dm = nullptr;
         unsigned long long* mv = nullptr;
@@ -8274,7 +8276,19 @@ struct Model::Impl {
                 const bool in = e < (int) l.slot.size() && l.slot[(size_t) e] >= 0;
                 const float h = e < (int) l.heat.size() ? l.heat[(size_t) e] : 0.0f;
                 n_res += in;
-                js += !in ? '0' : h < 10.0f ? '1' : h < 40.0f ? '2' : '3';
+                // 6 Nov: the states beside the card, most telling first: 7 in a ring slot (copied ahead), 4 masked (DS4_MASK), 6 kept
+                // fast by the balance, 5 soft-masked by it, 8 in the RAM store, 0 only on the drive ('1'-'3' unchanged: on the card)
+                char c = '0';
+                if (in) c = h < 10.0f ? '1' : h < 40.0f ? '2' : '3';
+                else if (il < (int) ring_own.size() && e < (int) ring_own[(size_t) il].size() && ring_own[(size_t) il][(size_t) e] >= 0) c = '7';
+                else if (!mask_host.empty() && mask_host[(size_t) il * g.n_exp + (size_t) e]) c = '4';
+                else {
+                    const int bs = bal_on && bal_state ? bal_state[(size_t) il * g.n_exp + (size_t) e].load(std::memory_order_relaxed) : 0;
+                    if (bs > 0) c = '6';
+                    else if (bs < 0) c = '5';
+                    else if (store && store->find(il, e) >= 0) c = '8';
+                }
+                js += c;
             }
             js += '"';
         }

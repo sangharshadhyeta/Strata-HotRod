@@ -194,6 +194,11 @@
         <div class="res-legend" aria-hidden="true">
           <span><i class="res-sw res-sw--0"></i>not in VRAM</span><span><i class="res-sw res-sw--1"></i>resident, idle</span>
           <span><i class="res-sw res-sw--2"></i>resident, used</span><span><i class="res-sw res-sw--3"></i>resident, hot</span>
+          <span data-code="7" hidden><i class="res-sw res-sw--7"></i>in a ring slot (copied ahead)</span>
+          <span data-code="8" hidden><i class="res-sw res-sw--8"></i>in RAM</span>
+          <span data-code="6" hidden><i class="res-sw res-sw--6"></i>kept fast (balance)</span>
+          <span data-code="5" hidden><i class="res-sw res-sw--5"></i>soft-masked (balance)</span>
+          <span data-code="4" hidden><i class="res-sw res-sw--4"></i>masked</span>
         </div>
         <p class="muted small res-note">One block per layer (layer 0 top left, reading across), one square per expert. The engine refreshes the map every couple of seconds while it swaps experts in and out.</p>
       </div>

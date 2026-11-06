@@ -434,7 +434,14 @@ function renderResidency(r) {
   const bg = tone("--st-surface-2", "#f7f7f7"), acc = tone("--st-accent", "#10b981"), hot = tone("--st-accent-hover", "#0c8a60");
   const surf = tone("--st-surface", "#ffffff");
   const idle = acc.map((c, i) => Math.round(0.28 * c + 0.72 * surf[i]));
-  const colors = [bg, idle, acc, hot];
+  const mix = (a, f) => a.map((c, i) => Math.round(f * c + (1 - f) * surf[i]));
+  const info = tone("--st-info", "#0f97ff"), warn = tone("--st-warn", "#e39b0b"), muted = tone("--st-ink-muted", "#6f6f6f");
+  // 0 drive only, 1-3 on the card (idle / used / hot), 4 masked, 5 soft-masked by the balance, 6 kept fast by it, 7 in a ring slot,
+  // 8 in the RAM store (the DeepSeek engine's states beside the card, 6 Nov; an engine that writes only 0-3 draws as before)
+  const colors = [bg, idle, acc, hot, mix(muted, 0.55), mix(warn, 0.45), mix(info, 0.45), info, mix(muted, 0.18)];
+  const seen = new Set();
+  rows.forEach((row) => { for (let e = 0; e < row.length; e++) seen.add(row.charCodeAt(e) - 48); });
+  document.querySelectorAll("#res-card [data-code]").forEach((el) => { el.hidden = !seen.has(Number(el.dataset.code)); });
   const ctx = canvas.getContext("2d");
   const img = ctx.createImageData(cw, ch);
   const gap = tone("--st-line", "#e5e7eb");           // the 1-cell gaps between the layers' blocks

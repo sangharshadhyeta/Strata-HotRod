@@ -136,6 +136,11 @@ main { flex: 1; min-height: 0; display: flex; }
 .res-sw--1 { background: color-mix(in srgb, var(--st-accent) 28%, var(--st-surface)); }
 .res-sw--2 { background: var(--st-accent); }
 .res-sw--3 { background: var(--st-accent-hover); }
+.res-sw--4 { background: color-mix(in srgb, var(--st-ink-muted) 55%, var(--st-surface)); }
+.res-sw--5 { background: color-mix(in srgb, var(--st-warn) 45%, var(--st-surface)); }
+.res-sw--6 { background: color-mix(in srgb, var(--st-info) 45%, var(--st-surface)); }
+.res-sw--7 { background: var(--st-info); }
+.res-sw--8 { background: color-mix(in srgb, var(--st-ink-muted) 18%, var(--st-surface)); }
 .res-note { margin: 0; }
 .tl-card { display: flex; flex-direction: column; gap: var(--st-s-3); position: relative; }
 .tl-head-right { display: inline-flex; align-items: center; gap: var(--st-s-3); }
