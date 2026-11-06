@@ -112,9 +112,12 @@ To upstream's DeepSeek engine, on by default when the ring is on (`=0` turns eac
   kept in the pack (`standin-learn.bin`), so it fills over hours of use.
 - **`DS4_PROF=1`** prints after each request the card's time a token by stage and the CPU lane's read wait and store hit rate.
 
-New and being tested (opt-in): `DS4_MASK=<share>` (the least-used experts of each layer are never routed to, from rank 3; an
-offline estimate gave only ~5% fewer reads at 25%, since the misses are spread over the experts) and `DS4_STANDIN_BALANCE=1`
-(per expert, a stand-in or a swap into fast memory, from the measured stand-in error, how often it is picked and the read cost).
+New 6-7 Nov (opt-in, in our config's `"env"`): `DS4_MASK=learn` - the mask learns from the model's own output: each
+re-checked token measures how far the masked and substituted experts moved it (the divergence ISTA's coder variant was
+chosen by, here from your own use), the least harmful of the little-used experts are masked, the proven-harmless ones at
+every rank, and an alternating speed test sets how deep it goes (two wins in a row move it; it never adds flips). With it,
+`DS4_STANDIN_BALANCE=1` (per expert, a stand-in or a swap into fast memory, from the measured stand-in error, how often it is
+picked and the read cost). `DS4_MASK=<share>` (a fixed share of the least-used) stays for comparison.
 
 Measured and left opt-in: `STRATA_LA_TAIL_READ=3` (23% slower, the drive is already at its limit here), `DS4_PCIE_BALANCE=1`
 (Qwen's dynamic balance: its copies arrive too late, -10%), and the ring orderings of 6 Nov - `DS4_RING_WORTH=1/2`,
@@ -213,6 +216,27 @@ systemd-run --scope -p MemoryMax=$(awk '/MemTotal/ {printf "%dK", $2 * 0.94}' /p
 The first start at a new context size learns its VRAM reserve; if it prints `ring: off (... would not fit)`, start it once
 more. When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095`. For this PC only, leave out `--host`
 and `--api-key`.
+
+</div>
+
+<div align="justify">
+
+**On your own PC** the engine fits itself to the machine; the first hour of use is that fitting, so it starts slower:
+
+- **Measured at start:** the VRAM reserve (per card and context), the RAM store, the CPU lane's threads and which experts
+  sit on the card (the most used first).
+- **Measured while it serves:** the read-ahead cap (from how long the decode's own reads wait), the copy limit, the
+  stand-in budget and the mask's depth (alternating speed tests over the same stretch of text; a setting is kept only when it
+  does not add flips). A faster or slower drive moves them where they belong on that machine.
+- **Learned files** sit in the pack folder: `standin-tune.txt`, `vram-reserve.txt`, `mask-learn.bin`, `standin-learn.bin`,
+  `hotrod-predictor.bin`. They hold this machine's values: when you move a pack to another PC, delete all but
+  `hotrod-predictor.bin` (the look-ahead belongs to the model and carries over) and let them relearn. Setup downloads our
+  trained look-ahead for Starw1-2.00bpw-MXFP8 and never overwrites one your PC has learned.
+- **The learning set** (opt-in, CUDA only): `"DS4_MASK": "learn"`, `"DS4_STANDIN_LEARN": "1"`, `"DS4_STANDIN_BALANCE": "1"`
+  in the config's `"env"`.
+- **What to watch** in the server log after a request: `auto mask test` and `the budget's search` (speeds and what was kept),
+  `mask learn:` and `look-ahead learner:`; `DS4_PROF=1` adds the time a token by stage.
+- **Smaller machines:** lower `--max-context` first; `--vision off` saves 319 MiB of VRAM.
 
 </div>
 
