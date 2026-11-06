@@ -858,7 +858,8 @@ class StrataEngine:
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
         spawned_at = time.monotonic()
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
+                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", errors="replace", bufsize=1,
+                          env=env, **pin)    # (#5044: a byte that is not UTF-8 killed the reader thread)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
         proc = self.proc                                 # THIS start's process: a close() from another thread may set self.proc to None meanwhile (#4792)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
@@ -2410,7 +2411,7 @@ class Vision:
         args, log, env = self.spawn
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
+                          stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
                           cwd=self.dir)
         contain(self.proc)
         try:
@@ -4681,6 +4682,7 @@ class Service:
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
@@ -5033,6 +5035,14 @@ class Service:
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
                     body_ok = True
+                except GpuBusy:
+                    # #3040 (PR #5044's approach): a batch engine can use up its BGEN retries before it has admitted this
+                    # request.  The monitor keeps an error row, but it is not a completed generation: no prompt tokens
+                    # and no part in the totals or latencies.  A continuation after native work keeps the old accounting.
+                    if not segments and n == 0:
+                        admission_rejected = True
+                        finish = "error"
+                    raise
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -5052,7 +5062,7 @@ class Service:
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
                             pc_read = last.get("prompt_read")
-                            seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            seen = 0 if admission_rejected else prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read; #3040
                             if not warm:                    # 20 Oct: a warm read is not a request for the history, the totals or the latencies
                                 self.history.append({
                                     "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -5072,20 +5082,21 @@ class Service:
                                     # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                     "drafts_offered": last.get("drafts_offered"),
                                     "drafts_accepted": last.get("drafts_accepted")})
-                                t = self.totals
-                                t["requests"] += 1
-                                t["prompt_tokens"] += seen
-                                t["reused"] += last.get("reused") or 0
-                                t["output_tokens"] += n
-                                t["prompt_ms"] += last.get("prompt_ms") or 0.0
-                                t["decode_ms"] += last.get("decode_ms") or 0.0
-                                t["drafts_offered"] += last.get("drafts_offered") or 0
-                                t["drafts_accepted"] += last.get("drafts_accepted") or 0
-                                ft0 = st.get("first_token")             # this request's own (#465: one per request)
-                                self.latencies.observe(ft0 - started if ft0 else None, n,
-                                                       (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
+                                if not admission_rejected:              # #3040: a refused admission did no work
+                                    t = self.totals
+                                    t["requests"] += 1
+                                    t["prompt_tokens"] += seen
+                                    t["reused"] += last.get("reused") or 0
+                                    t["output_tokens"] += n
+                                    t["prompt_ms"] += last.get("prompt_ms") or 0.0
+                                    t["decode_ms"] += last.get("decode_ms") or 0.0
+                                    t["drafts_offered"] += last.get("drafts_offered") or 0
+                                    t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                                    ft0 = st.get("first_token")             # this request's own (#465: one per request)
+                                    self.latencies.observe(ft0 - started if ft0 else None, n,
+                                                           (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
                             fresh = getattr(self.engine, "last", None)
-                            if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                            if fresh is not None and fresh is not before and not admission_rejected:      # the engine's clock for THIS request
                                 timings = request_timings(seen, n, last)
                                 self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
