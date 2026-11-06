@@ -1891,6 +1891,7 @@ struct Model::Impl {
         if (mask_learn_on) {   // (DS4_MASK=learn: the request's line, and the table saved with the stand-in tune file's saves)
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             ml_print();
+            mask_test_arm(0);   // a running mask test: the next request's prompt reads with the base levels
             ml_save();
         }
         if (lend_on) lend_print();   // (DS4_LEND: the experts lent now, of the last plan)
@@ -3749,7 +3750,7 @@ struct Model::Impl {
         // STRATA_LA_EXACT_W (Qwen's la_learn_alloc reads it the same way; 1: off): the loss weight of a true pick below the stand-in floor,
         // which is STRATA_ROUTE_RESIDENT_RANKS as standin_init reads it.  lo (3) is the learner's own scoring floor, unchanged.
         const char* ew = std::getenv("STRATA_LA_EXACT_W");
-        float exact_w = ew != nullptr ? (float) std::atof(ew) : 1.0f;
+        float exact_w = ew != nullptr ? (float) std::atof(ew) : 4.0f;   // (default 4 since 7 Nov, as Qwen's; =1 the old loss)
         if (!(exact_w > 0.0f)) exact_w = 1.0f;
         const char* rr = std::getenv("STRATA_ROUTE_RESIDENT_RANKS");
         const int exact_floor = std::max(0, rr != nullptr ? (int) std::atof(rr) : 3);
@@ -3780,7 +3781,12 @@ struct Model::Impl {
     // hit counts the engine keeps and saves: the profile file's uint32 counts, read at start; a layer with no counts at all is not masked).
     // The masks are one device block on the trunk's GPU (a single-GPU trunk only, as the stand-ins); the rule is route_mask_apply's.
     void mask_init() {
+        // default since 7 Nov: unset -> learn when the stand-ins it learns from are on (STRATA_STANDIN); DS4_MASK=0 turns it off
         const char* on = std::getenv("DS4_MASK");
+        if (on == nullptr) {
+            const char* si = std::getenv("STRATA_STANDIN");
+            if (si != nullptr && std::atoi(si) != 0) on = "learn";
+        }
         const bool learn = on != nullptr && std::strcmp(on, "learn") == 0;   // (DS4_MASK=learn: the scores decide, see ml_*)
         const double p0 = learn ? kMlP0 : (on != nullptr ? std::atof(on) : 0.0);
         if (!(p0 > 0.0)) return;
@@ -3962,10 +3968,17 @@ struct Model::Impl {
                     ne == g.n_exp && std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 &&
                     std::fread(&tot, sizeof tot, 1, f) == 1 && (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) &&
                     std::fread(&tok, sizeof tok, 1, f) == 1 && (ver < 3 || std::fread(&gf, sizeof gf, 1, f) == 1);   // (version 1: the split starts empty)
-        good = good && std::fread(ml_harm.data(), sizeof(double), ml_harm.size(), f) == ml_harm.size() &&
-               std::fread(ml_expo.data(), sizeof(double), ml_expo.size(), f) == ml_expo.size() &&
-               std::fread(ml_lv.data(), 1, ml_lv.size(), f) == ml_lv.size();
+        std::vector<double> lharm(ml_harm.size()), lexpo(ml_expo.size());   // (into temporaries: a truncated file changes nothing)
+        std::vector<uint8_t> llv(ml_lv.size());
+        good = good && std::fread(lharm.data(), sizeof(double), lharm.size(), f) == lharm.size() &&
+               std::fread(lexpo.data(), sizeof(double), lexpo.size(), f) == lexpo.size() &&
+               std::fread(llv.data(), 1, llv.size(), f) == llv.size();
         std::fclose(f);
+        if (good) {
+            ml_harm.swap(lharm);
+            ml_expo.swap(lexpo);
+            ml_lv.swap(llv);
+        }
         if (!good) {
             std::fprintf(stderr, "ds4: DS4_MASK=learn: %s is not this model's table (version or shape): a fresh start\n", ml_path().c_str());
             return false;
@@ -4085,7 +4098,11 @@ struct Model::Impl {
     void ml_upload_rows(const std::vector<uint8_t>& want) {
         const size_t ne = (size_t) g.n_exp;
         if (ml_dev_lv.size() != want.size()) ml_dev_lv.assign(want.size(), 0xFF);   // (unknown device rows: every row is sent)
+        if (ml_dev_lv == want) return;   // nothing differs: no wait, no copy
         cudaSetDevice(devs[(size_t) L[0].dev].id);
+        // the look-ahead learner's batch reads these rows on its non-blocking side stream: wait for all work before rewriting them (7 Nov
+        // review: a synchronous copy does not order against non-blocking streams).  Rare: a mask change, every 256 tokens at most.
+        if (cudaDeviceSynchronize() != cudaSuccess) { (void) cudaGetLastError(); return; }
         for (int il = 0; il < g.nl; ++il) {
             const size_t off = (size_t) il * ne;
             if (std::memcmp(ml_dev_lv.data() + off, want.data() + off, ne) == 0) continue;

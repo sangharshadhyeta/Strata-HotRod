@@ -600,6 +600,10 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (ix < 0 || ix >= n) {   // no finite score left (a NaN/inf gate row): never index with it (7 Nov crash hunt); say so once
+                if (r == 0) printf("ds4: router: a token's gate scores are not finite (NaN/inf) - the picks fall back to experts 0..k-1\n");
+                ix = r;
+            }
             pick[r] = ix;
             bs[ix] = -FLT_MAX;
         }
@@ -1692,6 +1696,10 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (ix < 0 || ix >= n) {   // no finite score left (a NaN/inf gate row): never index with it (7 Nov crash hunt); say so once
+                if (r == 0) printf("ds4: router: a token's gate scores are not finite (NaN/inf) - the picks fall back to experts 0..k-1\n");
+                ix = r;
+            }
             pick[r] = ix;
             bs[ix] = -FLT_MAX;
         }
