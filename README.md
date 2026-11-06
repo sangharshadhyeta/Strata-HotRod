@@ -332,6 +332,33 @@ When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095`. 
 
 <div align="justify">
 
+**On your own PC** the engine fits itself to the machine; the first hour of use is that fitting, so it starts slower:
+
+- **Measured at start:** the VRAM reserve (learned per card and context), the RAM tier (sized from free memory) and which
+  experts sit on the card or in RAM (the most used first).
+- **Measured while it serves:** the stand-in budget and the mask's depth, each by an alternating speed test over the same
+  stretch of text (the faster setting is kept only when it does not add flips). A faster or slower drive moves them where
+  they belong on that machine.
+- **Learned from your use:** the look-ahead, the mask and the stand-ins (below).
+- **Learned files** sit in `data/`, named by the model's id: `standin-tune-<id>.txt`, `mask-learn-<id>.bin`,
+  `standin-learn-<id>.bin`, `predictor-<id>.bin`, plus `ram-reserve.json`. They hold this machine's values: when you move an
+  install to another PC, delete all but `predictor-<id>.bin` (the look-ahead belongs to the model and carries over) and
+  let them relearn.
+- **The learning set** (new 6-7 Nov; on in our config's `"env"`, CUDA only - leave them out on AMD or Apple):
+  `"STRATA_MASK": "learn"` (each re-checked token measures how much the masked experts changed the output; the least
+  harmful of the little-used experts are masked, the proven-harmless ones at every rank, and the depth follows the speed
+  test), `"STRATA_STANDIN_LEARN": "1"`, `"STRATA_STANDIN_BALANCE": "1"` and `"STRATA_LA_EXACT_W": "4"` (the look-ahead
+  learns the picks that cost a read 4x harder; experts the mask removed weigh nothing).
+- **What to watch** in the server log after a request: `auto mask test` and `auto budget test` (each test's speeds and
+  what it kept), `mask learn:` (share, masked, at all ranks, re-check divergence) and `look-ahead learner:` (its guess rates
+  against the plain router).
+- **Smaller machines:** lower `--max-context` first (the KV cache is the largest fixed cost); setup refuses a PC that cannot
+  hold the fixed weights.
+
+</div>
+
+<div align="justify">
+
 **Update:** `scl enable gcc-toolset-13 -- ./update.sh --build` (new code, engine rebuilt where it changed, model kept).
 
 </div>
@@ -410,6 +437,10 @@ cp data/dsv41/profile-2.00.bin /mnt/nvme/strata-data/packs/ds41v/expert-profile.
 - `--vision off` (or leaving out `--mmproj` when packing) gives text only, and today the faster setup (see the known issue).
 - **Run** it as Qwen, in the same memory limit, from `Strata-HotRod-ds` with `$PY serve/server.py --engine strata --config strata-ds41.json`. The first start at a new context size
   learns its VRAM reserve; if it prints `ring: off (... would not fit)`, start it once more.
+- **On your own PC** it fits itself to the machine as Qwen does (above); its learned files sit in the pack folder
+  (`standin-tune.txt`, `vram-reserve.txt`, `mask-learn.bin`, `standin-learn.bin`, `hotrod-predictor.bin`) - when you move a
+  pack to another PC, delete all but `hotrod-predictor.bin`. The learning set: `"DS4_MASK": "learn"`, `"DS4_STANDIN_LEARN":
+  "1"`, `"DS4_STANDIN_BALANCE": "1"`.
 
 </div>
 
