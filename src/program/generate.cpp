@@ -4581,10 +4581,35 @@ int main(int argc, char** argv) {
                                      [&](int a, int b) { return pos[(size_t) (il * ne + b)] < pos[(size_t) (il * ne + a)]; });   // least used first
                     for (int64_t q = 0; q < per; ++q) host[(size_t) (il * ne + order[(size_t) q])] = 1;
                 }
+                // STRATA_MASK_FLOOR: the mask's own floor.  Unset or "standin": the stand-ins' floor (mlo).  "all": 0, masked picks move at every
+                // rank.  A number 0..10 (for tests) is the floor itself.  mlo stays the SSD-demand cost floor (route_mask_set's cost_lo).
+                int mfloor = mlo;
+                bool mfall = false, mfnum = false;
+                int mfn = 0;
+                if (const char* fv = std::getenv("STRATA_MASK_FLOOR")) {
+                    if (std::strcmp(fv, "all") == 0) {
+                        mfall = true;
+                        mfloor = 0;
+                    } else if (std::strcmp(fv, "standin") != 0) {
+                        mfn = std::atoi(fv);
+                        if (mfn >= 0 && mfn <= 10) {
+                            mfnum = true;
+                            mfloor = mfn;
+                        } else
+                            std::fprintf(stderr, "strata: STRATA_MASK_FLOOR=%s is not standin, all or 0..10: the stand-ins' floor is used\n", fv);
+                    }
+                }
+                char mfdesc[160];
+                if (mfall)
+                    std::snprintf(mfdesc, sizeof mfdesc, "mask floor: all ranks (STRATA_MASK_FLOOR=all)");
+                else if (mfnum)
+                    std::snprintf(mfdesc, sizeof mfdesc, "mask floor: %d (ranks below %d exact, STRATA_MASK_FLOOR=%d)", mfn, std::max(0, mfn - 1), mfn);
+                else
+                    std::snprintf(mfdesc, sizeof mfdesc, "mask floor: the stand-ins' (ranks below %d exact)", std::max(0, mlo - 1));
                 std::string merr;
-                if (strata::kernels::route_mask_set(host.data(), nl, ne, mlo, medge, merr))
-                    std::fprintf(stderr, "strata: STRATA_MASK=%.2f: %lld of %lld experts per layer masked (ranks below %d exact, edge %g; profile %s)\n",
-                                 share, (long long) per, (long long) ne, std::max(0, mlo - 1), (double) medge, o.expert_profile.c_str());
+                if (strata::kernels::route_mask_set(host.data(), nl, ne, mfloor, medge, merr, mlo))
+                    std::fprintf(stderr, "strata: STRATA_MASK=%.2f: %lld of %lld experts per layer masked (%s, edge %g; profile %s)\n",
+                                 share, (long long) per, (long long) ne, mfdesc, (double) medge, o.expert_profile.c_str());
                 else
                     std::fprintf(stderr, "strata: STRATA_MASK: off (%s)\n", merr.c_str());
             }

@@ -787,6 +787,7 @@ static size_t g_mask_cost_n = 0;
 static int g_mask_dev_id = -1;
 static int64_t g_mask_layers = 0, g_mask_ne = 0;
 static int g_mask_lo = 6;
+static int g_mask_cost_lo = 6;                      // STRATA_MASK_RESIDENT: the SSD demand counts ranks below this (the stand-ins' first rank)
 static std::vector<uint8_t> g_mask_host;            // the same mask on the host, [layers][n_expert] (the RAM tier reads it; empty: unset)
 static float g_mask_edge = -1.0f;
 namespace {
@@ -799,7 +800,7 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
                              const uint8_t* __restrict__ mask, int n_tok, int lo, float edge, float* __restrict__ row_shift,
                              unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset,
                              const int32_t* __restrict__ res, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
-                             uint32_t* __restrict__ cost, const int* __restrict__ ctrl) {
+                             uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo) {
     const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
     if (t >= n_tok) return;
     const int row = row_base + t;
@@ -810,8 +811,9 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
     for (int r = 0; r < 10; ++r) my[r] = id[r];
     // STRATA_MASK_RESIDENT: the router's own picks that would be read from the SSD are this decode row's demand.  Counted before any move, so
     // a masked expert keeps its count and the mask does not flip it in and out.  Only decode rows (mev) count; the look-ahead's guesses do not.
+    // Only ranks below cost_lo count: the stand-ins (ranks at or above it) serve those reads, so they are not paid SSD demand.
     if (res != nullptr && cost != nullptr && mev != nullptr && lane == 0)
-        for (int r = 0; r < 10; ++r)
+        for (int r = 0; r < 10 && r < cost_lo; ++r)
             if (my[r] >= 0 && my[r] < 512 && !mask_cheap(my[r], res, ring, cheap)) atomicAdd(cost + (size_t) layer * 512 + my[r], 1u);
     // STRATA_MASK_RESIDENT control window (route_mask_control): nothing moves, the router's picks stay; the masked picks still count as seen
     // (moved adds nothing).  *ctrl is the same for every lane, so the return is uniform across the warp.
@@ -874,7 +876,7 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
     }
 }
 }  // namespace
-bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int lo, float edge, std::string& msg) {
+bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int lo, float edge, std::string& msg, int cost_lo) {
     if (g_mask_dev != nullptr) { msg = "already set"; return false; }
     int dev = -1;
     if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); msg = "no CUDA device"; return false; }
@@ -928,6 +930,7 @@ bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int
     g_mask_layers = n_layers;
     g_mask_ne = n_expert;
     g_mask_lo = lo;
+    g_mask_cost_lo = cost_lo < 0 ? lo : cost_lo;
     g_mask_edge = edge;
     return true;
 }
@@ -956,7 +959,7 @@ void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_
     route_mask_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, mask, n_tok, g_mask_lo,
                                                                               g_mask_edge, row_shift, g_mask_stats, mev, layer, row_base,
                                                                               layer == 0, res, ring, cheap, g_mask_cost,
-                                                                              res != nullptr ? g_mask_ctrl_dev : nullptr);
+                                                                              res != nullptr ? g_mask_ctrl_dev : nullptr, g_mask_cost_lo);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

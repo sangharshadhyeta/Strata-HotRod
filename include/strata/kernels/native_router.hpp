@@ -107,8 +107,9 @@ int32_t* route_pred_dev(int64_t target_layer, int dist);            ///< dist 1,
 float* route_pred_logits();                                          ///< scratch, 8 x 512 floats
 float* route_pred_weights();                                         ///< scratch, 8 x 10 floats
 /// STRATA_MASK (opt-in, changes the output): the per-layer mask of the least-used experts, device [layers][n_expert] (1 = masked),
-/// set once at start on the current GPU; lo / edge are the route-resident floor (RANKS lo, EDGE).  false: `msg` says why.
-bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int lo, float edge, std::string& msg);
+/// set once at start on the current GPU; lo / edge are the mask's floor (RANKS lo, or STRATA_MASK_FLOOR), EDGE.  cost_lo (< 0: lo) is the
+/// stand-ins' first rank: the SSD-demand counters count only the router's picks below it.  false: `msg` says why.
+bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int lo, float edge, std::string& msg, int cost_lo = -1);
 const uint8_t* route_mask_layer(int64_t layer, int64_t n_expert);   ///< the layer's mask; nullptr when unset or on another GPU
 /// The mask's host copy, flat [layers][n_expert] (1 = masked); empty until route_mask_set succeeds.  The RAM tier gives masked experts the lowest keep priority.
 const std::vector<uint8_t>* route_mask_host();

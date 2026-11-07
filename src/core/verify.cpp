@@ -6471,6 +6471,8 @@ struct MaskLearnState {
     std::vector<Pick> pend_picks;
     double pend_sum = 0.0;
     bool pend_masked = false;        // the pending row has a mask move
+    // the churn line: the levels that went up (lv_up) and down (lv_down) in the relevels since the last report (STRATA_MASK_RESIDENT)
+    long long lv_up = 0, lv_down = 0;
 };
 std::shared_ptr<MaskLearnState> g_mlr;
 
@@ -6567,6 +6569,11 @@ bool mlr_relevel(MaskLearnState& s) {
     std::vector<uint8_t> nlv;
     mlr_levels(s, s.p, s.g, nlv);
     const bool changed = nlv != s.lv;
+    if (changed && nlv.size() == s.lv.size())   // the churn line: each entry's level change, up or down
+        for (size_t i = 0; i < nlv.size(); ++i) {
+            if (nlv[i] > s.lv[i]) ++s.lv_up;
+            else if (nlv[i] < s.lv[i]) ++s.lv_down;
+        }
     s.lv = std::move(nlv);
     return changed;
 }
@@ -6841,12 +6848,16 @@ std::string mask_learn_report() {
                            s.dem_mask, s.dem_tot, frac);
         // STRATA_MASK_RESIDENT: the decode windows run with the mask's moves off (control windows) since the last line
         if (n < (int) sizeof buf) n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; control windows %lld", g_mask_ctrl_win);
+        // STRATA_MASK_RESIDENT: the churn line, the levels that changed since the last line (up / down)
+        if (n < (int) sizeof buf) n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; levels changed +%lld -%lld", s.lv_up, s.lv_down);
     }
     if (n > 0 && n < (int) sizeof buf - 1) std::snprintf(buf + n, sizeof buf - (size_t) n, "\n");
     s.dsum = 0.0;
     s.dn = 0;
     s.dem_tot = 0;
     s.dem_mask = 0;
+    s.lv_up = 0;
+    s.lv_down = 0;
     g_mask_ctrl_win = 0;
     return buf;
 }

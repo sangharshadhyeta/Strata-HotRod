@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -1377,7 +1378,13 @@ private:
     std::atomic<const std::vector<float>*> promo_usage_{nullptr};
     const std::vector<float>* keep_bias_ = nullptr;   ///< STRATA_STANDIN_BALANCE: the eviction factors (null: none)
     const std::vector<uint8_t>* mask_low_ = nullptr;  ///< STRATA_MASK: the masked experts, first to leave the RAM tier (null: none)
-    bool masked_low(size_t i) const { return mask_low_ != nullptr && i < mask_low_->size() && (*mask_low_)[i] != 0; }
+    // STRATA_MASK_RESIDENT (default on; =0: the old rule), read once: the RAM tier evicts level 2 (masked at every rank) first; the old rule
+    // evicts every masked expert (levels 1 and 2) first
+    bool masked_low(size_t i) const {
+        static const bool res_rule = [] { const char* v = std::getenv("STRATA_MASK_RESIDENT"); return v == nullptr || std::atoi(v) != 0; }();
+        if (mask_low_ == nullptr || i >= mask_low_->size()) return false;
+        return res_rule ? (*mask_low_)[i] == 2 : (*mask_low_)[i] != 0;
+    }
     mutable std::mutex promo_mu_;
     std::deque<Promo> promo_q_;                  ///< written into a place, not yet published (publish_promotions takes them all)
     std::vector<char> promo_busy_;               ///< per (layer, expert): queued or being read (cleared when published / dropped)
