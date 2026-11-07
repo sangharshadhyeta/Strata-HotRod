@@ -3832,7 +3832,10 @@ struct Model::Impl {
                 mask_fl = 0;
                 mask_fl_how = "all ranks (DS4_MASK_FLOOR=all)";
             } else if (std::strcmp(mf, "standin") != 0) {
-                const int v = std::atoi(mf);
+                // a number only when every character is a digit (atoi reads "abc" as 0, which would move every rank)
+                bool digits = mf[0] != '\0';
+                for (const char* c = mf; *c != '\0'; ++c) digits = digits && *c >= '0' && *c <= '9';
+                const int v = digits ? std::atoi(mf) : -1;
                 if (v >= 0 && v <= kPicks) {
                     mask_fl = v;
                     mask_fl_how = "DS4_MASK_FLOOR=" + std::to_string(v);
