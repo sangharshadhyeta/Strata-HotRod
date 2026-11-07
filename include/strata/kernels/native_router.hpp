@@ -125,6 +125,8 @@ void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_
 bool route_mask_cost_read(std::vector<uint32_t>& out);
 /// STRATA_MASK=learn: copies the changed layers of `host` (same size as the set mask) to the device and the host copy. false: not set.
 bool route_mask_update(const std::vector<uint8_t>& host);
+/// STRATA_MASK_RESIDENT: between windows, on = this window is a control (the mask moves no pick; the masked picks are still counted). No-op unset.
+void route_mask_control(bool on);
 /// The seen / moved counts since the last read (read and reset); false when no mask is set.
 bool route_mask_read(unsigned long long& seen, unsigned long long& moved);
 /// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear expert predictors, folded into one bf16 [512 x n_embd]

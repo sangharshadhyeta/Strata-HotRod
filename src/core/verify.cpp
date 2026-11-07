@@ -4574,6 +4574,7 @@ bool Verifier::route_brake_on() { return route_resident_cfg().brake_on; }
 bool mask_test_begin();
 void mask_test_arm(int arm);
 bool mask_test_end(bool won, double out[4]);
+bool mask_control_next();   // STRATA_MASK_RESIDENT: this decode window is a control (defined with the mask-learn section)
 namespace {
 void route_auto_schedule(RouteResidentCfg& c);   // defined with the test helpers below route_auto_window
 float route_auto_arm_b(const RouteResidentCfg& c, int arm);   // defined with the test helpers below route_auto_window
@@ -4696,6 +4697,9 @@ static void la_tail_skip_update(const RouteResidentCfg& c) {
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
 // STRATA_ROUTE_BUDGET_AUTO: a decode window (auto_ok) takes the search's b for both ranks; a cut's next window is exact for ranks < lo only.
 void Verifier::route_budget_window(bool decode, bool auto_ok) {
+    // STRATA_MASK_RESIDENT with the mask learner: this window's control flag, written before the window runs (every window passes here, the
+    // kernels read the flag only inside a window).  Off otherwise.
+    strata::kernels::route_mask_control(mask_learn_active() && mask_resident_on() && decode && mask_control_next());
     RouteResidentCfg& c = route_resident_cfg();
     if (!c.dyn_on && !c.fragile_on) {
         la_tail_skip_update(c);   // (the static budget_tail decides the tail here: win_tail is never set)
@@ -6422,6 +6426,7 @@ constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
 constexpr double kMlMinSide = 16.0, kMlPMin = 0.025;   // re-checks needed on each side of the comparison; the share's floor
 constexpr int kMlMinPop = 8;
 constexpr double kMtStepP = 0.025, kMtStepG = 0.1;   // a mask test's candidate: one step of the share p and of the level-2 fraction g
+constexpr long long kMlControlEvery = 8;   // STRATA_MASK_RESIDENT: one decode window in 8 is a control (no mask moves), so p and g get their "without" side
 
 struct MaskLearnState {
     struct Pick {
@@ -6801,6 +6806,16 @@ bool mask_learn_save(const std::string& path, std::string& msg) {
     return mlr_save(*g_mlr, path, msg);
 }
 
+// STRATA_MASK_RESIDENT control windows: every kMlControlEvery-th decode window (counted from the start) runs with the mask's moves off, so
+// the re-checks it gives have no mask move and land on the "without" side.  g_mask_ctrl_n counts the decode windows; g_mask_ctrl_win the
+// control windows since the last mask line.
+static long long g_mask_ctrl_n = 0, g_mask_ctrl_win = 0;
+bool mask_control_next() {
+    if (++g_mask_ctrl_n % kMlControlEvery != 0) return false;
+    ++g_mask_ctrl_win;
+    return true;
+}
+
 std::string mask_learn_report() {
     if (!g_mlr) return "";
     MaskLearnState& s = *g_mlr;
@@ -6821,12 +6836,15 @@ std::string mask_learn_report() {
         n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; SSD demand this request: %lld picks on masked experts of %lld (%.1f%%); "
                            "the moved count on the mask line above is picks moved off the SSD to a cheap expert (SSD reads avoided)",
                            s.dem_mask, s.dem_tot, frac);
+        // STRATA_MASK_RESIDENT: the decode windows run with the mask's moves off (control windows) since the last line
+        if (n < (int) sizeof buf) n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; control windows %lld", g_mask_ctrl_win);
     }
     if (n > 0 && n < (int) sizeof buf - 1) std::snprintf(buf + n, sizeof buf - (size_t) n, "\n");
     s.dsum = 0.0;
     s.dn = 0;
     s.dem_tot = 0;
     s.dem_mask = 0;
+    g_mask_ctrl_win = 0;
     return buf;
 }
 

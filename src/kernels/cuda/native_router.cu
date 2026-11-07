@@ -780,6 +780,8 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
 // the verifier.  One warp per token; the weights are the softmax of the new picks when any moved (as route-resident does).
 static uint8_t* g_mask_dev = nullptr;                // device [layers][n_expert], 1 = masked
 static unsigned long long* g_mask_stats = nullptr;  // device [2]: masked picks seen, picks moved
+static int* g_mask_ctrl_host = nullptr;             // host-mapped int: 1 = a control window (no mask moves); g_mask_ctrl_dev is its device alias (STRATA_MASK_RESIDENT)
+static int* g_mask_ctrl_dev = nullptr;
 static uint32_t* g_mask_cost = nullptr;             // device [layers][512]: the router's picks that are not cheap (the SSD demand; STRATA_MASK_RESIDENT)
 static size_t g_mask_cost_n = 0;
 static int g_mask_dev_id = -1;
@@ -797,7 +799,7 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
                              const uint8_t* __restrict__ mask, int n_tok, int lo, float edge, float* __restrict__ row_shift,
                              unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset,
                              const int32_t* __restrict__ res, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
-                             uint32_t* __restrict__ cost) {
+                             uint32_t* __restrict__ cost, const int* __restrict__ ctrl) {
     const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
     if (t >= n_tok) return;
     const int row = row_base + t;
@@ -811,6 +813,17 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
     if (res != nullptr && cost != nullptr && mev != nullptr && lane == 0)
         for (int r = 0; r < 10; ++r)
             if (my[r] >= 0 && my[r] < 512 && !mask_cheap(my[r], res, ring, cheap)) atomicAdd(cost + (size_t) layer * 512 + my[r], 1u);
+    // STRATA_MASK_RESIDENT control window (route_mask_control): nothing moves, the router's picks stay; the masked picks still count as seen
+    // (moved adds nothing).  *ctrl is the same for every lane, so the return is uniform across the warp.
+    if (ctrl != nullptr && *ctrl != 0) {
+        if (lane == 0 && stats != nullptr) {
+            unsigned long long masked = 0;
+            for (int r = 0; r < 10; ++r)
+                if (my[r] >= 0 && my[r] < 512 && mask[my[r]] != 0) ++masked;
+            atomicAdd(stats, masked);
+        }
+        return;
+    }
     int seen = 0, moved = 0;
     for (int r = 0; r < 10; ++r) {
         const int e = my[r];
@@ -888,9 +901,27 @@ bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int
             cst = nullptr;
         }
     }
+    // the control flag (STRATA_MASK_RESIDENT): a host-mapped int beside the stats, as g_cheap_host is (read by the kernel at launch, written
+    // between windows by route_mask_control).  On failure: nullptr, so no control windows.
+    int* ctl = nullptr;
+    int* ctl_d = nullptr;
+    if (cudaHostAlloc((void**) &ctl, sizeof(int), cudaHostAllocMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        ctl = nullptr;
+    } else if (cudaHostGetDevicePointer((void**) &ctl_d, ctl, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cudaFreeHost(ctl);
+        ctl = nullptr;
+        ctl_d = nullptr;
+    } else {
+        *ctl = 0;
+    }
+    if (ctl == nullptr) std::fprintf(stderr, "strata: STRATA_MASK_RESIDENT: no host-mapped control flag, so no control windows\n");
     g_mask_dev = dm;
     g_mask_host.assign(host, host + n);
     g_mask_stats = st;
+    g_mask_ctrl_host = ctl;
+    g_mask_ctrl_dev = ctl_d;
     g_mask_cost = cst;
     g_mask_cost_n = cst != nullptr ? cn : 0;
     g_mask_dev_id = dev;
@@ -921,11 +952,20 @@ bool route_mask_cost_read(std::vector<uint32_t>& out) {   // the SSD-demand coun
 void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream,
                        MaskEvs* mev, int layer, int row_base, const int32_t* res, const uint8_t* ring, const uint8_t* cheap) {
     if (!mask || !logits || !ids || !weights || n_tok < 1 || g_mask_stats == nullptr) return;
+    // the control flag is the resident rule's only (the old rule passes nullptr: no control windows there)
     route_mask_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, mask, n_tok, g_mask_lo,
                                                                               g_mask_edge, row_shift, g_mask_stats, mev, layer, row_base,
-                                                                              layer == 0, res, ring, cheap, g_mask_cost);
+                                                                              layer == 0, res, ring, cheap, g_mask_cost,
+                                                                              res != nullptr ? g_mask_ctrl_dev : nullptr);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+// STRATA_MASK_RESIDENT: the window's control flag, written between windows (no kernel of the previous window still reads it: run() syncs its
+// stream and joins the look-ahead's before it returns).  The write is a host store to mapped memory, as route_cfg_set_budgets' is.
+void route_mask_control(bool on) {
+    if (g_mask_ctrl_host == nullptr) return;
+    *(volatile int*) g_mask_ctrl_host = on ? 1 : 0;
+    __sync_synchronize();
 }
 bool route_mask_update(const std::vector<uint8_t>& host) {
     if (g_mask_dev == nullptr || host.size() != g_mask_host.size()) return false;
