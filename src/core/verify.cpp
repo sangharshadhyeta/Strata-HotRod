@@ -114,6 +114,12 @@ static bool la_learn_timing_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN_TIMING"); return e != nullptr && e[0] == '1'; }();
     return on;
 }
+// STRATA_MASK_RESIDENT (default on; =0: the old rule): the mask moves a pick only onto a cheap expert, the masked set is chosen by the
+// measured SSD demand, and p and g move only by the live flip comparison (no mask test).  Read once.
+static bool mask_resident_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MASK_RESIDENT"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
 struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
@@ -2961,9 +2967,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               strata::kernels::route_pred_weights(), n, s);
                     // STRATA_MASK: the guesses follow the target layer's mask by the router's rule (no row_shift: a prefetch, not an output)
                     if (NE == 512 && K == 10 && !route_resident_cfg().win_exact)
-                        if (const uint8_t* mk = strata::kernels::route_mask_layer(l + dist, g.n_expert))
+                        if (const uint8_t* mk = strata::kernels::route_mask_layer(l + dist, g.n_expert)) {
+                            // STRATA_MASK_RESIDENT: the same residency tables of the target layer, so the guesses follow the router's new rule
+                            const bool mres = mask_resident_on();
                             strata::kernels::native_route_mask(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
-                                                               strata::kernels::route_pred_weights(), mk, n, nullptr, s);
+                                                               strata::kernels::route_pred_weights(), mk, n, nullptr, s, nullptr, (int) (l + dist), 0,
+                                                               mres && hits_.d_res != nullptr ? hits_.d_res + (l + dist) * g.n_expert : nullptr,
+                                                               mres ? strata::kernels::route_ring_layer(l + dist, g.n_expert) : nullptr,
+                                                               mres ? strata::kernels::route_cheap_layer(l + dist, g.n_expert) : nullptr);
+                        }
                     // STRATA_LA_EDGE_SKIP (decode windows: this node runs only for n <= 8): a predicted rank lo-1 pick that a resident
                     // stand-in within the edge would replace is not read ahead (its id becomes -1; route_pred_edge_skip)
                     if (la_edge_skip && hits_.d_res != nullptr)
@@ -3044,9 +3056,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (NE == 512 && K == 10 && !route_resident_cfg().win_exact) {
             if (const uint8_t* mk = strata::kernels::route_mask_layer(l, g.n_expert)) {
                 try {
+                    // STRATA_MASK_RESIDENT: this layer's residency tables (the rule's `cheap`); none when it is off (the old rule)
+                    const bool mres = mask_resident_on();
                     strata::kernels::native_route_mask(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, mk, n,
                                                        n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr, cs,
-                                                       n <= 8 ? mev_ : nullptr, (int) l, (int) tb);   // (STRATA_MASK=learn: the list)
+                                                       n <= 8 ? mev_ : nullptr, (int) l, (int) tb,   // (STRATA_MASK=learn: the list)
+                                                       mres && hits_.d_res != nullptr ? hits_.d_res + l * g.n_expert : nullptr,
+                                                       mres ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr,
+                                                       mres ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr);
                 } catch (const std::exception& e) { err = "verify mask: " + std::string(e.what()); return false; }
             }
         }
@@ -4701,7 +4718,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
             c.auto_win_arm = c.auto_cut_arm;   // the exact successor of a cut: its cut window's arm, not a scheduled window
             c.auto_win_sched = false;
         } else {
-            c.auto_mask_ok = mask_learn_active();   // STRATA_MASK=learn: a mask test may start here
+            c.auto_mask_ok = mask_learn_active() && !mask_resident_on();   // STRATA_MASK=learn: a mask test may start here (not with the resident rule: p, g move live)
             route_auto_schedule(c);
         }
         b = route_auto_arm_b(c, c.auto_win_arm);   // the request's budget (base arm) or its scaled candidate
@@ -6417,6 +6434,11 @@ struct MaskLearnState {
     std::vector<uint8_t> lv;         // [nl][ne] 0 unmasked, 1 masked (the rank rule), 2 masked at every rank
     std::vector<uint32_t> stamp;     // [nl][ne] dedup of one row's entries
     uint32_t stamp_id = 0;
+    // STRATA_MASK_RESIDENT: the SSD demand per (layer, expert): the router's picks that are not cheap, decayed (cost); cost_last is the device
+    // counter as last read (its deltas are added to cost); dem_tot / dem_mask count the deltas since the request's line (all, and on masked experts)
+    std::vector<double> cost;
+    std::vector<uint32_t> cost_last;
+    long long dem_tot = 0, dem_mask = 0;
     double p = kMlP0;
     // the depth of the mask at level 2: at most round(g x the layer's masked count) of a layer's graduated experts are level 2 (the lowest
     // harm rates first); g is a mask test's second number (STRATA_MASK=learn x AUTO), starts at the loaded table's level-2 share (else 0.25)
@@ -6457,6 +6479,7 @@ void mlr_levels(const MaskLearnState& s, double p, double g, std::vector<uint8_t
     const int64_t ne = s.ne;
     const int64_t per = (int64_t) std::floor(p * (double) ne + 1e-9);
     const int64_t pool_n = std::min<int64_t>(ne, 2 * per);
+    const bool res_rule = mask_resident_on();   // STRATA_MASK_RESIDENT: the pool is the most expensive experts (SSD demand), not the least used
     out.assign((size_t) (s.nl * ne), 0);
     std::vector<double> rate((size_t) ne), pop;
     std::vector<int> ord((size_t) ne), keep, cand, grad_set;
@@ -6466,8 +6489,14 @@ void mlr_levels(const MaskLearnState& s, double p, double g, std::vector<uint8_t
         const double* hm = s.harm.data() + (size_t) il * (size_t) ne;
         const double* ex = s.expo.data() + (size_t) il * (size_t) ne;
         const int64_t* pr = s.pos.data() + (size_t) il * (size_t) ne;
+        const double* cs = res_rule ? s.cost.data() + (size_t) il * (size_t) ne : nullptr;
         bool ranked = false;
-        for (int64_t e = 0; e < ne; ++e) ranked = ranked || pr[e] != INT64_MAX;
+        if (res_rule) {
+            double tot = 0.0;
+            for (int64_t e = 0; e < ne; ++e) tot += cs[e];
+            ranked = tot > 0.0;   // STRATA_MASK_RESIDENT: a layer with no SSD demand gets nothing masked
+        } else
+            for (int64_t e = 0; e < ne; ++e) ranked = ranked || pr[e] != INT64_MAX;
         if (!ranked) continue;
         pop.clear();
         for (int64_t e = 0; e < ne; ++e) {
@@ -6493,10 +6522,23 @@ void mlr_levels(const MaskLearnState& s, double p, double g, std::vector<uint8_t
             ++masked;
         }
         for (int64_t e = 0; e < ne; ++e) ord[(size_t) e] = (int) e;
-        std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] > pr[b]; });
         cand.clear();
-        for (int64_t q = 0; q < pool_n; ++q)
-            if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
+        if (res_rule) {
+            // STRATA_MASK_RESIDENT: the pool is the most expensive experts (SSD demand, ties: the lower id), the first pool_n of them not masked
+            // yet; only those with measured harm (exposure >= kMlMinAg) are candidates, the lowest harm rate first (below)
+            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return cs[a] > cs[b]; });
+            int64_t pooled = 0;
+            for (int64_t q = 0; q < ne && pooled < pool_n; ++q) {
+                const int e = ord[(size_t) q];
+                if (nlv[(size_t) e] != 0) continue;
+                ++pooled;
+                if (ex[e] >= kMlMinAg) cand.push_back(e);
+            }
+        } else {
+            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] > pr[b]; });
+            for (int64_t q = 0; q < pool_n; ++q)
+                if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
+        }
         std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
         for (int e : cand) {
             if (masked >= per) break;
@@ -6538,25 +6580,50 @@ void mt_next_stage(int& first, int& stage, bool won, int d) {
     }
 }
 
+// STRATA_MASK_RESIDENT: the device's SSD-demand counters since the last read; each delta joins the decayed cost, and the request's counts
+// (all demand, and the demand on experts the mask holds).  The counters are never reset, so a wrapped u32 delta is still right.
+void mlr_read_cost(MaskLearnState& s) {
+    std::vector<uint32_t> cur;
+    const size_t cnt = (size_t) s.nl * (size_t) s.ne;
+    if (!strata::kernels::route_mask_cost_read(cur) || cur.size() != cnt || s.cost_last.size() != cnt || s.cost.size() != cnt) return;
+    for (size_t i = 0; i < cnt; ++i) {
+        const uint32_t d = cur[i] - s.cost_last[i];
+        s.cost_last[i] = cur[i];
+        if (d == 0) continue;
+        s.cost[i] += (double) d;
+        s.dem_tot += d;
+        if (s.lv[i] >= 1) s.dem_mask += d;
+    }
+}
+
 // Every kMlMaskEvery kept tokens the masks move: p follows the re-checks' agreement (98% up, under 95% down), then the levels; the changed rows go
 // to the device.  While a mask test runs its arms' levels are fixed (the test's end relevels): the harm and exposure keep learning.
 void mlr_update(MaskLearnState& s) {
+    const bool res_rule = mask_resident_on();
+    if (res_rule) mlr_read_cost(s);
     if (s.mt_on) return;
     // the flip rate of re-checks with a mask move against those without (the stand-ins' own): > 2 SE above -> p -0.05; within 1 SE -> +0.025
+    // STRATA_MASK_RESIDENT: g moves with p (-0.1 with -0.05, +0.1 with +0.025); there is no mask test to set it
     if (s.nm >= kMlMinSide && s.fsn >= kMlMinSide) {
         const double rm = s.fm / s.nm, rs = s.fs / s.fsn, r = (s.fm + s.fs) / (s.nm + s.fsn);
         const double se = std::sqrt(std::max(1e-9, r * (1.0 - r) * (1.0 / s.nm + 1.0 / s.fsn)));
-        if (rm - rs > 2.0 * se) s.p = std::max(kMlPMin, s.p - 0.05);
-        else if (rm - rs < se) s.p = std::min(kMlPMax, s.p + 0.025);
+        if (rm - rs > 2.0 * se) {
+            s.p = std::max(kMlPMin, s.p - 0.05);
+            if (res_rule) s.g = std::max(0.0, s.g - 0.1);
+        } else if (rm - rs < se) {
+            s.p = std::min(kMlPMax, s.p + 0.025);
+            if (res_rule) s.g = std::min(1.0, s.g + 0.1);
+        }
     }
     // the upload is tried every round (it compares rows itself): a failed one is retried, not only when the levels change again
     (void) mlr_relevel(s);
     if (!strata::kernels::route_mask_update(s.lv)) std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
 }
 
-// The table file: "MLRN", version 4, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the kept token count, g, the mask
-// test's progress (version 4: mt_step as a double, then mt_first, mt_stage, mt_win_d, mt_last_move as int32), then harm and exposure (double)
-// and the levels.  Versions 1 and 2 have no g (it is the loaded levels' level-2 share); versions 1 to 3 have no test progress (the defaults).
+// The table file: "MLRN", version 5, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the kept token count, g, the mask
+// test's progress (version 4: mt_step as a double, then mt_first, mt_stage, mt_win_d, mt_last_move as int32), then harm and exposure (double),
+// the levels, and (version 5) the SSD demand cost (double, [nl][ne]).  Versions 1 and 2 have no g (it is the loaded levels' level-2 share);
+// versions 1 to 3 have no test progress (the defaults); versions 1 to 4 have no cost (zero).
 // A running test (mt_on) is not saved: the direction state, the step and an unconfirmed win carry over, the test itself starts again.
 bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg) {
     const std::string tmp = path + ".tmp";
@@ -6565,7 +6632,7 @@ bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg
         msg = "cannot open " + tmp;
         return false;
     }
-    const uint32_t ver = 4;   // 2: + the mask/stand-in split of the re-checks; 3: + g; 4: + the mask test's direction state, step and unconfirmed win
+    const uint32_t ver = 5;   // 2: + the mask/stand-in split of the re-checks; 3: + g; 4: + the mask test's direction state, step and unconfirmed win; 5: + cost
     const double split[4] = {s.fm, s.nm, s.fs, s.fsn};
     const int32_t nl = (int32_t) s.nl, ne = (int32_t) s.ne;
     const long long tok = s.tok;
@@ -6580,7 +6647,8 @@ bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg
               std::fwrite(&mt_last_move, sizeof mt_last_move, 1, f) == 1 &&
               std::fwrite(s.harm.data(), sizeof(double), s.harm.size(), f) == s.harm.size() &&
               std::fwrite(s.expo.data(), sizeof(double), s.expo.size(), f) == s.expo.size() &&
-              std::fwrite(s.lv.data(), 1, s.lv.size(), f) == s.lv.size();
+              std::fwrite(s.lv.data(), 1, s.lv.size(), f) == s.lv.size() &&
+              std::fwrite(s.cost.data(), sizeof(double), s.cost.size(), f) == s.cost.size();
     ok = std::fclose(f) == 0 && ok;
     if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
         msg = "not written: " + path;
@@ -6604,9 +6672,10 @@ bool mlr_load(MaskLearnState& s, const std::string& path) {
     int32_t mt_first = -1, mt_stage = 0, mt_win_d = 0, mt_last_move = 0;   // (version 4 only; the defaults otherwise)
     std::vector<double> harm(cnt), expo(cnt);
     std::vector<uint8_t> lv(cnt);
+    std::vector<double> cost(cnt, 0.0);       // (version 5 only; zero before)
     double split[4] = {0.0, 0.0, 0.0, 0.0};   // (version 1: the scores kept, the split starts empty)
     bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 &&
-                (ver == 1 || ver == 2 || ver == 3 || ver == 4) &&
+                (ver >= 1 && ver <= 5) &&
                 std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == s.nl && ne == s.ne &&
                 std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 && std::fread(&tot, sizeof tot, 1, f) == 1 &&
                 (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) && std::fread(&tok, sizeof tok, 1, f) == 1 &&
@@ -6615,7 +6684,8 @@ bool mlr_load(MaskLearnState& s, const std::string& path) {
                              std::fread(&mt_stage, sizeof mt_stage, 1, f) == 1 && std::fread(&mt_win_d, sizeof mt_win_d, 1, f) == 1 &&
                              std::fread(&mt_last_move, sizeof mt_last_move, 1, f) == 1)) &&
                 std::fread(harm.data(), sizeof(double), cnt, f) == cnt && std::fread(expo.data(), sizeof(double), cnt, f) == cnt &&
-                std::fread(lv.data(), 1, cnt, f) == cnt;
+                std::fread(lv.data(), 1, cnt, f) == cnt &&
+                (ver < 5 || std::fread(cost.data(), sizeof(double), cnt, f) == cnt);
     std::fclose(f);
     if (!good) return false;
     if (ver < 3) {   // g: the loaded levels' level-2 share of the masked pairs (0.25 when nothing is masked)
@@ -6651,6 +6721,7 @@ bool mlr_load(MaskLearnState& s, const std::string& path) {
     s.harm = std::move(harm);
     s.expo = std::move(expo);
     s.lv = std::move(lv);
+    s.cost = std::move(cost);
     return true;
 }
 
@@ -6697,7 +6768,9 @@ std::vector<uint8_t> mask_learn_begin(int64_t n_layers, int64_t n_expert, const 
     s->expo.assign(cnt, 0.0);
     s->lv.assign(cnt, 0);
     s->stamp.assign(cnt, 0u);
-    mlr_relevel(*s);   // from zero scores: the profile's least-used pairs at the share p0
+    s->cost.assign(cnt, 0.0);
+    s->cost_last.assign(cnt, 0u);
+    mlr_relevel(*s);   // from zero scores: the profile's least-used pairs at the share p0 (STRATA_MASK_RESIDENT: none until demand is measured)
     g_mlr = s;
     return s->lv;
 }
@@ -6715,7 +6788,8 @@ bool mask_learn_open(const std::string& path, std::string& msg) {
         msg = "the mask rows not uploaded";
         return false;
     }
-    msg = std::string(loaded ? "the saved table" : "a fresh table") + ", p " + std::to_string(s.p);
+    msg = std::string(loaded ? "the saved table" : "a fresh table") + ", p " + std::to_string(s.p) +
+          (mask_resident_on() ? ", resident swap, expensive experts, live" : ", the old rule (STRATA_MASK_RESIDENT=0)");
     return loaded;
 }
 
@@ -6737,12 +6811,22 @@ std::string mask_learn_report() {
         scored += s.expo[i] > 0.0;
     }
     const double dm = s.dn > 0 ? s.dsum / (double) s.dn : 0.0;
-    char buf[384];
-    std::snprintf(buf, sizeof buf, "strata serve: mask learn: p %.3f, g %.3f, %lld masked (%lld at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
-                  "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f\n",
-                  s.p, s.g, m, a, dm, s.dn, scored, s.fm, s.nm, s.fs, s.fsn);
+    char buf[768];
+    int n = std::snprintf(buf, sizeof buf, "strata serve: mask learn: p %.3f, g %.3f, %lld masked (%lld at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
+                          "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f",
+                          s.p, s.g, m, a, dm, s.dn, scored, s.fm, s.nm, s.fs, s.fsn);
+    if (mask_resident_on() && n > 0 && n < (int) sizeof buf) {
+        // STRATA_MASK_RESIDENT: the request's SSD demand (the router's non-cheap picks, and those on masked experts), then what the moved count means
+        const double frac = s.dem_tot > 0 ? 100.0 * (double) s.dem_mask / (double) s.dem_tot : 0.0;
+        n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; SSD demand this request: %lld picks on masked experts of %lld (%.1f%%); "
+                           "the moved count on the mask line above is picks moved off the SSD to a cheap expert (SSD reads avoided)",
+                           s.dem_mask, s.dem_tot, frac);
+    }
+    if (n > 0 && n < (int) sizeof buf - 1) std::snprintf(buf + n, sizeof buf - (size_t) n, "\n");
     s.dsum = 0.0;
     s.dn = 0;
+    s.dem_tot = 0;
+    s.dem_mask = 0;
     return buf;
 }
 
@@ -6832,6 +6916,7 @@ void Verifier::mask_learn_window(int T, int kept, bool cut) {
     if (s.tok / kMlDecayEvery != before / kMlDecayEvery) {
         for (double& v : s.harm) v *= 0.5;
         for (double& v : s.expo) v *= 0.5;
+        for (double& v : s.cost) v *= 0.5;   // STRATA_MASK_RESIDENT: the demand decays with the harm and exposure
         s.ag_ok *= 0.5;
         s.ag_tot *= 0.5;
         s.fm *= 0.5;

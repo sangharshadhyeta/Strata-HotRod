@@ -780,15 +780,24 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
 // the verifier.  One warp per token; the weights are the softmax of the new picks when any moved (as route-resident does).
 static uint8_t* g_mask_dev = nullptr;                // device [layers][n_expert], 1 = masked
 static unsigned long long* g_mask_stats = nullptr;  // device [2]: masked picks seen, picks moved
+static uint32_t* g_mask_cost = nullptr;             // device [layers][512]: the router's picks that are not cheap (the SSD demand; STRATA_MASK_RESIDENT)
+static size_t g_mask_cost_n = 0;
 static int g_mask_dev_id = -1;
 static int64_t g_mask_layers = 0, g_mask_ne = 0;
 static int g_mask_lo = 6;
 static std::vector<uint8_t> g_mask_host;            // the same mask on the host, [layers][n_expert] (the RAM tier reads it; empty: unset)
 static float g_mask_edge = -1.0f;
 namespace {
+// STRATA_MASK_RESIDENT: an expert is cheap when the router reads it without an SSD fetch: on the card (res), in the look-ahead ring, or in the
+// RAM tier (route_resident_k's `have` and the RAM floor's table, as one rule).  `res` is the layer's slice, ring and cheap may be nullptr.
+__device__ __forceinline__ bool mask_cheap(int f, const int32_t* res, const uint8_t* ring, const uint8_t* cheap) {
+    return res[f] >= 0 || (ring != nullptr && ring[f] != 0) || (cheap != nullptr && cheap[f] != 0);
+}
 __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                              const uint8_t* __restrict__ mask, int n_tok, int lo, float edge, float* __restrict__ row_shift,
-                             unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset) {
+                             unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset,
+                             const int32_t* __restrict__ res, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
+                             uint32_t* __restrict__ cost) {
     const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
     if (t >= n_tok) return;
     const int row = row_base + t;
@@ -797,17 +806,25 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
     int32_t* id = ids + (size_t) t * 10;
     int my[10];
     for (int r = 0; r < 10; ++r) my[r] = id[r];
+    // STRATA_MASK_RESIDENT: the router's own picks that would be read from the SSD are this decode row's demand.  Counted before any move, so
+    // a masked expert keeps its count and the mask does not flip it in and out.  Only decode rows (mev) count; the look-ahead's guesses do not.
+    if (res != nullptr && cost != nullptr && mev != nullptr && lane == 0)
+        for (int r = 0; r < 10; ++r)
+            if (my[r] >= 0 && my[r] < 512 && !mask_cheap(my[r], res, ring, cheap)) atomicAdd(cost + (size_t) layer * 512 + my[r], 1u);
     int seen = 0, moved = 0;
     for (int r = 0; r < 10; ++r) {
         const int e = my[r];
         if (e < 0 || e >= 512 || mask[e] == 0) continue;   // uniform across the warp
         ++seen;
+        // STRATA_MASK_RESIDENT: a masked pick that is already cheap stays (it costs no SSD read); it is still counted as seen
+        if (res != nullptr && mask_cheap(e, res, ring, cheap)) continue;   // uniform across the warp
         const bool all = mask[e] == 2;   // level 2 (graduated, STRATA_MASK=learn): moves at every rank
         if (!all && r < lo - 1) continue;
         float bv = -INFINITY;
         int bi = -1;
         for (int f = lane; f < 512; f += 32) {   // the best unmasked expert the token did not pick (a strictly greater logit wins; lowest id on ties)
             if (mask[f] != 0) continue;
+            if (res != nullptr && !mask_cheap(f, res, ring, cheap)) continue;   // STRATA_MASK_RESIDENT: the substitute must be cheap too
             bool used = false;
             for (int q = 0; q < 10; ++q) used |= my[q] == f;
             if (used) continue;
@@ -860,9 +877,22 @@ bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int
         msg = "no room on the GPU for it";
         return false;
     }
+    // the SSD-demand counters (STRATA_MASK_RESIDENT): [layers][512], zeroed.  The kernel indexes them by 512, so they exist for a 512-expert
+    // router only; on any failure they stay nullptr and the feature has no cost data (the mask itself is unaffected).
+    uint32_t* cst = nullptr;
+    const size_t cn = (size_t) n_layers * 512;
+    if (n_expert == 512) {
+        if (cudaMalloc((void**) &cst, cn * sizeof(uint32_t)) != cudaSuccess || cudaMemset(cst, 0, cn * sizeof(uint32_t)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (cst != nullptr) (void) cudaFree(cst);
+            cst = nullptr;
+        }
+    }
     g_mask_dev = dm;
     g_mask_host.assign(host, host + n);
     g_mask_stats = st;
+    g_mask_cost = cst;
+    g_mask_cost_n = cst != nullptr ? cn : 0;
     g_mask_dev_id = dev;
     g_mask_layers = n_layers;
     g_mask_ne = n_expert;
@@ -877,12 +907,23 @@ const uint8_t* route_mask_layer(int64_t layer, int64_t n_expert) {
     return dev == g_mask_dev_id ? g_mask_dev + (size_t) layer * (size_t) n_expert : nullptr;   // another GPU's router keeps its own picks
 }
 const std::vector<uint8_t>* route_mask_host() { return &g_mask_host; }
+bool route_mask_cost_read(std::vector<uint32_t>& out) {   // the SSD-demand counters, [layers][512] (not reset: the learner takes the deltas)
+    out.clear();
+    if (g_mask_cost == nullptr) return false;
+    out.resize(g_mask_cost_n);
+    if (cudaMemcpy(out.data(), g_mask_cost, g_mask_cost_n * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        out.clear();
+        return false;
+    }
+    return true;
+}
 void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream,
-                       MaskEvs* mev, int layer, int row_base) {
+                       MaskEvs* mev, int layer, int row_base, const int32_t* res, const uint8_t* ring, const uint8_t* cheap) {
     if (!mask || !logits || !ids || !weights || n_tok < 1 || g_mask_stats == nullptr) return;
     route_mask_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, mask, n_tok, g_mask_lo,
                                                                               g_mask_edge, row_shift, g_mask_stats, mev, layer, row_base,
-                                                                              layer == 0);
+                                                                              layer == 0, res, ring, cheap, g_mask_cost);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

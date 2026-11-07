@@ -115,8 +115,14 @@ const std::vector<uint8_t>* route_mask_host();
 /// Moves the layer's masked picks of the n_tok rows (ids / weights [n_tok][10], logits [n_tok][512]) by the rule above; row_shift (device,
 /// nullable) gets each move's w x gap.  The same call moves the look-ahead's guesses under the target layer's mask (no row_shift).
 /// mev (STRATA_MASK=learn): each move's layer, replaced expert and w x gap go to row (row_base + t) of the list; layer 0 resets the rows.
+/// STRATA_MASK_RESIDENT: res (the layer's residency slice, route_resident's `res`), ring and cheap (the layer's ring and RAM-tier slices, nullable)
+/// make the rule resident-aware: a masked pick moves only when it is not cheap, and only onto a cheap expert.  res == nullptr: the old rule.
+/// With mev (a decode row) the layer's non-cheap picks are counted in the SSD-demand counters (route_mask_cost_read).
 void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream,
-                       MaskEvs* mev = nullptr, int layer = 0, int row_base = 0);
+                       MaskEvs* mev = nullptr, int layer = 0, int row_base = 0, const int32_t* res = nullptr, const uint8_t* ring = nullptr,
+                       const uint8_t* cheap = nullptr);
+/// STRATA_MASK_RESIDENT: the SSD-demand counters, flat [layers][512] (the router's non-cheap picks since the start, u32, wrapping). false: none.
+bool route_mask_cost_read(std::vector<uint32_t>& out);
 /// STRATA_MASK=learn: copies the changed layers of `host` (same size as the set mask) to the device and the host copy. false: not set.
 bool route_mask_update(const std::vector<uint8_t>& host);
 /// The seen / moved counts since the last read (read and reset); false when no mask is set.
