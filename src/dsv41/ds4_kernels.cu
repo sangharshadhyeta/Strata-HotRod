@@ -1732,10 +1732,14 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     __shared__ int premask[kPicks];   // (the router's own picks before the mask: a moved pick's risk below)
     if (threadIdx.x == 0) {
         for (int r = 0; r < k; ++r) premask[r] = pick[r];
-        // DS4_MASK_RESIDENT's cost: the router's own picks that are off the card (the demand, before the mask: a masked expert keeps its cost)
-        if (mcost != nullptr && mcost_layer >= 0)
-            for (int r = 0; r < k; ++r)
+        // DS4_MASK_RESIDENT's cost: the router's own picks that are off the card (the demand, before the mask: a masked expert keeps its cost).
+        // Only the ranks below the stand-ins' floor count: the ranks at or above it are mostly served by a stand-in, so their reads are not paid
+        // (no stand-ins: every rank counts)
+        if (mcost != nullptr && mcost_layer >= 0) {
+            const int cf = sti != nullptr ? sti->floor : k;
+            for (int r = 0; r < k && r < cf; ++r)
                 if (vram[premask[r]] == 0ull) atomicAdd(&mcost[(size_t) mcost_layer * n + premask[r]], 1u);
+        }
     }
     __syncthreads();
     if (rm.m != nullptr) {   // DS4_MASK: the masked picks move first; the stand-ins then see the router's picks as they are now

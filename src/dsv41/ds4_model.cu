@@ -1124,6 +1124,7 @@ struct Model::Impl {
     std::vector<double> ml_cost;            // [nl][n_exp]
     std::vector<uint32_t> ml_cost_last;     // [nl][n_exp]
     double ml_fold_all = 0.0, ml_fold_mask = 0.0;   // the cost folded since the request's line: all experts, and those at level >= 1
+    long long ml_lv_up = 0, ml_lv_down = 0;         // DS4_MASK_RESIDENT: the entries whose level rose / fell in ml_relevel since the request's line
     int* ml_ctrl_h = nullptr;               // DS4_MASK_RESIDENT: the control flag (host-mapped; ml_ctrl_d goes into RouteMask::ctrl; null: no control tokens)
     const int* ml_ctrl_d = nullptr;
     long long ml_ctrl_n = 0, ml_ctrl_req = 0;   // the learner's decode tokens (kMlControlEvery's phase); the control tokens since the request's line
@@ -3822,6 +3823,24 @@ struct Model::Impl {
         auto envf = [](const char* k, float d) { const char* v = std::getenv(k); return v != nullptr ? (float) std::atof(v) : d; };
         const int floor_r = std::max(0, (int) envf("STRATA_ROUTE_RESIDENT_RANKS", 3.0f));
         const float edge = std::max(0.0f, envf("STRATA_ROUTE_RESIDENT_EDGE", 1.0f));
+        // DS4_MASK_FLOOR (testing): the mask's own floor. Unset or "standin": the stand-ins' floor (floor_r); "all": floor 0, masked picks move
+        // at every rank; a plain number 0..kPicks is taken as the floor. The stand-ins' floor is not changed.
+        int mask_fl = floor_r;
+        std::string mask_fl_how = "the stand-ins'";
+        if (const char* mf = std::getenv("DS4_MASK_FLOOR")) {
+            if (std::strcmp(mf, "all") == 0) {
+                mask_fl = 0;
+                mask_fl_how = "all ranks (DS4_MASK_FLOOR=all)";
+            } else if (std::strcmp(mf, "standin") != 0) {
+                const int v = std::atoi(mf);
+                if (v >= 0 && v <= kPicks) {
+                    mask_fl = v;
+                    mask_fl_how = "DS4_MASK_FLOOR=" + std::to_string(v);
+                } else {
+                    std::fprintf(stderr, "ds4: DS4_MASK_FLOOR=%s: not all, standin or 0..%d: the stand-ins' floor\n", mf, kPicks);
+                }
+            }
+        }
         const int ne = g.n_exp;
         const int per = (int) std::floor(p * ne);
         const std::string pf = o.profile.empty() ? std::string("none") : o.profile;
@@ -3929,7 +3948,7 @@ struct Model::Impl {
         d_mask = dm;
         d_mask_moved = mv;
         mask_p = learn ? mask_p : p;
-        mask_floor = floor_r;
+        mask_floor = mask_fl;
         mask_edge = edge;
         for (int il = 0; il < g.nl; ++il) L[(size_t) il].route_mask = dm + (size_t) il * ne;
         if (learn) {
@@ -3941,24 +3960,24 @@ struct Model::Impl {
             if (!mask_resident) tune.mask_learn([this] { return mask_test_begin(); }, [this](const StandinTune::MaskEnd& r) { mask_test_end(r); });
         }
         char rk[160];
-        if (floor_r == 0)
+        if (mask_fl == 0)
             std::snprintf(rk, sizeof rk, "every rank may move");
         else if (edge > 0.0f)
-            std::snprintf(rk, sizeof rk, "rank %d within %.2f logits", floor_r - 1, (double) edge);
+            std::snprintf(rk, sizeof rk, "rank %d within %.2f logits", mask_fl - 1, (double) edge);
         else
-            std::snprintf(rk, sizeof rk, "rank %d exact", floor_r - 1);
+            std::snprintf(rk, sizeof rk, "rank %d exact", mask_fl - 1);
         if (learn)
             std::fprintf(stderr,
                          "ds4: DS4_MASK=learn: p %.3f at the start (the scores move the masks every %d decode tokens; all ranks from %d exposures), "
-                         "%s, from rank %d moved; %s; profile %s, %d masked (%d at all ranks), %d of them on the card\n",
-                         mask_p, kMlMaskEvery, (int) kMlMinExpo, rk, floor_r,
+                         "%s, from rank %d moved; mask floor: %s; %s; profile %s, %d masked (%d at all ranks), %d of them on the card\n",
+                         mask_p, kMlMaskEvery, (int) kMlMinExpo, rk, mask_fl, mask_fl_how.c_str(),
                          mask_resident ? "resident swap, expensive experts, live" : "the old rule (DS4_MASK_RESIDENT=0)", pf.c_str(), masked,
                          all_ranks, on_card);
         else
             std::fprintf(stderr,
                          "ds4: DS4_MASK=%.2f: per layer the %d least-picked experts masked (ranks below %d exact, %s, from rank %d moved; "
-                         "profile %s), %d of the %d masked on the card\n",
-                         p, per, std::max(0, floor_r - 1), rk, floor_r, pf.c_str(), on_card, masked);
+                         "mask floor: %s; profile %s), %d of the %d masked on the card\n",
+                         p, per, std::max(0, mask_fl - 1), rk, mask_fl, mask_fl_how.c_str(), pf.c_str(), on_card, masked);
     }
     // ---- DS4_MASK=learn (opt-in): the mask learns from the model's own divergence on the user's traffic. A flip re-check runs a fragile token
     // twice (the stand-ins, then exactly): KL(exact || stand-in run) over the vocab is RCO's objective on real traffic (ml_recheck). Each
@@ -4065,6 +4084,7 @@ struct Model::Impl {
         ml_cost.assign(cnt, 0.0);
         ml_cost_last.assign(cnt, 0u);
         ml_fold_all = ml_fold_mask = 0.0;
+        ml_lv_up = ml_lv_down = 0;
         mask_p = kMlP0;
         ml_ag_ok = ml_ag_tot = 0.0;
         ml_fm = ml_nm = ml_fs = ml_ns = 0.0;
@@ -4163,6 +4183,12 @@ struct Model::Impl {
         std::vector<uint8_t> nlv;
         ml_levels(mask_p, ml_g, nlv);
         const bool changed = nlv != ml_lv;
+        // DS4_MASK_RESIDENT: the churn since the request's line - the entries whose level rose (+) or fell (-) in this change
+        if (mask_resident && changed && nlv.size() == ml_lv.size())
+            for (size_t i = 0; i < nlv.size(); ++i) {
+                ml_lv_up += nlv[i] > ml_lv[i];
+                ml_lv_down += nlv[i] < ml_lv[i];
+            }
         ml_lv = std::move(nlv);
         return changed;
     }
@@ -4396,9 +4422,14 @@ struct Model::Impl {
             std::snprintf(ctl, sizeof ctl, "; control tokens %lld", ml_ctrl_req);
             ml_ctrl_req = 0;
         }
+        char lch[64] = "";
+        if (mask_resident) {   // (the churn since the last line: the entries whose level rose (+) and fell (-))
+            std::snprintf(lch, sizeof lch, "; levels changed +%lld -%lld", ml_lv_up, ml_lv_down);
+            ml_lv_up = ml_lv_down = 0;
+        }
         std::fprintf(stderr, "ds4: request: mask learn: p %.3f, g %.3f, %d masked (%d at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
-                     "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f%s%s\n",
-                     mask_p, ml_g, m, a, dm, ml_dn, scored, ml_fm, ml_nm, ml_fs, ml_ns, dem, ctl);
+                     "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f%s%s%s\n",
+                     mask_p, ml_g, m, a, dm, ml_dn, scored, ml_fm, ml_nm, ml_fs, ml_ns, dem, ctl, lch);
         ml_dsum = 0.0;
         ml_dn = 0;
         ml_fold_all = 0.0;
