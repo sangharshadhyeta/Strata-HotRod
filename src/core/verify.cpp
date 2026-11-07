@@ -6940,10 +6940,14 @@ void Verifier::mask_learn_window(int T, int kept, bool cut) {
         for (double& v : s.cost) v *= 0.5;   // STRATA_MASK_RESIDENT: the demand decays with the harm and exposure
         s.ag_ok *= 0.5;
         s.ag_tot *= 0.5;
-        s.fm *= 0.5;
-        s.nm *= 0.5;
-        s.fs *= 0.5;
-        s.fsn *= 0.5;
+        // STRATA_MASK_RESIDENT: the flip split that moves p and g is halved 4x less often than the scores, so it keeps its evidence long
+        // enough to act (8095, 7 Nov: the "without" side reached kMlMinSide and was halved back before the next mlr_update)
+        if (!mask_resident_on() || (s.tok / kMlDecayEvery) % 4 == 0) {
+            s.fm *= 0.5;
+            s.nm *= 0.5;
+            s.fs *= 0.5;
+            s.fsn *= 0.5;
+        }
     }
     if (s.tok / kMlMaskEvery != before / kMlMaskEvery) mlr_update(s);
     if (s.tok / kMlSaveEvery != before / kMlSaveEvery && !s.path.empty()) {
