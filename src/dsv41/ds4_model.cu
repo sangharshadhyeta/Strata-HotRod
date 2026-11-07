@@ -13165,7 +13165,10 @@ struct Model::Impl {
         plan_window(p0, T, wplan);
         if (ml_ctrl_h != nullptr) {   // DS4_MASK_RESIDENT: this step's control flag, before any layer of the step is enqueued
             // (a control token: the learner's decode token every kMlControlEvery-th; its first pass only - the exact re-run is not counted)
-            const bool ctl = T == 1 && mask_learn_on && !standin_bypass && ++ml_ctrl_n % kMlControlEvery == 0;
+            // (the share follows the evidence: every (kMlControlEvery / 2)-th while the "without" side has fewer than kMlMinSide re-checks -
+            // halved every kMlDecayEvery tokens, at 1 in 8 it stayed under kMlMinSide on Qwen's twin, 7 Nov, and p never moved)
+            const long long every = ml_ns < kMlMinSide ? kMlControlEvery / 2 : kMlControlEvery;
+            const bool ctl = T == 1 && mask_learn_on && !standin_bypass && ++ml_ctrl_n % every == 0;
             if (ctl) ++ml_ctrl_req;
             if (*ml_ctrl_h != (ctl ? 1 : 0)) {   // (written only on a change, and after the trunk stream is idle: the previous step's route kernels read it)
                 cudaSetDevice(devs[(size_t) L[0].dev].id);
