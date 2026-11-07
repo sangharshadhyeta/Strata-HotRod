@@ -16728,9 +16728,11 @@ int main(int argc, char** argv) {
             }
             {   // STRATA_MASK: this request's masked picks seen and the picks moved (takes and resets the counts)
                 unsigned long long mk_seen = 0, mk_moved = 0;
+                // STRATA_MASK_RESIDENT (default on, the verifier's rule): a move takes a pick off the SSD onto a cheap expert
+                static const bool mk_res = [] { const char* v = std::getenv("STRATA_MASK_RESIDENT"); return v == nullptr || std::atoi(v) != 0; }();
                 if (strata::kernels::route_mask_read(mk_seen, mk_moved))
-                    std::fprintf(stderr, "strata serve: mask (STRATA_MASK): %llu masked picks seen, %llu moved to the next unmasked expert\n",
-                                 mk_seen, mk_moved);
+                    std::fprintf(stderr, "strata serve: mask (STRATA_MASK): %llu masked picks seen, %llu %s\n", mk_seen, mk_moved,
+                                 mk_res ? "moved off the SSD to a cheap expert (SSD reads avoided)" : "moved to the next unmasked expert");
             }
             if (ver.mask_learn_active()) std::fputs(strata::core::mask_learn_report().c_str(), stderr);   // STRATA_MASK=learn: the request's line
             strata::core::mask_test_arm(0);   // a running mask test: the next request's prompt reads with the base levels (its windows re-upload theirs)
