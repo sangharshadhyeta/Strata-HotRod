@@ -854,6 +854,10 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
         if (bi < 0) continue;                                // uniform
         const float gap = fmaxf(0.0f, l[e] - bv);
         if (!all && r == lo - 1 && !(edge > 0.0f && gap <= edge)) continue;
+        // STRATA_MASK_RESIDENT: below the stand-ins' first rank (cost_lo) a move is gated as the stand-ins gate theirs - the substitute must be
+        // within the stand-ins' edge (STRATA_ROUTE_RESIDENT_EDGE; none: no move) - at every level, so STRATA_MASK_FLOOR=all keeps the top ranks'
+        // logit check (7 Nov: without it, rank-0 swaps cut answers short and looped the reasoning).  Uniform across the warp (gap is reduced).
+        if (res != nullptr && r < cost_lo && !(edge > 0.0f && gap <= edge)) continue;
         if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * gap);
         if (lane == 0 && mev != nullptr && row < kMaskEvRows) {   // STRATA_MASK=learn: the replaced pick and its risk
             const unsigned q = mev->n[row]++;
