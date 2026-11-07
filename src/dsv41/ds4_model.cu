@@ -3806,9 +3806,11 @@ struct Model::Impl {
             if (si != nullptr && std::atoi(si) != 0) on = "learn";
         }
         const bool learn = on != nullptr && std::strcmp(on, "learn") == 0;   // (DS4_MASK=learn: the scores decide, see ml_*)
-        // DS4_MASK_RESIDENT (default on; 0: the old rule, byte for byte). Only with the learner: the fixed-fraction mask keeps its rule.
+        // DS4_MASK_RESIDENT (opt-in, =1; unset or 0: the old rule, byte for byte). Only with the learner: the fixed-fraction mask keeps its
+        // rule. Opt-in since 7 Nov: on Qwen's twin it cut SSD reads ~20% but not decode time, and with the mask floor at every rank its
+        // MMLU-Pro reasoning ran longer (7 of 40 past 3000 tokens).
         const char* rs = std::getenv("DS4_MASK_RESIDENT");
-        const bool resident_env = rs == nullptr || std::atoi(rs) != 0;
+        const bool resident_env = rs != nullptr && std::atoi(rs) != 0;
         const double p0 = learn ? kMlP0 : (on != nullptr ? std::atof(on) : 0.0);
         if (!(p0 > 0.0)) return;
         if (learn && (!fr_on || d_standin == nullptr)) {
