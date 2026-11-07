@@ -566,6 +566,13 @@ __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ 
                     if (!(rm.edge > 0.0f && gap <= rm.edge)) continue;
                 }
             }
+            // DS4_MASK_RESIDENT: below the stand-ins' floor (rm.gate) a move is gated as the stand-ins gate theirs - the substitute must be within
+            // the stand-ins' edge (none: no move) - at every level, so DS4_MASK_FLOOR=all keeps the top ranks' logit check (Qwen's twin, 7 Nov:
+            // without it, rank-0 swaps cut answers short and looped the reasoning)
+            if (rm.vram != nullptr && r < rm.gate) {
+                const float gap = fmaxf(0.0f, logits[p] - logits[mcand[c]]);
+                if (!(rm.edge > 0.0f && gap <= rm.edge)) continue;
+            }
             pick[r] = mcand[c++];
             ++mv;
         }

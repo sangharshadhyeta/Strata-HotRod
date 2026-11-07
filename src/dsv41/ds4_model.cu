@@ -1112,6 +1112,7 @@ struct Model::Impl {
     unsigned long long* d_mask_moved = nullptr;
     double mask_p = 0.0;
     int mask_floor = 3;
+    int mask_gate = 3;   // DS4_MASK_RESIDENT: the stand-ins' floor (STRATA_ROUTE_RESIDENT_RANKS): below it a mask move is gated by mask_edge
     float mask_edge = 1.0f;
     // DS4_MASK=learn (mask_init, the ml_* functions): the buffers and the learned table (see the comment above mask_init)
     bool mask_learn_on = false;
@@ -3952,6 +3953,7 @@ struct Model::Impl {
         d_mask_moved = mv;
         mask_p = learn ? mask_p : p;
         mask_floor = mask_fl;
+        mask_gate = floor_r;   // (the stand-ins' own floor, whatever DS4_MASK_FLOOR says)
         mask_edge = edge;
         for (int il = 0; il < g.nl; ++il) L[(size_t) il].route_mask = dm + (size_t) il * ne;
         if (learn) {
@@ -4449,6 +4451,7 @@ struct Model::Impl {
             if (mask_resident) r.vram = l.vram_tab;   // (the layer's table: a masked pick moves only onto the card)
         }
         if (mask_resident) r.ctrl = ml_ctrl_d;   // (the control flag: this step's moves are off when it is set)
+        if (mask_resident) r.gate = mask_gate;   // (below the stand-ins' floor a move is gated by the stand-ins' edge)
         return r;
     }
     void standin_init() {

@@ -117,6 +117,7 @@ struct RouteMask {
     unsigned long long* moved = nullptr;
     const unsigned long long* vram = nullptr;
     const int* ctrl = nullptr;   // (a host-mapped int's device pointer: non-zero, this token's moves are off - a control token, DS4_MASK_RESIDENT)
+    int gate = 0;                // (DS4_MASK_RESIDENT: the stand-ins' floor; a move at a rank below it needs a substitute within `edge`. 0: none)
 };
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
            cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr, const RouteMask* rmask = nullptr);
