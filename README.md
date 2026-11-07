@@ -1,4 +1,4 @@
-<p align="center"><i>A system which rewires the model around how you use it.</i></p>
+<p align="center"><i>A system which rewires the model around the way you use it.</i></p>
 
 <p align="center"><img src="docs/media/hotrod-hero.gif" width="380" alt="Strata Hot Rod: the Strata hexagon in fire and ice"></p>
 
