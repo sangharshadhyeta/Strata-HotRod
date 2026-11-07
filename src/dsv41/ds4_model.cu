@@ -4308,10 +4308,14 @@ struct Model::Impl {
             for (double& v : ml_cost) v *= 0.5;
             ml_ag_ok *= 0.5;
             ml_ag_tot *= 0.5;
-            ml_fm *= 0.5;
-            ml_nm *= 0.5;
-            ml_fs *= 0.5;
-            ml_ns *= 0.5;
+            // DS4_MASK_RESIDENT: the flip split that moves p and g is halved 4x less often than the scores, so it keeps its evidence long
+            // enough to act (Qwen's twin on 8095, 7 Nov: the "without" side reached kMlMinSide and was halved back before the next update)
+            if (!mask_resident || (ml_tok / kMlDecayEvery) % 4 == 0) {
+                ml_fm *= 0.5;
+                ml_nm *= 0.5;
+                ml_fs *= 0.5;
+                ml_ns *= 0.5;
+            }
         }
         if (ml_tok % kMlMaskEvery == 0) ml_update();
         if (ml_tok % kMlSaveEvery == 0) ml_save();
