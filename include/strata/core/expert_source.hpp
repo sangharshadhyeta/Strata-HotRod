@@ -1379,14 +1379,14 @@ private:
     std::atomic<const std::vector<float>*> promo_usage_{nullptr};
     const std::vector<float>* keep_bias_ = nullptr;   ///< STRATA_STANDIN_BALANCE: the eviction factors (null: none)
     const std::vector<uint8_t>* mask_low_ = nullptr;  ///< STRATA_MASK: the masked experts, first to leave the RAM tier (null: none)
-    // STRATA_MASK_RESIDENT (default on; =0: the old rule), read once: the RAM tier evicts level 2 (masked at every rank) first; the old rule
+    // STRATA_MASK_RESIDENT (opt-in, =1; unset: the old rule), read once: the RAM tier evicts level 2 (masked at every rank) first; the old rule
     // evicts every masked expert (levels 1 and 2) first
     // (the new rule is the learner's: a fixed STRATA_MASK=<share> mask has no level 2, so it keeps the old rule and its eviction preference)
     bool masked_low(size_t i) const {
         static const bool res_rule = [] {
             const char* v = std::getenv("STRATA_MASK_RESIDENT");
             const char* m = std::getenv("STRATA_MASK");
-            return (v == nullptr || std::atoi(v) != 0) && m != nullptr && std::strcmp(m, "learn") == 0;
+            return v != nullptr && std::atoi(v) != 0 && m != nullptr && std::strcmp(m, "learn") == 0;
         }();
         if (mask_low_ == nullptr || i >= mask_low_->size()) return false;
         return res_rule ? (*mask_low_)[i] == 2 : (*mask_low_)[i] != 0;

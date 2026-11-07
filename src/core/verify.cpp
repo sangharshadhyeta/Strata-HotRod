@@ -114,10 +114,11 @@ static bool la_learn_timing_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN_TIMING"); return e != nullptr && e[0] == '1'; }();
     return on;
 }
-// STRATA_MASK_RESIDENT (default on; =0: the old rule): the mask moves a pick only onto a cheap expert, the masked set is chosen by the
-// measured SSD demand, and p and g move only by the live flip comparison (no mask test).  Read once.
+// STRATA_MASK_RESIDENT (opt-in, =1; unset or 0: the old rule): the mask moves a pick only onto a cheap expert, the masked set is chosen by
+// the measured SSD demand, and p and g move only by the live flip comparison (no mask test).  Read once.  Opt-in since 7 Nov: on 8095 it
+// cut SSD reads ~20% but not decode time, and with STRATA_MASK_FLOOR=all its MMLU-Pro reasoning ran longer (7 of 40 past 3000 tokens).
 static bool mask_resident_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_MASK_RESIDENT"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool on = [] { const char* v = std::getenv("STRATA_MASK_RESIDENT"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
 struct RouteResidentCfg {
