@@ -508,13 +508,18 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
 // DS4_MASK's move, for one token, block-wide (every thread calls it): the token's masked picks pick[0..k) move to the best unmasked experts it
 // did not pick (bs: the selection scores, the picks at -FLT_MAX), nearest rank first. Rank < floor - 1 stays; rank floor - 1 moves when edge > 0
 // and the candidate's logit gap is at most edge; ranks from floor on move. *moved_out: the picks moved (thread 0's count, for every thread).
-// pick[r] < 0 or >= n is no pick (never masked). Shared scratch: mcand (>= k entries), n_mc, want, bv[32], bi[32].
+// pick[r] < 0 or >= n is no pick (never masked). Shared scratch: mcand and mval (>= k entries: the candidates and their scores), n_mc, want,
+// bv[32], bi[32].
+// With rm.vram (DS4_MASK_RESIDENT's resident swap): a pick on the card is never masked out, and the candidates are unmasked experts on the card,
+// so a masked pick moves only from off the card to on it. The candidates the move loop did not use go back into bs (their scores, mval), so the
+// stand-ins after it can take them.
 __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ logits, int n, int k, float* bs, int* pick, float* bv,
-                                 int* bi, int* mcand, int* n_mc, int* want, int* moved_out) {
+                                 int* bi, int* mcand, float* mval, int* n_mc, int* want, int* moved_out) {
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     if (threadIdx.x == 0) {
         int m = 0;
-        for (int r = 0; r < k; ++r) m += pick[r] >= 0 && pick[r] < n && rm.m[pick[r]] != 0;
+        for (int r = 0; r < k; ++r)
+            m += pick[r] >= 0 && pick[r] < n && rm.m[pick[r]] != 0 && !(rm.vram != nullptr && rm.vram[pick[r]] != 0ull);
         *want = m;
         *n_mc = 0;
         *moved_out = 0;
@@ -524,7 +529,8 @@ __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ 
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
         for (int i = threadIdx.x; i < n; i += blockDim.x)
-            if (rm.m[i] == 0 && (bs[i] > best || (bs[i] == best && i < bix))) best = bs[i], bix = i;
+            if (rm.m[i] == 0 && (rm.vram == nullptr || rm.vram[i] != 0ull) && (bs[i] > best || (bs[i] == best && i < bix)))
+                best = bs[i], bix = i;
         for (int o = 16; o > 0; o >>= 1) {
             const float ov = __shfl_xor_sync(0xffffffffu, best, o);
             const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
@@ -538,7 +544,9 @@ __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ 
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
             if (ix < n && b > -FLT_MAX) {
-                mcand[(*n_mc)++] = ix;
+                const int q = (*n_mc)++;
+                mcand[q] = ix;
+                mval[q] = b;
                 bs[ix] = -FLT_MAX;
             }
         }
@@ -549,6 +557,7 @@ __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ 
         for (int r = 0; r < k && c < *n_mc; ++r) {
             const int p = pick[r];
             if (p < 0 || p >= n || rm.m[p] == 0) continue;
+            if (rm.vram != nullptr && rm.vram[p] != 0ull) continue;   // (on the card: its read is not saved by a move)
             if (rm.m[p] == 1) {   // (2: masked at every rank - DS4_MASK=learn's graduation - moves at any rank)
                 if (r < rm.floor - 1) continue;
                 if (r == rm.floor - 1) {
@@ -560,6 +569,8 @@ __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ 
             ++mv;
         }
         *moved_out = mv;
+        if (rm.vram != nullptr)   // (the unused candidates are still the stand-ins' to take)
+            for (int q = c; q < *n_mc; ++q) bs[mcand[q]] = mval[q];
     }
     __syncthreads();
 }
@@ -587,6 +598,7 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
     __shared__ int bi[32];
     __shared__ int pick[16];
     __shared__ int mcand[kPicks], n_mc, mwant, mmoved;
+    __shared__ float mval[kPicks];
     const int t = blockIdx.x;
     logits += (size_t) t * 1024;
     if (bias_vl != nullptr && ((vl.w[t >> 5] >> (t & 31)) & 1u)) bias = bias_vl;
@@ -622,7 +634,7 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
         __syncthreads();
     }
     if (rm.m != nullptr) {   // DS4_MASK: the masked picks move (before the weights: they are the picks' own scores)
-        route_mask_apply(rm, logits, n, k, bs, pick, bv, bi, mcand, &n_mc, &mwant, &mmoved);
+        route_mask_apply(rm, logits, n, k, bs, pick, bv, bi, mcand, mval, &n_mc, &mwant, &mmoved);
         if (threadIdx.x == 0 && mmoved > 0 && rm.moved != nullptr) atomicAdd(rm.moved, (unsigned long long) mmoved);
     }
     if (threadIdx.x == 0) {
@@ -1671,7 +1683,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             Standin* __restrict__ sti, PcieRoute pc, const RouteMask rm,
                                                             const float* __restrict__ pair_c, int* cap_rec,
                                                             const float* __restrict__ pair_err, MaskEvs* __restrict__ mev,
-                                                            int mev_layer, bool mev_reset) {
+                                                            int mev_layer, bool mev_reset, unsigned* __restrict__ mcost,
+                                                            int mcost_layer) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1679,6 +1692,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     __shared__ int on_cpu;
     __shared__ int cand[kPicks], n_cand, want;
     __shared__ int mcand[kPicks], n_mc, mwant, mmoved;
+    __shared__ float mval[kPicks];
     const int t = blockIdx.x;
     logits += (size_t) t * 1024;
     if (bias_vl != nullptr && ((vl >> t) & 1u)) bias = bias_vl;
@@ -1715,11 +1729,16 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         __syncthreads();
     }
     __shared__ int premask[kPicks];   // (the router's own picks before the mask: a moved pick's risk below)
-    if (threadIdx.x == 0)
+    if (threadIdx.x == 0) {
         for (int r = 0; r < k; ++r) premask[r] = pick[r];
+        // DS4_MASK_RESIDENT's cost: the router's own picks that are off the card (the demand, before the mask: a masked expert keeps its cost)
+        if (mcost != nullptr && mcost_layer >= 0)
+            for (int r = 0; r < k; ++r)
+                if (vram[premask[r]] == 0ull) atomicAdd(&mcost[(size_t) mcost_layer * n + premask[r]], 1u);
+    }
     __syncthreads();
     if (rm.m != nullptr) {   // DS4_MASK: the masked picks move first; the stand-ins then see the router's picks as they are now
-        route_mask_apply(rm, logits, n, k, bs, pick, bv, bi, mcand, &n_mc, &mwant, &mmoved);
+        route_mask_apply(rm, logits, n, k, bs, pick, bv, bi, mcand, mval, &n_mc, &mwant, &mmoved);
         if (threadIdx.x == 0 && mmoved > 0 && rm.moved != nullptr) atomicAdd(rm.moved, (unsigned long long) mmoved);
     }
     // stand-ins: the card-resident experts the token did not pick, best selection score first, one for each rank that may swap and
@@ -1906,6 +1925,7 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     __shared__ int bi[32];
     __shared__ int pk[kAhead1];   // (m <= kAhead1: the guesses of one layer)
     __shared__ int mcand[kAhead1], n_mc, mwant, mmoved;
+    __shared__ float mval[kAhead1];   // (as mcand: up to m <= kAhead1 candidates)
     const int t = blockIdx.x;
     logits += (size_t) t * 1024;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -1938,7 +1958,7 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
         __syncthreads();
     }
     if (rm.m != nullptr) {   // DS4_MASK: the guesses follow the target layer's mask by the router's rule (the moves are not counted)
-        route_mask_apply(rm, logits, n, m, bs, pk, bv, bi, mcand, &n_mc, &mwant, &mmoved);
+        route_mask_apply(rm, logits, n, m, bs, pk, bv, bi, mcand, mval, &n_mc, &mwant, &mmoved);
     }
     if (threadIdx.x == 0)
         for (int r = 0; r < m; ++r) req->ahead[t][off + r] = pk[r];
@@ -2382,7 +2402,8 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
                    unsigned vl, int na0, int na1, int na2, Standin* standin, const PcieRoute* pc, const RouteMask* rmask,
-                   float* pair_c, int* cap_rec, const float* pair_err, MaskEvs* mev, int mev_layer, bool mev_reset) {
+                   float* pair_c, int* cap_rec, const float* pair_err, MaskEvs* mev, int mev_layer, bool mev_reset,
+                   unsigned* mcost, int mcost_layer) {
 #if defined(STRATA_METAL)
     // selection only: the prefetch schedule (req) is published by the CUDA kernel, and is turned on separately here
     // (the Metal selection has no DS4_MASK: rmask is for the CUDA kernels only)
@@ -2397,7 +2418,8 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     static const RouteMask no_mask{};
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
                                            vl != 0 ? bias_vl : nullptr, vl, standin, pc != nullptr ? *pc : no_pcie,
-                                           rmask != nullptr ? *rmask : no_mask, pair_c, cap_rec, pair_err, mev, mev_layer, mev_reset);
+                                           rmask != nullptr ? *rmask : no_mask, pair_c, cap_rec, pair_err, mev, mev_layer, mev_reset,
+                                           mcost, mcost_layer);
     if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, na2);
 }
 /// STRATA_STANDIN_LEARN: dst[e] = part[r][e] for the slot r the device's record names (sel[0]; -1: nothing copied), part the per-slot

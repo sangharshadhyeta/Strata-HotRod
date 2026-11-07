@@ -108,11 +108,14 @@ struct VlBits {
 /// candidate's logit gap is at most edge (the stand-ins' rank); ranks from floor on always move. The candidate is the best unmasked
 /// expert the token did not pick, by the router's selection score. moved: device counter of the picks moved (null: not counted).
 /// m[e] = 2 (DS4_MASK=learn's graduation): masked at every rank, the floor and the edge rule do not apply to it.
+/// vram: the layer's table (non-zero: the expert is on the card). Set, a masked pick on the card stays, and a masked pick off the card
+/// moves only to an unmasked expert on the card (a resident swap: the move saves a read). Null: the rule above.
 struct RouteMask {
     const unsigned char* m = nullptr;
     int floor = 3;
     float edge = 1.0f;
     unsigned long long* moved = nullptr;
+    const unsigned long long* vram = nullptr;
 };
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
            cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr, const RouteMask* rmask = nullptr);
@@ -304,7 +307,10 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    unsigned vl = 0, int na0 = 0, int na1 = 0, int na2 = 0, Standin* standin = nullptr,
                    const PcieRoute* pc = nullptr, const RouteMask* rmask = nullptr,
                    float* pair_c = nullptr, int* cap_rec = nullptr,
-                   const float* pair_err = nullptr, MaskEvs* mev = nullptr, int mev_layer = 0, bool mev_reset = false);
+                   const float* pair_err = nullptr, MaskEvs* mev = nullptr, int mev_layer = 0, bool mev_reset = false,
+                   unsigned* mcost = nullptr, int mcost_layer = -1);
+/// (DS4_MASK_RESIDENT: mcost [nl][n] u32 (device), mcost_layer >= 0: each of the token's router picks off the card adds one to
+/// mcost[mcost_layer][e] - the demand the learner's cost counts. Null: nothing counted.)
 /// DS4_STANDIN_BALANCE (opt-in, with pair_c): pair_err [n][n] (the layer's measured relative error per true expert e and stand-in s, -1 until
 /// the pair is ready). A ready pair's stand-in is exposed by its error: its risk is weight x error, and at ranks from the floor on the budget
 /// is checked against weight x error (the edge rule at floor - 1 keeps the logit gap). Null: the gap, as before.

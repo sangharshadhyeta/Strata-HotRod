@@ -1116,6 +1116,14 @@ struct Model::Impl {
     // DS4_MASK=learn (mask_init, the ml_* functions): the buffers and the learned table (see the comment above mask_init)
     bool mask_learn_on = false;
     MaskEvs* d_mev = nullptr;               // device (trunk GPU): the decode token's replaced picks (route_publish writes them)
+    // DS4_MASK_RESIDENT (default on, learn only; 0: the old rule): the masked pick moves only to a card expert (a resident swap), and the
+    // masked set is the experts whose picks cost the most reads. d_mcost [nl][n_exp] u32 (trunk GPU): each decode pick off the card, counted
+    // by route_publish; ml_cost (host, decayed) and ml_cost_last (the counter's value at the last fold) take its deltas in ml_fold_cost.
+    bool mask_resident = false;
+    unsigned* d_mcost = nullptr;
+    std::vector<double> ml_cost;            // [nl][n_exp]
+    std::vector<uint32_t> ml_cost_last;     // [nl][n_exp]
+    double ml_fold_all = 0.0, ml_fold_mask = 0.0;   // the cost folded since the request's line: all experts, and those at level >= 1
     float* d_logit0 = nullptr;              // device (head GPU) [vocab]: a re-checked token's first-pass logits
     float* d_kl = nullptr;                  // device (head GPU) [1]: the re-check's KL
     std::vector<double> ml_harm, ml_expo;   // [nl][n_exp]: the harm and the exposure (decayed)
@@ -1884,9 +1892,9 @@ struct Model::Impl {
         if (d_mask_moved != nullptr) {   // (DS4_MASK: the picks moved so far, cumulative like the stand-ins' counts)
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             unsigned long long mvd = 0;
+            const char* what = mask_resident ? "picks moved off the card to a resident expert (reads avoided)" : "picks moved to the next unmasked expert";
             if (cudaMemcpy(&mvd, d_mask_moved, sizeof mvd, cudaMemcpyDeviceToHost) == cudaSuccess)
-                std::fprintf(stderr, "ds4: request: mask: p=%.2f F %d E %.2f, %llu picks moved to the next unmasked expert\n", mask_p,
-                             mask_floor, (double) mask_edge, mvd);
+                std::fprintf(stderr, "ds4: request: mask: p=%.2f F %d E %.2f, %llu %s\n", mask_p, mask_floor, (double) mask_edge, mvd, what);
         }
         if (mask_learn_on) {   // (DS4_MASK=learn: the request's line, and the table saved with the stand-in tune file's saves)
             cudaSetDevice(devs[(size_t) L[0].dev].id);
@@ -1937,12 +1945,14 @@ struct Model::Impl {
             d_mev = nullptr;
             mask_learn_on = false;
         }
-        if (d_mask != nullptr || d_mask_moved != nullptr) {   // DS4_MASK's blocks (the counter printed by request_end)
+        if (d_mask != nullptr || d_mask_moved != nullptr || d_mcost != nullptr) {   // DS4_MASK's blocks (the counter printed by request_end)
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             if (d_mask != nullptr) cudaFree(d_mask);
             if (d_mask_moved != nullptr) cudaFree(d_mask_moved);
+            if (d_mcost != nullptr) cudaFree(d_mcost);
             d_mask = nullptr;
             d_mask_moved = nullptr;
+            d_mcost = nullptr;
             for (Layer& l : L) l.route_mask = nullptr;
         }
         if (la_on) {   // the learner's report and its file, before the devices go
@@ -3788,6 +3798,9 @@ struct Model::Impl {
             if (si != nullptr && std::atoi(si) != 0) on = "learn";
         }
         const bool learn = on != nullptr && std::strcmp(on, "learn") == 0;   // (DS4_MASK=learn: the scores decide, see ml_*)
+        // DS4_MASK_RESIDENT (default on; 0: the old rule, byte for byte). Only with the learner: the fixed-fraction mask keeps its rule.
+        const char* rs = std::getenv("DS4_MASK_RESIDENT");
+        const bool resident_env = rs == nullptr || std::atoi(rs) != 0;
         const double p0 = learn ? kMlP0 : (on != nullptr ? std::atof(on) : 0.0);
         if (!(p0 > 0.0)) return;
         if (learn && (!fr_on || d_standin == nullptr)) {
@@ -3814,6 +3827,19 @@ struct Model::Impl {
             return;
         }
         std::vector<unsigned char> host((size_t) g.nl * ne, 0);
+        mask_resident = learn && resident_env;
+        if (mask_resident) {   // the cost counter first: ml_init's levels read the costs (none yet: none masked)
+            const size_t cnt = (size_t) g.nl * (size_t) ne;
+            cudaSetDevice(devs[(size_t) L[0].dev].id);
+            if (cudaMalloc((void**) &d_mcost, sizeof(unsigned) * cnt) != cudaSuccess ||
+                cudaMemset(d_mcost, 0, sizeof(unsigned) * cnt) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (d_mcost != nullptr) cudaFree(d_mcost);
+                d_mcost = nullptr;
+                mask_resident = false;
+                std::fprintf(stderr, "ds4: DS4_MASK_RESIDENT: the old rule (no device memory for the cost counter)\n");
+            }
+        }
         if (learn) {
             ml_init();   // the saved scores (or none) and the levels they give now; the profile's counts seed the candidates
             host = ml_lv;
@@ -3891,7 +3917,8 @@ struct Model::Impl {
             d_kl = kl;
             d_mev = mev;
             mask_learn_on = true;
-            tune.mask_learn([this] { return mask_test_begin(); }, [this](const StandinTune::MaskEnd& r) { mask_test_end(r); });
+            // (resident: the levels follow the live flip comparison only, no A/B mask test)
+            if (!mask_resident) tune.mask_learn([this] { return mask_test_begin(); }, [this](const StandinTune::MaskEnd& r) { mask_test_end(r); });
         }
         char rk[160];
         if (floor_r == 0)
@@ -3903,8 +3930,10 @@ struct Model::Impl {
         if (learn)
             std::fprintf(stderr,
                          "ds4: DS4_MASK=learn: p %.3f at the start (the scores move the masks every %d decode tokens; all ranks from %d exposures), "
-                         "%s, from rank %d moved; profile %s, %d masked (%d at all ranks), %d of them on the card\n",
-                         mask_p, kMlMaskEvery, (int) kMlMinExpo, rk, floor_r, pf.c_str(), masked, all_ranks, on_card);
+                         "%s, from rank %d moved; %s; profile %s, %d masked (%d at all ranks), %d of them on the card\n",
+                         mask_p, kMlMaskEvery, (int) kMlMinExpo, rk, floor_r,
+                         mask_resident ? "resident swap, expensive experts, live" : "the old rule (DS4_MASK_RESIDENT=0)", pf.c_str(), masked,
+                         all_ranks, on_card);
         else
             std::fprintf(stderr,
                          "ds4: DS4_MASK=%.2f: per layer the %d least-picked experts masked (ranks below %d exact, %s, from rank %d moved; "
@@ -3927,8 +3956,9 @@ struct Model::Impl {
     static constexpr double kMtStepP = 0.025, kMtStepG = 0.1;   // a mask test's candidate: one step of the share p and of the level-2 fraction g
     std::string ml_path() const { return o.pack + "/mask-learn.bin"; }
     size_t ml_at(int il, int e) const { return (size_t) il * (size_t) g.n_exp + (size_t) e; }
-    // the file: "MLRN", version 3, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the token count, g, then harm and exposure
-    // (double) and the levels (bytes).  Versions 1 and 2 have no g: it is the loaded levels' level-2 share (0.25 when nothing is masked).
+    // the file: "MLRN", version 4, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the token count, g, then harm and exposure
+    // (double), the levels (bytes) and the cost (double).  Versions 1 and 2 have no g: it is the loaded levels' level-2 share (0.25 when nothing
+    // is masked).  Versions 1..3 have no cost: it starts at zero.
     void ml_save() const {
         const std::string path = ml_path(), tmp = path + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -3936,7 +3966,7 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: DS4_MASK=learn: %s not written\n", path.c_str());
             return;
         }
-        const uint32_t ver = 3;   // 2: + the mask/stand-in split of the re-checks (ml_fm, ml_nm, ml_fs, ml_ns); 3: + g
+        const uint32_t ver = 4;   // 2: + the mask/stand-in split of the re-checks (ml_fm, ml_nm, ml_fs, ml_ns); 3: + g; 4: + ml_cost after the levels
         const int32_t nl = g.nl, ne = g.n_exp;
         const long long tok = ml_tok;
         const double split[4] = {ml_fm, ml_nm, ml_fs, ml_ns};
@@ -3948,7 +3978,8 @@ struct Model::Impl {
                   std::fwrite(&tok, sizeof tok, 1, f) == 1 && std::fwrite(&gf, sizeof gf, 1, f) == 1 &&
                   std::fwrite(ml_harm.data(), sizeof(double), ml_harm.size(), f) == ml_harm.size() &&
                   std::fwrite(ml_expo.data(), sizeof(double), ml_expo.size(), f) == ml_expo.size() &&
-                  std::fwrite(ml_lv.data(), 1, ml_lv.size(), f) == ml_lv.size();
+                  std::fwrite(ml_lv.data(), 1, ml_lv.size(), f) == ml_lv.size() &&
+                  std::fwrite(ml_cost.data(), sizeof(double), ml_cost.size(), f) == ml_cost.size();
         ok = std::fclose(f) == 0 && ok;
         if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) std::fprintf(stderr, "ds4: DS4_MASK=learn: %s not written\n", path.c_str());
     }
@@ -3964,20 +3995,23 @@ struct Model::Impl {
         double split[4] = {0.0, 0.0, 0.0, 0.0};
         double gf = 0.0;
         bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 &&
-                    (ver == 1 || ver == 2 || ver == 3) && std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == g.nl &&
+                    (ver >= 1 && ver <= 4) && std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == g.nl &&
                     ne == g.n_exp && std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 &&
                     std::fread(&tot, sizeof tot, 1, f) == 1 && (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) &&
                     std::fread(&tok, sizeof tok, 1, f) == 1 && (ver < 3 || std::fread(&gf, sizeof gf, 1, f) == 1);   // (version 1: the split starts empty)
         std::vector<double> lharm(ml_harm.size()), lexpo(ml_expo.size());   // (into temporaries: a truncated file changes nothing)
         std::vector<uint8_t> llv(ml_lv.size());
+        std::vector<double> lcost(ml_cost.size(), 0.0);   // (versions 1..3: no costs - zero)
         good = good && std::fread(lharm.data(), sizeof(double), lharm.size(), f) == lharm.size() &&
                std::fread(lexpo.data(), sizeof(double), lexpo.size(), f) == lexpo.size() &&
-               std::fread(llv.data(), 1, llv.size(), f) == llv.size();
+               std::fread(llv.data(), 1, llv.size(), f) == llv.size() &&
+               (ver < 4 || std::fread(lcost.data(), sizeof(double), lcost.size(), f) == lcost.size());
         std::fclose(f);
         if (good) {
             ml_harm.swap(lharm);
             ml_expo.swap(lexpo);
             ml_lv.swap(llv);
+            ml_cost.swap(lcost);
         }
         if (!good) {
             std::fprintf(stderr, "ds4: DS4_MASK=learn: %s is not this model's table (version or shape): a fresh start\n", ml_path().c_str());
@@ -4007,6 +4041,9 @@ struct Model::Impl {
         ml_harm.assign(cnt, 0.0);
         ml_expo.assign(cnt, 0.0);
         ml_lv.assign(cnt, 0);
+        ml_cost.assign(cnt, 0.0);
+        ml_cost_last.assign(cnt, 0u);
+        ml_fold_all = ml_fold_mask = 0.0;
         mask_p = kMlP0;
         ml_ag_ok = ml_ag_tot = 0.0;
         ml_fm = ml_nm = ml_fs = ml_ns = 0.0;
@@ -4028,6 +4065,8 @@ struct Model::Impl {
     // (share n per layer) keeps the current level-2 pairs first (the lowest rates first), then the pool's least-used experts (the fewest picks
     // first, ties by the lower id; the lowest rates within it).  Level 2 goes to the graduated ones (enough exposure, a rate under the layer's
     // 10th percentile), the lowest rates first, at most round(frac x the layer's masked count).  A layer with no profile counts gets none.
+    // DS4_MASK_RESIDENT (mask_resident): the pool is the experts whose picks cost the most reads off the card (ml_cost, the most first; a layer with
+    // no cost yet gets none), and only the ones with measured exposure (kMlMinAg) qualify; the pool's lowest rates go first, as before.
     void ml_levels(double share, double frac, std::vector<uint8_t>& out) const {
         const int ne = g.n_exp;
         const int per = (int) std::floor(share * ne + 1e-9);
@@ -4040,10 +4079,17 @@ struct Model::Impl {
             uint8_t* nlv = out.data() + (size_t) il * ne;
             const double* hm = ml_harm.data() + (size_t) il * ne;
             const double* ex = ml_expo.data() + (size_t) il * ne;
+            const double* cs = ml_cost.data() + (size_t) il * ne;
             const uint32_t* pr = prof.data() + (size_t) il * ne;
-            uint64_t sum = 0;
-            for (int e = 0; e < ne; ++e) sum += pr[e];
-            if (sum == 0) continue;   // (no counts for the layer: nothing says which of its experts are unused - none masked, as mask_init)
+            if (mask_resident) {
+                double csum = 0.0;
+                for (int e = 0; e < ne; ++e) csum += cs[e];
+                if (csum == 0.0) continue;   // (no cost yet for the layer: nothing is masked)
+            } else {
+                uint64_t sum = 0;
+                for (int e = 0; e < ne; ++e) sum += pr[e];
+                if (sum == 0) continue;   // (no counts for the layer: nothing says which of its experts are unused - none masked, as mask_init)
+            }
             pop.clear();
             for (int e = 0; e < ne; ++e) {
                 rate[(size_t) e] = hm[e] / std::max(1.0, ex[e]);
@@ -4066,10 +4112,15 @@ struct Model::Impl {
                 ++masked;
             }
             for (int e = 0; e < ne; ++e) ord[(size_t) e] = e;
-            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] < pr[b]; });
+            if (mask_resident) {   // the most expensive first (ties: the lower id, the stable order)
+                std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return cs[a] > cs[b]; });
+            } else {
+                std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] < pr[b]; });
+            }
             cand.clear();
             for (int q = 0; q < pool_n; ++q)
-                if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
+                if (nlv[(size_t) ord[(size_t) q]] == 0 && (!mask_resident || ex[ord[(size_t) q]] >= kMlMinAg))
+                    cand.push_back(ord[(size_t) q]);
             std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
             for (int e : cand) {
                 if (masked >= per) break;
@@ -4120,13 +4171,38 @@ struct Model::Impl {
     // every kMlMaskEvery decode tokens: p follows the flips the mask adds - the flip rate of re-checked tokens with a mask move against
     // those without one (the stand-ins' own rate): more than 2 standard errors above -> p -= 0.05; within 1 -> p += 0.025; else held.
     // p never falls below kMlPMin, so mask moves keep coming and the comparison keeps its evidence.
+    // DS4_MASK_RESIDENT: the device's cost counts since the last fold go into ml_cost (uint32 deltas: the counter is not reset, it wraps safely)
+    void ml_fold_cost() {
+        if (d_mcost == nullptr) return;
+        const size_t cnt = ml_cost.size();
+        std::vector<uint32_t> cur(cnt);
+        cudaSetDevice(devs[(size_t) L[0].dev].id);
+        if (cudaMemcpy(cur.data(), d_mcost, sizeof(uint32_t) * cnt, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();   // (the fold is skipped; the next one counts these picks too)
+            return;
+        }
+        for (size_t i = 0; i < cnt; ++i) {
+            const uint32_t delta = cur[i] - ml_cost_last[i];
+            ml_cost[i] += (double) delta;
+            ml_cost_last[i] = cur[i];
+            ml_fold_all += (double) delta;
+            if (ml_lv[i] != 0) ml_fold_mask += (double) delta;
+        }
+    }
     void ml_update() {
+        ml_fold_cost();   // (the demand the learner counts since the last fold; before the levels that read it)
         if (mt_on) return;   // (a mask test runs: its arms' levels are fixed; the harm and exposure keep learning)
         if (ml_nm >= kMlMinSide && ml_ns >= kMlMinSide) {
             const double rm = ml_fm / ml_nm, rs = ml_fs / ml_ns, r = (ml_fm + ml_fs) / (ml_nm + ml_ns);
             const double se = std::sqrt(std::max(1e-9, r * (1.0 - r) * (1.0 / ml_nm + 1.0 / ml_ns)));
-            if (rm - rs > 2.0 * se) mask_p = std::max(kMlPMin, mask_p - 0.05);
-            else if (rm - rs < se) mask_p = std::min(kMlPMax, mask_p + 0.025);
+            // (resident: the depth g moves with the share p, by the same comparison)
+            if (rm - rs > 2.0 * se) {
+                mask_p = std::max(kMlPMin, mask_p - 0.05);
+                if (mask_resident) ml_g = std::max(0.0, ml_g - 0.1);
+            } else if (rm - rs < se) {
+                mask_p = std::min(kMlPMax, mask_p + 0.025);
+                if (mask_resident) ml_g = std::min(1.0, ml_g + 0.1);
+            }
         }
         if (ml_relevel()) ml_upload();
     }
@@ -4208,6 +4284,7 @@ struct Model::Impl {
         if (ml_tok % kMlDecayEvery == 0) {
             for (double& v : ml_harm) v *= 0.5;
             for (double& v : ml_expo) v *= 0.5;
+            for (double& v : ml_cost) v *= 0.5;
             ml_ag_ok *= 0.5;
             ml_ag_tot *= 0.5;
             ml_fm *= 0.5;
@@ -4285,11 +4362,17 @@ struct Model::Impl {
             scored += ml_expo[i] > 0.0;
         }
         const double dm = ml_dn > 0 ? ml_dsum / (double) ml_dn : 0.0;
+        char dem[160] = "";
+        if (mask_resident)   // (the demand folded since the last line: the picks that cost reads, and how many of them were on masked experts)
+            std::snprintf(dem, sizeof dem, "; demand reads this request: %.0f on masked experts of %.0f (%.1f%%)", ml_fold_mask, ml_fold_all,
+                          ml_fold_all > 0.0 ? 100.0 * ml_fold_mask / ml_fold_all : 0.0);
         std::fprintf(stderr, "ds4: request: mask learn: p %.3f, g %.3f, %d masked (%d at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
-                     "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f\n",
-                     mask_p, ml_g, m, a, dm, ml_dn, scored, ml_fm, ml_nm, ml_fs, ml_ns);
+                     "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f%s\n",
+                     mask_p, ml_g, m, a, dm, ml_dn, scored, ml_fm, ml_nm, ml_fs, ml_ns, dem);
         ml_dsum = 0.0;
         ml_dn = 0;
+        ml_fold_all = 0.0;
+        ml_fold_mask = 0.0;
     }
     // the mask and the rule for one trunk layer's router (no mask: the router as it was); the picks moved are counted in d_mask_moved
     RouteMask route_mask_of(const Layer& l) const {
@@ -4299,6 +4382,7 @@ struct Model::Impl {
             r.floor = mask_floor;
             r.edge = mask_edge;
             r.moved = d_mask_moved;
+            if (mask_resident) r.vram = l.vram_tab;   // (the layer's table: a masked pick moves only onto the card)
         }
         return r;
     }
@@ -13722,7 +13806,8 @@ struct Model::Impl {
                           na[1], na[2], T == 1 && !l.mtp && !standin_bypass ? d_standin : nullptr, &pr, standin_bypass ? nullptr : &rmp,
                           lrn && !learn_observe ? d_pair_c + (size_t) l.il * g.n_exp * g.n_exp : nullptr, lrn ? d_cap_rec + (size_t) 4 * l.il : nullptr,
                           lrn && bal_on ? d_pair_err + (size_t) l.il * g.n_exp * g.n_exp : nullptr,   // (stand-ins: decode tokens of the trunk only)
-                          mlv ? d_mev : nullptr, l.il, l.il == 0);   // (DS4_MASK=learn: the first trunk layer resets the token's list)
+                          mlv ? d_mev : nullptr, l.il, l.il == 0,   // (DS4_MASK=learn: the first trunk layer resets the token's list)
+                          mlv ? d_mcost : nullptr, mlv ? l.il : -1);   // (DS4_MASK_RESIDENT: this layer's off-card picks, on the same tokens)
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
