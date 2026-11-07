@@ -510,9 +510,11 @@ def cpu_isa_words() -> tuple:
     return f"{model or 'this CPU'} ({have})", missing
 
 
-def start_exit_note(rc: int | None) -> str:
+def start_exit_note(rc: int | None, exe=None) -> str:
     """The sentence the start error carries about how the engine process ended (the engine log is silent when the
-    system ends it): "" without a status, else a line, with the CPU's AVX flags after an illegal instruction."""
+    system ends it): "" without a status, else a line, with the CPU's AVX flags after an illegal instruction.
+    `exe` (the engine binary) is the caller's argument: the DeepSeek line uses it to name a missing DLL (loader_diag); here
+    it is accepted and unused, so a failed start reports its reason instead of raising TypeError (7 Nov)."""
     words = engine_exit_words(rc)
     if not words:
         return ""
