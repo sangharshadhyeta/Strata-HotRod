@@ -1124,6 +1124,9 @@ struct Model::Impl {
     std::vector<double> ml_cost;            // [nl][n_exp]
     std::vector<uint32_t> ml_cost_last;     // [nl][n_exp]
     double ml_fold_all = 0.0, ml_fold_mask = 0.0;   // the cost folded since the request's line: all experts, and those at level >= 1
+    int* ml_ctrl_h = nullptr;               // DS4_MASK_RESIDENT: the control flag (host-mapped; ml_ctrl_d goes into RouteMask::ctrl; null: no control tokens)
+    const int* ml_ctrl_d = nullptr;
+    long long ml_ctrl_n = 0, ml_ctrl_req = 0;   // the learner's decode tokens (kMlControlEvery's phase); the control tokens since the request's line
     float* d_logit0 = nullptr;              // device (head GPU) [vocab]: a re-checked token's first-pass logits
     float* d_kl = nullptr;                  // device (head GPU) [1]: the re-check's KL
     std::vector<double> ml_harm, ml_expo;   // [nl][n_exp]: the harm and the exposure (decayed)
@@ -1945,14 +1948,17 @@ struct Model::Impl {
             d_mev = nullptr;
             mask_learn_on = false;
         }
-        if (d_mask != nullptr || d_mask_moved != nullptr || d_mcost != nullptr) {   // DS4_MASK's blocks (the counter printed by request_end)
+        if (d_mask != nullptr || d_mask_moved != nullptr || d_mcost != nullptr || ml_ctrl_h != nullptr) {   // DS4_MASK's blocks (the counter printed by request_end)
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             if (d_mask != nullptr) cudaFree(d_mask);
             if (d_mask_moved != nullptr) cudaFree(d_mask_moved);
             if (d_mcost != nullptr) cudaFree(d_mcost);
+            if (ml_ctrl_h != nullptr) cudaFreeHost(ml_ctrl_h);
             d_mask = nullptr;
             d_mask_moved = nullptr;
             d_mcost = nullptr;
+            ml_ctrl_h = nullptr;
+            ml_ctrl_d = nullptr;
             for (Layer& l : L) l.route_mask = nullptr;
         }
         if (la_on) {   // the learner's report and its file, before the devices go
@@ -3906,6 +3912,20 @@ struct Model::Impl {
                 return;
             }
         }
+        if (mask_resident) {   // DS4_MASK_RESIDENT: the control flag, host-mapped as Req is (the kernels read it; a failure: no control tokens)
+            void* cm = nullptr;
+            void* cd = nullptr;
+            if (cudaHostAlloc(&cm, sizeof(int), cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+                cudaHostGetDevicePointer(&cd, cm, 0) == cudaSuccess) {
+                *(int*) cm = 0;
+                ml_ctrl_h = (int*) cm;
+                ml_ctrl_d = (const int*) cd;
+            } else {
+                (void) cudaGetLastError();
+                if (cm != nullptr) cudaFreeHost(cm);
+                std::fprintf(stderr, "ds4: DS4_MASK_RESIDENT: no control tokens (no host-mapped memory for the flag)\n");
+            }
+        }
         d_mask = dm;
         d_mask_moved = mv;
         mask_p = learn ? mask_p : p;
@@ -3953,6 +3973,7 @@ struct Model::Impl {
     static constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
     static constexpr double kMlMinSide = 16.0, kMlPMin = 0.025;   // re-checks needed on each side of the comparison; the share's floor
     static constexpr int kMlMinPop = 8;
+    static constexpr long long kMlControlEvery = 8;   // DS4_MASK_RESIDENT: one decode token in 8 runs with no mask move, so the re-checks have a "without" side
     static constexpr double kMtStepP = 0.025, kMtStepG = 0.1;   // a mask test's candidate: one step of the share p and of the level-2 fraction g
     std::string ml_path() const { return o.pack + "/mask-learn.bin"; }
     size_t ml_at(int il, int e) const { return (size_t) il * (size_t) g.n_exp + (size_t) e; }
@@ -4366,9 +4387,14 @@ struct Model::Impl {
         if (mask_resident)   // (the demand folded since the last line: the picks that cost reads, and how many of them were on masked experts)
             std::snprintf(dem, sizeof dem, "; demand reads this request: %.0f on masked experts of %.0f (%.1f%%)", ml_fold_mask, ml_fold_all,
                           ml_fold_all > 0.0 ? 100.0 * ml_fold_mask / ml_fold_all : 0.0);
+        char ctl[64] = "";
+        if (mask_resident) {   // (the control tokens since the last line: their re-checks are the flips' "without" side)
+            std::snprintf(ctl, sizeof ctl, "; control tokens %lld", ml_ctrl_req);
+            ml_ctrl_req = 0;
+        }
         std::fprintf(stderr, "ds4: request: mask learn: p %.3f, g %.3f, %d masked (%d at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
-                     "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f%s\n",
-                     mask_p, ml_g, m, a, dm, ml_dn, scored, ml_fm, ml_nm, ml_fs, ml_ns, dem);
+                     "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f%s%s\n",
+                     mask_p, ml_g, m, a, dm, ml_dn, scored, ml_fm, ml_nm, ml_fs, ml_ns, dem, ctl);
         ml_dsum = 0.0;
         ml_dn = 0;
         ml_fold_all = 0.0;
@@ -4384,6 +4410,7 @@ struct Model::Impl {
             r.moved = d_mask_moved;
             if (mask_resident) r.vram = l.vram_tab;   // (the layer's table: a masked pick moves only onto the card)
         }
+        if (mask_resident) r.ctrl = ml_ctrl_d;   // (the control flag: this step's moves are off when it is set)
         return r;
     }
     void standin_init() {
@@ -13136,6 +13163,16 @@ struct Model::Impl {
         for (int t = 0; t < T; ++t)   // (h_emb is written again by the next window, after this one's last sync)
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
         plan_window(p0, T, wplan);
+        if (ml_ctrl_h != nullptr) {   // DS4_MASK_RESIDENT: this step's control flag, before any layer of the step is enqueued
+            // (a control token: the learner's decode token every kMlControlEvery-th; its first pass only - the exact re-run is not counted)
+            const bool ctl = T == 1 && mask_learn_on && !standin_bypass && ++ml_ctrl_n % kMlControlEvery == 0;
+            if (ctl) ++ml_ctrl_req;
+            if (*ml_ctrl_h != (ctl ? 1 : 0)) {   // (written only on a change, and after the trunk stream is idle: the previous step's route kernels read it)
+                cudaSetDevice(devs[(size_t) L[0].dev].id);
+                CK(cudaStreamSynchronize(devs[(size_t) L[0].dev].st));
+                *ml_ctrl_h = ctl ? 1 : 0;
+            }
+        }
         la_win = la_on && T == 1 && wplan.async;   // the learner's window: a decode token on the async path
         if (d_standin != nullptr && T == 1) {   // the stand-ins' per-token flags start at 0 for this token's layers
             cudaSetDevice(devs[(size_t) L[0].dev].id);

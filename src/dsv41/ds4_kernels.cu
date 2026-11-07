@@ -518,9 +518,10 @@ __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ 
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     if (threadIdx.x == 0) {
         int m = 0;
-        for (int r = 0; r < k; ++r)
+        const bool control = rm.ctrl != nullptr && *rm.ctrl != 0;   // (a control token: no move at all, so its re-check has a "without" side)
+        for (int r = 0; r < k && !control; ++r)
             m += pick[r] >= 0 && pick[r] < n && rm.m[pick[r]] != 0 && !(rm.vram != nullptr && rm.vram[pick[r]] != 0ull);
-        *want = m;
+        *want = m;   // (0 on a control token: no candidate, and the move loop below takes none)
         *n_mc = 0;
         *moved_out = 0;
     }
