@@ -4591,7 +4591,10 @@ int main(int argc, char** argv) {
                         mfall = true;
                         mfloor = 0;
                     } else if (std::strcmp(fv, "standin") != 0) {
-                        mfn = std::atoi(fv);
+                        // a number only when every character is a digit (atoi reads "abc" as 0, which would move every rank)
+                        bool digits = fv[0] != '\0';
+                        for (const char* c = fv; *c != '\0'; ++c) digits = digits && *c >= '0' && *c <= '9';
+                        mfn = digits ? std::atoi(fv) : -1;
                         if (mfn >= 0 && mfn <= 10) {
                             mfnum = true;
                             mfloor = mfn;
