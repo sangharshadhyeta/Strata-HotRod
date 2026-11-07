@@ -4452,6 +4452,10 @@ struct Model::Impl {
         }
         if (mask_resident) r.ctrl = ml_ctrl_d;   // (the control flag: this step's moves are off when it is set)
         if (mask_resident) r.gate = mask_gate;   // (below the stand-ins' floor a move is gated by the stand-ins' edge)
+        if (mask_resident && d_standin != nullptr) {   // (at and above the floor a move takes the stand-ins' budget test: the live budget, route_scale)
+            r.budget = &d_standin->budget;
+            r.scale = g.route_scale;
+        }
         return r;
     }
     void standin_init() {

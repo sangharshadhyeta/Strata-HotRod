@@ -513,8 +513,11 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
 // With rm.vram (DS4_MASK_RESIDENT's resident swap): a pick on the card is never masked out, and the candidates are unmasked experts on the card,
 // so a masked pick moves only from off the card to on it. The candidates the move loop did not use go back into bs (their scores, mval), so the
 // stand-ins after it can take them.
+// DS4_MASK_RESIDENT's budget test (rm.budget, with sc: the router's unbiased scores of the token, nullable): at and above rm.gate a move
+// needs the same test the stand-ins take a swap by, w x gap <= budget, with w the picks' weight as route_publish computes it (from the picks
+// on entry, before any move). A move that fails it is skipped, and its candidate stays unused.
 __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ logits, int n, int k, float* bs, int* pick, float* bv,
-                                 int* bi, int* mcand, float* mval, int* n_mc, int* want, int* moved_out) {
+                                 int* bi, int* mcand, float* mval, int* n_mc, int* want, int* moved_out, const float* sc) {
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     if (threadIdx.x == 0) {
         int m = 0;
@@ -555,6 +558,10 @@ __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ 
     }
     if (threadIdx.x == 0) {
         int c = 0, mv = 0;
+        float psum = 0.0f;   // (the picks' score sum on entry: the budget test's weights)
+        if (rm.vram != nullptr && rm.budget != nullptr && sc != nullptr)
+            for (int q = 0; q < k; ++q)
+                if (pick[q] >= 0 && pick[q] < n) psum += sc[pick[q]];
         for (int r = 0; r < k && c < *n_mc; ++r) {
             const int p = pick[r];
             if (p < 0 || p >= n || rm.m[p] == 0) continue;
@@ -572,6 +579,12 @@ __device__ void route_mask_apply(const RouteMask& rm, const float* __restrict__ 
             if (rm.vram != nullptr && r < rm.gate) {
                 const float gap = fmaxf(0.0f, logits[p] - logits[mcand[c]]);
                 if (!(rm.edge > 0.0f && gap <= rm.edge)) continue;
+            }
+            // DS4_MASK_RESIDENT: at and above the stand-ins' floor a move takes the stand-ins' budget test (w x gap <= the live budget)
+            if (rm.vram != nullptr && rm.budget != nullptr && sc != nullptr && r >= rm.gate) {
+                const float w = sc[p] / (psum + 1e-20f) * rm.scale;
+                const float gap = fmaxf(0.0f, logits[p] - logits[mcand[c]]);
+                if (!(w * gap <= *rm.budget)) continue;
             }
             pick[r] = mcand[c++];
             ++mv;
@@ -642,7 +655,7 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
         __syncthreads();
     }
     if (rm.m != nullptr) {   // DS4_MASK: the masked picks move (before the weights: they are the picks' own scores)
-        route_mask_apply(rm, logits, n, k, bs, pick, bv, bi, mcand, mval, &n_mc, &mwant, &mmoved);
+        route_mask_apply(rm, logits, n, k, bs, pick, bv, bi, mcand, mval, &n_mc, &mwant, &mmoved, sc);
         if (threadIdx.x == 0 && mmoved > 0 && rm.moved != nullptr) atomicAdd(rm.moved, (unsigned long long) mmoved);
     }
     if (threadIdx.x == 0) {
@@ -1750,7 +1763,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     }
     __syncthreads();
     if (rm.m != nullptr) {   // DS4_MASK: the masked picks move first; the stand-ins then see the router's picks as they are now
-        route_mask_apply(rm, logits, n, k, bs, pick, bv, bi, mcand, mval, &n_mc, &mwant, &mmoved);
+        route_mask_apply(rm, logits, n, k, bs, pick, bv, bi, mcand, mval, &n_mc, &mwant, &mmoved, sc);
         if (threadIdx.x == 0 && mmoved > 0 && rm.moved != nullptr) atomicAdd(rm.moved, (unsigned long long) mmoved);
     }
     // stand-ins: the card-resident experts the token did not pick, best selection score first, one for each rank that may swap and
@@ -1970,7 +1983,7 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
         __syncthreads();
     }
     if (rm.m != nullptr) {   // DS4_MASK: the guesses follow the target layer's mask by the router's rule (the moves are not counted)
-        route_mask_apply(rm, logits, n, m, bs, pk, bv, bi, mcand, mval, &n_mc, &mwant, &mmoved);
+        route_mask_apply(rm, logits, n, m, bs, pk, bv, bi, mcand, mval, &n_mc, &mwant, &mmoved, nullptr);   // (no sc here: the guesses' budget test is off)
     }
     if (threadIdx.x == 0)
         for (int r = 0; r < m; ++r) req->ahead[t][off + r] = pk[r];
