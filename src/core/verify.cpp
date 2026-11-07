@@ -6809,9 +6809,12 @@ bool mask_learn_save(const std::string& path, std::string& msg) {
 // STRATA_MASK_RESIDENT control windows: every kMlControlEvery-th decode window (counted from the start) runs with the mask's moves off, so
 // the re-checks it gives have no mask move and land on the "without" side.  g_mask_ctrl_n counts the decode windows; g_mask_ctrl_win the
 // control windows since the last mask line.
+// The share follows the evidence: while the "without" side holds fewer than kMlMinSide re-checks (it is halved every kMlDecayEvery kept
+// tokens, so at 1 in 8 it settled near 7-14 on 8095, 7 Nov, and p never moved), every (kMlControlEvery / 2)-th window is a control.
 static long long g_mask_ctrl_n = 0, g_mask_ctrl_win = 0;
 bool mask_control_next() {
-    if (++g_mask_ctrl_n % kMlControlEvery != 0) return false;
+    const long long every = g_mlr && g_mlr->fsn < kMlMinSide ? kMlControlEvery / 2 : kMlControlEvery;
+    if (++g_mask_ctrl_n % every != 0) return false;
     ++g_mask_ctrl_win;
     return true;
 }
