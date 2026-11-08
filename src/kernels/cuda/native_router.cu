@@ -400,7 +400,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  int cheap_rank0, int cheap_anytier, unsigned long long* __restrict__ bstats,
                                  float* __restrict__ row_shift, const float* __restrict__ pair_c,
                                  int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe,
-                                 MaskEvs* __restrict__ mev, int row_base, const uint32_t* __restrict__ fctrl) {
+                                 MaskEvs* __restrict__ mev, int row_base, const uint32_t* __restrict__ fctrl,
+                                 float* __restrict__ margin_out) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -419,6 +420,24 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     const float budget_tail = ((const volatile RouteCfg*) cfg)->budget_tail;
     const float* l = logits + (size_t) t * 512;
     int32_t* id = ids + (size_t) t * 10;
+    // SPEC-recheck-gated (C): the early margin, the router's top-1 minus top-2 raw logit over all 512 experts, before any stand-in, min'd into
+    // margin_out[row] by the routers of layers 0-3 (the host sets the array to a large value before each window; predicated, uniform per warp)
+    if (margin_out != nullptr && layer < 4) {
+        float m1 = -INFINITY, m2 = -INFINITY;
+        for (int f = lane; f < 512; f += 32) {
+            const float v = l[f];
+            if (v > m1) { m2 = m1; m1 = v; }
+            else if (v > m2) m2 = v;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float o1 = __shfl_xor_sync(0xffffffffu, m1, off);
+            const float o2 = __shfl_xor_sync(0xffffffffu, m2, off);
+            if (o1 > m1) { m2 = fmaxf(m1, o2); m1 = o1; }
+            else m2 = fmaxf(m2, o1);
+        }
+        if (lane == 0) margin_out[row_base + t] = fminf(margin_out[row_base + t], m1 - m2);
+    }
     if (lane == 0) {
         // detail (decode rows, cumulative, STRATA_TRACE_ADAPT): [r] picks of rank r not resident, [10] the router weight on them
         // (x1e6), [11] rows, [12] rows whose top-1 is not resident, [13] rows with a non-resident pick among the top 5
@@ -580,7 +599,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
             // STRATA_MASK=learn: the replaced pick (orig[r]) and its risk, in this row's list
             if (lane == 0 && mev != nullptr && row_base + t < kMaskEvRows) {
                 const unsigned q = mev->n[row_base + t]++;
-                if (q < kMaskEvCap) mev->e[row_base + t][q] = MaskEv{layer, orig[r], weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f), 0};
+                if (q < kMaskEvCap) mev->e[row_base + t][q] = MaskEv{layer, orig[r], weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f), (int32_t) ((r & 15) << 1) /* mask_ev_pack(0, r) */};
             }
             my[r] = bi;
             sub_s[r] = bi;
@@ -770,7 +789,8 @@ static uint32_t* g_frag_ctrl_dev = nullptr;
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift,
-                           const float* pair_c, int32_t* lrn_rec, int layer, const float* pair_pe, MaskEvs* mev, int row_base) {
+                           const float* pair_c, int32_t* lrn_rec, int layer, const float* pair_pe, MaskEvs* mev, int row_base,
+                           float* margin_out) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     // STRATA_ROUTE_RAM_FLOOR's safety: the stand-in for a rank 0-1 pick must be within STRATA_ROUTE_RAM_FLOOR_MARGIN logits (default 1,
     // the margin SPEC E1 found sound for rank 1), and rank 0 is replaced only with STRATA_ROUTE_RAM_FLOOR_RANK0=1 (off: it leaked
@@ -783,7 +803,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
         n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier, bstats, row_shift,
-        pair_c, lrn_rec, layer, pair_pe, mev, row_base, g_frag_ctrl_dev);
+        pair_c, lrn_rec, layer, pair_pe, mev, row_base, g_frag_ctrl_dev, margin_out);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -878,7 +898,7 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
         if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * gap);
         if (lane == 0 && mev != nullptr && row < kMaskEvRows) {   // STRATA_MASK=learn: the replaced pick and its risk
             const unsigned q = mev->n[row]++;
-            if (q < kMaskEvCap) mev->e[row][q] = MaskEv{layer, e, weights[(size_t) t * 10 + r] * gap, 1};
+            if (q < kMaskEvCap) mev->e[row][q] = MaskEv{layer, e, weights[(size_t) t * 10 + r] * gap, (int32_t) (1 | ((r & 15) << 1)) /* mask_ev_pack(1, r) */};
         }
         my[r] = bi;
         ++moved;

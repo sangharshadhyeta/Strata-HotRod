@@ -40,6 +40,8 @@ inline SuccessorPlan successor_plan(bool successor, bool row_only) {
 struct Pick {
     int32_t layer;
     int32_t expert;
+    int32_t rank = 0;   ///< the replaced pick's router rank (0-9); used by plan_prefetch_ranked only
+    float risk = 0.f;   ///< the event's risk (w x gap); used by plan_prefetch_ranked only
 };
 
 /// What the prefetch does with a cut row's picks: `todo` in queue order (ascending layer, first appearance within a layer), at most
@@ -74,6 +76,38 @@ inline PrefetchPlan plan_prefetch(const std::vector<Pick>& picks, size_t cap, Is
         fresh.resize(cap);
     }
     p.todo = std::move(fresh);
+    return p;
+}
+
+/// SPEC-recheck-gated (E): the cut row's picks ranked for the prefetch.  Order: rank ascending, then risk descending (a NaN risk is 0), then
+/// layer and expert ascending (a fixed order).  A repeat keeps its first (best-ranked) place; a resident pick is skipped and counted; the first
+/// `cap` fresh picks in that order are taken, the rest of the fresh ones count as over_cap.  The queue order is ascending layer (stable).
+template <class IsResident>
+inline PrefetchPlan plan_prefetch_ranked(std::vector<Pick> picks, size_t cap, IsResident is_resident) {
+    auto risk_of = [](const Pick& k) { return k.risk == k.risk ? k.risk : 0.0f; };
+    std::stable_sort(picks.begin(), picks.end(), [&](const Pick& a, const Pick& b) {
+        if (a.rank != b.rank) return a.rank < b.rank;
+        if (risk_of(a) != risk_of(b)) return risk_of(a) > risk_of(b);
+        if (a.layer != b.layer) return a.layer < b.layer;
+        return a.expert < b.expert;
+    });
+    PrefetchPlan p;
+    std::set<std::pair<int32_t, int32_t>> seen;
+    std::vector<Pick> chosen;
+    for (const Pick& k : picks) {
+        if (!seen.insert({k.layer, k.expert}).second) {
+            ++p.duplicate;
+            continue;
+        }
+        if (is_resident(k.layer, k.expert)) {
+            ++p.resident;
+            continue;
+        }
+        if (chosen.size() < cap) chosen.push_back(k);
+        else ++p.over_cap;
+    }
+    std::stable_sort(chosen.begin(), chosen.end(), [](const Pick& a, const Pick& b) { return a.layer < b.layer; });
+    p.todo = std::move(chosen);
     return p;
 }
 

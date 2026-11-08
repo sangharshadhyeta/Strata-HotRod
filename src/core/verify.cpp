@@ -14,6 +14,7 @@
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/paired_test.hpp"
 #include "strata/core/recheck_cheap.hpp"
+#include "strata/core/recheck_gate.hpp"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -204,6 +205,23 @@ struct RouteResidentCfg {
     // SPEC-recheck-cheap change 1: STRATA_RECHECK_ROW_ONLY (default on): the exact successor of a cut makes only its row 0 exact (the fragile
     // flag's row count is 1 for it); the request's budget stays for the other rows.  Off: the whole-window exact successor (budget 0, win_exact).
     bool recheck_row_only = true;
+    // SPEC-recheck-gated: STRATA_RECHECK_GATE (default on, needs the fragile re-check; 0 = the re-check of before).  Rule 1-3 per row from the
+    // drafter's probability (the decode loop computes the uncertain rows' bits, route_gate_rows); eligibility for a cut (route_fragile_first);
+    // rule 4 audit windows; rule 5 the threshold mover on gs (the learner's totals, eligible rows only).
+    bool gate_on = false;                     ///< the gate is active (STRATA_RECHECK_GATE, and the fragile re-check)
+    long long gate_audit_every = 256;         ///< STRATA_RECHECK_AUDIT_EVERY: every n-th decode window is an audit window (0 = none)
+    long long gate_win = 0;                   ///< decode windows counted for the audit cadence (process-wide)
+    uint32_t gate_bits = 0;                   ///< this window's uncertain-row hold bits (route_gate_rows; consumed by route_budget_window)
+    bool gate_bits_set = false;               ///< route_gate_rows was called for this window
+    gate::State gs;                           ///< the learner's state: totals (eligible rows), P_HI, rank table (in-process for now)
+    struct GateReq {                          ///< this request's gate counts (route_gate_take takes and resets them)
+        long long held = 0, skipped = 0, audit_wins = 0, cuts = 0;
+        long long au_moved[gate::kNone + 1] = {}, au_cut[gate::kNone + 1] = {}, au_flip[gate::kNone + 1] = {};
+        gate::RankTable rk;
+    } gq;
+    bool gate_pend = false, gate_pend_audit = false;   ///< a gate cut is waiting for its verdict
+    int gate_pend_bucket = gate::kNone;
+    long long gate_pend_rank[gate::kRankSlots][gate::kBands] = {};   ///< the pending cut's rank-wise swaps
     bool fragile_pend = false;                ///< a cut's row is waiting for the exact window that re-decides it
     int32_t fragile_pend_tok = 0;             ///< the stand-in window's top-1 id at the cut row (argmax, not the sampled token)
     bool fragile_pend_stop = false;           ///< the pending cut is a stop re-check (route_fragile_stop_cut: its row's stand-in token is a stop id)
@@ -417,6 +435,10 @@ RouteResidentCfg& route_resident_cfg() {
         { const char* v = std::getenv("STRATA_FRAGILE_BRAKE"); r.brake_on = v == nullptr || std::atoi(v) != 0; }
         // SPEC-recheck-cheap change 1 (default on, =0 the whole-window exact successor of before): the exact successor makes row 0 only exact
         { const char* v = std::getenv("STRATA_RECHECK_ROW_ONLY"); r.recheck_row_only = v == nullptr || std::atoi(v) != 0; }
+        // SPEC-recheck-gated: the gate (default on, needs the fragile re-check), its start P_HI and the audit cadence
+        { const char* v = std::getenv("STRATA_RECHECK_GATE"); r.gate_on = r.fragile_on && (v == nullptr || std::atoi(v) != 0); }
+        if (const char* v = std::getenv("STRATA_RECHECK_P_HI")) r.gs.p_hi = gate::clamp_p_hi((float) std::atof(v));
+        if (const char* v = std::getenv("STRATA_RECHECK_AUDIT_EVERY")) r.gate_audit_every = std::max(0LL, std::atoll(v));
         // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 off): every n-th eligible decode window is a fragile control window (see RouteResidentCfg)
         if (const char* v = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) r.fr_ctrl_every = std::max(0LL, std::atoll(v));
         if (const char* v = std::getenv("STRATA_FRAGILE_K0")) {
@@ -4792,6 +4814,131 @@ bool Verifier::route_control_take(std::string& out) {
     return any;
 }
 
+// ---- SPEC-recheck-gated (see verify.hpp: route_gate_*).  The learner's state is process-wide; the request counts are taken at the request's end.
+bool Verifier::route_gate_on() const { return route_resident_cfg().gate_on; }
+float Verifier::route_gate_p_hi() const { return route_resident_cfg().gs.p_hi; }
+
+bool Verifier::route_gate_audit_next() {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_on) return false;
+    ++c.gate_win;
+    const int every = (int) std::min<long long>(c.gate_audit_every, 1000000000LL);
+    const bool audit = strata::core::gate::audit_due(c.gate_win, every);
+    if (audit) ++c.gq.audit_wins;
+    return audit;
+}
+
+void Verifier::route_gate_rows(uint32_t bits, bool audit) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_on) return;
+    c.gate_bits = audit ? 0u : bits;
+    c.gate_bits_set = true;
+    for (uint32_t b = c.gate_bits; b != 0; b &= b - 1) ++c.gq.held;
+}
+
+void Verifier::route_gate_window(int a0, const int* bucket, const float* shift, const uint8_t* eligible, bool audit) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_on) return;
+    // rows 1..a0 (row 0 is never cut): the eligible moved rows, by their drafter bucket (kNone for none rows)
+    for (int q = 1; q <= a0; ++q) {
+        if (!(shift[q] > 0.0f) || eligible[q] == 0) continue;
+        strata::core::gate::add_moved(c.gs, bucket[q]);
+        if (audit) ++c.gq.au_moved[bucket[q]];
+    }
+    const int dir = strata::core::gate::step(c.gs);   // rule 5 (acts only with 2,000 moved rows since its last move)
+    if (dir != 0)
+        std::fprintf(stderr, "strata serve: recheck gate: P_HI %s to %.2f (move %lld)\n", dir > 0 ? "up" : "down", (double) c.gs.p_hi,
+                     c.gs.moves);
+}
+
+void Verifier::route_gate_cut(int row, int bucket, bool audit, bool control, const std::vector<strata::core::recheck::Pick>& picks) {
+    RouteResidentCfg& c = route_resident_cfg();
+    c.gate_pend = false;
+    if (!c.gate_on || control) return;   // a noise control re-check is not the gate's evidence
+    c.gate_pend = true;
+    c.gate_pend_audit = audit;
+    c.gate_pend_bucket = bucket;
+    for (int s = 0; s < strata::core::gate::kRankSlots; ++s)
+        for (int b = 0; b < strata::core::gate::kBands; ++b) c.gate_pend_rank[s][b] = 0;
+    for (const strata::core::recheck::Pick& p : picks) {   // the cut row's swaps, by rank and layer band (a mask move counts as a swap too)
+        const int s = strata::core::gate::rank_slot(p.rank);
+        if (s >= 0) ++c.gate_pend_rank[s][strata::core::gate::band_of(p.layer)];
+    }
+    strata::core::gate::add_cut(c.gs, bucket);
+    ++c.gq.cuts;
+    if (audit) ++c.gq.au_cut[bucket];
+    (void) row;
+}
+
+void Verifier::route_gate_settled(bool exact_ok, bool flipped) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_pend) return;
+    c.gate_pend = false;
+    if (!exact_ok) return;   // the exact row was not read: no verdict
+    const int b = c.gate_pend_bucket;
+    if (flipped) {
+        strata::core::gate::add_flip(c.gs, b);
+        if (c.gate_pend_audit) ++c.gq.au_flip[b];
+    }
+    const int f = flipped ? 1 : 0;
+    for (int s = 0; s < strata::core::gate::kRankSlots; ++s)
+        for (int band = 0; band < strata::core::gate::kBands; ++band) {
+            const long long n = c.gate_pend_rank[s][band];
+            if (n == 0) continue;
+            c.gs.rank.n[s][band][f] += n;
+            c.gq.rk.n[s][band][f] += n;
+        }
+    const int dir = strata::core::gate::step(c.gs);
+    if (dir != 0)
+        std::fprintf(stderr, "strata serve: recheck gate: P_HI %s to %.2f (move %lld)\n", dir > 0 ? "up" : "down", (double) c.gs.p_hi,
+                     c.gs.moves);
+}
+
+bool Verifier::route_gate_take(std::string& gate_line, std::string& rank_line) {
+    RouteResidentCfg& c = route_resident_cfg();
+    RouteResidentCfg::GateReq& q = c.gq;
+    gate_line.clear();
+    rank_line.clear();
+    bool any_rank = false;
+    for (int s = 0; s < strata::core::gate::kRankSlots; ++s)
+        for (int b = 0; b < strata::core::gate::kBands; ++b) any_rank = any_rank || q.rk.n[s][b][0] + q.rk.n[s][b][1] > 0;
+    const bool any = q.held > 0 || q.skipped > 0 || q.audit_wins > 0 || q.cuts > 0;
+    if (c.gate_on && any) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "P_HI %.2f, rows held up front %lld, cuts skipped (rule 1) %lld, audit windows %lld; audit moved/cut/flipped:",
+                      (double) c.gs.p_hi, q.held, q.skipped, q.audit_wins);
+        gate_line = buf;
+        for (int b = 0; b <= strata::core::gate::kNone; ++b) {
+            if (q.au_moved[b] + q.au_cut[b] + q.au_flip[b] == 0) continue;
+            std::snprintf(buf, sizeof buf, " %s %lld/%lld/%lld", b == strata::core::gate::kNone ? "none" : std::to_string(b).c_str(),
+                          q.au_moved[b], q.au_cut[b], q.au_flip[b]);
+            gate_line += buf;
+        }
+    }
+    if (c.gate_on && any_rank) {
+        // re-check by rank: per rank (flipped / not) over the layer bands, then per band
+        std::string s = "re-check by rank (flipped / not):";
+        char buf[64];
+        for (int r = 0; r < strata::core::gate::kRankSlots; ++r) {
+            long long fl = 0, nf = 0;
+            for (int b = 0; b < strata::core::gate::kBands; ++b) { fl += q.rk.n[r][b][1]; nf += q.rk.n[r][b][0]; }
+            std::snprintf(buf, sizeof buf, " r%d %lld/%lld", r + 3, fl, nf);
+            s += buf;
+        }
+        s += "; layer bands";
+        static const char* band_name[4] = {"0-11", "12-23", "24-35", "36-47"};
+        for (int b = 0; b < strata::core::gate::kBands; ++b) {
+            long long fl = 0, nf = 0;
+            for (int r = 0; r < strata::core::gate::kRankSlots; ++r) { fl += q.rk.n[r][b][1]; nf += q.rk.n[r][b][0]; }
+            std::snprintf(buf, sizeof buf, " %s %lld/%lld", band_name[b], fl, nf);
+            s += buf;
+        }
+        rank_line = s;
+    }
+    q = RouteResidentCfg::GateReq{};
+    return c.gate_on && (any || any_rank);
+}
+
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
 // STRATA_ROUTE_BUDGET_AUTO: a decode window (auto_ok) takes the search's b for both ranks; a cut's next window is exact for ranks < lo only.
 void Verifier::route_budget_window(bool decode, bool auto_ok) {
@@ -4851,7 +4998,19 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     // SPEC-recheck-cheap change 1: the successor's flag row count is 1 (route_fragile_rows; false when the flag is not allocated, then the
     // whole-window exact path of before runs).  Its request budget stays; only the whole-window exact state and budget 0 are dropped.
     const bool succ = decode && c.fragile_exact;
-    const bool row_only = succ && c.recheck_row_only && strata::kernels::route_fragile_rows(1);
+    const bool row_only = succ && c.recheck_row_only && strata::kernels::route_fragile_hold_ready();
+    // SPEC-recheck-gated: the hold bitmask of this window = every row (the control window), else the successor's row 0 and the uncertain
+    // rows of the gate (rule 2; route_gate_rows, none in an audit window).  With the gate off the bits are the successor's row 0 alone (or none).
+    {
+        uint32_t bits = fctl ? strata::core::gate::kAllBits : 0u;
+        if (!fctl) {
+            if (row_only) bits |= 1u;
+            if (c.gate_bits_set) bits |= c.gate_bits;
+        }
+        strata::kernels::route_fragile_hold(bits);
+        c.gate_bits = 0;
+        c.gate_bits_set = false;
+    }
     const strata::core::recheck::SuccessorPlan sp = strata::core::recheck::successor_plan(succ, row_only);
     c.win_exact = sp.win_exact;   // STRATA_MASK: the exact re-run is unmasked too (its outputs are the re-decision)
     if (decode && c.auto_on && auto_ok && c.auto_mask && !c.win_exact) mask_test_arm(c.auto_win_arm);   // STRATA_MASK=learn: this arm's levels on the device
@@ -4939,7 +5098,7 @@ void Verifier::route_fragile_zero_shift() {
 // Row 0 is never cut (a re-run would step the state twice), so the search is over rows 1..n-1.  Until k is set (STRATA_FRAGILE_K0, or learned
 // from the first kFragileLearn windows: the ratios gap / shift of their moved rows 1.., k = their 10th percentile, no cut meanwhile) it
 // returns -1.  The moved rows' shift and gap are sampled for the request's medians (route_fragile_take).
-int Verifier::route_fragile_first(const float* gap, const float* shift, int n, bool* explore, bool* control) {
+int Verifier::route_fragile_first(const float* gap, const float* shift, int n, bool* explore, bool* control, const uint8_t* eligible) {
     RouteResidentCfg& c = route_resident_cfg();
     if (explore != nullptr) *explore = false;
     if (control != nullptr) *control = false;
@@ -4972,7 +5131,11 @@ int Verifier::route_fragile_first(const float* gap, const float* shift, int n, b
             c.fr_samp_shift.push_back(shift[r]);
             c.fr_samp_gap.push_back(gap[r]);
         }
-        if (first < 0 && r >= 1 && c.fragile_k_set && !(gap[r] >= c.fragile_k * shift[r])) first = r;
+        // SPEC-recheck-gated: a close call on a row the gate does not allow to be cut is skipped (and counted), not taken
+        if (r >= 1 && c.fragile_k_set && !(gap[r] >= c.fragile_k * shift[r])) {
+            if (eligible != nullptr && !eligible[r]) ++c.gq.skipped;
+            else if (first < 0) first = r;
+        }
     }
     // Exploration (deterministic: every 16th eligible window, not a random draw): with no normal cut, the first moved row r >= 1 whose
     // ratio gap / shift is in [k, 8k) is an explore cut.  Rows with ratio below k would have been normal cuts, so they are not explored.
@@ -4980,7 +5143,7 @@ int Verifier::route_fragile_first(const float* gap, const float* shift, int n, b
         for (int r = 1; r < n && first < 0; ++r) {
             if (!(shift[r] > 0.0f)) continue;
             const float ratio = gap[r] / shift[r];
-            if (ratio >= c.fragile_k && ratio < 8.0f * c.fragile_k) first = r;
+            if (ratio >= c.fragile_k && ratio < 8.0f * c.fragile_k && (eligible == nullptr || eligible[r])) first = r;
         }
         if (first >= 0 && explore != nullptr) *explore = true;
     }
@@ -7045,7 +7208,7 @@ void Verifier::mask_learn_cut(int row, int32_t stand_top1, int T, bool control) 
         if (a.layer < 0 || a.layer >= s.nl || a.expert < 0 || a.expert >= s.ne) continue;
         const double x = std::max(0.0, (double) a.x);
         s.pend_picks.push_back({a.layer, a.expert, x});
-        s.pend_masked = s.pend_masked || a.kind == 1;
+        s.pend_masked = s.pend_masked || strata::kernels::mask_ev_kind(a.kind) == 1;
         s.pend_sum += x;
     }
 }
@@ -7069,7 +7232,8 @@ size_t Verifier::route_recheck_picks(int row, std::vector<strata::core::recheck:
     }
     // both kinds: a stand-in swap's replaced pick and a mask move's; the successor's row 0 reads the router's pick of each
     for (const strata::kernels::MaskEv& a : evs)
-        if (a.layer >= 0 && a.layer < s.nl && a.expert >= 0 && a.expert < s.ne) out.push_back({a.layer, a.expert});
+        if (a.layer >= 0 && a.layer < s.nl && a.expert >= 0 && a.expert < s.ne)
+            out.push_back({a.layer, a.expert, strata::kernels::mask_ev_rank(a.kind), a.x});   // SPEC-recheck-gated: the rank and risk (E, D)
     return out.size();
 }
 
@@ -7081,7 +7245,10 @@ bool Verifier::route_recheck_prefetch_on() {
 size_t Verifier::route_recheck_prefetch_max() {
     static const size_t cap = [] {
         const char* v = std::getenv("STRATA_RECHECK_PREFETCH_MAX");
-        return v != nullptr ? (size_t) std::max(0LL, std::atoll(v)) : (size_t) 96;
+        // SPEC-recheck-gated (E): the ranked prefetch takes 12 per cut; with the gate off, the old 96 (the cut order of before)
+        const char* g = std::getenv("STRATA_RECHECK_GATE");
+        const bool gate = g == nullptr || std::atoi(g) != 0;
+        return v != nullptr ? (size_t) std::max(0LL, std::atoll(v)) : gate ? (size_t) 12 : (size_t) 96;
     }();
     return cap;
 }

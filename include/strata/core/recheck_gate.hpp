@@ -1,0 +1,273 @@
+// include/strata/core/recheck_gate.hpp - the re-check gated by drafter confidence (docs/SPEC-recheck-gated.md: the rule 1-6, step B's
+// eligibility, step C's early-margin deciles), header-only, no CUDA.  Everything the decode loop decides per row or per window lives here,
+// so it can be tested on the CPU: the row's rule from its drafter probability, the hold bitmask of the uncertain rows, the audit cadence,
+// the eligibility of a moved row for a cut, the threshold mover (rule 5, Wilson bounds), the early-margin deciles, and the state that
+// persists across requests and restarts (text, keyed by the model's fingerprint).
+//
+// The counts the mover learns from are the eligible rows only: a row that was not eligible for a re-check was not measured, so it is not
+// counted.  With the gate on, a confident row is eligible only in an audit window; an uncertain row and a "none" row are always eligible
+// (8 Nov: uncertain rows are no longer held up front).  With the gate off every moved row is eligible in every window.
+#pragma once
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace strata::core::gate {
+
+constexpr int kNone = 10;                      ///< the bucket of a row with no drafter probability (fp_bucket's 10)
+constexpr int kBuckets = 10;                   ///< drafter probability buckets 0.0-0.1 .. 0.9-1.0
+constexpr uint32_t kAllBits = 0xFFFFFFFFu;     ///< every row held (the control window)
+constexpr float kPHiDefault = 0.9f;            ///< rule 1's start value (STRATA_RECHECK_P_HI)
+constexpr float kPHiLo = 0.6f, kPHiHi = 0.95f; ///< rule 5's range
+constexpr float kPHiStep = 0.1f;               ///< one bucket
+constexpr double kZ90 = 1.645;                 ///< the Wilson z of the 90% bounds (as route_wilson90)
+constexpr double kFlipBound = 0.005;           ///< rule 5's flip-rate bound (0.5% per moved row)
+constexpr long long kMoveRows = 2000;          ///< at most one move per this many audited moved rows
+constexpr int kMarginRing = 4096;              ///< the early-margin samples kept for the running deciles
+
+enum class Rule { None, Confident, Uncertain };
+
+/// The row's rule.  bucket: fp_bucket (0-9, or kNone); p: the drafter's probability of the row's token (valid when bucket != kNone).
+inline Rule classify(int bucket, float p, float p_hi) {
+    if (bucket >= kNone) return Rule::None;
+    return p >= p_hi ? Rule::Confident : Rule::Uncertain;
+}
+
+/// Eligible for a cut: every row in an audit window; outside one, the uncertain rows (rule 2) and the rows with no drafter probability (rule 3).
+/// Only the confident rows (rule 1) are not eligible outside an audit window.
+inline bool eligible(Rule r, bool audit) { return audit || r != Rule::Confident; }
+
+/// Rule 2 as the hold bitmask.  Changed on 8 Nov (coordinator, from the live data): the uncertain rows are NOT held (exact up front cost
+/// ~100 expert reads per row, against the re-check paying only for the ~14% of them that are cut); they stay eligible for a cut, as today.
+/// This returns 0 (the bitmask of step A stays for a later rank-partial re-check).
+inline uint32_t uncertain_bits(const int* bucket, const float* p, int T, float p_hi, bool audit) {
+    (void) bucket; (void) p; (void) T; (void) p_hi; (void) audit;
+    return 0u;
+}
+
+/// Rule 4: decode window number `window` (1-based, counted over the decode windows of the process) is an audit window when every > 0 and
+/// window is a multiple of every.
+inline bool audit_due(long long window, int every) { return every > 0 && window > 0 && window % every == 0; }
+
+/// Clamps P_HI into the range 0.6-0.95.
+inline float clamp_p_hi(float p) {
+    if (!(p >= kPHiLo)) return kPHiLo;   // (NaN too)
+    return p > kPHiHi ? kPHiHi : p;
+}
+
+/// The bucket just below P_HI (the one rule 5 tests for a move down): floor(p_hi * 10), taken a hair below, so 0.9 gives 8.
+inline int below_bucket(float p_hi) { return (int) std::floor(p_hi * 10.0f - 1e-4f); }
+/// The first confident bucket of P_HI (rule 5 tests the confident buckets for a move up): floor(p_hi * 10), a hair above, so 0.9 gives 9.
+inline int confident_bucket(float p_hi) { return (int) std::floor(p_hi * 10.0f + 1e-4f); }
+
+/// The Wilson 90% bound of k flips in n moved rows (upper or lower).  n = 0: 1 (upper) or 0 (lower).
+inline double wilson(long long k, long long n, bool upper) {
+    if (n <= 0) return upper ? 1.0 : 0.0;
+    const double z2 = kZ90 * kZ90, nn = (double) n, p = (double) k / nn;
+    const double centre = p + z2 / (2.0 * nn);
+    const double half = kZ90 * std::sqrt(p * (1.0 - p) / nn + z2 / (4.0 * nn * nn));
+    const double denom = 1.0 + z2 / nn;
+    return upper ? (centre + half) / denom : (centre - half) / denom;
+}
+
+/// Per-bucket counts: index 0-9 the drafter buckets, 10 the none rows.
+struct Counts {
+    long long moved[kNone + 1] = {};
+    long long cut[kNone + 1] = {};
+    long long flip[kNone + 1] = {};
+};
+
+/// Early-margin deciles (step C): the none rows' moved / cut / flipped by the decile of their margin.
+struct Deciles {
+    long long moved[kBuckets] = {};
+    long long cut[kBuckets] = {};
+    long long flip[kBuckets] = {};
+};
+
+/// SPEC-recheck-gated (D): the flip attribution by rank and layer band, [rank - 3 (ranks 3-9)][band (layer / 12, 0-3)][0 not flipped, 1 flipped],
+/// counted over the swaps (replaced picks) of each cut row.
+constexpr int kRankSlots = 7;
+constexpr int kBands = 4;
+struct RankTable {
+    long long n[kRankSlots][kBands][2] = {};
+};
+/// The rank's slot (ranks 3-9 -> 0-6), or -1.
+inline int rank_slot(int rank) { return rank >= 3 && rank <= 9 ? rank - 3 : -1; }
+/// The layer band (layers 0-11 -> 0, 12-23 -> 1, 24-35 -> 2, 36-47 -> 3; past 47 -> 3, below 0 -> 0).
+inline int band_of(int layer) {
+    const int b = layer < 0 ? 0 : layer / 12;
+    return b > 3 ? 3 : b;
+}
+
+/// Everything the gate keeps across requests and restarts.  total: the eligible rows, cumulative (what the logs print and the totals
+/// file keeps).  since: the same, since the last P_HI move (the mover's evidence).  margin_ring: the none rows' margins (running estimate).
+struct State {
+    float p_hi = kPHiDefault;
+    long long moves = 0;
+    Counts total;
+    Counts since;
+    Deciles margin;
+    RankTable rank;
+    std::vector<float> margin_ring;
+    size_t margin_pos = 0;
+};
+
+inline void add_moved(State& s, int bucket) {
+    ++s.total.moved[bucket];
+    ++s.since.moved[bucket];
+}
+inline void add_cut(State& s, int bucket) {
+    ++s.total.cut[bucket];
+    ++s.since.cut[bucket];
+}
+inline void add_flip(State& s, int bucket) {
+    ++s.total.flip[bucket];
+    ++s.since.flip[bucket];
+}
+
+/// The early margin's decile against the running estimate: the share of the ring below m, in tenths (0 with no sample; NaN is decile 0).
+inline int margin_decile(const State& s, float m) {
+    const size_t n = s.margin_ring.size();
+    if (n == 0) return 0;
+    size_t less = 0;
+    for (float v : s.margin_ring) less += v < m ? 1u : 0u;
+    const int d = (int) (10.0 * (double) less / (double) n);
+    return d > 9 ? 9 : d;
+}
+/// Adds a margin sample to the ring (NaN is not kept).
+inline void add_margin_sample(State& s, float m) {
+    if (m != m) return;
+    if (s.margin_ring.size() < (size_t) kMarginRing) {
+        s.margin_ring.push_back(m);
+    } else {
+        s.margin_ring[s.margin_pos] = m;
+        s.margin_pos = (s.margin_pos + 1) % (size_t) kMarginRing;
+    }
+}
+
+/// Rule 5, the threshold mover.  Evidence: `since` (the eligible rows since the last move) and at least kMoveRows moved rows in the
+/// drafter buckets.  Up (P_HI + one bucket, capped at 0.95) when the Wilson 90% lower bound of the confident buckets' flip rate exceeds
+/// 0.5%.  Otherwise down (P_HI - one bucket, floored at 0.6) when the Wilson 90% upper bound of the bucket just below P_HI is at most 0.5%.
+/// A move resets `since` and counts one move.  Returns +1 (up), -1 (down), 0 (no move).
+inline int step(State& s) {
+    long long moved_all = 0;
+    for (int b = 0; b < kBuckets; ++b) moved_all += s.since.moved[b];
+    if (moved_all < kMoveRows) return 0;
+    const int kc = confident_bucket(s.p_hi), kb = below_bucket(s.p_hi);
+    int dir = 0;
+    long long cm = 0, cf = 0;
+    for (int b = kc < 0 ? 0 : kc; b < kBuckets; ++b) {
+        cm += s.since.moved[b];
+        cf += s.since.flip[b];
+    }
+    if (cm > 0 && s.p_hi < kPHiHi - 1e-6f && wilson(cf, cm, false) > kFlipBound) {
+        dir = 1;
+    } else if (kb >= 0 && kb < kBuckets && s.p_hi > kPHiLo + 1e-6f && s.since.moved[kb] > 0 &&
+               wilson(s.since.flip[kb], s.since.moved[kb], true) <= kFlipBound) {
+        dir = -1;
+    }
+    if (dir == 0) return 0;
+    s.p_hi = clamp_p_hi(s.p_hi + (float) dir * kPHiStep);
+    ++s.moves;
+    s.since = Counts{};
+    return dir;
+}
+
+// ---- persistence: text, one key per line, keyed by the model's fingerprint (a file of another model is refused).
+
+/// The state as text (the fingerprint on the first line).  Floats are written with 9 digits, so a round trip is exact.
+inline std::string serialize(const State& s, uint64_t fp) {
+    std::string out;
+    char buf[64];
+    auto counts = [&](const char* name, const long long* v, int n) {
+        out += name;
+        for (int i = 0; i < n; ++i) {
+            std::snprintf(buf, sizeof buf, " %lld", v[i]);
+            out += buf;
+        }
+        out += "\n";
+    };
+    std::snprintf(buf, sizeof buf, "fingerprint %016llx\n", (unsigned long long) fp);
+    out += buf;
+    std::snprintf(buf, sizeof buf, "p_hi %.9g\n", (double) s.p_hi);
+    out += buf;
+    std::snprintf(buf, sizeof buf, "moves %lld\n", s.moves);
+    out += buf;
+    counts("total_moved", s.total.moved, kNone + 1);
+    counts("total_cut", s.total.cut, kNone + 1);
+    counts("total_flip", s.total.flip, kNone + 1);
+    counts("since_moved", s.since.moved, kNone + 1);
+    counts("since_cut", s.since.cut, kNone + 1);
+    counts("since_flip", s.since.flip, kNone + 1);
+    counts("margin_moved", s.margin.moved, kBuckets);
+    counts("margin_cut", s.margin.cut, kBuckets);
+    counts("margin_flip", s.margin.flip, kBuckets);
+    counts("rank", &s.rank.n[0][0][0], kRankSlots * kBands * 2);
+    std::snprintf(buf, sizeof buf, "margin_pos %lld\n", (long long) s.margin_pos);
+    out += buf;
+    out += "margin_ring";
+    for (float v : s.margin_ring) {
+        std::snprintf(buf, sizeof buf, " %.9g", (double) v);
+        out += buf;
+    }
+    out += "\n";
+    return out;
+}
+
+/// Reads serialize's text into s.  false (s unchanged) when the fingerprint is not fp, or a line is malformed.
+inline bool parse(const std::string& text, uint64_t fp, State& s) {
+    State t;
+    bool fp_ok = false;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream ls(line);
+        std::string key;
+        if (!(ls >> key)) continue;
+        if (key == "fingerprint") {
+            std::string hex;
+            if (!(ls >> hex)) return false;
+            fp_ok = std::stoull(hex, nullptr, 16) == (unsigned long long) fp;
+        } else if (key == "p_hi") {
+            double v = 0;
+            if (!(ls >> v)) return false;
+            t.p_hi = clamp_p_hi((float) v);
+        } else if (key == "moves") {
+            if (!(ls >> t.moves)) return false;
+        } else if (key == "margin_pos") {
+            long long v = 0;
+            if (!(ls >> v) || v < 0) return false;
+            t.margin_pos = (size_t) v;
+        } else if (key == "margin_ring") {
+            double v = 0;
+            while (ls >> v) t.margin_ring.push_back((float) v);
+        } else {
+            long long* dst = nullptr;
+            int n = 0;
+            if (key == "total_moved") { dst = t.total.moved; n = kNone + 1; }
+            else if (key == "total_cut") { dst = t.total.cut; n = kNone + 1; }
+            else if (key == "total_flip") { dst = t.total.flip; n = kNone + 1; }
+            else if (key == "since_moved") { dst = t.since.moved; n = kNone + 1; }
+            else if (key == "since_cut") { dst = t.since.cut; n = kNone + 1; }
+            else if (key == "since_flip") { dst = t.since.flip; n = kNone + 1; }
+            else if (key == "margin_moved") { dst = t.margin.moved; n = kBuckets; }
+            else if (key == "margin_cut") { dst = t.margin.cut; n = kBuckets; }
+            else if (key == "margin_flip") { dst = t.margin.flip; n = kBuckets; }
+            else if (key == "rank") { dst = &t.rank.n[0][0][0]; n = kRankSlots * kBands * 2; }
+            if (dst == nullptr) continue;   // an unknown key: kept out (forward compatibility)
+            for (int i = 0; i < n; ++i)
+                if (!(ls >> dst[i])) return false;
+        }
+    }
+    if (!fp_ok) return false;
+    if (t.margin_pos >= (size_t) kMarginRing || t.margin_ring.size() > (size_t) kMarginRing) return false;
+    s = t;
+    return true;
+}
+
+}  // namespace strata::core::gate

@@ -249,7 +249,10 @@ public:
     /// explore (optional): set true when the cut is an explore cut (no normal cut; every 16th eligible window; ratio in [k, 8k)).
     /// control (optional): set true when the cut is a control re-check (no normal or explore cut; every 32nd eligible window; a row
     /// no stand-in moved, shift 0): its flip is the noise floor, kept apart from the k / brake / guard evidence.
-    static int route_fragile_first(const float* gap, const float* shift, int n, bool* explore = nullptr, bool* control = nullptr);
+    /// eligible (optional, SPEC-recheck-gated rule 1-3): per row, 1 = the row may be cut (the gate's eligibility); a close row that is not
+    /// eligible is not cut and counted as skipped (route_gate_take).  nullptr: every row is eligible (the gate off).
+    static int route_fragile_first(const float* gap, const float* shift, int n, bool* explore = nullptr, bool* control = nullptr,
+                                   const uint8_t* eligible = nullptr);
     static void route_fragile_cut(float ratio, int32_t stand_top1, bool explore = false, bool control = false);
     /// Stop re-check (serve loop, after route_fragile_cut): marks the pending cut as a stop cut, its row's stand-in token being a stop id.
     static void route_fragile_stop_cut();
@@ -275,6 +278,23 @@ public:
     /// the fragile control flag and counts the window under its kind (control or other) with its committed tokens (kept; 0 for a merged window)
     /// and its wall seconds.  route_control_take: this request's control windows against the others, as one line (false: none ran; resets).
     static void route_window_done(int kept, double secs);
+    /// SPEC-recheck-gated (STRATA_RECHECK_GATE, on by default with the fragile re-check; off restores the re-check of before exactly).
+    /// route_gate_on: the gate is active.  route_gate_audit_next: call once per non-merged decode window before route_gate_rows; true when
+    /// the window is an audit window (rule 4: the rule is suspended, every row eligible).  route_gate_rows(bits, audit): this window's hold
+    /// bitmask of the uncertain rows (rule 2; 0 in an audit window), set before route_budget_window, which composes the device flag from it.
+    /// route_gate_p_hi: the current P_HI (rule 1).  route_gate_window(a0, bucket, shift, eligible, audit): after route_fragile_shifts, for rows
+    /// 1..a0: the eligible moved rows count into the learner's totals (drafter buckets), then rule 5 may move P_HI.  route_gate_cut(row, bucket,
+    /// audit, control, picks): the cut row's accounting and its rank-wise swaps (picks from route_recheck_picks; control cuts are not counted).
+    /// route_gate_settled(exact_ok, flipped): the pending cut's verdict (after route_fragile_settle's exact row).  route_gate_take: this
+    /// request's gate line and rank line (false when nothing ran); resets the request counts.
+    bool route_gate_on() const;
+    bool route_gate_audit_next();
+    void route_gate_rows(uint32_t bits, bool audit);
+    float route_gate_p_hi() const;
+    void route_gate_window(int a0, const int* bucket, const float* shift, const uint8_t* eligible, bool audit);
+    void route_gate_cut(int row, int bucket, bool audit, bool control, const std::vector<strata::core::recheck::Pick>& picks);
+    void route_gate_settled(bool exact_ok, bool flipped);
+    static bool route_gate_take(std::string& gate_line, std::string& rank_line);
     static bool route_control_take(std::string& out);
     /// STRATA_FRAGILE_BRAKE: at a request's end, its size class learns its start fraction and clean level (route_class_end; the tune file is
     /// written); route_class_state gives the request's class and that class's start and clean level.

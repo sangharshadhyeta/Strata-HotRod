@@ -62,6 +62,41 @@ int main() {
         check(e.todo.empty() && e.resident == 0 && e.duplicate == 0 && e.over_cap == 0, "prefetch: an empty row queues nothing");
     }
 
+    // SPEC-recheck-gated (E): ranked prefetch - rank first, then risk, the cap on the chosen set, residents skipped, layer order queued
+    {
+        auto none = [](int32_t, int32_t) { return false; };
+        // rank 5 has the highest risk but rank 3 comes first: the cap of 2 takes the rank-3 picks (largest risk first), then nothing else
+        const std::vector<rc::Pick> picks = {
+            {4, 10, 5, 9.0f}, {1, 7, 3, 0.2f}, {2, 8, 3, 0.9f}, {3, 9, 3, 0.5f}, {6, 11, 4, 1.0f},
+        };
+        const rc::PrefetchPlan p = rc::plan_prefetch_ranked(picks, 2, none);
+        check(p.todo.size() == 2 && p.over_cap == 3, "ranked: the cap of 2 keeps 2 picks and counts 3 over it");
+        // the chosen two are (2,8) risk 0.9 and (3,9) risk 0.5, both rank 3; queued in ascending layer
+        check(p.todo[0].layer == 2 && p.todo[0].expert == 8 && p.todo[1].layer == 3 && p.todo[1].expert == 9,
+              "ranked: rank 3 first, then the largest risk, queued in ascending layer");
+        const rc::PrefetchPlan big = rc::plan_prefetch_ranked(picks, 96, none);
+        check(big.todo.size() == 5 && big.over_cap == 0, "ranked: a large cap takes every fresh pick");
+        check(big.todo[0].layer == 1 && big.todo[4].layer == 6, "ranked: the queue is in ascending layer whatever the rank");
+    }
+    {
+        // a resident pick is skipped and counted, not counted against the cap; the next best takes its place
+        const std::vector<rc::Pick> picks = {{2, 8, 3, 0.9f}, {3, 9, 3, 0.5f}, {1, 7, 3, 0.2f}};
+        auto res28 = [](int32_t l, int32_t e) { return l == 2 && e == 8; };
+        const rc::PrefetchPlan p = rc::plan_prefetch_ranked(picks, 2, res28);
+        check(p.resident == 1 && p.todo.size() == 2 && p.over_cap == 0, "ranked: a resident pick is skipped, the cap counts fresh picks only");
+        check(p.todo[0].layer == 1 && p.todo[1].layer == 3, "ranked: the next fresh picks fill the cap, in layer order");
+    }
+    {
+        // a repeat keeps its first place (the best rank) and is counted as a duplicate
+        const std::vector<rc::Pick> picks = {{2, 8, 5, 0.1f}, {2, 8, 3, 0.1f}, {1, 4, 4, 0.0f}};
+        auto none = [](int32_t, int32_t) { return false; };
+        const rc::PrefetchPlan p = rc::plan_prefetch_ranked(picks, 96, none);
+        check(p.duplicate == 1 && p.todo.size() == 2, "ranked: a repeat is one pick, counted once as a duplicate");
+        check(p.todo[0].layer == 1 && p.todo[1].layer == 2, "ranked: the repeat keeps its best rank's place, queue in layer order");
+        const rc::PrefetchPlan z = rc::plan_prefetch_ranked(picks, 0, none);
+        check(z.todo.empty() && z.over_cap == 2, "ranked: cap 0 queues nothing");
+    }
+
     std::printf("recheck_cheap_test: ok\n");
     return 0;
 }

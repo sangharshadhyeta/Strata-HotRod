@@ -61,6 +61,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/recheck_cheap.hpp"
+#include "strata/core/recheck_gate.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #if defined(STRATA_PREFILL_MMQ)
@@ -2486,9 +2487,12 @@ struct RecheckPrefetchCounts {
     size_t queued = 0, resident = 0, duplicate = 0, dropped = 0;
 };
 static RecheckPrefetchCounts g_recheck_pf;
-static void recheck_prefetch(strata::core::ExpertSource* src, const std::vector<strata::core::recheck::Pick>& picks) {
+// SPEC-recheck-gated (E): with the gate on (ranked), the picks are ranked (rank, then risk) and capped at 12; with it off, the cut order of before.
+static void recheck_prefetch(strata::core::ExpertSource* src, const std::vector<strata::core::recheck::Pick>& picks, bool ranked) {
     auto* fs = dynamic_cast<strata::core::FileExpertSource*>(src);
-    const auto plan = strata::core::recheck::plan_prefetch(picks, strata::core::Verifier::route_recheck_prefetch_max(), [fs](int32_t l, int32_t e) {
+    auto is_res = [fs](int32_t l, int32_t e) { return fs != nullptr && fs->complement_ready() && fs->has_resident(l, e); };
+    const auto plan = ranked ? strata::core::recheck::plan_prefetch_ranked(picks, strata::core::Verifier::route_recheck_prefetch_max(), is_res)
+                             : strata::core::recheck::plan_prefetch(picks, strata::core::Verifier::route_recheck_prefetch_max(), [fs](int32_t l, int32_t e) {
         return fs != nullptr && fs->complement_ready() && fs->has_resident(l, e);
     });
     g_recheck_pf.resident += plan.resident;
@@ -16131,6 +16135,29 @@ int main(int argc, char** argv) {
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
                 if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                // The re-check by draft confidence (counters only, one line per request): each stand-in-moved row, cut row and flipped
+                // row, bucketed by the MTP drafter's probability for the token that row outputs (dprob[r], drafted before this window
+                // ran; bucket 10 = no drafter probability: the window's last row, a suffix/chain draft, the first window).  It measures
+                // whether the drafter's confidence predicts the flips, so close calls could be routed exactly before the window runs.
+                auto fp_bucket = [&](int r) -> int {
+                    if (first_window || from_sfx || chain_n > 0 || r >= T_mtp - 1 || r < 0 || (size_t) r >= dprob.size()) return 10;
+                    return std::min(9, std::max(0, (int) (dprob[(size_t) r] * 10.0f)));
+                };
+                // SPEC-recheck-gated rules 1-4, decided before the window runs (the hold bits go to the device flag in route_budget_window):
+                // rule 2's uncertain rows are held (exact up front) unless this is an audit window (rule 4), which holds nothing.
+                const bool g_on = ver.route_gate_on();
+                const float g_phi = ver.route_gate_p_hi();
+                std::vector<int> g_bk((size_t) T, strata::core::gate::kNone);
+                std::vector<float> g_pv((size_t) T, 0.0f);
+                for (int r = 0; r < T; ++r) {
+                    g_bk[(size_t) r] = fp_bucket(r);
+                    g_pv[(size_t) r] = (size_t) r < dprob.size() ? dprob[(size_t) r] : 0.0f;
+                }
+                bool g_audit = false;
+                if (g_on) {
+                    if (!merged) g_audit = ver.route_gate_audit_next();
+                    ver.route_gate_rows(strata::core::gate::uncertain_bits(g_bk.data(), g_pv.data(), T, g_phi, g_audit), g_audit);
+                }
                 ver.route_budget_window(true, !merged);   // STRATA_ROUTE_BUDGET_DYN: the decode budget of this window (no-op when off); AUTO: not a merged window
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -16145,11 +16172,7 @@ int main(int argc, char** argv) {
                 // The re-check by draft confidence (counters only, one line per request): each stand-in-moved row, cut row and flipped
                 // row, bucketed by the MTP drafter's probability for the token that row outputs (dprob[r], drafted before this window
                 // ran; bucket 10 = no drafter probability: the window's last row, a suffix/chain draft, the first window).  It measures
-                // whether the drafter's confidence predicts the flips, so close calls could be routed exactly before the window runs.
-                auto fp_bucket = [&](int r) -> int {
-                    if (first_window || from_sfx || chain_n > 0 || r >= T_mtp - 1 || r < 0 || (size_t) r >= dprob.size()) return 10;
-                    return std::min(9, std::max(0, (int) (dprob[(size_t) r] * 10.0f)));
-                };
+                // whether the drafter's confidence predicts the flips (fp_bucket: defined before the window)
                 // the previous cut's row, decided exactly by this window: its row 0's top-1 id (argmax; the sampled token is not judged)
                 if (rb_on) strata::core::Verifier::route_gen_now(produced_n);   // STRATA_ROLLBACK: the flips' positions
                 if (!merged && strata::core::Verifier::route_fragile_pending()) {
@@ -16158,6 +16181,7 @@ int main(int argc, char** argv) {
                     const bool ex_ok = ver.route_fragile_gaps(1, &ex_gap, &ex_top1);
                     if (fp_pend_b >= 0) {   // the re-check by draft confidence: did the cut row flip?
                         if (ex_ok && ex_top1 >= 0 && ex_top1 != fp_pend_top1) ++fp_flip[fp_pend_b];
+                        ver.route_gate_settled(ex_ok && ex_top1 >= 0, ex_top1 != fp_pend_top1);   // SPEC-recheck-gated: the gate's verdict
                         fp_pend_b = -1;
                     }
                     strata::core::Verifier::route_fragile_settle(ex_ok, ex_top1);
@@ -16183,7 +16207,14 @@ int main(int argc, char** argv) {
                     if (ver.route_fragile_gaps(a0 + 1, fr_gap.data(), fr_top1.data()) && ver.route_fragile_shifts(a0 + 1, fr_shift.data())) {
                         bool fr_explore = false;   // an explore cut: no normal cut in this window; the first row with ratio in [k, 8k) (every 16th window)
                         bool fr_control = false;   // a control re-check: no normal or explore cut; the first accepted row no stand-in moved (every 32nd window)
-                        int r = strata::core::Verifier::route_fragile_first(fr_gap.data(), fr_shift.data(), a0 + 1, &fr_explore, &fr_control);
+                        // SPEC-recheck-gated: a row is eligible for a cut (rule 1 and 2 rows are not, outside an audit window; rule 3 and an audit window's
+                        // rows are); the learner counts the eligible moved rows (route_gate_window) and rule 5 may move P_HI after them
+                        std::vector<uint8_t> g_elig((size_t) a0 + 1, 1);
+                        if (g_on)
+                            for (int q = 0; q <= a0; ++q)
+                                g_elig[(size_t) q] = strata::core::gate::eligible(strata::core::gate::classify(g_bk[(size_t) q], g_pv[(size_t) q], g_phi), g_audit) ? 1 : 0;
+                        if (g_on) ver.route_gate_window(a0, g_bk.data(), fr_shift.data(), g_elig.data(), g_audit);
+                        int r = strata::core::Verifier::route_fragile_first(fr_gap.data(), fr_shift.data(), a0 + 1, &fr_explore, &fr_control, g_on ? g_elig.data() : nullptr);
                         for (int q = 1; q <= a0; ++q)   // the re-check by draft confidence: the rows a stand-in moved (row 0 is never cut)
                             if (fr_shift[(size_t) q] > 0.0f) ++fp_moved[fp_bucket(q)];
                         // Stop re-check (no normal, explore or control cut): the first row q in 1..a0 that a stand-in moved and whose token is a stop
@@ -16192,7 +16223,8 @@ int main(int argc, char** argv) {
                         bool fr_stop = false;
                         if (r < 1)
                             for (int q = 1; q <= a0 && !fr_stop; ++q)
-                                if (fr_shift[(size_t) q] > 0.0f && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) q]) != o.eos_ids.end()) {
+                                if (fr_shift[(size_t) q] > 0.0f && g_elig[(size_t) q] != 0 &&   // SPEC-recheck-gated: an eligible row only
+                                    std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) q]) != o.eos_ids.end()) {
                                     r = q;
                                     fr_stop = true;
                                 }
@@ -16203,10 +16235,12 @@ int main(int argc, char** argv) {
                             ver.standin_learn_cut(r);   // STRATA_STANDIN_LEARN: the cut row's first stand-in and its y_s (no-op when off)
                             ver.mask_learn_cut(r, fr_top1[(size_t) r], T, fr_control);   // STRATA_MASK=learn: the first-pass logits, the row's picks
                             // SPEC-recheck-cheap change 2: the row's replaced picks are read ahead before the exact successor runs (host, between windows)
-                            if (srcp != nullptr && strata::core::Verifier::route_recheck_prefetch_on()) {
-                                std::vector<strata::core::recheck::Pick> rc_picks;
-                                if (ver.route_recheck_picks(r, rc_picks) > 0) recheck_prefetch(srcp, rc_picks);
-                            }
+                            // (the cut row's events, once: the gate's rank-wise count (D) and the prefetch (E, ranked with the gate on))
+                            std::vector<strata::core::recheck::Pick> rc_picks;
+                            const bool pf_on = srcp != nullptr && strata::core::Verifier::route_recheck_prefetch_on();
+                            if (pf_on || g_on) ver.route_recheck_picks(r, rc_picks);
+                            if (g_on) ver.route_gate_cut(r, fp_bucket(r), g_audit, fr_control, rc_picks);
+                            if (pf_on && !rc_picks.empty()) recheck_prefetch(srcp, rc_picks, g_on);
                             if (rb_on) strata::core::Verifier::route_fragile_pos(produced_n + r);   // STRATA_ROLLBACK: row r's token position
                             fr_cut = r;
                             fp_pend_b = fp_bucket(r);   // the re-check by draft confidence: this cut's bucket, judged by the next window
@@ -16805,6 +16839,13 @@ int main(int argc, char** argv) {
             {   // STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL: this request's control windows against the others (one line when any ran)
                 std::string ctl_line;
                 if (strata::core::Verifier::route_control_take(ctl_line)) std::fprintf(stderr, "strata serve: %s\n", ctl_line.c_str());
+            }
+            {   // SPEC-recheck-gated: this request's gate counts (held rows, cuts skipped by rule 1, audit windows and their buckets) and the rank-wise flips
+                std::string gate_line, rank_line;
+                if (strata::core::Verifier::route_gate_take(gate_line, rank_line)) {
+                    if (!gate_line.empty()) std::fprintf(stderr, "strata serve: recheck gate: %s\n", gate_line.c_str());
+                    if (!rank_line.empty()) std::fprintf(stderr, "strata serve: %s\n", rank_line.c_str());
+                }
             }
             {   // the re-check by draft confidence: one line per request when any row was moved (buckets 0.0-0.1 .. 0.9-1.0, then "none")
                 long long any = 0;

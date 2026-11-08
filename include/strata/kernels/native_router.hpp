@@ -15,8 +15,12 @@ struct MaskEv {
     int32_t layer;
     int32_t expert;
     float x;
-    int32_t kind;   // 1: a mask move, 0: a stand-in swap (the share follows the flips the mask adds beyond the stand-ins')
+    int32_t kind;   // bit 0: 1 = a mask move, 0 = a stand-in swap; bits 1-4: the replaced pick's router rank (0-9), see mask_ev_pack
 };
+/// SPEC-recheck-gated (D): MaskEv::kind packs the event's kind in bit 0 (unchanged meaning) and the replaced pick's rank in bits 1-4.
+constexpr int32_t mask_ev_pack(int kind, int rank) { return (int32_t) ((kind & 1) | ((rank & 15) << 1)); }
+constexpr int mask_ev_kind(int32_t v) { return v & 1; }
+constexpr int mask_ev_rank(int32_t v) { return (v >> 1) & 15; }
 struct MaskEvs {
     unsigned n[kMaskEvRows];
     MaskEv e[kMaskEvRows][kMaskEvCap];
@@ -81,7 +85,9 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                            unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr,
                            const uint8_t* ring = nullptr, const uint8_t* cheap = nullptr, unsigned long long* bstats = nullptr,
                            float* row_shift = nullptr, const float* pair_c = nullptr, int32_t* lrn_rec = nullptr, int layer = 0,
-                           const float* pair_pe = nullptr, MaskEvs* mev = nullptr, int row_base = 0);
+                           const float* pair_pe = nullptr, MaskEvs* mev = nullptr, int row_base = 0, float* margin_out = nullptr);
+/// SPEC-recheck-gated (C): margin_out = nullptr or the device array [rows] (row_base + t); layers 0-3 min their router's top-1 minus top-2
+/// raw logit into it (the caller sets it to a large value before the window).  Other layers leave it alone.
 /// STRATA_STANDIN_BALANCE: pair_pe = the layer's [512][512] risk factor (clip(err / mean err, 0.25, 4) of a ready pair, 1 otherwise), or nullptr.
 /// STRATA_STANDIN_LEARN: pair_c = the layer's [512][512] correction (nullptr: none); lrn_rec = nullptr or the rows' [n][4] first-stand-in
 /// records (layer, rank, true expert, stand-in; layer -1 until set, the host resets them per window); layer = this layer's index.
