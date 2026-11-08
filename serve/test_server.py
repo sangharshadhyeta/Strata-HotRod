@@ -22,9 +22,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
+from serve.prompt_cache import PromptCache  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
                           PP_DONE_TAIL, Service,
-                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
+                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_cache_fingerprint,
+                          prompt_progress,
                           prompt_tokens_seen,
                           request_stats, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
@@ -6151,3 +6153,160 @@ class PrepareCancelled(unittest.TestCase):
             ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
+
+
+class FakeCacheEngine:
+    """A PromptCache engine stand-in: SAVE writes a small file and answers the count the engine holds (`held_len`)."""
+    gen = 1
+
+    def __init__(self):
+        self.held_len = 0
+        self.saves = []
+
+    def session_file(self, action, path):
+        with open(path, "wb") as f:
+            f.write(b"x" * 64)
+        self.saves.append(path)
+        return {"tokens": self.held_len, "bytes": 64, "ms": 1.0}
+
+
+class PromptCacheSwitch(unittest.TestCase):
+    """8 Nov: a conversation the engine holds is saved before another replaces it; only the latest save of a conversation is kept;
+    the fingerprint does not follow the engine file's size or mtime; entries unused past the age limit go."""
+    T = 248045                                    # a turn token id (id equality only)
+
+    @staticmethod
+    def conversation(who, n_tail, tail):
+        """System turn, then the first user turn `who` (the key), then a tail of `n_tail` tokens."""
+        return [1, PromptCacheSwitch.T, 2, PromptCacheSwitch.T, who, PromptCacheSwitch.T] + [tail] * n_tail
+
+    def save(self, pc, eng, ids, gen):
+        eng.held_len = len(ids) + len(gen)
+        return pc.after(eng, ids, gen, prompt_read=100)
+
+    def test_held_conversation_saved_before_a_different_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            pc = PromptCache(d, "fp", min_read=16, turn_id=self.T)
+            eng = FakeCacheEngine()
+            ids, gen = self.conversation(3, 40, 7), [8, 9]
+            eng.held_len = len(ids) + len(gen)
+            self.assertIsNone(pc.after(eng, ids, gen, prompt_read=None, save=False))   # records what the engine holds only
+            self.assertEqual(os.listdir(d), [])
+            self.assertIsNone(pc.before_switch(eng, ids + gen + [10] * 5), "a request that continues it saves nothing")
+            self.assertIsNone(pc.before_switch(eng, ids + gen[:1]), "a request that continues it, shorter, saves nothing")
+            eng.gen = 2
+            self.assertIsNone(pc.before_switch(eng, self.conversation(9, 40, 7)), "another engine process: not its state")
+            eng.gen = 1
+            note = pc.before_switch(eng, self.conversation(9, 40, 7))
+            self.assertTrue(note.startswith("prompt cache: saved the conversation being replaced ("), note)
+            self.assertEqual(len(eng.saves), 1)
+            self.assertEqual(len([n for n in os.listdir(d) if n.endswith(".json")]), 1)
+            short = PromptCache(d, "fp", min_read=1000, turn_id=self.T)
+            short.held, short.held_gen = ids, 1
+            self.assertIsNone(short.before_switch(eng, self.conversation(9, 40, 7)), "shorter than min_read: not saved")
+
+    def test_latest_save_only_per_conversation(self):
+        with tempfile.TemporaryDirectory() as d:
+            pc = PromptCache(d, "fp", min_read=16, turn_id=self.T)
+            eng = FakeCacheEngine()
+            self.save(pc, eng, self.conversation(3, 20, 7), [8])
+            middle = self.conversation(3, 25, 5) + [51]               # the same first two turns, a changed middle
+            self.save(pc, eng, middle, [52])
+            self.assertEqual(len(pc.entries), 1, "the older save of the conversation is dropped")
+            later = middle + [52] + [60] * 30                          # a later, longer prompt that continues it
+            self.save(pc, eng, later, [61, 62])
+            self.assertEqual(len(pc.entries), 1)
+            self.assertEqual(list(pc.entries.values())[0]["tokens"], later + [61, 62])
+            self.assertEqual(len([n for n in os.listdir(d) if n.endswith(".json")]), 1)
+
+    def test_two_conversations_keep_one_entry_each(self):
+        with tempfile.TemporaryDirectory() as d:
+            pc = PromptCache(d, "fp", min_read=16, turn_id=self.T)
+            eng = FakeCacheEngine()
+            self.save(pc, eng, self.conversation(3, 20, 7), [8])
+            self.save(pc, eng, self.conversation(9, 20, 7), [8])
+            self.assertEqual(len(pc.entries), 2)
+
+    def test_the_request_path_saves_before_it_restores(self):
+        calls = []
+
+        class Recording:
+            held, held_gen = None, None
+            entries, stats, dir = {}, {}, ""
+
+            def before_switch(self, engine, ids):
+                calls.append("switch")
+
+            def before(self, engine, ids):
+                calls.append("before")
+
+            def after(self, engine, ids, generated, prompt_read, save=True):
+                return None
+
+            def covers(self, ids, gen):
+                return False
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "Hello."), tok, ChatTemplate(Path(__file__).resolve().parent / "chat_template.jinja"))
+        svc.pcache = Recording()
+        list(svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event()))
+        self.assertEqual(calls[:2], ["switch", "before"])
+
+    def test_fingerprint_ignores_the_engine_file_mtime_and_size_unless_strict(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "engine")
+            with open(exe, "wb") as f:
+                f.write(b"a" * 10)
+            os.utime(exe, (1_000_000_000, 1_000_000_000))
+            cfg = {"model_name": "m", "exe": exe, "args": ["--ctx", "8192", "--prefill", "512"]}
+            fp = prompt_cache_fingerprint(cfg)
+            os.utime(exe, (1_100_000_000, 1_100_000_000))                # a rebuild: a new mtime
+            self.assertEqual(prompt_cache_fingerprint(cfg), fp)
+            with open(exe, "wb") as f:                                    # ... and a new size
+                f.write(b"b" * 20)
+            self.assertEqual(prompt_cache_fingerprint(cfg), fp)
+            strict = dict(cfg, prompt_cache_strict_build=True)
+            sfp = prompt_cache_fingerprint(strict)
+            self.assertNotEqual(sfp, fp)
+            os.utime(exe, (1_200_000_000, 1_200_000_000))
+            self.assertNotEqual(prompt_cache_fingerprint(strict), sfp, "strict: the mtime is in it")
+            self.assertNotEqual(prompt_cache_fingerprint(dict(cfg, args=["--ctx", "4096"])), fp, "a state setting is in it")
+            self.assertEqual(prompt_cache_fingerprint(dict(cfg, args=["--ctx", "8192", "--prefill", "1024"])), fp,
+                             "a speed-only setting is not")
+
+    def write_entry(self, d, key, fp, used):
+        with open(os.path.join(d, key + ".bin"), "wb") as f:
+            f.write(b"x" * 100)
+        with open(os.path.join(d, key + ".json"), "w", encoding="utf-8") as f:
+            json.dump({"fingerprint": fp, "tokens": [1, 2, 3], "used": used, "prompt_len": 3}, f)
+
+    def test_entries_unused_past_the_age_limit_go_at_scan(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            self.write_entry(d, "old", "fp", now - 3 * 3600)
+            self.write_entry(d, "fresh", "fp", now - 60)
+            self.write_entry(d, "oldforeign", "other", now - 3 * 3600)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                pc = PromptCache(d, "fp", max_age_s=3600)
+            self.assertEqual(sorted(pc.entries), ["fresh"])
+            self.assertFalse(os.path.exists(os.path.join(d, "old.bin")))
+            self.assertIn("prompt cache: dropped 2 entries unused for over 1 h (0.00 GiB)", buf.getvalue())
+
+    def test_the_age_limit_applies_after_a_save(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            self.write_entry(d, "old", "fp", now - 3 * 3600)
+            self.write_entry(d, "fresh", "fp", now - 60)
+            pc = PromptCache(d, "fp", min_read=16, turn_id=self.T)     # no age limit at the scan: both kept
+            self.assertEqual(sorted(pc.entries), ["fresh", "old"])
+            pc.max_age_s = 3600
+            eng = FakeCacheEngine()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                note = self.save(pc, eng, self.conversation(3, 20, 7), [8])
+            self.assertIn("saved", note)
+            self.assertNotIn("old", pc.entries)
+            self.assertFalse(os.path.exists(os.path.join(d, "old.bin")))
+            self.assertIn("fresh", pc.entries)
+            self.assertEqual(len(pc.entries), 2)
+            self.assertIn("prompt cache: dropped 1 entries unused for over 1 h", buf.getvalue())

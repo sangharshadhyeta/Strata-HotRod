@@ -24,13 +24,14 @@ import time
 
 class PromptCache:
     def __init__(self, directory: str, fingerprint: str, min_read: int = 256, min_gain: int = 256, limit_bytes: int | None = None,
-                 turn_id: int | None = None):
+                 turn_id: int | None = None, max_age_s: float = 0):
         self.dir = directory
         self.fingerprint = fingerprint
         self.min_read = min_read          # a request that read fewer prompt tokens than this is not worth a save
         self.min_gain = min_gain          # a restore must bring at least this many tokens the engine does not hold
         self.limit_bytes = limit_bytes    # None: an eighth of the free disk, between 1 GiB and 256 GiB (solid's rule)
         self.turn_id = turn_id            # <|im_start|>: the engine's turn checkpoint sits at an entry's last one (None: whole entries only)
+        self.max_age_s = max_age_s        # an entry unused (its "used" time) for longer goes, the last own one too (0: no age limit)
         self.held: list[int] | None = None   # what the engine holds now, as far as this server knows (a hint: the engine checks)
         self.held_gen = None                 # ... and the engine process it was true of
         self.entries: dict[str, dict] = {}
@@ -81,10 +82,27 @@ class PromptCache:
                 pass
         self._trim()
 
+    def _age_out(self):
+        """E1 (8 Nov): an entry unused for longer than max_age_s goes - another build's or this engine's, the last own one too
+        (unlike the size rule): a save nobody has used for that long is dropped.  Logged as one line."""
+        if not self.max_age_s:
+            return
+        cutoff = time.time() - self.max_age_s
+        old = [k for k, e in self.entries.items() if e["used"] < cutoff] + [k for k, e in self.foreign.items() if e["used"] < cutoff]
+        if not old:
+            return
+        freed = sum((self.entries.get(k) or self.foreign[k])["bytes"] for k in old)
+        for k in old:
+            self._remove(k)
+            self.stats["dropped"] += 1
+        print(f"[strata] prompt cache: dropped {len(old)} entries unused for over {self.max_age_s / 3600:g} h "
+              f"({freed / (1 << 30):.2f} GiB)", flush=True)
+
     def _trim(self, keep: str | None = None):
         """Under the limit: the entries other engine builds or settings wrote go first (oldest first: this engine never restores
         them, but a rollback to the build that wrote them can while they are kept), then this engine's own, least recently
-        used first; `keep` (the entry just saved) and the last own entry stay."""
+        used first; `keep` (the entry just saved) and the last own entry stay.  Entries unused past max_age_s go first of all."""
+        self._age_out()
         limit = self._limit()
         own = lambda: sum(e["bytes"] for e in self.entries.values())   # noqa: E731
         while self.foreign and own() + sum(e["bytes"] for e in self.foreign.values()) > limit:
@@ -211,6 +229,30 @@ class PromptCache:
         self.held, self.held_gen = tokens, gen
         if not save or not prompt_read or prompt_read < self.min_read or any(self._prefix_len(e["tokens"], tokens) == len(tokens) for e in self.entries.values()):
             return None                   # a short read, or an entry already holds all of it
+        return self._save(engine, tokens, ids=ids)
+
+    # ---- before a request that switches conversation: the one the engine holds is saved first (8 Nov)
+    def before_switch(self, engine, ids: list[int]) -> str | None:
+        """A long conversation the engine holds is replaced by this request (its prompt does not start with what the engine holds):
+        it is saved first, so its next turn restores instead of reading it again (8 Nov: a 180K-token agent conversation was
+        read again from token 0 after one other request).  Not when the request continues it, when it is shorter than min_read,
+        when the held process is not this engine, or when an entry already holds all of it.  Called with the fifo held, before
+        before().  Returns a line to log, or None."""
+        held = self.held
+        if held is None or len(held) < self.min_read or self.held_gen != getattr(engine, "gen", None):
+            return None
+        if self._prefix_len(self.held, ids) >= len(self.held) - 2:   # the request continues it (the engine's one or two extra tokens allowed)
+            return None
+        if any(self._prefix_len(e["tokens"], held) == len(held) for e in self.entries.values()):
+            return None
+        return self._save(engine, list(held), replaced=True)
+
+    # ---- the save itself, shared by after() and before_switch()
+    def _save(self, engine, tokens: list[int], ids: list[int] | None = None, replaced: bool = False) -> str | None:
+        """Saves what the engine holds (`tokens`, as this server knows it) as one entry.  `ids` (the prompt) only goes into the
+        entry's prompt_len; `replaced`: the log line says the conversation was replaced.  The entry is written whole, the entries
+        it continues are dropped, and so are the other entries of the same conversation (B2: its key is its tokens up to and
+        including the third turn token, so only the latest save of a conversation is kept).  Returns a line to log, or None."""
         key = hashlib.sha1(json.dumps(tokens).encode()).hexdigest()[:24]
         path = os.path.join(self.dir, key + ".bin")
         t0 = time.time()
@@ -231,15 +273,35 @@ class PromptCache:
         if not 0 <= saved - len(tokens) <= 2:   # a count further off than the engine's one extra token: the lists no longer agree
             self._remove(key)
             return f"prompt cache: the engine saved {saved} tokens, this server expected {len(tokens)} to {len(tokens) + 2}; entry dropped"
-        meta = {"fingerprint": self.fingerprint, "tokens": tokens, "used": time.time(), "prompt_len": len(ids)}
+        meta = {"fingerprint": self.fingerprint, "tokens": tokens, "used": time.time(), "prompt_len": len(ids or tokens)}
         tmp = os.path.join(self.dir, key + ".json.tmp")
         with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
             json.dump(meta, f)
         os.replace(tmp, os.path.join(self.dir, key + ".json"))   # the sidecar last and whole: an entry exists only with both
-        self.entries[key] = {"tokens": tokens, "bytes": os.path.getsize(path), "used": meta["used"], "prompt_len": len(ids)}
+        self.entries[key] = {"tokens": tokens, "bytes": os.path.getsize(path), "used": meta["used"], "prompt_len": meta["prompt_len"]}
         self.stats["saves"] += 1
         for k in [k for k, e in self.entries.items() if k != key and self._prefix_len(e["tokens"], tokens) == len(e["tokens"])]:
             self._remove(k)               # a shorter entry that this one continues is no longer needed
             self.stats["dropped"] += 1
+        conv = self._conv_len(tokens)     # B2: the same conversation's other saves go (only the latest is kept)
+        if conv is not None:
+            for k in [k for k, e in self.entries.items() if k != key and self._conv_len(e["tokens"]) == conv
+                      and self._prefix_len(e["tokens"], tokens) >= conv]:
+                self._remove(k)
+                self.stats["dropped"] += 1
         self._trim(keep=key)
-        return f"prompt cache: saved {len(tokens)} tokens in {time.time() - t0:.2f} s ({self.entries[key]['bytes'] >> 20} MiB, {len(self.entries)} entries)"
+        what = f"the conversation being replaced ({len(tokens)} tokens)" if replaced else f"{len(tokens)} tokens"
+        return f"prompt cache: saved {what} in {time.time() - t0:.2f} s ({self.entries[key]['bytes'] >> 20} MiB, {len(self.entries)} entries)"
+
+    def _conv_len(self, t: list[int]) -> int | None:
+        """B1: the length of a conversation's key - its tokens up to and including the third turn token (the system turn and the
+        first user turn).  None with fewer than three turn tokens, or no turn_id.  Id equality only."""
+        if self.turn_id is None:
+            return None
+        i = -1
+        try:
+            for _ in range(3):
+                i = t.index(self.turn_id, i + 1)
+        except ValueError:
+            return None
+        return i + 1

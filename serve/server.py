@@ -4809,6 +4809,18 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     pc_read = None                      # the prompt tokens this request read (the prompt cache saves after a long read)
                     if self.pcache is not None and not par and not emb:
+                        # A2 (8 Nov): a long conversation the engine holds is replaced by this prompt: it is saved first, so its
+                        # next turn can restore it (the save is skipped when this prompt continues what the engine holds)
+                        try:
+                            note = self.pcache.before_switch(self.engine, ids)
+                            if note:
+                                print(f"[strata] {note}", flush=True)
+                        except (EngineDied, EngineSilent) as e:
+                            finish = "error"
+                            self._say_died(e)
+                            raise
+                        except Exception as e:          # an extra, as before(): its failure never fails a request
+                            print(f"[strata] prompt cache (before switch): {e!r}", flush=True)
                         # the long start of this prompt may be on disk (a conversation the engine no longer holds, after a restart)
                         try:
                             note = self.pcache.before(self.engine, ids)
@@ -7515,6 +7527,39 @@ def default_model_name(cfg: dict) -> str:
     return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
 
 
+def prompt_cache_fingerprint(cfg: dict) -> str:
+    """The prompt cache's fingerprint: the model, the engine file's path and the arguments that change the state.  C1 (8 Nov): the
+    engine file's size and mtime are left out, so a rebuild keeps the saved prompts - the engine checks each file it restores
+    (header, model and config fingerprints, the K/V shapes) and refuses one it cannot use, which costs a re-read, never a wrong
+    answer.  "prompt_cache_strict_build": true puts size and mtime back (the list is then the one this fingerprint always was)."""
+    exe = cfg.get("exe") or ""
+    # Hot Rod (19 Oct): settings that change only HOW FAST the same state is computed (the prompt chunk, the RAM tier,
+    # swap rounds, PCIe share, the expert cache, drafting) are left out, so tuning them no longer drops every saved
+    # prompt - each such change emptied the cache (41 GB, "0 entries kept"); the prompt path's output was measured
+    # identical across these. The engine file, the model, the K/V format and the context stay in it, and the engine
+    # still checks every restored file itself.
+    speed_only = {"--prefill", "--resident-budget-gib", "--adapt-every", "--adapt-swaps", "--pcie-frac",
+                  "--expert-cache", "--spec", "--spec-min-p", "--mmap-experts", "--resident-experts",
+                  "--expert-profile", "--pool-workers", "--pool-tasks"}
+    state_args, skip = [], False
+    args_l = list(cfg.get("args") or [])
+    for i, x in enumerate(args_l):
+        if skip:
+            skip = False
+            continue
+        if x in speed_only:
+            # a flag with a value: its value is the next argument unless that is another flag
+            skip = i + 1 < len(args_l) and not str(args_l[i + 1]).startswith("--")
+            continue
+        state_args.append(x)
+    parts = [cfg.get("model_name"), exe]
+    if cfg.get("prompt_cache_strict_build"):
+        st_exe = os.stat(exe) if exe and os.path.exists(exe) else None
+        parts += [st_exe.st_size if st_exe else 0, st_exe.st_mtime_ns if st_exe else 0]
+    parts.append(state_args)
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:32]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -7765,35 +7810,16 @@ def main() -> int:
     # file, its arguments and the model, so a rebuilt engine or another setting never restores an old one.
     if cfg.get("prompt_cache_path"):
         try:
-            exe = cfg.get("exe") or ""
-            st_exe = os.stat(exe) if exe and os.path.exists(exe) else None
-            # Hot Rod (19 Oct): settings that change only HOW FAST the same state is computed (the prompt chunk, the RAM tier,
-            # swap rounds, PCIe share, the expert cache, drafting) are left out, so tuning them no longer drops every saved
-            # prompt - each such change emptied the cache (41 GB, "0 entries kept"); the prompt path's output was measured
-            # identical across these. The engine file, the model, the K/V format and the context stay in it, and the engine
-            # still checks every restored file itself.
-            speed_only = {"--prefill", "--resident-budget-gib", "--adapt-every", "--adapt-swaps", "--pcie-frac",
-                          "--expert-cache", "--spec", "--spec-min-p", "--mmap-experts", "--resident-experts",
-                          "--expert-profile", "--pool-workers", "--pool-tasks"}
-            state_args, skip = [], False
-            args_l = list(cfg.get("args") or [])
-            for i, x in enumerate(args_l):
-                if skip:
-                    skip = False
-                    continue
-                if x in speed_only:
-                    # a flag with a value: its value is the next argument unless that is another flag
-                    skip = i + 1 < len(args_l) and not str(args_l[i + 1]).startswith("--")
-                    continue
-                state_args.append(x)
-            fp = hashlib.sha256(json.dumps([cfg.get("model_name"), exe, st_exe.st_size if st_exe else 0, st_exe.st_mtime_ns if st_exe else 0,
-                                            state_args], sort_keys=True, default=str).encode()).hexdigest()[:32]
+            fp = prompt_cache_fingerprint(cfg)
             # only reads of 16k+ tokens are saved (a re-read of 25 s or more): 19 Oct, 432 saves wrote 369 GB to the expert drive
             # for 12 restores - the next request almost always continues in RAM.  ("prompt_cache_min_read" overrides.)
+            # E1 (8 Nov): an entry unused for "prompt_cache_max_age_h" hours (default 48; 0: no limit) is dropped
+            max_age_h = cfg.get("prompt_cache_max_age_h")
             svc.pcache = PromptCache(slot_save_dir(cfg["prompt_cache_path"], cfg.get("cwd")), fp,
                                      min_read=int(cfg.get("prompt_cache_min_read") or 16384),
                                      limit_bytes=int(cfg["prompt_cache_gib"] * (1 << 30)) if cfg.get("prompt_cache_gib") else None,
-                                     turn_id=StrataEngine.TURN_ID)
+                                     turn_id=StrataEngine.TURN_ID,
+                                     max_age_s=float(48 if max_age_h is None else max_age_h) * 3600)
         except (ValueError, OSError) as e:
             raise SystemExit(f"[strata] prompt cache: {e}")
         print(f"[strata] prompt cache on: {svc.pcache.dir} ({len(svc.pcache.entries)} entries kept from earlier)", flush=True)
