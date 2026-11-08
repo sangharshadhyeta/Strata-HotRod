@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "strata/core/tune_steps.hpp"
+
 namespace strata::core::gate {
 
 constexpr int kNone = 10;                      ///< the bucket of a row with no drafter probability (fp_bucket's 10)
@@ -177,6 +179,7 @@ struct State {
     Counts since;
     Deciles margin;
     RankTable rank;
+    tune::Tune tune;     ///< step G: the cap multipliers and the prefetch count chosen by the paired tuner (persisted)
     Ring shift;          ///< step F: the moved rows' final row_shift (the cap's median, the calibration deciles)
     ShiftCal cal;        ///< step F: the cut rows' shift decile, split by the verdict
     std::vector<float> margin_ring;
@@ -276,6 +279,13 @@ inline std::string serialize(const State& s, uint64_t fp) {
     counts("rank", &s.rank.n[0][0][0], kRankSlots * kBands * 2);
     counts("cal_flip", s.cal.flip, kBuckets);
     counts("cal_not", s.cal.not_flip, kBuckets);
+    std::snprintf(buf, sizeof buf, "tune_set %d\n", s.tune.set ? 1 : 0);
+    out += buf;
+    std::snprintf(buf, sizeof buf, "tune_cap %.9g %.9g %.9g %d %d %d\n", s.tune.cap_unc, s.tune.cap_none, (double) s.tune.cap_step,
+                  s.tune.cap_last_win, s.tune.cap_first, s.tune.cap_stage);
+    out += buf;
+    std::snprintf(buf, sizeof buf, "tune_prefetch %lld %d %d\n", s.tune.prefetch, s.tune.pf_first, s.tune.pf_stage);
+    out += buf;
     std::snprintf(buf, sizeof buf, "shift_pos %lld\n", (long long) s.shift.pos);
     out += buf;
     out += "shift_ring";
@@ -322,6 +332,29 @@ inline bool parse(const std::string& text, uint64_t fp, State& s) {
         } else if (key == "margin_ring") {
             double v = 0;
             while (ls >> v) t.margin_ring.push_back((float) v);
+        } else if (key == "tune_set") {
+            int v = 0;
+            if (!(ls >> v)) return false;
+            t.tune.set = v != 0;
+        } else if (key == "tune_cap") {
+            double u = 0, n = 0, st = 0;
+            int lw = 0, f = 1, sg = 0;
+            if (!(ls >> u >> n >> st >> lw >> f >> sg)) return false;
+            if (!(u > 0.0) || !(n > 0.0) || !(st > 0.0)) return false;
+            t.tune.cap_unc = u;
+            t.tune.cap_none = n;
+            t.tune.cap_step = (float) st;
+            t.tune.cap_last_win = lw;
+            t.tune.cap_first = f < 0 ? -1 : 1;
+            t.tune.cap_stage = sg != 0 ? 1 : 0;
+        } else if (key == "tune_prefetch") {
+            long long p = 0;
+            int f = 1, sg = 0;
+            if (!(ls >> p >> f >> sg)) return false;
+            if (p < tune::kPrefetchLo || p > tune::kPrefetchHi) return false;
+            t.tune.prefetch = p;
+            t.tune.pf_first = f < 0 ? -1 : 1;
+            t.tune.pf_stage = sg != 0 ? 1 : 0;
         } else if (key == "shift_pos") {
             long long v = 0;
             if (!(ls >> v) || v < 0) return false;

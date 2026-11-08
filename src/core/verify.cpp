@@ -281,7 +281,14 @@ struct RouteResidentCfg {
     // STRATA_MASK=learn x AUTO: after each budget test the next one is a MASK test (the mask's depth (p, g), see mask_test_begin): the same
     // interleaved arms, both at req_b; the arms are the mask's levels (uploaded when the arm changes).  Its state (p, g) lives in the learner.
     bool auto_mask = false;                   ///< the running test is a mask test
-    bool auto_mask_next = false;              ///< the next test is a mask test (set when a budget test ends under STRATA_MASK=learn)
+    // SPEC-recheck-gated step G: the rotation budget -> mask -> cap -> prefetch -> budget (tune_steps.hpp).  auto_next_kind: the kind the
+    // scheduler starts next; auto_kind: the running test's kind (tune::Kind).  The cap and prefetch tests use the budget test's rule and
+    // decision (paired::decide, the quality veto, the cut guard); their candidates are in auto_cap_cu / _cn and auto_pf_cand.
+    int auto_next_kind = 0;                   ///< tune::Kind of the next test
+    int auto_kind = 0;                        ///< tune::Kind of the running test (Budget when none runs)
+    bool tune_cap_on = false, tune_pf_on = false;   ///< STRATA_TUNE_CAP / STRATA_TUNE_PREFETCH (with the gate; 0 = fixed)
+    double auto_cap_cu = 0.0, auto_cap_cn = 0.0;    ///< the running cap test's candidate multipliers (the arm 1 values)
+    long long auto_pf_cand = 0;               ///< the running prefetch test's candidate count (the arm 1 value)
     bool auto_mask_ok = false;                ///< the mask learner is active for this window (route_budget_window sets it before the scheduler)
     // Learned state across restarts (route_tune_open): standin-tune.txt beside the expert profile, keyed to the model fingerprint.
     // Written after each finished test and each k update; read once at serve start (AUTO / FRAGILE on).
@@ -450,8 +457,14 @@ RouteResidentCfg& route_resident_cfg() {
         if (const char* v = std::getenv("STRATA_RECHECK_AUDIT_EVERY")) r.gate_audit_every = std::max(0LL, std::atoll(v));
         // SPEC-recheck-gated step F: the shift cap (default on with the gate; 0 = +inf everywhere), its multipliers
         { const char* v = std::getenv("STRATA_SHIFT_CAP"); r.cap_on = r.gate_on && (v == nullptr || std::atoi(v) != 0); }
-        if (const char* v = std::getenv("STRATA_SHIFT_CAP_UNC")) r.cap_mult.unc = (float) std::atof(v);
-        if (const char* v = std::getenv("STRATA_SHIFT_CAP_NONE")) r.cap_mult.none = (float) std::atof(v);
+        // SPEC-recheck-gated step G: the cap multipliers and the prefetch count are the paired tuner's (persisted in the .gate file); the env
+        // values are their start values only when no saved state exists (route_gate_read sets tune.set)
+        if (const char* v = std::getenv("STRATA_SHIFT_CAP_UNC")) r.gs.tune.cap_unc = std::atof(v);
+        if (const char* v = std::getenv("STRATA_SHIFT_CAP_NONE")) r.gs.tune.cap_none = std::atof(v);
+        if (const char* v = std::getenv("STRATA_RECHECK_PREFETCH_MAX")) r.gs.tune.prefetch = std::max(0LL, std::min(64LL, std::atoll(v)));
+        else if (r.gate_on) r.gs.tune.prefetch = 12;
+        { const char* v = std::getenv("STRATA_TUNE_CAP"); r.tune_cap_on = r.gate_on && (v == nullptr || std::atoi(v) != 0); }
+        { const char* v = std::getenv("STRATA_TUNE_PREFETCH"); r.tune_pf_on = r.gate_on && std::getenv("STRATA_RECHECK_PREFETCH_MAX") == nullptr && (v == nullptr || std::atoi(v) != 0); }
         if (const char* v = std::getenv("STRATA_SHIFT_CAP_CONF")) r.cap_mult.conf = (float) std::atof(v);
         // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 off): every n-th eligible decode window is a fragile control window (see RouteResidentCfg)
         if (const char* v = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) r.fr_ctrl_every = std::max(0LL, std::atoll(v));
@@ -5016,13 +5029,22 @@ void Verifier::route_shift_cap_window(const int* bucket, const float* p, int T, 
     if (!c.cap_on) return;
     const float median = c.gs.shift.median();
     const size_t n = c.gs.shift.n();
+    // SPEC-recheck-gated step G: the multipliers are the tuned pair; arm 1 of a running cap test uses its candidate (the window is timed
+    // as that arm by route_auto_window, so the candidate is the only difference between the arms)
+    strata::core::gate::CapMult m = c.cap_mult;
+    m.unc = (float) c.gs.tune.cap_unc;
+    m.none = (float) c.gs.tune.cap_none;
+    if (c.auto_kind == tune::Cap && c.auto_testing && c.auto_win_arm == 1) {
+        m.unc = (float) c.auto_cap_cu;
+        m.none = (float) c.auto_cap_cn;
+    }
     float caps[32];
-    strata::core::gate::fill_caps(caps, bucket, p, T, c.gs.p_hi, audit, median, n, c.cap_mult);
+    strata::core::gate::fill_caps(caps, bucket, p, T, c.gs.p_hi, audit, median, n, m);
     strata::kernels::route_shift_cap_set(caps, 32);   // between windows (the kernels read the array at each launch)
     using strata::core::gate::Rule;
-    c.cap_last[0] = strata::core::gate::cap_for(Rule::Confident, median, n, c.cap_mult);
-    c.cap_last[1] = strata::core::gate::cap_for(Rule::Uncertain, median, n, c.cap_mult);
-    c.cap_last[2] = strata::core::gate::cap_for(Rule::None, median, n, c.cap_mult);
+    c.cap_last[0] = strata::core::gate::cap_for(Rule::Confident, median, n, m);
+    c.cap_last[1] = strata::core::gate::cap_for(Rule::Uncertain, median, n, m);
+    c.cap_last[2] = strata::core::gate::cap_for(Rule::None, median, n, m);
 }
 
 bool Verifier::route_shift_take(std::string& cap_line, std::string& cal_line) {
@@ -5540,7 +5562,7 @@ float auto_clamp_b(double b) { return std::min(4.0f, std::max(0.02f, (float) b))
 // The decode budget of an arm's window: the base arm runs at the request's req_b, the candidate at req_b * s^d (clamped; 0 stays 0).
 // A mask test runs both arms at req_b.
 float route_auto_arm_b(const RouteResidentCfg& c, int arm) {
-    if (arm == 0 || c.req_b <= 0.0f || c.auto_mask) return c.req_b;
+    if (arm == 0 || c.req_b <= 0.0f || c.auto_mask || c.auto_kind != tune::Budget) return c.req_b;   // (step G: cap and prefetch tests too)
     return auto_clamp_b((double) c.req_b * std::pow((double) c.auto_step, (double) c.auto_dir));
 }
 
@@ -5579,17 +5601,71 @@ void auto_next_stage(RouteResidentCfg& c, bool won, int d) {
 }
 
 // The next scheduled window's arm: runs of kAutoRun windows; run r is arm (r % 2) ^ ((r / 2) % 2), so each pair of runs alternates which arm is first.
+// SPEC-recheck-gated step G: the rotation's next kind after `k` (tune_steps.hpp: budget -> mask -> cap -> prefetch -> budget).
+static int rot_next(const RouteResidentCfg& c, int k) { return tune::next_kind(k, mask_learn_env(), c.tune_cap_on, c.tune_pf_on); }
+
+// A cap test: the candidate of its direction (paired::DirState); a candidate at the bound is a loss at once (no test, false).
+static bool cap_test_begin(RouteResidentCfg& c) {
+    auto& t = c.gs.tune;
+    paired::DirState ds{t.cap_first, t.cap_stage};
+    const int d = ds.dir();
+    double cu = 0.0, cn = 0.0;
+    if (!tune::cap_candidate(t.cap_unc, t.cap_none, (double) t.cap_step, d, cu, cn)) {
+        ds.update(false, d);
+        t.cap_first = ds.first;
+        t.cap_stage = ds.stage;
+        return false;
+    }
+    c.auto_cap_cu = cu;
+    c.auto_cap_cn = cn;
+    c.auto_kind = tune::Cap;
+    c.auto_mask = false;
+    c.auto_dir = d;
+    auto_reset_arms(c);
+    return true;
+}
+
+// A prefetch test: the candidate count of its direction; at a bound, a loss at once (no test, false).
+static bool pf_test_begin(RouteResidentCfg& c) {
+    auto& t = c.gs.tune;
+    paired::DirState ds{t.pf_first, t.pf_stage};
+    const int d = ds.dir();
+    long long cand = 0;
+    if (!tune::prefetch_candidate(t.prefetch, d, cand)) {
+        ds.update(false, d);
+        t.pf_first = ds.first;
+        t.pf_stage = ds.stage;
+        return false;
+    }
+    c.auto_pf_cand = cand;
+    c.auto_kind = tune::Prefetch;
+    c.auto_mask = false;
+    c.auto_dir = d;
+    auto_reset_arms(c);
+    return true;
+}
+
 void route_auto_schedule(RouteResidentCfg& c) {
     while (!c.auto_testing) {
-        // STRATA_MASK=learn: after a budget test the next test is the mask's depth (when the learner can test now; else a budget test)
-        if (c.auto_mask_next && c.auto_mask_ok) {
-            c.auto_mask_next = false;
-            if (mask_test_begin()) {
+        const int k = c.auto_next_kind;
+        // SPEC-recheck-gated step G / STRATA_MASK=learn: the rotation's mask, cap and prefetch tests start when they can; else the rotation moves on
+        if (k == tune::Mask) {
+            if (c.auto_mask_ok && mask_test_begin()) {
+                c.auto_kind = tune::Mask;
                 c.auto_mask = true;
                 auto_reset_arms(c);
                 break;
             }
+            c.auto_next_kind = rot_next(c, k);
+            continue;
         }
+        if (k == tune::Cap || k == tune::Prefetch) {
+            const bool started = k == tune::Cap ? cap_test_begin(c) : pf_test_begin(c);
+            if (started) break;
+            c.auto_next_kind = rot_next(c, k);
+            continue;
+        }
+        c.auto_kind = tune::Budget;
         const int d = c.auto_stage == 0 ? c.auto_first : -c.auto_first;
         const double cand = auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d));
         // the learned ceiling (b_clean; 2 x the start while none is learned): a candidate above it is not tested (a loss)
@@ -5645,7 +5721,60 @@ void route_auto_pair_done(RouteResidentCfg& c) {
     if (v != paired::Verdict::Continue) route_auto_test_done(c, v == paired::Verdict::Move, why);
 }
 
+// SPEC-recheck-gated step G: the end of a cap or a prefetch test.  Same arms, same rule, same veto and cut guard as the budget test; a move
+// takes the candidate (the cap's ratio unc / none is kept), the step and direction states move as the budget's do, and the values are saved.
+static void tune_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
+    auto& t = c.gs.tune;
+    const int d = c.auto_dir;
+    const double sb = c.auto_secs[0] > 0.0 ? (double) c.auto_tok[0] / c.auto_secs[0] : 0.0;
+    const double sc = c.auto_secs[1] > 0.0 ? (double) c.auto_tok[1] / c.auto_secs[1] : 0.0;
+    const double pb = c.auto_tok[0] > 0 ? (double) c.auto_fl[0] / (double) c.auto_tok[0] : 0.0;
+    const double pc = c.auto_tok[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_tok[1] : 0.0;
+    const long long pairs = c.auto_pair.n;
+    const double pmean = c.auto_pair.mean, pse = c.auto_pair.se();
+    if (c.auto_kind == tune::Cap) {
+        std::fprintf(stderr, "strata serve: auto cap test %.3f/%.3f vs %.3f/%.3f (unc/none): pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
+                     "%.1f vs %.1f tok/s over %d+%d windows; flips/100 tok %.2f vs %.2f; cuts %lld vs %lld\n",
+                     c.auto_cap_cu, c.auto_cap_cn, t.cap_unc, t.cap_none, pairs, pmean, pse, won ? "move" : "keep", auto_reason_name(why), sc, sb,
+                     (int) c.auto_n[1], (int) c.auto_n[0], 100.0 * pc, 100.0 * pb, c.auto_cuts[1], c.auto_cuts[0]);
+        paired::BudgetStep bs{t.cap_step, t.cap_last_win};
+        bs.update(won, d);
+        t.cap_step = bs.step;
+        t.cap_last_win = bs.last_win;
+        paired::DirState ds{t.cap_first, t.cap_stage};
+        ds.update(won, d);
+        t.cap_first = ds.first;
+        t.cap_stage = ds.stage;
+        if (won) {
+            t.cap_unc = c.auto_cap_cu;
+            t.cap_none = c.auto_cap_cn;
+        }
+        t.set = true;
+        c.auto_next_kind = rot_next(c, tune::Cap);
+    } else {
+        std::fprintf(stderr, "strata serve: auto prefetch test %lld vs %lld: pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
+                     "%.1f vs %.1f tok/s over %d+%d windows; flips/100 tok %.2f vs %.2f; cuts %lld vs %lld\n",
+                     (long long) c.auto_pf_cand, t.prefetch, pairs, pmean, pse, won ? "move" : "keep", auto_reason_name(why), sc, sb,
+                     (int) c.auto_n[1], (int) c.auto_n[0], 100.0 * pc, 100.0 * pb, c.auto_cuts[1], c.auto_cuts[0]);
+        paired::DirState ds{t.pf_first, t.pf_stage};
+        ds.update(won, d);
+        t.pf_first = ds.first;
+        t.pf_stage = ds.stage;
+        if (won) t.prefetch = c.auto_pf_cand;
+        t.set = true;
+        c.auto_next_kind = rot_next(c, tune::Prefetch);
+    }
+    c.auto_kind = tune::Budget;
+    c.auto_mask = false;
+    c.auto_testing = false;
+    route_tune_write(c);
+}
+
 void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
+    if (c.auto_kind == tune::Cap || c.auto_kind == tune::Prefetch) {
+        tune_test_done(c, won, why);
+        return;
+    }
     const int d = c.auto_dir;
     const double sb = c.auto_secs[0] > 0.0 ? (double) c.auto_tok[0] / c.auto_secs[0] : 0.0;
     const double sc = c.auto_secs[1] > 0.0 ? (double) c.auto_tok[1] / c.auto_secs[1] : 0.0;
@@ -5666,7 +5795,8 @@ void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
                      100.0 * pc, 100.0 * pb, c.auto_cuts[1], c.auto_cuts[0], cut_per_100(c.auto_cuts[1], c.auto_tok[1]),
                      cut_per_100(c.auto_cuts[0], c.auto_tok[0]));
         c.auto_mask = false;
-        c.auto_mask_next = false;   // a budget test next
+        c.auto_kind = tune::Budget;
+        c.auto_next_kind = rot_next(c, tune::Mask);   // step G: the rotation's next kind (cap, prefetch or budget)
         c.auto_testing = false;
         return;
     }
@@ -5688,7 +5818,8 @@ void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
     c.auto_testing = false;
     ++c.auto_tests;
     ++c.auto_tests_take;
-    c.auto_mask_next = mask_learn_env();   // STRATA_MASK=learn: the next test is the mask's depth
+    c.auto_kind = tune::Budget;
+    c.auto_next_kind = rot_next(c, tune::Budget);   // step G: the rotation's next kind (mask when on, else cap, prefetch, budget)
     route_tune_write(c);
 }
 }  // namespace
@@ -7364,14 +7495,14 @@ bool Verifier::route_recheck_prefetch_on() {
 }
 
 size_t Verifier::route_recheck_prefetch_max() {
-    static const size_t cap = [] {
-        const char* v = std::getenv("STRATA_RECHECK_PREFETCH_MAX");
-        // SPEC-recheck-gated (E): the ranked prefetch takes 12 per cut; with the gate off, the old 96 (the cut order of before)
-        const char* g = std::getenv("STRATA_RECHECK_GATE");
-        const bool gate = g == nullptr || std::atoi(g) != 0;
-        return v != nullptr ? (size_t) std::max(0LL, std::atoll(v)) : gate ? (size_t) 12 : (size_t) 96;
-    }();
-    return cap;
+    // SPEC-recheck-gated (E, G): with the gate, the tuned count per cut (start 12; STRATA_RECHECK_PREFETCH_MAX fixes it), the candidate for the
+    // cut windows of arm 1 while a prefetch test runs; with the gate off, the old 96 (or the env value)
+    static const bool fixed = std::getenv("STRATA_RECHECK_PREFETCH_MAX") != nullptr;
+    static const size_t fixed_v = fixed ? (size_t) std::max(0LL, std::atoll(std::getenv("STRATA_RECHECK_PREFETCH_MAX"))) : (size_t) 96;
+    const RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_on || fixed) return fixed_v;
+    if (c.auto_kind == tune::Prefetch && c.auto_testing && c.auto_cut_arm == 1) return (size_t) c.auto_pf_cand;
+    return (size_t) c.gs.tune.prefetch;
 }
 
 // The exact successor (the window that just ran): D = KL(exact row 0 || the cut row's first pass) on the device; the pending row's picks take

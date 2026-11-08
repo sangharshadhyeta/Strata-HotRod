@@ -252,6 +252,63 @@ int main() {
               "round trip: calibration and the shift ring come back");
     }
 
+    // SPEC-recheck-gated step G: the rotation budget -> mask -> cap -> prefetch -> budget, skipping the kinds that are off
+    {
+        namespace t = strata::core::tune;
+        check(t::next_kind(t::Budget, true, true, true) == t::Mask && t::next_kind(t::Mask, true, true, true) == t::Cap &&
+                  t::next_kind(t::Cap, true, true, true) == t::Prefetch && t::next_kind(t::Prefetch, true, true, true) == t::Budget,
+              "rotation: budget -> mask -> cap -> prefetch -> budget");
+        check(t::next_kind(t::Budget, false, true, true) == t::Cap && t::next_kind(t::Cap, false, true, true) == t::Prefetch,
+              "rotation: mask off is skipped");
+        check(t::next_kind(t::Mask, true, false, true) == t::Prefetch && t::next_kind(t::Prefetch, true, false, false) == t::Budget,
+              "rotation: cap off is skipped; prefetch off goes back to budget");
+        check(t::next_kind(t::Budget, false, false, false) == t::Budget && t::next_kind(t::Cap, false, false, false) == t::Budget,
+              "rotation: only budget on, always budget");
+    }
+    {
+        namespace t = strata::core::tune;
+        // the cap candidate: both multipliers times step^d, the ratio kept (1.5), up 1.25 / down 1 / 1.25
+        double cu = 0.0, cn = 0.0;
+        check(t::cap_candidate(1.5, 1.0, 1.25, 1, cu, cn) && near(cu, 1.875, 1e-9) && near(cn, 1.25, 1e-9) && near(cu / cn, 1.5, 1e-9),
+              "cap candidate: up by the step, ratio 1.5 kept");
+        check(t::cap_candidate(1.5, 1.0, 1.25, -1, cu, cn) && near(cu, 1.2, 1e-9) && near(cn, 0.8, 1e-9), "cap candidate: down by the step");
+        check(t::cap_candidate(7.0, 1.0, 1.25, 1, cu, cn) && cu <= 8.0 + 1e-9 && near(cu / cn, 7.0, 1e-9),
+              "cap candidate: the larger multiplier stops at 8, the ratio kept");
+        check(!t::cap_candidate(0.3, 0.25, 1.25, -1, cu, cn), "cap candidate: at the 0.25 floor a down move is not a candidate");
+        check(!t::cap_candidate(0.0, 1.0, 1.25, 1, cu, cn) && !t::cap_candidate(1.5, 1.0, 0.0, 1, cu, cn),
+              "cap candidate: a non-positive multiplier or step is not a candidate");
+        // the prefetch candidate: x or / 1.5 rounded, at least one step, range 0-64, 0 a candidate
+        long long m = -1;
+        check(t::prefetch_candidate(12, 1, m) && m == 18, "prefetch candidate: 12 up 1.5x is 18");
+        check(t::prefetch_candidate(12, -1, m) && m == 8, "prefetch candidate: 12 down 1.5x is 8");
+        check(t::prefetch_candidate(2, 1, m) && m == 3, "prefetch candidate: at least one step (2 up is 3)");
+        check(t::prefetch_candidate(1, -1, m) && m == 0, "prefetch candidate: 0 is a candidate (1 down is 0)");
+        check(!t::prefetch_candidate(0, -1, m), "prefetch candidate: 0 down is not a candidate");
+        check(!t::prefetch_candidate(64, 1, m) && t::prefetch_candidate(40, 1, m) && m == 60, "prefetch candidate: range 0-64");
+    }
+    {
+        // the tune state survives a save and a load; an out-of-range prefetch count is refused
+        g::State s;
+        s.tune.set = true;
+        s.tune.cap_unc = 1.875;
+        s.tune.cap_none = 1.25;
+        s.tune.cap_step = 1.5625f;
+        s.tune.cap_last_win = 1;
+        s.tune.cap_first = -1;
+        s.tune.cap_stage = 1;
+        s.tune.prefetch = 18;
+        s.tune.pf_first = -1;
+        s.tune.pf_stage = 1;
+        g::State u;
+        check(g::parse(g::serialize(s, 11), 11, u) && u.tune.set && near(u.tune.cap_unc, 1.875, 1e-6) && near(u.tune.cap_none, 1.25, 1e-6) &&
+                  near(u.tune.cap_step, 1.5625, 1e-6) && u.tune.cap_last_win == 1 && u.tune.cap_first == -1 && u.tune.cap_stage == 1 &&
+                  u.tune.prefetch == 18 && u.tune.pf_first == -1 && u.tune.pf_stage == 1,
+              "round trip: the tune state (cap multipliers, steps, directions, prefetch count) comes back");
+        g::State v;
+        check(!g::parse("fingerprint 0b\ntune_prefetch 99 1 0\n", 11, v), "tune: a prefetch count above 64 is refused");
+        check(!g::parse("fingerprint 0b\ntune_cap 0 1 1.25 0 1 0\n", 11, v), "tune: a non-positive cap multiplier is refused");
+    }
+
     std::printf("recheck_gate_test: ok\n");
     return 0;
 }

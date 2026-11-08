@@ -16157,9 +16157,10 @@ int main(int argc, char** argv) {
                 if (g_on) {
                     if (!merged) g_audit = ver.route_gate_audit_next();
                     ver.route_gate_rows(strata::core::gate::uncertain_bits(g_bk.data(), g_pv.data(), T, g_phi, g_audit), g_audit);
-                    ver.route_shift_cap_window(g_bk.data(), g_pv.data(), T, g_audit);   // SPEC-recheck-gated step F: the rows' shift caps
                 }
                 ver.route_budget_window(true, !merged);   // STRATA_ROUTE_BUDGET_DYN: the decode budget of this window (no-op when off); AUTO: not a merged window
+                // SPEC-recheck-gated step F/G: the rows' shift caps, after the window's arm is known (a cap test's arm 1 uses its candidate)
+                if (g_on) ver.route_shift_cap_window(g_bk.data(), g_pv.data(), T, g_audit);
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
