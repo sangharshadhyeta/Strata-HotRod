@@ -7171,8 +7171,9 @@ def main() -> int:
         cfg.setdefault("env", {})["STRATA_LA_MODEL"] = str(la_model)
     if (henv := hotrod_default_env(family, model, hip)):
         cfg["env"] = {**(cfg.get("env") or {}), **henv}
-        # the measured setup's PCIe share: none (the engine's 0.55 default for a native pack was not what was measured)
-        args += ["--pcie-frac", "0"]
+        # no --pcie-frac: any --pcie-frac (0 included) turns STRATA_PCIE_BALANCE off, and the balance sets each layer's PCIe share from
+        # measured costs. On the RTX 3060 PC (8 Nov, against --pcie-frac 0): 34.3 vs 31.5 tok/s at 60-120K prompts, 32.9 vs 32.2 at
+        # 120-170K, fewer SSD bytes per token in every range (42 requests against 177).
         # prompt chunks up to 16384 tokens: every chunk streams the experts again, so an 8.5k prompt read as 8192 + 362
         # streamed them twice (19 Oct, 2 alternated pairs: 38 -> 24 s to the first word, decode +12%, half the NVMe reads)
         if "--prefill" in args and args[args.index("--prefill") + 1] == "auto":
