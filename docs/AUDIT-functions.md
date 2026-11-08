@@ -23,6 +23,25 @@ the session that started 8 Nov 11:04 (413 requests, 828 prompt lines) unless not
 - PCIe balance: re-measured the CPU pool (93 us per missed expert) and moved pcie_frac 0.55 -> 0.40.
 - Stop re-check: runs (1 kept this request; 16 of 586 continued earlier).
 
+## Round 2 - the decode slowdown (8 Nov afternoon)
+Like for like (32-128K prompts, answers >= 200 tokens): windows took 53-62 ms on 17-20 Oct and 75-83 ms on 6-8 Nov; tokens per window
+(drafting) were the same; the hit rate was higher (96% vs 92%). At 45K context the all-on speed (33.2 tok/s) equals the short-prompt
+speed (32.3): context length is not the cause.
+
+**Feature cost** (calibration prompts - reasoning, prose, code - temperature 0, one sample per arm, each arm = one feature off):
+re-check off +25% (a second A/B: 40.7 vs ~30); GPU look-ahead off +8.7%; tail read off +5.8%; learned look-ahead off +5.5%;
+stand-in learn + mask off +2.9%; 8 read-ahead threads -1%. Stage timers (ms/window): router 12.8, cpu-wait 14.2, pcie-experts 9.0,
+vram-experts 7.8, gdn 7.4, hc-read 4.0, ffn-read 3.6, attn 3.2.
+
+**Re-check by drafter confidence** (28 requests): flips per moved row 0.21% at p >= 0.9 (6,168 rows), 2.5% at 0.5-0.9 (2,145), 3.0% for
+rows with no draft probability (6,903 rows; 209 of 275 flips, 68% of the cuts). An exact row costs ~100 expert reads (every
+non-resident rank 3-9 pick over 48 layers), so exact-up-front costs more than the re-check; the lever is a rank-partial re-check (exact
+only at the ranks / layers that flip), measured by counter D on branch recheck-gated.
+
+Branches: recheck-cheap (merged into combined-nov8; its 96-per-cut prefetch clogged the drive - capped at 12 and ranked in
+recheck-gated E), adaptive-la (b3185dc05), router-fuse (27a18889b; GPU parity not run: the card is exclusive to 8095),
+recheck-gated (in progress).
+
 ## Next rounds
 DeepSeek's engine (ds4: lines), the server's own functions (prompt cache, MCP, effort handling), and the RAM tier (promotion: 11-37
 promoted per request, hits 8-21 - is that the intended scale?).
