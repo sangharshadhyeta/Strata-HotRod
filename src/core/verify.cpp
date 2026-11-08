@@ -4900,7 +4900,9 @@ void Verifier::route_gate_window(int a0, const int* bucket, const float* shift, 
     // rows 1..a0 (row 0 is never cut): the eligible moved rows, by their drafter bucket (kNone for none rows)
     for (int q = 1; q <= a0; ++q) {
         if (!(shift[q] > 0.0f)) continue;
-        c.gs.shift.add(shift[q], strata::core::gate::kShiftRing);   // step F: every moved row's final shift (the cap's median and deciles)
+        // step F: the cap's median and deciles take only uncapped shifts - an audit window caps nothing, and before 64 samples no cap is
+        // active.  A capped row's shift is held at its cap, so feeding it would ratchet the median (and the caps) down over time.
+        if (audit || c.gs.shift.n() < 64) c.gs.shift.add(shift[q], strata::core::gate::kShiftRing);
         if (eligible[q] == 0) continue;
         strata::core::gate::add_moved(c.gs, bucket[q]);
         if (audit) ++c.gq.au_moved[bucket[q]];
