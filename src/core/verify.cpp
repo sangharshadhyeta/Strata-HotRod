@@ -1874,9 +1874,26 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
+    // STRATA_LA_PRIO (default 1, 0 = the priorities as before): the window's decode streams (cs_, sh_cs_) at the device's greatest
+    // priority, the learner's batch stream (la_cs_, below) at the least, so the batch runs on the SMs the window leaves idle.
+    // A stage's shared stream (set_stream) keeps the priority its owner gave it.
+    static const bool la_prio_on = [] { const char* v = std::getenv("STRATA_LA_PRIO"); return v == nullptr || std::atoi(v) != 0; }();
+    auto make_stream_at = [](cudaStream_t* s, bool least) -> cudaError_t {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        int lo = 0, top = 0;
+        if (cudaDeviceGetStreamPriorityRange(&lo, &top) == cudaSuccess &&
+            cudaStreamCreateWithPriority(s, cudaStreamNonBlocking, least ? lo : top) == cudaSuccess)
+            return cudaSuccess;
+        cudaGetLastError();   // (the priority call failed: the default priority, as make_stream)
+#else
+        (void) least;
+#endif
+        return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
+    };
+    auto make_decode_stream = [&](cudaStream_t* s) { return la_prio_on ? make_stream_at(s, false) : make_stream(s); };
     if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
-    else if (make_stream(&cs_) != cudaSuccess) cs_ = nullptr;
-    if (cs_ == nullptr || make_stream(&sh_cs_) != cudaSuccess) {
+    else if (make_decode_stream(&cs_) != cudaSuccess) cs_ = nullptr;
+    if (cs_ == nullptr || make_decode_stream(&sh_cs_) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
     }
@@ -1890,7 +1907,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 #if !defined(STRATA_USE_HIP)
     // the look-ahead node's own stream (record_window, STRATA_LOOKAHEAD_GPU_STREAM), made like sh_cs_.  Optional: on any
     // failure it is left off (nullptr) and the node stays on cs
-    if (make_stream(&la_cs_) != cudaSuccess) la_cs_ = nullptr;
+    if ((la_prio_on ? make_stream_at(&la_cs_, true) : make_stream(&la_cs_)) != cudaSuccess) la_cs_ = nullptr;
     if (la_cs_ != nullptr &&
         (cudaEventCreateWithFlags(&ev_la_fork_, cudaEventDisableTiming) != cudaSuccess ||
          cudaEventCreateWithFlags(&ev_la_read_done_, cudaEventDisableTiming) != cudaSuccess ||
