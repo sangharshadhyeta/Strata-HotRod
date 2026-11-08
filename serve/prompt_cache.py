@@ -294,14 +294,19 @@ class PromptCache:
         return f"prompt cache: saved {what} in {time.time() - t0:.2f} s ({self.entries[key]['bytes'] >> 20} MiB, {len(self.entries)} entries)"
 
     def _conv_len(self, t: list[int]) -> int | None:
-        """B1: the length of a conversation's key - its tokens up to and including the third turn token (the system turn and the
-        first user turn).  None with fewer than three turn tokens, or no turn_id.  Id equality only."""
-        if self.turn_id is None:
-            return None
-        i = -1
-        try:
-            for _ in range(3):
-                i = t.index(self.turn_id, i + 1)
-        except ValueError:
-            return None
-        return i + 1
+        return conversation_len(t, self.turn_id)
+
+
+def conversation_len(t: list[int], turn_id: int | None) -> int | None:
+    """B1: the length of a conversation's key - its tokens up to and including the third turn token (the system turn and the
+    first user turn).  None with fewer than three turn tokens, or no turn_id.  Id equality only.  Shared with serve/capture.py,
+    which keys its records by the same conversation."""
+    if turn_id is None:
+        return None
+    i = -1
+    try:
+        for _ in range(3):
+            i = t.index(turn_id, i + 1)
+    except ValueError:
+        return None
+    return i + 1

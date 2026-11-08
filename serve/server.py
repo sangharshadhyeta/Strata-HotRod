@@ -55,6 +55,7 @@ from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 from prompt_cache import PromptCache   # serve/prompt_cache.py: the prompt cache on disk (config "prompt_cache_path")
+import capture as capture_mod          # serve/capture.py: the capture record (docs/SPEC-capture.md; STRATA_CAPTURE=1 or "capture": true)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -3487,6 +3488,7 @@ class Service:
         self.warm_lock = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.pcache = None                            # the prompt cache on disk (config "prompt_cache_path"; off when None)
+        self.capture = None                           # the capture record (serve/capture.py; off when None - nothing is written then)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -5151,8 +5153,9 @@ class Service:
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
+                            cap_msg = f", {self.capture.status()}" if self.capture is not None else ""   # capture on: N KB written, K dropped
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}{cap_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
@@ -5215,6 +5218,12 @@ class Service:
                 "reasoning_recoveries": recovery_count}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
+        if self.capture is not None and not emb and not warm:
+            # capture record A: queued only (put_nowait), so the reply never waits for it; a failure here is never a failed request
+            try:
+                self.capture.request(ids, raw_ids, finish, done)
+            except Exception as e:
+                print(f"[strata] capture: {e!r}", flush=True)
         yield "done", done
 
 
@@ -7823,6 +7832,17 @@ def main() -> int:
         except (ValueError, OSError) as e:
             raise SystemExit(f"[strata] prompt cache: {e}")
         print(f"[strata] prompt cache on: {svc.pcache.dir} ({len(svc.pcache.entries)} entries kept from earlier)", flush=True)
+    # the capture record (SPEC-capture A and B; off unless STRATA_CAPTURE=1 or "capture": true): the ring is opened only when on
+    try:
+        cap_cfg = capture_mod.settings(cfg, os.environ)
+        if cap_cfg is not None:
+            svc.capture = capture_mod.Capture(cap_cfg["dir"], prompt_cache_fingerprint(cfg), model=svc.model,
+                                              gib=cap_cfg["gib"], max_age_d=cap_cfg["max_age_d"],
+                                              turn_id=StrataEngine.TURN_ID)
+    except (ValueError, OSError) as e:
+        raise SystemExit(f"[strata] capture: {e}")
+    if svc.capture is not None:
+        capture_mod.print_started(svc.capture, cap_cfg["gib"], cap_cfg["max_age_d"])
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
