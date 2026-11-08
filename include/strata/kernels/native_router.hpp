@@ -104,8 +104,29 @@ const int32_t* route_pred_host();                                   ///< the tab
 constexpr int kRoutePredDists = 3;
 inline int route_pred_slot(int dist) { return dist == 1 ? 0 : dist == 2 ? 1 : dist == 4 ? 2 : -1; }
 int32_t* route_pred_dev(int64_t target_layer, int dist);            ///< dist 1, 2 or 4: the slab of 8 x 10 ids, device alias
-float* route_pred_logits();                                          ///< scratch, 8 x 512 floats
-float* route_pred_weights();                                         ///< scratch, 8 x 10 floats
+float* route_pred_logits();                                          ///< scratch, 8 x 512 floats (slot 0)
+float* route_pred_weights();                                         ///< scratch, 8 x 10 floats (slot 0)
+float* route_pred_logits_at(int slot);                               ///< SPEC-router-fuse: the slot's 8 x 512 logits (3 slots)
+float* route_pred_weights_at(int slot);                              ///< SPEC-router-fuse: the slot's 8 x 10 weights
+/// SPEC-router-fuse step 1: one dist of the look-ahead for the fused selection: its logits (8 x 512, the GEMV's), ids (the target
+/// layer's slab), weights (8 x 10), the target layer's mask / mask-resident / ring / cheap slices, the residency slice `res` for the
+/// edge skip and tail read (nullptr: none), and whether those two are on.  nullptr logits: the dist is not computed this window.
+struct RoutePredDist {
+    float* logits;
+    int32_t* ids;
+    float* w;
+    const uint8_t* mask;
+    const int32_t* mres;
+    const uint8_t* ring;
+    const uint8_t* cheap;
+    const int32_t* res;
+    int layer;
+    bool edge_on;
+    bool tail_on;
+};
+/// The look-ahead's post-GEMV chain for all dists in one launch (top-10, the mask, route_pred_edge_skip, route_pred_tail_read), each
+/// dist exactly as the one-kernel launches run it.  n_tok 1..8, tail_all as route_pred_tail_read's.  Needs the same setup as those.
+void route_pred_select(const RoutePredDist (&d)[kRoutePredDists], int n_tok, int tail_all, void* stream);
 /// STRATA_MASK (opt-in, changes the output): the per-layer mask of the least-used experts, device [layers][n_expert] (1 = masked),
 /// set once at start on the current GPU; lo / edge are the mask's floor (RANKS lo, or STRATA_MASK_FLOOR), EDGE.  cost_lo (< 0: lo) is the
 /// stand-ins' first rank: the SSD-demand counters count only the router's picks below it.  false: `msg` says why.
@@ -154,6 +175,9 @@ void route_pred_bias_add(float* logits, const float* bias, int n_tok, void* stre
 bool la_learn_alloc(int64_t n_layers, int64_t n_embd, int lo, bool timing, std::string& msg);
 bool la_learn_active();                                              ///< allocated, on the scratch GPU
 void la_learn_forward(int64_t l, int dist, const float* x, int n, void* stream);
+/// SPEC-router-fuse step 1: la_learn_forward with the dist's route scratch (route_pred_logits_at(route_pred_slot(dist)) on entry: the
+/// plain logits; the leader's on exit).  la_learn_forward is this with route_pred_logits().
+void la_learn_forward_at(int64_t l, int dist, const float* x, int n, void* stream, float* route);
 void la_learn_label(int64_t l, const float* true_logits, int n, void* stream);
 void la_learn_window_end(void* stream);
 void la_learn_pre_launch(void* stream);

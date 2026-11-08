@@ -1116,6 +1116,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(route_control_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(route_control_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME route_control_parity COMMAND route_control_parity)
+  # SPEC-router-fuse step 1: the fused look-ahead (one GEMV, one selection) against the per-dist chain, bit for bit
+  add_executable(router_fuse_parity src/kernels/router_fuse_parity.cu)
+  target_include_directories(router_fuse_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(router_fuse_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME router_fuse_parity COMMAND router_fuse_parity)
+  set_tests_properties(router_fuse_parity PROPERTIES TIMEOUT 300)
   set_tests_properties(route_control_parity PROPERTIES TIMEOUT 120)
 
   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
