@@ -51,3 +51,22 @@ Per request: rows held up front (rule 2), cuts skipped by rule 1, audit windows 
 3. Build; serve tests; import check.
 4. Live on 8095 (idle only; the user's go is given): the calibration prompts at temperature 0, gate on vs STRATA_RECHECK_GATE=0 vs
    STRATA_FRAGILE_RECHECK=0, twice each; tok/s, flips caught by the audit, held rows; answers read by hand.
+
+## Step F - the per-row shift cap (prevent the drift that flips; added 8 Nov after counter D)
+Counter D on 8095 (7 requests): the flipped share of cut rows' swaps is the same at every rank (39.1-39.9%, ranks 3-9) and every layer
+band (39.3-39.7%) - a flip is the sum of many small shifts in one row, not one bad stand-in. So the row's accumulated shift is capped
+while the row is computed:
+- **The cap:** route_resident_k (and route_mask_k for mask moves) add each move's risk to row_shift[row]. A move is taken only if
+  row_shift[row] + this move's shift <= cap[row]; otherwise the pick stays the router's own (exact, as a held row's pick). One extra
+  comparison per candidate move. cap[] is a host-mapped float per row (<= 32 rows), written between windows (graph-safe, no host CUDA
+  call inside a window); +inf = today's behaviour.
+- **The cap per row from its class** (rules 1-3): confident rows (p >= P_HI) `cap_conf` (default +inf), uncertain rows `cap_unc`, none
+  rows `cap_none`. Defaults are multiples of a running median of moved rows' final row_shift (on the host, from the route_fragile_shifts
+  read that exists): cap_unc = 1.5 x median, cap_none = 1.0 x median. Settings: STRATA_SHIFT_CAP=0 (off: +inf everywhere),
+  STRATA_SHIFT_CAP_UNC / STRATA_SHIFT_CAP_NONE (the multipliers), STRATA_SHIFT_CAP_CONF (multiplier, default inf).
+- **Calibration counter:** for cut rows, the final row_shift by decile (running deciles), split flipped / not; one request line
+  `re-check by row shift (deciles 0-9, flipped / not): ...` - shows where the flips sit against the caps.
+- **Per request:** `shift cap: moves refused N (rows capped M), caps conf/unc/none x/y/z`.
+- The re-check, the audit and the gate stay (the safety net).
+Tests: kernel parity (cap +inf identical to today; a finite cap refuses exactly the moves past it; row_shift never exceeds the cap; held
+rows unchanged), CPU unit tests (the median, the multipliers, the classes), build, serve tests, import check.
