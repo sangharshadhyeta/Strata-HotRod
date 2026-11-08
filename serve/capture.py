@@ -86,37 +86,47 @@ def _ids_contain(hay: bytes, needle: bytes) -> bool:
 
 
 class Regenerates:
-    """B: regenerate detection within each conversation, kept in memory (the writer thread only)."""
+    """B: regenerate detection within each conversation, kept in memory (the writer thread only).  Id equality only.
+
+    A regenerate group is the answers to one prompt (equal prompt ids).  The group resolves when a later prompt in the same
+    conversation starts with that prompt and is longer (the conversation went on): the kept answer is the member whose answer ids
+    occur in the new prompt, else the latest member (a client replaces the answer shown with the new one, so going on keeps the
+    last) - the raw answer often does not occur verbatim, because the chat template drops the thinking from history."""
 
     def __init__(self):
         self.convs: collections.OrderedDict[str, dict] = collections.OrderedDict()
 
     def observe(self, rid: str, conv: str | None, prompt_b: bytes, answer_b: bytes) -> list[dict]:
-        """Events for one finished request: {"type": "kept", "req", "over"} when a pending pair's answer is contained in this
-        prompt, {"type": "replaced", "req", "by"} when this prompt equals an earlier one's (that earlier answer is replaced)."""
+        """Events for one finished request: {"type": "replaced", "req", "by"} when this prompt equals an earlier one's, and
+        {"type": "kept", "req", "over"} for each other member when a group resolves."""
         if conv is None:
             return []
-        st = self.convs.pop(conv, None) or {"entries": collections.deque(maxlen=ANSWERS_KEPT), "pending": []}
+        st = self.convs.pop(conv, None) or {"groups": collections.OrderedDict()}
         self.convs[conv] = st
         while len(self.convs) > CONVS_KEPT:
             self.convs.popitem(last=False)
-        events, still = [], []
-        for pair in st["pending"]:
-            kept = next((m for m in pair if _ids_contain(prompt_b, m["answer"])), None)
-            if kept is None:
-                still.append(pair)
+        groups = st["groups"]
+        events = []
+        for digest in list(groups):
+            g = groups[digest]
+            if len(g["members"]) < 2 or len(prompt_b) <= len(g["prompt"]) or not prompt_b.startswith(g["prompt"]):
                 continue
-            over = pair[1] if kept is pair[0] else pair[0]
-            events.append({"type": "kept", "req": kept["req"], "over": over["req"], "conv": conv})
-        st["pending"] = still
+            kept = next((m for m in reversed(g["members"]) if _ids_contain(prompt_b, m["answer"])), g["members"][-1])
+            for m in g["members"]:
+                if m is not kept:
+                    events.append({"type": "kept", "req": kept["req"], "over": m["req"], "conv": conv})
+            del groups[digest]
         digest = hashlib.sha1(prompt_b).digest()
         me = {"req": rid, "answer": answer_b}
-        for e in st["entries"]:
-            if not e["replaced"] and e["digest"] == digest:
-                e["replaced"] = True
-                events.append({"type": "replaced", "req": e["m"]["req"], "by": rid, "conv": conv})
-                st["pending"].append((e["m"], me))
-        st["entries"].append({"digest": digest, "m": me, "replaced": False})
+        g = groups.get(digest)
+        if g is None:
+            groups[digest] = {"prompt": prompt_b, "members": [me]}
+            while len(groups) > ANSWERS_KEPT:
+                groups.popitem(last=False)
+        else:
+            events.append({"type": "replaced", "req": g["members"][-1]["req"], "by": rid, "conv": conv})
+            g["members"].append(me)
+            del g["members"][:-ANSWERS_KEPT]
         return events
 
 

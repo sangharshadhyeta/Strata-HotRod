@@ -171,6 +171,31 @@ class Regenerate(TempFolder):
         self.assertEqual(pairs[0]["chosen"], second)
         self.assertEqual(pairs[0]["rejected"], first)
 
+    def test_continuing_without_the_raw_answer_keeps_the_latest(self):
+        # the next prompt holds the answer re-encoded (thinking dropped), not its raw ids: the latest member is kept
+        r = cap.Regenerates()
+        p = ids(CONV_A + [40])
+        self.assertEqual(r.observe("a", "c", p, ids([90, 91, 50, 51])), [])
+        self.assertEqual(r.observe("b", "c", p, ids([90, 92, 60, 61])), [{"type": "replaced", "req": "a", "by": "b", "conv": "c"}])
+        self.assertEqual([e["type"] for e in r.observe("c", "c", p, ids([90, 93, 70, 71]))], ["replaced"])
+        ev = r.observe("d", "c", ids(CONV_A + [40, 70, 71, 41]), ids([1]))
+        self.assertEqual(sorted((e["req"], e["over"]) for e in ev), [("c", "a"), ("c", "b")])
+
+    def test_an_earlier_answer_found_in_the_prompt_is_kept(self):
+        r = cap.Regenerates()
+        p = ids(CONV_A + [40])
+        r.observe("a", "c", p, ids([50, 51]))
+        r.observe("b", "c", p, ids([60, 61]))
+        ev = r.observe("d", "c", ids(CONV_A + [40, 50, 51, 41]), ids([1]))
+        self.assertEqual([(e["req"], e["over"]) for e in ev], [("a", "b")])
+
+    def test_a_different_next_prompt_does_not_resolve(self):
+        r = cap.Regenerates()
+        p = ids(CONV_A + [40])
+        r.observe("a", "c", p, ids([50]))
+        r.observe("b", "c", p, ids([60]))
+        self.assertEqual(r.observe("d", "c", ids(CONV_A + [41, 42]), ids([1])), [])   # an edited message: not a continuation
+
     def test_other_conversation_makes_no_pair(self):
         r = cap.Regenerates()
         self.assertEqual(r.observe("a", "conv-1", ids(CONV_A + [40]), ids([50, 51, 52, 53])), [])
