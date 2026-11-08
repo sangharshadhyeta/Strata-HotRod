@@ -128,6 +128,13 @@ bool route_mask_cost_read(std::vector<uint32_t>& out);
 bool route_mask_update(const std::vector<uint8_t>& host);
 /// STRATA_MASK_RESIDENT: between windows, on = this window is a control (the mask moves no pick; the masked picks are still counted). No-op unset.
 void route_mask_control(bool on);
+/// STRATA_FRAGILE_CTRL_EVERY: the fragile control flag's allocation (host-mapped, once).  Call it before any graph capture (the verifier's init);
+/// false when it cannot be had, and then no window is a control.
+bool route_fragile_control_alloc();
+/// STRATA_FRAGILE_CTRL_EVERY: between windows, on = this window is a fragile control (route_resident_k moves no pick and the mask kernel
+/// moves none either, so row_shift stays 0).  Read at each launch from host-mapped memory, graph-safe as route_mask_control.  false when the
+/// flag was never allocated (route_fragile_control_alloc); true otherwise.
+bool route_fragile_control(bool on);
 /// The seen / moved counts since the last read (read and reset); false when no mask is set.
 bool route_mask_read(unsigned long long& seen, unsigned long long& moved);
 /// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear expert predictors, folded into one bf16 [512 x n_embd]

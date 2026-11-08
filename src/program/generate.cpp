@@ -16163,6 +16163,10 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (!merged && ver.mask_learn_active()) ver.mask_learn_window(T, fr_cut >= 0 ? fr_cut : T, fr_cut >= 0);   // STRATA_MASK=learn
+                // STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL: this window's kind (control or other) with its committed tokens and seconds; it also
+                // clears the fragile control flag, so the drafter between windows sees none (merged windows commit nothing here)
+                strata::core::Verifier::route_window_done(merged ? 0 : (fr_cut >= 0 ? fr_cut : T),
+                                                          std::chrono::duration<double>(Clock::now() - tw0).count());
                 // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
                 // window to <path>.<n>, so the prompt paths (a peer card's share, a split) can be compared by KL
                 if (first_window) {
@@ -16745,6 +16749,10 @@ int main(int argc, char** argv) {
                              (long long) req_hits, (long long) req_look, off);
             }
             strata::core::Verifier::route_class_end();   // STRATA_FRAGILE_BRAKE: this request's size class learns its start and clean level
+            {   // STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL: this request's control windows against the others (one line when any ran)
+                std::string ctl_line;
+                if (strata::core::Verifier::route_control_take(ctl_line)) std::fprintf(stderr, "strata serve: %s\n", ctl_line.c_str());
+            }
             {   // STRATA_FRAGILE_RECHECK: this request's cuts, rows moved by stand-ins, flipped re-decisions and k (takes and resets the counts)
                 long long fr_cuts = 0, fr_explores = 0, fr_moved = 0, fr_flips = 0;
                 float fr_k = 0.0f, fr_med_shift = 0.0f, fr_med_gap = 0.0f, fr_req_b = 0.0f;

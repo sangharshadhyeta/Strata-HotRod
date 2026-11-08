@@ -4,6 +4,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/standin_pool.hpp"
+#include "strata/core/route_control.hpp"
 #include <cstring>
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
@@ -123,6 +124,12 @@ static bool mask_resident_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_MASK_RESIDENT"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
+// STRATA_MASK_CTRL (default on, =0 off): the mask's control windows also run without STRATA_MASK_RESIDENT (SPEC-control-windows): the
+// "without" side of the mask's re-checks then comes from them.  Off: only the resident rule runs control windows (the old gate).
+static bool mask_ctrl_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MASK_CTRL"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
 struct RouteResidentCfg {
     float margin = 0.0f;
     int lo = 6, hi = 9;
@@ -172,9 +179,20 @@ struct RouteResidentCfg {
     // that no stand-in moved (row_shift 0) is re-checked the same way.  Its flips are the noise of a re-decision (two windows of the same
     // tokens differ on their own), so they never enter fr_flip / req_fl / auto_fl.  The last kCtrlRing control re-checks are kept.
     enum { kCtrlEvery = 32, kCtrlRing = 200 };
+    // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 = the old selection below): every n-th eligible decode window (a non-merged window of a
+    // learned k, with a stand-in budget or AUTO, not an exact re-run) is a control window decided BEFORE it runs: route_fragile_control sets
+    // the device flag, so route_resident_k and the mask kernel move no pick and row_shift stays 0.  Its selection then takes the first
+    // row r >= 1 (every row is unmoved), so the re-check compares exact with exact.  A mask control window waits for the next window.
+    long long fr_ctrl_every = 128;
+    bool win_fctl = false;                    ///< this window is a fragile control window (set by route_budget_window; route_fragile_first selects its row)
     bool fr_ctrl[kCtrlRing] = {};             ///< per control re-check (ring): the exact row's top-1 differed from the stand-in's
     int fr_ctrl_pos = 0, fr_ctrl_n = 0;       ///< the control ring's next slot and its filled count
-    long long fr_ctrl_win = 0;                ///< eligible windows counted for the control selection (every kCtrlEvery-th may be one)
+    long long fr_ctrl_win = 0;                ///< eligible windows counted for the control cadence (the old selection's counter when fr_ctrl_every is 0)
+    // control windows' counts and tokens / seconds per window kind (0 other decode, 1 fragile control, 2 mask control, 3 exact re-run, not counted),
+    // this request's (route_control_take takes and resets them)
+    long long kn[4] = {0, 0, 0, 0}, ktok[4] = {0, 0, 0, 0};
+    double ksec[4] = {0.0, 0.0, 0.0, 0.0};
+    int win_kind = 0;                         ///< the kind of the window being run (set by route_budget_window)
     long long fr_ctrl_rc = 0, fr_ctrl_fl = 0; ///< this request's control re-checks and their flips (the stats line takes them)
     long long fragile_rechecks = 0, fragile_flips = 0;   ///< all re-checks and flips
     float fragile_pend_ratio = 0.0f;          ///< the pending cut's gap / row_shift
@@ -390,6 +408,8 @@ RouteResidentCfg& route_resident_cfg() {
         { const char* v = std::getenv("STRATA_FRAGILE_RECHECK"); r.fragile_on = v == nullptr || std::atoi(v) != 0; }
         // STRATA_FRAGILE_BRAKE (default on, =0 off): the per-request decode budget brake (see RouteResidentCfg)
         { const char* v = std::getenv("STRATA_FRAGILE_BRAKE"); r.brake_on = v == nullptr || std::atoi(v) != 0; }
+        // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 off): every n-th eligible decode window is a fragile control window (see RouteResidentCfg)
+        if (const char* v = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) r.fr_ctrl_every = std::max(0LL, std::atoll(v));
         if (const char* v = std::getenv("STRATA_FRAGILE_K0")) {
             const float k0 = (float) std::atof(v);
             if (k0 > 0.0f) {
@@ -1535,6 +1555,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // STRATA_ROUTE_RAM_FLOOR=1: the RAM-tier table the router reads (host-mapped; FileExpertSource keeps it equal to the tier)
     if (route_resident_cfg().margin > 0.0f && strata::kernels::route_ram_floor_on())
         strata::kernels::route_cheap_alloc((size_t) (g.n_layers * g.n_expert));
+    // STRATA_FRAGILE_CTRL_EVERY: the fragile control flag, allocated here so every kernel captured after this reads it (the mask kernel too)
+    if (route_resident_cfg().fragile_on && route_resident_cfg().fr_ctrl_every > 0 && !strata::kernels::route_fragile_control_alloc())
+        std::fprintf(stderr, "strata: STRATA_FRAGILE_CTRL_EVERY: no host-mapped control flag, so no fragile control windows\n");
     if (route_resident_cfg().margin > 0.0f) {
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
         // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
@@ -4602,13 +4625,12 @@ bool Verifier::route_brake_on() { return route_resident_cfg().brake_on; }
 bool mask_test_begin();
 void mask_test_arm(int arm);
 bool mask_test_end(bool won, double out[4]);
-bool mask_control_next();   // STRATA_MASK_RESIDENT: this decode window is a control (defined with the mask-learn section)
+long long mask_ctrl_every();   // STRATA_MASK_CTRL: the mask control's cadence in decode windows (defined with the mask-learn section)
+// the mask control's cadence counters: decode windows counted by the mask gate (route_window_control), control windows since the last mask line
+static long long g_mask_ctrl_n = 0, g_mask_ctrl_win = 0;
 namespace {
 void route_auto_schedule(RouteResidentCfg& c);   // defined with the test helpers below route_auto_window
 float route_auto_arm_b(const RouteResidentCfg& c, int arm);   // defined with the test helpers below route_auto_window
-
-// Wilson score interval at 90% (z = 1.645) for f flips in n re-checks: the flip rate's lower and upper bounds (0 and 1 when n is 0).
-void route_wilson90(long long f, long long n, double& lo, double& hi) { paired::wilson90(f, n, lo, hi); }
 
 // STRATA_FRAGILE_BRAKE: every kBrakeWindows decode windows of the request, the request's budget grows when it has >= kBrakeMin re-checks,
 // the Wilson 90% upper bound of its re-check flip rate is at most 0.2 and that of its flips per token is at most 0.01: req_b * 1.25 (never above auto_b; from 0, 0.25 * auto_b).  The request's
@@ -4712,13 +4734,64 @@ static void la_tail_skip_update(const RouteResidentCfg& c) {
     strata::core::la_tail_read_mode.store(mode, std::memory_order_relaxed);
 }
 
+// STRATA_FRAGILE_CTRL_EVERY: true when this decode window is a fragile control window.  Every fr_ctrl_every-th eligible window gets the device
+// flag (route_fragile_control): an eligible window is a non-merged decode window of a learned k, not an exact re-run, with a stand-in budget or
+// AUTO.  Counted only in eligible windows.  A window that is not a control clears the flag (the flag is written every window).
+static bool route_fragile_ctrl_next(RouteResidentCfg& c, bool eligible) {
+    const bool due = eligible && c.fragile_on && c.fragile_k_set && !c.fragile_exact && c.fr_ctrl_every > 0 &&
+                     (c.auto_on || c.dyn_on || c.budget > 0.0f || c.budget_tail > 0.0f);
+    if (!due || !route_ctrl_due(c.fr_ctrl_win, c.fr_ctrl_every) || !strata::kernels::route_fragile_control(true)) {
+        strata::kernels::route_fragile_control(false);
+        return false;
+    }
+    return true;
+}
+
+// STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL: after a decode window ran (its flag is cleared here, so a drafter between windows sees none), its
+// kind's count and committed tokens and seconds.  kept < 1 (a merged window, nothing committed) counts nothing; a window of an exact re-run is not counted.
+void Verifier::route_window_done(int kept, double secs) {
+    RouteResidentCfg& c = route_resident_cfg();
+    strata::kernels::route_fragile_control(false);
+    if (c.win_kind >= 3 || kept < 1) return;
+    ++c.kn[c.win_kind];
+    c.ktok[c.win_kind] += kept;
+    c.ksec[c.win_kind] += secs;
+}
+
+// STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL: this request's control windows against the other decode windows (count, tokens per second), for
+// the request's end line.  Takes and resets the counts.  false (out unset) when no control window ran in the request.
+bool Verifier::route_control_take(std::string& out) {
+    RouteResidentCfg& c = route_resident_cfg();
+    const bool any = c.kn[1] + c.kn[2] > 0;
+    if (any) {
+        auto rate = [&c](int k) { return c.ksec[k] > 0.0 ? (double) c.ktok[k] / c.ksec[k] : 0.0; };
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "control windows: fragile %lld (%.1f tok/s vs %.1f), mask %lld (%.1f vs %.1f)", c.kn[1], rate(1), rate(0),
+                      c.kn[2], rate(2), rate(0));
+        out = buf;
+    }
+    for (int k = 0; k < 4; ++k) {
+        c.kn[k] = 0;
+        c.ktok[k] = 0;
+        c.ksec[k] = 0.0;
+    }
+    return any;
+}
+
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
 // STRATA_ROUTE_BUDGET_AUTO: a decode window (auto_ok) takes the search's b for both ranks; a cut's next window is exact for ranks < lo only.
 void Verifier::route_budget_window(bool decode, bool auto_ok) {
-    // STRATA_MASK_RESIDENT with the mask learner: this window's control flag, written before the window runs (every window passes here, the
-    // kernels read the flag only inside a window).  Off otherwise.
-    strata::kernels::route_mask_control(mask_learn_active() && mask_resident_on() && decode && mask_control_next());
     RouteResidentCfg& c = route_resident_cfg();
+    // STRATA_FRAGILE_CTRL_EVERY: this window's fragile control flag, decided and written before the window runs (the kernels read it at launch)
+    const bool fctl = route_fragile_ctrl_next(c, decode && auto_ok);
+    c.win_fctl = fctl;
+    // STRATA_MASK_RESIDENT / STRATA_MASK_CTRL with the mask learner: this window's mask control flag, written before the window runs (every
+    // window passes here, the kernels read the flag only inside a window).  A fragile control window takes the window (route_window_control).
+    const bool mgate = mask_learn_active() && (mask_resident_on() || mask_ctrl_on()) && decode;
+    const strata::core::WindowControl wc = strata::core::route_window_control(fctl, mgate, g_mask_ctrl_n, mask_ctrl_every());
+    if (wc.mask) ++g_mask_ctrl_win;
+    strata::kernels::route_mask_control(wc.mask);
+    c.win_kind = decode && c.fragile_exact ? 3 : fctl ? 1 : wc.mask ? 2 : 0;
     if (!c.dyn_on && !c.fragile_on) {
         la_tail_skip_update(c);   // (the static budget_tail decides the tail here: win_tail is never set)
         return;
@@ -4892,9 +4965,10 @@ int Verifier::route_fragile_first(const float* gap, const float* shift, int n, b
     }
     // Noise control: every kCtrlEvery-th eligible window (k set) with no normal or explore cut re-checks its first accepted row r >= 1 that
     // no stand-in moved (shift 0; rows 0..n-1 are the accepted ones).
-    if (c.fragile_k_set && first < 0 && ++c.fr_ctrl_win % RouteResidentCfg::kCtrlEvery == 0) {
-        for (int r = 1; r < n && first < 0; ++r)
-            if (!(shift[r] > 0.0f)) first = r;
+    // STRATA_FRAGILE_CTRL_EVERY > 0: a control window is decided before it runs (win_fctl: no move, every row unmoved, so the first row r >= 1
+    // is taken); off (0): the old selection, every kCtrlEvery-th eligible window, which finds a row only when no stand-in moved one.
+    if (c.fragile_k_set && first < 0 && (c.fr_ctrl_every > 0 ? c.win_fctl : ++c.fr_ctrl_win % RouteResidentCfg::kCtrlEvery == 0)) {
+        first = route_ctrl_first_unmoved(shift, n);
         if (first >= 0 && control != nullptr) *control = true;
     }
     return first;
@@ -4924,14 +4998,6 @@ void Verifier::route_fragile_stop_cut() {
 }
 
 bool Verifier::route_fragile_pending() { return route_resident_cfg().fragile_pend; }
-
-// The noise floor: Wilson 90% bounds of the control ring's flip rate (0 and 1 while it is empty, so nothing above noise is shown yet).
-static void route_ctrl_bounds(const RouteResidentCfg& c, double& lo, double& hi) {
-    long long f = 0;
-    for (int i = 0; i < c.fr_ctrl_n; ++i)
-        if (c.fr_ctrl[i]) ++f;
-    route_wilson90(f, c.fr_ctrl_n, lo, hi);
-}
 
 // The exact decision of a pending cut row (the first output of the exact window that follows it): a flip is a changed top-1 id.
 // The ring holds the last 200 re-checks of this process (normal and explore cuts).  Every 50 re-checks of this process (and only once the
@@ -4975,7 +5041,7 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
     double flip_lo = 0.0, flip_hi = 0.0, tok_lo = 0.0, tok_hi = 0.0, ctrl_lo = 0.0, ctrl_hi = 0.0;
     route_wilson90(c.req_fl, c.req_rc, flip_lo, flip_hi);
     route_wilson90(c.req_fl, c.req_tok, tok_lo, tok_hi);
-    route_ctrl_bounds(c, ctrl_lo, ctrl_hi);   // the noise floor: the re-check flips must exceed it too
+    route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, ctrl_lo, ctrl_hi);   // the noise floor: the re-check flips must exceed it too
     const bool by_recheck = c.req_rc >= RouteResidentCfg::kBrakeMin && flip_lo > std::max(0.2, ctrl_hi);
     const bool by_token = c.req_tok >= RouteResidentCfg::kBrakeTokMin && c.req_fl >= RouteResidentCfg::kBrakeFlips && tok_lo > 0.01;
     // STRATA_ROLLBACK: the fast brake - >= kBrakeFlips flips within the last kRecentTok committed tokens (their positions in req_flip_pos)
@@ -5037,10 +5103,10 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
         if (c.fr_flip[i]) ++ring_fl;
     double ring_lo = 0.0, ring_hi = 0.0, kctrl_lo = 0.0, kctrl_hi = 0.0;
     route_wilson90(ring_fl, c.fr_n, ring_lo, ring_hi);
-    route_ctrl_bounds(c, kctrl_lo, kctrl_hi);
+    route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, kctrl_lo, kctrl_hi);
     const float old = c.fragile_k;
     float target = std::min((float) RouteResidentCfg::kFragileK, std::max(0.005f, 1.25f * largest));
-    if (target > old && !(ring_lo > kctrl_hi)) target = old;   // the flips are not above the noise: no raise
+    if (target > old && !route_k_raise_ok(ring_lo, kctrl_hi)) target = old;   // the flips are not above the noise: no raise
     // a step is bounded: up to 1.5 times the old k, down to 0.5 times it
     if (target > old) target = std::min(target, 1.5f * old);
     if (target < old) target = std::max(target, 0.5f * old);
@@ -5323,13 +5389,17 @@ void Verifier::route_auto_window(int n_keep, std::chrono::steady_clock::time_poi
     const int arm = c.auto_win_arm;
     double dt = 0.0;
     if (end > seg) dt = std::chrono::duration<double>(end - seg).count();
-    c.auto_secs[arm] += dt;
-    c.auto_pt_secs[arm] += dt;
+    // a control window (win_kind 1 fragile, 2 mask: stand-in or mask moves off, slower or faster by design) is not either arm's speed:
+    // its time and tokens are left out of the test, while the run bookkeeping below still counts it
+    if (c.win_kind != 1 && c.win_kind != 2) {
+        c.auto_secs[arm] += dt;
+        c.auto_pt_secs[arm] += dt;
+        c.auto_tok[arm] += n_keep;
+        c.auto_pt_tok[arm] += n_keep;
+    }
     c.auto_last_end = end;
     c.auto_last_req = c.auto_req;
     c.auto_have_last = true;
-    c.auto_tok[arm] += n_keep;
-    c.auto_pt_tok[arm] += n_keep;
     if (c.auto_win_sched) {
         ++c.auto_n[arm];
         // the second run of a pair block (runs 2k, 2k+1: one run per arm) ended
@@ -6865,18 +6935,13 @@ bool mask_learn_save(const std::string& path, std::string& msg) {
     return mlr_save(*g_mlr, path, msg);
 }
 
-// STRATA_MASK_RESIDENT control windows: every kMlControlEvery-th decode window (counted from the start) runs with the mask's moves off, so
-// the re-checks it gives have no mask move and land on the "without" side.  g_mask_ctrl_n counts the decode windows; g_mask_ctrl_win the
-// control windows since the last mask line.
+// STRATA_MASK_RESIDENT / STRATA_MASK_CTRL control windows: every kMlControlEvery-th decode window (counted from the start) runs with the mask's
+// moves off, so the re-checks it gives have no mask move and land on the "without" side.  g_mask_ctrl_n counts the decode windows (route_budget_window,
+// route_window_control); g_mask_ctrl_win the control windows since the last mask line.  A fragile control window takes its window first and does
+// not advance the count (SPEC-control-windows).
 // The share follows the evidence: while the "without" side holds fewer than kMlMinSide re-checks (it is halved every kMlDecayEvery kept
 // tokens, so at 1 in 8 it settled near 7-14 on 8095, 7 Nov, and p never moved), every (kMlControlEvery / 2)-th window is a control.
-static long long g_mask_ctrl_n = 0, g_mask_ctrl_win = 0;
-bool mask_control_next() {
-    const long long every = g_mlr && g_mlr->fsn < kMlMinSide ? kMlControlEvery / 2 : kMlControlEvery;
-    if (++g_mask_ctrl_n % every != 0) return false;
-    ++g_mask_ctrl_win;
-    return true;
-}
+long long mask_ctrl_every() { return g_mlr && g_mlr->fsn < kMlMinSide ? kMlControlEvery / 2 : kMlControlEvery; }
 
 std::string mask_learn_report() {
     if (!g_mlr) return "";
@@ -6892,16 +6957,18 @@ std::string mask_learn_report() {
     int n = std::snprintf(buf, sizeof buf, "strata serve: mask learn: p %.3f, g %.3f, %lld masked (%lld at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
                           "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f",
                           s.p, s.g, m, a, dm, s.dn, scored, s.fm, s.nm, s.fs, s.fsn);
-    if (mask_resident_on() && n > 0 && n < (int) sizeof buf) {
+    if ((mask_resident_on() || mask_ctrl_on()) && n > 0 && n < (int) sizeof buf) {
         // STRATA_MASK_RESIDENT: the request's SSD demand (the router's non-cheap picks, and those on masked experts), then what the moved count means
-        const double frac = s.dem_tot > 0 ? 100.0 * (double) s.dem_mask / (double) s.dem_tot : 0.0;
-        n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; SSD demand this request: %lld picks on masked experts of %lld (%.1f%%); "
-                           "the moved count on the mask line above is picks moved off the SSD to a cheap expert (SSD reads avoided)",
-                           s.dem_mask, s.dem_tot, frac);
-        // STRATA_MASK_RESIDENT: the decode windows run with the mask's moves off (control windows) since the last line
+        if (mask_resident_on()) {
+            const double frac = s.dem_tot > 0 ? 100.0 * (double) s.dem_mask / (double) s.dem_tot : 0.0;
+            n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; SSD demand this request: %lld picks on masked experts of %lld (%.1f%%); "
+                               "the moved count on the mask line above is picks moved off the SSD to a cheap expert (SSD reads avoided)",
+                               s.dem_mask, s.dem_tot, frac);
+        }
+        // STRATA_MASK_RESIDENT / STRATA_MASK_CTRL: the decode windows run with the mask's moves off (control windows) since the last line
         if (n < (int) sizeof buf) n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; control windows %lld", g_mask_ctrl_win);
         // STRATA_MASK_RESIDENT: the churn line, the levels that changed since the last line (up / down)
-        if (n < (int) sizeof buf) n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; levels changed +%lld -%lld", s.lv_up, s.lv_down);
+        if (mask_resident_on() && n < (int) sizeof buf) n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; levels changed +%lld -%lld", s.lv_up, s.lv_down);
     }
     if (n > 0 && n < (int) sizeof buf - 1) std::snprintf(buf + n, sizeof buf - (size_t) n, "\n");
     s.dsum = 0.0;
