@@ -16140,10 +16140,21 @@ int main(int argc, char** argv) {
                     if (ver.route_fragile_gaps(a0 + 1, fr_gap.data(), fr_top1.data()) && ver.route_fragile_shifts(a0 + 1, fr_shift.data())) {
                         bool fr_explore = false;   // an explore cut: no normal cut in this window; the first row with ratio in [k, 8k) (every 16th window)
                         bool fr_control = false;   // a control re-check: no normal or explore cut; the first accepted row no stand-in moved (every 32nd window)
-                        const int r = strata::core::Verifier::route_fragile_first(fr_gap.data(), fr_shift.data(), a0 + 1, &fr_explore, &fr_control);
+                        int r = strata::core::Verifier::route_fragile_first(fr_gap.data(), fr_shift.data(), a0 + 1, &fr_explore, &fr_control);
+                        // Stop re-check (no normal, explore or control cut): the first row q in 1..a0 that a stand-in moved and whose token is a stop
+                        // id (o.eos_ids, id equality) is cut and re-decided exactly, whatever its gap.  Row 0 is never cut (a re-run would step the
+                        // state twice), so a stop at row 0 stands and is not re-checked.
+                        bool fr_stop = false;
+                        if (r < 1)
+                            for (int q = 1; q <= a0 && !fr_stop; ++q)
+                                if (fr_shift[(size_t) q] > 0.0f && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) q]) != o.eos_ids.end()) {
+                                    r = q;
+                                    fr_stop = true;
+                                }
                         if (r >= 1) {
                             const float ratio = fr_shift[(size_t) r] > 0.0f ? fr_gap[(size_t) r] / fr_shift[(size_t) r] : 0.0f;
                             strata::core::Verifier::route_fragile_cut(ratio, fr_top1[(size_t) r], fr_explore, fr_control);
+                            if (fr_stop) strata::core::Verifier::route_fragile_stop_cut();
                             ver.standin_learn_cut(r);   // STRATA_STANDIN_LEARN: the cut row's first stand-in and its y_s (no-op when off)
                             ver.mask_learn_cut(r, fr_top1[(size_t) r], T, fr_control);   // STRATA_MASK=learn: the first-pass logits, the row's picks
                             if (rb_on) strata::core::Verifier::route_fragile_pos(produced_n + r);   // STRATA_ROLLBACK: row r's token position
@@ -16737,9 +16748,9 @@ int main(int argc, char** argv) {
             {   // STRATA_FRAGILE_RECHECK: this request's cuts, rows moved by stand-ins, flipped re-decisions and k (takes and resets the counts)
                 long long fr_cuts = 0, fr_explores = 0, fr_moved = 0, fr_flips = 0;
                 float fr_k = 0.0f, fr_med_shift = 0.0f, fr_med_gap = 0.0f, fr_req_b = 0.0f;
-                long long fr_brakes = 0, fr_ctrl_rc = 0, fr_ctrl_fl = 0;
+                long long fr_brakes = 0, fr_ctrl_rc = 0, fr_ctrl_fl = 0, fr_stop_cuts = 0, fr_stop_kept = 0;
                 if (strata::core::Verifier::route_fragile_take(fr_cuts, fr_explores, fr_moved, fr_flips, fr_k, fr_med_shift, fr_med_gap,
-                                                               fr_req_b, fr_brakes, fr_ctrl_rc, fr_ctrl_fl)) {
+                                                               fr_req_b, fr_brakes, fr_ctrl_rc, fr_ctrl_fl, fr_stop_cuts, fr_stop_kept)) {
                     std::fprintf(stderr, "strata serve: fragile recheck: %lld windows cut, %lld explore cuts, %lld rows moved by stand-ins, "
                                  "%lld flipped (k %.3f; median row_shift %.4f, median gap %.4f of the moved rows), control %lld re-checks %lld flips",
                                  fr_cuts, fr_explores, fr_moved, fr_flips, (double) fr_k, (double) fr_med_shift, (double) fr_med_gap,
@@ -16751,6 +16762,8 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, ", budget %.3f at end (%lld brakes), class %d start %.2f clean %.3f", (double) fr_req_b, fr_brakes,
                                      fr_class, (double) fr_start, (double) fr_clean);
                     }
+                    // stop re-checks: a stop-id row a stand-in moved, cut and re-decided exactly (kept: the exact top-1 agreed; continued: it did not)
+                    std::fprintf(stderr, "; stop re-checks %lld (%lld kept, %lld continued)", fr_stop_cuts, fr_stop_kept, fr_stop_cuts - fr_stop_kept);
                     std::fprintf(stderr, "\n");
                 }
             }

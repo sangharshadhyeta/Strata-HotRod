@@ -250,6 +250,8 @@ public:
     /// no stand-in moved, shift 0): its flip is the noise floor, kept apart from the k / brake / guard evidence.
     static int route_fragile_first(const float* gap, const float* shift, int n, bool* explore = nullptr, bool* control = nullptr);
     static void route_fragile_cut(float ratio, int32_t stand_top1, bool explore = false, bool control = false);
+    /// Stop re-check (serve loop, after route_fragile_cut): marks the pending cut as a stop cut, its row's stand-in token being a stop id.
+    static void route_fragile_stop_cut();
     /// exact_ok false: the exact row could not be read, so the pending cut is dropped without a verdict.
     static void route_fragile_settle(bool exact_ok, int32_t exact_top1);
     /// STRATA_ROLLBACK (opt-in; serve decode loop, verify.cpp).  route_gen_now: the request's committed decode tokens before the window;
@@ -265,7 +267,7 @@ public:
     /// This request's cuts, rows moved by stand-ins and flipped re-decisions, the current k, and the medians of the moved rows' shift and gap
     /// (false when the switch is off); resets the counts.  Also this request's decode budget at its end (req_b) and its brakes.
     static bool route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift, float& med_gap,
-                                   float& req_b, long long& brakes, long long& ctrl_rc, long long& ctrl_fl);
+                                   float& req_b, long long& brakes, long long& ctrl_rc, long long& ctrl_fl, long long& stop_cuts, long long& stop_kept);
     /// STRATA_FRAGILE_BRAKE (default on): the per-request decode budget brake (route_fragile_take's req_b and brakes are its).
     static bool route_brake_on();
     /// STRATA_FRAGILE_BRAKE: at a request's end, its size class learns its start fraction and clean level (route_class_end; the tune file is

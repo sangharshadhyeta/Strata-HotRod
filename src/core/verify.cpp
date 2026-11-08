@@ -182,6 +182,8 @@ struct RouteResidentCfg {
     bool win_exact = false;                   ///< this window is a flip re-check's exact re-run (set by route_budget_window): no STRATA_MASK moves in it
     bool fragile_pend = false;                ///< a cut's row is waiting for the exact window that re-decides it
     int32_t fragile_pend_tok = 0;             ///< the stand-in window's top-1 id at the cut row (argmax, not the sampled token)
+    bool fragile_pend_stop = false;           ///< the pending cut is a stop re-check (route_fragile_stop_cut: its row's stand-in token is a stop id)
+    long long fr_stop_cuts = 0, fr_stop_kept = 0;   ///< this request's stop re-checks, and those whose exact top-1 agreed with the stand-in's (kept)
     float win_low = 0.0f, win_tail = 0.0f;   ///< the budgets (ranks < lo, ranks >= lo) the last window ran with
     long long fr_cuts = 0, fr_explore_cuts = 0, fr_moved = 0, fr_flips = 0;   ///< this request's cuts (explore ones too), explore cuts, rows moved by stand-ins, flipped re-decisions (the stats line takes them)
     // STRATA_ROUTE_BUDGET_AUTO=1 (needs fragile_on; decode loop only): the engine chooses ONE budget b for ranks < lo and ranks >= lo alike.
@@ -4629,6 +4631,7 @@ void Verifier::route_budget_begin(int64_t prompt_tokens) {
     if (c.dyn_on) c.dyn_cur_hi = false;   // a request's first decode window starts at b_lo
     c.fragile_exact = false;              // STRATA_FRAGILE_RECHECK: a request starts with no pending cut
     c.fragile_pend = false;
+    c.fragile_pend_stop = false;
     if (c.auto_on) ++c.auto_req;          // STRATA_ROUTE_BUDGET_AUTO: the request whose windows the next arm time counts
     // STRATA_FRAGILE_BRAKE: this request starts at its class's start fraction s of auto_b, at least the class's clean level L when known,
     // and never above auto_b (auto_b itself when the brake is off)
@@ -4666,6 +4669,7 @@ bool Verifier::route_brake_take(int64_t& first, int64_t& last, float& old_b, flo
 void Verifier::route_rollback_reset() {
     RouteResidentCfg& c = route_resident_cfg();
     c.fragile_pend = false;
+    c.fragile_pend_stop = false;
     c.fragile_exact = false;
     c.req_flip_pos.clear();
 }
@@ -4898,6 +4902,14 @@ void Verifier::route_fragile_cut(float ratio, int32_t stand_top1, bool explore, 
     c.fragile_exact = true;
 }
 
+// Stop re-check (generate.cpp's serve loop, after route_fragile_cut): the cut row's stand-in token is one of the model's stop ids (o.eos_ids,
+// by id equality).  Counted apart in route_fragile_take; route_fragile_settle counts it kept when the exact run's top-1 agrees.
+void Verifier::route_fragile_stop_cut() {
+    RouteResidentCfg& c = route_resident_cfg();
+    ++c.fr_stop_cuts;
+    c.fragile_pend_stop = true;
+}
+
 bool Verifier::route_fragile_pending() { return route_resident_cfg().fragile_pend; }
 
 // The noise floor: Wilson 90% bounds of the control ring's flip rate (0 and 1 while it is empty, so nothing above noise is shown yet).
@@ -4916,9 +4928,12 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
     RouteResidentCfg& c = route_resident_cfg();
     if (!c.fragile_pend) return;
     c.fragile_pend = false;
+    const bool stop = c.fragile_pend_stop;   // a stop re-check (route_fragile_stop_cut): counted kept below when the exact top-1 agrees
+    c.fragile_pend_stop = false;
     if (!exact_ok) return;   // the exact row was not read: no verdict
     // a flip compares the argmax ids (the stand-in window's top-1 of the cut row, the exact window's top-1 of row 0), not the sampled tokens
     const bool flipped = exact_top1 != c.fragile_pend_tok;
+    if (stop && !flipped) ++c.fr_stop_kept;
     if (c.fragile_pend_control) {   // noise control: its own ring and counts, nothing else
         ++c.fr_ctrl_rc;
         if (flipped) ++c.fr_ctrl_fl;
@@ -5061,7 +5076,8 @@ void Verifier::route_class_state(int& cls, float& start, float& clean) {
 
 // This request's cuts, rows moved by stand-ins, flipped re-decisions and k; false when the switch is off.  Takes and resets the counts.
 bool Verifier::route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift,
-                                  float& med_gap, float& req_b, long long& brakes, long long& ctrl_rc, long long& ctrl_fl) {
+                                  float& med_gap, float& req_b, long long& brakes, long long& ctrl_rc, long long& ctrl_fl, long long& stop_cuts,
+                                  long long& stop_kept) {
     RouteResidentCfg& c = route_resident_cfg();
     if (!c.fragile_on) return false;
     cuts = c.fr_cuts;
@@ -5072,6 +5088,10 @@ bool Verifier::route_fragile_take(long long& cuts, long long& explores, long lon
     ctrl_fl = c.fr_ctrl_fl;
     c.fr_ctrl_rc = 0;
     c.fr_ctrl_fl = 0;
+    stop_cuts = c.fr_stop_cuts;   // this request's stop re-checks, and those kept (the exact top-1 agreed)
+    stop_kept = c.fr_stop_kept;
+    c.fr_stop_cuts = 0;
+    c.fr_stop_kept = 0;
     k = c.fragile_k;
     req_b = c.req_b;   // this request's budget at its end, and its brakes (not reset here: route_budget_begin resets them)
     brakes = c.req_brakes;
