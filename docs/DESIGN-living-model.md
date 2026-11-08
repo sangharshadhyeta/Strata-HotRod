@@ -10,6 +10,23 @@ small corrections that let hot experts stand in for cold ones, earlier routing -
 user's own past traffic. Over weeks the model it runs drifts toward the efficient design: a small, conscious working set that is known
 early, and everything else in a **subconscious** that is still there and comes back when it is needed.
 
+## 1.1 What we already have, and the role each part takes
+
+| Part of the engine today | Its role in the living model |
+| --- | --- |
+| VRAM expert cache, RAM tier, page cache, the ring | the three levels: conscious (VRAM), preconscious (RAM tier + ring), subconscious (NVMe) |
+| Stand-ins (residency-biased routing) and their self-tuning budget | today's substitutes; absorption (§3.1) grows them from one learned scale per pair (stand-in learn) into a low-rank correction |
+| Stand-in learn / stand-in balance tables | the first learned deltas - the format and save/load pattern the delta framework (§5 step 2) generalises |
+| The mask (old rule, and the opt-in resident rule) | the subconscious boundary; the resident rule's SSD-demand counter is the cost signal, its control windows are the canary mechanism (§6) |
+| Mask floor + top-rank logit gate | recall rule "distance" (§2.1): a pick too far from its substitute is recalled |
+| Fragile / flip re-check (exact re-runs) | the teacher: exact outputs for every learner, and recall rule "disagreement" |
+| Stop re-check | a quality guard, and the stop-continue rate in the gate |
+| Look-ahead learner (+1/+2/+4) and its predictor file | the planner and early routing (§3.3); its file is already a persisted, released learner |
+| Auto budget / mask tests, the tuners | the engine improving itself (§7.4), made a loop |
+| Prompt cache (save before a switch, conversation key) | conversation sessions; its conversation key is the capture's key (SPEC-capture A) |
+| MTP drafting, K/V streaming, PCIe balance, read-ahead | the speed layers - unchanged, the deltas run through them |
+| MMLU-Pro set, speed tests, server tests | the held-out panel and the build gates (§6) |
+
 ## 2. Three levels of memory
 
 | Level | Where | What it is | How it is used |
