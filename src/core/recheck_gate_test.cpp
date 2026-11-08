@@ -255,13 +255,16 @@ int main() {
     // SPEC-recheck-gated step G: the rotation budget -> mask -> cap -> prefetch -> budget, skipping the kinds that are off
     {
         namespace t = strata::core::tune;
-        check(t::next_kind(t::Budget, true, true, true) == t::Mask && t::next_kind(t::Mask, true, true, true) == t::Cap &&
-                  t::next_kind(t::Cap, true, true, true) == t::Prefetch && t::next_kind(t::Prefetch, true, true, true) == t::Budget,
-              "rotation: budget -> mask -> cap -> prefetch -> budget");
-        check(t::next_kind(t::Budget, false, true, true) == t::Cap && t::next_kind(t::Cap, false, true, true) == t::Prefetch,
+        check(t::next_kind(t::Budget, true, true, true, true) == t::Mask && t::next_kind(t::Mask, true, true, true, true) == t::Cap &&
+                  t::next_kind(t::Cap, true, true, true, true) == t::Prefetch && t::next_kind(t::Prefetch, true, true, true, true) == t::KMult &&
+                  t::next_kind(t::KMult, true, true, true, true) == t::Budget,
+              "rotation: budget -> mask -> cap -> prefetch -> k -> budget (step H2: the fifth kind)");
+        check(t::next_kind(t::Budget, false, true, true, true) == t::Cap && t::next_kind(t::Cap, false, true, true, true) == t::Prefetch,
               "rotation: mask off is skipped");
-        check(t::next_kind(t::Mask, true, false, true) == t::Prefetch && t::next_kind(t::Prefetch, true, false, false) == t::Budget,
+        check(t::next_kind(t::Mask, true, false, true, true) == t::Prefetch && t::next_kind(t::Prefetch, true, false, false, false) == t::Budget,
               "rotation: cap off is skipped; prefetch off goes back to budget");
+        check(t::next_kind(t::Prefetch, false, false, false, true) == t::KMult && t::next_kind(t::KMult, false, false, false, false) == t::Budget,
+              "rotation: k alone after prefetch; k off goes back to budget");
         check(t::next_kind(t::Budget, false, false, false) == t::Budget && t::next_kind(t::Cap, false, false, false) == t::Budget,
               "rotation: only budget on, always budget");
     }
@@ -307,6 +310,75 @@ int main() {
         g::State v;
         check(!g::parse("fingerprint 0b\ntune_prefetch 99 1 0\n", 11, v), "tune: a prefetch count above 64 is refused");
         check(!g::parse("fingerprint 0b\ntune_cap 0 1 1.25 0 1 0\n", 11, v), "tune: a non-positive cap multiplier is refused");
+    }
+
+    // SPEC-recheck-gated step H1: k from evidence above the noise floor (k_evidence, k_target)
+    {
+        // flips concentrated below ratio 0.02: all 40 entries at 0.02 flipped -> r* 0.02, k 1.25 x 0.02 = 0.025
+        std::vector<float> ratio(40, 0.02f);
+        std::vector<unsigned char> flip(40, true);
+        const g::KEvidence e = g::k_evidence(ratio.data(), reinterpret_cast<const bool*>(flip.data()), 40, 0.074);
+        check(e.found && near(e.r_star, 0.02, 1e-6) && e.n_t == 40 && e.f_t == 40, "k_evidence: flips at 0.02 give r* 0.02");
+        check(near(g::k_target(e, 40, 1.0f), 0.025, 1e-6), "k_target: 1.25 x r* = 0.025");
+    }
+    {
+        // noise at high ratios: 200 entries with ratio 0.005 .. 1.0; from ratio 0.505 on, 1 in 14 flipped (7%, the control's rate); no flip below.
+        // No threshold's entries show a flip rate above the control's noise: no evidence, so k halves from a full ring.
+        std::vector<float> ratio(200);
+        std::vector<unsigned char> flip(200, false);
+        for (int i = 0; i < 200; ++i) {
+            ratio[(size_t) i] = 0.005f * (float) (i + 1);
+            flip[(size_t) i] = i >= 100 && i % 14 == 0;
+        }
+        const g::KEvidence e = g::k_evidence(ratio.data(), reinterpret_cast<const bool*>(flip.data()), 200, 0.074);
+        check(!e.found, "k_evidence: flips at the control's noise rate, at high ratios, give no evidence");
+        check(near(g::k_target(e, 200, 1.0f), 0.5, 1e-6), "k_target: no evidence with a full ring halves k");
+    }
+    {
+        // small n: 5 entries, all flipped: fewer than 8 at or above any threshold, so no evidence; a short ring keeps k
+        std::vector<float> ratio(5, 0.3f);
+        std::vector<unsigned char> flip(5, true);
+        const g::KEvidence e = g::k_evidence(ratio.data(), reinterpret_cast<const bool*>(flip.data()), 5, 0.0);
+        check(!e.found && near(g::k_target(e, 5, 0.7f), 0.7, 1e-6), "k_evidence: fewer than 8 entries give no evidence, k kept");
+        // no control samples (ctrl_hi 1): nothing qualifies, as before (no raise)
+        std::vector<float> r40(40, 0.02f);
+        std::vector<unsigned char> f40(40, true);
+        check(!g::k_evidence(r40.data(), reinterpret_cast<const bool*>(f40.data()), 40, 1.0).found, "k_evidence: no control samples, no raise");
+        // no flips at all in a full ring: no evidence, k halves
+        std::vector<float> rn(60, 0.1f);
+        std::vector<unsigned char> fn(60, false);
+        check(!g::k_evidence(rn.data(), reinterpret_cast<const bool*>(fn.data()), 60, 0.074).found, "k_evidence: no flip, no evidence");
+        // the clamp: 1.25 x r* above 50 is 50
+        check(near(g::k_target(g::KEvidence{true, 100.0, 9, 9}, 9, 1.0f), 50.0, 1e-6), "k_target: clamped to 50");
+    }
+    // SPEC-recheck-gated step H2: the margin m candidates (m x step^d, range 0.6-1.5), the explore veto, and the persistence of m
+    {
+        namespace t = strata::core::tune;
+        double m = 0.0;
+        check(t::k_mult_candidate(1.0, 1.25, 1, m) && near(m, 1.25, 1e-9), "k candidate: up by the step");
+        check(t::k_mult_candidate(1.0, 1.25, -1, m) && near(m, 0.8, 1e-9), "k candidate: down by the step");
+        check(!t::k_mult_candidate(1.5, 1.25, 1, m) && !t::k_mult_candidate(0.6, 1.25, -1, m), "k candidate: at the range ends, not a candidate");
+        check(t::k_mult_candidate(1.4, 1.25, 1, m) && near(m, 1.5, 1e-9), "k candidate: clamped to 1.5 (still a candidate from 1.4)");
+        check(!t::k_mult_candidate(1.0, 0.0, 1, m), "k candidate: a non-positive step is not a candidate");
+        // explore veto: the candidate's explore flips (20/40, lower bound ~0.37) above the base's upper bound (2/40, ~0.14) and the control's
+        check(t::explore_veto(2, 40, 20, 40, 0.074, 16), "explore veto: the candidate's explore flips above noise block the move");
+        check(!t::explore_veto(2, 40, 5, 40, 0.074, 16), "explore veto: the candidate at the base's rate passes");
+        check(!t::explore_veto(2, 40, 20, 10, 0.074, 16), "explore veto: fewer than 16 candidate explore cuts: not blocked");
+    }
+    {
+        // the margin's state survives a save and a load; an out-of-range m is refused
+        g::State s;
+        s.tune.k_mult = 1.125;
+        s.tune.k_step = 1.5625f;
+        s.tune.k_last_win = 1;
+        s.tune.k_first = -1;
+        s.tune.k_stage = 1;
+        g::State u;
+        check(g::parse(g::serialize(s, 12), 12, u) && near(u.tune.k_mult, 1.125, 1e-9) && near(u.tune.k_step, 1.5625, 1e-6) &&
+                  u.tune.k_last_win == 1 && u.tune.k_first == -1 && u.tune.k_stage == 1,
+              "round trip: the margin m, its step and direction come back");
+        g::State v;
+        check(!g::parse("fingerprint 0c\ntune_k 2.0 1.25 0 1 0\n", 12, v), "tune: a margin above 1.5 is refused");
     }
 
     std::printf("recheck_gate_test: ok\n");
