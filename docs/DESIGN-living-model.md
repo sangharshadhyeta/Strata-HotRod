@@ -72,7 +72,48 @@ apart). Otherwise it is rolled back. Deltas are versioned on the NVMe; any versi
 4. **Router co-adaptation and early routing (§3.2, §3.3):** measured as early-guess agreement per layer over the weeks.
 5. **Consolidation, forgetting and sleep (§2.2, §3.4).**
 
-## 6. What tells us it works
+## 6. Does it hold? The validation that runs beside the learning
+- **A held-out panel the learners never see:** the 40 MMLU-Pro questions, an agent task set (multi-step tool use), long-context needle
+  and recall at 64K / 128K / 256K, and a fixed set of the user's own past prompts split by time (train on older, test on newer). Run at
+  every promotion and every night; a score below its band blocks the promotion.
+- **A frozen-base probe:** a fixed probe set whose next-token distributions are compared with the untouched base model's (KL). Drift is
+  allowed to grow only as fast as the panel stays flat.
+- **Canaries:** a new delta first serves a share of requests (as the mask's control windows do), compared live with the current version
+  on the same signals; it is promoted only when it is at least as good.
+- **Collapse watch:** answer diversity on the panel (distinct correct reasoning paths, not one memorised path) - the "consensus trap"
+  that label-free RL is known to fall into.
+- **Reward-hacking watch:** for every learned reward (§7), a sample of the episodes it rewarded is read by hand.
+- **One switch, always:** every learner has its own flag, every delta a version, and the base file is never written. Turning the living
+  model off returns exactly the base model.
+
+## 7. Recursive self-improvement (RSI)
+
+The loop of autoresearch and OpenEvolve, applied to this system: **propose -> evaluate on the panel and canary -> keep only if better ->
+repeat**, with the gate of §4 as the evaluator. Three kinds of proposals feed it:
+
+### 7.1 Rewards from the user's own work (RL from feedback, local)
+- **Agent work: did the command run or break.** Read from structured fields only - the tool result's `is_error` flag (Anthropic API) or
+  the exit code where the client sends it - never by reading the output's text (no pattern matching). A tool call that runs is a small
+  reward; a turn that ends the task is a larger one (the turn-level reward design of multi-turn agent RL).
+- **Text and reasoning: agreement under resampling.** In idle time, past prompts with checkable structure (maths, code with tests,
+  multiple choice) are answered several times; majority agreement is the label-free reward (TTRL), with the diversity watch of §6
+  against the consensus trap. Code answers are rewarded by running their tests.
+- **Conversation signals:** a regenerated or edited answer (the same prompt sent again) counts against the first answer; that is a
+  request-level fact, not a text judgement.
+- **What these rewards train:** only what this hardware can train - the router deltas (§3.2), small adapters on the conscious experts and
+  on attention (in VRAM), the planner, and the recall thresholds (§2.1). Never the base file.
+
+### 7.2 Weight-space programming (proposed edits)
+A strong model is shown a small, specific part of the weights together with a measured failure (an early stop, a loop, a recall that
+fires too often) and proposes a direct edit - the way "Sparks of Weight-Space Programming" fixed a 0.8B model's reasoning loops by
+changing 0.016% of its weights. Each proposal is only a candidate: it goes through the same panel, canary and hand-read gate.
+
+### 7.3 The system improving its own engine
+The same loop over the engine's own settings and code paths (as autoresearch edits its training code): a proposed change to a
+threshold, a budget or a schedule is built, run on the panel and the canary, and kept only if speed or quality improves with nothing
+else falling - our existing practice (one concept at a time, measured, no lost switch re-run), made a loop.
+
+## 8. What tells us it works
 - SSD bytes per token falling week by week, decode tok/s rising, with flips, stop-continues and hand-read quality flat.
 - The recall rate settling low (the subconscious is rarely needed) but non-zero (it is still there).
 - Early-routing agreement per layer rising toward the router's own choice.
