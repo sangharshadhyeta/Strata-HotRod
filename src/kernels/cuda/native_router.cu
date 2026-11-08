@@ -1422,7 +1422,7 @@ constexpr int kLaCnt = 18;       // counters per (s,d): [0] picks since change, 
                                  // [3+c] hits since change, [7+c] hits recent, [11+c] hits all, [15] changes, [16] resets,
                                  // [17] recent blocks in a row where the plain router beat the leader
 constexpr int kLaMinPicks = 200, kLaFreezePicks = 2000, kLaRecPicks = 500;
-constexpr float kLaLr = 1e-3f, kLaB1 = 0.9f, kLaB2 = 0.999f, kLaEps = 1e-8f, kLaWd = 1e-3f, kLaZ90 = 1.6448536f;
+constexpr float kLaLr = 1e-3f, kLaB1 = 0.9f, kLaB2 = 0.999f, kLaEps = 1e-8f, kLaWd = 1e-3f;
 
 static int la_dist_index(int dist) {
     for (int i = 0; i < kLaNd; ++i)
@@ -1691,12 +1691,24 @@ __device__ __forceinline__ void la_decide_one(const LaBatch& a, int sd, int w, i
     unsigned long long* c = a.cnt + (size_t) sd * kLaCnt;
     a.reset[sd] = 0;
     a.tick[sd] += 1;
-    for (int k = 0; k < kLaNSlots; ++k) any |= a.act[(size_t) sd * kLaNSlots + k] != 0;
     const int s = sd / a.Nd, dd = sd % a.Nd;
     const bool was_frozen = a.frozen[sd] != 0;
     int L = a.lead[sd];
-    // the frozen leader trained this window (its act flag, set by la_b_prep_k from the state it read; the leader does not change while frozen)
-    const bool trained_leader = L != 0 && a.act[(size_t) sd * kLaNSlots + L - 1] != 0;
+    const bool tgt = s + a.dist[dd] < a.L;
+    bool trained_leader = false;
+    if (a.cad_on) {
+        // what this window's training trains, from the state before this window's decision (the training kernels may be skipped
+        // when nothing is due, so the act flags cannot be read): the same test as la_b_prep_k
+        if (!was_frozen) {
+            for (int k = 1; k < kLaSlots; ++k) any |= (tgt && a.live[sd * kLaSlots + k] != 0);
+        } else {
+            trained_leader = L != 0 && tgt && a.live[sd * kLaSlots + L] != 0 && la_cadence::trains_at(a.cad[sd].due, w);
+            any |= trained_leader;
+        }
+    } else {
+        for (int k = 0; k < kLaNSlots; ++k) any |= a.act[(size_t) sd * kLaNSlots + k] != 0;
+        trained_leader = L != 0 && a.act[(size_t) sd * kLaNSlots + L - 1] != 0;
+    }
     const float nS = (float) c[0];
     if (!a.frozen[sd] && nS >= kLaMinPicks) {
         int best = -1;
@@ -1753,10 +1765,9 @@ __device__ __forceinline__ void la_decide_one(const LaBatch& a, int sd, int w, i
         } else if (!was_frozen) {
             la_cadence::set_frozen(st, w, c[0]);
             if (L == 0) st.due = la_cadence::kNever;   // a plain leader while frozen: no set trains
-        } else if (trained_leader) {
-            la_cadence::after_train(st, w, c[0], c[3 + L], c[1], c[7 + L]);
+        } else if (L != 0) {
+            la_cadence::after_window(st, w, trained_leader, c[0], c[3 + L], c[1], c[7 + L]);
         }
-        const bool tgt = s + a.dist[dd] < a.L;
         const int next = !tgt ? la_cadence::kNever : (a.frozen[sd] ? st.due : w + 1);
         mn = min(mn, next);
     }
@@ -2065,33 +2076,33 @@ void la_learn_pre_launch(void* stream) {
 }
 
 // after a learning window's graph is launched on cs: the batch on the side stream, which waits for the window's end and records done
-static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd, const uint8_t* mask, int win);
+static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd, const uint8_t* mask, int win, bool train);
 void la_learn_post_launch(void* stream, const int* res, int n) {
     if (!la_learn_active() || n < 1 || n > kLaTok) return;
     LaLearn& s = *g_la;
-    const int w = s.win++;   // every window counts, its batch launched or not
+    const int w = s.win++;   // every window counts
+    // the batch always runs its scoring and decision (rank, score, decide, reinit: the counters and the cadence advance every window);
+    // the training kernels only when a set is due (SPEC-adaptive-la change 2).  The gate: the last batch is done (its decide wrote the
+    // next training window, a host-mapped word read with no CUDA call) and no set is due in w.  STRATA_LA_CADENCE=0: always trains.
+    bool train = true;
     if (s.cad_on) {
-        // the gate (SPEC-adaptive-la change 2): the last batch's decide has written the next training window (a host-mapped word, read
-        // with no CUDA call); when no set trains in w there is no batch to launch and nothing to wait for
         std::atomic_thread_fence(std::memory_order_acquire);
         const bool valid = *static_cast<volatile int*>(&s.gate_min_h[1]) == s.last_launch;
         const int min_due = *static_cast<volatile int*>(&s.gate_min_h[0]);
-        if (!la_cadence::launch_needed(valid, min_due, w)) {
-            s.skipped += 1;
-            return;
-        }
+        train = la_cadence::launch_needed(valid, min_due, w);
+        if (!train) s.skipped += 1;
     }
     cudaStream_t cs = static_cast<cudaStream_t>(stream);
     cudaEventRecord(s.ev_end, cs);
     cudaStreamWaitEvent(s.side, s.ev_end, 0);
     s.last_launch = w;
     // the mask's base ([layers][512]; route_mask_layer(0) is the base): nullptr when no mask is set or it lives on another GPU
-    la_batch(s, res, n, kLaDist, kLaNd, route_mask_layer(0, kLaE), w);
+    la_batch(s, res, n, kLaDist, kLaNd, route_mask_layer(0, kLaE), w, train);
 }
 // the batch of n token rows on the instance's side stream (the caller ordered it after the work it reads): the LaBatch from the instance,
 // the dists (Nd of them), every kernel in launch order, and the done event.  The main learner's post launch and the drafter's batch share it.
 // mask: the route mask's base for the target layers (nullptr: none; the drafter's label is its own router, not a main layer, so it passes none).
-static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd, const uint8_t* mask, int win) {
+static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd, const uint8_t* mask, int win, bool train) {
     LaBatch a{};
     for (int c = 1; c < kLaSlots; ++c) {
         a.A[c] = s.A[c]; a.B[c] = s.B[c]; a.mA[c] = s.mA[c]; a.vA[c] = s.vA[c]; a.mB[c] = s.mB[c]; a.vB[c] = s.vB[c];
@@ -2118,17 +2129,19 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
     la_b_score_k<<<dim3(n, s.Nsd, kLaSlots), kLaE, 0, sd_s>>>(a);
     mark(1, 1);
     mark(2, 0);
-    la_b_prep_k<<<(s.Nset + 63) / 64, 64, 0, sd_s>>>(a);
-    mark(2, 1);
-    mark(3, 0);
-    la_b_grad_k<<<dim3(n, s.Nset), kLaE, 0, sd_s>>>(a);
-    mark(3, 1);
-    mark(4, 0);
-    la_b_upd_b_k<<<dim3(32, s.Nset), 256, 0, sd_s>>>(a);
-    mark(4, 1);
-    mark(5, 0);
-    la_b_upd_a_k<<<dim3((s.H + 255) / 256, s.Nset), 256, 0, sd_s>>>(a);
-    mark(5, 1);
+    if (train) {   // the training kernels: skipped when no set is due (their act flags would all be 0: nothing changes)
+        la_b_prep_k<<<(s.Nset + 63) / 64, 64, 0, sd_s>>>(a);
+        mark(2, 1);
+        mark(3, 0);
+        la_b_grad_k<<<dim3(n, s.Nset), kLaE, 0, sd_s>>>(a);
+        mark(3, 1);
+        mark(4, 0);
+        la_b_upd_b_k<<<dim3(32, s.Nset), 256, 0, sd_s>>>(a);
+        mark(4, 1);
+        mark(5, 0);
+        la_b_upd_a_k<<<dim3((s.H + 255) / 256, s.Nset), 256, 0, sd_s>>>(a);
+        mark(5, 1);
+    }
     mark(6, 0);
     la_b_decide_k<<<1, 256, 0, sd_s>>>(a);   // one block: the (s,d) loop and the block's gate and count
     mark(6, 1);
@@ -2213,7 +2226,7 @@ static std::string la_report_inst(LaLearn& s, const char* name) {
             const int med = per.empty() ? 0 : per[per.size() / 2];
             out += pre + ": trained in " + std::to_string(nt) + " of " + std::to_string(s.win) + " windows";
             if (s.cad_on) out += " (cadence median " + std::to_string(med) + ")";
-            out += ", " + std::to_string(s.skipped) + " batches not launched (no set trained)\n";
+            out += ", " + std::to_string(s.skipped) + " windows whose training launch was skipped (no set due)\n";
         }
     }
     // the resets: each (s,d)'s last one, logged when its count has grown (the recent picks, the plain router's hits, the old leader's)
@@ -2576,7 +2589,7 @@ void la_mtp_label(const float* logits_row, void* stream) {
 void la_mtp_batch() {
     if (!la_mtp_active()) return;
     static const int kDist1[1] = {1};
-    la_batch(*g_lam, g_mla.res2, 1, kDist1, 1, nullptr, g_lam->win++);
+    la_batch(*g_lam, g_mla.res2, 1, kDist1, 1, nullptr, g_lam->win++, true);
 }
 
 // before a window's graph is launched on its stream: the last batch is done, and the source copies are (the forward overwrites them)

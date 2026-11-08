@@ -8,8 +8,9 @@
 // the long-run rate (Newcombe 90%, over a recent block of >= kRecentMin picks) sends the period back to 4 at once, and so
 // does a change or a reset (a live (layer, dist) trains every window: period 1).
 //
-// A window's batch is skipped when no (layer, dist) trains in it (launch_needed): the host reads the decide kernel's
-// next-training window (a host-mapped word) and launches only when that window has a trainer.
+// The batch of a window always runs the scoring and the decision (rank, score, decide: the counters and the cadence advance every
+// window).  Only the training kernels (prep, grad, upd_b, upd_a) are launched when a set is due (launch_needed): the host reads the
+// decide kernel's next-training window (a host-mapped word, valid once the last batch is done) and skips them otherwise.
 #pragma once
 
 #include <climits>
@@ -83,17 +84,21 @@ STRATA_LA_HD void set_frozen(State& st, int w, unsigned long long picks) {
     st.per = kBasePeriod;
 }
 
-// the frozen leader trained in window w: the next training by the period the picks give, or back to kBasePeriod on a drop
-STRATA_LA_HD void after_train(State& st, int w, unsigned long long picks, unsigned long long hits_long, unsigned long long picks_rec,
-                              unsigned long long hits_rec) {
+// one window's cadence step for a frozen leader (every window, trained or not: the drop test sees every window's counters).  trained: the
+// leader's training ran in this window (its due window had come).  A trained window sets the next due by the period the picks give;
+// a recent drop sends the period back to kBasePeriod at once (the next due no later than w + kBasePeriod, so a persisting drop does
+// not hold the leader back)
+STRATA_LA_HD void after_window(State& st, int w, bool trained, unsigned long long picks, unsigned long long hits_long,
+                               unsigned long long picks_rec, unsigned long long hits_rec) {
+    if (trained) {
+        st.per = frozen_period(picks, st.base);
+        st.due = w + st.per;
+    }
     if (recent_drop(hits_long, picks, hits_rec, picks_rec)) {
         st.base = picks;
         st.per = kBasePeriod;
-        st.due = w + kBasePeriod;
-        return;
+        if (st.due > w + kBasePeriod) st.due = w + kBasePeriod;
     }
-    st.per = frozen_period(picks, st.base);
-    st.due = w + st.per;
 }
 
 // does the frozen leader train in window w (its state's due window has come)
