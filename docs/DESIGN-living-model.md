@@ -111,7 +111,18 @@ it is - no reward of our own design (no "the command ran" bonus):
   regression deltas, folded at sleep (§3.4).
 - **Every edit is a proposal:** it passes the panel, the frozen-base probe, the canary and a hand-read sample (§4, §6), or it is dropped.
 
-### 7.3 The system improving its own engine
+### 7.3 Gradient fine-tuning, in specific cases and areas
+Closed-form edits carry one direction per edit; some changes need more. Then - and only there - the system fine-tunes with gradients,
+by the same RLHF signal (DPO on the preference pairs, GRPO on the reward-model groups, as TRL / OpenRLHF / verl implement them):
+- **When:** an edit that fails the gate twice for the same behaviour; a behaviour that needs several directions at once; the planner and
+  the router deltas, whose targets (§3.2, §3.3) are naturally losses.
+- **Where:** only pieces small enough for the card - the routers, the planner, attention and the conscious experts' low-rank adapters -
+  never the whole model, never the base file.
+- **How it stays overhead-free:** idle time only (nights), and the adapter is folded into the weights' delta at sleep (§3.4), so serving
+  runs the same kernels at the same speed.
+- **The same gate:** panel, frozen-base probe, canary, hand-read sample.
+
+### 7.4 The system improving its own engine
 The same loop over the engine's own settings and code paths (as autoresearch edits its training code): a proposed change to a
 threshold, a budget or a schedule is built, run on the panel and the canary, and kept only if speed or quality improves with nothing
 else falling - our existing practice (one concept at a time, measured, no lost switch re-run), made a loop.
