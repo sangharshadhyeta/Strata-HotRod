@@ -386,6 +386,46 @@ int main() {
         check(!g::parse("fingerprint 0c\ntune_k 2.0 1.25 0 1 0\n", 12, v), "tune: a margin above 1.5 is refused");
     }
 
+    // the control re-checks (the noise floor), persisted: the newest kCtrlKeep kept, cumulative counts, the seed of a window's ring, the early cadence
+    {
+        g::State s;
+        for (int i = 0; i < 450; ++i) g::ctrl_add(s, i % 10 == 0);   // 45 flips in 450
+        check(s.ctrl.size() == g::kCtrlKeep && s.ctrl_seen == 450 && s.ctrl_flips_total == 45, "control: the newest 400 kept; cumulative 450 seen, 45 flipped");
+        // the last 400 are re-checks 50..449 (i = 50 is a flip: 50 % 10 == 0): 40 flips
+        int flips_kept = 0;
+        for (unsigned char v : s.ctrl) flips_kept += v;
+        check(flips_kept == 40, "control: the kept ring holds the newest 400 re-checks (40 of them flipped)");
+        // seeding a window's ring: the newest min(n, cap), oldest first, the next slot after them
+        bool ring200[200] = {};
+        int pos = -1;
+        const int n200 = g::ctrl_seed(s, ring200, 200, pos);
+        check(n200 == 200 && pos == 0, "seed: a ring of 200 takes the newest 200 (full, next slot 0)");
+        bool ring400[400] = {};
+        const int n400 = g::ctrl_seed(s, ring400, 400, pos);
+        check(n400 == 400 && pos == 0, "seed: a ring of 400 takes all 400 (full, next slot 0)");
+        int seeded_flips = 0;
+        for (int i = 0; i < n400; ++i) seeded_flips += ring400[i] ? 1 : 0;
+        check(seeded_flips == 40, "seed: the seeded flips equal the kept ring's");
+        g::State small;
+        for (int i = 0; i < 7; ++i) g::ctrl_add(small, i == 2);
+        bool ring[400] = {};
+        const int ns = g::ctrl_seed(small, ring, 400, pos);
+        check(ns == 7 && pos == 7 && ring[2] && !ring[0], "seed: fewer saved re-checks than the ring: n and the next slot follow them");
+        // the round trip keeps the control ring and its counts
+        g::State u;
+        check(g::parse(g::serialize(s, 13), 13, u) && u.ctrl == s.ctrl && u.ctrl_seen == 450 && u.ctrl_flips_total == 45,
+              "round trip: the control ring and its cumulative counts come back");
+        g::State v;
+        check(!g::parse("fingerprint 0d\nctrl_ring 1 2 0\n", 13, v), "control: a value other than 0 or 1 is refused");
+        std::string too_many = "fingerprint 0d\nctrl_ring";
+        for (int i = 0; i < 401; ++i) too_many += " 1";
+        check(!g::parse(too_many + "\n", 13, v), "control: more than 400 saved re-checks are refused");
+        // the early cadence: 128 eligible windows apart while fewer than 20 control re-checks exist, the configured one after
+        check(g::ctrl_every(1024, 0) == 128 && g::ctrl_every(1024, 19) == 128 && g::ctrl_every(1024, 20) == 1024,
+              "cadence: 1024 configured is 128 with fewer than 20 control re-checks, then 1024");
+        check(g::ctrl_every(64, 0) == 64 && g::ctrl_every(0, 0) == 0, "cadence: a shorter configured period stays; 0 (off) stays off");
+    }
+
     std::printf("recheck_gate_test: ok\n");
     return 0;
 }

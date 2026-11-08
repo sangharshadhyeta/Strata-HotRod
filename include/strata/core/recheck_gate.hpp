@@ -238,6 +238,10 @@ struct State {
     Deciles margin;
     RankTable rank;
     tune::Tune tune;     ///< step G: the cap multipliers and the prefetch count chosen by the paired tuner (persisted)
+    // the control re-checks (the noise floor of k and the brake): the last kCtrlKeep exact-vs-exact re-checks, oldest first (1 = the top-1
+    // flipped), and their cumulative count and flips.  Saved with the state and seeding the window's control ring at load.
+    std::vector<unsigned char> ctrl;
+    long long ctrl_seen = 0, ctrl_flips_total = 0;
     Ring shift;          ///< step F: the moved rows' final row_shift (the cap's median, the calibration deciles)
     ShiftCal cal;        ///< step F: the cut rows' shift decile, split by the verdict
     std::vector<float> margin_ring;
@@ -305,6 +309,37 @@ inline int step(State& s) {
     return dir;
 }
 
+// ---- the control re-checks (the noise floor), persisted with the state.
+
+constexpr size_t kCtrlKeep = 400;   ///< the control re-checks kept (the newest; a decayed window of the noise, not a cumulative sum)
+
+/// One control re-check (flipped or not): the ring keeps the newest kCtrlKeep, the counters are cumulative.
+inline void ctrl_add(State& s, bool flipped) {
+    ++s.ctrl_seen;
+    if (flipped) ++s.ctrl_flips_total;
+    if (s.ctrl.size() >= kCtrlKeep) s.ctrl.erase(s.ctrl.begin());
+    s.ctrl.push_back(flipped ? 1 : 0);
+}
+
+/// Seeds a window's control ring (ring[0..cap), the layout of the window's fr_ctrl): the newest min(size, cap) saved re-checks, oldest first.
+/// Returns the count n (the ring's fill) and sets pos to the next slot (n mod cap), as the ring keeps it.
+inline int ctrl_seed(const State& s, bool* ring, int cap, int& pos) {
+    const int n = (int) std::min<size_t>(s.ctrl.size(), (size_t) cap);
+    const size_t start = s.ctrl.size() - (size_t) n;
+    for (int i = 0; i < n; ++i) ring[i] = s.ctrl[start + (size_t) i] != 0;
+    pos = cap > 0 ? n % cap : 0;
+    return n;
+}
+
+/// The control cadence (STRATA_FRAGILE_CTRL_EVERY = configured, 0 = off): while fewer than kCtrlEarlyN control re-checks exist, at most
+/// kCtrlEarlyEvery eligible windows apart, so the noise floor is measured early; the configured cadence after that.
+constexpr long long kCtrlEarlyN = 20;
+constexpr long long kCtrlEarlyEvery = 128;
+inline long long ctrl_every(long long configured, long long n_ctrl) {
+    if (configured <= 0) return 0;
+    return n_ctrl < kCtrlEarlyN && configured > kCtrlEarlyEvery ? kCtrlEarlyEvery : configured;
+}
+
 // ---- persistence: text, one key per line, keyed by the model's fingerprint (a file of another model is refused).
 
 /// The state as text (the fingerprint on the first line).  Floats are written with 9 digits, so a round trip is exact.
@@ -347,6 +382,11 @@ inline std::string serialize(const State& s, uint64_t fp) {
     std::snprintf(buf, sizeof buf, "tune_k %.9g %.9g %d %d %d\n", s.tune.k_mult, (double) s.tune.k_step, s.tune.k_last_win, s.tune.k_first,
                   s.tune.k_stage);
     out += buf;
+    std::snprintf(buf, sizeof buf, "ctrl_seen %lld\nctrl_flips %lld\n", s.ctrl_seen, s.ctrl_flips_total);
+    out += buf;
+    out += "ctrl_ring";
+    for (unsigned char v : s.ctrl) out += v ? " 1" : " 0";
+    out += "\n";
     std::snprintf(buf, sizeof buf, "shift_pos %lld\n", (long long) s.shift.pos);
     out += buf;
     out += "shift_ring";
@@ -416,6 +456,16 @@ inline bool parse(const std::string& text, uint64_t fp, State& s) {
             t.tune.prefetch = p;
             t.tune.pf_first = f < 0 ? -1 : 1;
             t.tune.pf_stage = sg != 0 ? 1 : 0;
+        } else if (key == "ctrl_seen") {
+            if (!(ls >> t.ctrl_seen) || t.ctrl_seen < 0) return false;
+        } else if (key == "ctrl_flips") {
+            if (!(ls >> t.ctrl_flips_total) || t.ctrl_flips_total < 0) return false;
+        } else if (key == "ctrl_ring") {
+            long long v = 0;
+            while (ls >> v) {
+                if ((v != 0 && v != 1) || t.ctrl.size() >= kCtrlKeep) return false;   // a 0/1 per re-check, at most kCtrlKeep
+                t.ctrl.push_back((unsigned char) v);
+            }
         } else if (key == "tune_k") {
             double m = 0, st = 0;
             int lw = 0, f = 1, sg = 0;

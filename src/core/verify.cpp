@@ -194,7 +194,7 @@ struct RouteResidentCfg {
     // Noise control (STRATA_FRAGILE_RECHECK): every kCtrlEvery eligible windows with no normal or explore cut, the first accepted row r >= 1
     // that no stand-in moved (row_shift 0) is re-checked the same way.  Its flips are the noise of a re-decision (two windows of the same
     // tokens differ on their own), so they never enter fr_flip / req_fl / auto_fl.  The last kCtrlRing control re-checks are kept.
-    enum { kCtrlEvery = 32, kCtrlRing = 200 };
+    enum { kCtrlEvery = 32, kCtrlRing = 400 };   // (400 = the gate's persisted control re-checks, gate::kCtrlKeep: the seed fills it whole)
     // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 = the old selection below): every n-th eligible decode window (a non-merged window of a
     // learned k, with a stand-in budget or AUTO, not an exact re-run) is a control window decided BEFORE it runs: route_fragile_control sets
     // the device flag, so route_resident_k and the mask kernel move no pick and row_shift stays 0.  Its selection then takes the first
@@ -4838,9 +4838,15 @@ void Verifier::route_tune_open(const std::string& path, uint64_t model_fp) {
     c.tune_path = path;
     // SPEC-recheck-gated: the gate's saved state (P_HI, totals, ranks, shifts, calibration), when it is this model's
     if (c.gate_on && std::filesystem::exists(path + ".gate")) {
-        if (route_gate_read(path + ".gate", model_fp, c))
-            std::fprintf(stderr, "strata serve: recheck gate state loaded: P_HI %.2f, %lld moves so far (%s)\n", (double) c.gs.p_hi, c.gs.moves,
-                         (path + ".gate").c_str());
+        if (route_gate_read(path + ".gate", model_fp, c)) {
+            // the saved control re-checks seed the window's control ring: the k evidence and the brake have the noise floor from the first window
+            c.fr_ctrl_n = strata::core::gate::ctrl_seed(c.gs, c.fr_ctrl, RouteResidentCfg::kCtrlRing, c.fr_ctrl_pos);
+            double ctl_lo = 0.0, ctl_hi = 0.0;
+            route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, ctl_lo, ctl_hi);
+            std::fprintf(stderr, "strata serve: recheck gate state loaded: P_HI %.2f, %lld moves so far, noise floor from %d saved control re-checks "
+                         "(%lld flipped in all; flip rate upper bound %.3f) (%s)\n",
+                         (double) c.gs.p_hi, c.gs.moves, c.fr_ctrl_n, c.gs.ctrl_flips_total, ctl_hi, (path + ".gate").c_str());
+        }
         else
             std::fprintf(stderr, "strata serve: recheck gate state in %s ignored (its model fingerprint differs or it is malformed)\n", (path + ".gate").c_str());
     }
@@ -4980,7 +4986,9 @@ static void la_tail_skip_update(const RouteResidentCfg& c) {
 static bool route_fragile_ctrl_next(RouteResidentCfg& c, bool eligible) {
     const bool due = eligible && c.fragile_on && c.fragile_k_set && !c.fragile_exact && c.fr_ctrl_every > 0 &&
                      (c.auto_on || c.dyn_on || c.budget > 0.0f || c.budget_tail > 0.0f);
-    if (!due || !route_ctrl_due(c.fr_ctrl_win, c.fr_ctrl_every) || !strata::kernels::route_fragile_control(true)) {
+    // the cadence: 128 eligible windows apart while the noise floor has fewer than 20 control re-checks (gate::ctrl_every), the configured one after
+    if (!due || !route_ctrl_due(c.fr_ctrl_win, strata::core::gate::ctrl_every(c.fr_ctrl_every, c.fr_ctrl_n)) ||
+        !strata::kernels::route_fragile_control(true)) {
         strata::kernels::route_fragile_control(false);
         return false;
     }
@@ -5481,6 +5489,7 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
         ++c.fr_ctrl_rc;
         if (flipped) ++c.fr_ctrl_fl;
         c.fr_ctrl[c.fr_ctrl_pos] = flipped;
+        strata::core::gate::ctrl_add(c.gs, flipped);   // the persisted noise floor (the last kCtrlKeep control re-checks, cumulative counts)
         c.fr_ctrl_pos = (c.fr_ctrl_pos + 1) % RouteResidentCfg::kCtrlRing;
         if (c.fr_ctrl_n < RouteResidentCfg::kCtrlRing) ++c.fr_ctrl_n;
         return;
