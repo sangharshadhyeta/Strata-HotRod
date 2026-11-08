@@ -38,6 +38,20 @@ per-window data where it already crosses to the host; otherwise one async copy o
 For a sampled 1-in-64 of the experts read from the SSD (not from VRAM or RAM): the expert id, its input `x` and its output `y` (fp16),
 copied async after the expert's computation. Absorption fits `stand-in(x) + B·A·x ≈ y` from these.
 
+## Engine path rules (from the code, for C/D/E)
+- **No host CUDA call inside a verify window.** Issue #31: a `cudaMemcpyAsync` + `cudaLaunchHostFunc` inside a window, while the GPU
+  spins on a flag, hung the host on a driver lock for good (generate.cpp, the `--pcie-mode` comment). So C/D/E never copy with the
+  host's help mid-window: a capture kernel **stores into mapped, pinned host memory** (as `route_cfg_set_budgets` and the copy kernel
+  do), and a host thread drains that memory **between windows**.
+- **The windows are CUDA graphs:** nothing per window may be baked into a launch. The capture's sample counter and the ring's write
+  index live in device memory, as the look-ahead learner's leader, live flags and tick do (native_router.cu, STRATA_LA_LEARN).
+- **D reuses the learner's labels:** each window already copies every layer's router logits into a per-window buffer on `cs` (the
+  learner's labels). The router sample is a top-32 of that buffer on the learner's side stream, every Nth window - no second router read.
+- **C runs where x is:** the residual sum is one tiny accumulate kernel per captured layer, on the stream that already holds x; with
+  capture off it is not launched at all.
+- **E on the read path:** the cold-expert sample is taken where an SSD-read expert's output is formed, into the same mapped ring.
+- With capture off, the built graphs are identical to today's (checked: the node count per window is unchanged).
+
 ## Storage
 - A ring of segment files under `/mnt/nvme/strata-data/capture/` (owner-only, as the prompt cache), each with a header (format version,
   model and engine fingerprint, the prompt cache's rule).
