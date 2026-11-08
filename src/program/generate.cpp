@@ -15157,6 +15157,10 @@ int main(int argc, char** argv) {
             const size_t WS = (size_t) std::max(S, merge_T);
             std::vector<int32_t> drafts(DS, 0), window(WS), outv(WS);
             std::vector<float> dprob(DS, 0.0f);
+            // the re-check by draft confidence (see the decode loop): per drafter-probability bucket (0-9 = 0.0-0.1 .. 0.9-1.0, 10 = none)
+            long long fp_moved[11] = {}, fp_cut[11] = {}, fp_flip[11] = {};
+            int fp_pend_b = -1;
+            int32_t fp_pend_top1 = -1;
             std::vector<int32_t> sbuf((size_t) S, 0);
             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
             if (sfx_on) {
@@ -16111,12 +16115,24 @@ int main(int argc, char** argv) {
                 // Rows 0..r-1 are kept (a = r - 1 below), and the next window runs ranks < lo exact and re-decides row r (its row 0).  A close
                 // call at row 0 makes no cut and no re-run (a re-run would step the GDN/PLE state twice): the rows stand.
                 int fr_cut = -1;
+                // The re-check by draft confidence (counters only, one line per request): each stand-in-moved row, cut row and flipped
+                // row, bucketed by the MTP drafter's probability for the token that row outputs (dprob[r], drafted before this window
+                // ran; bucket 10 = no drafter probability: the window's last row, a suffix/chain draft, the first window).  It measures
+                // whether the drafter's confidence predicts the flips, so close calls could be routed exactly before the window runs.
+                auto fp_bucket = [&](int r) -> int {
+                    if (first_window || from_sfx || chain_n > 0 || r >= T_mtp - 1 || r < 0 || (size_t) r >= dprob.size()) return 10;
+                    return std::min(9, std::max(0, (int) (dprob[(size_t) r] * 10.0f)));
+                };
                 // the previous cut's row, decided exactly by this window: its row 0's top-1 id (argmax; the sampled token is not judged)
                 if (rb_on) strata::core::Verifier::route_gen_now(produced_n);   // STRATA_ROLLBACK: the flips' positions
                 if (!merged && strata::core::Verifier::route_fragile_pending()) {
                     float ex_gap = 0.0f;
                     int32_t ex_top1 = -1;
                     const bool ex_ok = ver.route_fragile_gaps(1, &ex_gap, &ex_top1);
+                    if (fp_pend_b >= 0) {   // the re-check by draft confidence: did the cut row flip?
+                        if (ex_ok && ex_top1 >= 0 && ex_top1 != fp_pend_top1) ++fp_flip[fp_pend_b];
+                        fp_pend_b = -1;
+                    }
                     strata::core::Verifier::route_fragile_settle(ex_ok, ex_top1);
                     ver.standin_learn_settle(ex_ok);   // STRATA_STANDIN_LEARN: the exact successor's y_e makes the sample (no-op when off)
                     ver.mask_learn_settle(ex_ok, ex_top1);   // STRATA_MASK=learn: D of the exact row 0 against the cut row's first pass
@@ -16141,6 +16157,8 @@ int main(int argc, char** argv) {
                         bool fr_explore = false;   // an explore cut: no normal cut in this window; the first row with ratio in [k, 8k) (every 16th window)
                         bool fr_control = false;   // a control re-check: no normal or explore cut; the first accepted row no stand-in moved (every 32nd window)
                         int r = strata::core::Verifier::route_fragile_first(fr_gap.data(), fr_shift.data(), a0 + 1, &fr_explore, &fr_control);
+                        for (int q = 1; q <= a0; ++q)   // the re-check by draft confidence: the rows a stand-in moved (row 0 is never cut)
+                            if (fr_shift[(size_t) q] > 0.0f) ++fp_moved[fp_bucket(q)];
                         // Stop re-check (no normal, explore or control cut): the first row q in 1..a0 that a stand-in moved and whose token is a stop
                         // id (o.eos_ids, id equality) is cut and re-decided exactly, whatever its gap.  Row 0 is never cut (a re-run would step the
                         // state twice), so a stop at row 0 stands and is not re-checked.
@@ -16159,6 +16177,9 @@ int main(int argc, char** argv) {
                             ver.mask_learn_cut(r, fr_top1[(size_t) r], T, fr_control);   // STRATA_MASK=learn: the first-pass logits, the row's picks
                             if (rb_on) strata::core::Verifier::route_fragile_pos(produced_n + r);   // STRATA_ROLLBACK: row r's token position
                             fr_cut = r;
+                            fp_pend_b = fp_bucket(r);   // the re-check by draft confidence: this cut's bucket, judged by the next window
+                            ++fp_cut[fp_pend_b];
+                            fp_pend_top1 = fr_top1[(size_t) r];
                         }
                     }
                 }
@@ -16752,6 +16773,20 @@ int main(int argc, char** argv) {
             {   // STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL: this request's control windows against the others (one line when any ran)
                 std::string ctl_line;
                 if (strata::core::Verifier::route_control_take(ctl_line)) std::fprintf(stderr, "strata serve: %s\n", ctl_line.c_str());
+            }
+            {   // the re-check by draft confidence: one line per request when any row was moved (buckets 0.0-0.1 .. 0.9-1.0, then "none")
+                long long any = 0;
+                for (int b = 0; b < 11; ++b) any += fp_moved[b] + fp_cut[b];
+                if (any > 0) {
+                    std::string ln = "strata serve: re-check by draft confidence (p buckets 0-9, none):";
+                    for (const auto* arr : {fp_moved, fp_cut, fp_flip}) {
+                        ln += arr == fp_moved ? " moved" : arr == fp_cut ? "; cut" : "; flipped";
+                        for (int b = 0; b < 11; ++b) ln += " " + std::to_string(arr[b]);
+                    }
+                    std::fprintf(stderr, "%s\n", ln.c_str());
+                }
+                for (int b = 0; b < 11; ++b) fp_moved[b] = fp_cut[b] = fp_flip[b] = 0;
+                fp_pend_b = -1;
             }
             {   // STRATA_FRAGILE_RECHECK: this request's cuts, rows moved by stand-ins, flipped re-decisions and k (takes and resets the counts)
                 long long fr_cuts = 0, fr_explores = 0, fr_moved = 0, fr_flips = 0;
