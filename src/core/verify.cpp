@@ -3,6 +3,7 @@
 #include "strata/core/sm75_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/standin_pool.hpp"
 #include <cstring>
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
@@ -1096,10 +1097,17 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
 // decayed least squares over the channels: num += y_s.y_e, den += y_s.y_s, ee += y_e.y_e (decay 0.98); c = num / den clipped to [0.5, 2],
 // used (the table's scale on the stand-in's weight) after kLrnReady samples, 1 before.  Pairs per layer: LRU of kLrnPerLayer.
 // The pairs persist across runs (standin-learn-<fp>.bin in data/).
+namespace sdp = strata::standin;
 namespace {
-constexpr int kLrnPerLayer = 4096, kLrnReady = 32;
-constexpr double kLrnDecay = 0.98;
-constexpr uint32_t kLrnMagic = 0x4C535453u;   // "STSL"
+constexpr int kLrnPerLayer = sdp::kPerLayer, kLrnReady = sdp::kReady;
+constexpr double kLrnDecay = sdp::kDecay;
+constexpr uint32_t kLrnMagic = sdp::kMagic;   // "STSL"
+// STRATA_STANDIN_POOL_APPLY=1: the corrections table takes the pooled c (the pair's estimate with its parent groups, standin_pool.hpp);
+// unset, it takes each pair's own c after its own kLrnReady samples, as before pooling.  The risk table and the balance always pool.
+bool standin_pool_apply_env() {
+    const char* e = std::getenv("STRATA_STANDIN_POOL_APPLY");
+    return e != nullptr && std::atoi(e) != 0;
+}
 // STRATA_STANDIN_LEARN=observe: the samples are collected and the table saved, but no correction is applied and the balance stays off
 // (the answers stay the default's) - so a server always learns; =1 applies the corrections
 bool standin_learn_observe_env() {
@@ -1119,12 +1127,7 @@ uint64_t lrn_key(int64_t l, int64_t e, int64_t s) { return ((uint64_t) l << 40) 
 }  // namespace
 
 struct Verifier::StandinLearnState {
-    struct Pair {
-        double num = 0.0, den = 0.0, ee = 0.0;
-        int n = 0;
-        float c = 1.0f;
-        uint64_t used = 0;
-    };
+    using Pair = sdp::Pair;
     struct Pending {   // the cut row's sample, copied at the cut (the next windows overwrite the device buffers)
         bool valid = false;
         int layer = -1, rank = -1, e = -1, s = -1;
@@ -1132,6 +1135,17 @@ struct Verifier::StandinLearnState {
     } pend;
     std::unordered_map<uint64_t, Pair> pairs;
     std::vector<int> count;      // pairs held per layer
+    // the pooled sums: per layer, and per (layer, e) (sdp::expert_key); every sample updates both (pairs evicted by the LRU keep theirs)
+    std::vector<sdp::Sums> layer_g;
+    std::unordered_map<uint64_t, sdp::Sums> exp_g;
+    // a pair's estimate with its parent groups (standin_pool.hpp)
+    sdp::Est est(uint64_t key, const Pair& p) const {
+        const int64_t l = (int64_t) (key >> 40), e = (int64_t) ((key >> 20) & 0xFFFFFu);
+        const auto it = exp_g.find(sdp::expert_key(l, e));
+        const sdp::Sums* eg = it == exp_g.end() ? nullptr : &it->second;
+        const sdp::Sums* lg = l >= 0 && l < (int64_t) layer_g.size() ? &layer_g[(size_t) l] : nullptr;
+        return sdp::estimate(p, eg, lg);
+    }
     uint64_t tick = 0;
     bool table_ready = false;    // the device table holds the pairs' scales (filled at the first decode window)
     int64_t dim = 0, layers = 0;
@@ -1153,12 +1167,9 @@ void Verifier::standin_learn_pe_layer(int64_t l) {
     double sum = 0.0;
     for (const auto& kv : st.pairs) {
         if ((int64_t) (kv.first >> 40) != l) continue;
-        const StandinLearnState::Pair& p = kv.second;
-        if (p.n < kLrnReady || !(p.ee > 0.0)) continue;
-        const double c = p.c;
-        double e2 = (p.ee - 2.0 * c * p.num + c * c * p.den) / p.ee;
-        if (!(e2 > 0.0)) e2 = 0.0;
-        const double err = std::sqrt(e2);
+        const sdp::Est es = st.est(kv.first, kv.second);
+        if (!es.ready) continue;
+        const double err = es.err;
         const int64_t e = (int64_t) ((kv.first >> 20) & 0xFFFFFu), s = (int64_t) (kv.first & 0xFFFFFu);
         errs.emplace_back(e * 512 + s, err);
         sum += err;
@@ -1194,14 +1205,10 @@ bool Verifier::standin_balance_commit(int n_tok, const std::vector<float>& use, 
     }
     std::vector<double> best((size_t) cnt, -1.0);
     for (const auto& kv : st.pairs) {
-        const StandinLearnState::Pair& p = kv.second;
-        if (p.n < kLrnReady || !(p.ee > 0.0)) continue;
-        const double c = p.c;
-        double e2 = (p.ee - 2.0 * c * p.num + c * c * p.den) / p.ee;
-        if (!(e2 > 0.0)) e2 = 0.0;
-        const double err = std::sqrt(e2);
+        const sdp::Est es = st.est(kv.first, kv.second);   // pooled: an expert whose (layer, e) group is ready ranks with no ready pair of its own
+        if (!es.ready) continue;
         const int64_t i = (int64_t) (kv.first >> 40) * 512 + (int64_t) ((kv.first >> 20) & 0xFFFFFu);
-        if (i < cnt && (best[(size_t) i] < 0.0 || err < best[(size_t) i])) best[(size_t) i] = err;
+        if (i < cnt && (best[(size_t) i] < 0.0 || es.err < best[(size_t) i])) best[(size_t) i] = es.err;
     }
     for (int64_t i = 0; i < cnt; ++i) {
         const float dm = miss[(size_t) i] - st.miss_last[(size_t) i];
@@ -1209,30 +1216,7 @@ bool Verifier::standin_balance_commit(int n_tok, const std::vector<float>& use, 
         st.miss_last[(size_t) i] = miss[(size_t) i];
     }
     keep.assign((size_t) cnt, 1.0f);
-    for (int64_t l = 0; l < nl; ++l) {
-        std::vector<std::pair<double, int>> rk;
-        for (int e = 0; e < 512; ++e) {
-            const int64_t i = l * 512 + e;
-            if (best[(size_t) i] < 0.0 || !(use[(size_t) i] > 0.0f)) continue;
-            const double value = (double) use[(size_t) i] * best[(size_t) i];
-            rk.emplace_back(value / ((double) st.miss_dec[(size_t) i] + 1.0), e);
-        }
-        if (rk.size() >= 10) {
-            std::sort(rk.begin(), rk.end(), [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
-                return a.first != b.first ? a.first > b.first : a.second < b.second;
-            });
-            const size_t k = std::max<size_t>(1, rk.size() / 10);
-            for (size_t pos = 0; pos < rk.size(); ++pos) {
-                const int d = pos < k ? 1 : pos + k >= rk.size() ? -1 : 0;
-                const size_t i = (size_t) l * 512 + (size_t) rk[pos].second;
-                int8_t& s = st.bal_state[i];
-                uint8_t& op = st.bal_opp[i];
-                if (d == 0 || d == s) op = 0;
-                else if (s == 0) { s = (int8_t) d; op = 0; }
-                else if (++op >= 2) { s = 0; op = 0; }   // the opposite side for 2 rounds: back to 0
-            }
-        }
-    }
+    sdp::balance_step(st.bal_state, st.bal_opp, best, use, st.miss_dec, nl);
     for (int64_t i = 0; i < cnt; ++i) {
         const int8_t s = st.bal_state[(size_t) i];
         keep[(size_t) i] = s > 0 ? 4.0f : s < 0 ? 0.25f : 1.0f;
@@ -1248,10 +1232,17 @@ void Verifier::standin_learn_fill_table() {
     StandinLearnState& st = *lrn_st_;
     const int64_t nl = st.layers;
     std::vector<float> host((size_t) nl * 512 * 512, 1.0f);
+    const bool pool = standin_pool_apply_env();
     for (const auto& kv : st.pairs) {
         const StandinLearnState::Pair& p = kv.second;
         const int64_t l = (int64_t) (kv.first >> 40), e = (int64_t) ((kv.first >> 20) & 0xFFFFFu), s = (int64_t) (kv.first & 0xFFFFFu);
-        if (p.n >= kLrnReady && l < nl && e < 512 && s < 512) host[((size_t) l * 512 + (size_t) e) * 512 + (size_t) s] = p.c;
+        if (l >= nl || e >= 512 || s >= 512) continue;
+        if (pool) {
+            const sdp::Est es = st.est(kv.first, p);
+            if (es.ready) host[((size_t) l * 512 + (size_t) e) * 512 + (size_t) s] = (float) es.c;
+        } else if (p.n >= kLrnReady) {
+            host[((size_t) l * 512 + (size_t) e) * 512 + (size_t) s] = p.c;
+        }
     }
     const OnDevice on(device_);
     if (cudaMemcpy(lrn_c_, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
@@ -1332,7 +1323,9 @@ void Verifier::standin_learn_settle(bool exact_ok) {
     const int64_t l = st.pend.layer, e = st.pend.e, s = st.pend.s;
     if (l < 0 || l >= st.layers || e < 0 || e >= n_exp || s < 0 || s >= n_exp) return;
     const uint64_t key = lrn_key(l, e, s);
+    const bool pool = standin_pool_apply_env();
     if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
+    if ((int64_t) st.layer_g.size() < st.layers) st.layer_g.resize((size_t) st.layers);
     auto it = st.pairs.find(key);
     if (it == st.pairs.end()) {
         if (st.count[(size_t) l] >= kLrnPerLayer) {   // the layer's least recently used pair goes (its table entry back to 1)
@@ -1340,7 +1333,7 @@ void Verifier::standin_learn_settle(bool exact_ok) {
             for (auto q = st.pairs.begin(); q != st.pairs.end(); ++q)
                 if ((int64_t) (q->first >> 40) == l && (old == st.pairs.end() || q->second.used < old->second.used)) old = q;
             if (old != st.pairs.end()) {
-                if (old->second.n >= kLrnReady && st.table_ready) {
+                if (!pool && old->second.n >= kLrnReady && st.table_ready) {
                     const int64_t oe = (int64_t) ((old->first >> 20) & 0xFFFFFu), os = (int64_t) (old->first & 0xFFFFFu);
                     const float one = 1.0f;
                     const OnDevice on(device_);
@@ -1361,7 +1354,9 @@ void Verifier::standin_learn_settle(bool exact_ok) {
     p.used = ++st.tick;
     ++p.n;
     ++st.samples_req;
-    if (p.n >= kLrnReady) {
+    sdp::add_sample(st.layer_g[(size_t) l], sxy, sxx, syy);
+    sdp::add_sample(st.exp_g[sdp::expert_key(l, e)], sxy, sxx, syy);
+    if (!pool && p.n >= kLrnReady) {
         const float c = (float) std::min(2.0, std::max(0.5, p.num / std::max(p.den, 1e-30)));
         if (c != p.c) {
             p.c = c;
@@ -1371,6 +1366,18 @@ void Verifier::standin_learn_settle(bool exact_ok) {
                     (void) cudaGetLastError();
             }
         }
+    } else if (pool && st.table_ready) {
+        // the pooled c of every pair in the layer may have moved (the layer and (layer, e) groups): the layer's slab, one upload
+        std::vector<float> slab((size_t) 512 * 512, 1.0f);
+        for (const auto& kv : st.pairs) {
+            if ((int64_t) (kv.first >> 40) != l) continue;
+            const sdp::Est es = st.est(kv.first, kv.second);
+            if (!es.ready) continue;
+            slab[((size_t) ((kv.first >> 20) & 0xFFFFFu)) * 512 + (size_t) (kv.first & 0xFFFFFu)] = (float) es.c;
+        }
+        const OnDevice on(device_);
+        if (cudaMemcpy(lrn_c_ + (size_t) l * 512 * 512, slab.data(), slab.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
+            (void) cudaGetLastError();
     }
     if (st.bal_on && lrn_pe_ != nullptr) standin_learn_pe_layer(l);
 }
@@ -1381,28 +1388,25 @@ bool Verifier::standin_learn_open(const std::string& path, std::string& msg) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) { msg = "no saved state yet"; return false; }
     StandinLearnState& st = *lrn_st_;
-    uint32_t hd[4] = {0, 0, 0, 0};
-    bool ok = std::fread(hd, 4, 4, f) == 4 && hd[0] == kLrnMagic && (int64_t) hd[1] == st.layers && hd[2] == 512;
-    size_t got = 0;
-    if (ok) {
-        if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
-        for (uint32_t i = 0; i < hd[3]; ++i) {
-            uint64_t key = 0;
-            StandinLearnState::Pair p;
-            if (std::fread(&key, 8, 1, f) != 1 || std::fread(&p.num, 8, 1, f) != 1 || std::fread(&p.den, 8, 1, f) != 1 ||
-                std::fread(&p.ee, 8, 1, f) != 1 || std::fread(&p.n, 4, 1, f) != 1 || std::fread(&p.c, 4, 1, f) != 1)
-                break;
-            const int64_t l = (int64_t) (key >> 40), e = (int64_t) ((key >> 20) & 0xFFFFFu), s = (int64_t) (key & 0xFFFFFu);
-            if (l >= st.layers || e >= 512 || s >= 512 || !std::isfinite(p.c)) continue;
-            if (st.count[(size_t) l] >= kLrnPerLayer) continue;
-            p.used = ++st.tick;
-            st.pairs[key] = p;
-            ++st.count[(size_t) l];
-            ++got;
-        }
-    }
+    std::vector<uint8_t> buf;
+    uint8_t chunk[1 << 14];
+    for (size_t k; (k = std::fread(chunk, 1, sizeof chunk, f)) > 0;) buf.insert(buf.end(), chunk, chunk + k);
     std::fclose(f);
-    if (!ok) { msg = "not this model's state"; return false; }
+    std::vector<sdp::Loaded> recs;
+    if (!sdp::parse_table(buf.data(), buf.size(), st.layers, recs)) { msg = "not this model's state"; return false; }
+    if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
+    size_t got = 0;
+    for (const sdp::Loaded& r : recs) {
+        const size_t l = (size_t) (r.key >> 40);
+        if (st.count[l] >= kLrnPerLayer) continue;
+        StandinLearnState::Pair p = r.p;
+        p.used = ++st.tick;
+        st.pairs[r.key] = p;
+        ++st.count[l];
+        ++got;
+    }
+    // the groups are rebuilt from the pairs (the file keeps no groups; samples of pairs the LRU dropped before the save are not in them)
+    sdp::rebuild_groups(st.pairs, st.layer_g, st.exp_g);
     if (st.table_ready) standin_learn_fill_table();
     msg = std::to_string(got) + " pairs";
     return true;
@@ -1438,16 +1442,22 @@ bool Verifier::standin_learn_save(const std::string& path, std::string& msg) con
 std::string Verifier::standin_learn_report() {
     if (lrn_st_ == nullptr) return "";
     StandinLearnState& st = *lrn_st_;
-    int ready = 0;
+    int ready = 0, own = 0;
     double dev = 0.0;
-    for (const auto& kv : st.pairs)
-        if (kv.second.n >= kLrnReady) {
-            ++ready;
-            dev += std::fabs((double) kv.second.c - 1.0);
-        }
-    char buf[192];
-    std::snprintf(buf, sizeof buf, "strata serve: stand-in learn: %d pairs ready, %lld samples this request, mean |c-1| %.4f\n", ready,
-                  st.samples_req, ready > 0 ? dev / ready : 0.0);
+    for (const auto& kv : st.pairs) {
+        if (kv.second.n >= kLrnReady) ++own;
+        const sdp::Est es = st.est(kv.first, kv.second);
+        if (!es.ready) continue;
+        ++ready;
+        dev += std::fabs(es.c - 1.0);
+    }
+    int pooled = 0;
+    for (const auto& kv : st.exp_g)
+        if (kv.second.n >= kLrnReady) ++pooled;
+    char buf[224];
+    std::snprintf(buf, sizeof buf,
+                  "strata serve: stand-in learn: %d pairs ready (%d own), %d experts pooled, %lld samples this request, mean |c-1| %.4f\n",
+                  ready, own, pooled, st.samples_req, ready > 0 ? dev / ready : 0.0);
     st.samples_req = 0;
     std::string out = buf;
     if (st.bal_on) {
@@ -1728,6 +1738,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             lrn_st_ = std::make_shared<StandinLearnState>();
             lrn_st_->dim = (int64_t) N;
             lrn_st_->layers = g.n_layers;
+            lrn_st_->layer_g.assign((size_t) g.n_layers, sdp::Sums{});
             lrn_st_->bal_on = standin_balance_env();
         } else {
             lrn_st_.reset();
