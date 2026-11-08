@@ -5447,7 +5447,7 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
     route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, kctrl_lo, kctrl_hi);
     const strata::core::gate::KEvidence ev = strata::core::gate::k_evidence(c.fr_ratio, c.fr_flip, c.fr_n, kctrl_hi);
     const float old = c.fragile_k;
-    float target = strata::core::gate::k_target(ev, c.fr_n, old);
+    float target = strata::core::gate::k_target(ev, c.fr_n, old, c.fr_ctrl_n);   // (8 Nov: lowering needs measured noise)
     // a step is bounded: up to 1.5 times the old k, down to 0.5 times it
     if (target > old) target = std::min(target, 1.5f * old);
     if (target < old) target = std::max(target, 0.5f * old);

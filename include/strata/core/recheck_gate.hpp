@@ -214,12 +214,17 @@ inline KEvidence k_evidence(const float* ratios, const bool* flips, int n, doubl
 
 /// The target k (before the caller's step limits: up to 1.5x, down to 0.5x per update): 1.25 x r* clamped to [0.005, 50] with evidence;
 /// else half of the old k when the ring has kKRingMin entries; else the old k.
-inline float k_target(const KEvidence& e, int n_ring, float old) {
+/// 8 Nov fix (live: k fell 0.039 -> 0.0012 in 15 minutes): "no flip above the noise" is evidence only when the noise is measured - with
+/// fewer than kKCtrlMin control samples the Wilson bound is huge, nothing can exceed it, and halving on every update collapsed k.  So the
+/// lowering needs kKCtrlMin control samples and never goes below kKFloor; otherwise k is held.
+constexpr int kKCtrlMin = 20;
+constexpr float kKFloor = 0.005f;
+inline float k_target(const KEvidence& e, int n_ring, float old, int n_ctrl) {
     if (e.found) {
         const double v = 1.25 * e.r_star;
         return (float) std::min(50.0, std::max(0.005, v));
     }
-    if (n_ring >= kKRingMin) return 0.5f * old;
+    if (n_ring >= kKRingMin && n_ctrl >= kKCtrlMin) return old > kKFloor ? std::max(kKFloor, 0.5f * old) : old;
     return old;
 }
 

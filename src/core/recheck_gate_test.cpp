@@ -319,7 +319,7 @@ int main() {
         std::vector<unsigned char> flip(40, true);
         const g::KEvidence e = g::k_evidence(ratio.data(), reinterpret_cast<const bool*>(flip.data()), 40, 0.074);
         check(e.found && near(e.r_star, 0.02, 1e-6) && e.n_t == 40 && e.f_t == 40, "k_evidence: flips at 0.02 give r* 0.02");
-        check(near(g::k_target(e, 40, 1.0f), 0.025, 1e-6), "k_target: 1.25 x r* = 0.025");
+        check(near(g::k_target(e, 40, 1.0f, 30), 0.025, 1e-6), "k_target: 1.25 x r* = 0.025");
     }
     {
         // noise at high ratios: 200 entries with ratio 0.005 .. 1.0; from ratio 0.505 on, 1 in 14 flipped (7%, the control's rate); no flip below.
@@ -332,14 +332,19 @@ int main() {
         }
         const g::KEvidence e = g::k_evidence(ratio.data(), reinterpret_cast<const bool*>(flip.data()), 200, 0.074);
         check(!e.found, "k_evidence: flips at the control's noise rate, at high ratios, give no evidence");
-        check(near(g::k_target(e, 200, 1.0f), 0.5, 1e-6), "k_target: no evidence with a full ring halves k");
+        check(near(g::k_target(e, 200, 1.0f, 30), 0.5, 1e-6), "k_target: no evidence with a full ring and measured noise halves k");
+        check(near(g::k_target(e, 200, 1.0f, 19), 1.0, 1e-6), "k_target: no evidence but fewer than 20 control samples holds k (8 Nov fix)");
+        check(near(g::k_target(e, 200, 1.0f, 0), 1.0, 1e-6), "k_target: no control samples holds k");
+        check(near(g::k_target(e, 200, 0.007f, 30), 0.005, 1e-6), "k_target: halving stops at the 0.005 floor");
+        check(near(g::k_target(e, 200, 0.005f, 30), 0.005, 1e-6), "k_target: k at the floor stays");
+        check(near(g::k_target(e, 200, 0.0012f, 30), 0.0012, 1e-6), "k_target: k already below the floor is not lowered further");
     }
     {
         // small n: 5 entries, all flipped: fewer than 8 at or above any threshold, so no evidence; a short ring keeps k
         std::vector<float> ratio(5, 0.3f);
         std::vector<unsigned char> flip(5, true);
         const g::KEvidence e = g::k_evidence(ratio.data(), reinterpret_cast<const bool*>(flip.data()), 5, 0.0);
-        check(!e.found && near(g::k_target(e, 5, 0.7f), 0.7, 1e-6), "k_evidence: fewer than 8 entries give no evidence, k kept");
+        check(!e.found && near(g::k_target(e, 5, 0.7f, 30), 0.7, 1e-6), "k_evidence: fewer than 8 entries give no evidence, k kept");
         // no control samples (ctrl_hi 1): nothing qualifies, as before (no raise)
         std::vector<float> r40(40, 0.02f);
         std::vector<unsigned char> f40(40, true);
@@ -349,7 +354,7 @@ int main() {
         std::vector<unsigned char> fn(60, false);
         check(!g::k_evidence(rn.data(), reinterpret_cast<const bool*>(fn.data()), 60, 0.074).found, "k_evidence: no flip, no evidence");
         // the clamp: 1.25 x r* above 50 is 50
-        check(near(g::k_target(g::KEvidence{true, 100.0, 9, 9}, 9, 1.0f), 50.0, 1e-6), "k_target: clamped to 50");
+        check(near(g::k_target(g::KEvidence{true, 100.0, 9, 9}, 9, 1.0f, 30), 50.0, 1e-6), "k_target: clamped to 50");
     }
     // SPEC-recheck-gated step H2: the margin m candidates (m x step^d, range 0.6-1.5), the explore veto, and the persistence of m
     {
