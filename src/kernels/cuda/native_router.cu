@@ -393,7 +393,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  int cheap_rank0, int cheap_anytier, unsigned long long* __restrict__ bstats,
                                  float* __restrict__ row_shift, const float* __restrict__ pair_c,
                                  int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe,
-                                 MaskEvs* __restrict__ mev, int row_base) {
+                                 MaskEvs* __restrict__ mev, int row_base, const int* __restrict__ fctrl) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -484,7 +484,10 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     // STRATA_ROUTE_BUDGET (budget > 0): the loop starts at rank 0, as with `cheap`.  A rank below lo (`brank`) takes the budget test below
     // instead of the margin / edge, and skips none of the RAM floor's rules (the budget wins for those ranks); ranks lo and up are as before.
     const bool bud = budget > 0.f;
-    for (int r = (cheap != nullptr || bud) ? 0 : first; r <= hi && r < 10; ++r) {
+    // STRATA_FRAGILE_CTRL_EVERY (route_fragile_control): a control window moves no pick, so every pick stays at its router rank and row_shift
+    // stays 0.  *fctrl is the same for every lane (uniform), so the loop is skipped by the whole warp.
+    const bool fctl = fctrl != nullptr && *fctrl != 0;
+    for (int r = (cheap != nullptr || bud) ? 0 : first; r <= hi && r < 10 && !fctl; ++r) {
         const int e = my[r];
         if (have(e)) continue;                          // already resident: uniform across the warp
         const bool brank = bud && r < lo;               // STRATA_ROUTE_BUDGET: this rank takes the budget test (uniform across the warp)
@@ -752,6 +755,11 @@ void mtp_zc_mark(const int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* 
     mtp_zc_mark_k<<<(n_thr + block - 1) / block, block, 0, static_cast<cudaStream_t>(stream)>>>(ids, d_slot, n_thr, ref, want, want_n,
                                                                                               want_cap, stats);
 }
+// STRATA_FRAGILE_CTRL_EVERY: the fragile control flag, a host-mapped int (1 = this window is a control: no stand-in or mask move), written
+// between windows by route_fragile_control.  Its device alias is read by route_resident_k and route_mask_k at each launch, as the mask's
+// control flag is.  Allocated on the first request for it; nullptr until then (no control windows).
+static int* g_frag_ctrl_host = nullptr;
+static int* g_frag_ctrl_dev = nullptr;
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift,
@@ -768,7 +776,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
         n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier, bstats, row_shift,
-        pair_c, lrn_rec, layer, pair_pe, mev, row_base);
+        pair_c, lrn_rec, layer, pair_pe, mev, row_base, g_frag_ctrl_dev);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -800,7 +808,7 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
                              const uint8_t* __restrict__ mask, int n_tok, int lo, float edge, float* __restrict__ row_shift,
                              unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset,
                              const int32_t* __restrict__ res, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
-                             uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo) {
+                             uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo, const int* __restrict__ fctrl) {
     const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
     if (t >= n_tok) return;
     const int row = row_base + t;
@@ -817,7 +825,8 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
             if (my[r] >= 0 && my[r] < 512 && !mask_cheap(my[r], res, ring, cheap)) atomicAdd(cost + (size_t) layer * 512 + my[r], 1u);
     // STRATA_MASK_RESIDENT control window (route_mask_control): nothing moves, the router's picks stay; the masked picks still count as seen
     // (moved adds nothing).  *ctrl is the same for every lane, so the return is uniform across the warp.
-    if (ctrl != nullptr && *ctrl != 0) {
+    // STRATA_FRAGILE_CTRL_EVERY (fctrl): a fragile control window moves nothing here either (its row_shift stays 0), and counts the same way.
+    if ((ctrl != nullptr && *ctrl != 0) || (fctrl != nullptr && *fctrl != 0)) {
         if (lane == 0 && stats != nullptr) {
             unsigned long long masked = 0;
             for (int r = 0; r < 10; ++r)
@@ -959,11 +968,12 @@ bool route_mask_cost_read(std::vector<uint32_t>& out) {   // the SSD-demand coun
 void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream,
                        MaskEvs* mev, int layer, int row_base, const int32_t* res, const uint8_t* ring, const uint8_t* cheap) {
     if (!mask || !logits || !ids || !weights || n_tok < 1 || g_mask_stats == nullptr) return;
-    // the control flag is the resident rule's only (the old rule passes nullptr: no control windows there)
+    // the mask's control flag (STRATA_MASK_RESIDENT, or STRATA_MASK_CTRL under the old rule: the window moves nothing in either case) and the
+    // fragile control flag (STRATA_FRAGILE_CTRL_EVERY: the same window, no move), both read at launch
     route_mask_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, mask, n_tok, g_mask_lo,
                                                                               g_mask_edge, row_shift, g_mask_stats, mev, layer, row_base,
                                                                               layer == 0, res, ring, cheap, g_mask_cost,
-                                                                              res != nullptr ? g_mask_ctrl_dev : nullptr, g_mask_cost_lo);
+                                                                              g_mask_ctrl_dev, g_mask_cost_lo, g_frag_ctrl_dev);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -973,6 +983,34 @@ void route_mask_control(bool on) {
     if (g_mask_ctrl_host == nullptr) return;
     *(volatile int*) g_mask_ctrl_host = on ? 1 : 0;
     __sync_synchronize();
+}
+// STRATA_FRAGILE_CTRL_EVERY: the window's fragile control flag, written between windows (same contract as route_mask_control).  on = true
+// allocates the flag on first use; false when it cannot be had (then this window is not a control window).  off is a no-op until it exists.
+// The flag is allocated once, before any graph capture (route_fragile_control_alloc at the verifier's init): a kernel captured while the
+// device alias is still nullptr would never read the flag.  Without it, route_fragile_control(true) is false and no window is a control.
+bool route_fragile_control_alloc() {
+    if (g_frag_ctrl_host != nullptr) return true;
+    int* h = nullptr;
+    int* d = nullptr;
+    if (cudaHostAlloc((void**) &h, sizeof(int), cudaHostAllocMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cudaFreeHost(h);
+        return false;
+    }
+    *h = 0;
+    g_frag_ctrl_host = h;
+    g_frag_ctrl_dev = d;
+    return true;
+}
+bool route_fragile_control(bool on) {
+    if (g_frag_ctrl_host == nullptr) return false;
+    *(volatile int*) g_frag_ctrl_host = on ? 1 : 0;
+    __sync_synchronize();
+    return true;
 }
 bool route_mask_update(const std::vector<uint8_t>& host) {
     if (g_mask_dev == nullptr || host.size() != g_mask_host.size()) return false;

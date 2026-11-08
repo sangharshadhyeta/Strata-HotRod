@@ -270,6 +270,11 @@ public:
                                    float& req_b, long long& brakes, long long& ctrl_rc, long long& ctrl_fl, long long& stop_cuts, long long& stop_kept);
     /// STRATA_FRAGILE_BRAKE (default on): the per-request decode budget brake (route_fragile_take's req_b and brakes are its).
     static bool route_brake_on();
+    /// STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL (SPEC-control-windows).  route_window_done, after each decode window of the serve loop: clears
+    /// the fragile control flag and counts the window under its kind (control or other) with its committed tokens (kept; 0 for a merged window)
+    /// and its wall seconds.  route_control_take: this request's control windows against the others, as one line (false: none ran; resets).
+    static void route_window_done(int kept, double secs);
+    static bool route_control_take(std::string& out);
     /// STRATA_FRAGILE_BRAKE: at a request's end, its size class learns its start fraction and clean level (route_class_end; the tune file is
     /// written); route_class_state gives the request's class and that class's start and clean level.
     static void route_class_end();
