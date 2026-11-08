@@ -385,15 +385,17 @@ static bool scratch_here() {
 // j + 32, ...) and reduced within the warp.  The bits are unchanged: a strictly greater logit wins, the smallest expert index breaks ties, and the
 // softmax is the same expression.  Our options ride on lane 0 (the counters, the wanted-expert count, the per-row record, the CCE bias) or are
 // reduced in the warp (the stand-in's place in the router's ranking).
-// The fragile hold bitmask (route_fragile_hold): bit r set = window row r keeps the router's picks; 0xFFFFFFFF holds every row (the control
-// window).  Rows >= 32 are held only by the all-ones mask.  Read by the kernels at each launch (uniform across the warp).
+// The fragile hold bitmask (route_fragile_hold; SPEC-recheck-gated step A): bit r set = window row r keeps the router's picks; 0xFFFFFFFF
+// holds every row (the control window).  Rows >= 32 are held only by the all-ones mask.  Read at each launch (uniform across the warp).
 __device__ __forceinline__ bool fragile_held(const uint32_t* fctrl, int row) {
     if (fctrl == nullptr) return false;
     const uint32_t b = *fctrl;
     return row < 32 ? ((b >> row) & 1u) != 0u : b == 0xFFFFFFFFu;
 }
-__global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
-                                 const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
+// one warp of token t (SPEC-router-fuse step 2: a device function, shared by route_resident_k and the post-routing kernel).
+// margin_out / cap / cap_stats (SPEC-recheck-gated C, F; nullptr = off): the early margin (layers 0-3), the row's shift cap and its refusal counters.
+__device__ __forceinline__ void route_resident_warp(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                 const int32_t* __restrict__ res, int t, const RouteCfg* cfg,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
                                  unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl,
                                  const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap, float cheap_margin,
@@ -401,10 +403,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  float* __restrict__ row_shift, const float* __restrict__ pair_c,
                                  int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe,
                                  MaskEvs* __restrict__ mev, int row_base, const uint32_t* __restrict__ fctrl,
-                                 float* __restrict__ margin_out, const float* __restrict__ cap,
-                                 unsigned long long* __restrict__ cap_stats) {
-    const int t = blockIdx.x;
-    if (t >= n_tok) return;
+                                 float* __restrict__ margin_out = nullptr, const float* __restrict__ cap = nullptr,
+                                 unsigned long long* __restrict__ cap_stats = nullptr) {
     const int lane = (int) threadIdx.x;
     // the floor lives in host-mapped memory, read at every launch, so a captured graph follows a change the host makes between
     // windows: the floor, the margin and the edge margin
@@ -511,8 +511,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     // STRATA_ROUTE_BUDGET (budget > 0): the loop starts at rank 0, as with `cheap`.  A rank below lo (`brank`) takes the budget test below
     // instead of the margin / edge, and skips none of the RAM floor's rules (the budget wins for those ranks); ranks lo and up are as before.
     const bool bud = budget > 0.f;
-    // STRATA_FRAGILE_CTRL_EVERY / SPEC-recheck-cheap (route_fragile_rows): a row below the flag's count moves no pick, so its picks stay at
-    // their router rank and row_shift stays 0.  The count is the same for every lane (uniform), so the loop is skipped by the whole warp.
+    // STRATA_FRAGILE_CTRL_EVERY (route_fragile_control): a control window moves no pick, so every pick stays at its router rank and row_shift
+    // stays 0.  *fctrl is the same for every lane (uniform), so the loop is skipped by the whole warp.
     const bool fctl = fragile_held(fctrl, row_base + t);
     // SPEC-recheck-gated step F: this row's shift cap (+inf = none; rows past 32 are never capped) and the row's shift so far (a uniform value:
     // read once, then followed by each applied move).  A refused move is counted in cap_stats[0] (moves), the row once in cap_stats[1].
@@ -659,6 +659,22 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
         }
     }
     if (lane == 0 && cap_hit && cap_stats != nullptr) atomicAdd(cap_stats + 1, 1ull);   // step F: this row had a refused move in this launch
+}
+__global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                 const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
+                                 unsigned long long* __restrict__ stats, float* __restrict__ want,
+                                 unsigned long long* __restrict__ detail, int32_t* __restrict__ rows, float* __restrict__ repl,
+                                 const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap, float cheap_margin,
+                                 int cheap_rank0, int cheap_anytier, unsigned long long* __restrict__ bstats,
+                                 float* __restrict__ row_shift, const float* __restrict__ pair_c,
+                                 int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe,
+                                 MaskEvs* __restrict__ mev, int row_base, const uint32_t* __restrict__ fctrl,
+                                 float* __restrict__ margin_out, const float* __restrict__ cap,
+                                 unsigned long long* __restrict__ cap_stats) {
+    const int t = blockIdx.x;   // one warp (32 threads) per token
+    if (t >= n_tok) return;
+    route_resident_warp(logits, ids, weights, res, t, cfg, stats, want, detail, rows, repl, ring, cheap, cheap_margin, cheap_rank0,
+                        cheap_anytier, bstats, row_shift, pair_c, lrn_rec, layer, pair_pe, mev, row_base, fctrl, margin_out, cap, cap_stats);
 }
 // ---- the floor: one small struct in host-mapped memory, read by the kernel at every launch.  The host sets it once (route_cfg_init)
 // and could move it between windows (route_cfg_set_floor; nothing does today).  A higher floor replaces less.  SPEC 17's per-part
@@ -811,20 +827,29 @@ static uint32_t* g_frag_ctrl_dev = nullptr;
 static float* g_cap_host = nullptr;
 static float* g_cap_dev = nullptr;
 static unsigned long long* g_cap_stats = nullptr;
+// The RAM floor's environment (read once): shared by native_route_resident and native_route_post.
+static void resident_env(float& cheap_margin, int& cheap_rank0, int& cheap_anytier) {
+    // STRATA_ROUTE_RAM_FLOOR's safety: the stand-in for a rank 0-1 pick must be within STRATA_ROUTE_RAM_FLOOR_MARGIN logits (default 1,
+    // the margin SPEC E1 found sound for rank 1), and rank 0 is replaced only with STRATA_ROUTE_RAM_FLOOR_RANK0=1 (off: it leaked
+    // <|im_start|>user into an answer at 94K tokens, 20 Oct)
+    static const float cm = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_MARGIN"); return v ? (float) std::atof(v) : 1.0f; }();
+    static const int r0 = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_RANK0"); return v != nullptr && std::atoi(v) != 0 ? 1 : 0; }();
+    // STRATA_ROUTE_RAM_FLOOR_ANYTIER (default ON since 20 Oct, =0 turns it off): a close stand-in replaces a rank 0-1 pick in the
+    // RAM tier too, not only one that would come from the SSD
+    static const int at = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_ANYTIER"); return v == nullptr || std::atoi(v) != 0 ? 1 : 0; }();
+    cheap_margin = cm;
+    cheap_rank0 = r0;
+    cheap_anytier = at;
+}
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift,
                            const float* pair_c, int32_t* lrn_rec, int layer, const float* pair_pe, MaskEvs* mev, int row_base,
                            float* margin_out) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
-    // STRATA_ROUTE_RAM_FLOOR's safety: the stand-in for a rank 0-1 pick must be within STRATA_ROUTE_RAM_FLOOR_MARGIN logits (default 1,
-    // the margin SPEC E1 found sound for rank 1), and rank 0 is replaced only with STRATA_ROUTE_RAM_FLOOR_RANK0=1 (off: it leaked
-    // <|im_start|>user into an answer at 94K tokens, 20 Oct)
-    static const float cheap_margin = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_MARGIN"); return v ? (float) std::atof(v) : 1.0f; }();
-    static const int cheap_rank0 = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_RANK0"); return v != nullptr && std::atoi(v) != 0 ? 1 : 0; }();
-    // STRATA_ROUTE_RAM_FLOOR_ANYTIER (default ON since 20 Oct, =0 turns it off): a close stand-in replaces a rank 0-1 pick in the
-    // RAM tier too, not only one that would come from the SSD
-    static const int cheap_anytier = [] { const char* v = std::getenv("STRATA_ROUTE_RAM_FLOOR_ANYTIER"); return v == nullptr || std::atoi(v) != 0 ? 1 : 0; }();
+    float cheap_margin;
+    int cheap_rank0, cheap_anytier;
+    resident_env(cheap_margin, cheap_rank0, cheap_anytier);
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
         n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier, bstats, row_shift,
@@ -856,16 +881,19 @@ namespace {
 __device__ __forceinline__ bool mask_cheap(int f, const int32_t* res, const uint8_t* ring, const uint8_t* cheap) {
     return res[f] >= 0 || (ring != nullptr && ring[f] != 0) || (cheap != nullptr && cheap[f] != 0);
 }
-__global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
-                             const uint8_t* __restrict__ mask, int n_tok, int lo, float edge, float* __restrict__ row_shift,
-                             unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset,
-                             const int32_t* __restrict__ res, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
-                             uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo, const uint32_t* __restrict__ fctrl,
-                             const float* __restrict__ cap, unsigned long long* __restrict__ cap_stats) {
-    const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
-    if (t >= n_tok) return;
+// The mask's rule for one token t of a warp (lane = threadIdx.x; one warp per token).  SPEC-router-fuse step 1/2: a device function, so the
+// fused selection kernel and the post-routing kernel run the same code as the one-kernel launch below.
+__device__ __forceinline__ void route_mask_warp(float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                                const uint8_t* __restrict__ mask, int t, int lo, float edge,
+                                                float* __restrict__ row_shift, unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev,
+                                                int layer, int row_base, bool reset, const int32_t* __restrict__ res,
+                                                const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
+                                                uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo,
+                                                const uint32_t* __restrict__ fctrl, const float* __restrict__ cap = nullptr,
+                                                unsigned long long* __restrict__ cap_stats = nullptr) {
+    const int lane = (int) threadIdx.x;
     const int row = row_base + t;
-    // SPEC-recheck-gated step F: the row's shift cap and its running shift (as route_resident_k: uniform values, see there)
+    // SPEC-recheck-gated step F: the row's shift cap and its running shift (as route_resident_warp: uniform values)
     const float cap_row = (cap != nullptr && row < 32) ? cap[row] : INFINITY;
     float shift_acc = row_shift != nullptr ? row_shift[t] : 0.0f;
     bool cap_hit = false;
@@ -882,8 +910,7 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
             if (my[r] >= 0 && my[r] < 512 && !mask_cheap(my[r], res, ring, cheap)) atomicAdd(cost + (size_t) layer * 512 + my[r], 1u);
     // STRATA_MASK_RESIDENT control window (route_mask_control): nothing moves, the router's picks stay; the masked picks still count as seen
     // (moved adds nothing).  *ctrl is the same for every lane, so the return is uniform across the warp.
-    // STRATA_FRAGILE_CTRL_EVERY / SPEC-recheck-cheap (fctrl): a row below the fragile flag's count moves nothing here either (its row_shift
-    // stays 0), and counts the same way.
+    // STRATA_FRAGILE_CTRL_EVERY (fctrl): a fragile control window moves nothing here either (its row_shift stays 0), and counts the same way.
     if ((ctrl != nullptr && *ctrl != 0) || fragile_held(fctrl, row)) {
         if (lane == 0 && stats != nullptr) {
             unsigned long long masked = 0;
@@ -955,6 +982,17 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
         for (int r = 0; r < 10; ++r) { ex[r] = expf(l[my[r]] - m); sum += ex[r]; }
         for (int r = 0; r < 10; ++r) { id[r] = my[r]; weights[(size_t) t * 10 + r] = ex[r] / sum; }
     }
+}
+__global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                             const uint8_t* __restrict__ mask, int n_tok, int lo, float edge, float* __restrict__ row_shift,
+                             unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset,
+                             const int32_t* __restrict__ res, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
+                             uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo, const uint32_t* __restrict__ fctrl,
+                             const float* __restrict__ cap, unsigned long long* __restrict__ cap_stats) {
+    const int t = (int) blockIdx.x;   // one warp (32 threads) per token
+    if (t >= n_tok) return;
+    route_mask_warp(logits, ids, weights, mask, t, lo, edge, row_shift, stats, mev, layer, row_base, reset, res, ring, cheap, cost, ctrl,
+                    cost_lo, fctrl, cap, cap_stats);
 }
 }  // namespace
 bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int lo, float edge, std::string& msg, int cost_lo) {
@@ -1163,6 +1201,87 @@ bool route_mask_read(unsigned long long& seen, unsigned long long& moved) {   //
     moved = h[1];
     return true;
 }
+struct PostArgs {
+    float* logits;
+    int32_t* ids;
+    float* weights;
+    int n_tok;
+    int layer;
+    int row_base;
+    const uint8_t* mask;
+    int mask_lo;
+    float mask_edge;
+    int cost_lo;
+    const int* mctrl;
+    unsigned long long* mstats;
+    uint32_t* cost;
+    MaskEvs* mev;
+    const int32_t* mres;
+    const uint8_t* mring;
+    const uint8_t* mcheap;
+    float* row_shift;
+    const int32_t* res;
+    unsigned long long* rstats;
+    float* want;
+    int32_t* rows;
+    float* repl;
+    const uint8_t* rring;
+    const uint8_t* rcheap;
+    float cheap_margin;
+    int cheap_rank0;
+    int cheap_anytier;
+    unsigned long long* bstats;
+    const float* pair_c;
+    int32_t* lrn_rec;
+    const float* pair_pe;
+    unsigned long long* detail;
+    const uint32_t* fctrl;
+    const RouteCfg* cfg;
+    float* label;
+    float* margin_out;          // SPEC-recheck-gated C (layers 0-3; nullptr = off)
+    const float* cap;           // SPEC-recheck-gated F: the per-row shift caps (nullptr = off)
+    unsigned long long* cap_stats;
+};
+// SPEC-router-fuse step 2: the layer's own post-routing stages in ONE launch, one warp per token: the learner's label copy (the logits,
+// unchanged by the stages), the layer's mask (route_mask_warp), then route_resident_warp.  The same bodies in the same order as the
+// separate launches, so every output is the same.  Off (STRATA_ROUTER_FUSE=0 or STRATA_ROUTER_FUSE_POST=0) the verifier makes the calls.
+__global__ void route_post_k(PostArgs a) {
+    const int t = (int) blockIdx.x;   // one warp (32 threads) per token
+    if (t >= a.n_tok) return;
+    const int lane = (int) threadIdx.x;
+    if (a.label != nullptr)
+        for (int i = lane; i < 512; i += 32) a.label[(size_t) t * 512 + i] = a.logits[(size_t) t * 512 + i];
+    if (a.mask != nullptr)
+        route_mask_warp(a.logits, a.ids, a.weights, a.mask, t, a.mask_lo, a.mask_edge, a.row_shift, a.mstats, a.mev, a.layer, a.row_base,
+                        a.layer == 0, a.mres, a.mring, a.mcheap, a.cost, a.mctrl, a.cost_lo, a.fctrl, a.cap, a.cap_stats);
+    __syncwarp();   // the mask's ids and weights are what the resident stage reads
+    if (a.res != nullptr)
+        route_resident_warp(a.logits, a.ids, a.weights, a.res, t, a.cfg, a.rstats, a.want, a.detail, a.rows, a.repl, a.rring, a.rcheap,
+                            a.cheap_margin, a.cheap_rank0, a.cheap_anytier, a.bstats, a.row_shift, a.pair_c, a.lrn_rec, a.layer, a.pair_pe,
+                            a.mev, a.row_base, a.fctrl, a.margin_out, a.cap, a.cap_stats);
+}
+void native_route_post(const RoutePostArgs& r, void* stream) {
+    if (!stream || r.n_tok < 1) throw std::invalid_argument("native_route_post: a stream and at least one row");
+    const bool mask_on = r.mask != nullptr && r.logits != nullptr && r.ids != nullptr && r.weights != nullptr && g_mask_stats != nullptr;
+    if (r.res != nullptr && g_cfg_dev == nullptr) throw std::invalid_argument("native_route_post: the resident stage needs route_cfg_init");
+    const bool res_on = r.res != nullptr;
+    if (!mask_on && !res_on && r.label == nullptr) return;
+    PostArgs a{};
+    a.logits = r.logits; a.ids = r.ids; a.weights = r.weights; a.n_tok = r.n_tok; a.layer = r.layer; a.row_base = r.row_base;
+    a.mask = mask_on ? r.mask : nullptr;
+    a.mask_lo = g_mask_lo; a.mask_edge = g_mask_edge; a.cost_lo = g_mask_cost_lo; a.mctrl = g_mask_ctrl_dev; a.mstats = g_mask_stats;
+    a.cost = g_mask_cost; a.mev = r.mev; a.mres = r.mres; a.mring = r.mring; a.mcheap = r.mcheap; a.row_shift = r.row_shift;
+    a.res = res_on ? r.res : nullptr;
+    a.rstats = r.rstats; a.want = r.want; a.rows = r.n_tok <= 8 ? r.rows : nullptr; a.repl = r.n_tok <= 8 ? r.repl : nullptr;
+    a.rring = r.rring; a.rcheap = r.rcheap; a.bstats = r.bstats; a.pair_c = r.pair_c; a.lrn_rec = r.lrn_rec; a.pair_pe = r.pair_pe;
+    a.detail = r.n_tok <= 8 ? g_detail : nullptr; a.fctrl = g_frag_ctrl_dev; a.cfg = g_cfg_dev;
+    resident_env(a.cheap_margin, a.cheap_rank0, a.cheap_anytier);
+    a.label = r.label;
+    a.margin_out = r.margin_out; a.cap = g_cap_dev; a.cap_stats = g_cap_stats;
+    route_post_k<<<(unsigned) r.n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(a);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
 static int32_t* g_pred_host = nullptr;
 static int32_t* g_pred_dev = nullptr;
 static float* g_pred_logits = nullptr;
@@ -1172,8 +1291,8 @@ void route_pred_alloc(int64_t n_layers) {
     const size_t n = (size_t) n_layers * kRoutePredDists * 8 * 10;
     if (cudaHostAlloc((void**) &g_pred_host, n * sizeof(int32_t), cudaHostAllocMapped) != cudaSuccess) { cudaGetLastError(); g_pred_host = nullptr; return; }
     if (cudaHostGetDevicePointer((void**) &g_pred_dev, g_pred_host, 0) != cudaSuccess ||
-        cudaMalloc((void**) &g_pred_logits, 8 * 512 * sizeof(float)) != cudaSuccess ||
-        cudaMalloc((void**) &g_pred_w, 8 * 10 * sizeof(float)) != cudaSuccess) {
+        cudaMalloc((void**) &g_pred_logits, (size_t) kRoutePredDists * 8 * 512 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &g_pred_w, (size_t) kRoutePredDists * 8 * 10 * sizeof(float)) != cudaSuccess) {
         cudaGetLastError();
         g_pred_host = nullptr;
         g_pred_dev = nullptr;
@@ -1190,6 +1309,9 @@ int32_t* route_pred_dev(int64_t target_layer, int dist) {
 }
 float* route_pred_logits() { return g_pred_logits; }
 float* route_pred_weights() { return g_pred_w; }
+// SPEC-router-fuse step 1: the per-slot scratch (slot = route_pred_slot(dist)); slot 0 is route_pred_logits / route_pred_weights.
+float* route_pred_logits_at(int slot) { return g_pred_logits != nullptr && slot >= 0 && slot < kRoutePredDists ? g_pred_logits + (size_t) slot * 8 * 512 : nullptr; }
+float* route_pred_weights_at(int slot) { return g_pred_w != nullptr && slot >= 0 && slot < kRoutePredDists ? g_pred_w + (size_t) slot * 8 * 10 : nullptr; }
 // STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear predictors (tools/predictor/export_la_model.py folds their
 // standardisation in): for each target layer a bf16 [512 x H] matrix and a float bias, applied to the previous layer's router input.
 static uint16_t* g_lam_w = nullptr;
@@ -1280,10 +1402,9 @@ void route_pred_bias_add(float* logits, const float* bias, int n_tok, void* stre
 // a negative id) and counted.  One warp per token; the reads of ids finish before lane 0 writes (the shuffle is a warp barrier).
 // Approximation: the router also refuses a stand-in past its maxrank or a heavy pick (wmax) and counts ring-landed experts as resident;
 // neither is seen here.
-__global__ void pred_edge_skip_k(const float* __restrict__ logits, int32_t* __restrict__ ids, const int32_t* __restrict__ res,
-                                 const RouteCfg* cfg, unsigned long long* __restrict__ skipped, int n_tok) {
-    const int t = blockIdx.x;
-    if (t >= n_tok) return;
+// one warp of token t (SPEC-router-fuse step 1: a device function, shared by pred_edge_skip_k and the fused selection kernel)
+__device__ __forceinline__ void pred_edge_skip_warp(const float* __restrict__ logits, int32_t* __restrict__ ids, const int32_t* __restrict__ res,
+                                                    const RouteCfg* cfg, unsigned long long* __restrict__ skipped, int t) {
     const int lane = (int) threadIdx.x;
     const int lo = ((const volatile RouteCfg*) cfg)->lo;
     const float edge = ((const volatile RouteCfg*) cfg)->edge;
@@ -1306,6 +1427,12 @@ __global__ void pred_edge_skip_k(const float* __restrict__ logits, int32_t* __re
         ids[(size_t) t * 10 + r] = -1;
         atomicAdd(skipped, 1ull);
     }
+}
+__global__ void pred_edge_skip_k(const float* __restrict__ logits, int32_t* __restrict__ ids, const int32_t* __restrict__ res,
+                                 const RouteCfg* cfg, unsigned long long* __restrict__ skipped, int n_tok) {
+    const int t = blockIdx.x;
+    if (t >= n_tok) return;
+    pred_edge_skip_warp(logits, ids, res, cfg, skipped, t);
 }
 static unsigned long long* g_pred_skip = nullptr;   // device counter: skipped predictions since the last take
 void route_pred_edge_skip_alloc() {
@@ -1338,10 +1465,10 @@ unsigned long long route_pred_edge_skips_take() {
 // The open rule (margin unlimited, tail budget 0) is not tested here: the host leaves every such guess unread (la_tail_read_mode 2).
 // The config is the host-mapped RouteCfg, read at every launch, so the window's budgets reach this kernel as they reach the router.
 // Approximations: the router's own picks before a swap (its `used` set) and the ring's landed copies (counted resident there) are not seen.
-__global__ void pred_tail_read_k(const float* __restrict__ logits, int32_t* __restrict__ ids, const float* __restrict__ w, const int32_t* __restrict__ res,
-                                 const RouteCfg* cfg, unsigned long long* __restrict__ skipped, int n_tok, int all_ranks) {
-    const int t = blockIdx.x;
-    if (t >= n_tok) return;
+// one warp of token t (SPEC-router-fuse step 1: a device function, shared by pred_tail_read_k and the fused selection kernel)
+__device__ __forceinline__ void pred_tail_read_warp(const float* __restrict__ logits, int32_t* __restrict__ ids, const float* __restrict__ w,
+                                                    const int32_t* __restrict__ res, const RouteCfg* cfg, unsigned long long* __restrict__ skipped,
+                                                    int t, int all_ranks) {
     const int lane = (int) threadIdx.x;
     const int lo = ((const volatile RouteCfg*) cfg)->lo;
     const int hi = ((const volatile RouteCfg*) cfg)->hi;
@@ -1388,6 +1515,12 @@ __global__ void pred_tail_read_k(const float* __restrict__ logits, int32_t* __re
         __syncwarp();   // lane 0's write is what the next rank's reads see
     }
 }
+__global__ void pred_tail_read_k(const float* __restrict__ logits, int32_t* __restrict__ ids, const float* __restrict__ w, const int32_t* __restrict__ res,
+                                 const RouteCfg* cfg, unsigned long long* __restrict__ skipped, int n_tok, int all_ranks) {
+    const int t = blockIdx.x;
+    if (t >= n_tok) return;
+    pred_tail_read_warp(logits, ids, w, res, cfg, skipped, t, all_ranks);
+}
 static unsigned long long* g_pred_tail = nullptr;   // device counter: stand-in-served predictions not read since the last take
 void route_pred_tail_read_alloc() {
     if (g_pred_tail != nullptr) return;
@@ -1409,6 +1542,73 @@ unsigned long long route_pred_tail_read_take() {
     if (cudaMemcpy(&v, g_pred_tail, sizeof v, cudaMemcpyDeviceToHost) != cudaSuccess) { cudaGetLastError(); return 0; }
     cudaMemset(g_pred_tail, 0, sizeof v);
     return v;
+}
+// SPEC-router-fuse step 1: the look-ahead's post-GEMV chain of ALL distances in one launch.  Block (token t, dist slot d) runs one warp:
+// the top-10 of the dist's logits, then the same bodies as the one-kernel launches, in the same order: the layer mask of the target layer,
+// route_pred_edge_skip, route_pred_tail_read (__syncwarp between them: each reads the ids the previous one wrote).  Dists are independent
+// (their own logits, ids, weights, target layer), so the per-dist results equal the sequential chain's.
+struct PredSelArgs {
+    float* logits[kRoutePredDists];
+    int32_t* ids[kRoutePredDists];
+    float* w[kRoutePredDists];
+    const uint8_t* mask[kRoutePredDists];
+    const int32_t* mres[kRoutePredDists];
+    const uint8_t* ring[kRoutePredDists];
+    const uint8_t* cheap[kRoutePredDists];
+    const int32_t* res[kRoutePredDists];
+    int layer[kRoutePredDists];
+    unsigned flags[kRoutePredDists];   // bit 0 mask, bit 1 edge skip, bit 2 tail read
+    int n_tok;
+    int lo_mask;
+    float edge_mask;
+    int cost_lo;
+    const int* ctrl;
+    const uint32_t* fctrl;
+    unsigned long long* mstats;
+    const RouteCfg* cfg;
+    unsigned long long* eskip;
+    unsigned long long* tskip;
+    int tail_all;
+};
+__global__ void route_pred_sel_k(PredSelArgs a) {
+    const int t = (int) blockIdx.x, d = (int) blockIdx.y;   // (one warp per block)
+    if (t >= a.n_tok || a.logits[d] == nullptr) return;   // uniform across the block
+    float* lg = a.logits[d];
+    int32_t* id = a.ids[d];
+    float* w = a.w[d];
+    route_warp_top10(lg + (size_t) t * 512, id + (size_t) t * 10, w + (size_t) t * 10, (int) threadIdx.x);
+    __syncwarp();
+    if (a.flags[d] & 1u) {
+        route_mask_warp(lg, id, w, a.mask[d], t, a.lo_mask, a.edge_mask, nullptr, a.mstats, nullptr, a.layer[d], 0, a.layer[d] == 0,
+                        a.mres[d], a.ring[d], a.cheap[d], nullptr, a.ctrl, a.cost_lo, a.fctrl);
+    }
+    __syncwarp();
+    if (a.flags[d] & 2u) pred_edge_skip_warp(lg, id, a.res[d], a.cfg, a.eskip, t);
+    __syncwarp();
+    if (a.flags[d] & 4u) pred_tail_read_warp(lg, id, w, a.res[d], a.cfg, a.tskip, t, a.tail_all);
+}
+void route_pred_select(const RoutePredDist (&dd)[kRoutePredDists], int n_tok, int tail_all, void* stream) {
+    if (!stream || n_tok < 1 || n_tok > 8) throw std::invalid_argument("route_pred_select: a stream and 1..8 rows");
+    PredSelArgs a{};
+    const RouteCfg* cfg = route_cfg_device();
+    bool any = false;
+    for (int i = 0; i < kRoutePredDists; ++i) {
+        const RoutePredDist& d = dd[i];
+        a.logits[i] = d.logits; a.ids[i] = d.ids; a.w[i] = d.w; a.mask[i] = d.mask; a.mres[i] = d.mres; a.ring[i] = d.ring;
+        a.cheap[i] = d.cheap; a.res[i] = d.res; a.layer[i] = d.layer; a.flags[i] = 0;
+        if (d.logits == nullptr || d.ids == nullptr || d.w == nullptr) { a.logits[i] = nullptr; continue; }
+        any = true;
+        // the same guards as the one-kernel wrappers (native_route_mask, route_pred_edge_skip, route_pred_tail_read)
+        if (d.mask != nullptr && g_mask_stats != nullptr) a.flags[i] |= 1u;
+        if (d.res != nullptr && d.edge_on && cfg != nullptr && g_pred_skip != nullptr && scratch_here()) a.flags[i] |= 2u;
+        if (d.res != nullptr && d.tail_on && cfg != nullptr && g_pred_tail != nullptr && scratch_here()) a.flags[i] |= 4u;
+    }
+    if (!any) return;
+    a.n_tok = n_tok; a.lo_mask = g_mask_lo; a.edge_mask = g_mask_edge; a.cost_lo = g_mask_cost_lo; a.ctrl = g_mask_ctrl_dev;
+    a.fctrl = g_frag_ctrl_dev; a.mstats = g_mask_stats; a.cfg = cfg; a.eskip = g_pred_skip; a.tskip = g_pred_tail; a.tail_all = tail_all;
+    route_pred_sel_k<<<dim3((unsigned) n_tok, kRoutePredDists), 32, 0, static_cast<cudaStream_t>(stream)>>>(a);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 static uint8_t* g_ring = nullptr;
 static size_t g_ring_n = 0;
@@ -2055,7 +2255,11 @@ bool la_learn_active() { return g_la != nullptr && scratch_here(); }
 
 // the forward, on cs (in the window's graph)
 void la_learn_forward(int64_t l, int dist, const float* x, int n, void* stream) {
-    if (!la_learn_active() || n < 1 || n > kLaTok || la_dist_index(dist) < 0) return;
+    la_learn_forward_at(l, dist, x, n, stream, route_pred_logits());
+}
+// SPEC-router-fuse step 1: the same forward with its route scratch given (the dist's slot: route_pred_logits_at).
+void la_learn_forward_at(int64_t l, int dist, const float* x, int n, void* stream, float* route) {
+    if (!la_learn_active() || n < 1 || n > kLaTok || la_dist_index(dist) < 0 || route == nullptr) return;
     LaLearn& s = *g_la;
     const int sd = (int) l * kLaNd + la_dist_index(dist);
     LaFwdArgs a{};
@@ -2063,7 +2267,7 @@ void la_learn_forward(int64_t l, int dist, const float* x, int n, void* stream) 
     a.xsave = dist == kLaDist[0] ? s.x + (size_t) l * kLaTok * s.H : nullptr;   // the first distance saves the input
     a.u = s.u + (size_t) sd * kLaTok * kLaRows;
     a.pred = s.pred + (size_t) sd * kLaSlots * kLaTok * kLaE;
-    a.route = route_pred_logits();
+    a.route = route;
     a.lead = s.lead + sd;
     a.n = n;
     a.H = s.H;
@@ -2078,6 +2282,11 @@ void la_learn_forward(int64_t l, int dist, const float* x, int n, void* stream) 
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
+// SPEC-router-fuse step 2: the label slab of layer l (rows 0..n-1 of this window), for the post-routing kernel's label copy; nullptr when off.
+float* la_learn_label_dev(int64_t l, int n) {
+    if (!la_learn_active() || n < 1 || n > kLaTok || l < 0 || l >= g_la->L) return nullptr;
+    return g_la->lab + (size_t) l * kLaTok * kLaE;
+}
 // the label of layer l for this window (on cs, in the graph): its router logits, kept for the batch
 void la_learn_label(int64_t l, const float* tl, int n, void* stream) {
     if (!la_learn_active() || n < 1 || n > kLaTok) return;

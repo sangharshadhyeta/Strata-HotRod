@@ -58,5 +58,11 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream);
+/// SPEC-router-fuse step 1: up to three projections of the same n_tok rows in ONE launch. Dist d (bit d of `live`) computes
+/// y[d * ldy_d + t * ldy + j] = w[d] . x_t for j < n_out, every output bitwise the bf16_gemv_fp32_mmvf_multi call's (one block per
+/// output row, the same reduction order). Returns false with nothing launched when the single calls would not be this kernel
+/// (STRATA_MMVF_ROWS=1, n_tok outside 1..8, bad shapes); the caller then makes the single calls.
+bool bf16_gemv_fp32_mmvf_multi3(const float* x, int64_t ldx, const uint16_t* const w[3], uint32_t live, float* y, int64_t ldy,
+                                int64_t ldy_d, int64_t n_in, int64_t n_out, int n_tok, void* stream);
 
 }  // namespace strata::kernels

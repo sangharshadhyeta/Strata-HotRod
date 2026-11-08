@@ -337,6 +337,85 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
 }
 
+// SPEC-router-fuse step 1: the three look-ahead projections in one launch.  Block (d * n_out + row) computes row `row` of dist d's
+// matrix for NT tokens with bf16_f32_mmvf_multi_kernel's arithmetic (the same pairs, the same two ordered FMAs per pair and token,
+// the same warp and block sums); the PDL prefetch is the only thing left out (no programmatic launch here).
+template <int BLOCK_SIZE, int NT>
+__global__ void bf16_f32_mmvf_multi3_kernel(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w0,
+                                            const uint16_t* __restrict__ w1, const uint16_t* __restrict__ w2, uint32_t live,
+                                            float* __restrict__ y, int64_t ldy, int64_t ldy_d, int n_in, int n_out, int n_tok) {
+    const int d = (int) blockIdx.x / n_out;
+    const int row = (int) blockIdx.x - d * n_out;
+    if (((live >> d) & 1u) == 0u) return;   // uniform across the block
+    const uint16_t* wd = d == 0 ? w0 : (d == 1 ? w1 : w2);
+    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(wd + (size_t) row * n_in);
+    const int t = threadIdx.x;
+    __shared__ float partials[NT][32];
+    if (t < 32) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) partials[k][t] = 0.0f;
+    }
+    __syncthreads();
+    float acc[NT];
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+        const uint32_t weight = __ldg(weights2 + pair);
+        const float wa = f32_from_bf16((uint16_t) weight), wb = f32_from_bf16((uint16_t) (weight >> 16));
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            const float2 input = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + pair);
+            acc[k] = __fmaf_rn(wa, input.x, acc[k]);
+            acc[k] = __fmaf_rn(wb, input.y, acc[k]);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = mmvf_warp_sum(acc[k]);
+    if constexpr (BLOCK_SIZE > 32) {
+        if ((t & 31) == 0)
+#pragma unroll
+            for (int k = 0; k < NT; ++k) partials[k][t / 32] = acc[k];
+        __syncthreads();
+        if (t < 32)
+#pragma unroll
+            for (int k = 0; k < NT; ++k) acc[k] = mmvf_warp_sum(partials[k][t]);
+    }
+    if (t == 0)
+#pragma unroll
+        for (int k = 0; k < NT; ++k) y[(size_t) d * ldy_d + (size_t) k * ldy + row] = acc[k];
+}
+
+bool bf16_gemv_fp32_mmvf_multi3(const float* x, int64_t ldx, const uint16_t* const w[3], uint32_t live, float* y, int64_t ldy,
+                                int64_t ldy_d, int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
+    if (rows || live == 0u || n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
+        y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || n_in > 0x7fffffff)
+        return false;
+    for (int d = 0; d < 3; ++d)
+        if (((live >> d) & 1u) != 0u && w[d] == nullptr) return false;
+    const cudaStream_t st = (cudaStream_t) stream;
+    const unsigned nb = (unsigned) (3 * n_out);
+    const uint16_t* w0 = w[0] != nullptr ? w[0] : (w[1] != nullptr ? w[1] : w[2]);   // (a dead dist's pointer is never read)
+    const uint16_t* w1 = w[1] != nullptr ? w[1] : w0;
+    const uint16_t* w2 = w[2] != nullptr ? w[2] : w0;
+    const int ni = (int) n_in, no = (int) n_out;
+#define STRATA_MMVF3_NT(B, NTV) \
+    case NTV: bf16_f32_mmvf_multi3_kernel<B, NTV><<<nb, B, 0, st>>>(x, ldx, w0, w1, w2, live, y, ldy, ldy_d, ni, no, n_tok); break
+#define STRATA_MMVF3_B(B) \
+    case B: switch (n_tok) { STRATA_MMVF3_NT(B, 1); STRATA_MMVF3_NT(B, 2); STRATA_MMVF3_NT(B, 3); STRATA_MMVF3_NT(B, 4); \
+                             STRATA_MMVF3_NT(B, 5); STRATA_MMVF3_NT(B, 6); STRATA_MMVF3_NT(B, 7); STRATA_MMVF3_NT(B, 8); } break
+    switch (mmvf_block_size(n_in)) {
+        STRATA_MMVF3_B(32); STRATA_MMVF3_B(64); STRATA_MMVF3_B(96); STRATA_MMVF3_B(128);
+        STRATA_MMVF3_B(160); STRATA_MMVF3_B(192); STRATA_MMVF3_B(224); STRATA_MMVF3_B(256);
+    }
+#undef STRATA_MMVF3_B
+#undef STRATA_MMVF3_NT
+    const cudaError_t result = cudaGetLastError();
+    if (result != cudaSuccess)
+        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi3 launch: ") + cudaGetErrorString(result));
+    return true;
+}
+
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
                          int64_t n_in, int64_t n_out, void* stream) {
     if (n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
