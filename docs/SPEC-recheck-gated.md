@@ -70,3 +70,18 @@ while the row is computed:
 - The re-check, the audit and the gate stay (the safety net).
 Tests: kernel parity (cap +inf identical to today; a finite cap refuses exactly the moves past it; row_shift never exceeds the cap; held
 rows unchanged), CPU unit tests (the median, the multipliers, the classes), build, serve tests, import check.
+
+## Step G - the shift-cap multipliers and the prefetch count chosen live (8 Nov, the user)
+The paired tuner (include/strata/core/paired_test.hpp; the budget test and the mask test in verify.cpp) gets two more tests in its
+rotation: budget -> mask -> **cap** -> **prefetch** -> budget ...
+- **Cap test:** the candidate scales both multipliers (cap_unc, cap_none) by the test's step (x or / 1.25 by direction, the same
+  direction / step rules as the budget test); arms interleaved and paired as today; decided by paired::decide with the quality veto and
+  the cut guard. A move keeps the ratio cap_unc / cap_none. Range 0.25-8 x the median; +inf (off) is not a candidate.
+- **Prefetch test:** the candidate changes STRATA_RECHECK_PREFETCH_MAX by x or / 1.5 (rounded, at least 1 step), range 0-64; 0 is a
+  candidate (no prefetch). Same decision rule.
+- The arm's values are written between windows (the cap array, the prefetch count on the host); nothing inside a window.
+- The chosen values persist in the .gate state file with the rest (loaded at start; the env values are the start values only when no
+  saved state exists).
+- Logs: `auto cap test x vs y: pairs N, mean d ..., -> keep|move (reason)` and the same for `auto prefetch test`.
+- Settings: STRATA_TUNE_CAP=0, STRATA_TUNE_PREFETCH=0 leave them fixed.
+Tests: CPU unit tests of the rotation, the candidates (steps, ranges, ratio kept), the persistence round trip; build; serve tests.
