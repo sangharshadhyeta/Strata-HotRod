@@ -295,6 +295,9 @@ inline std::atomic<int> la_tail_read_mode{0};
 inline std::atomic<int> la_tail_read_lo{0};
 /// the window's counts since the request's stats line took them: guesses at ranks >= lo queued, held back (queue full), and not read under mode 2
 inline std::atomic<long long> la_tail_read_queued{0}, la_tail_read_held{0}, la_tail_read_open_skips{0};
+/// SPEC-adaptive-la change 3: the decode read-ahead dispatch's host time (steady clock, ns, summed; the request's stats line takes it),
+/// the decode windows it ran in, the guesses it considered and queued, and (STRATA_TAIL_ADAPT=1) the windows the tail was restricted
+inline std::atomic<long long> la_ra_ns{0}, la_ra_windows{0}, la_ra_considered{0}, la_ra_queued{0}, la_tail_restrict_windows{0};
 class RouterLookahead {
 public:
     RouterLookahead() = default;
