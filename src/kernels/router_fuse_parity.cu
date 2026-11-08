@@ -48,6 +48,104 @@ struct Config {
 size_t slab(int64_t target, int slot) { return ((size_t) target * K::kRoutePredDists + (size_t) slot) * 80; }
 }  // namespace
 
+// ---- step 2: the layer's own post-routing stages, the separate calls against native_route_post (bit for bit) ----
+// The own routing of layer l: the router GEMV and the top-10 (the same ids and weights start both chains), then the mask, the resident
+// stage and (with the learner) the label copy: the separate calls, or the one launch.  Compared: ids exact, weights and row_shift bitwise,
+// the resident counters and the mask's seen / moved counts equal, the label bitwise.
+int run_post_checks(const float* dx, const uint16_t* dwall, const int32_t* dres, bool learner_ok, const Config& cfg, cudaStream_t s,
+                    int n, int l) {
+    const size_t nl = (size_t) kMaxN * kNE;
+    float *dlog, *dw_a, *dw_b, *dsh_a, *dsh_b;
+    int32_t *dids_a, *dids_b;
+    unsigned long long *dst_a, *dst_b;
+    ck(cudaMalloc((void**) &dlog, nl * 4), "post logits");
+    ck(cudaMalloc((void**) &dw_a, kMaxN * kK * 4), "post w a");
+    ck(cudaMalloc((void**) &dw_b, kMaxN * kK * 4), "post w b");
+    ck(cudaMalloc((void**) &dsh_a, kMaxN * 4), "post shift a");
+    ck(cudaMalloc((void**) &dsh_b, kMaxN * 4), "post shift b");
+    ck(cudaMalloc((void**) &dids_a, kMaxN * kK * 4), "post ids a");
+    ck(cudaMalloc((void**) &dids_b, kMaxN * kK * 4), "post ids b");
+    ck(cudaMalloc((void**) &dst_a, 16 * 8), "post stats a");
+    ck(cudaMalloc((void**) &dst_b, 16 * 8), "post stats b");
+    ck(cudaMemsetAsync(dsh_a, 0, kMaxN * 4, s), "z");
+    ck(cudaMemsetAsync(dsh_b, 0, kMaxN * 4, s), "z");
+    ck(cudaMemsetAsync(dst_a, 0, 16 * 8, s), "z");
+    ck(cudaMemsetAsync(dst_b, 0, 16 * 8, s), "z");
+    K::bf16_gemv_fp32_mmvf_multi(dx, kN, dwall + (size_t) l * kNE * kN, dlog, kNE, kN, kNE, n, s);
+    K::native_router_top10_multi(dlog, dids_a, dw_a, n, s);
+    ck(cudaMemcpyAsync(dids_b, dids_a, kMaxN * kK * 4, cudaMemcpyDeviceToDevice, s), "ids copy");
+    ck(cudaMemcpyAsync(dw_b, dw_a, kMaxN * kK * 4, cudaMemcpyDeviceToDevice, s), "w copy");
+    ck(cudaStreamSynchronize(s), "post start");
+    const bool label_on = cfg.learn && learner_ok;
+    const uint8_t* mask_l = K::route_mask_layer(l, kL);
+    const int32_t* res_l = dres + (size_t) l * kNE;
+    const int32_t* mres = cfg.mres ? dres + (size_t) l * kNE : nullptr;
+    unsigned long long seen = 0, moved = 0;
+    K::route_mask_read(seen, moved);   // (reset the counters)
+
+    // ---- the separate calls ----
+    if (label_on) K::la_learn_label(l, dlog, n, s);
+    K::native_route_mask(dlog, dids_a, dw_a, mask_l, n, dsh_a, s, nullptr, l, 0, mres, nullptr, nullptr);
+    K::native_route_resident(dlog, dids_a, dw_a, res_l, n, dst_a, s, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, dsh_a, nullptr,
+                             nullptr, l, nullptr, nullptr, 0);
+    ck(cudaStreamSynchronize(s), "post ref");
+    unsigned long long ref_seen = 0, ref_moved = 0;
+    K::route_mask_read(ref_seen, ref_moved);
+    std::vector<float> lab_ref((size_t) n * kNE, 0.f), lab_fus((size_t) n * kNE, 0.f);
+    if (label_on) ck(cudaMemcpy(lab_ref.data(), K::la_learn_label_dev(l, n), lab_ref.size() * 4, cudaMemcpyDeviceToHost), "lab ref");
+
+    // ---- the one launch ----
+    K::RoutePostArgs pa{};
+    pa.logits = dlog; pa.ids = dids_b; pa.weights = dw_b; pa.n_tok = n; pa.layer = l; pa.row_base = 0;
+    pa.mask = mask_l; pa.mres = mres; pa.row_shift = dsh_b; pa.res = res_l; pa.rstats = dst_b;
+    pa.label = label_on ? K::la_learn_label_dev(l, n) : nullptr;
+    K::native_route_post(pa, s);
+    ck(cudaStreamSynchronize(s), "post fused");
+    unsigned long long fus_seen = 0, fus_moved = 0;
+    K::route_mask_read(fus_seen, fus_moved);
+    if (label_on) ck(cudaMemcpy(lab_fus.data(), K::la_learn_label_dev(l, n), lab_fus.size() * 4, cudaMemcpyDeviceToHost), "lab fus");
+
+    // ---- compare ----
+    std::vector<int32_t> ia(kMaxN * kK), ib(kMaxN * kK);
+    std::vector<float> wa(kMaxN * kK), wb(kMaxN * kK), sa(kMaxN), sb(kMaxN);
+    unsigned long long ta[16], tb2[16];
+    ck(cudaMemcpy(ia.data(), dids_a, ia.size() * 4, cudaMemcpyDeviceToHost), "ia");
+    ck(cudaMemcpy(ib.data(), dids_b, ib.size() * 4, cudaMemcpyDeviceToHost), "ib");
+    ck(cudaMemcpy(wa.data(), dw_a, wa.size() * 4, cudaMemcpyDeviceToHost), "wa");
+    ck(cudaMemcpy(wb.data(), dw_b, wb.size() * 4, cudaMemcpyDeviceToHost), "wb");
+    ck(cudaMemcpy(sa.data(), dsh_a, sa.size() * 4, cudaMemcpyDeviceToHost), "sa");
+    ck(cudaMemcpy(sb.data(), dsh_b, sb.size() * 4, cudaMemcpyDeviceToHost), "sb");
+    ck(cudaMemcpy(ta, dst_a, sizeof ta, cudaMemcpyDeviceToHost), "ta");
+    ck(cudaMemcpy(tb2, dst_b, sizeof tb2, cudaMemcpyDeviceToHost), "tb");
+    int id_bad = 0, w_bad = 0, sh_bad = 0, lab_bad = 0, ties = 0;
+    for (int r = 0; r < n; ++r) {
+        bool same = true;
+        for (int k = 0; k < kK; ++k) same &= ia[r * kK + k] == ib[r * kK + k];
+        if (!same) ++id_bad;
+        if (std::memcmp(&wa[r * kK], &wb[r * kK], kK * 4) != 0) ++w_bad;
+        if (std::memcmp(&sa[r], &sb[r], 4) != 0) ++sh_bad;
+    }
+    if (label_on && std::memcmp(lab_ref.data(), lab_fus.data(), lab_ref.size() * 4) != 0) lab_bad = 1;
+    for (int i = 0; i < 16; ++i)
+        if (ta[i] != tb2[i]) { ++id_bad; break; }
+    if (ref_seen != fus_seen || ref_moved != fus_moved) ++id_bad;
+    // the ties of the own logits (as above): reported only
+    for (int r = 0; r < n; ++r) {
+        std::vector<float> row(kNE);
+        ck(cudaMemcpy(row.data(), dlog + (size_t) r * kNE, kNE * 4, cudaMemcpyDeviceToHost), "row");
+        std::partial_sort(row.begin(), row.begin() + 11, row.end(), std::greater<float>());
+        for (int q = 0; q + 1 < 11; ++q)
+            if (row[q] == row[q + 1]) { ++ties; break; }
+    }
+    const bool ok = id_bad == 0 && w_bad == 0 && sh_bad == 0 && lab_bad == 0;
+    std::printf("%s post  %-58s n=%d  ids-diff %d  weights-diff %d  shift-diff %d  label-diff %d  mask seen/moved %llu/%llu vs %llu/%llu  stats %s  ties(top11) %d\n",
+                ok ? "PASS" : "FAIL", cfg.name, n, id_bad, w_bad, sh_bad, lab_bad, ref_seen, ref_moved, fus_seen, fus_moved,
+                std::memcmp(ta, tb2, sizeof ta) == 0 ? "equal" : "DIFFER", ties);
+    cudaFree(dlog); cudaFree(dw_a); cudaFree(dw_b); cudaFree(dsh_a); cudaFree(dsh_b); cudaFree(dids_a); cudaFree(dids_b);
+    cudaFree(dst_a); cudaFree(dst_b);
+    return ok ? 0 : 1;
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     int bad = 0;
@@ -198,8 +296,10 @@ int main() {
                         ok ? "PASS" : "FAIL", cfg.name, n, l_bad, w_bad, id_bad, tie_rows_id_diff, ref_edge, fused_edge, ref_tail, fused_tail,
                         ties);
             if (!ok) ++bad;
+            bad += run_post_checks(dx, dwall, dres, learner_ok, cfg, s, n, l);
         }
     }
-    std::printf("router_fuse_parity (step 1, look-ahead): %s (%d failing cases)\n", bad == 0 ? "all bit-identical" : "MISMATCH", bad);
+    std::printf("router_fuse_parity (step 1 look-ahead, step 2 post-routing): %s (%d failing cases)\n",
+                bad == 0 ? "all bit-identical" : "MISMATCH", bad);
     return bad == 0 ? 0 : 1;
 }

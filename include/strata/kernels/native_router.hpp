@@ -143,6 +143,37 @@ const std::vector<uint8_t>* route_mask_host();
 void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream,
                        MaskEvs* mev = nullptr, int layer = 0, int row_base = 0, const int32_t* res = nullptr, const uint8_t* ring = nullptr,
                        const uint8_t* cheap = nullptr);
+/// SPEC-router-fuse step 2: the layer's own post-routing stages in one launch, one warp per token, in this order: the learner's label copy
+/// (label, nullable: the logits of the layer, copied), the layer's mask (mask nullable: no mask; mres / mring / mcheap as native_route_mask's
+/// res / ring / cheap), then native_route_resident's stage (res nullable: no stand-in stage; the other pointers as native_route_resident's).
+/// The arguments are exactly the two calls' (the verifier computes them as it does for those calls); each output is theirs.
+struct RoutePostArgs {
+    float* logits;
+    int32_t* ids;
+    float* weights;
+    int n_tok;
+    int layer;
+    int row_base;
+    const uint8_t* mask;
+    MaskEvs* mev;
+    const int32_t* mres;
+    const uint8_t* mring;
+    const uint8_t* mcheap;
+    float* row_shift;
+    const int32_t* res;
+    unsigned long long* rstats;
+    float* want;
+    int32_t* rows;
+    float* repl;
+    const uint8_t* rring;
+    const uint8_t* rcheap;
+    unsigned long long* bstats;
+    const float* pair_c;
+    int32_t* lrn_rec;
+    const float* pair_pe;
+    float* label;
+};
+void native_route_post(const RoutePostArgs& a, void* stream);
 /// STRATA_MASK_RESIDENT: the SSD-demand counters, flat [layers][512] (the router's non-cheap picks since the start, u32, wrapping). false: none.
 bool route_mask_cost_read(std::vector<uint32_t>& out);
 /// STRATA_MASK=learn: copies the changed layers of `host` (same size as the set mask) to the device and the host copy. false: not set.
@@ -179,6 +210,8 @@ void la_learn_forward(int64_t l, int dist, const float* x, int n, void* stream);
 /// plain logits; the leader's on exit).  la_learn_forward is this with route_pred_logits().
 void la_learn_forward_at(int64_t l, int dist, const float* x, int n, void* stream, float* route);
 void la_learn_label(int64_t l, const float* true_logits, int n, void* stream);
+/// SPEC-router-fuse step 2: layer l's label slab (rows 0..n-1 this window) for the post-routing kernel's copy; nullptr when the learner is off.
+float* la_learn_label_dev(int64_t l, int n);
 void la_learn_window_end(void* stream);
 void la_learn_pre_launch(void* stream);
 void la_learn_post_launch(void* stream, const int* resident, int n);

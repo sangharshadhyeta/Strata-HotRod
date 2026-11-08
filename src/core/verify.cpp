@@ -134,6 +134,10 @@ static bool la_fuse_la_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSE_LA"); return router_fuse_on() && (v == nullptr || v[0] != '0'); }();
     return on;
 }
+static bool router_post_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSE_POST"); return router_fuse_on() && (v == nullptr || v[0] != '0'); }();
+    return on;
+}
 // STRATA_MASK_CTRL (default on, =0 off): the mask's control windows also run without STRATA_MASK_RESIDENT (SPEC-control-windows): the
 // "without" side of the mask's re-checks then comes from them.  Off: only the resident rule runs control windows (the old gate).
 static bool mask_ctrl_on() {
@@ -3154,8 +3158,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // the look-ahead node: on la_cs_ (above) or the shared stream (STRATA_LOOKAHEAD_GPU_FORK=1), else here on cs
         if (la_gpu && !la_on_sh && !la_on_stream && !lookahead_node(cs)) return false;
+        // SPEC-router-fuse step 2 (STRATA_ROUTER_FUSE_POST=0 or STRATA_ROUTER_FUSE=0: off): the layer's mask, its stand-in stage and the learner's
+        // label are one launch (native_route_post, below) when the mask or the stand-ins are on; the label is copied there, after route_prior
+        // (which writes ids and weights, not the logits).  Otherwise the separate calls, as before.
+        const bool own_mask_on = NE == 512 && K == 10 && !route_resident_cfg().win_exact && strata::kernels::route_mask_layer(l, g.n_expert) != nullptr;
+        const bool own_res_on = route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr;
+        const bool post_own = router_post_on() && (own_mask_on || own_res_on);
+        float* const lab_dev = post_own && la_learn_win ? strata::kernels::la_learn_label_dev(l, n) : nullptr;
         // STRATA_LA_LEARN: this layer's router logits are the label of this window's batch (copied here; the batch runs after the window)
-        if (la_learn_win) {
+        if (la_learn_win && lab_dev == nullptr) {
             try {
                 strata::kernels::la_learn_label(l, logits_ + tb * NE, n, cs);
             } catch (const std::exception& e) { err = "verify look-ahead learner: " + std::string(e.what()); return false; }
@@ -3165,8 +3176,36 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+        if (post_own) {
+            try {
+                strata::kernels::RoutePostArgs pa{};
+                pa.logits = logits_ + tb * NE; pa.ids = ids_ + tb * K; pa.weights = w_ + tb * K;
+                pa.n_tok = (int) n; pa.layer = (int) l; pa.row_base = (int) tb;
+                pa.mask = own_mask_on ? strata::kernels::route_mask_layer(l, g.n_expert) : nullptr;
+                const bool mres = mask_resident_on();   // STRATA_MASK_RESIDENT: this layer's residency tables (the rule's `cheap`)
+                pa.mev = n <= 8 ? mev_ : nullptr;
+                pa.mres = mres && hits_.d_res != nullptr ? hits_.d_res + l * g.n_expert : nullptr;
+                pa.mring = mres ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr;
+                pa.mcheap = mres ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr;
+                pa.row_shift = n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr;
+                pa.res = own_res_on ? hits_.d_res + l * g.n_expert : nullptr;
+                pa.rstats = rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr;
+                pa.want = n <= 8 && !strata::kernels::route_rows_active() ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr;
+                pa.rows = n <= 8 ? strata::kernels::route_rows_layer(l) : nullptr;
+                pa.repl = n <= 8 ? strata::kernels::route_repl_layer(l, g.n_expert) : nullptr;
+                pa.rring = n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr;
+                pa.rcheap = n <= 8 ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr;
+                pa.bstats = rr_stats_ != nullptr ? rr_stats_ + 9 : nullptr;
+                pa.pair_c = lrn_c_ != nullptr && !standin_learn_observe_env() ? lrn_c_ + (size_t) l * 512 * 512 : nullptr;
+                pa.lrn_rec = lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr;
+                pa.pair_pe = lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr;
+                pa.label = lab_dev;
+                strata::kernels::native_route_post(pa, cs);
+            } catch (const std::exception& e) { err = "verify route-post: " + std::string(e.what()); return false; }
+        }
         // STRATA_MASK (opt-in, changes the output): the layer's masked picks move before the stand-ins see them; each move adds its w x gap to
         // the row's row_shift (the flip re-check's risk).  The flip re-check's exact re-run (win_exact) runs unmasked.
+        if (!post_own) {
         if (NE == 512 && K == 10 && !route_resident_cfg().win_exact) {
             if (const uint8_t* mk = strata::kernels::route_mask_layer(l, g.n_expert)) {
                 try {
@@ -3199,6 +3238,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       n <= 8 ? mev_ : nullptr, (int) tb);   // (STRATA_MASK=learn: this layer's replaced picks, by row)
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+        }   // !post_own
         if (!stage_mark(cs, kStRouter, err)) return false;
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
