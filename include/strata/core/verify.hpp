@@ -292,9 +292,14 @@ public:
     void route_gate_rows(uint32_t bits, bool audit);
     float route_gate_p_hi() const;
     void route_gate_window(int a0, const int* bucket, const float* shift, const uint8_t* eligible, bool audit);
-    void route_gate_cut(int row, int bucket, bool audit, bool control, const std::vector<strata::core::recheck::Pick>& picks);
+    void route_gate_cut(int row, int bucket, bool audit, bool control, const std::vector<strata::core::recheck::Pick>& picks, float shift);
     void route_gate_settled(bool exact_ok, bool flipped);
     static bool route_gate_take(std::string& gate_line, std::string& rank_line);
+    /// SPEC-recheck-gated step F: route_shift_cap_window(bucket, p, T, audit): before the window, the device caps of its rows (the class's
+    /// multiplier times the running median of the moved rows' final shifts; an audit window caps nothing).  route_shift_take: this request's
+    /// refused moves and their row launches (device counters), the current caps, and the calibration decile line (false when nothing ran).
+    void route_shift_cap_window(const int* bucket, const float* p, int T, bool audit);
+    static bool route_shift_take(std::string& cap_line, std::string& cal_line);
     static bool route_control_take(std::string& out);
     /// STRATA_FRAGILE_BRAKE: at a request's end, its size class learns its start fraction and clean level (route_class_end; the tune file is
     /// written); route_class_state gives the request's class and that class's start and clean level.

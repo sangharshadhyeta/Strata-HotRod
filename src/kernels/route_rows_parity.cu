@@ -102,6 +102,10 @@ int main() {
         std::fprintf(stderr, "route_fragile_control_alloc: no host-mapped flag\n");
         return 2;
     }
+    if (!strata::kernels::route_shift_cap_alloc()) {   // SPEC-recheck-gated step F: the cap array and its counters
+        std::fprintf(stderr, "route_shift_cap_alloc: no host-mapped cap array\n");
+        return 2;
+    }
     std::string msg;
     std::vector<uint8_t> mask_host(kExperts, 0);
     if (!strata::kernels::route_mask_set(mask_host.data(), 1, kExperts, kMaskLo, -1.0f, msg)) {
@@ -264,6 +268,85 @@ int main() {
                     std::printf("  case %d mask n_tok %d count %d row %d: differs\n", c, n_tok, n, t);
                 }
             }
+        }
+        // ---- SPEC-recheck-gated step F: the per-row shift cap (route_shift_cap_set).  No hold.  (a) a huge finite cap, (b) a cap equal to the
+        // uncapped row shift, are identical to the uncapped reference; (c) a random finite cap is never exceeded by the row's shift; (d) cap 0
+        // refuses every move with a positive shift, so the row shift is 0.  Both kernels.  Caps are reset to +inf after the section.
+        {
+            strata::kernels::route_fragile_hold(0u);
+            float capv[32];
+            auto set_caps = [&](float fill_v, bool use_ref, bool use_mref, bool random_frac) {
+                for (int i = 0; i < 32; ++i) capv[i] = INFINITY;
+                for (int t = 0; t < n_tok; ++t) {
+                    if (random_frac) capv[t] = std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) * ref.rs[(size_t) t];
+                    else if (use_ref) capv[t] = ref.rs[(size_t) t];
+                    else if (use_mref) capv[t] = mref.rs[(size_t) t];
+                    else capv[t] = fill_v;
+                }
+                strata::kernels::route_shift_cap_set(capv, 32);
+            };
+            Out rcap;
+            auto resident_run = [&](Out& o) {
+                set_run(0, false);
+                launch_resident(n_tok);
+                read_resident(n_tok, o);
+            };
+            // reference of the mask kernel (flag clear, uncapped): mref is computed above for this case
+            auto same_run = [&](const Out& a, const Out& b, const char* what) {
+                for (int t = 0; t < n_tok; ++t) {
+                    const size_t o = (size_t) t * kTop;
+                    if (std::memcmp(a.ids.data() + o, b.ids.data() + o, kTop * sizeof(int32_t)) != 0 || !same_bits(a.w.data() + o, b.w.data() + o, kTop) ||
+                        a.rs[(size_t) t] != b.rs[(size_t) t]) {
+                        ++bad;
+                        std::printf("  case %d %s row %d: differs\n", c, what, t);
+                    }
+                }
+            };
+            // (a) a huge finite cap, resident and mask
+            set_caps(1e30f, false, false, false);
+            resident_run(rcap);
+            same_run(rcap, ref, "shift cap 1e30 (resident)");
+            Out mcap;
+            run_mask(0, false, mcap);
+            same_run(mcap, mref, "shift cap 1e30 (mask)");
+            // (b) each row's cap is its uncapped shift: no move passes it
+            set_caps(0.0f, true, false, false);
+            resident_run(rcap);
+            same_run(rcap, ref, "shift cap = the uncapped shift (resident)");
+            set_caps(0.0f, false, true, false);
+            run_mask(0, false, mcap);
+            same_run(mcap, mref, "shift cap = the uncapped shift (mask)");
+            // (c) a random finite cap per row: the row's shift never exceeds it
+            set_caps(0.0f, false, false, true);
+            resident_run(rcap);
+            for (int t = 0; t < n_tok; ++t)
+                if (rcap.rs[(size_t) t] > capv[t]) {
+                    ++bad;
+                    std::printf("  case %d shift cap (resident) row %d: shift %.6f above the cap %.6f\n", c, t, rcap.rs[(size_t) t], capv[t]);
+                }
+            run_mask(0, false, mcap);
+            for (int t = 0; t < n_tok; ++t)
+                if (mcap.rs[(size_t) t] > capv[t]) {
+                    ++bad;
+                    std::printf("  case %d shift cap (mask) row %d: shift %.6f above the cap %.6f\n", c, t, mcap.rs[(size_t) t], capv[t]);
+                }
+            // (d) cap 0: no move with a positive shift; the row shift stays 0 (rows with only zero-gap moves may still move)
+            set_caps(0.0f, false, false, false);
+            resident_run(rcap);
+            for (int t = 0; t < n_tok; ++t)
+                if (rcap.rs[(size_t) t] != 0.0f) {
+                    ++bad;
+                    std::printf("  case %d cap 0 (resident) row %d: shift %.6f\n", c, t, rcap.rs[(size_t) t]);
+                }
+            run_mask(0, false, mcap);
+            for (int t = 0; t < n_tok; ++t)
+                if (mcap.rs[(size_t) t] != 0.0f) {
+                    ++bad;
+                    std::printf("  case %d cap 0 (mask) row %d: shift %.6f\n", c, t, mcap.rs[(size_t) t]);
+                }
+            // the caps are reset: every later section sees +inf
+            for (int i = 0; i < 32; ++i) capv[i] = INFINITY;
+            strata::kernels::route_shift_cap_set(capv, 32);
         }
         // ---- SPEC-recheck-gated step A: the row bitmask (route_fragile_hold).  Bit r holds row r: its picks, weights and row_shift stay the
         // router's; every other row is the flag-clear run's, bit for bit.  0xFFFFFFFF is the control window (checked above as a count).

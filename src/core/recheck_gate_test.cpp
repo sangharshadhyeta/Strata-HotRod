@@ -198,6 +198,60 @@ int main() {
               "round trip: the rank table comes back");
     }
 
+    // SPEC-recheck-gated step F: the shift ring (median, deciles, the cap of the newest samples), the caps per class, the window's caps
+    {
+        g::Ring r;
+        for (int i = 1; i <= 4; ++i) r.add((float) i, 4);
+        r.add(5.0f, 4);
+        r.add(6.0f, 4);
+        check(r.n() == 4 && r.pos == 2, "shift ring: the newest 4 kept, the next slot after the wrap");
+        check(r.median() == 5.0f, "shift ring: the upper median of {3,4,5,6} is 5");
+        g::Ring z;
+        z.add(0.0f, 8);
+        z.add(-1.0f, 8);
+        z.add(0.0f / 0.0f, 8);
+        check(z.n() == 0 && z.median() == 0.0f && z.decile(1.0f) == 0, "shift ring: zero, negative and NaN shifts are not kept");
+        g::Ring d;
+        for (int i = 1; i <= 10; ++i) d.add((float) i, 64);
+        check(d.decile(5.5f) == 5 && d.decile(0.5f) == 0 && d.decile(100.0f) == 9, "shift ring: deciles from the share below");
+    }
+    {
+        const g::CapMult m;   // defaults: conf +inf, unc 1.5, none 1.0
+        check(g::cap_for(g::Rule::Uncertain, 2.0f, 10, m) == INFINITY, "cap: no cap before 64 samples");
+        check(g::cap_for(g::Rule::Uncertain, 0.0f, 100, m) == INFINITY, "cap: no cap with a zero median");
+        check(g::cap_for(g::Rule::Confident, 2.0f, 100, m) == INFINITY, "cap: confident rows default to no cap");
+        check(near(g::cap_for(g::Rule::Uncertain, 2.0f, 100, m), 3.0, 1e-6), "cap: uncertain rows at 1.5 x the median");
+        check(near(g::cap_for(g::Rule::None, 2.0f, 100, m), 2.0, 1e-6), "cap: none rows at 1.0 x the median");
+        g::CapMult mc;
+        mc.conf = 2.0f;
+        check(near(g::cap_for(g::Rule::Confident, 2.0f, 100, mc), 4.0, 1e-6), "cap: a finite confident multiplier applies");
+    }
+    {
+        const int bucket[3] = {9, 3, g::kNone};
+        const float p[3] = {0.95f, 0.3f, 0.0f};
+        float caps[32];
+        g::fill_caps(caps, bucket, p, 3, 0.9f, false, 2.0f, 100, g::CapMult{});
+        check(caps[0] == INFINITY && near(caps[1], 3.0, 1e-6) && near(caps[2], 2.0, 1e-6) && caps[3] == INFINITY && caps[31] == INFINITY,
+              "fill_caps: confident inf, uncertain 1.5 x, none 1 x; rows past T inf");
+        g::fill_caps(caps, bucket, p, 3, 0.9f, true, 2.0f, 100, g::CapMult{});
+        bool all_inf = true;
+        for (float v : caps) all_inf = all_inf && v == INFINITY;
+        check(all_inf, "fill_caps: an audit window caps nothing");
+        g::fill_caps(caps, bucket, p, 3, 0.9f, false, 2.0f, 10, g::CapMult{});
+        check(caps[1] == INFINITY, "fill_caps: no cap until the median has 64 samples");
+    }
+    {
+        // the calibration counter and the shift ring survive a save and a load
+        g::State s;
+        s.cal.flip[7] = 3;
+        s.cal.not_flip[7] = 40;
+        for (int i = 1; i <= 70; ++i) s.shift.add(0.01f * (float) i, g::kShiftRing);
+        g::State t;
+        check(g::parse(g::serialize(s, 9), 9, t) && t.cal.flip[7] == 3 && t.cal.not_flip[7] == 40 && t.shift.n() == 70 &&
+                  t.shift.median() == s.shift.median() && t.shift.pos == s.shift.pos,
+              "round trip: calibration and the shift ring come back");
+    }
+
     std::printf("recheck_gate_test: ok\n");
     return 0;
 }

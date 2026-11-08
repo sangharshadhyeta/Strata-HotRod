@@ -9,6 +9,7 @@
 // (8 Nov: uncertain rows are no longer held up front).  With the gate off every moved row is eligible in every window.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -104,6 +105,69 @@ inline int band_of(int layer) {
     return b > 3 ? 3 : b;
 }
 
+// ---- SPEC-recheck-gated step F: the per-row shift cap.  The caps are multiples of a running median of the moved rows' final row_shift.
+
+/// A ring of samples (the newest `cap` kept): the running median and the running deciles.
+struct Ring {
+    std::vector<float> v;
+    size_t pos = 0;
+    void add(float x, size_t cap) {
+        if (!(x == x) || !(x > 0.0f)) return;   // NaN and non-positive values are not kept
+        if (v.size() < cap) v.push_back(x);
+        else {
+            v[pos] = x;
+            pos = (pos + 1) % cap;
+        }
+    }
+    size_t n() const { return v.size(); }
+    /// The upper median (element n/2 of the sorted samples); 0 with no sample.
+    float median() const {
+        if (v.empty()) return 0.0f;
+        std::vector<float> c = v;
+        std::nth_element(c.begin(), c.begin() + (std::ptrdiff_t) (c.size() / 2), c.end());
+        return c[c.size() / 2];
+    }
+    /// The decile of x against the samples: the share below x, in tenths (0 with no sample; 9 at most).
+    int decile(float x) const {
+        if (v.empty()) return 0;
+        size_t less = 0;
+        for (float s : v) less += s < x ? 1u : 0u;
+        const int d = (int) (10.0 * (double) less / (double) v.size());
+        return d > 9 ? 9 : d;
+    }
+};
+constexpr size_t kShiftRing = 4096;   ///< the moved rows' final shifts kept for the median and the deciles
+constexpr size_t kShiftMin = 64;      ///< no cap before this many samples
+
+/// The cap multipliers of the running median, per row class (+inf = no cap for the class).  Defaults: confident none, uncertain 1.5, none 1.0.
+struct CapMult {
+    float conf = INFINITY;
+    float unc = 1.5f;
+    float none = 1.0f;
+};
+
+/// The cap of a row of class r: its multiplier times the running median; +inf until kShiftMin samples and a positive median.
+inline float cap_for(Rule r, float median, size_t n, const CapMult& m) {
+    if (!(median > 0.0f) || n < kShiftMin) return INFINITY;
+    const float k = r == Rule::Confident ? m.conf : r == Rule::Uncertain ? m.unc : m.none;
+    return k * median;
+}
+
+/// The 32 caps of this window's rows (row r: its class from bucket / p / P_HI).  An audit window caps nothing (the audit measures the
+/// uncapped behaviour).  Rows past T and past 32 stay +inf.
+inline void fill_caps(float* out32, const int* bucket, const float* p, int T, float p_hi, bool audit, float median, size_t n, const CapMult& m) {
+    for (int r = 0; r < 32; ++r) out32[r] = INFINITY;
+    if (audit) return;
+    const int rows = T < 32 ? T : 32;
+    for (int r = 0; r < rows; ++r) out32[r] = cap_for(classify(bucket[r], p[r], p_hi), median, n, m);
+}
+
+/// The calibration counter (step F): the cut rows' final shift by decile of the running shifts, split by the verdict.
+struct ShiftCal {
+    long long flip[kBuckets] = {};
+    long long not_flip[kBuckets] = {};
+};
+
 /// Everything the gate keeps across requests and restarts.  total: the eligible rows, cumulative (what the logs print and the totals
 /// file keeps).  since: the same, since the last P_HI move (the mover's evidence).  margin_ring: the none rows' margins (running estimate).
 struct State {
@@ -113,6 +177,8 @@ struct State {
     Counts since;
     Deciles margin;
     RankTable rank;
+    Ring shift;          ///< step F: the moved rows' final row_shift (the cap's median, the calibration deciles)
+    ShiftCal cal;        ///< step F: the cut rows' shift decile, split by the verdict
     std::vector<float> margin_ring;
     size_t margin_pos = 0;
 };
@@ -208,6 +274,16 @@ inline std::string serialize(const State& s, uint64_t fp) {
     counts("margin_cut", s.margin.cut, kBuckets);
     counts("margin_flip", s.margin.flip, kBuckets);
     counts("rank", &s.rank.n[0][0][0], kRankSlots * kBands * 2);
+    counts("cal_flip", s.cal.flip, kBuckets);
+    counts("cal_not", s.cal.not_flip, kBuckets);
+    std::snprintf(buf, sizeof buf, "shift_pos %lld\n", (long long) s.shift.pos);
+    out += buf;
+    out += "shift_ring";
+    for (float v : s.shift.v) {
+        std::snprintf(buf, sizeof buf, " %.9g", (double) v);
+        out += buf;
+    }
+    out += "\n";
     std::snprintf(buf, sizeof buf, "margin_pos %lld\n", (long long) s.margin_pos);
     out += buf;
     out += "margin_ring";
@@ -246,6 +322,13 @@ inline bool parse(const std::string& text, uint64_t fp, State& s) {
         } else if (key == "margin_ring") {
             double v = 0;
             while (ls >> v) t.margin_ring.push_back((float) v);
+        } else if (key == "shift_pos") {
+            long long v = 0;
+            if (!(ls >> v) || v < 0) return false;
+            t.shift.pos = (size_t) v;
+        } else if (key == "shift_ring") {
+            double v = 0;
+            while (ls >> v) t.shift.v.push_back((float) v);
         } else {
             long long* dst = nullptr;
             int n = 0;
@@ -259,6 +342,8 @@ inline bool parse(const std::string& text, uint64_t fp, State& s) {
             else if (key == "margin_cut") { dst = t.margin.cut; n = kBuckets; }
             else if (key == "margin_flip") { dst = t.margin.flip; n = kBuckets; }
             else if (key == "rank") { dst = &t.rank.n[0][0][0]; n = kRankSlots * kBands * 2; }
+            else if (key == "cal_flip") { dst = t.cal.flip; n = kBuckets; }
+            else if (key == "cal_not") { dst = t.cal.not_flip; n = kBuckets; }
             if (dst == nullptr) continue;   // an unknown key: kept out (forward compatibility)
             for (int i = 0; i < n; ++i)
                 if (!(ls >> dst[i])) return false;
@@ -266,6 +351,7 @@ inline bool parse(const std::string& text, uint64_t fp, State& s) {
     }
     if (!fp_ok) return false;
     if (t.margin_pos >= (size_t) kMarginRing || t.margin_ring.size() > (size_t) kMarginRing) return false;
+    if (t.shift.pos >= kShiftRing || t.shift.v.size() > kShiftRing) return false;
     s = t;
     return true;
 }

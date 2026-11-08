@@ -151,6 +151,13 @@ bool route_fragile_rows(int n);
 bool route_fragile_hold(uint32_t bits);
 /// true when the hold flag exists (route_fragile_control_alloc succeeded).
 bool route_fragile_hold_ready();
+/// SPEC-recheck-gated step F: the per-row shift cap.  route_shift_cap_alloc (once, before any graph capture); route_shift_cap_set(caps, n):
+/// between windows, row r < n is capped at caps[r] (the rest +inf); a move that would take the row's shift past its cap is refused (the pick
+/// stays the router's own).  route_shift_cap_read(moves, rows): between requests, the refusals since the last read (moves refused; row launches
+/// with at least one refusal), reset.  Without the alloc, nothing is capped.
+bool route_shift_cap_alloc();
+bool route_shift_cap_set(const float* caps, int n);
+bool route_shift_cap_read(unsigned long long& moves, unsigned long long& rows);
 /// The seen / moved counts since the last read (read and reset); false when no mask is set.
 bool route_mask_read(unsigned long long& seen, unsigned long long& moved);
 /// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear expert predictors, folded into one bf16 [512 x n_embd]

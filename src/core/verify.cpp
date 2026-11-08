@@ -219,6 +219,15 @@ struct RouteResidentCfg {
         long long au_moved[gate::kNone + 1] = {}, au_cut[gate::kNone + 1] = {}, au_flip[gate::kNone + 1] = {};
         gate::RankTable rk;
     } gq;
+    struct ShiftReq {                         ///< step F: this request's calibration by shift decile and its refusals (route_shift_take resets them)
+        gate::ShiftCal cal;
+        long long cap_moves = 0, cap_rows = 0;   ///< refused moves and row launches with a refusal (the device counters, read at the request's end)
+    } sq;
+    // SPEC-recheck-gated step F: the per-row shift cap (STRATA_SHIFT_CAP, with the gate) and its multipliers; the calibration by shift decile
+    bool cap_on = false;                      ///< caps are set before each non-audit window (the gate on, STRATA_SHIFT_CAP not 0)
+    gate::CapMult cap_mult;                   ///< STRATA_SHIFT_CAP_CONF / _UNC / _NONE: multipliers of the running median (conf default +inf)
+    float cap_last[3] = {INFINITY, INFINITY, INFINITY};   ///< the caps of the last window's classes (conf, unc, none), for the request line
+    int gate_pend_sdec = 0;                   ///< the pending cut's shift decile (calibration)
     bool gate_pend = false, gate_pend_audit = false;   ///< a gate cut is waiting for its verdict
     int gate_pend_bucket = gate::kNone;
     long long gate_pend_rank[gate::kRankSlots][gate::kBands] = {};   ///< the pending cut's rank-wise swaps
@@ -439,6 +448,11 @@ RouteResidentCfg& route_resident_cfg() {
         { const char* v = std::getenv("STRATA_RECHECK_GATE"); r.gate_on = r.fragile_on && (v == nullptr || std::atoi(v) != 0); }
         if (const char* v = std::getenv("STRATA_RECHECK_P_HI")) r.gs.p_hi = gate::clamp_p_hi((float) std::atof(v));
         if (const char* v = std::getenv("STRATA_RECHECK_AUDIT_EVERY")) r.gate_audit_every = std::max(0LL, std::atoll(v));
+        // SPEC-recheck-gated step F: the shift cap (default on with the gate; 0 = +inf everywhere), its multipliers
+        { const char* v = std::getenv("STRATA_SHIFT_CAP"); r.cap_on = r.gate_on && (v == nullptr || std::atoi(v) != 0); }
+        if (const char* v = std::getenv("STRATA_SHIFT_CAP_UNC")) r.cap_mult.unc = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_SHIFT_CAP_NONE")) r.cap_mult.none = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_SHIFT_CAP_CONF")) r.cap_mult.conf = (float) std::atof(v);
         // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 off): every n-th eligible decode window is a fragile control window (see RouteResidentCfg)
         if (const char* v = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) r.fr_ctrl_every = std::max(0LL, std::atoll(v));
         if (const char* v = std::getenv("STRATA_FRAGILE_K0")) {
@@ -1594,6 +1608,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (route_resident_cfg().fragile_on && (route_resident_cfg().fr_ctrl_every > 0 || route_resident_cfg().recheck_row_only) &&
         !strata::kernels::route_fragile_control_alloc())
         std::fprintf(stderr, "strata: STRATA_FRAGILE_CTRL_EVERY: no host-mapped control flag, so no fragile control windows\n");
+    // SPEC-recheck-gated step F: the shift cap's array and counters (before any capture, as the flag); without them nothing is capped
+    if (route_resident_cfg().cap_on && !strata::kernels::route_shift_cap_alloc()) {
+        route_resident_cfg().cap_on = false;
+        std::fprintf(stderr, "strata: STRATA_SHIFT_CAP: no host-mapped cap array, so no shift cap\n");
+    }
     if (route_resident_cfg().margin > 0.0f) {
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
         // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
@@ -4552,8 +4571,39 @@ void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("S
 // holds "key value" lines: fingerprint (the model's, hex; a file keyed to another model is ignored), budget, step, k, tests, rechecks,
 // flips, clean (the learned ceiling b_clean: 0 or missing = none yet).  Written to a temp name and renamed, after each finished test and each k update; read once at serve start (route_tune_open).
 namespace {
+// SPEC-recheck-gated (persistence): the gate's state (totals, P_HI, rank table, shifts, calibration, margin deciles) beside the tune file,
+// <tune file>.gate, keyed by the same fingerprint.  Written with the tune file (route_tune_write), read at open (route_tune_open).
+void route_gate_write(const RouteResidentCfg& c) {
+    const std::string path = c.tune_path + ".gate";
+    const std::string tmp = path + ".tmp";
+    const std::string text = strata::core::gate::serialize(c.gs, c.tune_fp);
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (f == nullptr) return;
+    bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        std::fprintf(stderr, "strata serve: recheck gate state: cannot write %s\n", path.c_str());
+    }
+}
+
+// Reads the gate state of this model (false: missing, unreadable, another model's fingerprint, or malformed; c.gs is then unchanged).
+bool route_gate_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) return false;
+    std::string text;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    return strata::core::gate::parse(text, fp, c.gs);
+}
+
 void route_tune_write(const RouteResidentCfg& c) {
     if (!c.tune_open || c.tune_path.empty()) return;
+    if (c.gate_on) route_gate_write(c);   // (gate off: no new file, as before)
     const std::string tmp = c.tune_path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "w");
     if (f == nullptr) {
@@ -4640,6 +4690,14 @@ void Verifier::route_tune_open(const std::string& path, uint64_t model_fp) {
     c.tune_open = true;
     c.tune_fp = model_fp;
     c.tune_path = path;
+    // SPEC-recheck-gated: the gate's saved state (P_HI, totals, ranks, shifts, calibration), when it is this model's
+    if (c.gate_on && std::filesystem::exists(path + ".gate")) {
+        if (route_gate_read(path + ".gate", model_fp, c))
+            std::fprintf(stderr, "strata serve: recheck gate state loaded: P_HI %.2f, %lld moves so far (%s)\n", (double) c.gs.p_hi, c.gs.moves,
+                         (path + ".gate").c_str());
+        else
+            std::fprintf(stderr, "strata serve: recheck gate state in %s ignored (its model fingerprint differs or it is malformed)\n", (path + ".gate").c_str());
+    }
     if (!std::filesystem::exists(path)) return;
     if (!route_tune_read(path, model_fp, c)) {
         std::fprintf(stderr, "strata serve: stand-in tuning in %s ignored (its model fingerprint differs or it has none)\n", path.c_str());
@@ -4841,7 +4899,9 @@ void Verifier::route_gate_window(int a0, const int* bucket, const float* shift, 
     if (!c.gate_on) return;
     // rows 1..a0 (row 0 is never cut): the eligible moved rows, by their drafter bucket (kNone for none rows)
     for (int q = 1; q <= a0; ++q) {
-        if (!(shift[q] > 0.0f) || eligible[q] == 0) continue;
+        if (!(shift[q] > 0.0f)) continue;
+        c.gs.shift.add(shift[q], strata::core::gate::kShiftRing);   // step F: every moved row's final shift (the cap's median and deciles)
+        if (eligible[q] == 0) continue;
         strata::core::gate::add_moved(c.gs, bucket[q]);
         if (audit) ++c.gq.au_moved[bucket[q]];
     }
@@ -4851,13 +4911,14 @@ void Verifier::route_gate_window(int a0, const int* bucket, const float* shift, 
                      c.gs.moves);
 }
 
-void Verifier::route_gate_cut(int row, int bucket, bool audit, bool control, const std::vector<strata::core::recheck::Pick>& picks) {
+void Verifier::route_gate_cut(int row, int bucket, bool audit, bool control, const std::vector<strata::core::recheck::Pick>& picks, float shift) {
     RouteResidentCfg& c = route_resident_cfg();
     c.gate_pend = false;
     if (!c.gate_on || control) return;   // a noise control re-check is not the gate's evidence
     c.gate_pend = true;
     c.gate_pend_audit = audit;
     c.gate_pend_bucket = bucket;
+    c.gate_pend_sdec = c.gs.shift.decile(shift);   // step F: the cut row's final shift, by decile of the running shifts
     for (int s = 0; s < strata::core::gate::kRankSlots; ++s)
         for (int b = 0; b < strata::core::gate::kBands; ++b) c.gate_pend_rank[s][b] = 0;
     for (const strata::core::recheck::Pick& p : picks) {   // the cut row's swaps, by rank and layer band (a mask move counts as a swap too)
@@ -4879,6 +4940,14 @@ void Verifier::route_gate_settled(bool exact_ok, bool flipped) {
     if (flipped) {
         strata::core::gate::add_flip(c.gs, b);
         if (c.gate_pend_audit) ++c.gq.au_flip[b];
+    }
+    // step F: the calibration by shift decile, split by the verdict (the state and this request's copy)
+    if (flipped) {
+        ++c.gs.cal.flip[c.gate_pend_sdec];
+        ++c.sq.cal.flip[c.gate_pend_sdec];
+    } else {
+        ++c.gs.cal.not_flip[c.gate_pend_sdec];
+        ++c.sq.cal.not_flip[c.gate_pend_sdec];
     }
     const int f = flipped ? 1 : 0;
     for (int s = 0; s < strata::core::gate::kRankSlots; ++s)
@@ -4937,6 +5006,56 @@ bool Verifier::route_gate_take(std::string& gate_line, std::string& rank_line) {
     }
     q = RouteResidentCfg::GateReq{};
     return c.gate_on && (any || any_rank);
+}
+
+// ---- SPEC-recheck-gated step F: the per-row shift cap (see verify.hpp: route_shift_cap_window, route_shift_take)
+void Verifier::route_shift_cap_window(const int* bucket, const float* p, int T, bool audit) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.cap_on) return;
+    const float median = c.gs.shift.median();
+    const size_t n = c.gs.shift.n();
+    float caps[32];
+    strata::core::gate::fill_caps(caps, bucket, p, T, c.gs.p_hi, audit, median, n, c.cap_mult);
+    strata::kernels::route_shift_cap_set(caps, 32);   // between windows (the kernels read the array at each launch)
+    using strata::core::gate::Rule;
+    c.cap_last[0] = strata::core::gate::cap_for(Rule::Confident, median, n, c.cap_mult);
+    c.cap_last[1] = strata::core::gate::cap_for(Rule::Uncertain, median, n, c.cap_mult);
+    c.cap_last[2] = strata::core::gate::cap_for(Rule::None, median, n, c.cap_mult);
+}
+
+bool Verifier::route_shift_take(std::string& cap_line, std::string& cal_line) {
+    RouteResidentCfg& c = route_resident_cfg();
+    cap_line.clear();
+    cal_line.clear();
+    unsigned long long mv = 0, rw = 0;
+    if (c.cap_on && strata::kernels::route_shift_cap_read(mv, rw)) {   // (between requests: the windows are synced)
+        c.sq.cap_moves += (long long) mv;
+        c.sq.cap_rows += (long long) rw;
+    }
+    if (c.cap_on && (c.sq.cap_moves > 0 || c.sq.cap_rows > 0)) {
+        auto cap_txt = [](float v, char* buf) { if (v < INFINITY) std::snprintf(buf, 32, "%.4f", (double) v); else std::snprintf(buf, 32, "inf"); };
+        char a[32], b[32], d[32];
+        cap_txt(c.cap_last[0], a);
+        cap_txt(c.cap_last[1], b);
+        cap_txt(c.cap_last[2], d);
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "shift cap: moves refused %lld (rows capped %lld), caps conf/unc/none %s/%s/%s", c.sq.cap_moves,
+                      c.sq.cap_rows, a, b, d);
+        cap_line = buf;
+    }
+    bool any = false;
+    for (int b = 0; b < strata::core::gate::kBuckets; ++b) any = any || c.sq.cal.flip[b] + c.sq.cal.not_flip[b] > 0;
+    if (c.gate_on && any) {
+        std::string s = "re-check by row shift (deciles 0-9, flipped / not):";
+        char buf[48];
+        for (int b = 0; b < strata::core::gate::kBuckets; ++b) {
+            std::snprintf(buf, sizeof buf, " d%d %lld/%lld", b, c.sq.cal.flip[b], c.sq.cal.not_flip[b]);
+            s += buf;
+        }
+        cal_line = s;
+    }
+    c.sq = RouteResidentCfg::ShiftReq{};
+    return !cap_line.empty() || !cal_line.empty();
 }
 
 // STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.

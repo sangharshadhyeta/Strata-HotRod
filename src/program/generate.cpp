@@ -16157,6 +16157,7 @@ int main(int argc, char** argv) {
                 if (g_on) {
                     if (!merged) g_audit = ver.route_gate_audit_next();
                     ver.route_gate_rows(strata::core::gate::uncertain_bits(g_bk.data(), g_pv.data(), T, g_phi, g_audit), g_audit);
+                    ver.route_shift_cap_window(g_bk.data(), g_pv.data(), T, g_audit);   // SPEC-recheck-gated step F: the rows' shift caps
                 }
                 ver.route_budget_window(true, !merged);   // STRATA_ROUTE_BUDGET_DYN: the decode budget of this window (no-op when off); AUTO: not a merged window
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
@@ -16239,7 +16240,7 @@ int main(int argc, char** argv) {
                             std::vector<strata::core::recheck::Pick> rc_picks;
                             const bool pf_on = srcp != nullptr && strata::core::Verifier::route_recheck_prefetch_on();
                             if (pf_on || g_on) ver.route_recheck_picks(r, rc_picks);
-                            if (g_on) ver.route_gate_cut(r, fp_bucket(r), g_audit, fr_control, rc_picks);
+                            if (g_on) ver.route_gate_cut(r, fp_bucket(r), g_audit, fr_control, rc_picks, fr_shift[(size_t) r]);
                             if (pf_on && !rc_picks.empty()) recheck_prefetch(srcp, rc_picks, g_on);
                             if (rb_on) strata::core::Verifier::route_fragile_pos(produced_n + r);   // STRATA_ROLLBACK: row r's token position
                             fr_cut = r;
@@ -16841,7 +16842,12 @@ int main(int argc, char** argv) {
                 if (strata::core::Verifier::route_control_take(ctl_line)) std::fprintf(stderr, "strata serve: %s\n", ctl_line.c_str());
             }
             {   // SPEC-recheck-gated: this request's gate counts (held rows, cuts skipped by rule 1, audit windows and their buckets) and the rank-wise flips
-                std::string gate_line, rank_line;
+                std::string gate_line, rank_line, cap_line, cal_line;
+                // step F first: its calibration and refusals are its own counts (route_gate_take resets only the gate's)
+                if (strata::core::Verifier::route_shift_take(cap_line, cal_line)) {
+                    if (!cap_line.empty()) std::fprintf(stderr, "strata serve: %s\n", cap_line.c_str());
+                    if (!cal_line.empty()) std::fprintf(stderr, "strata serve: %s\n", cal_line.c_str());
+                }
                 if (strata::core::Verifier::route_gate_take(gate_line, rank_line)) {
                     if (!gate_line.empty()) std::fprintf(stderr, "strata serve: recheck gate: %s\n", gate_line.c_str());
                     if (!rank_line.empty()) std::fprintf(stderr, "strata serve: %s\n", rank_line.c_str());
