@@ -5864,6 +5864,43 @@ using strata::kernels::route_pred_slot;
 static std::vector<uint32_t> g_warm4_mark;
 static uint32_t g_warm4_pass = 0;
 
+// SPEC-adaptive-la change 3 (STRATA_TAIL_ADAPT=1, opt-in, default off): the decode read-ahead's tail (ranks >= lo) is dropped once the
+// last 64 decode windows queued no tail guess.  A routed expert that was not card-resident and was predicted at a rank >= lo (by any
+// dist's prediction for its layer) brings the tail back.  Off: nothing here runs.
+static std::atomic<int> g_ta_quiet{0}, g_ta_this{0}, g_ta_restricted{0};
+static constexpr int kTailQuietWindows = 64;
+static bool tail_adapt_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_TAIL_ADAPT"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+// a decode window starts (the dispatch of layer 0): the last window's tail guesses decide the quiet count, and the restriction starts
+// once the count reaches 64
+static void tail_adapt_window_start() {
+    const int quiet = g_ta_this.exchange(0, std::memory_order_relaxed) != 0 ? 0 : g_ta_quiet.load(std::memory_order_relaxed) + 1;
+    g_ta_quiet.store(quiet, std::memory_order_relaxed);
+    if (quiet >= kTailQuietWindows) g_ta_restricted.store(1, std::memory_order_relaxed);
+    if (g_ta_restricted.load(std::memory_order_relaxed) != 0) la_tail_restrict_windows.fetch_add(1, std::memory_order_relaxed);
+}
+// layer d.layers' routed experts (ids: n_tok x k): a non-resident one predicted at a rank >= lo ends the restriction
+static void tail_adapt_observe(const ExpertDispatch& d, const int32_t* ids, int64_t n_tok, int64_t k, int64_t lo) {
+    if (k < 1 || lo <= 0 || g_ta_restricted.load(std::memory_order_relaxed) == 0) return;
+    static const int kDists[3] = {1, 2, 4};
+    for (int64_t i = 0; i < n_tok * k; ++i) {
+        const int32_t e = ids[i];
+        const int64_t t = i / k;
+        if (e < 0 || e >= d.n_expert || d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+        for (int di = 0; di < 3; ++di) {
+            const size_t slot = (size_t) route_pred_slot(kDists[di]);
+            for (int64_t r = lo; r < 10; ++r)
+                if (d.gpu_pred[(((size_t) d.layers * kRoutePredDists + slot) * 8 + (size_t) t) * 10 + (size_t) r] == e) {
+                    g_ta_restricted.store(0, std::memory_order_relaxed);
+                    g_ta_quiet.store(0, std::memory_order_relaxed);
+                    return;
+                }
+        }
+    }
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -5904,6 +5941,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     if (d.gpu_pred != nullptr && d.gpu_pred_warm && d.host_res != nullptr && n_tok <= 8 && d.src != nullptr) {
+        // SPEC-adaptive-la change 3: the host time of this dispatch (steady clock), its guesses considered and queued
+        const auto ra_t0 = std::chrono::steady_clock::now();
+        long long ra_cons = 0, ra_queued = 0;
+        const bool tail_adapt = tail_adapt_on();
+        const int64_t adapt_lo = tail_adapt ? la_tail_read_lo.load(std::memory_order_relaxed) : 0;
+        if (tail_adapt) {
+            if (d.layers == 0) tail_adapt_window_start();
+            tail_adapt_observe(d, ids, n_tok, k, adapt_lo);
+        }
         // STRATA_LOOKAHEAD_GPU: the GPU look-ahead's picks for the next two layers (computed on this layer's input before the doorbell),
         // warmed on the file tier as the CPU look-ahead's are - without recomputing the routers on the CPU
         // dists 1 and 2, then (STRATA_LA_LEARN: gpu_pred_d4) dist 4: queued after the nearer targets' guesses of this dispatch
@@ -5927,7 +5973,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             FileExpertSource* fs = tail_read ? dynamic_cast<FileExpertSource*>(d.src) : nullptr;
             const size_t tail_room = fs != nullptr ? (size_t) std::max(0, fs->io_workers() - (int) fs->io_queue_depth()) : 0;
             size_t tail_queued = 0;
-            const int64_t n_ranks = tail_read ? 10 : std::min(d.gpu_pred_ranks, 10);
+            int64_t n_ranks = tail_read ? 10 : std::min(d.gpu_pred_ranks, 10);
+            if (tail_adapt && adapt_lo > 0 && g_ta_restricted.load(std::memory_order_relaxed) != 0) n_ranks = std::min<int64_t>(n_ranks, adapt_lo);
             const int64_t outer = rank_major ? n_ranks : n_tok, inner = rank_major ? n_tok : n_ranks;
             // STRATA_IO_GATE: a guess is read ahead only when its position's use rate is at least the drive's load (reads in progress and queued, per
             // worker; each guess queued in this batch adds one).  gate_pos: each queued guess's position (dist slot * 10 + rank) for the source to learn from
@@ -5943,6 +5990,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             for (int64_t a = 0; a < outer; ++a)
                 for (int64_t b = 0; b < inner; ++b) {
                     const int64_t t = rank_major ? b : a, r = rank_major ? a : b;
+                    ++ra_cons;
                     const int32_t e = d.gpu_pred[(((size_t) target * kRoutePredDists + (size_t) route_pred_slot(dist)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
                     if (gate_fs != nullptr && !gate_fs->ra_admit(di * 10 + (int) r, (double) (gate_busy + (size_t) nw) / gate_workers)) continue;
@@ -5967,6 +6015,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     const size_t mi = (size_t) target * (size_t) d.n_expert + (size_t) e;
                     if (d.gpu_pred_d4 && dist != 4 && g_warm4_mark[mi] == g_warm4_pass) continue;
                     if (std::find(want, want + nw, (int64_t) e) == want + nw) {
+                        if (tail_adapt && adapt_lo > 0 && r >= adapt_lo) g_ta_this.store(1, std::memory_order_relaxed);
                         gate_pos[nw] = di * 10 + (int) r;
                         want[nw++] = e;
                         if (d.gpu_pred_d4 && dist == 4) g_warm4_mark[mi] = g_warm4_pass;
@@ -5976,7 +6025,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (nw > 0) d.src->warm(target, want, nw, gate_fs != nullptr ? gate_pos : nullptr);
             t_decode_guess = false;
             d.pred_fed += nw;
+            ra_queued += nw;
         }
+        la_ra_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - ra_t0).count(),
+                           std::memory_order_relaxed);
+        la_ra_considered.fetch_add(ra_cons, std::memory_order_relaxed);
+        la_ra_queued.fetch_add(ra_queued, std::memory_order_relaxed);
+        if (d.layers == 0) la_ra_windows.fetch_add(1, std::memory_order_relaxed);
     }
     if (d.lookahead != nullptr && d.gpu_pred == nullptr) {
         if (d.lookahead->stats_on()) {
