@@ -298,6 +298,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)
   add_test(NAME host_limits_test COMMAND host_limits_test)
+
+  # the on-line tuners' paired sequential decision (STRATA_ROUTE_BUDGET_AUTO / STRATA_MASK=learn): A/A false moves, power,
+  # the quality veto, scripted state sequences; header-only, no GPU (include/strata/core/paired_test.hpp)
+  add_executable(paired_test_test tests/core/paired_test_test.cpp)
+  target_include_directories(paired_test_test PRIVATE include)
+  add_test(NAME paired_test_test COMMAND paired_test_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------

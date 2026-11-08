@@ -11,6 +11,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
+#include "strata/core/paired_test.hpp"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -191,17 +192,19 @@ struct RouteResidentCfg {
     // Process-wide (kept across requests).  An INTERLEAVED test compares two arms over the same stretch of decode, so content drift cancels:
     // the base arm at b and the candidate arm at b * s^d (s: auto_step, 1.25 at the start; auto_dir d: +1 up, -1 down).  Runs of kAutoRun non-merged decode windows
     // alternate between the arms; the first run of each pair alternates: arm of run r = (r % 2) ^ ((r / 2) % 2) (base, cand, cand, base, ...).
-    // A test ends when both arms have kAutoMin scheduled windows (deferred while a cut is pending, so the exact successor is charged first).
+    // A test is a PAIRED sequential test (core/paired_test.hpp): the runs come in blocks of two (runs 2k, 2k+1 hold one run per arm), and
+    // each block is a pair with d = ln(rate_cand / rate_base).  After each pair the test moves (mean d - 2 se > ln(1 + STRATA_TUNE_MIN_EFFECT)),
+    // keeps (mean d + 2 se < that delta, or the pair cap: 160 budget, 240 mask), or continues.  The look waits while a cut is pending, so the
+    // exact successor is charged to its block first.
     // An arm's speed = its committed tokens / its wall seconds: each window adds end - max(start, the previous window's end) when the previous
     // window was the same request, else end - start.  A cut window's exact successor is charged to the cut window's arm (its re-checks
     // cost that arm) but is not a scheduled window.
-    // State machine: a round tests auto_first (stage 0).  A win (candidate speed >= 1.02 times the base's) moves b to the candidate and the
-    // next round starts with that direction.  A loss starts the other direction (stage 1) against the same base; a loss there keeps b, and
-    // the next round starts with the other direction.  b is clamped to [0.02, 4].
+    // State machine: a round tests auto_first (stage 0).  A move (paired decision) sets b to the candidate and the next round starts with
+    // that direction.  A keep starts the other direction (stage 1) against the same base; a keep there keeps b, and the next round starts
+    // with the other direction (paired::DirState).  b is clamped to [0.02, 4].
     // The static STRATA_ROUTE_BUDGET / _TAIL / _DYN are ignored for decode (DYN is switched off); a prompt window keeps them.
-    // kMaskMin: a mask test's windows per arm - 4x the budget test's: over 96 windows speed swings +-5-10% with the text, so the mask's
-    // depth walked back and forth on noise (6 Nov night, 17 tests in 15 minutes); a mask move also needs two wins in a row (mask_test_end)
-    enum { kAutoRun = 8, kAutoMin = 96, kMaskMin = 384 };
+    // The test's length is set by its pair count (paired::budget_rule / mask_rule), not by windows.
+    enum { kAutoRun = 8 };
     bool auto_on = false;
     float auto_b = 0.1f, auto_b0 = 0.1f;      ///< the base budget of ranks < lo and of ranks >= lo; the start (STRATA_ROUTE_BUDGET_AUTO_B0)
     bool auto_testing = false;                ///< a test is running (its arms below)
@@ -216,7 +219,7 @@ struct RouteResidentCfg {
     int auto_run_left = 0;                    ///< windows left in the current run
     int auto_run_arm = 0;                     ///< the current run's arm
     int auto_win_arm = 0;                     ///< the arm of the window being run (set before its run)
-    bool auto_win_sched = false;              ///< that window is a scheduled one (counts toward kAutoMin)
+    bool auto_win_sched = false;              ///< that window is a scheduled one (a run's window)
     int auto_cut_arm = 0;                     ///< the arm of the last cut window (its exact successor runs at this arm's budget)
     long long auto_req = 0;                   ///< the request counter (route_budget_begin)
     bool auto_have_last = false;              ///< a window of the search ran before (auto_last_end / auto_last_req are its)
@@ -236,6 +239,12 @@ struct RouteResidentCfg {
     bool auto_b0_env = false;                 ///< STRATA_ROUTE_BUDGET_AUTO_B0 is set: it overrides the file's b
     float auto_step = 1.25f;                  ///< the candidate's step factor s: candidate = b * s^d (saved; after a win in the same direction as the last win s grows to 2, after a loss it shrinks toward 1.1)
     int auto_last_win = 0;                    ///< the direction of the last win (0: no win yet)
+    // The paired test (paired_test.hpp): the running test's pair statistics, the sums of the running pair block per arm (its two runs), a
+    // block that ended and waits for a cut's exact successor (auto_pair_ready), and the minimum effect (STRATA_TUNE_MIN_EFFECT, 0.03 = 3%).
+    paired::PairStats auto_pair;
+    double auto_pt_tok[2] = {0.0, 0.0}, auto_pt_secs[2] = {0.0, 0.0};
+    bool auto_pair_ready = false;
+    double auto_min_effect = 0.03;
     // STRATA_FRAGILE_BRAKE (default on, =0 off; with FRAGILE and AUTO): each request has its own decode budget req_b, used for its decode
     // windows instead of auto_b.  route_budget_begin sets req_b = s[c] * auto_b (at least the class's clean level L[c], at most auto_b; per-class
     // learned, see cls_start).  A brake stops at L[c] while L[c] is known (route_fragile_settle).  The AUTO arms scale it: base req_b, candidate req_b * s^d.
@@ -418,6 +427,11 @@ RouteResidentCfg& route_resident_cfg() {
             }
         }
         r.auto_b = r.auto_b0;
+        // STRATA_TUNE_MIN_EFFECT (0.03): the smallest speed gain a tuner's move needs (a fraction; ln(1 + it) is the paired test's delta)
+        if (const char* v = std::getenv("STRATA_TUNE_MIN_EFFECT")) {
+            const double me = std::atof(v);
+            if (me > 0.0 && me < 1.0) r.auto_min_effect = me;
+        }
         // STRATA_ROUTE_BIAS=<beta>: the CCE bias.  (v0.1.42 has the same idea as STRATA_ROUTE_PRIOR, route_prior.cu: to be merged into one)
         if (const char* v = std::getenv("STRATA_ROUTE_BIAS")) { const double b = std::atof(v); r.bias = b > 0.0 ? (float) std::log1p(b) : 0.0f; }
         return true;
@@ -4594,19 +4608,7 @@ void route_auto_schedule(RouteResidentCfg& c);   // defined with the test helper
 float route_auto_arm_b(const RouteResidentCfg& c, int arm);   // defined with the test helpers below route_auto_window
 
 // Wilson score interval at 90% (z = 1.645) for f flips in n re-checks: the flip rate's lower and upper bounds (0 and 1 when n is 0).
-void route_wilson90(long long f, long long n, double& lo, double& hi) {
-    if (n <= 0) {
-        lo = 0.0;
-        hi = 1.0;
-        return;
-    }
-    const double z = 1.645, z2 = z * z, nn = (double) n, p = (double) f / nn;
-    const double centre = p + z2 / (2.0 * nn);
-    const double half = z * std::sqrt(p * (1.0 - p) / nn + z2 / (4.0 * nn * nn));
-    const double den = 1.0 + z2 / nn;
-    lo = (centre - half) / den;
-    hi = (centre + half) / den;
-}
+void route_wilson90(long long f, long long n, double& lo, double& hi) { paired::wilson90(f, n, lo, hi); }
 
 // STRATA_FRAGILE_BRAKE: every kBrakeWindows decode windows of the request, the request's budget grows when it has >= kBrakeMin re-checks,
 // the Wilson 90% upper bound of its re-check flip rate is at most 0.2 and that of its flips per token is at most 0.01: req_b * 1.25 (never above auto_b; from 0, 0.25 * auto_b).  The request's
@@ -5179,6 +5181,10 @@ void auto_reset_arms(RouteResidentCfg& c) {
     c.auto_runs = 0;
     c.auto_run_left = 0;
     c.auto_testing = true;
+    c.auto_pair = paired::PairStats();
+    c.auto_pt_tok[0] = c.auto_pt_tok[1] = 0.0;
+    c.auto_pt_secs[0] = c.auto_pt_secs[1] = 0.0;
+    c.auto_pair_ready = false;
 }
 
 // Starts a budget test of direction d at the base b.
@@ -5191,16 +5197,11 @@ void auto_begin_test(RouteResidentCfg& c, int d) {
 
 // A direction whose candidate clamps to the base (b at a bound) is not tested: it counts as a loss at once.
 void auto_next_stage(RouteResidentCfg& c, bool won, int d) {
-    if (won) {
-        c.auto_b = c.auto_cand_b;
-        c.auto_first = d;   // the winning direction is tested first next round
-        c.auto_stage = 0;
-    } else if (c.auto_stage == 0) {
-        c.auto_stage = 1;   // the other direction against the same base
-    } else {
-        c.auto_first = -c.auto_first;   // both lost: keep b, the other direction first next round
-        c.auto_stage = 0;
-    }
+    if (won) c.auto_b = c.auto_cand_b;
+    paired::DirState ds{c.auto_first, c.auto_stage};   // a win tests the winning direction first; a keep the other one (paired_test.hpp)
+    ds.update(won, d);
+    c.auto_first = ds.first;
+    c.auto_stage = ds.stage;
 }
 
 // The next scheduled window's arm: runs of kAutoRun windows; run r is arm (r % 2) ^ ((r / 2) % 2), so each pair of runs alternates which arm is first.
@@ -5235,12 +5236,37 @@ void route_auto_schedule(RouteResidentCfg& c) {
     c.auto_win_sched = true;
 }
 
-// Both arms have kAutoMin scheduled windows: the candidate wins when its speed is at least 1.02 times the base's, unless quality is lost.
-// Quality is judged per committed token (the harm rises with flips per token, not with the re-check rate): when both arms have
-// >= kAutoTokMin committed tokens, the candidate is blocked when its Wilson 90% lower flips-per-token bound exceeds the base's upper
-// bound, or when its point rate exceeds 1.5 times the base's with >= kBrakeFlips flips (no significance needed).  Otherwise speed decides.
+// Each pair block (one run per arm) is one sample: d = ln(rate_cand / rate_base) of the block (a block with no committed tokens or no time
+// is no sample).  The look is paired::decide: quality first (the veto: the candidate's flips per committed token, paired::quality_veto, with
+// >= kAutoTokMin tokens per arm, ends the test as a keep), then the sequential rule (move / keep / continue at the cap).
 // A completed test whose candidate had <= 0.5 flips per 100 tokens over >= kCleanTok tokens raises b_clean (the ceiling) to its budget.
-void route_auto_test_done(RouteResidentCfg& c) {
+void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why);
+const char* auto_reason_name(paired::Reason why) {
+    switch (why) {
+        case paired::Reason::Move: return "move";
+        case paired::Reason::BelowDelta: return "keep: below the minimum effect";
+        case paired::Reason::Cap: return "keep: pair cap";
+        case paired::Reason::Quality: return "keep: quality";
+        default: return "keep";
+    }
+}
+
+// The pair block that just ended: one more sample, then the look.
+void route_auto_pair_done(RouteResidentCfg& c) {
+    c.auto_pair_ready = false;
+    double d = 0.0;
+    if (paired::pair_diff(c.auto_pt_tok[0], c.auto_pt_secs[0], c.auto_pt_tok[1], c.auto_pt_secs[1], d)) c.auto_pair.add(d);
+    c.auto_pt_tok[0] = c.auto_pt_tok[1] = 0.0;
+    c.auto_pt_secs[0] = c.auto_pt_secs[1] = 0.0;
+    const bool blocked = paired::quality_veto(c.auto_fl[0], c.auto_tok[0], c.auto_fl[1], c.auto_tok[1], RouteResidentCfg::kAutoTokMin,
+                                              RouteResidentCfg::kBrakeFlips);
+    const paired::Rule rule = c.auto_mask ? paired::mask_rule(c.auto_min_effect) : paired::budget_rule(c.auto_min_effect);
+    paired::Reason why = paired::Reason::None;
+    const paired::Verdict v = paired::decide(c.auto_pair, rule, blocked, &why);
+    if (v != paired::Verdict::Continue) route_auto_test_done(c, v == paired::Verdict::Move, why);
+}
+
+void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
     const int d = c.auto_dir;
     const double sb = c.auto_secs[0] > 0.0 ? (double) c.auto_tok[0] / c.auto_secs[0] : 0.0;
     const double sc = c.auto_secs[1] > 0.0 ? (double) c.auto_tok[1] / c.auto_secs[1] : 0.0;
@@ -5248,20 +5274,16 @@ void route_auto_test_done(RouteResidentCfg& c) {
     const double fc = c.auto_rc[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_rc[1] : 0.0;
     const double pb = c.auto_tok[0] > 0 ? (double) c.auto_fl[0] / (double) c.auto_tok[0] : 0.0;   // flips per committed token
     const double pc = c.auto_tok[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_tok[1] : 0.0;
-    double base_lo = 0.0, base_hi = 0.0, cand_lo = 0.0, cand_hi = 0.0;
-    route_wilson90(c.auto_fl[0], c.auto_tok[0], base_lo, base_hi);
-    route_wilson90(c.auto_fl[1], c.auto_tok[1], cand_lo, cand_hi);
-    const bool enough = c.auto_tok[0] >= RouteResidentCfg::kAutoTokMin && c.auto_tok[1] >= RouteResidentCfg::kAutoTokMin;
-    const bool quality = !(enough && (cand_lo > base_hi || (pc > 1.5 * pb && c.auto_fl[1] >= RouteResidentCfg::kBrakeFlips)));
-    const bool won = sc >= sb * 1.02 && quality;
+    const long long pairs = c.auto_pair.n;
+    const double pmean = c.auto_pair.mean, pse = c.auto_pair.se();
     if (c.auto_mask) {   // STRATA_MASK=learn: a mask test decides the mask's (p, g); no budget state moves
         double pg[4] = {0.0, 0.0, 0.0, 0.0};
         const bool moved = mask_test_end(won, pg);
-        std::fprintf(stderr, "strata serve: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): %.1f vs %.1f tok/s over %d+%d windows -> (%.3f,%.3f)%s; "
-                     "flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f%s\n",
-                     pg[2], pg[3], pg[0], pg[1], sc, sb, (int) c.auto_n[1], (int) c.auto_n[0], moved ? pg[2] : pg[0], moved ? pg[3] : pg[1],
-                     won && !moved ? " (a first win: the next test repeats it)" : "",
-                     fc, fb, c.auto_rc[1], c.auto_rc[0], 100.0 * pc, 100.0 * pb, quality ? "" : ", quality lost");
+        std::fprintf(stderr, "strata serve: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
+                     "%.1f vs %.1f tok/s over %d+%d windows -> (%.3f,%.3f); flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f\n",
+                     pg[2], pg[3], pg[0], pg[1], pairs, pmean, pse, moved ? "move" : "keep", auto_reason_name(why), sc, sb,
+                     (int) c.auto_n[1], (int) c.auto_n[0], moved ? pg[2] : pg[0], moved ? pg[3] : pg[1], fc, fb, c.auto_rc[1], c.auto_rc[0],
+                     100.0 * pc, 100.0 * pb);
         c.auto_mask = false;
         c.auto_mask_next = false;   // a budget test next
         c.auto_testing = false;
@@ -5271,18 +5293,15 @@ void route_auto_test_done(RouteResidentCfg& c) {
         && (double) c.auto_cand_b > c.b_clean)
         c.b_clean = (double) c.auto_cand_b;
     const float b_old = c.auto_b, cand = c.auto_cand_b, step = c.auto_step;   // step: the factor this test's candidate used
-    // the step: a win in the same direction as the last win grows it (to 2); a loss shrinks it toward 1.1 (sqrt, floor 1.1)
-    if (won) {
-        if (d == c.auto_last_win) c.auto_step = std::min(c.auto_step * 1.25f, 2.0f);
-        c.auto_last_win = d;
-    } else {
-        c.auto_step = std::max(std::sqrt(c.auto_step), 1.1f);
-    }
+    paired::BudgetStep bs{c.auto_step, c.auto_last_win};   // the step (paired_test.hpp): a win in the same direction grows it, a keep shrinks it
+    bs.update(won, d);
+    c.auto_step = bs.step;
+    c.auto_last_win = bs.last_win;
     auto_next_stage(c, won, d);
-    std::fprintf(stderr, "strata serve: auto budget test %.3f vs %.3f: %.1f vs %.1f tok/s over %d+%d windows step %.2f -> %.3f; "
-                 "flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f%s\n",
-                 (double) cand, (double) b_old, sc, sb, (int) c.auto_n[1], (int) c.auto_n[0], (double) step, (double) c.auto_b,
-                 fc, fb, c.auto_rc[1], c.auto_rc[0], 100.0 * pc, 100.0 * pb, quality ? "" : ", quality lost");
+    std::fprintf(stderr, "strata serve: auto budget test %.3f vs %.3f: pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
+                 "%.1f vs %.1f tok/s over %d+%d windows step %.2f -> %.3f; flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f\n",
+                 (double) cand, (double) b_old, pairs, pmean, pse, won ? "move" : "keep", auto_reason_name(why), sc, sb,
+                 (int) c.auto_n[1], (int) c.auto_n[0], (double) step, (double) c.auto_b, fc, fb, c.auto_rc[1], c.auto_rc[0], 100.0 * pc, 100.0 * pb);
     c.auto_testing = false;
     ++c.auto_tests;
     ++c.auto_tests_take;
@@ -5295,22 +5314,28 @@ bool Verifier::route_auto_on() { return route_resident_cfg().auto_on; }
 
 // One non-merged decode window's commit.  Its wall time: from its ver.run start, or, when the previous window was the same request, from
 // that window's end (the loop's own work between the windows counts; the gap between two requests does not).  The window's time and
-// tokens go to the arm that ran it (auto_win_arm).  A test that reached kAutoMin is decided once no cut is pending.
+// tokens go to the arm that ran it (auto_win_arm).  A pair block that ended is decided once no cut is pending.
 void Verifier::route_auto_window(int n_keep, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
     RouteResidentCfg& c = route_resident_cfg();
     if (!c.auto_on) return;
     const bool same = c.auto_have_last && c.auto_last_req == c.auto_req;
     const std::chrono::steady_clock::time_point seg = same ? c.auto_last_end : start;
     const int arm = c.auto_win_arm;
-    if (end > seg) c.auto_secs[arm] += std::chrono::duration<double>(end - seg).count();
+    double dt = 0.0;
+    if (end > seg) dt = std::chrono::duration<double>(end - seg).count();
+    c.auto_secs[arm] += dt;
+    c.auto_pt_secs[arm] += dt;
     c.auto_last_end = end;
     c.auto_last_req = c.auto_req;
     c.auto_have_last = true;
     c.auto_tok[arm] += n_keep;
-    if (c.auto_win_sched) ++c.auto_n[arm];
-    const long long need = c.auto_mask ? (long long) RouteResidentCfg::kMaskMin : (long long) RouteResidentCfg::kAutoMin;
-    if (c.auto_testing && c.auto_n[0] >= need && c.auto_n[1] >= need && !c.fragile_exact)
-        route_auto_test_done(c);
+    c.auto_pt_tok[arm] += n_keep;
+    if (c.auto_win_sched) {
+        ++c.auto_n[arm];
+        // the second run of a pair block (runs 2k, 2k+1: one run per arm) ended
+        if (c.auto_run_left == 0 && (c.auto_runs - 1) % 2 == 1) c.auto_pair_ready = true;
+    }
+    if (c.auto_testing && c.auto_pair_ready && !c.fragile_exact) route_auto_pair_done(c);
 }
 
 // The AUTO budget and the tests finished since the last call (false when the switch is off).
@@ -6484,7 +6509,7 @@ struct MaskLearnState {
     // (-1: none yet), and the direction state (first direction, stage 0 / 1: as the budget test's)
     bool mt_on = false;
     int mt_d = -1, mt_cur = -1, mt_first = -1, mt_stage = 0;
-    int mt_win_d = 0;                // the direction of an unconfirmed win (0: none): a move needs two wins in a row
+    int mt_win_d = 0;                // unused since the paired test (kept at 0 for the file format): the two-wins rule is gone
     double mt_step = 1.0;            // the step's multiple (p step kMtStepP x it, g step kMtStepG x it): x2 after a move in the same direction
     int mt_last_move = 0;            // as the last move (to 8), halved after a loss (to 1) - the budget test's growing step (7 Nov: from 0.35 the
                                      // fixed 0.025 steps needed ~44 winning tests to reach the depth the live run had found)
@@ -6613,15 +6638,10 @@ bool mlr_relevel(MaskLearnState& s) {
 // STRATA_MASK=learn x AUTO: the mask test's direction state, as the budget test's (auto_next_stage): a win keeps the direction first;
 // a loss tries the other direction; both lost: the other direction first next round.
 void mt_next_stage(int& first, int& stage, bool won, int d) {
-    if (won) {
-        first = d;
-        stage = 0;
-    } else if (stage == 0) {
-        stage = 1;
-    } else {
-        first = -first;
-        stage = 0;
-    }
+    paired::DirState ds{first, stage};
+    ds.update(won, d);
+    first = ds.first;
+    stage = ds.stage;
 }
 
 // STRATA_MASK_RESIDENT: the device's SSD-demand counters since the last read; each delta joins the decayed cost, and the request's counts
@@ -7035,8 +7055,8 @@ void mask_test_arm(int arm) {
         std::fprintf(stderr, "strata: STRATA_MASK=learn: the test arm's mask rows not uploaded\n");
 }
 
-// The test's end: out = base p, base g, candidate p, candidate g.  A move needs two wins in a row in the same direction: a first win is
-// remembered and the next test repeats that direction against the same base; a second moves (p, g) to the candidate; a loss forgets it.
+// The test's end: out = base p, base g, candidate p, candidate g.  The paired test (paired_test.hpp) decides: a move (won) takes the candidate's
+// (p, g) at once; a keep leaves it.  The step as before: a move the same way as the last move doubles it, a keep halves it.
 // Returns whether (p, g) moved.  The levels are recomputed and uploaded; the table is saved.
 bool mask_test_end(bool won, double out[4]) {
     if (!g_mlr) return false;
@@ -7045,19 +7065,19 @@ bool mask_test_end(bool won, double out[4]) {
     out[1] = s.g;
     out[2] = s.mt_cand_p;
     out[3] = s.mt_cand_g;
-    bool moved = false;
-    if (won && s.mt_win_d == s.mt_d) {
+    const bool moved = won;
+    paired::MaskStep ms{s.mt_step, s.mt_last_move};
+    if (won) {
         s.p = s.mt_cand_p;
         s.g = s.mt_cand_g;
-        moved = true;
-        s.mt_win_d = 0;
-        if (s.mt_d == s.mt_last_move) s.mt_step = std::min(8.0, s.mt_step * 2.0);   // a second move the same way: bigger steps
-        s.mt_last_move = s.mt_d;
+        ms.on_move(s.mt_d);
     } else {
-        s.mt_win_d = won ? s.mt_d : 0;
-        if (!won) s.mt_step = std::max(1.0, s.mt_step * 0.5);   // a loss: smaller steps near the best depth
+        ms.on_loss();
     }
-    mt_next_stage(s.mt_first, s.mt_stage, won, s.mt_d);   // (a win, confirmed or not, tests the same direction next)
+    s.mt_step = ms.step;
+    s.mt_last_move = ms.last_move;
+    s.mt_win_d = 0;   // (the two-wins-in-a-row rule is gone; the field stays in the file format, always 0)
+    mt_next_stage(s.mt_first, s.mt_stage, won, s.mt_d);   // the direction state (a keep tries the other direction)
     s.mt_on = false;
     s.mt_cur = -1;
     mlr_relevel(s);
