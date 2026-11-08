@@ -65,6 +65,7 @@ extern "C" void ds4_busy_end();
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -1265,6 +1266,11 @@ struct Model::Impl {
     float fr_k = 4.0f;
     float* d_top2 = nullptr;
     long long fr_used = 0, fr_checks = 0, fr_flips = 0;
+    // stop re-checks: a re-checked token whose top-1 is one of the model's stop ids (stop_ids), whatever its gap; fr_stop_kept: the exact
+    // run's top-1 is that stop too (the reply really ends there)
+    long long fr_stop_checks = 0, fr_stop_kept = 0;
+    // the model's own stop ids, from its GGUF eos_token_id (Geo::eos, set at load): the ids a reply ends on
+    std::set<int> stop_ids;
     // the re-check study (6 Nov): fr_pc[prev close][this close] decode tokens, fr_pf[prev close] flips, fr_prev the last token's close
     // call; fr_fl[8-layer bin][0 re-checks, 1 flips] by the re-checked token's first substituted layer (DS4_STANDIN_LEARN's record)
     long long fr_pc[2][2] = {{0, 0}, {0, 0}}, fr_pf[2] = {0, 0}, fr_fl[8][2] = {};
@@ -1859,8 +1865,8 @@ struct Model::Impl {
                 std::fprintf(stderr, "%s\n", line.c_str());
             }
             if (fr_on) {
-                std::fprintf(stderr, "ds4: request: stand-ins: %lld decode tokens took them, %lld re-checked exactly, %lld of those changed the top token\n",
-                             fr_used, fr_checks, fr_flips);
+                std::fprintf(stderr, "ds4: request: stand-ins: %lld decode tokens took them, %lld re-checked exactly, %lld of those changed the top token; stop re-checks %lld (%lld kept, %lld continued)\n",
+                             fr_used, fr_checks, fr_flips, fr_stop_checks, fr_stop_kept, fr_stop_checks - fr_stop_kept);
                 // 6 Nov (cumulative): does the last token's close call predict this one's? (prev close / not -> tokens, close calls, flips),
                 // and where the re-checked tokens' first substitution falls (8-layer bins; flips in brackets): a re-run from there would
                 // skip the layers before it
@@ -2688,6 +2694,7 @@ struct Model::Impl {
         const double t0 = now_ms();
         if (!pk.load(o.pack, err)) return false;
         g.from(pk);
+        stop_ids = {g.eos};   // (the stop re-check: the GGUF's eos_token_id; ds4_main's serve --eos defaults to "1", the server's family sets its eos from the tokenizer)
         if (g.dim == 0 || g.nl == 0 || (int) g.ratios.size() < g.nl) {
             err = o.pack + "/ds4.txt: incomplete geometry";
             return false;
@@ -11504,7 +11511,9 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(t2, d_top2, sizeof t2, cudaMemcpyDeviceToHost, hd.st));
         CK(cudaStreamSynchronize(hd.st));
         gap = t2[0] - t2[1];
-        if (gap >= fr_k * risk) {
+        // a stop id on top (the reply's end) is re-run exactly whatever its gap: a stand-in's error can turn a token into the end (8 Nov)
+        const bool stop_tok = stop_ids.count((int) t2[2]) > 0;
+        if (gap >= fr_k * risk && !stop_tok) {
             if (mask_learn_on && ++ml_nrc % kMlSampleEvery == 0) ml_sample();
             study_quiet();
             return true;
@@ -11542,6 +11551,10 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(hd.st));
         flipped = (int) t2[2] != before;
         fr_flips += flipped;
+        if (stop_tok) {   // (the exact run's top-1 is the same stop: the reply really ends here)
+            ++fr_stop_checks;
+            fr_stop_kept += !flipped;
+        }
         if (mask_learn_on) ml_recheck(flipped);
         // the re-check study: this token was a close call (and flipped or not)
         ++fr_pc[fr_prev][1];
