@@ -484,9 +484,9 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     // STRATA_ROUTE_BUDGET (budget > 0): the loop starts at rank 0, as with `cheap`.  A rank below lo (`brank`) takes the budget test below
     // instead of the margin / edge, and skips none of the RAM floor's rules (the budget wins for those ranks); ranks lo and up are as before.
     const bool bud = budget > 0.f;
-    // STRATA_FRAGILE_CTRL_EVERY (route_fragile_control): a control window moves no pick, so every pick stays at its router rank and row_shift
-    // stays 0.  *fctrl is the same for every lane (uniform), so the loop is skipped by the whole warp.
-    const bool fctl = fctrl != nullptr && *fctrl != 0;
+    // STRATA_FRAGILE_CTRL_EVERY / SPEC-recheck-cheap (route_fragile_rows): a row below the flag's count moves no pick, so its picks stay at
+    // their router rank and row_shift stays 0.  The count is the same for every lane (uniform), so the loop is skipped by the whole warp.
+    const bool fctl = fctrl != nullptr && row_base + t < *fctrl;
     for (int r = (cheap != nullptr || bud) ? 0 : first; r <= hi && r < 10 && !fctl; ++r) {
         const int e = my[r];
         if (have(e)) continue;                          // already resident: uniform across the warp
@@ -825,8 +825,9 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
             if (my[r] >= 0 && my[r] < 512 && !mask_cheap(my[r], res, ring, cheap)) atomicAdd(cost + (size_t) layer * 512 + my[r], 1u);
     // STRATA_MASK_RESIDENT control window (route_mask_control): nothing moves, the router's picks stay; the masked picks still count as seen
     // (moved adds nothing).  *ctrl is the same for every lane, so the return is uniform across the warp.
-    // STRATA_FRAGILE_CTRL_EVERY (fctrl): a fragile control window moves nothing here either (its row_shift stays 0), and counts the same way.
-    if ((ctrl != nullptr && *ctrl != 0) || (fctrl != nullptr && *fctrl != 0)) {
+    // STRATA_FRAGILE_CTRL_EVERY / SPEC-recheck-cheap (fctrl): a row below the fragile flag's count moves nothing here either (its row_shift
+    // stays 0), and counts the same way.
+    if ((ctrl != nullptr && *ctrl != 0) || (fctrl != nullptr && row < *fctrl)) {
         if (lane == 0 && stats != nullptr) {
             unsigned long long masked = 0;
             for (int r = 0; r < 10; ++r)
@@ -1006,12 +1007,13 @@ bool route_fragile_control_alloc() {
     g_frag_ctrl_dev = d;
     return true;
 }
-bool route_fragile_control(bool on) {
+bool route_fragile_rows(int n) {
     if (g_frag_ctrl_host == nullptr) return false;
-    *(volatile int*) g_frag_ctrl_host = on ? 1 : 0;
+    *(volatile int*) g_frag_ctrl_host = n < 0 ? 0 : n;
     __sync_synchronize();
     return true;
 }
+bool route_fragile_control(bool on) { return route_fragile_rows(on ? (1 << 30) : 0); }
 bool route_mask_update(const std::vector<uint8_t>& host) {
     if (g_mask_dev == nullptr || host.size() != g_mask_host.size()) return false;
     const size_t ne = (size_t) g_mask_ne;

@@ -13,6 +13,7 @@
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/paired_test.hpp"
+#include "strata/core/recheck_cheap.hpp"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -200,6 +201,9 @@ struct RouteResidentCfg {
     bool fragile_pend_control = false;        ///< the pending cut is a control re-check (its verdict is the noise floor)
     bool fragile_exact = false;               ///< the next decode window runs ranks < lo exact (after a cut)
     bool win_exact = false;                   ///< this window is a flip re-check's exact re-run (set by route_budget_window): no STRATA_MASK moves in it
+    // SPEC-recheck-cheap change 1: STRATA_RECHECK_ROW_ONLY (default on): the exact successor of a cut makes only its row 0 exact (the fragile
+    // flag's row count is 1 for it); the request's budget stays for the other rows.  Off: the whole-window exact successor (budget 0, win_exact).
+    bool recheck_row_only = true;
     bool fragile_pend = false;                ///< a cut's row is waiting for the exact window that re-decides it
     int32_t fragile_pend_tok = 0;             ///< the stand-in window's top-1 id at the cut row (argmax, not the sampled token)
     bool fragile_pend_stop = false;           ///< the pending cut is a stop re-check (route_fragile_stop_cut: its row's stand-in token is a stop id)
@@ -244,6 +248,9 @@ struct RouteResidentCfg {
     std::chrono::steady_clock::time_point auto_last_end{};
     long long auto_last_req = -1;
     long long auto_tests = 0, auto_tests_take = 0;   ///< tests finished; tests since the stats line took them
+    // SPEC-recheck-cheap change 4: the running test's cuts per arm (route_fragile_cut, charged to the cut window's arm; control re-checks and
+    // windows not timed by the arms are left out, as their tokens are).  Printed in the test line; the cut guard in the paired decision.
+    long long auto_cuts[2] = {0, 0};
     // STRATA_MASK=learn x AUTO: after each budget test the next one is a MASK test (the mask's depth (p, g), see mask_test_begin): the same
     // interleaved arms, both at req_b; the arms are the mask's levels (uploaded when the arm changes).  Its state (p, g) lives in the learner.
     bool auto_mask = false;                   ///< the running test is a mask test
@@ -408,6 +415,8 @@ RouteResidentCfg& route_resident_cfg() {
         { const char* v = std::getenv("STRATA_FRAGILE_RECHECK"); r.fragile_on = v == nullptr || std::atoi(v) != 0; }
         // STRATA_FRAGILE_BRAKE (default on, =0 off): the per-request decode budget brake (see RouteResidentCfg)
         { const char* v = std::getenv("STRATA_FRAGILE_BRAKE"); r.brake_on = v == nullptr || std::atoi(v) != 0; }
+        // SPEC-recheck-cheap change 1 (default on, =0 the whole-window exact successor of before): the exact successor makes row 0 only exact
+        { const char* v = std::getenv("STRATA_RECHECK_ROW_ONLY"); r.recheck_row_only = v == nullptr || std::atoi(v) != 0; }
         // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 off): every n-th eligible decode window is a fragile control window (see RouteResidentCfg)
         if (const char* v = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) r.fr_ctrl_every = std::max(0LL, std::atoll(v));
         if (const char* v = std::getenv("STRATA_FRAGILE_K0")) {
@@ -1559,7 +1568,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (route_resident_cfg().margin > 0.0f && strata::kernels::route_ram_floor_on())
         strata::kernels::route_cheap_alloc((size_t) (g.n_layers * g.n_expert));
     // STRATA_FRAGILE_CTRL_EVERY: the fragile control flag, allocated here so every kernel captured after this reads it (the mask kernel too)
-    if (route_resident_cfg().fragile_on && route_resident_cfg().fr_ctrl_every > 0 && !strata::kernels::route_fragile_control_alloc())
+    // (SPEC-recheck-cheap: the row-only successor needs the flag too, so it is allocated for STRATA_RECHECK_ROW_ONLY as well)
+    if (route_resident_cfg().fragile_on && (route_resident_cfg().fr_ctrl_every > 0 || route_resident_cfg().recheck_row_only) &&
+        !strata::kernels::route_fragile_control_alloc())
         std::fprintf(stderr, "strata: STRATA_FRAGILE_CTRL_EVERY: no host-mapped control flag, so no fragile control windows\n");
     if (route_resident_cfg().margin > 0.0f) {
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
@@ -4837,11 +4848,18 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     // A cut's exact successor decides every rank exactly: before 25 Oct only ranks < lo were made exact here and the tail kept its
     // stand-ins, so a "re-decided" token could still be moved by a rank 3-9 stand-in.  A tail budget of ~0 lets only a stand-in that
     // the router scored at least as high as the pick through (gap <= 0), i.e. no change.
-    c.win_exact = decode && c.fragile_exact;   // STRATA_MASK: the exact re-run is unmasked too (its outputs are the re-decision)
+    // SPEC-recheck-cheap change 1: the successor's flag row count is 1 (route_fragile_rows; false when the flag is not allocated, then the
+    // whole-window exact path of before runs).  Its request budget stays; only the whole-window exact state and budget 0 are dropped.
+    const bool succ = decode && c.fragile_exact;
+    const bool row_only = succ && c.recheck_row_only && strata::kernels::route_fragile_rows(1);
+    const strata::core::recheck::SuccessorPlan sp = strata::core::recheck::successor_plan(succ, row_only);
+    c.win_exact = sp.win_exact;   // STRATA_MASK: the exact re-run is unmasked too (its outputs are the re-decision)
     if (decode && c.auto_on && auto_ok && c.auto_mask && !c.win_exact) mask_test_arm(c.auto_win_arm);   // STRATA_MASK=learn: this arm's levels on the device
     if (decode && c.fragile_exact) {
-        b = 0.0f;
-        tail = 1e-30f;
+        if (sp.zero_budget) {
+            b = 0.0f;
+            tail = 1e-30f;
+        }
         c.fragile_exact = false;
     }
     // Ranks below the configured floor (STRATA_ROUTE_RESIDENT_RANKS=3-9: ranks 0-2) follow the configured rank rule - ranks 0-1 exact,
@@ -4984,6 +5002,8 @@ void Verifier::route_fragile_cut(float ratio, int32_t stand_top1, bool explore, 
     ++c.fr_cuts;
     if (explore) ++c.fr_explore_cuts;
     c.auto_cut_arm = c.auto_win_arm;   // STRATA_ROUTE_BUDGET_AUTO: the cut window's arm; its exact successor is charged to it
+    // SPEC-recheck-cheap change 4: a cut of a timed window (kinds 0 and 3, as route_auto_window times them) counts for its arm
+    if (!control && c.win_kind != 1 && c.win_kind != 2) ++c.auto_cuts[c.auto_cut_arm];
     c.fragile_pend = true;
     c.fragile_pend_explore = explore;
     c.fragile_pend_control = control;
@@ -5247,6 +5267,7 @@ void auto_reset_arms(RouteResidentCfg& c) {
     c.auto_secs[0] = c.auto_secs[1] = 0.0;
     c.auto_rc[0] = c.auto_rc[1] = 0;
     c.auto_fl[0] = c.auto_fl[1] = 0;
+    c.auto_cuts[0] = c.auto_cuts[1] = 0;
     c.auto_runs = 0;
     c.auto_run_left = 0;
     c.auto_testing = true;
@@ -5310,12 +5331,15 @@ void route_auto_schedule(RouteResidentCfg& c) {
 // >= kAutoTokMin tokens per arm, ends the test as a keep), then the sequential rule (move / keep / continue at the cap).
 // A completed test whose candidate had <= 0.5 flips per 100 tokens over >= kCleanTok tokens raises b_clean (the ceiling) to its budget.
 void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why);
+// SPEC-recheck-cheap change 4: cuts per 100 committed tokens of an arm (0 with no tokens)
+double cut_per_100(long long cuts, long long tok) { return tok > 0 ? 100.0 * (double) cuts / (double) tok : 0.0; }
 const char* auto_reason_name(paired::Reason why) {
     switch (why) {
         case paired::Reason::Move: return "move";
         case paired::Reason::BelowDelta: return "keep: below the minimum effect";
         case paired::Reason::Cap: return "keep: pair cap";
         case paired::Reason::Quality: return "keep: quality";
+        case paired::Reason::Cuts: return "keep: cuts";
         default: return "keep";
     }
 }
@@ -5329,9 +5353,11 @@ void route_auto_pair_done(RouteResidentCfg& c) {
     c.auto_pt_secs[0] = c.auto_pt_secs[1] = 0.0;
     const bool blocked = paired::quality_veto(c.auto_fl[0], c.auto_tok[0], c.auto_fl[1], c.auto_tok[1], RouteResidentCfg::kAutoTokMin,
                                               RouteResidentCfg::kBrakeFlips);
+    // SPEC-recheck-cheap change 4: the candidate's cuts per token (Wilson 90%) against twice the base's: no move (reason "cuts")
+    const bool cut_blocked = paired::cut_veto(c.auto_cuts[0], c.auto_tok[0], c.auto_cuts[1], c.auto_tok[1], RouteResidentCfg::kAutoTokMin);
     const paired::Rule rule = c.auto_mask ? paired::mask_rule(c.auto_min_effect) : paired::budget_rule(c.auto_min_effect);
     paired::Reason why = paired::Reason::None;
-    const paired::Verdict v = paired::decide(c.auto_pair, rule, blocked, &why);
+    const paired::Verdict v = paired::decide(c.auto_pair, rule, blocked, &why, cut_blocked);
     if (v != paired::Verdict::Continue) route_auto_test_done(c, v == paired::Verdict::Move, why);
 }
 
@@ -5349,10 +5375,12 @@ void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
         double pg[4] = {0.0, 0.0, 0.0, 0.0};
         const bool moved = mask_test_end(won, pg);
         std::fprintf(stderr, "strata serve: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
-                     "%.1f vs %.1f tok/s over %d+%d windows -> (%.3f,%.3f); flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f\n",
+                     "%.1f vs %.1f tok/s over %d+%d windows -> (%.3f,%.3f); flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f; "
+                     "cuts %lld vs %lld (%.1f vs %.1f /100 tok)\n",
                      pg[2], pg[3], pg[0], pg[1], pairs, pmean, pse, moved ? "move" : "keep", auto_reason_name(why), sc, sb,
                      (int) c.auto_n[1], (int) c.auto_n[0], moved ? pg[2] : pg[0], moved ? pg[3] : pg[1], fc, fb, c.auto_rc[1], c.auto_rc[0],
-                     100.0 * pc, 100.0 * pb);
+                     100.0 * pc, 100.0 * pb, c.auto_cuts[1], c.auto_cuts[0], cut_per_100(c.auto_cuts[1], c.auto_tok[1]),
+                     cut_per_100(c.auto_cuts[0], c.auto_tok[0]));
         c.auto_mask = false;
         c.auto_mask_next = false;   // a budget test next
         c.auto_testing = false;
@@ -5368,9 +5396,11 @@ void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
     c.auto_last_win = bs.last_win;
     auto_next_stage(c, won, d);
     std::fprintf(stderr, "strata serve: auto budget test %.3f vs %.3f: pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
-                 "%.1f vs %.1f tok/s over %d+%d windows step %.2f -> %.3f; flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f\n",
+                 "%.1f vs %.1f tok/s over %d+%d windows step %.2f -> %.3f; flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f; "
+                 "cuts %lld vs %lld (%.1f vs %.1f /100 tok)\n",
                  (double) cand, (double) b_old, pairs, pmean, pse, won ? "move" : "keep", auto_reason_name(why), sc, sb,
-                 (int) c.auto_n[1], (int) c.auto_n[0], (double) step, (double) c.auto_b, fc, fb, c.auto_rc[1], c.auto_rc[0], 100.0 * pc, 100.0 * pb);
+                 (int) c.auto_n[1], (int) c.auto_n[0], (double) step, (double) c.auto_b, fc, fb, c.auto_rc[1], c.auto_rc[0], 100.0 * pc, 100.0 * pb,
+                 c.auto_cuts[1], c.auto_cuts[0], cut_per_100(c.auto_cuts[1], c.auto_tok[1]), cut_per_100(c.auto_cuts[0], c.auto_tok[0]));
     c.auto_testing = false;
     ++c.auto_tests;
     ++c.auto_tests_take;
@@ -7018,6 +7048,42 @@ void Verifier::mask_learn_cut(int row, int32_t stand_top1, int T, bool control) 
         s.pend_masked = s.pend_masked || a.kind == 1;
         s.pend_sum += x;
     }
+}
+
+size_t Verifier::route_recheck_picks(int row, std::vector<strata::core::recheck::Pick>& out) {
+    out.clear();
+    if (!mask_learn_active() || row < 1 || row >= strata::kernels::kMaskEvRows || g_mlr == nullptr) return 0;
+    const MaskLearnState& s = *g_mlr;
+    const OnDevice on(device_);
+    unsigned n = 0;
+    if (cudaMemcpy(&n, &mev_->n[row], sizeof n, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    n = std::min<unsigned>(n, (unsigned) strata::kernels::kMaskEvCap);
+    if (n == 0) return 0;
+    std::vector<strata::kernels::MaskEv> evs(n);
+    if (cudaMemcpy(evs.data(), &mev_->e[row][0], n * sizeof(strata::kernels::MaskEv), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    // both kinds: a stand-in swap's replaced pick and a mask move's; the successor's row 0 reads the router's pick of each
+    for (const strata::kernels::MaskEv& a : evs)
+        if (a.layer >= 0 && a.layer < s.nl && a.expert >= 0 && a.expert < s.ne) out.push_back({a.layer, a.expert});
+    return out.size();
+}
+
+bool Verifier::route_recheck_prefetch_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_RECHECK_PREFETCH"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+
+size_t Verifier::route_recheck_prefetch_max() {
+    static const size_t cap = [] {
+        const char* v = std::getenv("STRATA_RECHECK_PREFETCH_MAX");
+        return v != nullptr ? (size_t) std::max(0LL, std::atoll(v)) : (size_t) 96;
+    }();
+    return cap;
 }
 
 // The exact successor (the window that just ran): D = KL(exact row 0 || the cut row's first pass) on the device; the pending row's picks take

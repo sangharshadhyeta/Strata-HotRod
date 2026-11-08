@@ -23,6 +23,7 @@
 
 #include <cstdio>
 
+#include "strata/core/recheck_cheap.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
@@ -302,6 +303,12 @@ public:
     /// of n <= 8 rows with `kept` rows kept; cut: true when the window was cut at its row kept).  active: the buffers and the state exist.
     bool mask_learn_active() const;
     void mask_learn_cut(int row, int32_t stand_top1, int T, bool control);
+    /// SPEC-recheck-cheap change 2: the replaced picks (layer, expert) of decode row `row` (>= 1) of the window that was cut, from the
+    /// mask-learn event list (STRATA_MASK=learn; none without it).  Call after the window ran and before the successor.  Returns the count.
+    size_t route_recheck_picks(int row, std::vector<strata::core::recheck::Pick>& out);
+    /// STRATA_RECHECK_PREFETCH (default on, =0 off) and STRATA_RECHECK_PREFETCH_MAX (default 96): the cut row's prefetch switch and its cap.
+    static bool route_recheck_prefetch_on();
+    static size_t route_recheck_prefetch_max();
     void mask_learn_settle(bool exact_ok, int32_t exact_top1);
     void mask_learn_window(int T, int kept, bool cut);
     std::string standin_learn_report();

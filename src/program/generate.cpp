@@ -60,6 +60,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/recheck_cheap.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #if defined(STRATA_PREFILL_MMQ)
@@ -2476,6 +2477,32 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
 static bool lookahead_promote_env() {
     const char* v = std::getenv("STRATA_LOOKAHEAD_PROMOTE");
     return v == nullptr || std::atoi(v) != 0;
+}
+
+// SPEC-recheck-cheap change 2 (STRATA_RECHECK_PREFETCH): a cut row's replaced picks are queued for a read ahead of the exact successor on the
+// expert source's read-ahead (ExpertSource::warm, the look-ahead tail read's path: RAM staging, then the card by the cache fill).  Per request
+// counts (the stats line takes them): queued, already resident in the RAM copy, repeats, dropped past the cap.
+struct RecheckPrefetchCounts {
+    size_t queued = 0, resident = 0, duplicate = 0, dropped = 0;
+};
+static RecheckPrefetchCounts g_recheck_pf;
+static void recheck_prefetch(strata::core::ExpertSource* src, const std::vector<strata::core::recheck::Pick>& picks) {
+    auto* fs = dynamic_cast<strata::core::FileExpertSource*>(src);
+    const auto plan = strata::core::recheck::plan_prefetch(picks, strata::core::Verifier::route_recheck_prefetch_max(), [fs](int32_t l, int32_t e) {
+        return fs != nullptr && fs->complement_ready() && fs->has_resident(l, e);
+    });
+    g_recheck_pf.resident += plan.resident;
+    g_recheck_pf.duplicate += plan.duplicate;
+    g_recheck_pf.dropped += plan.over_cap;
+    // the plan is layer-ordered: one warm call per layer (the successor's layers run in ascending order)
+    size_t i = 0;
+    while (i < plan.todo.size()) {
+        std::vector<int64_t> ex;
+        const int32_t layer = plan.todo[i].layer;
+        for (; i < plan.todo.size() && plan.todo[i].layer == layer; ++i) ex.push_back(plan.todo[i].expert);
+        src->warm(layer, ex.data(), (int64_t) ex.size(), nullptr);
+        g_recheck_pf.queued += ex.size();
+    }
 }
 
 int main(int argc, char** argv) {
@@ -16175,6 +16202,11 @@ int main(int argc, char** argv) {
                             if (fr_stop) strata::core::Verifier::route_fragile_stop_cut();
                             ver.standin_learn_cut(r);   // STRATA_STANDIN_LEARN: the cut row's first stand-in and its y_s (no-op when off)
                             ver.mask_learn_cut(r, fr_top1[(size_t) r], T, fr_control);   // STRATA_MASK=learn: the first-pass logits, the row's picks
+                            // SPEC-recheck-cheap change 2: the row's replaced picks are read ahead before the exact successor runs (host, between windows)
+                            if (srcp != nullptr && strata::core::Verifier::route_recheck_prefetch_on()) {
+                                std::vector<strata::core::recheck::Pick> rc_picks;
+                                if (ver.route_recheck_picks(r, rc_picks) > 0) recheck_prefetch(srcp, rc_picks);
+                            }
                             if (rb_on) strata::core::Verifier::route_fragile_pos(produced_n + r);   // STRATA_ROLLBACK: row r's token position
                             fr_cut = r;
                             fp_pend_b = fp_bucket(r);   // the re-check by draft confidence: this cut's bucket, judged by the next window
@@ -16808,6 +16840,10 @@ int main(int argc, char** argv) {
                     // stop re-checks: a stop-id row a stand-in moved, cut and re-decided exactly (kept: the exact top-1 agreed; continued: it did not)
                     std::fprintf(stderr, "; stop re-checks %lld (%lld kept, %lld continued)", fr_stop_cuts, fr_stop_kept, fr_stop_cuts - fr_stop_kept);
                     std::fprintf(stderr, "\n");
+                    if (g_recheck_pf.queued + g_recheck_pf.resident + g_recheck_pf.duplicate + g_recheck_pf.dropped > 0)   // SPEC-recheck-cheap change 2
+                        std::fprintf(stderr, "strata serve: re-check prefetch: %zu queued, %zu already resident, %zu repeats, %zu dropped past the cap\n",
+                                     g_recheck_pf.queued, g_recheck_pf.resident, g_recheck_pf.duplicate, g_recheck_pf.dropped);
+                    g_recheck_pf = RecheckPrefetchCounts();
                 }
             }
             {   // STRATA_MASK: this request's masked picks seen and the picks moved (takes and resets the counts)

@@ -36,7 +36,7 @@ struct Rule {
 };
 
 enum class Verdict { Continue, Move, Keep };
-enum class Reason { None, Move, BelowDelta, Cap, Quality };
+enum class Reason { None, Move, BelowDelta, Cap, Quality, Cuts };
 
 // The budget test's rule: 12 pairs at least, 160 at most.  The mask test: the same minimum, 240 at most (its effect is measured on
 // a slower-moving quantity).  min_effect is the fraction (STRATA_TUNE_MIN_EFFECT, 0.03 = 3%).
@@ -79,14 +79,28 @@ inline bool quality_veto(long long flips_base, long long tok_base, long long fli
     return cand_lo > base_hi || (pc > 1.5 * pb && flips_cand >= min_flips);
 }
 
+// The cut guard (STRATA_RECHECK_ROW_ONLY's tuner, SPEC-recheck-cheap change 4): the candidate's cuts per committed token. Blocked when
+// the candidate's Wilson 90% lower bound exceeds twice the base's upper bound. Needs >= min_tok tokens in both arms (else not blocked).
+inline bool cut_veto(long long cuts_base, long long tok_base, long long cuts_cand, long long tok_cand, long long min_tok) {
+    if (tok_base < min_tok || tok_cand < min_tok) return false;
+    double base_lo = 0.0, base_hi = 0.0, cand_lo = 0.0, cand_hi = 0.0;
+    wilson90(std::min(cuts_base, tok_base), tok_base, base_lo, base_hi);
+    wilson90(std::min(cuts_cand, tok_cand), tok_cand, cand_lo, cand_hi);
+    return cand_lo > 2.0 * base_hi;
+}
+
 // One look after a pair.  quality_blocked: the quality veto holds (the test ends as a keep, the base's own outcome today).
+// cuts_blocked: the cut guard holds (a keep, reason Cuts; the quality veto takes precedence).
 // The sequential rule: move when mean - z se > delta; keep when mean + z se < delta, or at the cap; else continue.
-inline Verdict decide(const PairStats& s, const Rule& r, bool quality_blocked, Reason* why = nullptr) {
+inline Verdict decide(const PairStats& s, const Rule& r, bool quality_blocked, Reason* why = nullptr, bool cuts_blocked = false) {
     Reason reason = Reason::None;
     Verdict v = Verdict::Continue;
     if (quality_blocked) {
         v = Verdict::Keep;
         reason = Reason::Quality;
+    } else if (cuts_blocked) {
+        v = Verdict::Keep;
+        reason = Reason::Cuts;
     } else if (s.n >= r.min_pairs) {
         const double half = r.z * s.se();
         if (s.mean - half > r.delta) {

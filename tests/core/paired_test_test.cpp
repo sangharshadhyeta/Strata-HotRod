@@ -256,6 +256,25 @@ int main() {
         check(pt::decide(s, r, false) == pt::Verdict::Move, "scripted mask: a clear 8% gain moves the mask at 12 pairs");
     }
 
+    {
+        // SPEC-recheck-cheap change 4: the cut guard (Wilson 90% of cuts per token; the candidate's lower bound above twice the base's upper)
+        check(pt::cut_veto(10, 1000, 60, 1000, 100), "cut guard: 6 cuts per 100 tok against 1 per 100 is blocked (lower bound above 2x the base's upper)");
+        check(!pt::cut_veto(10, 1000, 20, 1000, 100), "cut guard: 2 per 100 against 1 per 100 is not blocked (the bounds overlap at 2x)");
+        check(!pt::cut_veto(10, 1000, 60, 1000, 2000), "cut guard: under the token minimum in either arm nothing is blocked");
+        check(!pt::cut_veto(0, 1000, 0, 1000, 100), "cut guard: no cuts in either arm is not blocked");
+        check(!pt::cut_veto(5, 1000, 5, 1000, 100), "cut guard: equal rates are not blocked");
+        check(pt::cut_veto(30, 1000, 900, 1000, 100) && pt::cut_veto(0, 1000, 500, 1000, 100), "cut guard: a candidate far above the base is blocked, even from zero");
+        // the decision: a clear gain moves at 12 pairs unless the cut guard holds, then it is kept with reason Cuts; the quality veto wins over it
+        pt::Rule r = pt::budget_rule(0.03);
+        pt::PairStats s;
+        for (int i = 0; i < 12; ++i) s.add(std::log(1.10));
+        pt::Reason why = pt::Reason::None;
+        check(pt::decide(s, r, false, &why) == pt::Verdict::Move && why == pt::Reason::Move, "cuts: a clear gain moves when no guard holds");
+        check(pt::decide(s, r, false, &why, true) == pt::Verdict::Keep && why == pt::Reason::Cuts, "cuts: the cut guard keeps a clear gain (reason Cuts)");
+        check(pt::decide(s, r, true, &why, true) == pt::Verdict::Keep && why == pt::Reason::Quality, "cuts: the quality veto takes precedence over the cut guard");
+        check(pt::decide(s, r, false, &why, false) == pt::Verdict::Move, "cuts: an unblocked decision is unchanged by the new argument");
+    }
+
     std::printf("paired_test_test: %s (%d failed)\n", g_fail ? "FAIL" : "ok", g_fail);
     return g_fail ? 1 : 0;
 }
