@@ -86,27 +86,30 @@ apart). Otherwise it is rolled back. Deltas are versioned on the NVMe; any versi
 - **One switch, always:** every learner has its own flag, every delta a version, and the base file is never written. Turning the living
   model off returns exactly the base model.
 
-## 7. Recursive self-improvement (RSI)
+## 7. Recursive self-improvement: RLHF signals, weight-space programming instead of training
 
-The loop of autoresearch and OpenEvolve, applied to this system: **propose -> evaluate on the panel and canary -> keep only if better ->
-repeat**, with the gate of §4 as the evaluator. Three kinds of proposals feed it:
+The loop of autoresearch and OpenEvolve - **propose -> evaluate on the panel and canary -> keep only if better -> repeat** - with the
+gate of §4 as the evaluator. What changes behaviour is **not fine-tuning**: the system computes direct, closed-form weight edits itself,
+from the standard RLHF signal, and folds them into the weights, so serving pays nothing for them.
 
-### 7.1 Rewards from the user's own work (RL from feedback, local)
-- **Agent work: did the command run or break.** Read from structured fields only - the tool result's `is_error` flag (Anthropic API) or
-  the exit code where the client sends it - never by reading the output's text (no pattern matching). A tool call that runs is a small
-  reward; a turn that ends the task is a larger one (the turn-level reward design of multi-turn agent RL).
-- **Text and reasoning: agreement under resampling.** In idle time, past prompts with checkable structure (maths, code with tests,
-  multiple choice) are answered several times; majority agreement is the label-free reward (TTRL), with the diversity watch of §6
-  against the consensus trap. Code answers are rewarded by running their tests.
-- **Conversation signals:** a regenerated or edited answer (the same prompt sent again) counts against the first answer; that is a
-  request-level fact, not a text judgement.
-- **What these rewards train:** only what this hardware can train - the router deltas (§3.2), small adapters on the conscious experts and
-  on attention (in VRAM), the planner, and the recall thresholds (§2.1). Never the base file.
+### 7.1 The signal: best-in-class RLHF, no house rewards
+The open RLHF frameworks (TRL, OpenRLHF, verl) all rest on the same mechanism: **preference pairs** (a chosen and a rejected answer to
+the same prompt) or a **reward model's scores** over a group of sampled answers, optimised by DPO, PPO or GRPO. We take that signal as
+it is - no reward of our own design (no "the command ran" bonus):
+- **Human preference, from the user:** when the user regenerates or edits an answer, the kept answer is chosen and the replaced one
+  rejected (a request-level fact: the same prompt sent again), and an explicit preference field on the API when the client sends one.
+- **Reward-model preference, in idle time:** past prompts are answered several times (a GRPO-style group), and an open reward model
+  from the current leaderboards ranks them; the best and the worst form a pair. Idle time only, so serving pays nothing.
 
-### 7.2 Weight-space programming (proposed edits)
-A strong model is shown a small, specific part of the weights together with a measured failure (an early stop, a loop, a recall that
-fires too often) and proposes a direct edit - the way "Sparks of Weight-Space Programming" fixed a 0.8B model's reasoning loops by
-changing 0.016% of its weights. Each proposal is only a candidate: it goes through the same panel, canary and hand-read gate.
+### 7.2 The update: weight-space programming by the system itself
+- **From pairs to a direction:** for each pair, the activations at chosen layers on the chosen answer minus those on the rejected one;
+  averaged over many pairs, that is the preference's direction in the model (contrastive activation addition). BiPO (bi-directional
+  preference optimisation of the vector alone) is the stronger variant when plain averaging is too noisy.
+- **From a direction to an edit:** Steer2Edit's closed form turns the steering vector into rank-1 edits of the components that carry it,
+  so the behaviour lives in the weights - no gradient through the model, no adapter at run time, no serving overhead.
+- **The same for efficiency:** the router deltas (§3.2) and the absorption corrections (§3.1) are written the same way - closed-form or
+  regression deltas, folded at sleep (§3.4).
+- **Every edit is a proposal:** it passes the panel, the frozen-base probe, the canary and a hand-read sample (§4, §6), or it is dropped.
 
 ### 7.3 The system improving its own engine
 The same loop over the engine's own settings and code paths (as autoresearch edits its training code): a proposed change to a
