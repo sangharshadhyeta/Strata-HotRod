@@ -1239,8 +1239,11 @@ bool Verifier::standin_balance_commit(int n_tok, const std::vector<float>& use, 
     }
     std::vector<double> best((size_t) cnt, -1.0);
     for (const auto& kv : st.pairs) {
-        const sdp::Est es = st.est(kv.first, kv.second);   // pooled: an expert whose (layer, e) group is ready ranks with no ready pair of its own
-        if (!es.ready) continue;
+        // pooled: an expert whose (layer, e) group is ready ranks with no ready pair of its own.  An expert known only through its layer's
+        // mean does not rank: its err is the layer's, so its place would follow use and misses, not how well it is stood in for
+        // (8 Nov live: the hit rate slid 96.1 -> 94.8% while such experts were given up)
+        const sdp::Est es = st.est(kv.first, kv.second);
+        if (!es.own_expert) continue;
         const int64_t i = (int64_t) (kv.first >> 40) * 512 + (int64_t) ((kv.first >> 20) & 0xFFFFFu);
         if (i < cnt && (best[(size_t) i] < 0.0 || es.err < best[(size_t) i])) best[(size_t) i] = es.err;
     }
