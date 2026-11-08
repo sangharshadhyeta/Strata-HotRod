@@ -137,8 +137,14 @@ bool route_fragile_control_alloc();
 bool route_fragile_control(bool on);
 /// SPEC-recheck-cheap change 1: the fragile flag as a row count, between windows (same contract as route_fragile_control).  Rows t of the
 /// window with row_base + t < n keep the router's picks (no stand-in move, no mask move, row_shift 0); the rest run as usual.  n = 0: none;
-/// n >= the window's rows: every row (route_fragile_control(true) is n = a large value).  false when the flag was never allocated.
+/// n >= 32: every row (the all-ones mask), as route_fragile_control(true).  false when the flag was never allocated.
 bool route_fragile_rows(int n);
+/// SPEC-recheck-gated step A: the fragile hold as a row bitmask, between windows (same contract as route_fragile_rows).  Bit r set = window
+/// row r keeps the router's picks (no stand-in move, no mask move, row_shift 0); rows >= 32 are held only by 0xFFFFFFFF, which holds every
+/// row (the control window).  false when the flag was never allocated.
+bool route_fragile_hold(uint32_t bits);
+/// true when the hold flag exists (route_fragile_control_alloc succeeded).
+bool route_fragile_hold_ready();
 /// The seen / moved counts since the last read (read and reset); false when no mask is set.
 bool route_mask_read(unsigned long long& seen, unsigned long long& moved);
 /// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear expert predictors, folded into one bf16 [512 x n_embd]

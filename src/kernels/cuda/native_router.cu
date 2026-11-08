@@ -385,6 +385,13 @@ static bool scratch_here() {
 // j + 32, ...) and reduced within the warp.  The bits are unchanged: a strictly greater logit wins, the smallest expert index breaks ties, and the
 // softmax is the same expression.  Our options ride on lane 0 (the counters, the wanted-expert count, the per-row record, the CCE bias) or are
 // reduced in the warp (the stand-in's place in the router's ranking).
+// The fragile hold bitmask (route_fragile_hold): bit r set = window row r keeps the router's picks; 0xFFFFFFFF holds every row (the control
+// window).  Rows >= 32 are held only by the all-ones mask.  Read by the kernels at each launch (uniform across the warp).
+__device__ __forceinline__ bool fragile_held(const uint32_t* fctrl, int row) {
+    if (fctrl == nullptr) return false;
+    const uint32_t b = *fctrl;
+    return row < 32 ? ((b >> row) & 1u) != 0u : b == 0xFFFFFFFFu;
+}
 __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                                  const int32_t* __restrict__ res, int n_tok, const RouteCfg* cfg,
                                  unsigned long long* __restrict__ stats, float* __restrict__ want,
@@ -393,7 +400,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  int cheap_rank0, int cheap_anytier, unsigned long long* __restrict__ bstats,
                                  float* __restrict__ row_shift, const float* __restrict__ pair_c,
                                  int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe,
-                                 MaskEvs* __restrict__ mev, int row_base, const int* __restrict__ fctrl) {
+                                 MaskEvs* __restrict__ mev, int row_base, const uint32_t* __restrict__ fctrl) {
     const int t = blockIdx.x;
     if (t >= n_tok) return;
     const int lane = (int) threadIdx.x;
@@ -486,7 +493,7 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
     const bool bud = budget > 0.f;
     // STRATA_FRAGILE_CTRL_EVERY / SPEC-recheck-cheap (route_fragile_rows): a row below the flag's count moves no pick, so its picks stay at
     // their router rank and row_shift stays 0.  The count is the same for every lane (uniform), so the loop is skipped by the whole warp.
-    const bool fctl = fctrl != nullptr && row_base + t < *fctrl;
+    const bool fctl = fragile_held(fctrl, row_base + t);
     for (int r = (cheap != nullptr || bud) ? 0 : first; r <= hi && r < 10 && !fctl; ++r) {
         const int e = my[r];
         if (have(e)) continue;                          // already resident: uniform across the warp
@@ -758,8 +765,8 @@ void mtp_zc_mark(const int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* 
 // STRATA_FRAGILE_CTRL_EVERY: the fragile control flag, a host-mapped int (1 = this window is a control: no stand-in or mask move), written
 // between windows by route_fragile_control.  Its device alias is read by route_resident_k and route_mask_k at each launch, as the mask's
 // control flag is.  Allocated on the first request for it; nullptr until then (no control windows).
-static int* g_frag_ctrl_host = nullptr;
-static int* g_frag_ctrl_dev = nullptr;
+static uint32_t* g_frag_ctrl_host = nullptr;   // the hold bitmask (route_fragile_hold)
+static uint32_t* g_frag_ctrl_dev = nullptr;
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift,
@@ -808,7 +815,7 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
                              const uint8_t* __restrict__ mask, int n_tok, int lo, float edge, float* __restrict__ row_shift,
                              unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset,
                              const int32_t* __restrict__ res, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
-                             uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo, const int* __restrict__ fctrl) {
+                             uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo, const uint32_t* __restrict__ fctrl) {
     const int t = (int) blockIdx.x, lane = (int) threadIdx.x;
     if (t >= n_tok) return;
     const int row = row_base + t;
@@ -827,7 +834,7 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
     // (moved adds nothing).  *ctrl is the same for every lane, so the return is uniform across the warp.
     // STRATA_FRAGILE_CTRL_EVERY / SPEC-recheck-cheap (fctrl): a row below the fragile flag's count moves nothing here either (its row_shift
     // stays 0), and counts the same way.
-    if ((ctrl != nullptr && *ctrl != 0) || (fctrl != nullptr && row < *fctrl)) {
+    if ((ctrl != nullptr && *ctrl != 0) || fragile_held(fctrl, row)) {
         if (lane == 0 && stats != nullptr) {
             unsigned long long masked = 0;
             for (int r = 0; r < 10; ++r)
@@ -991,9 +998,9 @@ void route_mask_control(bool on) {
 // device alias is still nullptr would never read the flag.  Without it, route_fragile_control(true) is false and no window is a control.
 bool route_fragile_control_alloc() {
     if (g_frag_ctrl_host != nullptr) return true;
-    int* h = nullptr;
-    int* d = nullptr;
-    if (cudaHostAlloc((void**) &h, sizeof(int), cudaHostAllocMapped) != cudaSuccess) {
+    uint32_t* h = nullptr;
+    uint32_t* d = nullptr;
+    if (cudaHostAlloc((void**) &h, sizeof(uint32_t), cudaHostAllocMapped) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
@@ -1007,13 +1014,19 @@ bool route_fragile_control_alloc() {
     g_frag_ctrl_dev = d;
     return true;
 }
-bool route_fragile_rows(int n) {
+bool route_fragile_hold_ready() { return g_frag_ctrl_host != nullptr; }
+bool route_fragile_hold(uint32_t bits) {
     if (g_frag_ctrl_host == nullptr) return false;
-    *(volatile int*) g_frag_ctrl_host = n < 0 ? 0 : n;
+    *(volatile uint32_t*) g_frag_ctrl_host = bits;
     __sync_synchronize();
     return true;
 }
-bool route_fragile_control(bool on) { return route_fragile_rows(on ? (1 << 30) : 0); }
+// A row count n (the SPEC-recheck-cheap form): rows 0..n-1 held.  n >= 32 holds every row (the all-ones mask).
+bool route_fragile_rows(int n) {
+    if (n < 0) n = 0;
+    return route_fragile_hold(n >= 32 ? 0xFFFFFFFFu : ((1u << n) - 1u));
+}
+bool route_fragile_control(bool on) { return route_fragile_hold(on ? 0xFFFFFFFFu : 0u); }
 bool route_mask_update(const std::vector<uint8_t>& host) {
     if (g_mask_dev == nullptr || host.size() != g_mask_host.size()) return false;
     const size_t ne = (size_t) g_mask_ne;

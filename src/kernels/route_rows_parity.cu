@@ -265,6 +265,75 @@ int main() {
                 }
             }
         }
+        // ---- SPEC-recheck-gated step A: the row bitmask (route_fragile_hold).  Bit r holds row r: its picks, weights and row_shift stay the
+        // router's; every other row is the flag-clear run's, bit for bit.  0xFFFFFFFF is the control window (checked above as a count).
+        {
+            std::uniform_int_distribution<uint32_t> ub(0u, 0xFFFFFFFFu);
+            const uint32_t rows_mask = (1u << n_tok) - 1u;
+            for (int m = 0; m < 4; ++m) {
+                const uint32_t bits = m == 0 ? 0xFFFFFFFFu : (m == 1 ? 0u : (ub(rng) & rows_mask));
+                // the resident kernel
+                strata::kernels::route_fragile_hold(bits);
+                ck(cudaMemcpy(d_ids, ids_in.data(), ids_in.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "up ids bits");
+                ck(cudaMemcpy(d_w, w_in.data(), w_in.size() * sizeof(float), cudaMemcpyHostToDevice), "up w bits");
+                ck(cudaMemcpy(d_rs, rs0.data(), rs0.size() * sizeof(float), cudaMemcpyHostToDevice), "up rs bits");
+                ck(cudaMemset(d_stats, 0, 4 * sizeof(unsigned long long)), "zero stats bits");
+                Out got;
+                launch_resident(n_tok);
+                read_resident(n_tok, got);
+                for (int t = 0; t < n_tok; ++t) {
+                    const bool held = t < 32 ? ((bits >> t) & 1u) != 0u : bits == 0xFFFFFFFFu;
+                    const int32_t* gi = got.ids.data() + (size_t) t * kTop;
+                    const float* gw = got.w.data() + (size_t) t * kTop;
+                    bool ok;
+                    if (held) {
+                        ok = std::memcmp(gi, ids_in.data() + (size_t) t * kTop, kTop * sizeof(int32_t)) == 0 &&
+                             same_bits(gw, w_in.data() + (size_t) t * kTop, kTop) && got.rs[(size_t) t] == 0.0f;
+                        ++rows_held;
+                    } else {
+                        ok = std::memcmp(gi, ref.ids.data() + (size_t) t * kTop, kTop * sizeof(int32_t)) == 0 &&
+                             same_bits(gw, ref.w.data() + (size_t) t * kTop, kTop) && got.rs[(size_t) t] == ref.rs[(size_t) t];
+                    }
+                    if (!ok) {
+                        ++bad;
+                        std::printf("  case %d resident bits 0x%08x row %d (%s): differs\n", c, bits, t, held ? "held" : "free");
+                    }
+                }
+                // the mask kernel
+                strata::kernels::route_mask_control(false);
+                strata::kernels::route_fragile_hold(bits);
+                ck(cudaMemcpy(d_ids, ids_in.data(), ids_in.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "up ids mask bits");
+                ck(cudaMemcpy(d_w, w_in.data(), w_in.size() * sizeof(float), cudaMemcpyHostToDevice), "up w mask bits");
+                ck(cudaMemcpy(d_rs, rs0.data(), rs0.size() * sizeof(float), cudaMemcpyHostToDevice), "up rs mask bits");
+                strata::kernels::native_route_mask(d_logits, d_ids, d_w, d_mask, n_tok, d_rs, (void*) stream);
+                ck(cudaStreamSynchronize(stream), "sync mask bits");
+                Out gm;
+                gm.ids.assign((size_t) n_tok * kTop, 0);
+                gm.w.assign((size_t) n_tok * kTop, 0.0f);
+                gm.rs.assign((size_t) n_tok, 0.0f);
+                ck(cudaMemcpy(gm.ids.data(), d_ids, gm.ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "down ids mask bits");
+                ck(cudaMemcpy(gm.w.data(), d_w, gm.w.size() * sizeof(float), cudaMemcpyDeviceToHost), "down w mask bits");
+                ck(cudaMemcpy(gm.rs.data(), d_rs, gm.rs.size() * sizeof(float), cudaMemcpyDeviceToHost), "down rs mask bits");
+                for (int t = 0; t < n_tok; ++t) {
+                    const bool held = t < 32 ? ((bits >> t) & 1u) != 0u : bits == 0xFFFFFFFFu;
+                    const int32_t* gi = gm.ids.data() + (size_t) t * kTop;
+                    const float* gw = gm.w.data() + (size_t) t * kTop;
+                    bool ok;
+                    if (held) {
+                        ok = std::memcmp(gi, ids_in.data() + (size_t) t * kTop, kTop * sizeof(int32_t)) == 0 &&
+                             same_bits(gw, w_in.data() + (size_t) t * kTop, kTop) && gm.rs[(size_t) t] == 0.0f;
+                        ++mask_rows_held;
+                    } else {
+                        ok = std::memcmp(gi, mref.ids.data() + (size_t) t * kTop, kTop * sizeof(int32_t)) == 0 &&
+                             same_bits(gw, mref.w.data() + (size_t) t * kTop, kTop) && gm.rs[(size_t) t] == mref.rs[(size_t) t];
+                    }
+                    if (!ok) {
+                        ++bad;
+                        std::printf("  case %d mask bits 0x%08x row %d (%s): differs\n", c, bits, t, held ? "held" : "free");
+                    }
+                }
+            }
+        }
         Out mbig, mctl;
         run_mask(kAll, false, mbig);
         run_mask(0, true, mctl);   // the old control window (the mask's own flag)
