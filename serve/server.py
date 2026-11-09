@@ -54,7 +54,10 @@ from pathlib import Path
 from typing import Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
-from prompt_cache import PromptCache   # serve/prompt_cache.py: the prompt cache on disk (config "prompt_cache_path")
+try:   # serve/prompt_cache.py: the prompt cache on disk (config "prompt_cache_path"); imported as the serve package, or run as a script
+    from .prompt_cache import PromptCache
+except ImportError:
+    from prompt_cache import PromptCache
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
