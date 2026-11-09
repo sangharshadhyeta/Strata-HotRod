@@ -519,6 +519,13 @@ const std::vector<float>* Learner::pair_b(int layer, int e, int s) const {
     return p != nullptr && p->has_b ? &p->B : nullptr;
 }
 
+size_t Learner::pairs_with_holdout(int min_ho) const {
+    size_t n = 0;
+    for (const auto& kv : pairs_)
+        if (kv.second.n_ho >= (uint64_t) std::max(0, min_ho)) ++n;
+    return n;
+}
+
 size_t Learner::slots_used() const {
     size_t n = 0;
     for (bool u : slot_used_) n += u ? 1u : 0u;

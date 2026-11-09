@@ -1237,8 +1237,28 @@ bool standin_pool_apply_env() {
 // mode when STRATA_STANDIN_LEARN is unset or 0 (no correction applied; the answers stay the default's).
 bool subfit_log_env_on() { return strata::core::subfit::log_on_env(std::getenv("STRATA_SUBFIT_LOG")); }
 // SPEC-substitute-fit stage 2 step 1 (STRATA_SUBFIT_LEARN=1, opt-in): the live per-pair learner and its layer-input capture.
-bool subfit_learn_env_on() { return strata::core::subfit::log_on_env(std::getenv("STRATA_SUBFIT_LEARN")); }
+// STRATA_SUBFIT_LEARN unset: on when STRATA_SUBFIT_APPLY is set to something but off (the apply needs the learner)
+bool subfit_apply_env_on() {
+    const char* e = std::getenv("STRATA_SUBFIT_APPLY");
+    return e != nullptr && std::strcmp(e, "off") != 0;
+}
+bool subfit_learn_env_on() {
+    const char* e = std::getenv("STRATA_SUBFIT_LEARN");
+    return e != nullptr ? strata::core::subfit::log_on_env(e) : subfit_apply_env_on();
+}
+// the apply mode when on: 1 dynamic (unset or any other value), 2 all; 0 off
+int subfit_apply_mode_env() {
+    if (!subfit_apply_env_on()) return 0;
+    return (int) strata::core::subfit_learn::apply_env(std::getenv("STRATA_SUBFIT_APPLY"));
+}
+// the APPLY mode for the request-end lines: 'off' unless STRATA_SUBFIT_APPLY is set (the gate's own slot index is not changed by this)
+const char* subfit_mode_text(const RouteResidentCfg& c) {
+    return subfit_apply_env_on() ? strata::core::subfit_learn::apply_name((strata::core::subfit_learn::Apply) c.subfit_mode) : "off";
+}
+bool g_sub_apply_on = false;                 // SPEC-substitute-fit stage 2: the apply path exists (the Verifier's sub_on_, for the static readers)
+long long g_sub_req_corr = 0, g_sub_req_subs = 0, g_sub_req_refused = 0;   // this request's counters (route_shift_take reads them)
 std::unique_ptr<strata::core::subfit_learn::Learner> g_sub_learn;   // created with the stand-in learner's dims (make_sub_learn)
+std::unique_ptr<strata::core::subfit_learn::UploadPacker> g_sub_packer;   // the host side of the device tables (the mirror, the writes)
 uint64_t g_sub_learn_req = 0;                                         // the learner's samples since the request's end (the stats line)
 void make_sub_learn(int64_t dim, int64_t layers) {
     if (g_sub_learn || dim <= 0 || layers <= 0) return;
@@ -1248,6 +1268,7 @@ void make_sub_learn(int64_t dim, int64_t layers) {
     cfg.rank = strata::core::subfit_learn::rank_env(std::getenv("STRATA_SUBFIT_RANK"));
     cfg.max_pairs = strata::core::subfit_learn::pairs_env(std::getenv("STRATA_SUBFIT_PAIRS"));
     g_sub_learn = std::make_unique<strata::core::subfit_learn::Learner>(cfg);
+    g_sub_packer = std::make_unique<strata::core::subfit_learn::UploadPacker>(cfg.n_layers);
 }
 bool standin_learn_observe_env() {
     const char* e = std::getenv("STRATA_STANDIN_LEARN");
@@ -1420,6 +1441,7 @@ void Verifier::standin_learn_begin_window(bool decode, bool exact) {
     }
     // STRATA_SUBFIT_LEARN: the live learner exists from the first decode window (the stand-in learner's dims are known)
     if (x_on_ && decode && subfit_learn_env_on()) make_sub_learn(st.dim, st.layers);
+    if (sub_on_ && !sub_started_ && g_sub_learn) subfit_tables_start();   // SPEC-substitute-fit stage 2: A and the fits, before the window
     // STRATA_SUBFIT_LOG: the sample file opens here (the dims are known now); one decode window in sp_every_ is a probe window (gate[3])
     sp_win_ = false;
     if (sp_on_ && decode) {
@@ -1706,20 +1728,74 @@ bool Verifier::subfit_learn_save(const std::string& path, uint64_t fp, std::stri
     return g_sub_learn->save(path, fp, msg);
 }
 
+strata::kernels::SubfitRoute Verifier::subfit_route_(int64_t l, int tb) const {
+    strata::kernels::SubfitRoute r;   // all null: the kernels do what they did before the learner
+    if (!sub_on_ || sub_tab_.lut == nullptr) return r;
+    r.orig = sub_orig_ + (size_t) tb * 10;
+    r.flag = sub_flag_ + (size_t) tb * 10;
+    r.lut = sub_tab_.lut + (size_t) l * 512 * 512;
+    r.resid = sub_tab_.resid;
+    r.mode = sub_mode_;
+    return r;
+}
+
+// SPEC-substitute-fit stage 2 (steps 2, 3): A_l once per layer (fp16), then the learner's current fits.  Between windows only.
+void Verifier::subfit_tables_start() {
+    if (!sub_on_ || sub_started_ || !g_sub_learn || sub_tab_.lut == nullptr) return;
+    const size_t per = (size_t) sub_tab_.r * (size_t) sub_tab_.N;
+    const OnDevice on(device_);
+    for (int l = 0; l < sub_tab_.layers; ++l) {
+        const std::vector<uint16_t> A = g_sub_learn->features_f16(l);
+        if (A.size() != per) return;
+        if (cudaMemcpy(sub_tab_.A + (size_t) l * per, A.data(), per * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+    }
+    sub_started_ = true;
+    subfit_tables_sync(g_sub_learn->all_fitted());
+}
+
+// The learner's changes as device writes: LUT entries, each slot's B (fp16), c and resid, and the fitted counts per layer.
+void Verifier::subfit_tables_sync(const strata::core::subfit_learn::Changes& ch) {
+    if (!sub_on_ || sub_tab_.lut == nullptr || !g_sub_packer) return;
+    std::vector<strata::core::subfit_learn::LutWrite> lw;
+    std::vector<strata::core::subfit_learn::SlotWrite> sw;
+    g_sub_packer->pack(ch, lw, sw);
+    const OnDevice on(device_);
+    const size_t N = (size_t) sub_tab_.N, r = (size_t) sub_tab_.r;
+    for (const auto& w : lw) {
+        if (cudaMemcpy(sub_tab_.lut + w.index, &w.value, sizeof(int16_t), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+    }
+    for (const auto& w : sw) {
+        if (w.slot < 0 || w.slot >= sub_tab_.slots) continue;
+        if (!w.freed && w.b.size() == N * r &&
+            cudaMemcpy(sub_tab_.B + (size_t) w.slot * N * r, w.b.data(), w.b.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess)
+            (void) cudaGetLastError();
+        if (cudaMemcpy(sub_tab_.c + w.slot, &w.c, sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+        if (cudaMemcpy(sub_tab_.resid + w.slot, &w.resid, sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+    }
+    const std::vector<int32_t>& nf = g_sub_packer->fit_n();
+    if ((int) nf.size() == sub_tab_.layers && cudaMemcpy(sub_tab_.nfit, nf.data(), nf.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
+        (void) cudaGetLastError();
+}
+
 std::string Verifier::subfit_learn_report() {
     if (!subfit_learn_active() || !g_sub_learn) return "";
-    // the request's end: the pairs with new samples refit and the gate moves.  The device table is not uploaded yet (the apply kernel
-    // is not built): the changes are counted and dropped here.
+    // the request's end: the pairs with new samples refit and the gate moves; the changes go to the device tables (between windows)
     const strata::core::subfit_learn::Changes ch = g_sub_learn->refit();
+    subfit_tables_sync(ch);
     const strata::core::subfit_learn::Summary s = g_sub_learn->summary();
-    const auto mode = (strata::core::subfit_learn::Apply) route_resident_cfg().subfit_mode;
-    char buf[320];
+    const size_t ready = g_sub_learn->pairs_with_holdout(strata::core::subfit_learn::kHoldWindow);
+    const char* mode = sub_on_ ? strata::core::subfit_learn::apply_name((strata::core::subfit_learn::Apply) sub_mode_) : "off";
+    char buf[512];
     std::snprintf(buf, sizeof buf,
-                  "strata serve: subfit: mode %s, pairs sampled %zu, fitted %zu (held-out gain median %.3f, min %.3f), corrected moves 0 of "
-                  "%llu substituted (apply not built: %zu slot changes dropped), refusals left n/a\n",
-                  strata::core::subfit_learn::apply_name(mode), s.pairs, s.fitted, s.gain_median, s.gain_min,
-                  (unsigned long long) g_sub_learn_req, ch.slots.size());
+                  "strata serve: subfit: mode %s, pairs sampled %zu, fitted %zu (held-out gain median %.3f, min %.3f), corrected moves %lld of "
+                  "%lld substituted, refusals left %lld, samples this request %llu, pairs with >=32 held-out %zu\n",
+                  mode, s.pairs, s.fitted, s.gain_median, s.gain_min, g_sub_req_corr, g_sub_req_subs, g_sub_req_refused,
+                  (unsigned long long) g_sub_learn_req, ready);
     g_sub_learn_req = 0;
+    g_sub_req_corr = g_sub_req_subs = g_sub_req_refused = 0;
     return buf;
 }
 
@@ -2050,6 +2126,24 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sp_every_ = strata::core::subfit::probe_every_env(std::getenv("STRATA_SUBFIT_PROBE_EVERY"));
         if (!sp_on) sp_ = strata::kernels::SubfitProbeBufs{};
         if (!x_on_) lrn_x_ = nullptr;
+        // SPEC-substitute-fit stage 2: the apply's orig / flag rows and the device tables, only with STRATA_SUBFIT_APPLY set (not off)
+        const bool sub_on = lrn_on && subfit_apply_env_on();
+        sub_orig_ = b.take<int16_t>(sub_on ? T * 10 : 0);
+        sub_flag_ = b.take<uint8_t>(sub_on ? T * 10 : 0);
+        sub_on_ = false;
+        sub_mode_ = 0;
+        if (sub_on && strata::kernels::route_shift_cap_alloc()) {
+            const int rk = strata::core::subfit_learn::rank_env(std::getenv("STRATA_SUBFIT_RANK"));
+            if (cudaMemset(sub_orig_, 0xff, (size_t) T * 10 * sizeof(int16_t)) == cudaSuccess && cudaMemset(sub_flag_, 0, (size_t) T * 10) == cudaSuccess &&
+                strata::kernels::subfit_tables_alloc(sub_tab_, (int) g.n_layers, strata::core::subfit_learn::kMaxFitted, (int) N, rk)) {
+                sub_on_ = true;
+                sub_mode_ = subfit_apply_mode_env();
+                g_sub_apply_on = true;
+            } else {
+                std::fprintf(stderr, "strata: STRATA_SUBFIT_APPLY: no device tables, so no correction applied\n");
+            }
+        }
+        if (!sub_on_) { sub_orig_ = nullptr; sub_flag_ = nullptr; }
         lrn_pe_ = b.take<float>(lrn_on && standin_balance_env() ? (uint64_t) g.n_layers * 512 * 512 : 0);
         if (!(lrn_on && standin_balance_env())) lrn_pe_ = nullptr;
         if (!lrn_on) { lrn_c_ = nullptr; lrn_rec_ = nullptr; lrn_ys_ = nullptr; lrn_ye_ = nullptr; lrn_gate_ = nullptr; }
@@ -3443,6 +3537,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // SPEC-router-fuse step 2 (STRATA_ROUTER_FUSE_POST=0 or STRATA_ROUTER_FUSE=0: off): the layer's mask, its stand-in stage and the learner's
         // label are one launch (native_route_post, below) when the mask or the stand-ins are on; the label is copied there, after route_prior
         // (which writes ids and weights, not the logits).  Otherwise the separate calls, as before.
+        const strata::kernels::SubfitRoute sub_r = subfit_route_(l, (int) tb);   // SPEC-substitute-fit stage 2 (all null: off)
         const bool own_mask_on = NE == 512 && K == 10 && !route_resident_cfg().win_exact && strata::kernels::route_mask_layer(l, g.n_expert) != nullptr;
         const bool own_res_on = route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr;
         const bool post_own = router_post_on() && (own_mask_on || own_res_on);
@@ -3483,6 +3578,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 pa.bstats = rr_stats_ != nullptr ? rr_stats_ + 9 : nullptr;
                 pa.pair_c = lrn_c_ != nullptr && !standin_learn_observe_env() ? lrn_c_ + (size_t) l * 512 * 512 : nullptr;
                 pa.lrn_rec = lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr;
+                pa.sub = &sub_r;
                 pa.pair_pe = lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr;
                 pa.label = lab_dev;
                 strata::kernels::native_route_post(pa, cs);
@@ -3501,7 +3597,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                        n <= 8 ? mev_ : nullptr, (int) l, (int) tb,   // (STRATA_MASK=learn: the list)
                                                        mres && hits_.d_res != nullptr ? hits_.d_res + l * g.n_expert : nullptr,
                                                        mres ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr,
-                                                       mres ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr);
+                                                       mres ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr, &sub_r);
                 } catch (const std::exception& e) { err = "verify mask: " + std::string(e.what()); return false; }
             }
         }
@@ -3520,7 +3616,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       lrn_c_ != nullptr && !standin_learn_observe_env() ? lrn_c_ + (size_t) l * 512 * 512 : nullptr,   // STRATA_STANDIN_LEARN: the layer's corrections (=observe: none applied)
                                       lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr, (int) l,
                                       lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr,
-                                      n <= 8 ? mev_ : nullptr, (int) tb);   // (STRATA_MASK=learn: this layer's replaced picks, by row)
+                                      n <= 8 ? mev_ : nullptr, (int) tb, nullptr, &sub_r);   // (STRATA_MASK=learn: this layer's replaced picks, by row; SPEC-substitute-fit: sub_r)
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         }   // !post_own
@@ -3736,7 +3832,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
+            // (SPEC-substitute-fit stage 2: with the apply on, the hit rows are added before the combine, so the apply reads the whole parts)
+            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 && !sub_on_ &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
             if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
@@ -3751,6 +3848,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // STRATA_SUBFIT_LOG (opt-in): row 0's raw expert outputs of this layer, after the experts and their join, before the combine
         if (sp_on_ && lrn_gate_ != nullptr && tb == 0)
             strata::kernels::subfit_probe_y(parts_, lrn_gate_, (int64_t) K * N, sp_.y + (size_t) l * K * N, cs);
+        // SPEC-substitute-fit stage 2 (step 3): the substituted slots' outputs are corrected before the combine: parts = c parts + B A x.
+        // One launch per layer and group whenever the apply is on (the window graph is captured once); a layer with no fit is a no-op on device.
+        if (sub_on_ && sub_tab_.lut != nullptr) {
+            strata::kernels::SubfitApplyArgs aa;
+            aa.parts = parts_ + (size_t) tb * K * N;
+            aa.x = mixed_ + (size_t) tb * N;
+            aa.ids = ids_ + (size_t) tb * K;
+            aa.orig = sub_orig_ + (size_t) tb * K;
+            aa.flag = sub_flag_ + (size_t) tb * K;
+            aa.lut = sub_tab_.lut + (size_t) l * 512 * 512;
+            aa.A = sub_tab_.A + (size_t) l * sub_tab_.r * sub_tab_.N;
+            aa.B = sub_tab_.B;
+            aa.c = sub_tab_.c;
+            aa.nfit = sub_tab_.nfit + l;
+            aa.r = sub_tab_.r;
+            aa.N = (int) N;
+            aa.K = (int) K;
+            aa.n = n;
+            aa.mode = sub_mode_;
+            strata::kernels::subfit_apply(aa, cs);
+        }
         const bool learn = lrn_gate_ != nullptr;
         auto learn_tap_at = [&](int row) {
             strata::kernels::MoeLearnTap t;
@@ -5424,10 +5542,13 @@ bool Verifier::route_shift_take(std::string& cap_line, std::string& cal_line) {
     RouteResidentCfg& c = route_resident_cfg();
     cap_line.clear();
     cal_line.clear();
-    unsigned long long mv = 0, rw = 0;
-    if (c.cap_on && strata::kernels::route_shift_cap_read(mv, rw)) {   // (between requests: the windows are synced)
+    unsigned long long mv = 0, rw = 0, cc = 0, ss = 0;
+    if ((c.cap_on || g_sub_apply_on) && strata::kernels::route_shift_cap_read(mv, rw, &cc, &ss)) {   // (between requests: the windows are synced)
         c.sq.cap_moves += (long long) mv;
         c.sq.cap_rows += (long long) rw;
+        g_sub_req_corr += (long long) cc;       // SPEC-substitute-fit stage 2: corrected moves, substituted moves, refusals left
+        g_sub_req_subs += (long long) ss;
+        g_sub_req_refused += (long long) mv;
     }
     if (c.cap_on && (c.sq.cap_moves > 0 || c.sq.cap_rows > 0)) {
         auto cap_txt = [](float v, char* buf) { if (v < INFINITY) std::snprintf(buf, 32, "%.4f", (double) v); else std::snprintf(buf, 32, "inf"); };
@@ -5818,12 +5939,12 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
         if (ev.found)
             std::fprintf(stderr, "strata serve: fragile recheck (APPLY mode %s): k %.3f (base k_safe %.3f (r* %.3f, n_t %lld, f_t %lld; control upper bound %.3f over %d "
                          "control re-checks); %lld rechecks, %lld flips in all)\n",
-                         strata::core::subfit_learn::apply_name((strata::core::subfit_learn::Apply) c.subfit_mode),
+                         subfit_mode_text(c),
                          (double) c.fragile_k, (double) c.fragile_k, ev.r_star, ev.n_t, ev.f_t, kctrl_hi, c.fr_ctrl_n, c.fragile_rechecks, c.fragile_flips);
         else
             std::fprintf(stderr, "strata serve: fragile recheck (APPLY mode %s): k %.3f (no flip above the control's noise (upper bound %.3f over %d control "
                          "re-checks): k lowered by half; %lld rechecks)\n",
-                         strata::core::subfit_learn::apply_name((strata::core::subfit_learn::Apply) c.subfit_mode),
+                         subfit_mode_text(c),
                          (double) c.fragile_k, kctrl_hi, c.fr_ctrl_n, c.fragile_rechecks);
         route_tune_write(c);
     }

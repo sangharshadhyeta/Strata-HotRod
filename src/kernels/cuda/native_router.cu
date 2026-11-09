@@ -23,6 +23,8 @@
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/la_cadence.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/subfit_apply.hpp"
+#include "strata/core/subfit_rule.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -393,6 +395,10 @@ __device__ __forceinline__ bool fragile_held(const uint32_t* fctrl, int row) {
     const uint32_t b = *fctrl;
     return row < 32 ? ((b >> row) & 1u) != 0u : b == 0xFFFFFFFFu;
 }
+// SPEC-substitute-fit stage 2: the fitted slot of pair (e, s) in this layer's LUT, or -1 (no table, or no fit).
+__device__ __forceinline__ int sub_slot(const SubfitRoute& sub, int e, int s) {
+    return (sub.lut != nullptr && e >= 0 && e < 512 && s >= 0 && s < 512) ? (int) sub.lut[e * 512 + s] : -1;
+}
 // one warp of token t (SPEC-router-fuse step 2: a device function, shared by route_resident_k and the post-routing kernel).
 // margin_out / cap / cap_stats (SPEC-recheck-gated C, F; nullptr = off): the early margin (layers 0-3), the row's shift cap and its refusal counters.
 __device__ __forceinline__ void route_resident_warp(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
@@ -405,7 +411,7 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
                                  int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe,
                                  MaskEvs* __restrict__ mev, int row_base, const uint32_t* __restrict__ fctrl,
                                  float* __restrict__ margin_out = nullptr, const float* __restrict__ cap = nullptr,
-                                 unsigned long long* __restrict__ cap_stats = nullptr) {
+                                 unsigned long long* __restrict__ cap_stats = nullptr, const SubfitRoute sub = SubfitRoute{}) {
     const int lane = (int) threadIdx.x;
     // the floor lives in host-mapped memory, read at every launch, so a captured graph follows a change the host makes between
     // windows: the floor, the margin and the edge margin
@@ -498,6 +504,12 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
     // STRATA_STANDIN_LEARN: the router's picks (orig) and the stand-in each swapped rank took (sub_s, -1: none)
     int32_t orig[10], sub_s[10];
     for (int r = 0; r < 10; ++r) { orig[r] = my[r]; sub_s[r] = -1; }
+    // SPEC-substitute-fit stage 2: the router's own pick of each slot (a mask move before this stage left it in sub.orig); the pair is (pick, s)
+    int pair_orig[10];
+    for (int r = 0; r < 10; ++r) {
+        pair_orig[r] = orig[r];
+        if (sub.orig != nullptr && sub.orig[(size_t) t * 10 + r] >= 0) pair_orig[r] = sub.orig[(size_t) t * 10 + r];
+    }
     // STRATA_RING: an expert whose look-ahead ring copy has landed counts as resident (the host plan finds it in the ring)
     auto have = [&](int f) { return res[f] >= 0 || (ring != nullptr && ring[f] != 0); };
     int swaps = 0, tail = 0, before = 0;
@@ -578,14 +590,25 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
         if (bi >= 0 && trank && bstats != nullptr && lane == 0) atomicAdd(bstats + (take ? 3 : 4), 1ull);   // bstats [3] tail replaced, [4] tail kept exact by the bound
         // SPEC-recheck-gated step F: a move that would take the row's accumulated shift past its cap stays the router's pick (refused).
         // cap_row and shift_acc are the same in every lane (warp-reduced values; shift_acc starts at the row's shift and follows each move).
-        if (bi >= 0 && take && cap_row < INFINITY) {
+        // SPEC-substitute-fit stage 2 (steps 4-5): a fitted pair (its LUT entry) is taken corrected by subfit_rule::decide: dynamic past the
+        // cap (refused otherwise), all on every move.  No table (sub.lut == nullptr): the old cap test, as before.
+        bool corr = false;
+        float corr_add = 0.f;
+        const int fslot = (bi >= 0 && take) ? sub_slot(sub, pair_orig[r], bi) : -1;
+        if (bi >= 0 && take && (cap_row < INFINITY || fslot >= 0)) {
             const float pf_c = pair_pe != nullptr ? pair_pe[(size_t) orig[r] * 512 + bi] : 1.0f;
-            if (shift_acc + weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf_c > cap_row) {
+            const float resid = (fslot >= 0 && sub.resid != nullptr) ? sub.resid[fslot] : 1.0f;
+            const strata::core::subfit_rule::Move mv = strata::core::subfit_rule::decide(
+                shift_acc, cap_row, cap_row < INFINITY, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf_c, fslot >= 0, resid, sub.mode);
+            if (!mv.take) {
                 take = false;
                 if (lane == 0) {
                     cap_hit = true;
                     if (cap_stats != nullptr) atomicAdd(cap_stats, 1ull);
                 }
+            } else if (mv.corrected) {
+                corr = true;
+                corr_add = mv.add;
             }
         }
         if (bi >= 0 && take) {
@@ -614,8 +637,9 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
             // the stand-in (the quantity the budget test uses), summed over the layers and the picks of the row (read by the host)
             // STRATA_STANDIN_BALANCE (pair_pe, opt-in): a ready pair's risk is scaled by its relative error (clip 0.25-4; 1 until ready)
             const float pf = pair_pe != nullptr ? pair_pe[(size_t) orig[r] * 512 + bi] : 1.0f;
-            if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf);
-            shift_acc += weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf;   // (the cap's running shift, every lane)
+            const float add_shift = corr ? corr_add : weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf;   // a corrected move adds plain x resid
+            if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, add_shift);
+            shift_acc += add_shift;   // (the cap's running shift, every lane)
             // STRATA_MASK=learn: the replaced pick (orig[r]) and its risk, in this row's list
             if (lane == 0 && mev != nullptr && row_base + t < kMaskEvRows) {
                 const unsigned q = mev->n[row_base + t]++;
@@ -624,6 +648,15 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
             my[r] = bi;
             sub_s[r] = bi;
             ++swaps;
+            // SPEC-substitute-fit stage 2: the pair (router's pick, s) and whether the move is corrected; counts [2] corrected, [3] substituted
+            if (lane == 0 && sub.orig != nullptr) {
+                sub.orig[(size_t) t * 10 + r] = (int16_t) pair_orig[r];
+                sub.flag[(size_t) t * 10 + r] = corr ? 1 : 0;
+                if (cap_stats != nullptr) {
+                    atomicAdd(cap_stats + 3, 1ull);
+                    if (corr) atomicAdd(cap_stats + 2, 1ull);
+                }
+            }
             // STRATA_STANDIN_LEARN: this row's first stand-in (layer, rank, true expert, stand-in); the buffer is reset each decode window
             if (lane == 0 && lrn_rec != nullptr && lrn_rec[(size_t) t * 4] < 0) {
                 lrn_rec[(size_t) t * 4] = layer;
@@ -671,11 +704,11 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
                                  int32_t* __restrict__ lrn_rec, int layer, const float* __restrict__ pair_pe,
                                  MaskEvs* __restrict__ mev, int row_base, const uint32_t* __restrict__ fctrl,
                                  float* __restrict__ margin_out, const float* __restrict__ cap,
-                                 unsigned long long* __restrict__ cap_stats) {
+                                 unsigned long long* __restrict__ cap_stats, const SubfitRoute sub) {
     const int t = blockIdx.x;   // one warp (32 threads) per token
     if (t >= n_tok) return;
     route_resident_warp(logits, ids, weights, res, t, cfg, stats, want, detail, rows, repl, ring, cheap, cheap_margin, cheap_rank0,
-                        cheap_anytier, bstats, row_shift, pair_c, lrn_rec, layer, pair_pe, mev, row_base, fctrl, margin_out, cap, cap_stats);
+                        cheap_anytier, bstats, row_shift, pair_c, lrn_rec, layer, pair_pe, mev, row_base, fctrl, margin_out, cap, cap_stats, sub);
 }
 // ---- the floor: one small struct in host-mapped memory, read by the kernel at every launch.  The host sets it once (route_cfg_init)
 // and could move it between windows (route_cfg_set_floor; nothing does today).  A higher floor replaces less.  SPEC 17's per-part
@@ -846,7 +879,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                            unsigned long long* stats, void* stream, float* want, int32_t* rows, float* repl,
                            const uint8_t* ring, const uint8_t* cheap, unsigned long long* bstats, float* row_shift,
                            const float* pair_c, int32_t* lrn_rec, int layer, const float* pair_pe, MaskEvs* mev, int row_base,
-                           float* margin_out) {
+                           float* margin_out, const SubfitRoute* sub) {
     if (!stream || n_tok < 1 || !res_layer || g_cfg_dev == nullptr) throw std::invalid_argument("native_route_resident: bad arguments");
     float cheap_margin;
     int cheap_rank0, cheap_anytier;
@@ -854,7 +887,8 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     route_resident_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(   // one warp (32 threads) per token
         logits, ids, weights, res_layer, n_tok, g_cfg_dev, stats, want, n_tok <= 8 ? g_detail : nullptr, n_tok <= 8 ? rows : nullptr,
         n_tok <= 8 ? repl : nullptr, ring, cheap, cheap_margin, cheap_rank0, cheap_anytier, bstats, row_shift,
-        pair_c, lrn_rec, layer, pair_pe, mev, row_base, g_frag_ctrl_dev, margin_out, g_cap_dev, g_cap_stats);
+        pair_c, lrn_rec, layer, pair_pe, mev, row_base, g_frag_ctrl_dev, margin_out, g_cap_dev, g_cap_stats,
+        sub != nullptr ? *sub : SubfitRoute{});
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -891,9 +925,15 @@ __device__ __forceinline__ void route_mask_warp(float* __restrict__ logits, int3
                                                 const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
                                                 uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo,
                                                 const uint32_t* __restrict__ fctrl, const float* __restrict__ cap = nullptr,
-                                                unsigned long long* __restrict__ cap_stats = nullptr) {
+                                                unsigned long long* __restrict__ cap_stats = nullptr, const SubfitRoute sub = SubfitRoute{}) {
     const int lane = (int) threadIdx.x;
     const int row = row_base + t;
+    // SPEC-substitute-fit stage 2: this row's substitution record starts empty (the resident stage fills what it moves; the apply consumes)
+    if (sub.orig != nullptr && lane == 0)
+        for (int r = 0; r < 10; ++r) {
+            sub.orig[(size_t) t * 10 + r] = -1;
+            sub.flag[(size_t) t * 10 + r] = 0;
+        }
     // SPEC-recheck-gated step F: the row's shift cap and its running shift (as route_resident_warp: uniform values)
     const float cap_row = (cap != nullptr && row < 32) ? cap[row] : INFINITY;
     float shift_acc = row_shift != nullptr ? row_shift[t] : 0.0f;
@@ -953,22 +993,43 @@ __device__ __forceinline__ void route_mask_warp(float* __restrict__ logits, int3
         // within the stand-ins' edge (STRATA_ROUTE_RESIDENT_EDGE; none: no move) - at every level, so STRATA_MASK_FLOOR=all keeps the top ranks'
         // logit check (7 Nov: without it, rank-0 swaps cut answers short and looped the reasoning).  Uniform across the warp (gap is reduced).
         if (res != nullptr && r < cost_lo && !(edge > 0.0f && gap <= edge)) continue;
-        // SPEC-recheck-gated step F: a move past the row's shift cap is refused (the pick stays; uniform: gap and the weight are warp-reduced)
-        if (cap_row < INFINITY && shift_acc + weights[(size_t) t * 10 + r] * gap > cap_row) {
-            if (lane == 0) {
-                cap_hit = true;
-                if (cap_stats != nullptr) atomicAdd(cap_stats, 1ull);
+        // SPEC-recheck-gated step F: a move past the row's shift cap is refused (the pick stays; uniform: gap and the weight are warp-reduced).
+        // SPEC-substitute-fit stage 2: a fitted pair is taken corrected instead (subfit_rule::decide; no table: the old test)
+        bool corr = false;
+        float add_shift = weights[(size_t) t * 10 + r] * gap;
+        const int fslot = sub.lut != nullptr ? sub_slot(sub, e, bi) : -1;   // (uniform: e and bi are warp-uniform)
+        if (cap_row < INFINITY || fslot >= 0) {
+            const float resid = (fslot >= 0 && sub.resid != nullptr) ? sub.resid[fslot] : 1.0f;
+            const strata::core::subfit_rule::Move mv = strata::core::subfit_rule::decide(
+                shift_acc, cap_row, cap_row < INFINITY, weights[(size_t) t * 10 + r] * gap, fslot >= 0, resid, sub.mode);
+            if (!mv.take) {
+                if (lane == 0) {
+                    cap_hit = true;
+                    if (cap_stats != nullptr) atomicAdd(cap_stats, 1ull);
+                }
+                continue;
             }
-            continue;
+            if (mv.corrected) {
+                corr = true;
+                add_shift = mv.add;
+            }
         }
-        shift_acc += weights[(size_t) t * 10 + r] * gap;
-        if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, weights[(size_t) t * 10 + r] * gap);
+        shift_acc += add_shift;
+        if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, add_shift);
         if (lane == 0 && mev != nullptr && row < kMaskEvRows) {   // STRATA_MASK=learn: the replaced pick and its risk
             const unsigned q = mev->n[row]++;
             if (q < kMaskEvCap) mev->e[row][q] = MaskEv{layer, e, weights[(size_t) t * 10 + r] * gap, (int32_t) (1 | ((r & 15) << 1)) /* mask_ev_pack(1, r) */};
         }
         my[r] = bi;
         ++moved;
+        if (lane == 0 && sub.orig != nullptr) {   // SPEC-substitute-fit stage 2: the router's pick e and the move's correction flag
+            sub.orig[(size_t) t * 10 + r] = (int16_t) e;
+            sub.flag[(size_t) t * 10 + r] = corr ? 1 : 0;
+            if (cap_stats != nullptr) {
+                atomicAdd(cap_stats + 3, 1ull);
+                if (corr) atomicAdd(cap_stats + 2, 1ull);
+            }
+        }
     }
     if (lane == 0 && stats != nullptr) {
         atomicAdd(stats, (unsigned long long) seen);
@@ -989,11 +1050,11 @@ __global__ void route_mask_k(float* __restrict__ logits, int32_t* __restrict__ i
                              unsigned long long* __restrict__ stats, MaskEvs* __restrict__ mev, int layer, int row_base, bool reset,
                              const int32_t* __restrict__ res, const uint8_t* __restrict__ ring, const uint8_t* __restrict__ cheap,
                              uint32_t* __restrict__ cost, const int* __restrict__ ctrl, int cost_lo, const uint32_t* __restrict__ fctrl,
-                             const float* __restrict__ cap, unsigned long long* __restrict__ cap_stats) {
+                             const float* __restrict__ cap, unsigned long long* __restrict__ cap_stats, const SubfitRoute sub) {
     const int t = (int) blockIdx.x;   // one warp (32 threads) per token
     if (t >= n_tok) return;
     route_mask_warp(logits, ids, weights, mask, t, lo, edge, row_shift, stats, mev, layer, row_base, reset, res, ring, cheap, cost, ctrl,
-                    cost_lo, fctrl, cap, cap_stats);
+                    cost_lo, fctrl, cap, cap_stats, sub);
 }
 }  // namespace
 bool route_mask_set(const uint8_t* host, int64_t n_layers, int64_t n_expert, int lo, float edge, std::string& msg, int cost_lo) {
@@ -1073,14 +1134,16 @@ bool route_mask_cost_read(std::vector<uint32_t>& out) {   // the SSD-demand coun
     return true;
 }
 void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream,
-                       MaskEvs* mev, int layer, int row_base, const int32_t* res, const uint8_t* ring, const uint8_t* cheap) {
+                       MaskEvs* mev, int layer, int row_base, const int32_t* res, const uint8_t* ring, const uint8_t* cheap,
+                       const SubfitRoute* sub) {
     if (!mask || !logits || !ids || !weights || n_tok < 1 || g_mask_stats == nullptr) return;
     // the mask's control flag (STRATA_MASK_RESIDENT, or STRATA_MASK_CTRL under the old rule: the window moves nothing in either case) and the
     // fragile control flag (STRATA_FRAGILE_CTRL_EVERY: the same window, no move), both read at launch
     route_mask_k<<<(unsigned) n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, mask, n_tok, g_mask_lo,
                                                                               g_mask_edge, row_shift, g_mask_stats, mev, layer, row_base,
                                                                               layer == 0, res, ring, cheap, g_mask_cost,
-                                                                              g_mask_ctrl_dev, g_mask_cost_lo, g_frag_ctrl_dev, g_cap_dev, g_cap_stats);
+                                                                              g_mask_ctrl_dev, g_mask_cost_lo, g_frag_ctrl_dev, g_cap_dev, g_cap_stats,
+                                                                              sub != nullptr ? *sub : SubfitRoute{});
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -1143,7 +1206,7 @@ bool route_shift_cap_alloc() {
     }
     for (int i = 0; i < 32; ++i) h[i] = INFINITY;
     unsigned long long* st = nullptr;
-    if (cudaMalloc((void**) &st, 2 * sizeof(unsigned long long)) != cudaSuccess || cudaMemset(st, 0, 2 * sizeof(unsigned long long)) != cudaSuccess) {
+    if (cudaMalloc((void**) &st, 4 * sizeof(unsigned long long)) != cudaSuccess || cudaMemset(st, 0, 4 * sizeof(unsigned long long)) != cudaSuccess) {
         (void) cudaGetLastError();
         if (st != nullptr) (void) cudaFree(st);
         (void) cudaFreeHost(h);
@@ -1162,10 +1225,12 @@ bool route_shift_cap_set(const float* caps, int n) {
     return true;
 }
 // Between requests: the refusals since the last read (moves, row launches), read and reset.  false when none exists.
-bool route_shift_cap_read(unsigned long long& moves, unsigned long long& rows) {
+bool route_shift_cap_read(unsigned long long& moves, unsigned long long& rows, unsigned long long* corrected, unsigned long long* substituted) {
     moves = rows = 0;
+    if (corrected != nullptr) *corrected = 0;
+    if (substituted != nullptr) *substituted = 0;
     if (g_cap_stats == nullptr) return false;
-    unsigned long long v[2] = {0, 0};
+    unsigned long long v[4] = {0, 0, 0, 0};
     if (cudaMemcpy(v, g_cap_stats, sizeof v, cudaMemcpyDeviceToHost) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
@@ -1173,6 +1238,8 @@ bool route_shift_cap_read(unsigned long long& moves, unsigned long long& rows) {
     if (cudaMemset(g_cap_stats, 0, sizeof v) != cudaSuccess) (void) cudaGetLastError();
     moves = v[0];
     rows = v[1];
+    if (corrected != nullptr) *corrected = v[2];
+    if (substituted != nullptr) *substituted = v[3];
     return true;
 }
 bool route_mask_update(const std::vector<uint8_t>& host) {
@@ -1242,6 +1309,7 @@ struct PostArgs {
     float* margin_out;          // SPEC-recheck-gated C (layers 0-3; nullptr = off)
     const float* cap;           // SPEC-recheck-gated F: the per-row shift caps (nullptr = off)
     unsigned long long* cap_stats;
+    SubfitRoute sub;            // SPEC-substitute-fit stage 2 (all null = off)
 };
 // SPEC-router-fuse step 2: the layer's own post-routing stages in ONE launch, one warp per token: the learner's label copy (the logits,
 // unchanged by the stages), the layer's mask (route_mask_warp), then route_resident_warp.  The same bodies in the same order as the
@@ -1254,12 +1322,12 @@ __global__ void route_post_k(PostArgs a) {
         for (int i = lane; i < 512; i += 32) a.label[(size_t) t * 512 + i] = a.logits[(size_t) t * 512 + i];
     if (a.mask != nullptr)
         route_mask_warp(a.logits, a.ids, a.weights, a.mask, t, a.mask_lo, a.mask_edge, a.row_shift, a.mstats, a.mev, a.layer, a.row_base,
-                        a.layer == 0, a.mres, a.mring, a.mcheap, a.cost, a.mctrl, a.cost_lo, a.fctrl, a.cap, a.cap_stats);
+                        a.layer == 0, a.mres, a.mring, a.mcheap, a.cost, a.mctrl, a.cost_lo, a.fctrl, a.cap, a.cap_stats, a.sub);
     __syncwarp();   // the mask's ids and weights are what the resident stage reads
     if (a.res != nullptr)
         route_resident_warp(a.logits, a.ids, a.weights, a.res, t, a.cfg, a.rstats, a.want, a.detail, a.rows, a.repl, a.rring, a.rcheap,
                             a.cheap_margin, a.cheap_rank0, a.cheap_anytier, a.bstats, a.row_shift, a.pair_c, a.lrn_rec, a.layer, a.pair_pe,
-                            a.mev, a.row_base, a.fctrl, a.margin_out, a.cap, a.cap_stats);
+                            a.mev, a.row_base, a.fctrl, a.margin_out, a.cap, a.cap_stats, a.sub);
 }
 void native_route_post(const RoutePostArgs& r, void* stream) {
     if (!stream || r.n_tok < 1) throw std::invalid_argument("native_route_post: a stream and at least one row");
@@ -1279,6 +1347,7 @@ void native_route_post(const RoutePostArgs& r, void* stream) {
     resident_env(a.cheap_margin, a.cheap_rank0, a.cheap_anytier);
     a.label = r.label;
     a.margin_out = r.margin_out; a.cap = g_cap_dev; a.cap_stats = g_cap_stats;
+    a.sub = r.sub != nullptr ? *r.sub : SubfitRoute{};
     route_post_k<<<(unsigned) r.n_tok, 32, 0, static_cast<cudaStream_t>(stream)>>>(a);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

@@ -29,6 +29,7 @@
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/subfit_capture.hpp"
+#include "strata/kernels/subfit_apply.hpp"
 
 #include <cuda_runtime.h>
 
@@ -99,6 +100,11 @@ struct VerifyHits {
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
 };
+
+namespace subfit_learn {
+struct Changes;
+struct UploadPacker;
+}
 
 class Verifier {
 public:
@@ -339,6 +345,11 @@ public:
     std::string subfit_learn_report();
     /// STRATA_SUBFIT_LEARN is on (the learner and the layer-input capture)
     bool subfit_learn_active() const;
+    /// SPEC-substitute-fit stage 2 steps 2-5: the device tables' start (A uploaded once; the learner's fits written) and the upload of the
+    /// learner's changes (between windows: the request's end and the start).  Both no-ops with STRATA_SUBFIT_APPLY off.
+    void subfit_tables_start();
+    void subfit_tables_sync(const strata::core::subfit_learn::Changes& ch);
+    strata::kernels::SubfitRoute subfit_route_(int64_t l, int tb) const;
     /// STRATA_MASK=learn: the mask_learn_* hooks, after the window that ran (cut / settle as the stand-in learn's; window: every decode window
     /// of n <= 8 rows with `kept` rows kept; cut: true when the window was cut at its row kept).  active: the buffers and the state exist.
     bool mask_learn_active() const;
@@ -850,6 +861,14 @@ private:
     struct StandinLearnState;
     float* lrn_x_ = nullptr;           ///< device [T][N] (STRATA_SUBFIT_LOG): each stand-in row's layer input at its first stand-in's layer
     strata::kernels::SubfitProbeBufs sp_{};   ///< STRATA_SUBFIT_LOG: the probe buffers (kernels/subfit_capture.hpp)
+    // SPEC-substitute-fit stage 2 (STRATA_SUBFIT_APPLY set, not off; the learner on): the original pick of each substituted slot (int16
+    // [T][10], -1 none) and its corrected flag ([T][10]); both consumed by subfit_apply.  The device tables: LUT, A, B, c, resid, nfit.
+    int16_t* sub_orig_ = nullptr;
+    uint8_t* sub_flag_ = nullptr;
+    strata::kernels::SubfitTables sub_tab_{};
+    bool sub_on_ = false;              ///< the apply path exists (buffers, tables, the route wiring, the apply launch)
+    int sub_mode_ = 0;                 ///< 1 dynamic, 2 all (0 when off)
+    bool sub_started_ = false;         ///< A uploaded and the learner's state written to the tables
     bool sp_on_ = false;               ///< the logger's buffers exist
     bool x_on_ = false;                ///< the layer-input capture exists (STRATA_SUBFIT_LOG or STRATA_SUBFIT_LEARN: lrn_x_ and its launch)
     bool sp_win_ = false;              ///< this window is a probe window (set at its begin)

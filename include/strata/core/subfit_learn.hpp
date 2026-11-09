@@ -153,6 +153,8 @@ public:
 
     Summary summary() const;
     size_t pair_count() const { return pairs_.size(); }
+    /// Pairs with at least `min_ho` held-out samples so far (the request-end line's count).
+    size_t pairs_with_holdout(int min_ho) const;
     size_t slots_used() const;
 
     /// Persistence per model fingerprint: stats and fits (the features are recomputed, not saved).

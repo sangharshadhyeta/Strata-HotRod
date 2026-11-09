@@ -416,6 +416,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_gr_norm.cu
                           src/kernels/cuda/native_moe.cu
                           src/kernels/cuda/subfit_capture.cu
+                          src/kernels/cuda/subfit_apply.cu
                           src/kernels/cuda/native_gdn.cu
                           src/kernels/cuda/native_gr_postops.cu
                           src/kernels/cuda/native_router.cu
@@ -605,6 +606,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(host_graph_launch_test PRIVATE CUDA::cudart Threads::Threads)
     add_test(NAME host_graph_launch_test COMMAND host_graph_launch_test)
     set_tests_properties(host_graph_launch_test PROPERTIES TIMEOUT 30)
+    # SPEC-substitute-fit stage 2 step 3: the apply kernel against a CPU reference (exit 77 without a device; compiled here, run on a GPU)
+    add_executable(subfit_apply_test tests/cuda/subfit_apply_test.cu)
+    target_include_directories(subfit_apply_test PRIVATE include)
+    target_link_libraries(subfit_apply_test PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME subfit_apply_test COMMAND subfit_apply_test)
+    set_tests_properties(subfit_apply_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   endif()
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
     add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)

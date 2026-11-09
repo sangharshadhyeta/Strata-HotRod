@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "strata/kernels/subfit_apply.hpp"
+
 namespace strata::kernels {
 /// STRATA_MASK=learn: the replaced picks of each decode row (a move of the mask, a stand-in swap): layer, the replaced expert, and its risk
 /// (w x gap). Row r's list is n[r] long (entries past kMaskEvCap are counted, not kept); layer 0's launch of a window resets the rows.
@@ -85,7 +87,8 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                            unsigned long long* stats, void* stream, float* want = nullptr, int32_t* rows = nullptr, float* repl = nullptr,
                            const uint8_t* ring = nullptr, const uint8_t* cheap = nullptr, unsigned long long* bstats = nullptr,
                            float* row_shift = nullptr, const float* pair_c = nullptr, int32_t* lrn_rec = nullptr, int layer = 0,
-                           const float* pair_pe = nullptr, MaskEvs* mev = nullptr, int row_base = 0, float* margin_out = nullptr);
+                           const float* pair_pe = nullptr, MaskEvs* mev = nullptr, int row_base = 0, float* margin_out = nullptr,
+                           const SubfitRoute* sub = nullptr);
 /// SPEC-recheck-gated (C): margin_out = nullptr or the device array [rows] (row_base + t); layers 0-3 min their router's top-1 minus top-2
 /// raw logit into it (the caller sets it to a large value before the window).  Other layers leave it alone.
 /// STRATA_STANDIN_BALANCE: pair_pe = the layer's [512][512] risk factor (clip(err / mean err, 0.25, 4) of a ready pair, 1 otherwise), or nullptr.
@@ -148,7 +151,7 @@ const std::vector<uint8_t>* route_mask_host();
 /// With mev (a decode row) the layer's non-cheap picks are counted in the SSD-demand counters (route_mask_cost_read).
 void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_t* mask, int n_tok, float* row_shift, void* stream,
                        MaskEvs* mev = nullptr, int layer = 0, int row_base = 0, const int32_t* res = nullptr, const uint8_t* ring = nullptr,
-                       const uint8_t* cheap = nullptr);
+                       const uint8_t* cheap = nullptr, const SubfitRoute* sub = nullptr);
 /// SPEC-router-fuse step 2: the layer's own post-routing stages in one launch, one warp per token, in this order: the learner's label copy
 /// (label, nullable: the logits of the layer, copied), the layer's mask (mask nullable: no mask; mres / mring / mcheap as native_route_mask's
 /// res / ring / cheap), then native_route_resident's stage (res nullable: no stand-in stage; the other pointers as native_route_resident's).
@@ -179,6 +182,7 @@ struct RoutePostArgs {
     const float* pair_pe;
     float* label;
     float* margin_out = nullptr;   // SPEC-recheck-gated (C): the early margin of layers 0-3 (nullptr = off)
+    const SubfitRoute* sub = nullptr;   // SPEC-substitute-fit stage 2: the layer's corrections (nullptr = off)
 };
 void native_route_post(const RoutePostArgs& a, void* stream);
 /// STRATA_MASK_RESIDENT: the SSD-demand counters, flat [layers][512] (the router's non-cheap picks since the start, u32, wrapping). false: none.
@@ -210,7 +214,8 @@ bool route_fragile_hold_ready();
 /// with at least one refusal), reset.  Without the alloc, nothing is capped.
 bool route_shift_cap_alloc();
 bool route_shift_cap_set(const float* caps, int n);
-bool route_shift_cap_read(unsigned long long& moves, unsigned long long& rows);
+bool route_shift_cap_read(unsigned long long& moves, unsigned long long& rows, unsigned long long* corrected = nullptr,
+                          unsigned long long* substituted = nullptr);
 /// The seen / moved counts since the last read (read and reset); false when no mask is set.
 bool route_mask_read(unsigned long long& seen, unsigned long long& moved);
 /// STRATA_LA_MODEL=<file> (opt-in): the published per-layer d=1 linear expert predictors, folded into one bf16 [512 x n_embd]
