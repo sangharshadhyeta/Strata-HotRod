@@ -1236,6 +1236,19 @@ bool standin_pool_apply_env() {
 // STRATA_SUBFIT_LOG=1 (SPEC-substitute-fit stage 1a): the sample logger.  It needs the learn tap, so it turns the learner on in observe
 // mode when STRATA_STANDIN_LEARN is unset or 0 (no correction applied; the answers stay the default's).
 bool subfit_log_env_on() { return strata::core::subfit::log_on_env(std::getenv("STRATA_SUBFIT_LOG")); }
+// SPEC-substitute-fit stage 2 step 1 (STRATA_SUBFIT_LEARN=1, opt-in): the live per-pair learner and its layer-input capture.
+bool subfit_learn_env_on() { return strata::core::subfit::log_on_env(std::getenv("STRATA_SUBFIT_LEARN")); }
+std::unique_ptr<strata::core::subfit_learn::Learner> g_sub_learn;   // created with the stand-in learner's dims (make_sub_learn)
+uint64_t g_sub_learn_req = 0;                                         // the learner's samples since the request's end (the stats line)
+void make_sub_learn(int64_t dim, int64_t layers) {
+    if (g_sub_learn || dim <= 0 || layers <= 0) return;
+    strata::core::subfit_learn::Config cfg;
+    cfg.n = (int) dim;
+    cfg.n_layers = (int) layers;
+    cfg.rank = strata::core::subfit_learn::rank_env(std::getenv("STRATA_SUBFIT_RANK"));
+    cfg.max_pairs = strata::core::subfit_learn::pairs_env(std::getenv("STRATA_SUBFIT_PAIRS"));
+    g_sub_learn = std::make_unique<strata::core::subfit_learn::Learner>(cfg);
+}
 bool standin_learn_observe_env() {
     const char* e = std::getenv("STRATA_STANDIN_LEARN");
     if (e != nullptr && std::strcmp(e, "observe") == 0) return true;
@@ -1404,6 +1417,8 @@ void Verifier::standin_learn_begin_window(bool decode, bool exact) {
         gate[1] = st.pend.layer;
         gate[2] = st.pend.rank;
     }
+    // STRATA_SUBFIT_LEARN: the live learner exists from the first decode window (the stand-in learner's dims are known)
+    if (x_on_ && decode && subfit_learn_env_on()) make_sub_learn(st.dim, st.layers);
     // STRATA_SUBFIT_LOG: the sample file opens here (the dims are known now); one decode window in sp_every_ is a probe window (gate[3])
     sp_win_ = false;
     if (sp_on_ && decode) {
@@ -1443,7 +1458,7 @@ void Verifier::standin_learn_cut(int row) {
         (void) cudaGetLastError();
         return;
     }
-    if (sp_on_ && lrn_x_ != nullptr) {   // STRATA_SUBFIT_LOG: the cut row's layer input (this stand-in window's)
+    if (x_on_ && lrn_x_ != nullptr) {   // STRATA_SUBFIT_LOG / STRATA_SUBFIT_LEARN: the cut row's layer input (this stand-in window's)
         std::vector<float> x((size_t) st.dim);
         if (cudaMemcpy(x.data(), lrn_x_ + (size_t) row * st.dim, sizeof(float) * (size_t) st.dim, cudaMemcpyDeviceToHost) != cudaSuccess) {
             (void) cudaGetLastError();
@@ -1488,6 +1503,11 @@ void Verifier::standin_learn_settle(bool exact_ok) {
     // STRATA_SUBFIT_LOG: the sample (x, y_s, y_e) of this stand-in, between windows (issue #31: no CUDA call inside a window)
     if (g_subfit && g_subfit->is_open() && (int64_t) st.pend.x.size() == D)
         g_subfit->write_stand_in((uint16_t) l, (uint16_t) e, (uint16_t) s, (uint8_t) st.pend.rank, st.pend.x.data(), ys.data(), ye.data());
+    // STRATA_SUBFIT_LEARN: the same sample feeds the live learner (between windows; its refit is at the request's end)
+    if (g_sub_learn && (int64_t) st.pend.x.size() == D) {
+        g_sub_learn->add_sample((int) l, (int) e, (int) s, st.pend.x.data(), ys.data(), ye.data());
+        ++g_sub_learn_req;
+    }
     const uint64_t key = lrn_key(l, e, s);
     const bool pool = standin_pool_apply_env();
     if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
@@ -1649,6 +1669,57 @@ void Verifier::subfit_probe_collect() {
     }
     if (g_subfit->write_probe((uint16_t) l, (uint16_t) pre[(size_t) (l * K + k)], (uint8_t) k, w[(size_t) (l * K + k)], x.data(), y.data()))
         ++st.probe_recs;
+}
+
+// SPEC-substitute-fit stage 2 step 1: the live learner's file (per model fingerprint), its request-end refit and its stats line.
+bool Verifier::subfit_learn_active() const { return lrn_st_ != nullptr && subfit_learn_env_on(); }
+
+bool Verifier::subfit_learn_open(const std::string& path, uint64_t fp, std::string& msg) {
+    if (!subfit_learn_active()) {
+        msg = "not on";
+        return false;
+    }
+    make_sub_learn(lrn_st_->dim, lrn_st_->layers);
+    if (!g_sub_learn) {
+        msg = "no dims";
+        return false;
+    }
+    if (!std::filesystem::exists(path)) {
+        msg = "no saved state yet";
+        return false;
+    }
+    std::string err;
+    if (g_sub_learn->load(path, fp, err)) {
+        msg = "loaded";
+        return true;
+    }
+    msg = err;
+    return false;
+}
+
+bool Verifier::subfit_learn_save(const std::string& path, uint64_t fp, std::string& msg) const {
+    if (!g_sub_learn) {
+        msg = "not on";
+        return false;
+    }
+    return g_sub_learn->save(path, fp, msg);
+}
+
+std::string Verifier::subfit_learn_report() {
+    if (!subfit_learn_active() || !g_sub_learn) return "";
+    // the request's end: the pairs with new samples refit and the gate moves.  The device table is not uploaded yet (the apply kernel
+    // is not built): the changes are counted and dropped here.
+    const strata::core::subfit_learn::Changes ch = g_sub_learn->refit();
+    const strata::core::subfit_learn::Summary s = g_sub_learn->summary();
+    const auto mode = (strata::core::subfit_learn::Apply) route_resident_cfg().subfit_mode;
+    char buf[320];
+    std::snprintf(buf, sizeof buf,
+                  "strata serve: subfit: mode %s, pairs sampled %zu, fitted %zu (held-out gain median %.3f, min %.3f), corrected moves 0 of "
+                  "%llu substituted (apply not built: %zu slot changes dropped), refusals left n/a\n",
+                  strata::core::subfit_learn::apply_name(mode), s.pairs, s.fitted, s.gain_median, s.gain_min,
+                  (unsigned long long) g_sub_learn_req, ch.slots.size());
+    g_sub_learn_req = 0;
+    return buf;
 }
 
 std::string Verifier::standin_learn_report() {
@@ -1965,7 +2036,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         // STRATA_SUBFIT_LOG=1 (opt-in): the stand-in rows' layer inputs and row 0's probe buffers (K = 10); nothing else is taken
         const bool sp_on = lrn_on && subfit_log_env_on();
         const uint64_t spL = (uint64_t) g.n_layers;
-        lrn_x_ = b.take<float>(sp_on ? (uint64_t) T * N : 0);
+        // STRATA_SUBFIT_LEARN=1 (opt-in, stage 2): the layer input of each stand-in row too (the learner's x); off: nothing extra is taken
+        x_on_ = lrn_on && (sp_on || subfit_learn_env_on());
+        lrn_x_ = b.take<float>(x_on_ ? (uint64_t) T * N : 0);
         sp_.x = b.take<float>(sp_on ? spL * N : 0);
         sp_.y = b.take<float>(sp_on ? spL * 10 * N : 0);
         sp_.w = b.take<float>(sp_on ? spL * 10 : 0);
@@ -1974,7 +2047,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sp_.clean = b.take<int32_t>(sp_on ? spL : 0);
         sp_on_ = sp_on;
         sp_every_ = strata::core::subfit::probe_every_env(std::getenv("STRATA_SUBFIT_PROBE_EVERY"));
-        if (!sp_on) { lrn_x_ = nullptr; sp_ = strata::kernels::SubfitProbeBufs{}; }
+        if (!sp_on) sp_ = strata::kernels::SubfitProbeBufs{};
+        if (!x_on_) lrn_x_ = nullptr;
         lrn_pe_ = b.take<float>(lrn_on && standin_balance_env() ? (uint64_t) g.n_layers * 512 * 512 : 0);
         if (!(lrn_on && standin_balance_env())) lrn_pe_ = nullptr;
         if (!lrn_on) { lrn_c_ = nullptr; lrn_rec_ = nullptr; lrn_ys_ = nullptr; lrn_ye_ = nullptr; lrn_gate_ = nullptr; }
@@ -3450,9 +3524,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         }   // !post_own
         // STRATA_SUBFIT_LOG (opt-in): the stand-in rows' layer input; row 0's probe flags, weights and input after route-resident
-        if (sp_on_ && lrn_gate_ != nullptr) {
+        if ((sp_on_ || x_on_) && lrn_gate_ != nullptr) {   // (x_on_ alone: the layer input only, for the learner)
             strata::kernels::subfit_capture_x(mixed_ + (size_t) tb * N, lrn_rec_ + (size_t) tb * 4, lrn_gate_, (int) l,
                                               lrn_x_ + (size_t) tb * N, N, n, cs);
+        }
+        if (sp_on_ && lrn_gate_ != nullptr) {
             if (tb == 0 && hits_.d_res != nullptr)
                 strata::kernels::subfit_probe_post(ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, sp_.pre, sp_.clean, lrn_gate_,
                                                    mixed_ + (size_t) tb * N, (int) l, K, N, sp_.x, sp_.w, sp_.flag, cs);
@@ -5739,12 +5815,14 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
     // H3: the k line with the base k_safe, r*, n_t, f_t and the control's upper bound
     if (c.fragile_k != old) {
         if (ev.found)
-            std::fprintf(stderr, "strata serve: fragile recheck: k %.3f (base k_safe %.3f (r* %.3f, n_t %lld, f_t %lld; control upper bound %.3f over %d "
+            std::fprintf(stderr, "strata serve: fragile recheck (APPLY mode %s): k %.3f (base k_safe %.3f (r* %.3f, n_t %lld, f_t %lld; control upper bound %.3f over %d "
                          "control re-checks); %lld rechecks, %lld flips in all)\n",
+                         strata::core::subfit_learn::apply_name((strata::core::subfit_learn::Apply) c.subfit_mode),
                          (double) c.fragile_k, (double) c.fragile_k, ev.r_star, ev.n_t, ev.f_t, kctrl_hi, c.fr_ctrl_n, c.fragile_rechecks, c.fragile_flips);
         else
-            std::fprintf(stderr, "strata serve: fragile recheck: k %.3f (no flip above the control's noise (upper bound %.3f over %d control "
+            std::fprintf(stderr, "strata serve: fragile recheck (APPLY mode %s): k %.3f (no flip above the control's noise (upper bound %.3f over %d control "
                          "re-checks): k lowered by half; %lld rechecks)\n",
+                         strata::core::subfit_learn::apply_name((strata::core::subfit_learn::Apply) c.subfit_mode),
                          (double) c.fragile_k, kctrl_hi, c.fr_ctrl_n, c.fragile_rechecks);
         route_tune_write(c);
     }

@@ -12490,6 +12490,8 @@ int main(int argc, char** argv) {
         } else if (strata::core::mask_learn_env())
             std::fprintf(stderr, "strata serve: mask learn: off (needs the flip re-check: STRATA_FRAGILE_RECHECK and route-resident)\n");
         std::string standin_learn_file;
+        std::string subfit_learn_file;   // SPEC-substitute-fit stage 2 step 1 (STRATA_SUBFIT_LEARN): beside the stand-in learner's file
+        uint64_t subfit_learn_fp = 0;
         if (ver.standin_learn_active()) {
             const std::string tune = standin_tune_path(o);
             strata::core::SessionFileIdentity sid;
@@ -12500,6 +12502,15 @@ int main(int argc, char** argv) {
                 char hex[17];
                 std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) sid.model);
                 standin_learn_file = (std::filesystem::path(tune).parent_path() / ("standin-learn-" + std::string(hex) + ".bin")).string();
+                if (ver.subfit_learn_active()) {
+                    subfit_learn_file = (std::filesystem::path(tune).parent_path() / ("subfit-learn-" + std::string(hex) + ".bin")).string();
+                    subfit_learn_fp = sid.model;
+                    std::string sm;
+                    if (ver.subfit_learn_open(subfit_learn_file, subfit_learn_fp, sm))
+                        std::fprintf(stderr, "strata serve: subfit learn: loaded %s (%s)\n", subfit_learn_file.c_str(), sm.c_str());
+                    else
+                        std::fprintf(stderr, "strata serve: subfit learn: starts empty (%s)\n", sm.c_str());
+                }
                 std::string lm;
                 if (ver.standin_learn_open(standin_learn_file, lm))
                     std::fprintf(stderr, "strata serve: stand-in learn: loaded %s (%s)\n", standin_learn_file.c_str(), lm.c_str());
@@ -17079,6 +17090,13 @@ int main(int argc, char** argv) {
                 if (!standin_learn_file.empty() && !ver.standin_learn_save(standin_learn_file, lm))
                     std::fprintf(stderr, "strata serve: stand-in learn: cannot save %s (%s)\n", standin_learn_file.c_str(), lm.c_str());
                 std::fputs(ver.standin_learn_report().c_str(), stderr);
+            }
+            // SPEC-substitute-fit stage 2 step 1 (STRATA_SUBFIT_LEARN=1): the learner's refit at the request's end, its file, and its line
+            if (ver.subfit_learn_active()) {
+                std::string sm;
+                if (!subfit_learn_file.empty() && !ver.subfit_learn_save(subfit_learn_file, subfit_learn_fp, sm))
+                    std::fprintf(stderr, "strata serve: subfit learn: cannot save %s (%s)\n", subfit_learn_file.c_str(), sm.c_str());
+                std::fputs(ver.subfit_learn_report().c_str(), stderr);
             }
             // STRATA_LA_EDGE_SKIP (opt-in =1 since 24 Oct): the decode look-ahead's rank lo-1 predictions that a resident stand-in
             // within the edge covers, not read ahead, since the previous request (the device counter is taken and zeroed here)

@@ -331,6 +331,14 @@ public:
     /// and subfit_probe_collect() runs after each window that was a probe window (between windows: the host reads the probe buffers).
     static void subfit_set_path(const std::string& path);
     void subfit_probe_collect();
+    /// SPEC-substitute-fit stage 2 step 1 (STRATA_SUBFIT_LEARN=1, opt-in; needs the stand-in learner): the live per-pair learner.  Its file
+    /// opens at start (false with msg when there is none, the learner starts empty); subfit_learn_report() refits at a request's end
+    /// (between windows), saves the file when path is not empty, and returns the request-end line.  "" when the learner is off.
+    bool subfit_learn_open(const std::string& path, uint64_t fp, std::string& msg);
+    bool subfit_learn_save(const std::string& path, uint64_t fp, std::string& msg) const;
+    std::string subfit_learn_report();
+    /// STRATA_SUBFIT_LEARN is on (the learner and the layer-input capture)
+    bool subfit_learn_active() const;
     /// STRATA_MASK=learn: the mask_learn_* hooks, after the window that ran (cut / settle as the stand-in learn's; window: every decode window
     /// of n <= 8 rows with `kept` rows kept; cut: true when the window was cut at its row kept).  active: the buffers and the state exist.
     bool mask_learn_active() const;
@@ -843,6 +851,7 @@ private:
     float* lrn_x_ = nullptr;           ///< device [T][N] (STRATA_SUBFIT_LOG): each stand-in row's layer input at its first stand-in's layer
     strata::kernels::SubfitProbeBufs sp_{};   ///< STRATA_SUBFIT_LOG: the probe buffers (kernels/subfit_capture.hpp)
     bool sp_on_ = false;               ///< the logger's buffers exist
+    bool x_on_ = false;                ///< the layer-input capture exists (STRATA_SUBFIT_LOG or STRATA_SUBFIT_LEARN: lrn_x_ and its launch)
     bool sp_win_ = false;              ///< this window is a probe window (set at its begin)
     int sp_every_ = 64;                ///< STRATA_SUBFIT_PROBE_EVERY: decode windows per probe window
     uint64_t sp_decode_ = 0;           ///< decode windows seen
