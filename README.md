@@ -127,6 +127,10 @@ questions, 30 coding questions, answers read by hand): 47 of 50 and 30 of 30 cor
 nothing replaced. A test this small cannot show a difference of one or two answers either way. Since 24 Oct every JSON and
 code answer in the structured-output checks has been valid. Detail: [SPEC.md](SPEC.md).
 
+**Re-check on and off (9 Nov):** 3 short and 3 long answers (2,500 tokens each, a CPU explanation, a 150-line program, a
+multi-step tank problem), run twice, every answer read in full with its thinking: all correct and clean in both settings
+(no loops, stray tokens or broken words); 42-44 tokens/s with the re-check off, 31-34 with it on.
+
 **MMLU-Pro (30 Oct): 87.1%** - 183 of 210 questions (15 from each of its 14 subjects), thinking on, 32K context,
 temperature 0, the stand-ins on; every answer finished cleanly (no cut-offs or loops). For comparison, published Vals
 scores: Qwen3.8-27B 84.3%, Qwen3.8 Max 88.6%.
@@ -158,8 +162,10 @@ about the ones that do not.
 <div align="justify">
 
 **Stand-in experts.** A missing expert is replaced by one already on the card only when
-`router weight × logit gap ≤ budget`. The budget tunes itself by measured speed, a token a stand-in could have flipped is
-recomputed exactly, and each request brakes itself when it sees flips.
+`router weight × logit gap ≤ budget`. **For extra certainty**, the flip re-check (`"STRATA_FRAGILE_RECHECK": "1"`) recomputes
+exactly the few tokens a stand-in could have flipped; with it on, the budget also tunes itself by measured speed and the
+stand-ins, the mask and the substitute corrections keep learning. It is off by default since 9 Nov: about a quarter slower,
+and every answer we read was correct either way.
 
 </div>
 
@@ -233,6 +239,12 @@ and kept across restarts.
 Every change and its measurement: [docs/HOTROD-DETAILS.md](docs/HOTROD-DETAILS.md) · the predictor study:
 [docs/PREDICTOR-EXPERIMENTS.md](docs/PREDICTOR-EXPERIMENTS.md) · the full log of ideas tried: [docs/perf-ideas.md](docs/perf-ideas.md) ·
 earlier experiments from a separate fork: [docs/EARLIER-EXPERIMENTS.md](docs/EARLIER-EXPERIMENTS.md).
+
+**New on main (9 Nov):** the flip re-check is opt-in (`STRATA_FRAGILE_RECHECK=1`; off: 42-44 vs 31-34 tokens/s on this
+PC at 262K, answers correct in both); the shift cap is opt-in (`STRATA_SHIFT_CAP=1`); the stand-in learner learns from the
+real experts again (it had read zeros since 8 Nov); a substitute-correction learner with a flip mode
+(`STRATA_SUBFIT_APPLY=flip`, needs the re-check; it applies a pair's correction only where its own held-out test shows a
+gain - none has on Qwen IQ3_S yet).
 
 **New in v0.1.45-hotrod.2 (31 Oct):** the learned look-ahead v2 (trained with a rank-weighted loss) is the one setup
 downloads; the expert placement comes from routing traces (`tools/placement/solve.py`); the Monitor's decode timeline
@@ -338,21 +350,31 @@ When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095`. 
 
 - **Measured at start:** the VRAM reserve (learned per card and context), the RAM tier (sized from free memory) and which
   experts sit on the card or in RAM (the most used first).
-- **Measured while it serves:** the stand-in budget and the mask's depth, each by an alternating speed test over the same
-  stretch of text (the faster setting is kept only when it does not add flips). A faster or slower drive moves them where
-  they belong on that machine.
+- **Measured while it serves (with the re-check on):** the stand-in budget and the mask's depth, each by an alternating
+  speed test over the same stretch of text (the faster setting is kept only when it does not add flips). A faster or slower
+  drive moves them where they belong on that machine. With the re-check off (the default) the values already learned are
+  used as they are.
 - **Learned from your use:** the look-ahead, the mask and the stand-ins (below).
 - **Learned files** sit in `data/`, named by the model's id: `standin-tune-<id>.txt`, `mask-learn-<id>.bin`,
-  `standin-learn-<id>.bin`, `predictor-<id>.bin`, plus `ram-reserve.json`. They hold this machine's values: when you move an
+  `standin-learn-<id>.bin`, `subfit-learn-<id>.bin`, `predictor-<id>.bin`, plus `ram-reserve.json`. They hold this machine's values: when you move an
   install to another PC, delete all but `predictor-<id>.bin` (the look-ahead belongs to the model and carries over) and
   let them relearn.
-- **The learned mask is on by default** (7 Nov, CUDA; with route-resident stand-ins configured): each re-checked token
+- **For better certainty, turn the flip re-check on** - add to the config's `"env"`:
+
+  ```json
+  "STRATA_FRAGILE_RECHECK": "1"
+  ```
+
+  The few tokens a stand-in could have flipped (6-8 in 100 here) are then recomputed with the real experts, and the learning
+  below runs. It costs about a quarter of the speed (31-34 instead of 42-44 tokens/s on this PC at 262K). Every answer we
+  read was correct either way; turn it on for long or high-stakes answers, or to let the engine keep fitting itself.
+- **The learned mask** (7 Nov, CUDA; needs the re-check and route-resident stand-ins): each re-checked token
   measures how much the masked experts changed the output; the least harmful of the little-used experts are masked, the
   proven-harmless ones at every rank, and the depth follows the speed test. The look-ahead learns the picks that cost a read
   4x harder (`STRATA_LA_EXACT_W`, default 4) and gives the experts the mask removed no weight. `"STRATA_MASK": "0"` and
-  `"STRATA_LA_EXACT_W": "1"` turn them off (do so on AMD or Apple). Opt-in: `"STRATA_STANDIN_LEARN": "1"` and
-  `"STRATA_STANDIN_BALANCE": "1"` (no gain shown yet).
-- **What to watch** in the server log after a request: `auto mask test` and `auto budget test` (each test's speeds and
+  `"STRATA_LA_EXACT_W": "1"` turn them off (do so on AMD or Apple). Opt-in (all need the re-check): `"STRATA_STANDIN_LEARN": "1"`,
+  `"STRATA_STANDIN_BALANCE": "1"` (no gain shown yet) and `"STRATA_SUBFIT_APPLY": "flip"` (the substitute corrections).
+- **What to watch** in the server log after a request (the tests and learners need the re-check on): `auto mask test` and `auto budget test` (each test's speeds and
   what it kept), `mask learn:` (share, masked, at all ranks, re-check divergence) and `look-ahead learner:` (its guess rates
   against the plain router).
 - **Smaller machines:** lower `--max-context` first (the KV cache is the largest fixed cost); setup refuses a PC that cannot
