@@ -1,5 +1,6 @@
 // src/kernels/cuda/subfit_capture.cu - the device side of STRATA_SUBFIT_LOG=1 (see include/strata/kernels/subfit_capture.hpp).
 #include "strata/kernels/subfit_capture.hpp"
+#include <cuda_runtime.h>
 
 namespace strata::kernels {
 namespace {
@@ -49,26 +50,26 @@ __global__ void k_probe_y(const float* __restrict__ parts, const int32_t* __rest
 }  // namespace
 
 void subfit_capture_x(const float* mixed, const int32_t* rec, const int32_t* gate, int layer, float* x, int64_t N, int n_rows,
-                      cudaStream_t stream) {
+                      void* stream) {
     if (n_rows <= 0) return;
     const dim3 grid((unsigned) ((N + kThreads - 1) / kThreads), (unsigned) n_rows);
-    k_capture_x<<<grid, kThreads, 0, stream>>>(mixed, rec, gate, layer, x, N, n_rows);
+    k_capture_x<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(mixed, rec, gate, layer, x, N, n_rows);
 }
 
 void subfit_probe_pre(const int32_t* ids, const int32_t* rec, const int32_t* gate, int layer, int K, int32_t* pre, int32_t* clean,
-                      int32_t* flag, cudaStream_t stream) {
-    k_probe_pre<<<1, 32, 0, stream>>>(ids, rec, gate, layer, K, pre, clean, flag);
+                      int32_t* flag, void* stream) {
+    k_probe_pre<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(ids, rec, gate, layer, K, pre, clean, flag);
 }
 
 void subfit_probe_post(const int32_t* ids, const float* w, const int32_t* res, const int32_t* pre, const int32_t* clean,
                        const int32_t* gate, const float* mixed0, int layer, int K, int64_t N, float* x, float* w_out, int32_t* flag,
-                       cudaStream_t stream) {
-    k_probe_post<<<1, kThreads, 0, stream>>>(ids, w, res, pre, clean, gate, mixed0, layer, K, N, x, w_out, flag);
+                       void* stream) {
+    k_probe_post<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(ids, w, res, pre, clean, gate, mixed0, layer, K, N, x, w_out, flag);
 }
 
-void subfit_probe_y(const float* parts, const int32_t* gate, int64_t K_N, float* y, cudaStream_t stream) {
+void subfit_probe_y(const float* parts, const int32_t* gate, int64_t K_N, float* y, void* stream) {
     const int64_t blocks = (K_N + kThreads - 1) / kThreads;
-    k_probe_y<<<(unsigned) (blocks < 1 ? 1 : blocks), kThreads, 0, stream>>>(parts, gate, K_N, y);
+    k_probe_y<<<(unsigned) (blocks < 1 ? 1 : blocks), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(parts, gate, K_N, y);
 }
 
 }  // namespace strata::kernels
