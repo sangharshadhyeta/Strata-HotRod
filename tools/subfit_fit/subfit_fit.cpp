@@ -237,10 +237,13 @@ void analyse_layer(const std::vector<Item*>& items, bool tag1, double lambda_rel
             for (int a = 0; a < F; ++a) Htr.push_back(h[a]);
             for (int j = 0; j < N; ++j) Rtr.push_back((double) it->ye[(size_t) j] - (double) ysub[j]);
             // the scalars (training half): the substitute's and the oracle's
+            // (a tag-2 item has no stand-in output: its ys is empty, so only the oracle's (yb) scalar is taken; the crash of 2026-11-09)
             for (int j = 0; j < N; ++j) {
                 const double y = it->ye[(size_t) j];
-                sxy_s += (double) it->ys[(size_t) j] * y;
-                sxx_s += (double) it->ys[(size_t) j] * it->ys[(size_t) j];
+                if (tag1) {
+                    sxy_s += (double) it->ys[(size_t) j] * y;
+                    sxx_s += (double) it->ys[(size_t) j] * it->ys[(size_t) j];
+                }
                 sxy_b += (double) it->yb[(size_t) j] * y;
                 sxx_b += (double) it->yb[(size_t) j] * it->yb[(size_t) j];
             }
