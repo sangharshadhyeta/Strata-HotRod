@@ -49,7 +49,7 @@ constexpr double kScalarClip = 4.0;           ///< the scalar used is clipped to
 constexpr double kLambdaRel = 0.1;            ///< lambda = kLambdaRel * trace(ZtZ) / r
 
 /// The learner's switch (STRATA_SUBFIT_APPLY, read once at start): off, dynamic (the step-F cap's refusals are taken corrected), all.
-enum class Apply { Off = 0, Dynamic = 1, All = 2 };
+enum class Apply { Off = 0, Dynamic = 1, All = 2, Flip = 3 };
 /// "off", "dynamic", "all"; unset or anything else is dynamic (the default).
 Apply apply_env(const char* v);
 const char* apply_name(Apply a);

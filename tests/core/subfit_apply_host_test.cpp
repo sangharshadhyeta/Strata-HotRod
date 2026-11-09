@@ -105,6 +105,12 @@ void test_rule() {
     // a fitted pair in mode off is not corrected either (the mode is the switch)
     CHECK(!rule::decide(0.0f, 0.5f, true, 9.0f, true, 0.3f, rule::kModeOff).corrected, "mode off ignores the fit");
     CHECK(!rule::decide(0.0f, 0.5f, true, 9.0f, true, 0.3f, rule::kModeOff).take, "mode off: a fitted move past the cap is still refused");
+    // mode flip: corrected only in the flip re-check's window; outside it the move is exactly as mode off
+    CHECK(rule::decide(0.0f, kInf, false, 2.0f, true, 0.3f, rule::kModeFlip, true).corrected, "flip: a fitted move in the re-check window is corrected");
+    CHECK(std::fabs(rule::decide(0.0f, kInf, false, 2.0f, true, 0.3f, rule::kModeFlip, true).add - 0.6f) < 1e-6f, "flip: its shift is plain x resid");
+    CHECK(!rule::decide(0.0f, kInf, false, 2.0f, true, 0.3f, rule::kModeFlip, false).corrected, "flip: outside the window the move is plain");
+    CHECK(!rule::decide(0.0f, kInf, false, 2.0f, false, 1.0f, rule::kModeFlip, true).corrected, "flip: an unfitted move is never corrected");
+    CHECK(!rule::decide(0.0f, 0.5f, true, 9.0f, true, 0.3f, rule::kModeFlip, false).take, "flip: outside the window the cap refuses as mode off");
 
     // dynamic: under the cap, a fitted move is plain; past the cap it is taken corrected, adding plain x resid
     rule::Move m = rule::decide(0.1f, 1.0f, true, 0.4f, true, 0.25f, rule::kModeDynamic);

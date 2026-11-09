@@ -8,6 +8,8 @@
 //   - mode all: every fitted move is taken and corrected (no cap test); its shift counts as plain x resid.
 //   - mode dynamic: a move past the row's cap (shift_acc + plain > cap) is taken corrected when fitted (its shift counts as plain x resid),
 //     and refused otherwise (the router's pick stays).  A move under the cap is taken plain, as today.
+//   - mode flip: only in the flip re-check's exact window (flip_win) is a fitted move taken corrected (the router lets the move through
+//     the re-check's ~0 tail budget for it); in every other window the move is plain, as mode off.
 //   - mode off (or no fit): the cap refuses a move past the cap, exactly as before the learner existed.
 #pragma once
 
@@ -22,6 +24,7 @@ namespace strata::core::subfit_rule {
 constexpr int kModeOff = 0;
 constexpr int kModeDynamic = 1;
 constexpr int kModeAll = 2;
+constexpr int kModeFlip = 3;
 
 struct Move {
     bool take;       ///< the move is made (false: refused, the router's pick stays)
@@ -30,9 +33,10 @@ struct Move {
 };
 
 /// The decision for one move.  capped: the row has a cap (cap < +inf); shift_acc: the row's shift so far; plain: this move's shift.
-STRATA_SUBFIT_HD Move decide(float shift_acc, float cap, bool capped, float plain, bool fitted, float resid, int mode) {
+STRATA_SUBFIT_HD Move decide(float shift_acc, float cap, bool capped, float plain, bool fitted, float resid, int mode,
+                             bool flip_win = false) {
     Move d{true, false, plain};
-    if (fitted && mode == kModeAll) {
+    if (fitted && (mode == kModeAll || (mode == kModeFlip && flip_win))) {
         d.corrected = true;
     } else if (capped && shift_acc + plain > cap) {
         if (fitted && mode == kModeDynamic) {

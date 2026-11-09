@@ -1462,7 +1462,7 @@ void Verifier::standin_learn_begin_window(bool decode, bool exact) {
     StandinLearnState& st = *lrn_st_;
     const OnDevice on(device_);
     if (!st.table_ready) standin_learn_fill_table();
-    int32_t gate[4] = {0, 0, 0, 0};
+    int32_t gate[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     if (decode) {
         if (cudaMemset(lrn_rec_, 0xff, (size_t) max_t_ * 4 * sizeof(int32_t)) != cudaSuccess) (void) cudaGetLastError();
         if (shd_on_ && cudaMemset(shd_n_, 0, (size_t) max_t_ * sizeof(uint32_t)) != cudaSuccess) (void) cudaGetLastError();
@@ -1470,6 +1470,7 @@ void Verifier::standin_learn_begin_window(bool decode, bool exact) {
         gate[0] = y_e ? 2 : 1;
         gate[1] = st.pend.layer;
         gate[2] = st.pend.rank;
+        gate[4] = exact ? 1 : 0;   // STRATA_SUBFIT_APPLY=flip: this is a flip re-check's exact window (the router corrects fitted stand-ins in it)
     }
     // STRATA_SUBFIT_LEARN: the live learner exists from the first decode window (the stand-in learner's dims are known)
     if (x_on_ && decode && subfit_learn_env_on()) make_sub_learn(st.dim, st.layers);
@@ -1855,6 +1856,7 @@ strata::kernels::SubfitRoute Verifier::subfit_route_(int64_t l, int tb) const {
     r.lut = sub_tab_.lut + (size_t) l * 512 * 512;
     r.resid = sub_tab_.resid;
     r.mode = sub_mode_;
+    r.gate = lrn_gate_;
     return r;
 }
 
@@ -2246,7 +2248,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         lrn_rec_ = b.take<int32_t>(lrn_on ? T * 4 : 0);
         lrn_ys_ = b.take<float>(lrn_on ? T * N : 0);
         lrn_ye_ = b.take<float>(lrn_on ? N : 0);
-        lrn_gate_ = b.take<int32_t>(lrn_on ? 4 : 0);
+        lrn_gate_ = b.take<int32_t>(lrn_on ? 8 : 0);
         // STRATA_SUBFIT_LOG=1 (opt-in): the stand-in rows' layer inputs and row 0's probe buffers (K = 10); nothing else is taken
         const bool sp_on = lrn_on && subfit_log_env_on();
         const uint64_t spL = (uint64_t) g.n_layers;
@@ -2279,7 +2281,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                     std::fprintf(stderr, "strata: STRATA_SUBFIT_APPLY: %.1f MiB of the correction tables in pinned host memory (VRAM full)\n",
                                  (double) sub_tab_.host_bytes / 1048576.0);
                 g_sub_apply_on = true;
-            } else {
+            } else if (sub_orig_ != nullptr) {   // (the sizing pass has no arena: nothing to report there)
                 std::fprintf(stderr, "strata: STRATA_SUBFIT_APPLY: no device tables, so no correction applied\n");
             }
         }

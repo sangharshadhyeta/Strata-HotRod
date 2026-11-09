@@ -37,6 +37,7 @@ struct SubfitRoute {
     uint32_t* list_n = nullptr;
     int list_cap = 0;
     uint32_t salt = 0;              ///< mixed into the reservoir's hash (the window count)
+    const int32_t* gate = nullptr;  ///< the learner's device gate; gate[4] = 1 in a flip re-check's exact window (mode flip reads it)
 };
 
 struct SubfitApplyArgs {

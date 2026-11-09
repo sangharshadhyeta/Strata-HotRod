@@ -63,6 +63,7 @@ Apply apply_env(const char* v) {
     if (v == nullptr) return Apply::Dynamic;
     if (std::strcmp(v, "off") == 0) return Apply::Off;
     if (std::strcmp(v, "all") == 0) return Apply::All;
+    if (std::strcmp(v, "flip") == 0) return Apply::Flip;
     return Apply::Dynamic;
 }
 
@@ -70,6 +71,7 @@ const char* apply_name(Apply a) {
     switch (a) {
         case Apply::Off: return "off";
         case Apply::All: return "all";
+        case Apply::Flip: return "flip";
         default: return "dynamic";
     }
 }

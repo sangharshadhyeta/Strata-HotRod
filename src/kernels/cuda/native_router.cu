@@ -592,6 +592,12 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
                         : gap <= ((cheap != nullptr && r < 2) ? cheap_margin
                                   : (edge >= 0.f && lo > 0 && r == lo - 1) ? edge : margin);
         if (bi >= 0 && trank && bstats != nullptr && lane == 0) atomicAdd(bstats + (take ? 3 : 4), 1ull);   // bstats [3] tail replaced, [4] tail kept exact by the bound
+        // STRATA_SUBFIT_APPLY=flip: in the flip re-check's exact window a pick the budget would read exactly takes its stand-in when the pair has a
+        // fitted slot (the apply kernel corrects it); unfitted pairs stay exact (gate[4] is the same for the warp: uniform)
+        const bool flip_win = sub.mode == strata::core::subfit_rule::kModeFlip && sub.gate != nullptr && sub.gate[4] != 0;
+        // (not the slot the learner samples y_e from in this window: gate[0] == 2 at gate[1] = layer, gate[2] = rank - it must stay exact)
+        const bool learn_slot = sub.gate != nullptr && sub.gate[0] == 2 && sub.gate[1] == layer && sub.gate[2] == r;
+        if (flip_win && !learn_slot && !take && bi >= 0 && sub_slot(sub, pair_orig[r], bi) >= 0) take = true;
         // SPEC-recheck-gated step F: a move that would take the row's accumulated shift past its cap stays the router's pick (refused).
         // cap_row and shift_acc are the same in every lane (warp-reduced values; shift_acc starts at the row's shift and follows each move).
         // SPEC-substitute-fit stage 2 (steps 4-5): a fitted pair (its LUT entry) is taken corrected by subfit_rule::decide: dynamic past the
@@ -603,7 +609,7 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
             const float pf_c = pair_pe != nullptr ? pair_pe[(size_t) orig[r] * 512 + bi] : 1.0f;
             const float resid = (fslot >= 0 && sub.resid != nullptr) ? sub.resid[fslot] : 1.0f;
             const strata::core::subfit_rule::Move mv = strata::core::subfit_rule::decide(
-                shift_acc, cap_row, cap_row < INFINITY, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf_c, fslot >= 0, resid, sub.mode);
+                shift_acc, cap_row, cap_row < INFINITY, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf_c, fslot >= 0, resid, sub.mode, flip_win);
             if (!mv.take) {
                 take = false;
                 if (lane == 0) {

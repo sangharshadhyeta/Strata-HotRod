@@ -237,12 +237,12 @@ inline float k_target(const KEvidence& e, int n_ring, float old, int n_ctrl) {
 /// runs, the ring of its own mode is State::ctrl (what the window seeds from and the control re-checks fill); the k is the verifier's
 /// fragile_k.  store_active() puts both back into the slot before a save; activate() takes a mode's slot when the process starts.
 /// Old files (no mode lines): the tune file's k and the gate's ring are the off slot, and they seed the other modes.
-constexpr int kApplyModes = 3;
+constexpr int kApplyModes = 4;   // off, dynamic, all, flip
 struct KByMode {
-    float k[kApplyModes] = {0.0f, 0.0f, 0.0f};
-    bool k_set[kApplyModes] = {false, false, false};
+    float k[kApplyModes] = {};
+    bool k_set[kApplyModes] = {};
     std::vector<unsigned char> ctrl[kApplyModes];
-    bool ctrl_set[kApplyModes] = {false, false, false};
+    bool ctrl_set[kApplyModes] = {};
 };
 
 /// The legacy values (the tune file's k when > 0, the gate's ring when the file had no mode lines) go to the off slot when it is not set,
