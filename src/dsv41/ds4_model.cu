@@ -190,6 +190,20 @@ std::vector<std::vector<int>> node_cores() {
 // anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
 void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
 void pin_self(int cpu) { os::pin_self(cpu); }
+// the machine's total RAM (MemTotal; the Windows physical total); ~0: not known
+uint64_t ram_total() {
+#if defined(_WIN32)
+    return os::commit().ram;
+#endif
+    std::istringstream mi(read_file("/proc/meminfo"));
+    std::string k;
+    uint64_t kb = 0;
+    while (mi >> k >> kb) {
+        if (k == "MemTotal:") return kb << 10;
+        mi.ignore(64, '\n');
+    }
+    return ~uint64_t{0};
+}
 // the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
 // (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
 uint64_t ram_avail() {
@@ -1877,7 +1891,8 @@ struct Model::Impl {
 
     // a request's end: the HotRod features report and save what they have so far (the counters are cumulative and
     // stay; the destructor reports the same at a clean shutdown, which a server's kill never reaches)
-    void request_end() {
+    void request_end(int64_t generated) {
+        store_hr_request(generated);   // (the RAM free at this request's end, before its buffers are freed; only the auto store learns)
         if (d_standin != nullptr) {
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             Standin h{};
@@ -7121,6 +7136,75 @@ struct Model::Impl {
             if (kt.first.find(".ffn.experts.") != std::string::npos && kt.first.rfind("mtp.", 0) != 0) b += (double) kt.second.bytes;
         return std::max(48.0, b / 1e9);
     }
+    // ---- the learned RAM headroom of the auto store: <pack>/ram-headroom.txt, "<key> <GB>" a line (the VRAM reserve's pattern).  The key: the
+    // machine's total RAM in GiB (rounded) and the context.  The auto store is the RAM free less this headroom: 12 GB (the system's and the
+    // owner's programs' share) until a start has learned otherwise.  A served request that generated 200 tokens or more leaves the least RAM
+    // free so far (store_hr_min_); the next start's headroom moves half of that spare (min less kRamMargin) down, never below kRamMargin and
+    // never above 12 GB.  DS4_STORE_HEADROOM_GB pins it (no learning); the explicit store sizes never reach this.
+    static constexpr double kStoreHeadroomMax = 12.0;
+    mutable bool store_hr_ready_ = false, store_hr_learn_ = false;
+    mutable double store_hr_ = kStoreHeadroomMax;        // the headroom this process uses
+    mutable double store_hr_file_ = kStoreHeadroomMax;   // the value the file holds for the key (the default when it holds none)
+    mutable double store_hr_min_ = 1e300;                // least free RAM (GB) at the end of the requests that generated >= 200 tokens
+    mutable std::string store_hr_key_;
+    static double kram_margin_gb() { return (double) kRamMargin / 1e9; }
+    std::string store_hr_key() const {
+        const uint64_t tot = ram_total();
+        const std::string gib = tot == ~uint64_t{0} ? std::string("unknown")
+                                                    : std::to_string((long long) std::llround((double) tot / (double) (1ull << 30))) + "GiB";
+        return gib + "/ctx" + std::to_string((long long) o.max_context);
+    }
+    std::map<std::string, double> store_hr_read() const {
+        std::map<std::string, double> m;
+        std::ifstream f(o.pack + "/ram-headroom.txt");
+        std::string k;
+        double v = 0.0;
+        while (f >> k >> v) m[k] = v;
+        return m;
+    }
+    // (the first call of the auto size loads it; an explicit size never calls it, so it prints nothing then)
+    void store_hr_load() const {
+        if (store_hr_ready_) return;
+        store_hr_ready_ = true;
+        store_hr_key_ = store_hr_key();
+        if (const char* v = std::getenv("DS4_STORE_HEADROOM_GB")) {
+            store_hr_ = store_hr_file_ = std::max(0.0, std::atof(v));
+            std::fprintf(stderr, "ds4: RAM store: headroom %.1f GB (DS4_STORE_HEADROOM_GB)\n", store_hr_);
+            return;
+        }
+        store_hr_learn_ = true;
+        const auto m = store_hr_read();
+        const auto it = m.find(store_hr_key_);
+        if (it == m.end()) {
+            store_hr_ = store_hr_file_ = kStoreHeadroomMax;
+            std::fprintf(stderr, "ds4: RAM store: headroom %.1f GB (default)\n", store_hr_);
+        } else {
+            store_hr_ = store_hr_file_ = std::min(kStoreHeadroomMax, std::max(kram_margin_gb(), it->second));
+            std::fprintf(stderr, "ds4: RAM store: headroom %.1f GB (learned for %s)\n", store_hr_, store_hr_key_.c_str());
+        }
+    }
+    // a request's end (generated: its decode tokens): the least free RAM so far, and the next start's headroom when it moves by 0.25 GB or more
+    void store_hr_request(int64_t generated) {
+        if (!store_hr_learn_ || generated < 200) return;
+        const uint64_t av = ram_avail();
+        if (av == ~uint64_t{0}) return;
+        store_hr_min_ = std::min(store_hr_min_, (double) av / 1e9);
+        const double spare = store_hr_min_ - kram_margin_gb();
+        const double next = std::min(kStoreHeadroomMax, std::max(kram_margin_gb(), store_hr_ - 0.5 * spare));
+        if (std::fabs(next - store_hr_file_) < 0.25) return;
+        auto m = store_hr_read();
+        m[store_hr_key_] = next;
+        const std::string path = o.pack + "/ram-headroom.txt", tmp = path + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            for (const auto& kv : m) f << kv.first << " " << kv.second << "\n";
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        std::fprintf(stderr, "ds4: RAM store: headroom %.1f -> %.1f GB for the next start (%.1f GB stayed available, margin %.1f)\n",
+                     store_hr_, next, store_hr_min_, kram_margin_gb());
+        store_hr_file_ = next;
+    }
     double store_gb() const {
         static double cached = -2.0;   // (decided once: the layout of the blobs depends on it)
         if (cached > -1.5) return cached;
@@ -7130,10 +7214,11 @@ struct Model::Impl {
         else if (gb < 0.0 && cpu_lane_fits_ram()) {   // auto, and the RAM holds every CPU-lane expert beside kRamMargin: they are copied in at load
             auto_copy_all = true;                       // (copy_experts), the demand store would only be a second, smaller copy of them
             gb = 0.0;
-        } else if (gb < 0.0) {   // auto: the RAM free now less 12 GB for the system and the owner's programs, all the experts at most
+        } else if (gb < 0.0) {   // auto: the RAM free now less the learned headroom (12 GB for the system and the owner's programs until learned), all the experts at most
+            store_hr_load();
             const uint64_t avail = ram_avail();
             avail0_ = avail;
-            const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - 12.0;
+            const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - store_hr_;
             gb = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         }
         return cached = gb;
@@ -7159,7 +7244,8 @@ struct Model::Impl {
         }
         const bool uma = integrated && avail0_ != ~uint64_t{0} && avail0_ > avail && (double) (avail0_ - avail) / 1e9 >= 4.0;
         const double ctx_gb = uma ? 1.1e-4 * std::max(0.0, (double) o.max_context - 16384.0) : 0.0;
-        const double room = (double) avail / 1e9 - 12.0 - ctx_gb;
+        store_hr_load();
+        const double room = (double) avail / 1e9 - store_hr_ - ctx_gb;
         const double now = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         if (now < gb)
             std::fprintf(stderr, "ds4: RAM store: %.1f GB of RAM free after the GPU's weights: store sized %.1f GB, not %.1f\n",
@@ -14431,7 +14517,7 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::save_profile() const { p_->save_profile(); }
-void Model::request_end() { p_->request_end(); }
+void Model::request_end(int64_t generated) { p_->request_end(generated); }
 const Stats& Model::stats() const {
     Stats& st = p_->st;
     if (p_->store) {   // (the store keeps its own counters: copied in when asked)

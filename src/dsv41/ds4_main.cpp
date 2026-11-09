@@ -1028,7 +1028,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                              hits + mis > 0 ? 100.0 * (double) hits / (double) (hits + mis) : 0.0);
             }
         }
-        m.request_end();
+        m.request_end(produced);
         {   // the expert profile (and the learned stand-in pairs) at most every 2 minutes, not after every request (6 Nov overhead
             // audit); the engine's end still saves them
             static auto prof_last = std::chrono::steady_clock::now() - std::chrono::hours(1);
