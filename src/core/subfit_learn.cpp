@@ -88,6 +88,9 @@ int pairs_env(const char* v) {
     return std::min(8192, std::max(1, p));
 }
 
+// The fitted pair's residual factor: sqrt(E1/E0) = sqrt(1 - gain) over the held-out window (gain 0 while the window is short: 1).
+static float residual_factor(double gain) { return (float) std::sqrt(std::max(0.0, 1.0 - gain)); }
+
 uint16_t f32_to_f16(float f) {
     uint32_t x;
     std::memcpy(&x, &f, sizeof x);
@@ -239,6 +242,7 @@ SlotChange Learner::slot_change(const Pair& p, int slot) const {
     sc.e = p.e;
     sc.s = p.s;
     sc.c = (float) p.c_used;
+    sc.resid = residual_factor(gain_recent(p));
     sc.b.resize(p.B.size());
     for (size_t i = 0; i < p.B.size(); ++i) sc.b[i] = f32_to_f16(p.B[i]);
     return sc;
@@ -381,6 +385,41 @@ void Learner::add_sample(int layer, int e, int s, const float* x, const float* y
             zs[j] += (float) (zk * (double) ys[j]);
         }
     }
+}
+
+UploadPacker::UploadPacker(int n_layers)
+    : n_layers_(std::max(1, n_layers)),
+      lut_((size_t) std::max(1, n_layers) * kExperts * kExperts, (int16_t) -1),
+      fit_n_((size_t) std::max(1, n_layers), 0) {}
+
+void UploadPacker::pack(const Changes& ch, std::vector<LutWrite>& lut_out, std::vector<SlotWrite>& slot_out) {
+    for (const LutChange& c : ch.lut) {
+        if (c.layer < 0 || c.layer >= n_layers_ || c.e < 0 || c.e >= kExperts || c.s < 0 || c.s >= kExperts) continue;
+        const size_t idx = lut_index(c.layer, c.e, c.s);
+        const int16_t old = lut_[idx];
+        if (old >= 0 && c.slot < 0) --fit_n_[(size_t) c.layer];
+        if (old < 0 && c.slot >= 0) ++fit_n_[(size_t) c.layer];
+        lut_[idx] = (int16_t) c.slot;
+        lut_out.push_back(LutWrite{idx, (int16_t) c.slot});
+    }
+    for (const SlotChange& sc : ch.slots) {
+        if (sc.slot < 0) continue;
+        SlotWrite w;
+        w.slot = sc.slot;
+        w.freed = sc.b.empty();
+        w.c = sc.c;
+        w.resid = sc.resid;
+        if (!w.freed) w.b = sc.b;
+        slot_out.push_back(std::move(w));
+    }
+}
+
+std::vector<uint16_t> Learner::features_f16(int layer) const {
+    std::vector<float> A;
+    features(layer, cfg_.n, cfg_.rank, cfg_.seed, A);
+    std::vector<uint16_t> out(A.size());
+    for (size_t i = 0; i < A.size(); ++i) out[i] = f32_to_f16(A[i]);
+    return out;
 }
 
 void Learner::refit_pair(Pair& p, Changes* ch) {

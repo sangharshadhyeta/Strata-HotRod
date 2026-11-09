@@ -26,7 +26,7 @@ namespace strata::core::subfit_learn {
 
 constexpr int kExperts = 512;                 ///< experts per layer (the LUT's side)
 constexpr int kDefaultRank = 16;              ///< STRATA_SUBFIT_RANK default
-constexpr int kDefaultPairs = 1024;           ///< STRATA_SUBFIT_PAIRS default
+constexpr int kDefaultPairs = 512;            ///< STRATA_SUBFIT_PAIRS default (0.5 MB of statistics each on a 31 GB box)
 constexpr int kMaxFitted = 512;               ///< fitted pairs in the device table (the LUT's slots)
 constexpr int kHoldEvery = 4;                 ///< every 4th sample of a pair is held out
 constexpr int kHoldWindow = 32;               ///< held-out samples in the gate's window (and the minimum before any decision)
@@ -42,7 +42,7 @@ Apply apply_env(const char* v);
 const char* apply_name(Apply a);
 /// STRATA_SUBFIT_RANK: default 16, clamped to [1, 32].
 int rank_env(const char* v);
-/// STRATA_SUBFIT_PAIRS: default 1024, clamped to [1, 8192].
+/// STRATA_SUBFIT_PAIRS: default 512, clamped to [1, 8192].
 int pairs_env(const char* v);
 
 /// IEEE half of a float (round to nearest even; overflow to infinity, tiny values to subnormal or zero).
@@ -72,6 +72,7 @@ struct SlotChange {
     int slot = -1;
     int layer = 0, e = 0, s = 0;
     float c = 1.0f;
+    float resid = 1.0f;        ///< the held-out residual sqrt(E1/E0) of the pair (the shift accounting's factor for a corrected move)
     std::vector<uint16_t> b;   ///< fp16 B, N x r (empty when the slot is freed)
 };
 /// One LUT entry change: (layer, e, s) -> slot, or -1 for none.
@@ -82,6 +83,36 @@ struct LutChange {
 struct Changes {
     std::vector<SlotChange> slots;
     std::vector<LutChange> lut;
+};
+
+/// The host side of the device upload (CPU only; the verifier copies the writes between windows).  It keeps the mirror of the LUT
+/// (n_layers x 512 x 512, -1 none) and the fitted count per layer (the apply kernel's launch check), and turns each Changes into the
+/// writes.  A fresh packer matches a device table filled with -1.
+struct LutWrite {
+    size_t index;    ///< (layer * 512 + e) * 512 + s
+    int16_t value;   ///< slot, or -1
+};
+struct SlotWrite {
+    int slot = -1;
+    bool freed = false;        ///< the slot is free: its LUT entries are written -1, its B is not written
+    float c = 1.0f;
+    float resid = 1.0f;
+    std::vector<uint16_t> b;   ///< fp16 B, N x r (empty when freed)
+};
+class UploadPacker {
+public:
+    explicit UploadPacker(int n_layers);
+    /// The writes of one Changes (LUT entries in order, then the slots); the mirror and the fitted counts are updated.  Entries out of
+    /// range are dropped (none come from the learner).
+    void pack(const Changes& ch, std::vector<LutWrite>& lut_out, std::vector<SlotWrite>& slot_out);
+    const std::vector<int16_t>& lut() const { return lut_; }
+    const std::vector<int32_t>& fit_n() const { return fit_n_; }
+    static size_t lut_index(int layer, int e, int s) { return ((size_t) layer * kExperts + (size_t) e) * kExperts + (size_t) s; }
+
+private:
+    int n_layers_;
+    std::vector<int16_t> lut_;
+    std::vector<int32_t> fit_n_;
 };
 
 /// The request-end summary: pairs with statistics, fitted pairs, the gains of the fitted pairs (median, minimum), and the fitted pairs
@@ -108,6 +139,9 @@ public:
 
     /// Every fitted pair with a slot, as changes (the device table's full upload, e.g. at start after load).
     Changes all_fitted() const;
+
+    /// Layer `layer`'s feature matrix A as fp16 (r x n, the device copy the apply kernel reads); the same values features() gives.
+    std::vector<uint16_t> features_f16(int layer) const;
 
     /// (layer, e, s) -> slot, or -1 (fitted with a device slot).  Out-of-range keys give -1.
     int lookup(int layer, int e, int s) const;
