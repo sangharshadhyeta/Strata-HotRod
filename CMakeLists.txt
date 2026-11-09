@@ -254,6 +254,10 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  # SPEC-substitute-fit stage 1a: the sample file's format (bf16, both record tags, header check, cap, env switches), CPU only
+  add_executable(subfit_samples_test tests/core/subfit_samples_test.cpp src/core/subfit_samples.cpp)
+  target_include_directories(subfit_samples_test PRIVATE include)
+  add_test(NAME subfit_samples_test COMMAND subfit_samples_test)
   add_executable(logit_bias_test src/core/logit_bias_test.cpp)
   target_include_directories(logit_bias_test PRIVATE include)
   add_test(NAME logit_bias_test COMMAND logit_bias_test)
@@ -392,6 +396,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_bf16.cu
                           src/kernels/cuda/native_gr_norm.cu
                           src/kernels/cuda/native_moe.cu
+                          src/kernels/cuda/subfit_capture.cu
                           src/kernels/cuda/native_gdn.cu
                           src/kernels/cuda/native_gr_postops.cu
                           src/kernels/cuda/native_router.cu
@@ -571,7 +576,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/subfit_samples.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)

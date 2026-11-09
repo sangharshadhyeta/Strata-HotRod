@@ -55,5 +55,9 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);
+/// One token through one expert, the calls above in their order: h (n_ff floats) = silu(gate.x) * up.x, the hidden state before the
+/// down projection, and y (n_embd floats) = down.h, the expert's output before any router weight.  SPEC-substitute-fit: the offline
+/// fit needs h and y of a substitute for a sample's x.
+void native_expert_forward(const NativeFmt& f, const uint8_t* blob, const float* x, float* h, float* y);
 
 }  // namespace strata::kernels::cpu

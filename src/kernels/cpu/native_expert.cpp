@@ -295,4 +295,17 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
 }
 
+void native_expert_forward(const NativeFmt& f, const uint8_t* blob, const float* x, float* h, float* y) {
+    alignas(64) uint8_t act[kNativeActBytes];
+    alignas(64) uint8_t hq[kNativeHBytes];
+    native_quant_act(f, x, act);
+    const void* a[1] = {act};
+    float* ff[1] = {h};
+    native_gu_rows(f, blob, a, 1, ff, 0, (int) f.n_ff);
+    native_quant_h(f, h, hq);
+    const void* hh[1] = {hq};
+    float* out[1] = {y};
+    native_down_rows(f, blob, hh, 1, out, 0, (int) f.n_embd);
+}
+
 }  // namespace strata::kernels::cpu

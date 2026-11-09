@@ -60,6 +60,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/subfit_samples.hpp"
 #include "strata/core/recheck_cheap.hpp"
 #include "strata/core/recheck_gate.hpp"
 #include "strata/core/mtp.hpp"
@@ -12399,6 +12400,19 @@ int main(int argc, char** argv) {
             learned[ram_rkey + what] = mib;
             vram_reserve_write(ram_reserve_path(o), learned);
         };
+        // STRATA_SUBFIT_LOG=1 (SPEC-substitute-fit stage 1a): the sample file beside the stand-in tuning, keyed to the model fingerprint
+        if (strata::core::subfit::log_on_env(std::getenv("STRATA_SUBFIT_LOG"))) {
+            strata::core::SessionFileIdentity sid;
+            std::string se;
+            const std::string tune = standin_tune_path(o);
+            if (!tune.empty() && session_identity(sid, se, {})) {
+                char hex[17];
+                std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) sid.model);
+                const std::filesystem::path samples = std::filesystem::path(tune).parent_path() / ("subfit-samples-" + std::string(hex) + ".bin");
+                strata::core::Verifier::subfit_set_path(samples.string());
+            } else
+                std::fprintf(stderr, "strata subfit: no sample file (%s)\n", se.c_str());
+        }
         // STRATA_FRAGILE_RECHECK / STRATA_ROUTE_BUDGET_AUTO: the learned stand-in tuning of this model is loaded before the first
         // request.  The model fingerprint is the session files' (session_identity: read once here, not per request).
         if (strata::core::Verifier::route_fragile_on()) {
@@ -16165,6 +16179,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                ver.subfit_probe_collect();   // STRATA_SUBFIT_LOG: a probe window's sample, between windows (no-op otherwise)
                 if (aflipped) apply_pending(true);   // 0.1.43: every layer's copies were waited for in the window; the bookkeeping now
                 // STRATA_FRAGILE_RECHECK (serial decode loop; merged windows are not cut): a window that ran with stand-ins is cut before its
                 // first close call: row r >= 1 that a stand-in moved (route_fragile_shifts) with a top-1 minus top-2 gap below k times the move.

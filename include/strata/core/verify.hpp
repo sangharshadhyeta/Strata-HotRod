@@ -28,6 +28,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/subfit_capture.hpp"
 
 #include <cuda_runtime.h>
 
@@ -324,6 +325,10 @@ public:
     bool standin_learn_save(const std::string& path, std::string& msg) const;
     void standin_learn_cut(int row);
     void standin_learn_settle(bool exact_ok);
+    /// STRATA_SUBFIT_LOG=1 (static: one sample file per process): the path is set at startup, the file opens at the first decode window,
+    /// and subfit_probe_collect() runs after each window that was a probe window (between windows: the host reads the probe buffers).
+    static void subfit_set_path(const std::string& path);
+    void subfit_probe_collect();
     /// STRATA_MASK=learn: the mask_learn_* hooks, after the window that ran (cut / settle as the stand-in learn's; window: every decode window
     /// of n <= 8 rows with `kept` rows kept; cut: true when the window was cut at its row kept).  active: the buffers and the state exist.
     bool mask_learn_active() const;
@@ -833,6 +838,12 @@ private:
     float* mlr_logit0_ = nullptr;               ///< STRATA_MASK=learn: device [vocab] the cut row's first-pass logits (head stage)
     float* mlr_kl_ = nullptr;                   ///< STRATA_MASK=learn: device [1] the re-check's KL
     struct StandinLearnState;
+    float* lrn_x_ = nullptr;           ///< device [T][N] (STRATA_SUBFIT_LOG): each stand-in row's layer input at its first stand-in's layer
+    strata::kernels::SubfitProbeBufs sp_{};   ///< STRATA_SUBFIT_LOG: the probe buffers (kernels/subfit_capture.hpp)
+    bool sp_on_ = false;               ///< the logger's buffers exist
+    bool sp_win_ = false;              ///< this window is a probe window (set at its begin)
+    int sp_every_ = 64;                ///< STRATA_SUBFIT_PROBE_EVERY: decode windows per probe window
+    uint64_t sp_decode_ = 0;           ///< decode windows seen
     std::shared_ptr<StandinLearnState> lrn_st_;   ///< host: the pairs, the pending sample, this request's counts (verify.cpp)
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
