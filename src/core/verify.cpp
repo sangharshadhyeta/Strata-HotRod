@@ -1252,7 +1252,8 @@ void make_sub_learn(int64_t dim, int64_t layers) {
 bool standin_learn_observe_env() {
     const char* e = std::getenv("STRATA_STANDIN_LEARN");
     if (e != nullptr && std::strcmp(e, "observe") == 0) return true;
-    return subfit_log_env_on() && (e == nullptr || std::atoi(e) == 0);
+    // (STRATA_SUBFIT_LEARN=1 alone is observe too: the live learner runs and no stand-in correction is applied)
+    return (subfit_log_env_on() || subfit_learn_env_on()) && (e == nullptr || std::atoi(e) == 0);
 }
 std::unique_ptr<strata::core::subfit::SampleWriter> g_subfit;   // STRATA_SUBFIT_LOG: the sample file (opened at the first decode window)
 std::string g_subfit_path;                                        // where it goes (Verifier::subfit_set_path); cleared when it cannot be opened
@@ -1263,7 +1264,7 @@ bool standin_balance_env() {
 constexpr int kLrnBalRound = 256;
 bool standin_learn_env() {
     const char* e = std::getenv("STRATA_STANDIN_LEARN");
-    return (e != nullptr && (std::atoi(e) != 0 || standin_learn_observe_env())) || subfit_log_env_on();
+    return (e != nullptr && (std::atoi(e) != 0 || standin_learn_observe_env())) || subfit_log_env_on() || subfit_learn_env_on();
 }
 uint64_t lrn_key(int64_t l, int64_t e, int64_t s) { return ((uint64_t) l << 40) | ((uint64_t) e << 20) | (uint64_t) s; }
 }  // namespace
