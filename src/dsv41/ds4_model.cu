@@ -1303,7 +1303,7 @@ struct Model::Impl {
     // stand-in s) pair learns a correction from the flip re-checks: a re-checked token's first stand-in (its layer's inputs are the same in
     // both passes, the layers before it took none) gives y_s (pass 1, the stand-in's down output) and y_e (the exact re-run, the true
     // expert's). Their least squares over the channels with decay 0.98: c = sum(num) / sum(den), num += y_s . y_e, den += y_s . y_s; the
-    // route scales the stand-in's weight by c once the pair has kLearnReady samples (clipped to [0.5, 2]), 1 before. Per pair two numbers.
+    // route scales the stand-in's weight by c once the pair has kLearnReady samples (the measured scale, >= 0; no clip since 9 Nov), 1 before. Per pair two numbers.
     static constexpr int kLearnMaxL = 128, kLearnPerLayer = 4096, kLearnReady = 32;
     bool learn_on = false;
     bool learn_observe = false;         // DS4_STANDIN_LEARN=observe: samples collected and saved, no correction applied
@@ -11284,7 +11284,7 @@ struct Model::Impl {
         ++p.n;
         ++learn_samples_req;
         if (p.n >= kLearnReady) {
-            const float c = (float) std::min(2.0, std::max(0.5, p.num / std::max(p.den, 1e-30)));
+            const float c = (float) std::max(0.0, p.num / std::max(p.den, 1e-30));   // the measured scale (9 Nov: no [0.5, 2] clip; a weight is >= 0)
             if (c != p.c) {
                 p.c = c;
                 CK(cudaMemcpyAsync(d_pair_c + ((size_t) il * n + e) * n + s, &c, sizeof c, cudaMemcpyHostToDevice, ld.st));
