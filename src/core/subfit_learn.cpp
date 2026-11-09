@@ -83,6 +83,12 @@ int rank_env(const char* v) {
     return std::min(32, std::max(1, r));
 }
 
+double gain_env(const char* v, double dflt) {
+    if (v == nullptr || *v == 0) return dflt;
+    const double g = std::atof(v);
+    return std::isfinite(g) ? std::max(-1.0, std::min(1.0, g)) : dflt;
+}
+
 bool ladder_env(const char* v) { return v == nullptr || std::atoi(v) != 0; }
 
 int pairs_env(const char* v) {
@@ -214,6 +220,7 @@ Learner::Learner(const Config& cfg) : cfg_(cfg) {
     cfg_.n_layers = std::max(1, cfg_.n_layers);
     slot_used_.assign((size_t) cfg_.max_fitted, false);
     cfg_.max_experts = std::max(1, cfg_.max_experts);
+    if (cfg_.gain_revoke >= cfg_.gain_fit) cfg_.gain_revoke = cfg_.gain_fit - 0.05;   // a fit must not flap at the bar
     lut_.assign(table_size(cfg_.n_layers), (int16_t) -1);
     A_.assign((size_t) cfg_.n_layers, {});
 }
@@ -463,10 +470,10 @@ void Learner::refit_pair(Pair& p, Changes* ch) {
     }
     if (p.n_ho >= (uint64_t) kHoldWindow) {
         const double g = gain_recent(p);
-        if (!p.is_fitted && g >= kGainFit) {
+        if (!p.is_fitted && g >= cfg_.gain_fit) {
             p.is_fitted = true;
             changed = true;
-        } else if (p.is_fitted && g < kGainRevoke) {
+        } else if (p.is_fitted && g < cfg_.gain_revoke) {
             p.is_fitted = false;
             free_slot(p, ch);
             return;
@@ -566,11 +573,12 @@ size_t Learner::slots_used() const {
 Summary Learner::summary() const {
     Summary s;
     s.pairs = pairs_.size();
-    std::vector<double> gains, glv[3];
+    std::vector<double> gains, glv[3], rlv[3];
     for (const auto& kv : pairs_) {
         const Pair& p = kv.second;
         const int lv = level_of(p.e, p.s);
         ++s.groups[lv];
+        if (p.ring_n >= kHoldWindow) rlv[lv].push_back(gain_recent(p));
         if (!p.is_fitted) continue;
         ++s.fitted;
         ++s.fitted_lv[lv];
@@ -578,6 +586,13 @@ Summary Learner::summary() const {
         gains.push_back(gain_recent(p));
         glv[lv].push_back(gain_recent(p));
     }
+    for (int lv = 0; lv < 3; ++lv)
+        if (!rlv[lv].empty()) {
+            std::sort(rlv[lv].begin(), rlv[lv].end());
+            s.ready_lv[lv] = rlv[lv].size();
+            s.ready_median_lv[lv] = rlv[lv][rlv[lv].size() / 2];
+            s.ready_best_lv[lv] = rlv[lv].back();
+        }
     for (int lv = 0; lv < 3; ++lv)
         if (!glv[lv].empty()) {
             std::sort(glv[lv].begin(), glv[lv].end());

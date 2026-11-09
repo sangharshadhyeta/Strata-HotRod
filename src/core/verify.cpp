@@ -1299,6 +1299,8 @@ void make_sub_learn(int64_t dim, int64_t layers) {
     cfg.rank = strata::core::subfit_learn::rank_env(std::getenv("STRATA_SUBFIT_RANK"));
     cfg.max_pairs = strata::core::subfit_learn::pairs_env(std::getenv("STRATA_SUBFIT_PAIRS"));
     cfg.ladder = strata::core::subfit_learn::ladder_env(std::getenv("STRATA_SUBFIT_LADDER"));
+    cfg.gain_fit = strata::core::subfit_learn::gain_env(std::getenv("STRATA_SUBFIT_GAIN_FIT"), strata::core::subfit_learn::kGainFit);
+    cfg.gain_revoke = strata::core::subfit_learn::gain_env(std::getenv("STRATA_SUBFIT_GAIN_REVOKE"), cfg.gain_fit - 0.10);
     g_sub_learn = std::make_unique<strata::core::subfit_learn::Learner>(cfg);
     g_sub_packer = std::make_unique<strata::core::subfit_learn::UploadPacker>(cfg.n_layers);
 }
@@ -1931,11 +1933,13 @@ std::string Verifier::subfit_learn_report() {
                   (unsigned long long) g_sub_learn_req, ready);
     g_sub_learn_req = 0;
     g_sub_req_corr = g_sub_req_subs = g_sub_req_refused = 0;
-    char b2[640];
+    char b2[1024];
     std::snprintf(b2, sizeof b2,
-                  "strata serve: subfit ladder: groups pair/expert/layer %zu/%zu/%zu, fitted %zu/%zu/%zu (median gain %.3f/%.3f/%.3f); "
+                  "strata serve: subfit ladder: groups pair/expert/layer %zu/%zu/%zu, held-out ready %zu/%zu/%zu (gain median %.3f/%.3f/%.3f, best %.3f/%.3f/%.3f), "
+                  "fitted %zu/%zu/%zu (median gain %.3f/%.3f/%.3f); "
                   "shadow: listed %llu, queued %llu, evaluated %llu, fed %llu, dropped %llu, failed %llu, pick not found %llu, waiting %zu\n",
-                  s.groups[0], s.groups[1], s.groups[2], s.fitted_lv[0], s.fitted_lv[1], s.fitted_lv[2], s.gain_median_lv[0],
+                  s.groups[0], s.groups[1], s.groups[2], s.ready_lv[0], s.ready_lv[1], s.ready_lv[2], s.ready_median_lv[0], s.ready_median_lv[1],
+                  s.ready_median_lv[2], s.ready_best_lv[0], s.ready_best_lv[1], s.ready_best_lv[2], s.fitted_lv[0], s.fitted_lv[1], s.fitted_lv[2], s.gain_median_lv[0],
                   s.gain_median_lv[1], s.gain_median_lv[2], (unsigned long long) g_shadow_listed, (unsigned long long) sst.queued,
                   (unsigned long long) sst.evaluated, (unsigned long long) g_shadow_taken, (unsigned long long) sst.dropped,
                   (unsigned long long) sst.failed, (unsigned long long) g_shadow_nomatch, g_shadow ? g_shadow->pending() : (size_t) 0);

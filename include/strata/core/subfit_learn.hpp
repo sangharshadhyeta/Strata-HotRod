@@ -58,6 +58,7 @@ int rank_env(const char* v);
 /// STRATA_SUBFIT_PAIRS: default 512, clamped to [1, 8192].
 int pairs_env(const char* v);
 bool ladder_env(const char* v);
+double gain_env(const char* v, double dflt);   ///< a gain bar from the environment (-1..1), else dflt
 
 /// IEEE half of a float (round to nearest even; overflow to infinity, tiny values to subnormal or zero).
 uint16_t f32_to_f16(float f);
@@ -78,6 +79,8 @@ struct Config {
     int max_pairs = kDefaultPairs;  ///< pair groups with statistics (least recently sampled evicted)
     int max_experts = kDefaultExperts;   ///< (layer, expert) groups with statistics (least recently sampled evicted); layers: all
     bool ladder = true;             ///< STRATA_SUBFIT_LADDER (default on): the (layer, expert) and layer groups learn too (off: pairs only)
+    double gain_fit = kGainFit;     ///< STRATA_SUBFIT_GAIN_FIT: held-out gain needed to become fitted (default 0.20)
+    double gain_revoke = kGainRevoke;   ///< STRATA_SUBFIT_GAIN_REVOKE: below it a fitted group is revoked (default 0.10; kept < gain_fit)
     int max_fitted = kMaxFitted;    ///< pairs with a device slot (the device table's rows)
     uint64_t seed = 1;              ///< the feature seed (the layer index is mixed in)
     int n_layers = 48;
@@ -139,6 +142,9 @@ struct Summary {
     double gain_median = 0.0, gain_min = 0.0;
     size_t groups[3] = {0, 0, 0}, fitted_lv[3] = {0, 0, 0};   ///< per level (pair, expert, layer)
     double gain_median_lv[3] = {0.0, 0.0, 0.0};
+    // every group with a full held-out window (fitted or not): how many per level and their held-out gain (median, best)
+    size_t ready_lv[3] = {0, 0, 0};
+    double ready_median_lv[3] = {0.0, 0.0, 0.0}, ready_best_lv[3] = {0.0, 0.0, 0.0};
 };
 
 class Learner {
