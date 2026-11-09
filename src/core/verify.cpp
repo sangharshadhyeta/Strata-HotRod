@@ -5450,7 +5450,10 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     c.win_low = low;
     c.win_tail = tail;
     strata::kernels::route_cfg_set_budgets(low, tail);
-    if (lrn_gate_ != nullptr) standin_learn_begin_window(decode, c.win_exact);   // STRATA_STANDIN_LEARN: this window's record and capture mode
+    // STRATA_STANDIN_LEARN: this window's record and capture mode.  The y_e capture belongs to the fragile successor (its row 0 is the
+    // exact re-decision in both forms: the row-only successor keeps win_exact false, so keying on win_exact alone never captured y_e
+    // and every sample's y_e stayed zero since row-only became the default).
+    if (lrn_gate_ != nullptr) standin_learn_begin_window(decode, succ || c.win_exact);
     la_tail_skip_update(c);
 }
 
