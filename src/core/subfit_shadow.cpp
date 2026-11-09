@@ -37,6 +37,14 @@ void Queue::set_eval(Eval eval, bool idle_prio) {
     idle_prio_ = idle_prio;
 }
 
+void Queue::set_paused(bool paused) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        paused_ = paused;
+    }
+    cv_.notify_all();
+}
+
 void Queue::push(Item&& it) {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -108,11 +116,16 @@ void Queue::run() {
         Eval ev;
         {
             std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [this] { return stop_ || !in_.empty(); });
+            cv_.wait(lk, [this] { return stop_ || (!paused_ && !in_.empty()); });
             if (stop_) return;
-            // oldest first
-            it = std::move(in_.front());
-            in_.pop_front();
+            // the same stand-in as the previous item when one is queued (its blob is already read), else the oldest
+            auto pick = in_.begin();
+            for (auto q = in_.begin(); q != in_.end(); ++q)
+                if (q->layer == last_layer_ && q->s == last_s_) { pick = q; break; }
+            it = std::move(*pick);
+            in_.erase(pick);
+            last_layer_ = it.layer;
+            last_s_ = it.s;
             busy_ = true;
             ev = eval_;
         }

@@ -186,6 +186,12 @@ void test_queue() {
     const auto d2 = q.take_done();
     CHECK(d2.size() == 1 && d2[0].ye.size() == (size_t) N && std::fabs(d2[0].ye[0] - 4.0f) < 1e-6f, "need_ye: the worker computes y_e = e(x) too");
     CHECK(!sh::cpu_ye_env(nullptr) && sh::cpu_ye_env("1") && !sh::cpu_ye_env("0"), "cpu y_e env: off by default");
+    q.set_paused(true);
+    q.push(sh::Item(it));
+    CHECK(!q.drain_for_tests(200), "paused: the item waits");
+    q.set_paused(false);
+    CHECK(q.drain_for_tests(5000), "resumed: the item is evaluated");
+    CHECK(q.take_done().size() == 1, "one finished after the resume");
     CHECK(sh::per_cut_env(nullptr) == sh::kDefaultPerCut && sh::per_cut_env("0") == 0 && sh::per_cut_env("999") == 256, "env");
 }
 

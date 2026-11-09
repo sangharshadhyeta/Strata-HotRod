@@ -1468,6 +1468,7 @@ void Verifier::standin_learn_begin_window(bool decode, bool exact) {
     if (decode) {
         if (cudaMemset(lrn_rec_, 0xff, (size_t) max_t_ * 4 * sizeof(int32_t)) != cudaSuccess) (void) cudaGetLastError();
         if (shd_on_ && cudaMemset(shd_n_, 0, (size_t) max_t_ * sizeof(uint32_t)) != cudaSuccess) (void) cudaGetLastError();
+        if (g_shadow) g_shadow->set_paused(true);   // shadow samples: no CPU evaluation or expert read while this request decodes
         const bool y_e = exact && st.pend.valid;
         gate[0] = y_e ? 2 : 1;
         gate[1] = st.pend.layer;
@@ -1720,6 +1721,7 @@ void Verifier::subfit_shadow_collect(int l0, int e0, int s0) {
     if (!g_shadow) {
         g_shadow = std::make_unique<strata::core::subfit_shadow::Queue>();
         g_shadow->set_eval(make_shadow_eval(L));
+        g_shadow->set_paused(true);   // made inside a request: evaluated after it
     }
     std::vector<int32_t> ids((size_t) (L * K));
     std::vector<float> xs((size_t) (L * D));
@@ -1907,6 +1909,7 @@ std::string Verifier::subfit_learn_report() {
     if (!subfit_learn_active() || !g_sub_learn) return "";
     // shadow samples finished by the idle-time CPU evaluator since the last request's end feed the learner first
     strata::core::subfit_shadow::Stats sst{};
+    if (g_shadow) g_shadow->set_paused(false);   // the request has ended: the idle-time evaluation may run until the next one
     if (g_shadow) {
         for (const auto& it : g_shadow->take_done()) {
             g_sub_learn->add_sample(it.layer, it.e, it.s, it.x.data(), it.ys.data(), it.ye.data());

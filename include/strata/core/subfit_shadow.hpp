@@ -22,7 +22,7 @@
 
 namespace strata::core::subfit_shadow {
 
-constexpr int kDefaultPerCut = 64;      ///< STRATA_SUBFIT_SHADOW default: substitutions listed per cut row (0 = no shadow samples)
+constexpr int kDefaultPerCut = 16;      ///< STRATA_SUBFIT_SHADOW default: substitutions listed per cut row (0 = no shadow samples)
 constexpr size_t kMaxQueued = 4096;     ///< items waiting for the CPU (the oldest dropped past it)
 constexpr size_t kMaxDone = 8192;       ///< finished samples waiting for the learner (the oldest dropped past it)
 
@@ -53,6 +53,9 @@ public:
 
     /// The worker starts on the first push after this (idle priority unless `idle_prio` is false: the tests).
     void set_eval(Eval eval, bool idle_prio = true);
+    /// Paused while a request decodes (the verifier pauses at each decode window, the request's end resumes): the worker's CPU and
+    /// expert reads never overlap decoding.  An item in progress finishes; no new one starts while paused.
+    void set_paused(bool paused);
     void push(Item&& it);
     /// The finished samples since the last call (in finishing order).
     std::vector<Item> take_done();
@@ -73,6 +76,8 @@ private:
     Stats st_;
     bool busy_ = false;
     bool stop_ = false;
+    bool paused_ = false;
+    int last_layer_ = -1, last_s_ = -1;   // the previous item's stand-in (its blob is warm: the same one is taken next when queued)
     std::thread th_;
 };
 
