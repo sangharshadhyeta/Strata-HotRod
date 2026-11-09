@@ -354,7 +354,46 @@ int main() {
         std::vector<unsigned char> fn(60, false);
         check(!g::k_evidence(rn.data(), reinterpret_cast<const bool*>(fn.data()), 60, 0.074).found, "k_evidence: no flip, no evidence");
         // the clamp: 1.25 x r* above 50 is 50
-        check(near(g::k_target(g::KEvidence{true, 100.0, 9, 9}, 9, 1.0f, 30), 50.0, 1e-6), "k_target: clamped to 50");
+        check(near(g::k_target(g::KEvidence{true, 100.0, 30, 30}, 9, 1.0f, 30), 50.0, 1e-6), "k_target: clamped to 50 (a raise with 30 re-checks)");
+    }
+    // SPEC-substitute-fit stage 2 step 3: k raises only on >= 30 re-checks behind r*; lowering is unchanged
+    {
+        check(near(g::k_target(g::KEvidence{true, 0.092, 8, 8}, 200, 0.05f, 30), 0.05, 1e-6),
+              "raise rule: 0.092 from 8 re-checks does not raise k (held at 0.05)");
+        check(near(g::k_target(g::KEvidence{true, 0.092, 30, 30}, 200, 0.05f, 30), 0.115, 1e-4),
+              "raise rule: 0.092 from 30 re-checks raises k to 1.25 r* = 0.115");
+        check(near(g::k_target(g::KEvidence{true, 0.02, 8, 8}, 200, 0.05f, 30), 0.025, 1e-6),
+              "lowering unchanged: 8 re-checks still lower k to 1.25 r*");
+    }
+    // SPEC-substitute-fit stage 2 step 3: k and the control ring per APPLY mode (off 0, dynamic 1, all 2)
+    {
+        check(g::mode_slot(-1) == 0 && g::mode_slot(1) == 1 && g::mode_slot(2) == 2 && g::mode_slot(7) == 2, "mode slots clamp to 0..2");
+        // an old file: the tune file's k and the gate's ring are the off slot, and they seed the other modes
+        g::KByMode old;
+        const std::vector<unsigned char> legacy{1, 0, 1};
+        g::seed_by_mode(old, 0.04f, &legacy);
+        check(old.k_set[0] && old.k_set[1] && old.k_set[2] && old.k[0] == 0.04f && old.k[2] == 0.04f,
+              "old file: the k goes to the off slot and seeds dynamic and all");
+        check(old.ctrl_set[2] && old.ctrl[1] == legacy, "old file: the ring goes to the off slot and seeds the others");
+        // a learned k in one mode is not taken by another mode
+        g::State s;
+        s.km = old;
+        s.ctrl = {0, 0, 0, 1};
+        g::store_active(s, 1, 0.07f);
+        check(near(s.km.k[1], 0.07, 1e-6) && near(s.km.k[0], 0.04, 1e-6) && near(s.km.k[2], 0.04, 1e-6),
+              "mode dynamic learns its own k; off and all keep theirs");
+        check(s.km.ctrl[1] == s.ctrl && s.km.ctrl[0] == legacy, "store_active keeps the mode's own ring");
+        float kout = 0.0f;
+        s.ctrl = {1};
+        check(g::activate(s, 2, kout) && near(kout, 0.04, 1e-6) && s.ctrl == legacy, "activate all: its k and its ring (the seeded one)");
+        // the mode lines round trip through the file, and a file without them loads with none set
+        const std::string text = g::serialize(s, 21);
+        g::State back;
+        check(g::parse(text, 21, back) && back.km.k_set[1] && near(back.km.k[1], 0.07, 1e-6) && back.km.ctrl[1] == s.km.ctrl[1],
+              "per-mode k and ring round trip through the gate file");
+        g::State plain;
+        check(g::parse(g::serialize(g::State{}, 22), 22, plain) && !plain.km.k_set[0] && !plain.km.ctrl_set[0],
+              "a file without mode lines loads with no mode state");
     }
     // SPEC-recheck-gated step H2: the margin m candidates (m x step^d, range 0.6-1.5), the explore veto, and the persistence of m
     {

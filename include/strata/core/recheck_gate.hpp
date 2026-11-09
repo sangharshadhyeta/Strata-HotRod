@@ -219,14 +219,57 @@ inline KEvidence k_evidence(const float* ratios, const bool* flips, int n, doubl
 /// lowering needs kKCtrlMin control samples and never goes below kKFloor; otherwise k is held.
 constexpr int kKCtrlMin = 20;
 constexpr float kKFloor = 0.005f;
+/// SPEC-substitute-fit stage 2 step 3: k may only RAISE when the evidence group behind r* has at least this many re-checks (n_t).  A
+/// threshold resting on 8 re-checks can hold k where it is but cannot push it up (the 0.092-from-8 case).  Lowering is unchanged.
+constexpr long long kKRaiseMinN = 30;
 inline float k_target(const KEvidence& e, int n_ring, float old, int n_ctrl) {
     if (e.found) {
         const double v = 1.25 * e.r_star;
-        return (float) std::min(50.0, std::max(0.005, v));
+        const float target = (float) std::min(50.0, std::max(0.005, v));
+        if (target > old && e.n_t < kKRaiseMinN) return old;   // a raise needs kKRaiseMinN re-checks behind r*
+        return target;
     }
     if (n_ring >= kKRingMin && n_ctrl >= kKCtrlMin) return old > kKFloor ? std::max(kKFloor, 0.5f * old) : old;
     return old;
 }
+
+/// SPEC-substitute-fit stage 2 step 3: the k and the control-noise ring of each APPLY mode (0 off, 1 dynamic, 2 all).  While the process
+/// runs, the ring of its own mode is State::ctrl (what the window seeds from and the control re-checks fill); the k is the verifier's
+/// fragile_k.  store_active() puts both back into the slot before a save; activate() takes a mode's slot when the process starts.
+/// Old files (no mode lines): the tune file's k and the gate's ring are the off slot, and they seed the other modes.
+constexpr int kApplyModes = 3;
+struct KByMode {
+    float k[kApplyModes] = {0.0f, 0.0f, 0.0f};
+    bool k_set[kApplyModes] = {false, false, false};
+    std::vector<unsigned char> ctrl[kApplyModes];
+    bool ctrl_set[kApplyModes] = {false, false, false};
+};
+
+/// The legacy values (the tune file's k when > 0, the gate's ring when the file had no mode lines) go to the off slot when it is not set,
+/// and every unset mode takes the off slot's values.
+inline void seed_by_mode(KByMode& km, float legacy_k, const std::vector<unsigned char>* legacy_ctrl) {
+    if (legacy_k > 0.0f && !km.k_set[0]) {
+        km.k[0] = legacy_k;
+        km.k_set[0] = true;
+    }
+    if (legacy_ctrl != nullptr && !km.ctrl_set[0]) {
+        km.ctrl[0] = *legacy_ctrl;
+        km.ctrl_set[0] = true;
+    }
+    for (int m = 1; m < kApplyModes; ++m) {
+        if (!km.k_set[m] && km.k_set[0]) {
+            km.k[m] = km.k[0];
+            km.k_set[m] = true;
+        }
+        if (!km.ctrl_set[m] && km.ctrl_set[0]) {
+            km.ctrl[m] = km.ctrl[0];
+            km.ctrl_set[m] = true;
+        }
+    }
+}
+
+/// The mode index of an APPLY value (clamped to the three modes).
+inline int mode_slot(int apply_mode) { return apply_mode < 0 ? 0 : (apply_mode >= kApplyModes ? kApplyModes - 1 : apply_mode); }
 
 /// Everything the gate keeps across requests and restarts.  total: the eligible rows, cumulative (what the logs print and the totals
 /// file keeps).  since: the same, since the last P_HI move (the mover's evidence).  margin_ring: the none rows' margins (running estimate).
@@ -246,7 +289,24 @@ struct State {
     ShiftCal cal;        ///< step F: the cut rows' shift decile, split by the verdict
     std::vector<float> margin_ring;
     size_t margin_pos = 0;
+    KByMode km;          ///< step 3: the k and the control ring of every APPLY mode (the active one's ring is ctrl)
 };
+
+/// Entering mode m at start: its ring becomes State::ctrl (when the mode has one).  Returns true and sets k_out when the mode has a k.
+inline bool activate(State& s, int m, float& k_out) {
+    if (s.km.ctrl_set[m]) s.ctrl = s.km.ctrl[m];
+    if (!s.km.k_set[m]) return false;
+    k_out = s.km.k[m];
+    return true;
+}
+
+/// Before a save: the active mode's k and ring go back into its slot (the other slots are kept as they were).
+inline void store_active(State& s, int m, float k) {
+    s.km.k[m] = k;
+    s.km.k_set[m] = true;
+    s.km.ctrl[m] = s.ctrl;
+    s.km.ctrl_set[m] = true;
+}
 
 inline void add_moved(State& s, int bucket) {
     ++s.total.moved[bucket];
@@ -387,6 +447,18 @@ inline std::string serialize(const State& s, uint64_t fp) {
     out += "ctrl_ring";
     for (unsigned char v : s.ctrl) out += v ? " 1" : " 0";
     out += "\n";
+    for (int m = 0; m < kApplyModes; ++m) {   // step 3: the modes' k and rings (a mode that has none writes no line)
+        if (s.km.k_set[m]) {
+            std::snprintf(buf, sizeof buf, "k_mode %d %.9g\n", m, (double) s.km.k[m]);
+            out += buf;
+        }
+        if (s.km.ctrl_set[m]) {
+            std::snprintf(buf, sizeof buf, "ctrl_mode %d", m);
+            out += buf;
+            for (unsigned char v : s.km.ctrl[m]) out += v ? " 1" : " 0";
+            out += "\n";
+        }
+    }
     std::snprintf(buf, sizeof buf, "shift_pos %lld\n", (long long) s.shift.pos);
     out += buf;
     out += "shift_ring";
@@ -466,6 +538,23 @@ inline bool parse(const std::string& text, uint64_t fp, State& s) {
                 if ((v != 0 && v != 1) || t.ctrl.size() >= kCtrlKeep) return false;   // a 0/1 per re-check, at most kCtrlKeep
                 t.ctrl.push_back((unsigned char) v);
             }
+        } else if (key == "k_mode") {
+            int m = -1;
+            double v = 0;
+            if (!(ls >> m >> v) || m < 0 || m >= kApplyModes || !(v > 0.0)) return false;
+            t.km.k[m] = (float) v;
+            t.km.k_set[m] = true;
+        } else if (key == "ctrl_mode") {
+            int m = -1;
+            if (!(ls >> m) || m < 0 || m >= kApplyModes) return false;
+            std::vector<unsigned char> ring;
+            long long v = 0;
+            while (ls >> v) {
+                if ((v != 0 && v != 1) || ring.size() >= kCtrlKeep) return false;
+                ring.push_back((unsigned char) v);
+            }
+            t.km.ctrl[m] = std::move(ring);
+            t.km.ctrl_set[m] = true;
         } else if (key == "tune_k") {
             double m = 0, st = 0;
             int lw = 0, f = 1, sg = 0;
