@@ -100,7 +100,7 @@ void test_env_and_fp16() {
     CHECK(std::string(apply_name(Apply::All)) == "all", "apply name");
     CHECK(rank_env(nullptr) == 16 && rank_env("8") == 8 && rank_env("0") == 16 && rank_env("99") == 32, "rank env");
     CHECK(pairs_env(nullptr) == kDefaultPairs && pairs_env("64") == 64 && pairs_env("-1") == kDefaultPairs, "pairs env");
-    CHECK(ladder_env(nullptr) && ladder_env("1") && !ladder_env("0"), "ladder env");
+    CHECK(!ladder_env(nullptr) && ladder_env("1") && !ladder_env("0"), "ladder env: off unless =1 (pairs only by default)");
     CHECK(f16_to_f32(f32_to_f16(1.0f)) == 1.0f && f16_to_f32(f32_to_f16(-2.5f)) == -2.5f, "fp16 exact values");
     CHECK(f16_to_f32(f32_to_f16(0.0f)) == 0.0f, "fp16 zero");
     bool rel_ok = true;

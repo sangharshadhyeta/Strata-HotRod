@@ -155,6 +155,21 @@ void test_packer_regions_and_persistence() {
     std::filesystem::remove(path);
 }
 
+void test_pair_admission() {
+    Config c = cfg();
+    c.pair_min_seen = 5;
+    Learner L(c);
+    Map m(0, 21, 0.6f);
+    std::mt19937 g(9);
+    std::vector<float> x, ys, ye;
+    for (int i = 0; i < 4; ++i) { m.make(g, x, ys, ye, false); L.add_sample(0, 1, 2, x.data(), ys.data(), ye.data()); }
+    double cu, cr, gn; bool f;
+    CHECK(!L.pair_info(0, 1, 2, cu, cr, gn, f), "a pair seen 4 times (min 5) has no group yet");
+    CHECK(L.pair_info(0, 1, kAny, cu, cr, gn, f), "its expert group learns from the start");
+    m.make(g, x, ys, ye, false); L.add_sample(0, 1, 2, x.data(), ys.data(), ye.data());
+    CHECK(L.pair_info(0, 1, 2, cu, cr, gn, f), "the 5th sighting admits the pair");
+}
+
 void test_queue() {
     sh::Queue q;
     sh::Item it;
@@ -202,6 +217,7 @@ int main() {
     test_expert_before_layer_and_pair_first();
     test_noise_uses_nothing();
     test_packer_regions_and_persistence();
+    test_pair_admission();
     test_queue();
     if (failures == 0) std::printf("subfit_ladder_test: all checks passed\n");
     return failures == 0 ? 0 : 1;

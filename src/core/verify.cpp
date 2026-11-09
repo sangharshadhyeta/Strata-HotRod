@@ -1301,6 +1301,7 @@ void make_sub_learn(int64_t dim, int64_t layers) {
     cfg.ladder = strata::core::subfit_learn::ladder_env(std::getenv("STRATA_SUBFIT_LADDER"));
     cfg.gain_fit = strata::core::subfit_learn::gain_env(std::getenv("STRATA_SUBFIT_GAIN_FIT"), strata::core::subfit_learn::kGainFit);
     cfg.gain_revoke = strata::core::subfit_learn::gain_env(std::getenv("STRATA_SUBFIT_GAIN_REVOKE"), cfg.gain_fit - 0.10);
+    if (const char* v = std::getenv("STRATA_SUBFIT_PAIR_MIN_SEEN")) cfg.pair_min_seen = std::max(1, std::atoi(v));
     g_sub_learn = std::make_unique<strata::core::subfit_learn::Learner>(cfg);
     g_sub_packer = std::make_unique<strata::core::subfit_learn::UploadPacker>(cfg.n_layers);
 }

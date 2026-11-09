@@ -78,9 +78,10 @@ struct Config {
     int rank = kDefaultRank;        ///< r
     int max_pairs = kDefaultPairs;  ///< pair groups with statistics (least recently sampled evicted)
     int max_experts = kDefaultExperts;   ///< (layer, expert) groups with statistics (least recently sampled evicted); layers: all
-    bool ladder = true;             ///< STRATA_SUBFIT_LADDER (default on): the (layer, expert) and layer groups learn too (off: pairs only)
+    bool ladder = true;             ///< STRATA_SUBFIT_LADDER (=1 opt-in; the engine's default is off: pairs only): the pooled (layer, expert) and layer groups learn too
     double gain_fit = kGainFit;     ///< STRATA_SUBFIT_GAIN_FIT: held-out gain needed to become fitted (default 0.20)
     double gain_revoke = kGainRevoke;   ///< STRATA_SUBFIT_GAIN_REVOKE: below it a fitted group is revoked (default 0.10; kept < gain_fit)
+    int pair_min_seen = 1;          ///< STRATA_SUBFIT_PAIR_MIN_SEEN: a pair gets a group only after this many sightings (the slots go to pairs that recur)
     int max_fitted = kMaxFitted;    ///< pairs with a device slot (the device table's rows)
     uint64_t seed = 1;              ///< the feature seed (the layer index is mixed in)
     int n_layers = 48;
@@ -237,6 +238,7 @@ private:
     std::vector<bool> slot_used_;             // cfg_.max_fitted slots
     std::vector<int16_t> lut_;                // table_size(n_layers): the three levels' slots (or -1)
     size_t level_n_[3] = {0, 0, 0};           // groups per level
+    std::unordered_map<uint64_t, uint32_t> sightings_;   // pair_min_seen > 1: how often each pair was sampled before it has a group
 };
 
 }  // namespace strata::core::subfit_learn

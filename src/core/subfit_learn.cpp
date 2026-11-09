@@ -89,7 +89,7 @@ double gain_env(const char* v, double dflt) {
     return std::isfinite(g) ? std::max(-1.0, std::min(1.0, g)) : dflt;
 }
 
-bool ladder_env(const char* v) { return v == nullptr || std::atoi(v) != 0; }
+bool ladder_env(const char* v) { return v != nullptr && std::atoi(v) != 0; }   // off by default (9 Nov): each pair's own correction only
 
 int pairs_env(const char* v) {
     if (v == nullptr) return kDefaultPairs;
@@ -362,7 +362,15 @@ void Learner::add_sample(int layer, int e, int s, const float* x, const float* y
         z[(size_t) k] = acc;
     }
     // the fallback ladder: the pair, its (layer, e) group and its layer group each learn from the sample (own held-out schedule)
-    add_to(get_or_create(layer, e, s, &pending_), z, ys, ye);
+    // a pair group only for a pair that recurs (STRATA_SUBFIT_PAIR_MIN_SEEN): the sightings before it has one are counted, not learned
+    bool pair_ok = true;
+    if (cfg_.pair_min_seen > 1 && find(layer, e, s) == nullptr) {
+        if (sightings_.size() > (1u << 18)) sightings_.clear();   // bounded (a reset only delays admission)
+        uint32_t& n = sightings_[key(layer, e, s)];
+        pair_ok = ++n >= (uint32_t) cfg_.pair_min_seen;
+        if (pair_ok) sightings_.erase(key(layer, e, s));
+    }
+    if (pair_ok) add_to(get_or_create(layer, e, s, &pending_), z, ys, ye);
     if (!cfg_.ladder) return;
     add_to(get_or_create(layer, e, kAny, &pending_), z, ys, ye);
     add_to(get_or_create(layer, kAny, kAny, &pending_), z, ys, ye);
