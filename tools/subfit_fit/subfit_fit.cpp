@@ -47,6 +47,7 @@ struct Opts {
     std::vector<double> lambdas = {0.01, 0.1, 1.0, 10.0, 100.0};   // relative to the mean feature energy
     bool check = false;
     int check_layer = 0, check_expert = 0;
+    double cap_refusals = -1.0, moves = -1.0;   // the request-end lines: "shift cap: moves refused N" and the stand-in moves M (mode estimate)
 };
 
 // The record's data after the substitute and candidate evaluation (float storage).
@@ -93,6 +94,8 @@ bool parse(int argc, char** argv, Opts& o) {
             if (o.lambdas.empty()) return false;
             continue;
         }
+        if (a == "--cap-refusals" && next(v)) { o.cap_refusals = std::atof(v.c_str()); continue; }
+        if (a == "--moves" && next(v)) { o.moves = std::atof(v.c_str()); continue; }
         if (a == "--check-blob" && i + 2 < argc) {
             o.check = true;
             o.check_layer = std::atoi(argv[++i]);
@@ -309,7 +312,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "subfit_fit: %s\n", lerr.c_str());
             return 2;
         }
-        strata::FileExpertSource src;
+        strata::core::FileExpertSource src;
         if (!src.open(o.pack, 48, kExperts, lerr)) {
             std::fprintf(stderr, "subfit_fit: %s\n", lerr.c_str());
             return 2;
@@ -335,7 +338,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "subfit_fit: %s\n", err.c_str());
         return 2;
     }
-    strata::FileExpertSource src;
+    strata::core::FileExpertSource src;
     if (!src.open(o.pack, n_layers, kExperts, err)) {
         std::fprintf(stderr, "subfit_fit: %s\n", err.c_str());
         return 2;
@@ -493,5 +496,17 @@ int main(int argc, char** argv) {
                 100.0 * nud_removed, 100.0 * oracle_removed);
     const bool go = nud_removed >= 0.4 || oracle_removed >= 0.4;
     std::printf("verdict: %s (stage 2 is built when a held-out removal reaches 40%%)\n", go ? "GO" : "NO-GO");
+    // mode estimate: ALL against DYNAMIC, on the shift cap's live numbers (--cap-refusals, --moves) and the pooled gain g
+    if (o.cap_refusals >= 0.0 && o.moves > 0.0) {
+        const double g = nud_removed;
+        const double f = moves_share(o.cap_refusals, o.moves);
+        const double r_all = residual_all(g), r_dyn = residual_dynamic(f, g);
+        std::printf("\nmode estimate (first order; pooled rank-16 gain g = %.3f; cap refused %.0f of %.0f moves)\n", g, o.cap_refusals, o.moves);
+        std::printf("%-10s %10s %14s %12s\n", "mode", "residual", "moves corrected", "gain kept");
+        std::printf("%-10s %10.4f %13.1f%% %11.1f%%\n", "ALL", r_all, 100.0, 100.0);
+        const double kept = 1.0 - r_all > 0.0 ? (1.0 - r_dyn) / (1.0 - r_all) : 0.0;
+        std::printf("%-10s %10.4f %13.1f%% %11.1f%%\n", "DYNAMIC", r_dyn, 100.0 * f, 100.0 * kept);
+        std::printf("verdict: dynamic keeps %.0f%% of ALL's gain for %.0f%% of its corrections\n", 100.0 * kept, 100.0 * f);
+    }
     return 0;
 }

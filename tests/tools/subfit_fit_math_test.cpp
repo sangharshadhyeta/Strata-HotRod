@@ -135,7 +135,8 @@ void test_truncate() {
     truncate_rank(Mr, N, F, r, 3, Tr);
     const double err2 = diff_frob(Tr, Mr) * diff_frob(Tr, Mr);
     CHECK(err2 <= 1.25 * tail && err2 >= 0.8 * tail, "randomized rank-5 error is near the optimal tail energy");
-    CHECK(truncate_rank(Mr, N, F, F, 3, Tr), "full rank returns the matrix");
+    truncate_rank(Mr, N, F, F, 3, Tr);
+    CHECK(diff_frob(Tr, Mr) < 1e-12, "full rank returns the matrix");
 }
 
 void test_scalar_and_split() {
@@ -182,9 +183,26 @@ void test_candidates() {
     CHECK(best_candidate(outs, ids, ye, 99) != 99, "the sample's own expert is excluded from the search");
 }
 
+void test_mode_arithmetic() {
+    CHECK(std::fabs(residual_all(0.75) - 0.5) < 1e-12, "ALL: sqrt(1 - g)");
+    CHECK(std::fabs(residual_all(0.0) - 1.0) < 1e-12, "no gain: residual 1");
+    CHECK(std::fabs(residual_all(1.0)) < 1e-12, "full gain: residual 0");
+    CHECK(std::fabs(residual_all(1.7)) < 1e-12 && std::fabs(residual_all(-0.3) - 1.0) < 1e-12, "g is clipped to [0, 1]");
+    CHECK(std::fabs(residual_dynamic(0.8, 0.75) - 0.6) < 1e-12, "DYNAMIC: (1 - f) + f sqrt(1 - g) = 0.2 + 0.4");
+    CHECK(std::fabs(residual_dynamic(1.0, 0.75) - residual_all(0.75)) < 1e-12, "f = 1 is ALL");
+    CHECK(std::fabs(residual_dynamic(0.0, 0.75) - 1.0) < 1e-12, "f = 0 is no correction");
+    // the gain kept by DYNAMIC against ALL is f
+    const double ra = residual_all(0.6), rd = residual_dynamic(0.8, 0.6);
+    CHECK(std::fabs((1.0 - rd) / (1.0 - ra) - 0.8) < 1e-12, "gain kept by DYNAMIC is f of ALL's");
+    CHECK(std::fabs(moves_share(3, 10) - 0.3) < 1e-12, "moves share: refused over moves");
+    CHECK(moves_share(12, 10) == 1.0, "moves share is at most 1");
+    CHECK(moves_share(0, 0) == 0.0, "no moves: 0");
+}
+
 }  // namespace
 
 int main() {
+    test_mode_arithmetic();
     test_cholesky();
     test_ridge_recovers_map();
     test_eig();

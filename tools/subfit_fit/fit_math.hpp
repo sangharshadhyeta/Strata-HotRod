@@ -29,6 +29,16 @@ double best_scalar(const std::vector<double>& ys, const std::vector<double>& ye,
 double sq_dist(const double* a, const double* b, int N);
 double sq_norm(const double* a, int N);
 double cosine(const double* a, const double* b, int N);
+double cosine(const float* a, const float* b, int N);
+
+/// Mode estimate (first order, amplitudes; 1 = no correction).  g = the fraction of a move's error energy that the rank-16 nudge removes.
+/// ALL gives every move its fitted variant: residual sqrt(1 - g) per move.  DYNAMIC corrects only the moves the shift cap refuses today
+/// (the share f = refused / moves); the others run plain: residual (1 - f) + f sqrt(1 - g).  The gain kept by DYNAMIC against ALL is f
+/// and its corrections are the share f of ALL's.
+double residual_all(double g);
+double residual_dynamic(double f, double g);
+double moves_share(double refused, double moves);
+
 
 /// Splits sample indices by parity: returns 0 for even indices, 1 for odd (the held-out split of the spec).
 inline int half_of(int64_t index) { return (int) (index & 1); }

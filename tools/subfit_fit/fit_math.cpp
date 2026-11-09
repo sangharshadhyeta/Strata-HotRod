@@ -222,4 +222,25 @@ double cosine(const double* a, const double* b, int N) {
     return na > 0.0 && nb > 0.0 ? ab / std::sqrt(na * nb) : 0.0;
 }
 
+static double clip01(double g) { return g < 0.0 ? 0.0 : (g > 1.0 ? 1.0 : g); }
+
+double residual_all(double g) { return std::sqrt(1.0 - clip01(g)); }
+
+double residual_dynamic(double f, double g) { return (1.0 - clip01(f)) + clip01(f) * residual_all(g); }
+
+double moves_share(double refused, double moves) {
+    if (!(moves > 0.0)) return 0.0;
+    return clip01(refused / moves);
+}
+
+double cosine(const float* a, const float* b, int N) {
+    double ab = 0.0, na = 0.0, nb = 0.0;
+    for (int i = 0; i < N; ++i) {
+        ab += (double) a[i] * b[i];
+        na += (double) a[i] * a[i];
+        nb += (double) b[i] * b[i];
+    }
+    return na > 0.0 && nb > 0.0 ? ab / std::sqrt(na * nb) : 0.0;
+}
+
 }  // namespace subfit_fit
