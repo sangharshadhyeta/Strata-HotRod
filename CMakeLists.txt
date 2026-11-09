@@ -262,6 +262,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(subfit_learn_test tests/core/subfit_learn_test.cpp src/core/subfit_learn.cpp)
   target_include_directories(subfit_learn_test PRIVATE include)
   add_test(NAME subfit_learn_test COMMAND subfit_learn_test)
+  # shadow samples (the idle-time CPU queue) and the learner's fallback ladder
+  add_executable(subfit_ladder_test tests/core/subfit_ladder_test.cpp src/core/subfit_learn.cpp src/core/subfit_shadow.cpp)
+  target_include_directories(subfit_ladder_test PRIVATE include)
+  find_package(Threads REQUIRED)
+  target_link_libraries(subfit_ladder_test PRIVATE Threads::Threads)
+  add_test(NAME subfit_ladder_test COMMAND subfit_ladder_test)
   # SPEC-substitute-fit stage 2 steps 2-5, host side: the shift rule (shared with the router kernels), the upload packer, the fp16 features
   add_executable(subfit_apply_host_test tests/core/subfit_apply_host_test.cpp src/core/subfit_learn.cpp)
   target_include_directories(subfit_apply_host_test PRIVATE include)
@@ -596,7 +602,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/subfit_samples.cpp src/core/subfit_learn.cpp
+    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/subfit_samples.cpp src/core/subfit_learn.cpp src/core/subfit_shadow.cpp
     src/core/risk_concentration.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})

@@ -29,6 +29,14 @@ struct SubfitRoute {
     const int16_t* lut = nullptr;   ///< this layer's LUT [512*512]: e*512+s -> slot, or -1
     const float* resid = nullptr;   ///< [slots]: the held-out residual sqrt(E1/E0) of each slot's pair
     int mode = 0;                   ///< strata::core::subfit_rule::kModeDynamic (1) or kModeAll (2); 0 = off
+    const int16_t* elut = nullptr;  ///< the fallback ladder: this layer's (layer, expert) slots [512] (used when the pair's LUT is -1)
+    const int16_t* llut = nullptr;  ///< ... then this layer's own slot [1]
+    // shadow samples (the learner on): every substitution of a row into list [rows][list_cap][4] (layer, rank, true pick, stand-in),
+    // reservoir-sampled past list_cap; list_n [rows] counts them (the host resets it each decode window).  nullptr: no list.
+    int32_t* list = nullptr;
+    uint32_t* list_n = nullptr;
+    int list_cap = 0;
+    uint32_t salt = 0;              ///< mixed into the reservoir's hash (the window count)
 };
 
 struct SubfitApplyArgs {
@@ -42,6 +50,8 @@ struct SubfitApplyArgs {
     const uint16_t* B = nullptr;        ///< all slots' B (slots x N x r, fp16)
     const float* c = nullptr;           ///< [slots]
     const int32_t* nfit = nullptr;      ///< this layer's fitted count (device): 0 = nothing to apply
+    const int16_t* elut = nullptr;      ///< the ladder: this layer's expert slots [512], then its layer slot [1] (nullable)
+    const int16_t* llut = nullptr;
     int r = 16, N = 2560, K = 10, n = 0;
     int mode = 1;                       ///< 1 dynamic (flagged moves), 2 all (every fitted move)
 };
@@ -52,7 +62,7 @@ void subfit_apply(const SubfitApplyArgs& a, void* stream);
 /// Device tables for `slots` slots of N x r, `layers` layers.  The LUT is set to -1, orig to -1, flag to 0 (the caller passes its own
 /// buffers); the others zero.  Returns false (nothing kept) when one allocation fails.
 struct SubfitTables {
-    int16_t* lut = nullptr;      ///< [layers][512][512]
+    int16_t* lut = nullptr;      ///< subfit_learn::table_size(layers): [layers][512][512] pairs, [layers][512] experts, [layers] layers
     uint16_t* A = nullptr;       ///< [layers][r][N]
     uint16_t* B = nullptr;       ///< [slots][N][r]
     float* c = nullptr;          ///< [slots]

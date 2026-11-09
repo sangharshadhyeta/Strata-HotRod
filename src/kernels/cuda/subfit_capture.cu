@@ -47,7 +47,33 @@ __global__ void k_probe_y(const float* __restrict__ parts, const int32_t* __rest
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < K_N; i += (int64_t) gridDim.x * blockDim.x) y[i] = parts[i];
 }
 
+__global__ void k_shadow_xi(const int32_t* __restrict__ ids, const float* __restrict__ mixed0, const int32_t* __restrict__ gate, int layer,
+                            int K, int64_t N, int32_t* __restrict__ ids_out, float* __restrict__ x_out) {
+    if (gate[3] != 2) return;
+    if (blockIdx.x == 0 && threadIdx.x < (unsigned) K) ids_out[(int64_t) layer * K + threadIdx.x] = ids[threadIdx.x];
+    for (int64_t c = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; c < N; c += (int64_t) gridDim.x * blockDim.x)
+        x_out[(int64_t) layer * N + c] = mixed0[c];
+}
+
+__global__ void k_shadow_y(const float* __restrict__ parts, const int32_t* __restrict__ gate, int layer, int64_t K_N,
+                           float* __restrict__ y_out) {
+    if (gate[3] != 2) return;
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < K_N; i += (int64_t) gridDim.x * blockDim.x)
+        y_out[(int64_t) layer * K_N + i] = parts[i];
+}
+
 }  // namespace
+
+void subfit_shadow_xi(const int32_t* ids, const float* mixed0, const int32_t* gate, int layer, int K, int64_t N, int32_t* ids_out,
+                      float* x_out, void* stream) {
+    const unsigned blocks = (unsigned) ((N + kThreads - 1) / kThreads);
+    k_shadow_xi<<<blocks < 1 ? 1 : blocks, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(ids, mixed0, gate, layer, K, N, ids_out, x_out);
+}
+
+void subfit_shadow_y(const float* parts, const int32_t* gate, int layer, int64_t K_N, float* y_out, void* stream) {
+    const int64_t blocks = (K_N + kThreads - 1) / kThreads;
+    k_shadow_y<<<(unsigned) (blocks < 1 ? 1 : blocks), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(parts, gate, layer, K_N, y_out);
+}
 
 void subfit_capture_x(const float* mixed, const int32_t* rec, const int32_t* gate, int layer, float* x, int64_t N, int n_rows,
                       void* stream) {

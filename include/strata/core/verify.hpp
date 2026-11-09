@@ -336,6 +336,9 @@ public:
     /// STRATA_SUBFIT_LOG=1 (static: one sample file per process): the path is set at startup, the file opens at the first decode window,
     /// and subfit_probe_collect() runs after each window that was a probe window (between windows: the host reads the probe buffers).
     static void subfit_set_path(const std::string& path);
+    /// SPEC-substitute-fit shadow samples: the pack directory whose experts.bin the idle-time CPU evaluator reads (generate.cpp, --pack)
+    static void subfit_set_pack(const std::string& pack);
+    void subfit_shadow_collect(int layer, int e, int s);   ///< shadow samples after the exact successor (verify.cpp)
     void subfit_probe_collect();
     /// SPEC-substitute-fit stage 2 step 1 (STRATA_SUBFIT_LEARN=1, opt-in; needs the stand-in learner): the live per-pair learner.  Its file
     /// opens at start (false with msg when there is none, the learner starts empty); subfit_learn_report() refits at a request's end
@@ -869,6 +872,16 @@ private:
     bool sub_on_ = false;              ///< the apply path exists (buffers, tables, the route wiring, the apply launch)
     int sub_mode_ = 0;                 ///< 1 dynamic, 2 all (0 when off)
     bool sub_started_ = false;         ///< A uploaded and the learner's state written to the tables
+    // SPEC-substitute-fit shadow samples (the learner on, STRATA_SUBFIT_SHADOW > 0): the router's list of each row's substitutions
+    // ([T][cap][4], counts [T]) and the exact successor's capture of row 0 per layer (picks [L][10], input [L][N], outputs [L][10][N])
+    int32_t* shd_list_ = nullptr;
+    uint32_t* shd_n_ = nullptr;
+    int32_t* shd_ids_ = nullptr;
+    float* shd_x_ = nullptr;
+    float* shd_y_ = nullptr;
+    int shd_cap_ = 0;
+    bool shd_on_ = false;
+    uint32_t shd_salt_ = 0;
     bool sp_on_ = false;               ///< the logger's buffers exist
     bool x_on_ = false;                ///< the layer-input capture exists (STRATA_SUBFIT_LOG or STRATA_SUBFIT_LEARN: lrn_x_ and its launch)
     bool sp_win_ = false;              ///< this window is a probe window (set at its begin)

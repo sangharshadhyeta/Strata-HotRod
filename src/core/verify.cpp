@@ -5,6 +5,9 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/standin_pool.hpp"
 #include "strata/core/subfit_samples.hpp"
+#include "strata/core/subfit_shadow.hpp"
+#include "strata/core/expert_source.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/core/subfit_learn.hpp"
 #include "strata/core/risk_concentration.hpp"
 #include "strata/kernels/subfit_capture.hpp"
@@ -1260,6 +1263,32 @@ long long g_sub_req_corr = 0, g_sub_req_subs = 0, g_sub_req_refused = 0;   // th
 std::unique_ptr<strata::core::subfit_learn::Learner> g_sub_learn;   // created with the stand-in learner's dims (make_sub_learn)
 std::unique_ptr<strata::core::subfit_learn::UploadPacker> g_sub_packer;   // the host side of the device tables (the mirror, the writes)
 uint64_t g_sub_learn_req = 0;                                         // the learner's samples since the request's end (the stats line)
+// SPEC-substitute-fit shadow samples: the idle-time CPU evaluation of the stand-in on the exact input (subfit_shadow.hpp)
+std::unique_ptr<strata::core::subfit_shadow::Queue> g_shadow;
+std::string g_subfit_pack;                                            // --pack (Verifier::subfit_set_pack)
+uint64_t g_shadow_taken = 0, g_shadow_listed = 0, g_shadow_nomatch = 0;   // this request: fed to the learner, listed, pick not found
+strata::core::subfit_shadow::Eval make_shadow_eval(int64_t layers) {
+    // a read-only view of the pack's experts.bin of its own (opened on the worker's first call; the engine's source is not touched)
+    auto src = std::make_shared<strata::core::FileExpertSource>();
+    auto state = std::make_shared<int>(0);   // 0 not tried, 1 open, -1 failed
+    const std::string pack = g_subfit_pack;
+    return [src, state, pack, layers](int layer, int s, const float* x, float* ys) -> bool {
+        if (*state == 0) {
+            std::string err;
+            *state = (!pack.empty() && src->open(pack, layers, 512, err)) ? 1 : -1;
+            if (*state < 0) std::fprintf(stderr, "strata subfit: shadow samples off (%s)\n", pack.empty() ? "no pack" : err.c_str());
+        }
+        if (*state < 0) return false;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        if (layer < 0 || (size_t) layer >= lay.fmt.size()) return false;
+        const auto& fm = lay.fmt[(size_t) layer];
+        const uint8_t* blob = src->blob_stable(layer, s);
+        if (blob == nullptr) return false;
+        std::vector<float> h((size_t) fm.n_ff);
+        strata::kernels::cpu::native_expert_forward(fm, blob, x, h.data(), ys);
+        return true;
+    };
+}
 void make_sub_learn(int64_t dim, int64_t layers) {
     if (g_sub_learn || dim <= 0 || layers <= 0) return;
     strata::core::subfit_learn::Config cfg;
@@ -1267,6 +1296,7 @@ void make_sub_learn(int64_t dim, int64_t layers) {
     cfg.n_layers = (int) layers;
     cfg.rank = strata::core::subfit_learn::rank_env(std::getenv("STRATA_SUBFIT_RANK"));
     cfg.max_pairs = strata::core::subfit_learn::pairs_env(std::getenv("STRATA_SUBFIT_PAIRS"));
+    cfg.ladder = strata::core::subfit_learn::ladder_env(std::getenv("STRATA_SUBFIT_LADDER"));
     g_sub_learn = std::make_unique<strata::core::subfit_learn::Learner>(cfg);
     g_sub_packer = std::make_unique<strata::core::subfit_learn::UploadPacker>(cfg.n_layers);
 }
@@ -1297,6 +1327,7 @@ struct Verifier::StandinLearnState {
         int layer = -1, rank = -1, e = -1, s = -1;
         std::vector<float> ys;
         std::vector<float> x;   // STRATA_SUBFIT_LOG: the cut row's layer input (the stand-in window's)
+        std::vector<int32_t> shadow;   // shadow samples: the cut row's listed substitutions, 4 ints each (layer, rank, e, s)
     } pend;
     std::unordered_map<uint64_t, Pair> pairs;
     std::vector<int> count;      // pairs held per layer
@@ -1434,6 +1465,7 @@ void Verifier::standin_learn_begin_window(bool decode, bool exact) {
     int32_t gate[4] = {0, 0, 0, 0};
     if (decode) {
         if (cudaMemset(lrn_rec_, 0xff, (size_t) max_t_ * 4 * sizeof(int32_t)) != cudaSuccess) (void) cudaGetLastError();
+        if (shd_on_ && cudaMemset(shd_n_, 0, (size_t) max_t_ * sizeof(uint32_t)) != cudaSuccess) (void) cudaGetLastError();
         const bool y_e = exact && st.pend.valid;
         gate[0] = y_e ? 2 : 1;
         gate[1] = st.pend.layer;
@@ -1461,6 +1493,13 @@ void Verifier::standin_learn_begin_window(bool decode, bool exact) {
             sp_win_ = true;
         }
     }
+    // shadow samples: the exact successor of a cut whose row listed substitutions captures row 0 per layer (gate[3] = 2; the logger's
+    // probe, gate[3] = 1, gives way for this window)
+    if (shd_on_ && decode && exact && st.pend.valid && !st.pend.shadow.empty()) {
+        gate[3] = 2;
+        sp_win_ = false;
+    }
+    ++shd_salt_;
     if (cudaMemcpy(lrn_gate_, gate, sizeof gate, cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
 }
 
@@ -1469,6 +1508,7 @@ void Verifier::standin_learn_cut(int row) {
     if (lrn_st_ == nullptr || row < 0 || row >= max_t_) return;
     StandinLearnState& st = *lrn_st_;
     st.pend.valid = false;
+    st.pend.shadow.clear();
     const OnDevice on(device_);
     int32_t rec[4] = {-1, -1, -1, -1};
     if (cudaMemcpy(rec, lrn_rec_ + (size_t) row * 4, sizeof rec, cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -1488,6 +1528,20 @@ void Verifier::standin_learn_cut(int row) {
             return;
         }
         st.pend.x = std::move(x);
+    }
+    if (shd_on_) {   // shadow samples: the row's listed substitutions (all layers, reservoir past the cap)
+        uint32_t cnt = 0;
+        if (cudaMemcpy(&cnt, shd_n_ + row, sizeof cnt, cudaMemcpyDeviceToHost) == cudaSuccess) {
+            const size_t m = std::min<size_t>(cnt, (size_t) shd_cap_);
+            st.pend.shadow.resize(m * 4);
+            if (m > 0 && cudaMemcpy(st.pend.shadow.data(), shd_list_ + (size_t) row * shd_cap_ * 4, m * 4 * sizeof(int32_t),
+                                    cudaMemcpyDeviceToHost) != cudaSuccess) {
+                (void) cudaGetLastError();
+                st.pend.shadow.clear();
+            }
+        } else {
+            (void) cudaGetLastError();
+        }
     }
     st.pend.valid = true;
     st.pend.layer = rec[0];
@@ -1531,6 +1585,7 @@ void Verifier::standin_learn_settle(bool exact_ok) {
         g_sub_learn->add_sample((int) l, (int) e, (int) s, st.pend.x.data(), ys.data(), ye.data());
         ++g_sub_learn_req;
     }
+    if (shd_on_ && g_sub_learn && !st.pend.shadow.empty()) subfit_shadow_collect((int) l, (int) e, (int) s);
     const uint64_t key = lrn_key(l, e, s);
     const bool pool = standin_pool_apply_env();
     if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
@@ -1649,6 +1704,50 @@ bool Verifier::standin_learn_save(const std::string& path, std::string& msg) con
 
 // The request's line: the ready pairs, this request's samples, and the mean |c - 1| of the ready pairs (the counts reset).
 void Verifier::subfit_set_path(const std::string& path) { g_subfit_path = path; }
+void Verifier::subfit_set_pack(const std::string& pack) { g_subfit_pack = pack; }
+
+// Shadow samples, after the exact successor of a cut (between windows): for each substitution the cut row listed, the successor's row-0
+// input of that layer and the true pick's output (found among the layer's exact picks) are queued; the CPU adds the stand-in's output
+// on that same input in idle time.  The primary sample (the first stand-in, its y_s from the GPU) is not queued again.
+void Verifier::subfit_shadow_collect(int l0, int e0, int s0) {
+    StandinLearnState& st = *lrn_st_;
+    const std::vector<int32_t> list = std::move(st.pend.shadow);
+    st.pend.shadow.clear();
+    const int64_t D = st.dim, L = st.layers, K = 10;
+    if (!g_shadow) {
+        g_shadow = std::make_unique<strata::core::subfit_shadow::Queue>();
+        g_shadow->set_eval(make_shadow_eval(L));
+    }
+    std::vector<int32_t> ids((size_t) (L * K));
+    std::vector<float> xs((size_t) (L * D));
+    const OnDevice on(device_);
+    if (cudaMemcpy(ids.data(), shd_ids_, ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(xs.data(), shd_x_, xs.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    for (size_t i = 0; i + 3 < list.size(); i += 4) {
+        const int l = list[i], e = list[i + 2], s = list[i + 3];
+        if (l < 0 || l >= L || e < 0 || e >= 512 || s < 0 || s >= 512) continue;
+        ++g_shadow_listed;
+        if (l == l0 && e == e0 && s == s0) continue;   // the primary sample
+        int k = -1;
+        for (int q = 0; q < K; ++q)
+            if (ids[(size_t) (l * K + q)] == e) { k = q; break; }
+        if (k < 0) { ++g_shadow_nomatch; continue; }   // the exact row did not pick e at this layer (its input moved)
+        strata::core::subfit_shadow::Item it;
+        it.layer = l;
+        it.e = e;
+        it.s = s;
+        it.x.assign(xs.begin() + l * D, xs.begin() + (l + 1) * D);
+        it.ye.resize((size_t) D);
+        if (cudaMemcpy(it.ye.data(), shd_y_ + (size_t) (l * K + k) * D, sizeof(float) * (size_t) D, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            continue;
+        }
+        g_shadow->push(std::move(it));
+    }
+}
 
 // STRATA_SUBFIT_LOG: after a probe window (the host is between windows; the window's buffers are complete).  One candidate
 // (layer, rank) of row 0 is drawn at random among the resident, unreplaced picks, and its input, raw output and router weight are written.
@@ -1730,7 +1829,18 @@ bool Verifier::subfit_learn_save(const std::string& path, uint64_t fp, std::stri
 
 strata::kernels::SubfitRoute Verifier::subfit_route_(int64_t l, int tb) const {
     strata::kernels::SubfitRoute r;   // all null: the kernels do what they did before the learner
+    if (shd_on_) {   // shadow samples: the router lists each row's substitutions (the learner on; the apply need not be)
+        r.list = shd_list_ + (size_t) tb * (size_t) shd_cap_ * 4;
+        r.list_n = shd_n_ + tb;
+        r.list_cap = shd_cap_;
+        r.salt = shd_salt_;
+    }
     if (!sub_on_ || sub_tab_.lut == nullptr) return r;
+    {
+        const size_t L = (size_t) sub_tab_.layers, pair_n = L * 512 * 512;
+        r.elut = sub_tab_.lut + pair_n + (size_t) l * 512;   // the ladder: the (layer, expert) slots, then the layer's slot
+        r.llut = sub_tab_.lut + pair_n + L * 512 + (size_t) l;
+    }
     r.orig = sub_orig_ + (size_t) tb * 10;
     r.flag = sub_flag_ + (size_t) tb * 10;
     r.lut = sub_tab_.lut + (size_t) l * 512 * 512;
@@ -1782,6 +1892,15 @@ void Verifier::subfit_tables_sync(const strata::core::subfit_learn::Changes& ch)
 
 std::string Verifier::subfit_learn_report() {
     if (!subfit_learn_active() || !g_sub_learn) return "";
+    // shadow samples finished by the idle-time CPU evaluator since the last request's end feed the learner first
+    strata::core::subfit_shadow::Stats sst{};
+    if (g_shadow) {
+        for (const auto& it : g_shadow->take_done()) {
+            g_sub_learn->add_sample(it.layer, it.e, it.s, it.x.data(), it.ys.data(), it.ye.data());
+            ++g_shadow_taken;
+        }
+        sst = g_shadow->take_stats();
+    }
     // the request's end: the pairs with new samples refit and the gate moves; the changes go to the device tables (between windows)
     const strata::core::subfit_learn::Changes ch = g_sub_learn->refit();
     subfit_tables_sync(ch);
@@ -1796,7 +1915,16 @@ std::string Verifier::subfit_learn_report() {
                   (unsigned long long) g_sub_learn_req, ready);
     g_sub_learn_req = 0;
     g_sub_req_corr = g_sub_req_subs = g_sub_req_refused = 0;
-    return buf;
+    char b2[640];
+    std::snprintf(b2, sizeof b2,
+                  "strata serve: subfit ladder: groups pair/expert/layer %zu/%zu/%zu, fitted %zu/%zu/%zu (median gain %.3f/%.3f/%.3f); "
+                  "shadow: listed %llu, queued %llu, evaluated %llu, fed %llu, dropped %llu, failed %llu, pick not found %llu, waiting %zu\n",
+                  s.groups[0], s.groups[1], s.groups[2], s.fitted_lv[0], s.fitted_lv[1], s.fitted_lv[2], s.gain_median_lv[0],
+                  s.gain_median_lv[1], s.gain_median_lv[2], (unsigned long long) g_shadow_listed, (unsigned long long) sst.queued,
+                  (unsigned long long) sst.evaluated, (unsigned long long) g_shadow_taken, (unsigned long long) sst.dropped,
+                  (unsigned long long) sst.failed, (unsigned long long) g_shadow_nomatch, g_shadow ? g_shadow->pending() : (size_t) 0);
+    g_shadow_taken = g_shadow_listed = g_shadow_nomatch = 0;
+    return std::string(buf) + b2;
 }
 
 std::string Verifier::standin_learn_report() {
@@ -2144,6 +2272,17 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             }
         }
         if (!sub_on_) { sub_orig_ = nullptr; sub_flag_ = nullptr; }
+        // SPEC-substitute-fit shadow samples (the learner on, STRATA_SUBFIT_SHADOW > 0, default 64): nothing taken otherwise
+        const int shd_cap = (x_on_ && subfit_learn_env_on())
+                                ? strata::core::subfit_shadow::per_cut_env(std::getenv("STRATA_SUBFIT_SHADOW")) : 0;
+        shd_list_ = b.take<int32_t>(shd_cap > 0 ? T * (uint64_t) shd_cap * 4 : 0);
+        shd_n_ = b.take<uint32_t>(shd_cap > 0 ? T : 0);
+        shd_ids_ = b.take<int32_t>(shd_cap > 0 ? spL * 10 : 0);
+        shd_x_ = b.take<float>(shd_cap > 0 ? spL * N : 0);
+        shd_y_ = b.take<float>(shd_cap > 0 ? spL * 10 * N : 0);
+        shd_cap_ = shd_cap;
+        shd_on_ = shd_cap > 0;
+        if (!shd_on_) { shd_list_ = nullptr; shd_n_ = nullptr; shd_ids_ = nullptr; shd_x_ = nullptr; shd_y_ = nullptr; }
         lrn_pe_ = b.take<float>(lrn_on && standin_balance_env() ? (uint64_t) g.n_layers * 512 * 512 : 0);
         if (!(lrn_on && standin_balance_env())) lrn_pe_ = nullptr;
         if (!lrn_on) { lrn_c_ = nullptr; lrn_rec_ = nullptr; lrn_ys_ = nullptr; lrn_ye_ = nullptr; lrn_gate_ = nullptr; }
@@ -3625,6 +3764,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             strata::kernels::subfit_capture_x(mixed_ + (size_t) tb * N, lrn_rec_ + (size_t) tb * 4, lrn_gate_, (int) l,
                                               lrn_x_ + (size_t) tb * N, N, n, cs);
         }
+        if (shd_on_ && lrn_gate_ != nullptr && tb == 0)   // shadow samples: row 0's picks and input (device-gated: gate[3] == 2)
+            strata::kernels::subfit_shadow_xi(ids_, mixed_, lrn_gate_, (int) l, (int) K, N, shd_ids_, shd_x_, cs);
         if (sp_on_ && lrn_gate_ != nullptr) {
             if (tb == 0 && hits_.d_res != nullptr)
                 strata::kernels::subfit_probe_post(ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, sp_.pre, sp_.clean, lrn_gate_,
@@ -3833,7 +3974,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
             // (SPEC-substitute-fit stage 2: with the apply on, the hit rows are added before the combine, so the apply reads the whole parts)
-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 && !sub_on_ &&
+            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 && !sub_on_ && !shd_on_ &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
             if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
@@ -3848,6 +3989,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // STRATA_SUBFIT_LOG (opt-in): row 0's raw expert outputs of this layer, after the experts and their join, before the combine
         if (sp_on_ && lrn_gate_ != nullptr && tb == 0)
             strata::kernels::subfit_probe_y(parts_, lrn_gate_, (int64_t) K * N, sp_.y + (size_t) l * K * N, cs);
+        if (shd_on_ && lrn_gate_ != nullptr && tb == 0)   // shadow samples: row 0's raw expert outputs (device-gated: gate[3] == 2)
+            strata::kernels::subfit_shadow_y(parts_, lrn_gate_, (int) l, (int64_t) K * N, shd_y_, cs);
         // SPEC-substitute-fit stage 2 (step 3): the substituted slots' outputs are corrected before the combine: parts = c parts + B A x.
         // One launch per layer and group whenever the apply is on (the window graph is captured once); a layer with no fit is a no-op on device.
         if (sub_on_ && sub_tab_.lut != nullptr) {
@@ -3862,6 +4005,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             aa.B = sub_tab_.B;
             aa.c = sub_tab_.c;
             aa.nfit = sub_tab_.nfit + l;
+            aa.elut = sub_tab_.lut + (size_t) sub_tab_.layers * 512 * 512 + (size_t) l * 512;
+            aa.llut = sub_tab_.lut + (size_t) sub_tab_.layers * 512 * 512 + (size_t) sub_tab_.layers * 512 + (size_t) l;
             aa.r = sub_tab_.r;
             aa.N = (int) N;
             aa.K = (int) K;

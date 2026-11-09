@@ -66,6 +66,7 @@ struct World {
 
 Config cfg() {
     Config c;
+    c.ladder = false;   // these tests cover the pair level alone (subfit_ladder_test covers the ladder)
     c.n = N;
     c.rank = R;
     c.max_pairs = 64;
@@ -136,7 +137,7 @@ void test_packer() {
     World learn(11, 0.5f), flip(11, 0.5f);
 
     // a fresh packer's mirror is all -1 and the counts are 0
-    CHECK(P.lut().size() == (size_t) NL * 512 * 512, "packer: the mirror is layers x 512 x 512");
+    CHECK(P.lut().size() == table_size(NL), "packer: the mirror holds the three levels (pairs, experts, layers)");
     CHECK(P.lut()[UploadPacker::lut_index(1, 511, 511)] == -1, "packer: a fresh mirror is -1");
     CHECK(P.fit_n()[0] == 0 && P.fit_n()[1] == 0, "packer: a fresh count is 0");
     CHECK(UploadPacker::lut_index(1, 2, 3) == ((size_t) 1 * 512 + 2) * 512 + 3, "packer: the index is (layer*512+e)*512+s");

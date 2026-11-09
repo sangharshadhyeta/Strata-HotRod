@@ -26,7 +26,20 @@ namespace strata::core::subfit_learn {
 
 constexpr int kExperts = 512;                 ///< experts per layer (the LUT's side)
 constexpr int kDefaultRank = 16;              ///< STRATA_SUBFIT_RANK default
-constexpr int kDefaultPairs = 512;            ///< STRATA_SUBFIT_PAIRS default (0.5 MB of statistics each on a 31 GB box)
+constexpr int kDefaultPairs = 256;            ///< STRATA_SUBFIT_PAIRS default: pair groups (0.5 MB of statistics each on a 31 GB box)
+constexpr int kDefaultExperts = 256;          ///< (layer, expert) groups kept (the ladder's middle level; least recently sampled evicted)
+/// The fallback ladder (9 Nov): every sample also feeds its (layer, missing expert) group and its layer group.  A group is keyed
+/// like a pair with kAny in place of s (expert level) or of both e and s (layer level).  At apply time a substituted slot uses the
+/// most specific FITTED level: the pair's slot, else its (layer, e) slot, else its layer's slot, else none.
+constexpr int kAny = 1023;
+/// The one device table for the three levels: the pair LUT [L][512][512], then the expert slots [L][512], then the layer slots [L].
+inline size_t table_size(int n_layers) { return (size_t) n_layers * 512 * 512 + (size_t) n_layers * 512 + (size_t) n_layers; }
+inline size_t table_index(int n_layers, int layer, int e, int s) {
+    if (e == kAny) return (size_t) n_layers * 512 * 512 + (size_t) n_layers * 512 + (size_t) layer;
+    if (s == kAny) return (size_t) n_layers * 512 * 512 + (size_t) layer * 512 + (size_t) e;
+    return ((size_t) layer * 512 + (size_t) e) * 512 + (size_t) s;
+}
+inline int level_of(int e, int s) { return e == kAny ? 2 : s == kAny ? 1 : 0; }
 constexpr int kMaxFitted = 512;               ///< fitted pairs in the device table (the LUT's slots)
 constexpr int kHoldEvery = 4;                 ///< every 4th sample of a pair is held out
 constexpr int kHoldWindow = 32;               ///< held-out samples in the gate's window (and the minimum before any decision)
@@ -44,6 +57,7 @@ const char* apply_name(Apply a);
 int rank_env(const char* v);
 /// STRATA_SUBFIT_PAIRS: default 512, clamped to [1, 8192].
 int pairs_env(const char* v);
+bool ladder_env(const char* v);
 
 /// IEEE half of a float (round to nearest even; overflow to infinity, tiny values to subnormal or zero).
 uint16_t f32_to_f16(float f);
@@ -61,7 +75,9 @@ bool ridge_solve(const double* ZtZ, const float* ZtYe, const float* ZtYs, double
 struct Config {
     int n = 2560;                   ///< the MoE input and output width
     int rank = kDefaultRank;        ///< r
-    int max_pairs = kDefaultPairs;  ///< pairs with statistics (least recently sampled evicted)
+    int max_pairs = kDefaultPairs;  ///< pair groups with statistics (least recently sampled evicted)
+    int max_experts = kDefaultExperts;   ///< (layer, expert) groups with statistics (least recently sampled evicted); layers: all
+    bool ladder = true;             ///< STRATA_SUBFIT_LADDER (default on): the (layer, expert) and layer groups learn too (off: pairs only)
     int max_fitted = kMaxFitted;    ///< pairs with a device slot (the device table's rows)
     uint64_t seed = 1;              ///< the feature seed (the layer index is mixed in)
     int n_layers = 48;
@@ -108,6 +124,7 @@ public:
     const std::vector<int16_t>& lut() const { return lut_; }
     const std::vector<int32_t>& fit_n() const { return fit_n_; }
     static size_t lut_index(int layer, int e, int s) { return ((size_t) layer * kExperts + (size_t) e) * kExperts + (size_t) s; }
+    size_t index(int layer, int e, int s) const { return table_index(n_layers_, layer, e, s); }
 
 private:
     int n_layers_;
@@ -120,6 +137,8 @@ private:
 struct Summary {
     size_t pairs = 0, fitted = 0, unslotted = 0;
     double gain_median = 0.0, gain_min = 0.0;
+    size_t groups[3] = {0, 0, 0}, fitted_lv[3] = {0, 0, 0};   ///< per level (pair, expert, layer)
+    double gain_median_lv[3] = {0.0, 0.0, 0.0};
 };
 
 class Learner {
@@ -132,6 +151,8 @@ public:
 
     /// One sample of pair (layer, e, s).  x, ys, ye: N floats each.  Non-finite samples are dropped.  Between windows only.
     void add_sample(int layer, int e, int s, const float* x, const float* ys, const float* ye);
+    /// the level whose slot a (layer, e, s) slot would use (0 pair, 1 expert, 2 layer), -1 none (the host mirror)
+    int level_used(int layer, int e, int s) const;
 
     /// The request end: every pair with new samples is refit; the fitted/revoked state is updated; the changes for the device are
     /// returned (slots whose fit changed or were freed, and the LUT entries that moved).
@@ -190,7 +211,8 @@ private:
     Pair* find(int layer, int e, int s);
     const Pair* find(int layer, int e, int s) const;
     Pair& get_or_create(int layer, int e, int s, Changes* ch);
-    void evict_one(Changes* ch);
+    void evict_one(int level, Changes* ch);
+    void add_to(Pair& p, const std::vector<double>& z, const float* ys, const float* ye);
     void free_slot(Pair& p, Changes* ch);
     bool assign_slot(Pair& p, Changes* ch);
     void set_lut(const Pair& p, int slot, Changes* ch);
@@ -207,7 +229,8 @@ private:
     std::unordered_map<uint64_t, Pair> pairs_;
     std::vector<std::vector<float>> A_;       // per layer, built on first use
     std::vector<bool> slot_used_;             // cfg_.max_fitted slots
-    std::vector<int16_t> lut_;                // n_layers x 512 x 512 (slot or -1)
+    std::vector<int16_t> lut_;                // table_size(n_layers): the three levels' slots (or -1)
+    size_t level_n_[3] = {0, 0, 0};           // groups per level
 };
 
 }  // namespace strata::core::subfit_learn

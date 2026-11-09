@@ -38,4 +38,11 @@ void subfit_probe_post(const int32_t* ids, const float* w, const int32_t* res, c
 /// Row 0's K raw expert outputs (parts: [K][N]) into y (the layer's [K][N] slab), while gate[3] == 1.
 void subfit_probe_y(const float* parts, const int32_t* gate, int64_t K_N, float* y, void* stream);
 
+/// SPEC-substitute-fit stage 2, shadow samples: while gate[3] == 2 (the exact successor of a cut whose row listed its substitutions),
+/// row 0's picks (ids [K]) and MoE input (mixed0 [N]) of this layer into ids_out[layer][K] and x_out[layer][N] ...
+void subfit_shadow_xi(const int32_t* ids, const float* mixed0, const int32_t* gate, int layer, int K, int64_t N, int32_t* ids_out,
+                      float* x_out, void* stream);
+/// ... and its K raw expert outputs (parts [K][N]) into y_out[layer][K][N].
+void subfit_shadow_y(const float* parts, const int32_t* gate, int layer, int64_t K_N, float* y_out, void* stream);
+
 }  // namespace strata::kernels

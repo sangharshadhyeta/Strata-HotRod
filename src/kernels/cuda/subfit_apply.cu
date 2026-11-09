@@ -30,7 +30,11 @@ __global__ void k_subfit_apply(SubfitApplyArgs a) {
         const int s = a.ids[idx];
         const int fl = a.flag[idx];
         int slot = -1;
-        if (nfit > 0 && e >= 0 && e < 512 && s >= 0 && s < 512) slot = a.lut[e * 512 + s];
+        if (nfit > 0 && e >= 0 && e < 512 && s >= 0 && s < 512) {
+            slot = a.lut[e * 512 + s];                                  // the ladder: the pair,
+            if (slot < 0 && a.elut != nullptr) slot = a.elut[e];        // else the (layer, expert) group,
+            if (slot < 0 && a.llut != nullptr) slot = a.llut[0];        // else the layer's group
+        }
         slot_k[tid] = (slot >= 0 && (a.mode == strata::core::subfit_rule::kModeAll || fl != 0)) ? slot : -1;
         a.orig[idx] = -1;
         a.flag[idx] = 0;
@@ -94,7 +98,7 @@ bool subfit_tables_alloc(SubfitTables& t, int layers, int slots, int N, int r) {
     t.N = N;
     t.r = r;
     void* p = nullptr;
-    const size_t lut_n = (size_t) layers * 512 * 512, a_n = (size_t) layers * r * N, b_n = (size_t) slots * N * r;
+    const size_t lut_n = (size_t) layers * 512 * 512 + (size_t) layers * 512 + (size_t) layers, a_n = (size_t) layers * r * N, b_n = (size_t) slots * N * r;
     bool ok = cudaMalloc(&p, lut_n * sizeof(int16_t)) == cudaSuccess;
     if (ok) {
         t.lut = static_cast<int16_t*>(p);

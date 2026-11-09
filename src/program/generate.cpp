@@ -12503,6 +12503,7 @@ int main(int argc, char** argv) {
                 std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) sid.model);
                 standin_learn_file = (std::filesystem::path(tune).parent_path() / ("standin-learn-" + std::string(hex) + ".bin")).string();
                 if (ver.subfit_learn_active()) {
+                    strata::core::Verifier::subfit_set_pack(o.pack);   // shadow samples: the CPU evaluator reads this pack's experts
                     subfit_learn_file = (std::filesystem::path(tune).parent_path() / ("subfit-learn-" + std::string(hex) + ".bin")).string();
                     subfit_learn_fp = sid.model;
                     std::string sm;

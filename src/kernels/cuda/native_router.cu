@@ -397,7 +397,11 @@ __device__ __forceinline__ bool fragile_held(const uint32_t* fctrl, int row) {
 }
 // SPEC-substitute-fit stage 2: the fitted slot of pair (e, s) in this layer's LUT, or -1 (no table, or no fit).
 __device__ __forceinline__ int sub_slot(const SubfitRoute& sub, int e, int s) {
-    return (sub.lut != nullptr && e >= 0 && e < 512 && s >= 0 && s < 512) ? (int) sub.lut[e * 512 + s] : -1;
+    if (sub.lut == nullptr || e < 0 || e >= 512 || s < 0 || s >= 512) return -1;
+    int slot = (int) sub.lut[e * 512 + s];                              // the ladder: the pair,
+    if (slot < 0 && sub.elut != nullptr) slot = (int) sub.elut[e];      // else the (layer, expert) group,
+    if (slot < 0 && sub.llut != nullptr) slot = (int) sub.llut[0];      // else the layer's group
+    return slot;
 }
 // one warp of token t (SPEC-router-fuse step 2: a device function, shared by route_resident_k and the post-routing kernel).
 // margin_out / cap / cap_stats (SPEC-recheck-gated C, F; nullptr = off): the early margin (layers 0-3), the row's shift cap and its refusal counters.
@@ -663,6 +667,20 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
                 lrn_rec[(size_t) t * 4 + 1] = r;
                 lrn_rec[(size_t) t * 4 + 2] = orig[r];
                 lrn_rec[(size_t) t * 4 + 3] = bi;
+            }
+            // SPEC-substitute-fit shadow samples: every substitution of the row (reservoir past the cap), for the exact successor's capture
+            if (lane == 0 && sub.list != nullptr && sub.list_n != nullptr && sub.list_cap > 0) {
+                const unsigned q = atomicAdd(sub.list_n + t, 1u);
+                unsigned j = q;
+                if (q >= (unsigned) sub.list_cap) {
+                    unsigned h = q * 2654435761u ^ (unsigned) layer * 40503u ^ (unsigned) r * 97u ^ sub.salt;
+                    h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+                    j = h % (q + 1u);
+                }
+                if (j < (unsigned) sub.list_cap) {
+                    int32_t* o = sub.list + ((size_t) t * (size_t) sub.list_cap + j) * 4;
+                    o[0] = layer; o[1] = r; o[2] = pair_orig[r]; o[3] = bi;
+                }
             }
             if (lane == 0 && cheap != nullptr && r < 2) ++cheap_subs;
         }

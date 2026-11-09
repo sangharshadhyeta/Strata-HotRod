@@ -81,6 +81,8 @@ int rank_env(const char* v) {
     return std::min(32, std::max(1, r));
 }
 
+bool ladder_env(const char* v) { return v == nullptr || std::atoi(v) != 0; }
+
 int pairs_env(const char* v) {
     if (v == nullptr) return kDefaultPairs;
     const int p = std::atoi(v);
@@ -209,7 +211,8 @@ Learner::Learner(const Config& cfg) : cfg_(cfg) {
     cfg_.max_fitted = std::min(kMaxFitted, std::max(1, cfg_.max_fitted));
     cfg_.n_layers = std::max(1, cfg_.n_layers);
     slot_used_.assign((size_t) cfg_.max_fitted, false);
-    lut_.assign((size_t) cfg_.n_layers * kExperts * kExperts, (int16_t) -1);
+    cfg_.max_experts = std::max(1, cfg_.max_experts);
+    lut_.assign(table_size(cfg_.n_layers), (int16_t) -1);
     A_.assign((size_t) cfg_.n_layers, {});
 }
 
@@ -230,7 +233,7 @@ const Learner::Pair* Learner::find(int layer, int e, int s) const {
 }
 
 void Learner::set_lut(const Pair& p, int slot, Changes* ch) {
-    const size_t idx = ((size_t) p.layer * kExperts + (size_t) p.e) * kExperts + (size_t) p.s;
+    const size_t idx = table_index(cfg_.n_layers, p.layer, p.e, p.s);
     lut_[idx] = (int16_t) slot;
     if (ch != nullptr) ch->lut.push_back(LutChange{p.layer, p.e, p.s, slot});
 }
@@ -277,19 +280,25 @@ bool Learner::assign_slot(Pair& p, Changes* ch) {
     return false;
 }
 
-void Learner::evict_one(Changes* ch) {
-    if (pairs_.empty()) return;
-    auto victim = pairs_.begin();
-    for (auto it = pairs_.begin(); it != pairs_.end(); ++it)
-        if (it->second.last_tick < victim->second.last_tick) victim = it;
+void Learner::evict_one(int level, Changes* ch) {
+    auto victim = pairs_.end();
+    for (auto it = pairs_.begin(); it != pairs_.end(); ++it) {
+        if (level_of(it->second.e, it->second.s) != level) continue;
+        if (victim == pairs_.end() || it->second.last_tick < victim->second.last_tick) victim = it;
+    }
+    if (victim == pairs_.end()) return;
     free_slot(victim->second, ch);
+    --level_n_[level];
     pairs_.erase(victim);
 }
 
 Learner::Pair& Learner::get_or_create(int layer, int e, int s, Changes* ch) {
     auto it = pairs_.find(key(layer, e, s));
     if (it != pairs_.end()) return it->second;
-    if ((int) pairs_.size() >= cfg_.max_pairs) evict_one(ch);
+    const int lv = level_of(e, s);
+    if (lv == 0 && (int) level_n_[0] >= cfg_.max_pairs) evict_one(0, ch);
+    if (lv == 1 && (int) level_n_[1] >= cfg_.max_experts) evict_one(1, ch);
+    ++level_n_[lv];
     Pair p;
     p.layer = layer;
     p.e = e;
@@ -335,9 +344,6 @@ void Learner::add_sample(int layer, int e, int s, const float* x, const float* y
     const int n = cfg_.n, r = cfg_.rank;
     for (int j = 0; j < n; ++j)
         if (!std::isfinite(x[j]) || !std::isfinite(ys[j]) || !std::isfinite(ye[j])) return;
-    Pair& p = get_or_create(layer, e, s, &pending_);
-    p.last_tick = ++tick_;
-    p.dirty = true;
     const std::vector<float>& A = features_of(layer);
     std::vector<double> z((size_t) r, 0.0);
     for (int k = 0; k < r; ++k) {
@@ -346,6 +352,17 @@ void Learner::add_sample(int layer, int e, int s, const float* x, const float* y
         for (int j = 0; j < n; ++j) acc += (double) a[j] * (double) x[j];
         z[(size_t) k] = acc;
     }
+    // the fallback ladder: the pair, its (layer, e) group and its layer group each learn from the sample (own held-out schedule)
+    add_to(get_or_create(layer, e, s, &pending_), z, ys, ye);
+    if (!cfg_.ladder) return;
+    add_to(get_or_create(layer, e, kAny, &pending_), z, ys, ye);
+    add_to(get_or_create(layer, kAny, kAny, &pending_), z, ys, ye);
+}
+
+void Learner::add_to(Pair& p, const std::vector<double>& z, const float* ys, const float* ye) {
+    const int n = cfg_.n, r = cfg_.rank;
+    p.last_tick = ++tick_;
+    p.dirty = true;
     const uint64_t idx = p.seen++;
     if (idx % (uint64_t) kHoldEvery == (uint64_t) kHoldEvery - 1) {   // held out: the pair's current fit, not trained on
         double e0 = 0.0, e0s = 0.0, e1 = 0.0;
@@ -389,13 +406,14 @@ void Learner::add_sample(int layer, int e, int s, const float* x, const float* y
 
 UploadPacker::UploadPacker(int n_layers)
     : n_layers_(std::max(1, n_layers)),
-      lut_((size_t) std::max(1, n_layers) * kExperts * kExperts, (int16_t) -1),
+      lut_(table_size(std::max(1, n_layers)), (int16_t) -1),
       fit_n_((size_t) std::max(1, n_layers), 0) {}
 
 void UploadPacker::pack(const Changes& ch, std::vector<LutWrite>& lut_out, std::vector<SlotWrite>& slot_out) {
     for (const LutChange& c : ch.lut) {
-        if (c.layer < 0 || c.layer >= n_layers_ || c.e < 0 || c.e >= kExperts || c.s < 0 || c.s >= kExperts) continue;
-        const size_t idx = lut_index(c.layer, c.e, c.s);
+        if (c.layer < 0 || c.layer >= n_layers_) continue;
+        if (!(c.e == kAny ? c.s == kAny : (c.e >= 0 && c.e < kExperts && (c.s == kAny || (c.s >= 0 && c.s < kExperts))))) continue;
+        const size_t idx = index(c.layer, c.e, c.s);
         const int16_t old = lut_[idx];
         if (old >= 0 && c.slot < 0) --fit_n_[(size_t) c.layer];
         if (old < 0 && c.slot >= 0) ++fit_n_[(size_t) c.layer];
@@ -491,7 +509,18 @@ Changes Learner::all_fitted() const {
 
 int Learner::lookup(int layer, int e, int s) const {
     if (layer < 0 || layer >= cfg_.n_layers || e < 0 || e >= kExperts || s < 0 || s >= kExperts) return -1;
-    return lut_[((size_t) layer * kExperts + (size_t) e) * kExperts + (size_t) s];
+    int16_t v = lut_[table_index(cfg_.n_layers, layer, e, s)];
+    if (v < 0) v = lut_[table_index(cfg_.n_layers, layer, e, kAny)];
+    if (v < 0) v = lut_[table_index(cfg_.n_layers, layer, kAny, kAny)];
+    return v;
+}
+
+int Learner::level_used(int layer, int e, int s) const {
+    if (layer < 0 || layer >= cfg_.n_layers || e < 0 || e >= kExperts || s < 0 || s >= kExperts) return -1;
+    if (lut_[table_index(cfg_.n_layers, layer, e, s)] >= 0) return 0;
+    if (lut_[table_index(cfg_.n_layers, layer, e, kAny)] >= 0) return 1;
+    if (lut_[table_index(cfg_.n_layers, layer, kAny, kAny)] >= 0) return 2;
+    return -1;
 }
 
 double Learner::gain_as_is(int layer, int e, int s) const {
@@ -535,14 +564,23 @@ size_t Learner::slots_used() const {
 Summary Learner::summary() const {
     Summary s;
     s.pairs = pairs_.size();
-    std::vector<double> gains;
+    std::vector<double> gains, glv[3];
     for (const auto& kv : pairs_) {
         const Pair& p = kv.second;
+        const int lv = level_of(p.e, p.s);
+        ++s.groups[lv];
         if (!p.is_fitted) continue;
         ++s.fitted;
+        ++s.fitted_lv[lv];
         if (p.slot < 0) ++s.unslotted;
         gains.push_back(gain_recent(p));
+        glv[lv].push_back(gain_recent(p));
     }
+    for (int lv = 0; lv < 3; ++lv)
+        if (!glv[lv].empty()) {
+            std::sort(glv[lv].begin(), glv[lv].end());
+            s.gain_median_lv[lv] = glv[lv][glv[lv].size() / 2];
+        }
     if (!gains.empty()) {
         std::sort(gains.begin(), gains.end());
         const size_t m = gains.size();
@@ -664,7 +702,7 @@ bool Learner::load(const std::string& path, uint64_t fp, std::string& err) {
         rd.get_f32s(p.zye, (size_t) r * n);
         rd.get_f32s(p.zys, (size_t) r * n);
         if (p.has_b) rd.get_f32s(p.B, (size_t) n * r);
-        if (!rd.ok || p.layer < 0 || p.layer >= cfg_.n_layers || p.e < 0 || p.e >= kExperts || p.s < 0 || p.s >= kExperts ||
+        if (!rd.ok || p.layer < 0 || p.layer >= cfg_.n_layers || !(p.e == kAny ? p.s == kAny : (p.e >= 0 && p.e < kExperts && (p.s == kAny || (p.s >= 0 && p.s < kExperts)))) ||
             p.ring_pos < 0 || p.ring_pos >= kHoldWindow || p.ring_n < 0 || p.ring_n > kHoldWindow) {
             err = "subfit learner file is malformed; not loaded";
             return false;
@@ -687,9 +725,11 @@ bool Learner::load(const std::string& path, uint64_t fp, std::string& err) {
     tick_ = tick;
     slot_used_ = used;
     std::fill(lut_.begin(), lut_.end(), (int16_t) -1);
+    level_n_[0] = level_n_[1] = level_n_[2] = 0;
     for (const auto& kv : pairs_) {
         const Pair& p = kv.second;
-        if (p.slot >= 0) lut_[((size_t) p.layer * kExperts + (size_t) p.e) * kExperts + (size_t) p.s] = (int16_t) p.slot;
+        ++level_n_[level_of(p.e, p.s)];
+        if (p.slot >= 0) lut_[table_index(cfg_.n_layers, p.layer, p.e, p.s)] = (int16_t) p.slot;
     }
     pending_ = Changes{};
     return true;
