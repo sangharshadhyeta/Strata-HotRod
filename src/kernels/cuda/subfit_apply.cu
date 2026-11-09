@@ -94,10 +94,10 @@ void subfit_apply(const SubfitApplyArgs& a, void* stream) {
 
 // One table: VRAM when it fits, else pinned host memory the GPU reads over PCIe (the expert cache fills the card at start, and the
 // tables are ~70 MB: the lookups are one small read per substitution, a slot's B is read only for a corrected move).  `host` says which.
-static bool alloc_table(size_t bytes, void** dev, void** host_ptr) {
+static bool alloc_table(size_t bytes, void** dev, void** host_ptr, bool vram_ok) {
     *dev = nullptr;
     *host_ptr = nullptr;
-    if (cudaMalloc(dev, bytes) == cudaSuccess) return true;
+    if (vram_ok && cudaMalloc(dev, bytes) == cudaSuccess) return true;
     (void) cudaGetLastError();
     *dev = nullptr;
     void* h = nullptr;
@@ -137,7 +137,9 @@ bool subfit_tables_alloc(SubfitTables& t, int layers, int slots, int N, int r) {
     void* dev[6] = {};
     bool ok = true;
     for (int i = 0; i < 6 && ok; ++i) {
-        ok = alloc_table(bytes[i], &dev[i], &t.host[i]);
+        // the LUT (25 MB) and B (40 MB) always in pinned host memory: in VRAM they took the margin the window graphs need later
+        // ('verify: instantiate: out of memory', 9 Nov); the small tables (A, c, resid, nfit) in VRAM when they fit
+        ok = alloc_table(bytes[i], &dev[i], &t.host[i], i != 0 && i != 2);
         if (ok) ok = fill_table(dev[i], t.host[i], fill[i], bytes[i]);
         if (ok && t.host[i] != nullptr) t.host_bytes += bytes[i];
         if (!ok) {

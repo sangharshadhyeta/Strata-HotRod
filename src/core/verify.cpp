@@ -2283,7 +2283,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                 sub_on_ = true;
                 sub_mode_ = subfit_apply_mode_env();
                 if (sub_tab_.host_bytes > 0)
-                    std::fprintf(stderr, "strata: STRATA_SUBFIT_APPLY: %.1f MiB of the correction tables in pinned host memory (VRAM full)\n",
+                    std::fprintf(stderr, "strata: STRATA_SUBFIT_APPLY: %.1f MiB of the correction tables in pinned host memory (kept out of VRAM: the window graphs need its margin)\n",
                                  (double) sub_tab_.host_bytes / 1048576.0);
                 g_sub_apply_on = true;
             } else if (sub_orig_ != nullptr) {   // (the sizing pass has no arena: nothing to report there)
