@@ -1866,7 +1866,7 @@ void Verifier::subfit_tables_start() {
     for (int l = 0; l < sub_tab_.layers; ++l) {
         const std::vector<uint16_t> A = g_sub_learn->features_f16(l);
         if (A.size() != per) return;
-        if (cudaMemcpy(sub_tab_.A + (size_t) l * per, A.data(), per * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (cudaMemcpy(sub_tab_.A + (size_t) l * per, A.data(), per * sizeof(uint16_t), cudaMemcpyDefault) != cudaSuccess) {
             (void) cudaGetLastError();
             return;
         }
@@ -1884,18 +1884,18 @@ void Verifier::subfit_tables_sync(const strata::core::subfit_learn::Changes& ch)
     const OnDevice on(device_);
     const size_t N = (size_t) sub_tab_.N, r = (size_t) sub_tab_.r;
     for (const auto& w : lw) {
-        if (cudaMemcpy(sub_tab_.lut + w.index, &w.value, sizeof(int16_t), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+        if (cudaMemcpy(sub_tab_.lut + w.index, &w.value, sizeof(int16_t), cudaMemcpyDefault) != cudaSuccess) (void) cudaGetLastError();
     }
     for (const auto& w : sw) {
         if (w.slot < 0 || w.slot >= sub_tab_.slots) continue;
         if (!w.freed && w.b.size() == N * r &&
-            cudaMemcpy(sub_tab_.B + (size_t) w.slot * N * r, w.b.data(), w.b.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess)
+            cudaMemcpy(sub_tab_.B + (size_t) w.slot * N * r, w.b.data(), w.b.size() * sizeof(uint16_t), cudaMemcpyDefault) != cudaSuccess)
             (void) cudaGetLastError();
-        if (cudaMemcpy(sub_tab_.c + w.slot, &w.c, sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
-        if (cudaMemcpy(sub_tab_.resid + w.slot, &w.resid, sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+        if (cudaMemcpy(sub_tab_.c + w.slot, &w.c, sizeof(float), cudaMemcpyDefault) != cudaSuccess) (void) cudaGetLastError();
+        if (cudaMemcpy(sub_tab_.resid + w.slot, &w.resid, sizeof(float), cudaMemcpyDefault) != cudaSuccess) (void) cudaGetLastError();
     }
     const std::vector<int32_t>& nf = g_sub_packer->fit_n();
-    if ((int) nf.size() == sub_tab_.layers && cudaMemcpy(sub_tab_.nfit, nf.data(), nf.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
+    if ((int) nf.size() == sub_tab_.layers && cudaMemcpy(sub_tab_.nfit, nf.data(), nf.size() * sizeof(int32_t), cudaMemcpyDefault) != cudaSuccess)
         (void) cudaGetLastError();
 }
 
@@ -2275,6 +2275,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                 strata::kernels::subfit_tables_alloc(sub_tab_, (int) g.n_layers, strata::core::subfit_learn::kMaxFitted, (int) N, rk)) {
                 sub_on_ = true;
                 sub_mode_ = subfit_apply_mode_env();
+                if (sub_tab_.host_bytes > 0)
+                    std::fprintf(stderr, "strata: STRATA_SUBFIT_APPLY: %.1f MiB of the correction tables in pinned host memory (VRAM full)\n",
+                                 (double) sub_tab_.host_bytes / 1048576.0);
                 g_sub_apply_on = true;
             } else {
                 std::fprintf(stderr, "strata: STRATA_SUBFIT_APPLY: no device tables, so no correction applied\n");

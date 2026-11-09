@@ -1,6 +1,7 @@
 // src/kernels/cuda/subfit_apply.cu - SPEC-substitute-fit stage 2: the per-pair correction of a substituted expert's output (see the header).
 #include "strata/kernels/subfit_apply.hpp"
 
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -91,44 +92,68 @@ void subfit_apply(const SubfitApplyArgs& a, void* stream) {
     k_subfit_apply<<<(unsigned) a.n, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(a);
 }
 
+// One table: VRAM when it fits, else pinned host memory the GPU reads over PCIe (the expert cache fills the card at start, and the
+// tables are ~70 MB: the lookups are one small read per substitution, a slot's B is read only for a corrected move).  `host` says which.
+static bool alloc_table(size_t bytes, void** dev, void** host_ptr) {
+    *dev = nullptr;
+    *host_ptr = nullptr;
+    if (cudaMalloc(dev, bytes) == cudaSuccess) return true;
+    (void) cudaGetLastError();
+    *dev = nullptr;
+    void* h = nullptr;
+    if (cudaHostAlloc(&h, bytes, cudaHostAllocMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    void* d = nullptr;
+    if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cudaFreeHost(h);
+        return false;
+    }
+    *dev = d;
+    *host_ptr = h;
+    return true;
+}
+
+static bool fill_table(void* dev, void* host_ptr, int byte, size_t bytes) {
+    if (host_ptr != nullptr) {
+        std::memset(host_ptr, byte, bytes);
+        return true;
+    }
+    return cudaMemset(dev, byte, bytes) == cudaSuccess;
+}
+
 bool subfit_tables_alloc(SubfitTables& t, int layers, int slots, int N, int r) {
     subfit_tables_free(t);
     t.layers = layers;
     t.slots = slots;
     t.N = N;
     t.r = r;
-    void* p = nullptr;
     const size_t lut_n = (size_t) layers * 512 * 512 + (size_t) layers * 512 + (size_t) layers, a_n = (size_t) layers * r * N, b_n = (size_t) slots * N * r;
-    bool ok = cudaMalloc(&p, lut_n * sizeof(int16_t)) == cudaSuccess;
-    if (ok) {
-        t.lut = static_cast<int16_t*>(p);
-        ok = cudaMemset(t.lut, 0xff, lut_n * sizeof(int16_t)) == cudaSuccess;   // int16 -1
+    const size_t bytes[6] = {lut_n * sizeof(int16_t), a_n * sizeof(uint16_t), b_n * sizeof(uint16_t), (size_t) slots * sizeof(float),
+                             (size_t) slots * sizeof(float), (size_t) layers * sizeof(int32_t)};
+    const int fill[6] = {0xff, 0, 0, 0, 0, 0};   // the LUT is int16 -1, the rest zero
+    void* dev[6] = {};
+    bool ok = true;
+    for (int i = 0; i < 6 && ok; ++i) {
+        ok = alloc_table(bytes[i], &dev[i], &t.host[i]);
+        if (ok) ok = fill_table(dev[i], t.host[i], fill[i], bytes[i]);
+        if (ok && t.host[i] != nullptr) t.host_bytes += bytes[i];
+        if (!ok) {
+            // keep what was taken so subfit_tables_free releases it
+            if (dev[i] != nullptr && t.host[i] == nullptr) (void) cudaFree(dev[i]);
+            else if (t.host[i] != nullptr) (void) cudaFreeHost(t.host[i]);
+            t.host[i] = nullptr;
+            dev[i] = nullptr;
+        }
     }
-    if (ok) ok = cudaMalloc(&p, a_n * sizeof(uint16_t)) == cudaSuccess;
-    if (ok) {
-        t.A = static_cast<uint16_t*>(p);
-        ok = cudaMemset(t.A, 0, a_n * sizeof(uint16_t)) == cudaSuccess;
-    }
-    if (ok) ok = cudaMalloc(&p, b_n * sizeof(uint16_t)) == cudaSuccess;
-    if (ok) {
-        t.B = static_cast<uint16_t*>(p);
-        ok = cudaMemset(t.B, 0, b_n * sizeof(uint16_t)) == cudaSuccess;
-    }
-    if (ok) ok = cudaMalloc(&p, (size_t) slots * sizeof(float)) == cudaSuccess;
-    if (ok) {
-        t.c = static_cast<float*>(p);
-        ok = cudaMemset(t.c, 0, (size_t) slots * sizeof(float)) == cudaSuccess;
-    }
-    if (ok) ok = cudaMalloc(&p, (size_t) slots * sizeof(float)) == cudaSuccess;
-    if (ok) {
-        t.resid = static_cast<float*>(p);
-        ok = cudaMemset(t.resid, 0, (size_t) slots * sizeof(float)) == cudaSuccess;
-    }
-    if (ok) ok = cudaMalloc(&p, (size_t) layers * sizeof(int32_t)) == cudaSuccess;
-    if (ok) {
-        t.nfit = static_cast<int32_t*>(p);
-        ok = cudaMemset(t.nfit, 0, (size_t) layers * sizeof(int32_t)) == cudaSuccess;
-    }
+    t.lut = static_cast<int16_t*>(dev[0]);
+    t.A = static_cast<uint16_t*>(dev[1]);
+    t.B = static_cast<uint16_t*>(dev[2]);
+    t.c = static_cast<float*>(dev[3]);
+    t.resid = static_cast<float*>(dev[4]);
+    t.nfit = static_cast<int32_t*>(dev[5]);
     if (!ok) {
         (void) cudaGetLastError();
         subfit_tables_free(t);
@@ -138,12 +163,11 @@ bool subfit_tables_alloc(SubfitTables& t, int layers, int slots, int N, int r) {
 }
 
 void subfit_tables_free(SubfitTables& t) {
-    if (t.lut) (void) cudaFree(t.lut);
-    if (t.A) (void) cudaFree(t.A);
-    if (t.B) (void) cudaFree(t.B);
-    if (t.c) (void) cudaFree(t.c);
-    if (t.resid) (void) cudaFree(t.resid);
-    if (t.nfit) (void) cudaFree(t.nfit);
+    void* dev[6] = {t.lut, t.A, t.B, t.c, t.resid, t.nfit};
+    for (int i = 0; i < 6; ++i) {
+        if (t.host[i] != nullptr) (void) cudaFreeHost(t.host[i]);
+        else if (dev[i] != nullptr) (void) cudaFree(dev[i]);
+    }
     t = SubfitTables{};
 }
 

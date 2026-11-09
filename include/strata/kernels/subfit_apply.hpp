@@ -69,6 +69,8 @@ struct SubfitTables {
     float* resid = nullptr;      ///< [slots]
     int32_t* nfit = nullptr;     ///< [layers]
     int layers = 0, slots = 0, N = 0, r = 0;
+    void* host[6] = {};       ///< per table (lut, A, B, c, resid, nfit): its pinned host block when VRAM was full, else nullptr
+    size_t host_bytes = 0;    ///< bytes placed in pinned host memory (0: all in VRAM)
 };
 bool subfit_tables_alloc(SubfitTables& t, int layers, int slots, int N, int r);
 void subfit_tables_free(SubfitTables& t);
