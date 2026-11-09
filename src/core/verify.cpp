@@ -5,6 +5,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/standin_pool.hpp"
 #include "strata/core/subfit_samples.hpp"
+#include "strata/core/subfit_learn.hpp"
 #include "strata/core/risk_concentration.hpp"
 #include "strata/kernels/subfit_capture.hpp"
 #include <random>
@@ -184,6 +185,9 @@ struct RouteResidentCfg {
     bool fragile_k_set = false;               ///< k is set: STRATA_FRAGILE_K0, or learned from the first kFragileLearn windows (no cut before)
     bool fragile_k_pinned = false;            ///< STRATA_FRAGILE_K0 is set: k never learns or updates, and the file's k does not replace it
     float fragile_k_file = 0.0f;              ///< the k the tune file holds (loaded); written back in place of a pinned k (0: none)
+    // SPEC-substitute-fit stage 2 step 3: STRATA_SUBFIT_APPLY's mode slot (0 off, 1 dynamic, 2 all), read once.  The k and the control ring
+    // of this slot are the process's; the other slots stay in the gate file as they were (gate::KByMode).
+    int subfit_mode = 1;
     enum { kFragileLearn = 64, kFragileSamples = 20000, kFragileK = 50 };
     long long fr_eligible = 0;                ///< eligible windows (k set, stand-in moves) counted by route_fragile_first: every 16th may explore
     long long fr_session = 0;                 ///< re-checks settled in this process (the ring's entries; the k update every 50)
@@ -494,6 +498,7 @@ RouteResidentCfg& route_resident_cfg() {
         if (const char* v = std::getenv("STRATA_SHIFT_CAP_CONF")) r.cap_mult.conf = (float) std::atof(v);
         // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 off): every n-th eligible decode window is a fragile control window (see RouteResidentCfg)
         if (const char* v = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) r.fr_ctrl_every = std::max(0LL, std::atoll(v));
+        r.subfit_mode = strata::core::gate::mode_slot((int) strata::core::subfit_learn::apply_env(std::getenv("STRATA_SUBFIT_APPLY")));
         if (const char* v = std::getenv("STRATA_FRAGILE_K0")) {
             const float k0 = (float) std::atof(v);
             if (k0 > 0.0f) {
@@ -4848,7 +4853,11 @@ float route_k_eff(const RouteResidentCfg& c) {
 void route_gate_write(const RouteResidentCfg& c) {
     const std::string path = c.tune_path + ".gate";
     const std::string tmp = path + ".tmp";
-    const std::string text = strata::core::gate::serialize(c.gs, c.tune_fp);
+    // step 3: this mode's k and ring go back into its slot (a pinned k is not learned: its slot keeps the k it had)
+    strata::core::gate::State saved = c.gs;
+    const float k_slot = c.gs.km.k_set[c.subfit_mode] ? c.gs.km.k[c.subfit_mode] : c.fragile_k;
+    strata::core::gate::store_active(saved, c.subfit_mode, c.fragile_k_pinned ? k_slot : c.fragile_k);
+    const std::string text = strata::core::gate::serialize(saved, c.tune_fp);
     FILE* f = std::fopen(tmp.c_str(), "w");
     if (f == nullptr) return;
     bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
@@ -4963,8 +4972,16 @@ void Verifier::route_tune_open(const std::string& path, uint64_t model_fp) {
     c.tune_fp = model_fp;
     c.tune_path = path;
     // SPEC-recheck-gated: the gate's saved state (P_HI, totals, ranks, shifts, calibration), when it is this model's
+    bool gate_loaded = false;
     if (c.gate_on && std::filesystem::exists(path + ".gate")) {
         if (route_gate_read(path + ".gate", model_fp, c)) {
+            gate_loaded = true;
+            // step 3: a file without per-mode rings keeps its ring (the active one) as the off slot, and that seeds the others; this
+            // process's mode takes its own ring as the active ring
+            const bool has_ring_modes = c.gs.km.ctrl_set[0] || c.gs.km.ctrl_set[1] || c.gs.km.ctrl_set[2];
+            strata::core::gate::seed_by_mode(c.gs.km, 0.0f, has_ring_modes ? nullptr : &c.gs.ctrl);
+            float mode_k_unused = 0.0f;
+            (void) strata::core::gate::activate(c.gs, c.subfit_mode, mode_k_unused);
             // the saved control re-checks seed the window's control ring: the k evidence and the brake have the noise floor from the first window
             c.fr_ctrl_n = strata::core::gate::ctrl_seed(c.gs, c.fr_ctrl, RouteResidentCfg::kCtrlRing, c.fr_ctrl_pos);
             double ctl_lo = 0.0, ctl_hi = 0.0;
@@ -4976,13 +4993,25 @@ void Verifier::route_tune_open(const std::string& path, uint64_t model_fp) {
         else
             std::fprintf(stderr, "strata serve: recheck gate state in %s ignored (its model fingerprint differs or it is malformed)\n", (path + ".gate").c_str());
     }
-    if (!std::filesystem::exists(path)) return;
-    if (!route_tune_read(path, model_fp, c)) {
+    const bool tune_exists = std::filesystem::exists(path);
+    const bool tune_ok = tune_exists && route_tune_read(path, model_fp, c);
+    if (tune_exists && !tune_ok)
         std::fprintf(stderr, "strata serve: stand-in tuning in %s ignored (its model fingerprint differs or it has none)\n", path.c_str());
-        return;
+    // step 3: this mode's own k.  The tune file's k is the active mode's (written back as `k`), so it seeds the off slot only when the
+    // gate file has no per-mode k lines; an unset mode takes the off slot's k (seed_by_mode); the mode's k then skips the learning.
+    if (gate_loaded && !c.fragile_k_pinned) {
+        const bool has_k_modes = c.gs.km.k_set[0] || c.gs.km.k_set[1] || c.gs.km.k_set[2];
+        strata::core::gate::seed_by_mode(c.gs.km, has_k_modes || !tune_ok ? 0.0f : c.fragile_k_file, nullptr);
+        float mode_k = 0.0f;
+        if (strata::core::gate::activate(c.gs, c.subfit_mode, mode_k)) {
+            c.fragile_k = mode_k;
+            c.fragile_k_set = true;
+            c.fr_learn_ratio.clear();
+        }
     }
-    std::fprintf(stderr, "strata serve: stand-in tuning loaded: budget %.3f, k %.4f (%lld tests) from %s\n",
-                 (double) c.auto_b, (double) c.fragile_k, (long long) c.auto_tests, path.c_str());
+    if (!tune_ok) return;
+    std::fprintf(stderr, "strata serve: stand-in tuning loaded: budget %.3f, k %.4f (%lld tests) from %s (APPLY mode slot %d)\n",
+                 (double) c.auto_b, (double) c.fragile_k, (long long) c.auto_tests, path.c_str(), c.subfit_mode);
 }
 
 bool Verifier::route_fragile_on() { return route_resident_cfg().fragile_on; }
