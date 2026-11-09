@@ -4527,6 +4527,7 @@ struct Model::Impl {
                     const char* br = std::getenv("STRATA_FRAGILE_BRAKE");
                     tune.configure(h.budget, fr_k, std::getenv("STRATA_FRAGILE_K0") != nullptr, br == nullptr || std::atoi(br) != 0);
                     tune_path = o.pack + "/standin-tune.txt";
+                    if (const char* ce = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) tune.set_ctrl_every(std::atoll(ce));
                     const bool loaded = tune.load(tune_path);
                     tune_on = true;
                     std::fprintf(stderr, "ds4: stand-ins: the budget tunes itself (%s): %s\n", loaded ? ("loaded " + tune_path).c_str() : "new",
@@ -11579,6 +11580,23 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(hd.st));
         flipped = (int) t2[2] != before;
         fr_flips += flipped;
+        // 9 Nov: a control re-check - the exact pass once more; the two exact top tokens differ only by noise (the k evidence's floor)
+        if (tune_on && tune.control_due()) {
+            const int exact1 = (int) t2[2];
+            pos = p0;
+            toks.resize((size_t) p0);
+            ctoks.resize((size_t) p0);
+            standin_bypass = true;
+            const bool ok2 = forward(&token, 1, 1, err);
+            standin_bypass = false;
+            if (!ok2) return false;
+            --st.tokens;
+            cudaSetDevice(hd.id);
+            logit_top2(hd.logits, g.vocab, d_top2, hd.st);
+            CK(cudaMemcpyAsync(t2, d_top2, sizeof t2, cudaMemcpyDeviceToHost, hd.st));
+            CK(cudaStreamSynchronize(hd.st));
+            tune.note_control((int) t2[2] != exact1);
+        }
         if (stop_tok) {   // (the exact run's top-1 is the same stop: the reply really ends here)
             ++fr_stop_checks;
             fr_stop_kept += !flipped;

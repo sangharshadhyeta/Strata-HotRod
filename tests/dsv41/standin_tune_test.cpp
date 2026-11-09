@@ -145,6 +145,30 @@ static void test_brake() {
 }
 
 // 4. k: no flips, no change; pinned, no change; learned, it moves only at a 50th re-check and inside its bounds.
+static void test_k_evidence() {   // 9 Nov port of the Qwen rule
+    {   // no measured noise floor (no control re-checks): flips everywhere cannot move k
+        StandinTune t;
+        t.configure(0.1f, 4.0f, false, false);
+        t.set_ctrl_every(0);
+        Engine e;
+        e.flip_from = 0.0;
+        e.flip_p = 0.5;
+        for (int i = 0; i < 3000; ++i) {
+            if (i % 200 == 0) t.begin_request();
+            e.token(t);
+        }
+        CHECK(e.flips > 0);
+        CHECK(t.k() == 4.0f);
+    }
+    {   // with a floor of 0 (controls never differ) the noise bound shrinks and the flips set k; every step within 0.5x-1.5x
+        StandinTune t;
+        t.configure(0.1f, 4.0f, false, false);
+        for (int i = 0; i < 40; ++i) t.note_control(false);
+        CHECK(t.ctrl_count() == 40);
+        CHECK(t.ctrl_hi() < 0.1);
+    }
+}
+
 static void test_k() {
     {   // no flips at all
         StandinTune t;
@@ -177,6 +201,7 @@ static void test_k() {
         for (int i = 0; i < 4000; ++i) {
             if (i % 200 == 0) t.begin_request();
             e.token(t);
+            if (t.control_due()) t.note_control(false);   // (9 Nov: the engine's control re-checks; exact vs exact never differs here)
             if (t.k() != prev) {
                 ++changes;
                 if (e.rechecks % 50 != 0) at_50 = false;
@@ -250,6 +275,7 @@ int main() {
     test_climb_to_knee();
     test_brake();
     test_k();
+    test_k_evidence();
     test_save_load();
     if (fails == 0) {
         std::printf("PASS ds4_standin_tune_test: all checks passed\n");

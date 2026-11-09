@@ -98,13 +98,40 @@ public:
             // the k ring: this re-check's ratio and flip, the last kKWindow re-checks
             ring_ratio_[ring_pos_] = risk > 0.0f && std::isfinite(gap / risk) ? gap / risk : 0.0f;
             ring_flip_[ring_pos_] = flipped;
-            ring_pos_ = (ring_pos_ + 1) % kKWindow;
+            ring_pos_ = (ring_pos_ + 1) % kKRing;
+            if (ring_n_ < kKRing) ++ring_n_;
             if (++rc_total_ % kKWindow == 0) k_update();
             brake_check();
         }
         const long long need = mask_testing_ ? (long long) kMaskMin : (long long) kAutoMin;   // (a mask test: 4x, see kMaskMin)
         if (testing_ && n_[0] >= need && n_[1] >= need) test_done();
     }
+
+    // ---- the noise floor (9 Nov, the Qwen engine's control re-checks): a control re-check runs the exact pass a second time and
+    // compares the two exact top tokens.  A difference is noise (no stand-in is involved); their rate's Wilson upper bound is the floor the
+    // k evidence must clear.  Due on every 2nd re-check until kCtrlMin controls are kept, then every ctrl_every-th
+    // (STRATA_FRAGILE_CTRL_EVERY, default 32; 0 off).
+    void set_ctrl_every(long long n) { ctrl_every_ = n < 0 ? 0 : n; }
+    bool control_due() {
+        if (ctrl_every_ <= 0) return false;
+        const long long every = ctrl_cnt_ < kCtrlMin ? 2 : ctrl_every_;
+        return ++ctrl_tick_ % every == 0;
+    }
+    void note_control(bool differed) {
+        ctrl_ring_[ctrl_pos_] = differed;
+        ctrl_pos_ = (ctrl_pos_ + 1) % kCtrlRing;
+        if (ctrl_cnt_ < kCtrlRing) ++ctrl_cnt_;
+        ++ctrl_req_;
+    }
+    int ctrl_count() const { return ctrl_cnt_; }
+    double ctrl_hi() const {
+        long long f = 0;
+        for (int i = 0; i < ctrl_cnt_; ++i) f += ctrl_ring_[i] ? 1 : 0;
+        double lo = 0.0, hi = 1.0;
+        wilson90(f, ctrl_cnt_, lo, hi);
+        return hi;
+    }
+    long long take_ctrl_req() { const long long v = ctrl_req_; ctrl_req_ = 0; return v; }
 
     // Writes the state to path (through a temp file, then renamed).  False when the file cannot be written.
     bool save(const std::string& path) const {
@@ -117,6 +144,11 @@ public:
         ok = ok && std::fprintf(f, "clean %.9g\n", b_clean_) > 0;
         ok = ok && std::fprintf(f, "tests %lld\n", tests_) > 0;
         ok = ok && std::fprintf(f, "lastwin %d\n", last_win_) > 0;
+        {   // the control ring, oldest first, as 0/1 characters
+            std::string bits;
+            for (int i = 0; i < ctrl_cnt_; ++i) bits += ctrl_ring_[(ctrl_pos_ - ctrl_cnt_ + i + kCtrlRing) % kCtrlRing] ? '1' : '0';
+            if (!bits.empty()) ok = ok && std::fprintf(f, "ctrl %s\n", bits.c_str()) > 0;
+        }
         ok = std::fclose(f) == 0 && ok;
         if (ok && std::rename(tmp.c_str(), path.c_str()) == 0) return true;
         std::remove(tmp.c_str());
@@ -133,6 +165,13 @@ public:
         while (std::fgets(line, sizeof line, f) != nullptr) {
             char key[32] = "";
             double v = 0.0;
+            if (std::strncmp(line, "ctrl ", 5) == 0) {   // the control ring (0/1 characters, oldest first)
+                ctrl_cnt_ = 0;
+                ctrl_pos_ = 0;
+                for (const char* q = line + 5; *q == '0' || *q == '1'; ++q) note_control(*q == '1');
+                ctrl_req_ = 0;
+                continue;
+            }
             if (std::sscanf(line, "%31s %lf", key, &v) != 2) continue;
             if (std::strcmp(key, "budget") == 0) budget = v;
             else if (std::strcmp(key, "k") == 0) k = v;
@@ -156,8 +195,8 @@ public:
     // One line: b, k, req_b, tests, wins, brakes.
     std::string stats() const {
         char buf[256];
-        std::snprintf(buf, sizeof buf, "b %.3f k %.3f req_b %.3f tests %lld wins %lld brakes %lld", (double) b_, (double) k_,
-                      (double) req_b_, tests_, wins_, brakes_);
+        std::snprintf(buf, sizeof buf, "b %.3f k %.3f req_b %.3f tests %lld wins %lld brakes %lld; noise floor %.3f from %d control re-checks",
+                      (double) b_, (double) k_, (double) req_b_, tests_, wins_, brakes_, ctrl_hi(), ctrl_cnt_);
         return buf;
     }
 
@@ -167,6 +206,10 @@ private:
     // kMaskMin: a mask test's tokens per arm, 4x the budget test's - shorter tests walked the mask's depth back and forth on noise (Qwen, 6 Nov)
     enum { kAutoRun = 8, kAutoMin = 400, kAutoTokMin = 200, kCleanTok = 400, kMaskMin = 1600 };
     enum { kBrakeMin = 15, kBrakeWindows = 64, kBrakeTokMin = 100, kBrakeFlips = 3, kKWindow = 50 };
+    // the k evidence (9 Nov port): the ring keeps kKRing re-checks; a threshold needs kEvidenceMinN entries, a raise kKRaiseMinN; the
+    // lowering needs kKRingMin ring entries and kCtrlMin controls and stops at kKFloor
+    enum { kKRing = 200, kEvidenceMinN = 8, kKRaiseMinN = 30, kKRingMin = 50, kCtrlMin = 20, kCtrlRing = 256 };
+    static constexpr float kKFloor = 0.005f;
     static constexpr double kZ = 1.6448536;   // the Wilson score's z for 90%
 
     // ---- the search state ----
@@ -210,9 +253,12 @@ private:
     // ---- k ----
     float k_ = 4.0f;
     bool k_pinned_ = false;
-    float ring_ratio_[kKWindow] = {};  ///< the last kKWindow re-checks: gap / risk
-    bool ring_flip_[kKWindow] = {};    ///< and whether each flipped
-    int ring_pos_ = 0;
+    float ring_ratio_[kKRing] = {};    ///< the last kKRing re-checks: gap / risk
+    bool ring_flip_[kKRing] = {};      ///< and whether each flipped
+    int ring_pos_ = 0, ring_n_ = 0;
+    bool ctrl_ring_[kCtrlRing] = {};   ///< the last control re-checks: did the two exact passes differ
+    int ctrl_pos_ = 0, ctrl_cnt_ = 0;
+    long long ctrl_tick_ = 0, ctrl_every_ = 32, ctrl_req_ = 0;
     long long rc_total_ = 0;           ///< re-checks in this process (the k update every kKWindow)
 
     static double clamp_d(double v, double lo, double hi) { return std::min(hi, std::max(lo, v)); }
@@ -337,21 +383,45 @@ private:
         req_rc_ = req_fl_ = req_tok_ = 0;
     }
 
-    // Every kKWindow re-checks: when any of the last kKWindow flipped, k = clamp(1.25 * the largest flipped gap/risk ratio, 0.5 k,
-    // 1.5 k).  No flip: k is kept.
+    // Every kKWindow re-checks (9 Nov: the Qwen engine's rule, which replaced "1.25 x the largest flipped ratio"): r* is the LARGEST
+    // flipped ratio t whose entries with ratio >= t (n_t >= kEvidenceMinN) flip with a Wilson 90% lower bound above the noise floor (the
+    // control re-checks' upper bound).  With r*: target 1.25 r*, but a raise needs n_t >= kKRaiseMinN (one flip in a few re-checks once
+    // pushed Qwen's k from 0.02 to 0.107).  Without: k is halved only when the ring has kKRingMin entries and the floor kCtrlMin controls
+    // (no measured noise is no evidence), never below kKFloor; else kept.  Each update moves k at most 0.5x-1.5x.
     void k_update() {
         if (k_pinned_) return;
-        bool any = false;
-        float largest = 0.0f;
-        for (int i = 0; i < kKWindow; ++i)
-            if (ring_flip_[i]) {
-                any = true;
-                largest = std::max(largest, ring_ratio_[i]);
+        const double floor_hi = ctrl_hi();
+        bool found = false;
+        double r_star = 0.0;
+        long long n_star = 0;
+        for (int i = 0; i < ring_n_; ++i) {
+            if (!ring_flip_[i]) continue;
+            const double t = (double) ring_ratio_[i];
+            if (!(t == t)) continue;
+            long long nt = 0, ft = 0;
+            for (int j = 0; j < ring_n_; ++j)
+                if ((double) ring_ratio_[j] >= t) {
+                    ++nt;
+                    if (ring_flip_[j]) ++ft;
+                }
+            if (nt < kEvidenceMinN) continue;
+            double lo = 0.0, hi = 0.0;
+            wilson90(ft, nt, lo, hi);
+            if (lo > floor_hi && (!found || t > r_star)) {
+                found = true;
+                r_star = t;
+                n_star = nt;
             }
-        if (!any) return;
+        }
         const float old = k_;
-        const float target = std::min(1.5f * old, std::max(0.5f * old, 1.25f * largest));
-        k_ = clamp_k((double) target);
+        float target = old;
+        if (found) {
+            target = (float) clamp_d(1.25 * r_star, 0.005, 50.0);
+            if (target > old && n_star < kKRaiseMinN) target = old;
+        } else if (ring_n_ >= kKRingMin && ctrl_cnt_ >= kCtrlMin) {
+            target = old > kKFloor ? std::max(kKFloor, 0.5f * old) : old;
+        }
+        k_ = clamp_k((double) std::min(1.5f * old, std::max(0.5f * old, target)));
     }
 
     // The test's end (both arms have kAutoMin tokens): the candidate wins at >= 1.02 times the base's speed, unless its quality is lost.
