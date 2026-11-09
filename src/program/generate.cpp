@@ -16918,6 +16918,10 @@ int main(int argc, char** argv) {
                                  mk_res ? "moved off the SSD to a cheap expert (SSD reads avoided)" : "moved to the next unmasked expert");
             }
             if (ver.mask_learn_active()) std::fputs(strata::core::mask_learn_report().c_str(), stderr);   // STRATA_MASK=learn: the request's line
+            if (ver.mask_learn_active()) {   // SPEC-substitute-fit: the swap risk concentration of the request's cut rows
+                const std::string rl = strata::core::mask_risk_line();
+                if (!rl.empty()) std::fprintf(stderr, "strata serve: %s\n", rl.c_str());
+            }
             strata::core::mask_test_arm(0);   // a running mask test: the next request's prompt reads with the base levels (its windows re-upload theirs)
             {   // STRATA_ROUTE_BUDGET_AUTO: the base budget the search ends this request at, and the tests it finished since the last line
                 float auto_b = 0.0f;

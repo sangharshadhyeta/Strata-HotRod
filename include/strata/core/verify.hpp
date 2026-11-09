@@ -61,6 +61,8 @@ std::vector<uint8_t> mask_learn_begin(int64_t n_layers, int64_t n_expert, const 
 bool mask_learn_open(const std::string& path, std::string& msg);
 bool mask_learn_save(const std::string& path, std::string& msg);
 std::string mask_learn_report();
+/// The request's swap risk concentration line (SPEC-substitute-fit); empty without STRATA_MASK=learn rows. Clears the counts.
+std::string mask_risk_line();
 
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their

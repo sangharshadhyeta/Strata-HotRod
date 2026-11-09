@@ -5,6 +5,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/standin_pool.hpp"
 #include "strata/core/subfit_samples.hpp"
+#include "strata/core/risk_concentration.hpp"
 #include "strata/kernels/subfit_capture.hpp"
 #include <random>
 #include "strata/core/route_control.hpp"
@@ -7362,6 +7363,9 @@ struct MaskLearnState {
     std::vector<Pick> pend_picks;
     double pend_sum = 0.0;
     bool pend_masked = false;        // the pending row has a mask move
+    std::vector<double> pend_rx;     // the pending row's event risks (the concentration counter)
+    strata::core::risk::RowShares pend_rc;   // ... their shares (top 1/3/10, events to 50/80/90%), kept until the verdict
+    strata::core::risk::Concentration rc;    // the request's swap risk concentration, by the verdict (flipped / held)
     // the churn line: the levels that went up (lv_up) and down (lv_down) in the relevels since the last report (STRATA_MASK_RESIDENT)
     long long lv_up = 0, lv_down = 0;
 };
@@ -7707,6 +7711,14 @@ bool mask_learn_save(const std::string& path, std::string& msg) {
 // tokens, so at 1 in 8 it settled near 7-14 on 8095, 7 Nov, and p never moved), every (kMlControlEvery / 2)-th window is a control.
 long long mask_ctrl_every() { return g_mlr && g_mlr->fsn < kMlMinSide ? kMlControlEvery / 2 : kMlControlEvery; }
 
+// The request's swap risk concentration line (cut rows, shares, events to 50/80/90%), then its counts are cleared.
+std::string mask_risk_line() {
+    if (!g_mlr) return "";
+    const std::string out = g_mlr->rc.line();
+    g_mlr->rc.reset();
+    return out;
+}
+
 std::string mask_learn_report() {
     if (!g_mlr) return "";
     MaskLearnState& s = *g_mlr;
@@ -7770,6 +7782,7 @@ void Verifier::mask_learn_cut(int row, int32_t stand_top1, int T, bool control) 
     s.pend_picks.clear();
     s.pend_sum = 0.0;
     s.pend_masked = false;
+    s.pend_rx.clear();
     const unsigned n = std::min<unsigned>(ev->n[row], (unsigned) strata::kernels::kMaskEvCap);
     for (unsigned i = 0; i < n; ++i) {
         const strata::kernels::MaskEv& a = ev->e[row][i];
@@ -7778,7 +7791,9 @@ void Verifier::mask_learn_cut(int row, int32_t stand_top1, int T, bool control) 
         s.pend_picks.push_back({a.layer, a.expert, x});
         s.pend_masked = s.pend_masked || strata::kernels::mask_ev_kind(a.kind) == 1;
         s.pend_sum += x;
+        s.pend_rx.push_back(x);
     }
+    s.pend_rc = strata::core::risk::row_shares(s.pend_rx);   // SPEC-substitute-fit: the row's risk concentration, kept to the verdict
 }
 
 size_t Verifier::route_recheck_picks(int row, std::vector<strata::core::recheck::Pick>& out) {
@@ -7841,6 +7856,7 @@ void Verifier::mask_learn_settle(bool exact_ok, int32_t exact_top1) {
         return;
     }
     const bool flipped = exact_top1 != s.pend_tok;
+    s.rc.add(s.pend_rc, flipped);   // the concentration counter: this row's shares, by its verdict
     if (s.pend_sum > 0.0)
         for (const MaskLearnState::Pick& pk : s.pend_picks) s.harm[mlr_at(s, pk.l, pk.e)] += (double) D * pk.x / s.pend_sum;
     s.ag_tot += 1.0;
