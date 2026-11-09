@@ -485,8 +485,10 @@ RouteResidentCfg& route_resident_cfg() {
         { const char* v = std::getenv("STRATA_RECHECK_GATE"); r.gate_on = r.fragile_on && (v == nullptr || std::atoi(v) != 0); }
         if (const char* v = std::getenv("STRATA_RECHECK_P_HI")) r.gs.p_hi = gate::clamp_p_hi((float) std::atof(v));
         if (const char* v = std::getenv("STRATA_RECHECK_AUDIT_EVERY")) r.gate_audit_every = std::max(0LL, std::atoll(v));
-        // SPEC-recheck-gated step F: the shift cap (default on with the gate; 0 = +inf everywhere), its multipliers
-        { const char* v = std::getenv("STRATA_SHIFT_CAP"); r.cap_on = r.gate_on && (v == nullptr || std::atoi(v) != 0); }
+        // SPEC-recheck-gated step F: the shift cap (opt-in since 9 Nov, STRATA_SHIFT_CAP=1 with the gate; off = +inf everywhere), its multipliers.
+        // Off by default: two frozen-state A/Bs on 8095 (8-9 Nov) had the cap off faster in every run (+3.5%, +3.7%): each refused move is an
+        // exact pick and a read, and the re-check on flip already guards the rows the cap protects.
+        { const char* v = std::getenv("STRATA_SHIFT_CAP"); r.cap_on = r.gate_on && v != nullptr && std::atoi(v) != 0; }
         // SPEC-recheck-gated step G: the cap multipliers and the prefetch count are the paired tuner's (persisted in the .gate file); the env
         // values are their start values only when no saved state exists (route_gate_read sets tune.set)
         if (const char* v = std::getenv("STRATA_SHIFT_CAP_UNC")) r.gs.tune.cap_unc = std::atof(v);
