@@ -1,6 +1,6 @@
 // tests/core/subfit_samples_test.cpp - SPEC-substitute-fit stage 1a: the sample file's format, CPU only.
-// Covers: bf16 rounding, the env switches, a round trip of both record tags, the header check on append, the size cap, and
-// that a writer which was never opened writes nothing.
+// Covers: bf16 rounding, the env switches, a round trip of both record tags (also at distinct layers with distinct x, y_s, y_e: a
+// swap or a zeroed field fails it), the header check on append, the size cap, and that a writer which was never opened writes nothing.
 #include "strata/core/subfit_samples.hpp"
 
 #include <cmath>
@@ -167,12 +167,77 @@ void test_cap_and_never_opened() {
     CHECK(!std::filesystem::exists(path), "no file is created without an open");
 }
 
+// Step 0 of stage 2: every record's x, y_s and y_e must come back as their own inputs, at distinct layers, with no swap and no zeroing.
+// Records of several layers (0, 5, 47 of the 48-layer pack), distinct non-zero vectors per record and per field; the stored y_e of each
+// tag-1 record must be non-zero, so a zeroed or swapped field fails the exact comparison below.
+void test_round_trip_distinct() {
+    using namespace strata::core::subfit;
+    const uint32_t N = 2560, L = 48;
+    const std::string path = tmp_path("distinct");
+    std::filesystem::remove(path);
+    std::string err;
+    const uint16_t layers[] = {0, 5, 47, 0};
+    auto fill = [&](std::vector<float>& v, int rec, int field) {
+        v.assign(N, 0.0f);
+        for (uint32_t i = 0; i < N; ++i)   // distinct per (record, field, index); never zero
+            v[i] = 0.001f * (float) (i + 1) * (float) (rec + 1) + 0.5f * (float) field + (i % 3 == 0 ? -0.25f : 0.125f);
+    };
+    std::vector<float> x, ys, ye;
+    {
+        SampleWriter w;
+        CHECK(w.open(path, N, L, err), ("open: " + err).c_str());
+        for (int r = 0; r < 4; ++r) {
+            fill(x, r, 0);
+            fill(ys, r, 1);
+            fill(ye, r, 2);
+            if (r == 2) {
+                CHECK(w.write_probe(layers[r], (uint16_t) (400 + r), (uint8_t) r, 0.25f + 0.0625f * (float) r, x.data(), ye.data()),
+                      "tag 2 written");
+            } else {
+                CHECK(w.write_stand_in(layers[r], (uint16_t) (100 + r), (uint16_t) (200 + r), (uint8_t) (r + 2), x.data(), ys.data(), ye.data()),
+                      "tag 1 written");
+            }
+        }
+    }
+    SampleReader rd;
+    CHECK(rd.open(path, err), ("reopen: " + err).c_str());
+    for (int r = 0; r < 4; ++r) {
+        Record got;
+        CHECK(rd.next(got, err), "a record is read");
+        if (r == 2) {
+            CHECK(got.tag == 2 && got.layer == layers[r] && got.e == 402 && got.rank == 2, "tag 2 fields as written");
+            CHECK(got.w == 0.25f + 0.0625f * 2.0f, "tag 2 w exact");
+            fill(x, r, 0);
+            fill(ye, r, 2);
+            bool ok = got.x.size() == N && got.ye.size() == N && got.ys.empty();
+            for (uint32_t i = 0; ok && i < N; ++i) ok = got.x[i] == bf(x[i]) && got.ye[i] == bf(ye[i]);
+            CHECK(ok, "tag 2: x and y_e are the bf16 of their own inputs (no swap, no zeroing)");
+            continue;
+        }
+        CHECK(got.tag == 1 && got.layer == layers[r] && got.e == 100 + r && got.s == 200 + r && got.rank == r + 2,
+              "tag 1 fields as written (layer, e, s, rank)");
+        fill(x, r, 0);
+        fill(ys, r, 1);
+        fill(ye, r, 2);
+        bool ok = got.x.size() == N && got.ys.size() == N && got.ye.size() == N;
+        for (uint32_t i = 0; ok && i < N; ++i) ok = got.x[i] == bf(x[i]) && got.ys[i] == bf(ys[i]) && got.ye[i] == bf(ye[i]);
+        CHECK(ok, "tag 1: x, y_s and y_e are the bf16 of their own inputs (no swap, no zeroing)");
+        double ye_energy = 0.0;
+        for (float v : got.ye) ye_energy += (double) v * (double) v;
+        CHECK(ye_energy > 1.0, "tag 1: the stored y_e is not zero");
+    }
+    Record tail;
+    CHECK(!rd.next(tail, err) && err.empty(), "clean end after four records");
+    std::filesystem::remove(path);
+}
+
 }  // namespace
 
 int main() {
     test_bf16();
     test_env();
     test_round_trip();
+    test_round_trip_distinct();
     test_append_and_header();
     test_cap_and_never_opened();
     if (failures == 0) {
