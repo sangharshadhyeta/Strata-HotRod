@@ -60,6 +60,8 @@ while the row is computed:
   row_shift[row] + this move's shift <= cap[row]; otherwise the pick stays the router's own (exact, as a held row's pick). One extra
   comparison per candidate move. cap[] is a host-mapped float per row (<= 32 rows), written between windows (graph-safe, no host CUDA
   call inside a window); +inf = today's behaviour.
+- **Opt-in since 9 Nov (`STRATA_SHIFT_CAP=1`).** Two frozen-state A/Bs on 8095 had the cap off faster in every run (+3.5%, +3.7%):
+  each refused move is an exact pick and a read, and the re-check on flip already guards the rows the cap protects.
 - **The cap per row from its class** (rules 1-3): confident rows (p >= P_HI) `cap_conf` (default +inf), uncertain rows `cap_unc`, none
   rows `cap_none`. Defaults are multiples of a running median of moved rows' final row_shift (on the host, from the route_fragile_shifts
   read that exists): cap_unc = 1.5 x median, cap_none = 1.0 x median. Settings: STRATA_SHIFT_CAP=0 (off: +inf everywhere),
