@@ -73,10 +73,23 @@ Output: a table per band and per rank (energy of y_e explained, held-out), and a
 if the held-out rank-16 nudge (or the best-candidate pick) removes >= 40% of the remaining error energy after the scalar.
 Tests: the regression on synthetic data with a known M (recovers it), the SVD truncation, the held-out split, the candidate search.
 
-## Stage 2 (only after the verdict; separate spec)
+## Stage 2 (only after the verdict; separate spec, outline recorded here)
 Per-pair low-rank variants fitted in idle time (pairs chosen by the fit's held-out score), stored as separate deltas (the original
 substitute keeps serving its own tokens), applied inside the expert kernel as one rank-r product on the 512-wide hidden state, the
 better-substitute table consulted by the stand-in kernel; memory in VRAM for the most-used pairs (~100 KB each), the rest in RAM.
+(Dimensions: the hidden state is 640 wide and the output 2560 wide; the rank-r product is on the 640-wide h.)
+
+**Two modes, `STRATA_SUBFIT_APPLY=all|dynamic` (default `dynamic`).**
+- `all`: every substitute move gets its fitted variant.
+- `dynamic`: a substitute runs plain until a move would take the row's accumulated shift past `cap[row]`. That is the step-F per-row
+  shift cap (the running median per row class, tuned by the step-G cap test), where `route_resident_warp` / `route_mask_warp` refuse the
+  move today (the exact pick is read instead). In dynamic mode that move is taken WITH the fitted variant instead of refused. A refusal
+  remains for pairs with no good fit (their held-out gain is below the bar, so they fall back to today's behaviour).
+- No new threshold and no new tuner kind: the cap and its tuning already exist. The mode estimate (`subfit_fit --cap-refusals N --moves M`)
+  reads the cap's live numbers from the request-end lines ("shift cap: moves refused N (rows capped M)" and the stand-in move count),
+  and prints for ALL and DYNAMIC the share of moves corrected and the residual shift (ALL: sqrt(1 - g_mean); DYNAMIC: the refused share
+  corrected, the rest plain).
+- The risk-concentration line (`swap risk concentration ...`, STRATA_MASK=learn) is kept as a measurement; it does not decide the mode.
 
 ## Hard rules
 No server or port access in the build; the logger runs live only when the lead starts it on 8095. Build only via safe_build.sh.
