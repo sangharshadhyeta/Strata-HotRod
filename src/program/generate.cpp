@@ -12415,7 +12415,9 @@ int main(int argc, char** argv) {
         }
         // STRATA_FRAGILE_RECHECK / STRATA_ROUTE_BUDGET_AUTO: the learned stand-in tuning of this model is loaded before the first
         // request.  The model fingerprint is the session files' (session_identity: read once here, not per request).
-        if (strata::core::Verifier::route_fragile_on()) {
+        // 9 Nov: also with the re-check off - route_tune_open then only reads the learned budget (the fixed bound; nothing is written),
+        // or returns at once with STRATA_ROUTE_BUDGET_FIXED=0.  (Before, it was never called then, and the bound was the start value.)
+        {
             const std::string tune = standin_tune_path(o);
             if (!tune.empty()) {
                 strata::core::SessionFileIdentity tid;
