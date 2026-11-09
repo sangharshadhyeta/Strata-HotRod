@@ -54,7 +54,7 @@ Default since 24 Oct 2026. Nothing in it is set by hand: the budget, the close-c
 - **One rule for every rank.** A missing pick takes the best stand-in on the card only when
   `router weight x logit gap <= budget`. A heavy pick (usually rank 0 or 1) needs a stand-in within about a logit; a light one
   (ranks 3-9) can take one much further away; a rank-0 pick in a flat routing is treated as lightly as its weight says.
-- **Fragile tokens are decided exactly** (`STRATA_FRAGILE_RECHECK`, default on, `=0` off). For each token the engine adds up
+- **Fragile tokens are decided exactly** (`STRATA_FRAGILE_RECHECK`, opt-in since 9 Nov: `=1` on; off by default after an A/B on Qwen IQ3_S: 42-44 tok/s off vs 31-34 on, answers clean in both). For each token the engine adds up
   how far stand-ins moved it (weight x gap of every replaced pick, all layers). When the token's lead over the runner-up is
   below `k` times that move, the window is cut just before it and the next window decides it with the top ranks exact.
   `k` is learned: the 10th percentile of lead/move on the first 64 windows, then just above the largest move that actually

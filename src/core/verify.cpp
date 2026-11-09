@@ -476,7 +476,10 @@ RouteResidentCfg& route_resident_cfg() {
         }
         // STRATA_FRAGILE_RECHECK (default on, =0 off): close calls of a stand-in window are decided exactly (see RouteResidentCfg);
         // STRATA_FRAGILE_K0 its start.  Default since 24 Oct: with AUTO, 21 of 21 answers clean where a fixed 0.25 budget broke words
-        { const char* v = std::getenv("STRATA_FRAGILE_RECHECK"); r.fragile_on = v == nullptr || std::atoi(v) != 0; }
+        // STRATA_FRAGILE_RECHECK: opt-in since 9 Nov (=1 on). Off by default: on 8095 (Qwen IQ3_S) re-check off ran 42.4-43.6 tok/s against
+        // 31.0-33.7 with it on, and every answer read (3 short, 3 long x2, thinking text included) was correct and clean in both arms. The
+        // re-check and everything that lives in it (gate, k learning, cap, stand-in learner, substitute-fit learner and flip mode) stay: =1.
+        { const char* v = std::getenv("STRATA_FRAGILE_RECHECK"); r.fragile_on = v != nullptr && std::atoi(v) != 0; }
         // STRATA_FRAGILE_BRAKE (default on, =0 off): the per-request decode budget brake (see RouteResidentCfg)
         { const char* v = std::getenv("STRATA_FRAGILE_BRAKE"); r.brake_on = v == nullptr || std::atoi(v) != 0; }
         // SPEC-recheck-cheap change 1 (default on, =0 the whole-window exact successor of before): the exact successor makes row 0 only exact

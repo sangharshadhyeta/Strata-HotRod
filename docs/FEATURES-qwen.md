@@ -187,7 +187,7 @@ Arguments (`args`):
 | `STRATA_FORCE_ISA` | see code | upstream |  | (no comment) | src/kernels/cpu/expert_layout.cpp:29 |
 | `STRATA_FRAGILE_BRAKE` | unset | HotRod |  | STRATA_FRAGILE_BRAKE (default on, =0 off): the per-request decode budget brake (see RouteResidentCfg) | src/core/verify.cpp:363 |
 | `STRATA_FRAGILE_K0` | see code | HotRod |  | (no comment) | src/core/verify.cpp:364 |
-| `STRATA_FRAGILE_RECHECK` | unset | HotRod |  | STRATA_FRAGILE_RECHECK (default on, =0 off): close calls of a stand-in window are decided exactly (see RouteResidentCfg); STRATA_FRAGILE_K0 its start.  Default since 24 Oct: with AUTO, 21 of 21 answers clean where a fixed 0.25 budget broke words | src/core/verify.cpp:361 |
+| `STRATA_FRAGILE_RECHECK` | unset | HotRod |  | STRATA_FRAGILE_RECHECK (opt-in since 9 Nov, =1 on; was default on since 24 Oct): close calls of a stand-in window are decided exactly (see RouteResidentCfg); STRATA_FRAGILE_K0 its start.  Default since 24 Oct: with AUTO, 21 of 21 answers clean where a fixed 0.25 budget broke words | src/core/verify.cpp:361 |
 | `STRATA_FS_AHEAD` | unset | upstream |  | (no comment) | src/program/generate.cpp:6882 |
 | `STRATA_FS_DEPTH` | unset | upstream |  | one GPU, no pipelined windows: a plan is done with its slots by the next window | src/core/expert_source.cpp:7751 |
 | `STRATA_FS_SLOTS` | unset | upstream |  | (no comment) | src/core/expert_source.cpp:7730, src/program/generate.cpp:6881 |
