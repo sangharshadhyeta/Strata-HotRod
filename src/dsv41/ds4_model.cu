@@ -7147,7 +7147,9 @@ struct Model::Impl {
     mutable double store_hr_file_ = kStoreHeadroomMax;   // the value the file holds for the key (the default when it holds none)
     mutable double store_hr_min_ = 1e300;                // least free RAM (GB) at the end of the requests that generated >= 200 tokens
     mutable std::string store_hr_key_;
-    static double kram_margin_gb() { return (double) kRamMargin / 1e9; }
+    // the RAM that must stay available while serving: 2.5 GiB, the Qwen engine's memory floor.  (Not kRamMargin, 8 GiB: that is the
+    // margin for copying every expert into RAM; at run time 5-7 GB stay available on a 30 GB PC, below it, so the headroom could never fall.)
+    static double kram_margin_gb() { return 2.5 * 1.073741824; }
     std::string store_hr_key() const {
         const uint64_t tot = ram_total();
         const std::string gib = tot == ~uint64_t{0} ? std::string("unknown")
