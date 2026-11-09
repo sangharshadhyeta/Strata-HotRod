@@ -129,6 +129,20 @@ static bool mask_resident_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_MASK_RESIDENT"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
+// SPEC-router-fuse (STRATA_ROUTER_FUSE=0: all off; STRATA_ROUTER_FUSE_LA=0: the look-ahead's step off; STRATA_ROUTER_FUSE_POST=0: the
+// post-routing step off).  Default on.  Read once.
+static bool router_fuse_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSE"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+static bool la_fuse_la_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSE_LA"); return router_fuse_on() && (v == nullptr || v[0] != '0'); }();
+    return on;
+}
+static bool router_post_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSE_POST"); return router_fuse_on() && (v == nullptr || v[0] != '0'); }();
+    return on;
+}
 // STRATA_MASK_CTRL (default on, =0 off): the mask's control windows also run without STRATA_MASK_RESIDENT (SPEC-control-windows): the
 // "without" side of the mask's re-checks then comes from them.  Off: only the resident rule runs control windows (the old gate).
 static bool mask_ctrl_on() {
@@ -183,7 +197,7 @@ struct RouteResidentCfg {
     // Noise control (STRATA_FRAGILE_RECHECK): every kCtrlEvery eligible windows with no normal or explore cut, the first accepted row r >= 1
     // that no stand-in moved (row_shift 0) is re-checked the same way.  Its flips are the noise of a re-decision (two windows of the same
     // tokens differ on their own), so they never enter fr_flip / req_fl / auto_fl.  The last kCtrlRing control re-checks are kept.
-    enum { kCtrlEvery = 32, kCtrlRing = 200 };
+    enum { kCtrlEvery = 32, kCtrlRing = 400 };   // (400 = the gate's persisted control re-checks, gate::kCtrlKeep: the seed fills it whole)
     // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 = the old selection below): every n-th eligible decode window (a non-merged window of a
     // learned k, with a stand-in budget or AUTO, not an exact re-run) is a control window decided BEFORE it runs: route_fragile_control sets
     // the device flag, so route_resident_k and the mask kernel move no pick and row_shift stays 0.  Its selection then takes the first
@@ -292,6 +306,11 @@ struct RouteResidentCfg {
     bool tune_cap_on = false, tune_pf_on = false;   ///< STRATA_TUNE_CAP / STRATA_TUNE_PREFETCH (with the gate; 0 = fixed)
     double auto_cap_cu = 0.0, auto_cap_cn = 0.0;    ///< the running cap test's candidate multipliers (the arm 1 values)
     long long auto_pf_cand = 0;               ///< the running prefetch test's candidate count (the arm 1 value)
+    // SPEC-recheck-gated step H2: the margin test (m, the rotation's fifth kind).  The explore cuts per arm (route_fragile_settle: the first row
+    // with ratio in [k_eff, 8 k_eff), every 16th window), flipped or not: the quality veto of the margin test (tune_steps.hpp explore_veto).
+    double auto_k_cand = 1.0;                 ///< the running margin test's candidate m (the arm 1 value)
+    long long auto_xrc[2] = {0, 0}, auto_xfl[2] = {0, 0};   ///< explore cuts / their flips per arm (base, candidate)
+    bool tune_k_on = false;                   ///< STRATA_TUNE_K (with the gate; 0 = m fixed at 1.0)
     bool auto_mask_ok = false;                ///< the mask learner is active for this window (route_budget_window sets it before the scheduler)
     // Learned state across restarts (route_tune_open): standin-tune.txt beside the expert profile, keyed to the model fingerprint.
     // Written after each finished test and each k update; read once at serve start (AUTO / FRAGILE on).
@@ -318,7 +337,7 @@ struct RouteResidentCfg {
     // auto_b; from 0 it becomes 0.25 * auto_b) when the request has >= 15 re-checks, a Wilson 90% upper bound <= 0.2 of its re-check
     // flip rate and a Wilson 90% upper bound <= 0.01 of flips per token.  The request's first grow check (window 64) sets req_b = auto_b
     // at once when that holds.  The search (auto_b) is unchanged by the brake.
-    enum { kBrakeMin = 15, kBrakeWindows = 64, kAutoTokMin = 200, kBrakeTokMin = 100, kBrakeFlips = 3, kCleanTok = 400 };
+    enum { kBrakeMin = 15, kBrakeWindows = 64, kAutoTokMin = 200, kBrakeTokMin = 100, kBrakeFlips = 3, kCleanTok = 400, kExploreMinRc = 16 };   // (kExploreMinRc: step H2)
     bool brake_on = true;                     ///< STRATA_FRAGILE_BRAKE: the per-request brake (off: req_b is auto_b for every request)
     float req_b = 0.1f;                       ///< this request's decode budget
     long long req_rc = 0, req_fl = 0;         ///< this request's re-checks and flips since its last brake
@@ -468,6 +487,9 @@ RouteResidentCfg& route_resident_cfg() {
         else if (r.gate_on) r.gs.tune.prefetch = 12;
         { const char* v = std::getenv("STRATA_TUNE_CAP"); r.tune_cap_on = r.gate_on && (v == nullptr || std::atoi(v) != 0); }
         { const char* v = std::getenv("STRATA_TUNE_PREFETCH"); r.tune_pf_on = r.gate_on && std::getenv("STRATA_RECHECK_PREFETCH_MAX") == nullptr && (v == nullptr || std::atoi(v) != 0); }
+        // SPEC-recheck-gated step H2: the margin m (start 1.0; STRATA_FRAGILE_K_MULT sets the start value; STRATA_TUNE_K=0 fixes it)
+        { const char* v = std::getenv("STRATA_TUNE_K"); r.tune_k_on = r.gate_on && (v == nullptr || std::atoi(v) != 0); }
+        if (const char* v = std::getenv("STRATA_FRAGILE_K_MULT")) r.gs.tune.k_mult = std::min(1.5, std::max(0.6, std::atof(v)));
         if (const char* v = std::getenv("STRATA_SHIFT_CAP_CONF")) r.cap_mult.conf = (float) std::atof(v);
         // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 off): every n-th eligible decode window is a fragile control window (see RouteResidentCfg)
         if (const char* v = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) r.fr_ctrl_every = std::max(0LL, std::atoll(v));
@@ -2050,9 +2072,26 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
+    // STRATA_LA_PRIO (default 1, 0 = the priorities as before): the window's decode streams (cs_, sh_cs_) at the device's greatest
+    // priority, the learner's batch stream (la_cs_, below) at the least, so the batch runs on the SMs the window leaves idle.
+    // A stage's shared stream (set_stream) keeps the priority its owner gave it.
+    static const bool la_prio_on = [] { const char* v = std::getenv("STRATA_LA_PRIO"); return v == nullptr || std::atoi(v) != 0; }();
+    auto make_stream_at = [](cudaStream_t* s, bool least) -> cudaError_t {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        int lo = 0, top = 0;
+        if (cudaDeviceGetStreamPriorityRange(&lo, &top) == cudaSuccess &&
+            cudaStreamCreateWithPriority(s, cudaStreamNonBlocking, least ? lo : top) == cudaSuccess)
+            return cudaSuccess;
+        cudaGetLastError();   // (the priority call failed: the default priority, as make_stream)
+#else
+        (void) least;
+#endif
+        return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
+    };
+    auto make_decode_stream = [&](cudaStream_t* s) { return la_prio_on ? make_stream_at(s, false) : make_stream(s); };
     if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
-    else if (make_stream(&cs_) != cudaSuccess) cs_ = nullptr;
-    if (cs_ == nullptr || make_stream(&sh_cs_) != cudaSuccess) {
+    else if (make_decode_stream(&cs_) != cudaSuccess) cs_ = nullptr;
+    if (cs_ == nullptr || make_decode_stream(&sh_cs_) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
     }
@@ -2066,7 +2105,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 #if !defined(STRATA_USE_HIP)
     // the look-ahead node's own stream (record_window, STRATA_LOOKAHEAD_GPU_STREAM), made like sh_cs_.  Optional: on any
     // failure it is left off (nullptr) and the node stays on cs
-    if (make_stream(&la_cs_) != cudaSuccess) la_cs_ = nullptr;
+    if ((la_prio_on ? make_stream_at(&la_cs_, true) : make_stream(&la_cs_)) != cudaSuccess) la_cs_ = nullptr;
     if (la_cs_ != nullptr &&
         (cudaEventCreateWithFlags(&ev_la_fork_, cudaEventDisableTiming) != cudaSuccess ||
          cudaEventCreateWithFlags(&ev_la_read_done_, cudaEventDisableTiming) != cudaSuccess ||
@@ -3179,7 +3218,57 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // dist 4 (STRATA_LA_LEARN=1 only, after dists 1 and 2: the nearest deadline first in the warm loop); without the learner, dists 1 and 2
                 static constexpr int kLookDist[3] = {1, 2, 4};
                 const int n_look = la_learn_env_on() ? 3 : 2;
-                for (int di = 0; di < n_look; ++di) {
+                // SPEC-router-fuse step 1 (STRATA_ROUTER_FUSE=0 or STRATA_ROUTER_FUSE_LA=0: off): the dists' router GEMVs in ONE launch
+                // (bf16_gemv_fp32_mmvf_multi3, each output bitwise its single call), the learner's forward per dist where it learns, then the
+                // post-GEMV chain of all dists in ONE launch (route_pred_select).  Off, when a predictor replaces dist 1's router (STRATA_LA_MODEL),
+                // or when the GEMV declines: the per-dist loop below, as before.
+                bool la_done = false;
+                if (la_fuse_la_on() && strata::kernels::route_pred_model_w(l + 1) == nullptr) {
+                    const uint16_t* wgt[3] = {nullptr, nullptr, nullptr};
+                    uint32_t live = 0;
+                    for (int di = 0; di < n_look; ++di) {
+                        const int dist = kLookDist[di];
+                        if (l + dist >= g.n_layers) break;
+                        const LayerView vt(wt, l + dist);
+                        const WeightRef* w_next = vt.get("ffn_gate_inp.weight");
+                        if (w_next == nullptr || w_next->kind != WeightKind::Bf16InF32) continue;
+                        wgt[di] = (const uint16_t*) w_next->data;
+                        live |= 1u << di;
+                    }
+                    if (live != 0u && strata::kernels::bf16_gemv_fp32_mmvf_multi3(mixed_ + tb * N, N, wgt, live, strata::kernels::route_pred_logits(),
+                                                                                  NE, (int64_t) 8 * NE, N, NE, n, s)) {
+                        for (int di = 0; di < n_look; ++di) {
+                            if (((live >> di) & 1u) == 0u) continue;
+                            if (la_learn_win)
+                                strata::kernels::la_learn_forward_at(l, kLookDist[di], mixed_ + tb * N, n, s,
+                                                                     strata::kernels::route_pred_logits_at(strata::kernels::route_pred_slot(kLookDist[di])));
+                        }
+                        strata::kernels::RoutePredDist pd[3];
+                        for (int di = 0; di < 3; ++di) {
+                            strata::kernels::RoutePredDist& p = pd[di];
+                            p = strata::kernels::RoutePredDist{};
+                            if (((live >> di) & 1u) == 0u) continue;
+                            const int dist = kLookDist[di];
+                            const int slot = strata::kernels::route_pred_slot(dist);
+                            p.logits = strata::kernels::route_pred_logits_at(slot);
+                            p.ids = strata::kernels::route_pred_dev(l + dist, dist);
+                            p.w = strata::kernels::route_pred_weights_at(slot);
+                            p.layer = l + dist;
+                            if (NE == 512 && K == 10 && !route_resident_cfg().win_exact)
+                                p.mask = strata::kernels::route_mask_layer(l + dist, g.n_expert);
+                            const bool mres_on = mask_resident_on();
+                            p.mres = mres_on && hits_.d_res != nullptr ? hits_.d_res + (l + dist) * g.n_expert : nullptr;
+                            p.ring = mres_on ? strata::kernels::route_ring_layer(l + dist, g.n_expert) : nullptr;
+                            p.cheap = mres_on ? strata::kernels::route_cheap_layer(l + dist, g.n_expert) : nullptr;
+                            p.res = hits_.d_res != nullptr ? hits_.d_res + (l + dist) * g.n_expert : nullptr;
+                            p.edge_on = la_edge_skip;
+                            p.tail_on = la_tail_read;
+                        }
+                        strata::kernels::route_pred_select(pd, n, la_tail_read_v == 2 ? 1 : 0, s);
+                        la_done = true;
+                    }
+                }
+                for (int di = 0; !la_done && di < n_look; ++di) {
                     const int dist = kLookDist[di];
                     if (l + dist >= g.n_layers) break;
                     const LayerView vt(wt, l + dist);
@@ -3270,8 +3359,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // the look-ahead node: on la_cs_ (above) or the shared stream (STRATA_LOOKAHEAD_GPU_FORK=1), else here on cs
         if (la_gpu && !la_on_sh && !la_on_stream && !lookahead_node(cs)) return false;
+        // SPEC-router-fuse step 2 (STRATA_ROUTER_FUSE_POST=0 or STRATA_ROUTER_FUSE=0: off): the layer's mask, its stand-in stage and the learner's
+        // label are one launch (native_route_post, below) when the mask or the stand-ins are on; the label is copied there, after route_prior
+        // (which writes ids and weights, not the logits).  Otherwise the separate calls, as before.
+        const bool own_mask_on = NE == 512 && K == 10 && !route_resident_cfg().win_exact && strata::kernels::route_mask_layer(l, g.n_expert) != nullptr;
+        const bool own_res_on = route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr;
+        const bool post_own = router_post_on() && (own_mask_on || own_res_on);
+        float* const lab_dev = post_own && la_learn_win ? strata::kernels::la_learn_label_dev(l, n) : nullptr;
         // STRATA_LA_LEARN: this layer's router logits are the label of this window's batch (copied here; the batch runs after the window)
-        if (la_learn_win) {
+        if (la_learn_win && lab_dev == nullptr) {
             try {
                 strata::kernels::la_learn_label(l, logits_ + tb * NE, n, cs);
             } catch (const std::exception& e) { err = "verify look-ahead learner: " + std::string(e.what()); return false; }
@@ -3284,8 +3380,36 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+        if (post_own) {
+            try {
+                strata::kernels::RoutePostArgs pa{};
+                pa.logits = logits_ + tb * NE; pa.ids = ids_ + tb * K; pa.weights = w_ + tb * K;
+                pa.n_tok = (int) n; pa.layer = (int) l; pa.row_base = (int) tb;
+                pa.mask = own_mask_on ? strata::kernels::route_mask_layer(l, g.n_expert) : nullptr;
+                const bool mres = mask_resident_on();   // STRATA_MASK_RESIDENT: this layer's residency tables (the rule's `cheap`)
+                pa.mev = n <= 8 ? mev_ : nullptr;
+                pa.mres = mres && hits_.d_res != nullptr ? hits_.d_res + l * g.n_expert : nullptr;
+                pa.mring = mres ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr;
+                pa.mcheap = mres ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr;
+                pa.row_shift = n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr;
+                pa.res = own_res_on ? hits_.d_res + l * g.n_expert : nullptr;
+                pa.rstats = rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr;
+                pa.want = n <= 8 && !strata::kernels::route_rows_active() ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr;
+                pa.rows = n <= 8 ? strata::kernels::route_rows_layer(l) : nullptr;
+                pa.repl = n <= 8 ? strata::kernels::route_repl_layer(l, g.n_expert) : nullptr;
+                pa.rring = n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr;
+                pa.rcheap = n <= 8 ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr;
+                pa.bstats = rr_stats_ != nullptr ? rr_stats_ + 9 : nullptr;
+                pa.pair_c = lrn_c_ != nullptr && !standin_learn_observe_env() ? lrn_c_ + (size_t) l * 512 * 512 : nullptr;
+                pa.lrn_rec = lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr;
+                pa.pair_pe = lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr;
+                pa.label = lab_dev;
+                strata::kernels::native_route_post(pa, cs);
+            } catch (const std::exception& e) { err = "verify route-post: " + std::string(e.what()); return false; }
+        }
         // STRATA_MASK (opt-in, changes the output): the layer's masked picks move before the stand-ins see them; each move adds its w x gap to
         // the row's row_shift (the flip re-check's risk).  The flip re-check's exact re-run (win_exact) runs unmasked.
+        if (!post_own) {
         if (NE == 512 && K == 10 && !route_resident_cfg().win_exact) {
             if (const uint8_t* mk = strata::kernels::route_mask_layer(l, g.n_expert)) {
                 try {
@@ -3318,6 +3442,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       n <= 8 ? mev_ : nullptr, (int) tb);   // (STRATA_MASK=learn: this layer's replaced picks, by row)
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+        }   // !post_own
         // STRATA_SUBFIT_LOG (opt-in): the stand-in rows' layer input; row 0's probe flags, weights and input after route-resident
         if (sp_on_ && lrn_gate_ != nullptr) {
             strata::kernels::subfit_capture_x(mixed_ + (size_t) tb * N, lrn_rec_ + (size_t) tb * 4, lrn_gate_, (int) l,
@@ -4709,6 +4834,14 @@ void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("S
 // holds "key value" lines: fingerprint (the model's, hex; a file keyed to another model is ignored), budget, step, k, tests, rechecks,
 // flips, clean (the learned ceiling b_clean: 0 or missing = none yet).  Written to a temp name and renamed, after each finished test and each k update; read once at serve start (route_tune_open).
 namespace {
+// SPEC-recheck-gated step H2: the threshold factor k_eff = m x k_safe.  m is the tuned margin; in a running margin test, arm 1 of its windows
+// uses the candidate.  The cut selection (route_fragile_first) and the explore band use k_eff.
+float route_k_eff(const RouteResidentCfg& c) {
+    double m = c.gs.tune.k_mult;
+    if (c.auto_kind == tune::KMult && c.auto_testing && c.auto_win_arm == 1) m = c.auto_k_cand;
+    return (float) (m * (double) c.fragile_k);
+}
+
 // SPEC-recheck-gated (persistence): the gate's state (totals, P_HI, rank table, shifts, calibration, margin deciles) beside the tune file,
 // <tune file>.gate, keyed by the same fingerprint.  Written with the tune file (route_tune_write), read at open (route_tune_open).
 void route_gate_write(const RouteResidentCfg& c) {
@@ -4830,9 +4963,15 @@ void Verifier::route_tune_open(const std::string& path, uint64_t model_fp) {
     c.tune_path = path;
     // SPEC-recheck-gated: the gate's saved state (P_HI, totals, ranks, shifts, calibration), when it is this model's
     if (c.gate_on && std::filesystem::exists(path + ".gate")) {
-        if (route_gate_read(path + ".gate", model_fp, c))
-            std::fprintf(stderr, "strata serve: recheck gate state loaded: P_HI %.2f, %lld moves so far (%s)\n", (double) c.gs.p_hi, c.gs.moves,
-                         (path + ".gate").c_str());
+        if (route_gate_read(path + ".gate", model_fp, c)) {
+            // the saved control re-checks seed the window's control ring: the k evidence and the brake have the noise floor from the first window
+            c.fr_ctrl_n = strata::core::gate::ctrl_seed(c.gs, c.fr_ctrl, RouteResidentCfg::kCtrlRing, c.fr_ctrl_pos);
+            double ctl_lo = 0.0, ctl_hi = 0.0;
+            route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, ctl_lo, ctl_hi);
+            std::fprintf(stderr, "strata serve: recheck gate state loaded: P_HI %.2f, %lld moves so far, noise floor from %d saved control re-checks "
+                         "(%lld flipped in all; flip rate upper bound %.3f) (%s)\n",
+                         (double) c.gs.p_hi, c.gs.moves, c.fr_ctrl_n, c.gs.ctrl_flips_total, ctl_hi, (path + ".gate").c_str());
+        }
         else
             std::fprintf(stderr, "strata serve: recheck gate state in %s ignored (its model fingerprint differs or it is malformed)\n", (path + ".gate").c_str());
     }
@@ -4972,7 +5111,9 @@ static void la_tail_skip_update(const RouteResidentCfg& c) {
 static bool route_fragile_ctrl_next(RouteResidentCfg& c, bool eligible) {
     const bool due = eligible && c.fragile_on && c.fragile_k_set && !c.fragile_exact && c.fr_ctrl_every > 0 &&
                      (c.auto_on || c.dyn_on || c.budget > 0.0f || c.budget_tail > 0.0f);
-    if (!due || !route_ctrl_due(c.fr_ctrl_win, c.fr_ctrl_every) || !strata::kernels::route_fragile_control(true)) {
+    // the cadence: 128 eligible windows apart while the noise floor has fewer than 20 control re-checks (gate::ctrl_every), the configured one after
+    if (!due || !route_ctrl_due(c.fr_ctrl_win, strata::core::gate::ctrl_every(c.fr_ctrl_every, c.fr_ctrl_n)) ||
+        !strata::kernels::route_fragile_control(true)) {
         strata::kernels::route_fragile_control(false);
         return false;
     }
@@ -5368,6 +5509,8 @@ void Verifier::route_fragile_zero_shift() {
 // returns -1.  The moved rows' shift and gap are sampled for the request's medians (route_fragile_take).
 int Verifier::route_fragile_first(const float* gap, const float* shift, int n, bool* explore, bool* control, const uint8_t* eligible) {
     RouteResidentCfg& c = route_resident_cfg();
+    // SPEC-recheck-gated step H2: the cut threshold is k_eff = m x k_safe (m: the tuned margin; the arm-1 candidate in a running margin test)
+    const float k_eff = route_k_eff(c);
     if (explore != nullptr) *explore = false;
     if (control != nullptr) *control = false;
     if (!c.fragile_k_set) {
@@ -5400,7 +5543,7 @@ int Verifier::route_fragile_first(const float* gap, const float* shift, int n, b
             c.fr_samp_gap.push_back(gap[r]);
         }
         // SPEC-recheck-gated: a close call on a row the gate does not allow to be cut is skipped (and counted), not taken
-        if (r >= 1 && c.fragile_k_set && !(gap[r] >= c.fragile_k * shift[r])) {
+        if (r >= 1 && c.fragile_k_set && !(gap[r] >= k_eff * shift[r])) {
             if (eligible != nullptr && !eligible[r]) ++c.gq.skipped;
             else if (first < 0) first = r;
         }
@@ -5411,7 +5554,7 @@ int Verifier::route_fragile_first(const float* gap, const float* shift, int n, b
         for (int r = 1; r < n && first < 0; ++r) {
             if (!(shift[r] > 0.0f)) continue;
             const float ratio = gap[r] / shift[r];
-            if (ratio >= c.fragile_k && ratio < 8.0f * c.fragile_k && (eligible == nullptr || eligible[r])) first = r;
+            if (ratio >= k_eff && ratio < 8.0f * k_eff && (eligible == nullptr || eligible[r])) first = r;   // the explore band of k_eff
         }
         if (first >= 0 && explore != nullptr) *explore = true;
     }
@@ -5471,9 +5614,15 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
         ++c.fr_ctrl_rc;
         if (flipped) ++c.fr_ctrl_fl;
         c.fr_ctrl[c.fr_ctrl_pos] = flipped;
+        strata::core::gate::ctrl_add(c.gs, flipped);   // the persisted noise floor (the last kCtrlKeep control re-checks, cumulative counts)
         c.fr_ctrl_pos = (c.fr_ctrl_pos + 1) % RouteResidentCfg::kCtrlRing;
         if (c.fr_ctrl_n < RouteResidentCfg::kCtrlRing) ++c.fr_ctrl_n;
         return;
+    }
+    // SPEC-recheck-gated step H2: an explore cut's verdict counts for its arm (the margin test's quality veto: flipped or not)
+    if (c.fragile_pend_explore) {
+        ++c.auto_xrc[c.auto_cut_arm];
+        if (flipped) ++c.auto_xfl[c.auto_cut_arm];
     }
     ++c.fragile_rechecks;
     if (flipped) {
@@ -5543,32 +5692,27 @@ void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
     if (c.fr_n < RouteResidentCfg::kFragileRing) ++c.fr_n;
     ++c.fr_session;
     if (c.fragile_k_pinned || c.fr_session < 50 || c.fr_session % 50 != 0) return;
-    bool any_flip = false;
-    float largest = 0.0f;
-    for (int i = 0; i < c.fr_n; ++i)
-        if (c.fr_flip[i]) {
-            any_flip = true;
-            if (c.fr_ratio[i] > largest) largest = c.fr_ratio[i];
-        }
-    if (!any_flip) return;   // no flip in the ring: k is kept
-    // Noise: a raise needs the ring's flip rate above the noise floor (Wilson 90%: the ring's lower bound above the control's upper bound)
-    long long ring_fl = 0;
-    for (int i = 0; i < c.fr_n; ++i)
-        if (c.fr_flip[i]) ++ring_fl;
-    double ring_lo = 0.0, ring_hi = 0.0, kctrl_lo = 0.0, kctrl_hi = 0.0;
-    route_wilson90(ring_fl, c.fr_n, ring_lo, ring_hi);
+    // SPEC-recheck-gated step H1: k_safe from the evidence above the noise floor (k_evidence: the largest flipped ratio whose entries
+    // at or above it have a Wilson lower bound above the control's upper bound); with no such evidence and a full ring, half of the old k
+    double kctrl_lo = 0.0, kctrl_hi = 0.0;
     route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, kctrl_lo, kctrl_hi);
+    const strata::core::gate::KEvidence ev = strata::core::gate::k_evidence(c.fr_ratio, c.fr_flip, c.fr_n, kctrl_hi);
     const float old = c.fragile_k;
-    float target = std::min((float) RouteResidentCfg::kFragileK, std::max(0.005f, 1.25f * largest));
-    if (target > old && !route_k_raise_ok(ring_lo, kctrl_hi)) target = old;   // the flips are not above the noise: no raise
+    float target = strata::core::gate::k_target(ev, c.fr_n, old, c.fr_ctrl_n);   // (8 Nov: lowering needs measured noise)
     // a step is bounded: up to 1.5 times the old k, down to 0.5 times it
     if (target > old) target = std::min(target, 1.5f * old);
     if (target < old) target = std::max(target, 0.5f * old);
     c.fragile_k = target;
+    // H3: the k line with the base k_safe, r*, n_t, f_t and the control's upper bound
     if (c.fragile_k != old) {
-        std::fprintf(stderr, "strata serve: fragile recheck: k %.3f (%lld rechecks, %lld flips, largest flipped ratio %.3f in the ring; "
-                     "ring flip rate lower bound %.3f vs control upper bound %.3f over %d control re-checks)\n",
-                     (double) c.fragile_k, c.fragile_rechecks, c.fragile_flips, (double) largest, ring_lo, kctrl_hi, c.fr_ctrl_n);
+        if (ev.found)
+            std::fprintf(stderr, "strata serve: fragile recheck: k %.3f (base k_safe %.3f (r* %.3f, n_t %lld, f_t %lld; control upper bound %.3f over %d "
+                         "control re-checks); %lld rechecks, %lld flips in all)\n",
+                         (double) c.fragile_k, (double) c.fragile_k, ev.r_star, ev.n_t, ev.f_t, kctrl_hi, c.fr_ctrl_n, c.fragile_rechecks, c.fragile_flips);
+        else
+            std::fprintf(stderr, "strata serve: fragile recheck: k %.3f (no flip above the control's noise (upper bound %.3f over %d control "
+                         "re-checks): k lowered by half; %lld rechecks)\n",
+                         (double) c.fragile_k, kctrl_hi, c.fr_ctrl_n, c.fragile_rechecks);
         route_tune_write(c);
     }
 }
@@ -5699,6 +5843,8 @@ void auto_reset_arms(RouteResidentCfg& c) {
     c.auto_rc[0] = c.auto_rc[1] = 0;
     c.auto_fl[0] = c.auto_fl[1] = 0;
     c.auto_cuts[0] = c.auto_cuts[1] = 0;
+    c.auto_xrc[0] = c.auto_xrc[1] = 0;   // step H2: the margin test's explore cuts per arm
+    c.auto_xfl[0] = c.auto_xfl[1] = 0;
     c.auto_runs = 0;
     c.auto_run_left = 0;
     c.auto_testing = true;
@@ -5727,7 +5873,28 @@ void auto_next_stage(RouteResidentCfg& c, bool won, int d) {
 
 // The next scheduled window's arm: runs of kAutoRun windows; run r is arm (r % 2) ^ ((r / 2) % 2), so each pair of runs alternates which arm is first.
 // SPEC-recheck-gated step G: the rotation's next kind after `k` (tune_steps.hpp: budget -> mask -> cap -> prefetch -> budget).
-static int rot_next(const RouteResidentCfg& c, int k) { return tune::next_kind(k, mask_learn_env(), c.tune_cap_on, c.tune_pf_on); }
+static int rot_next(const RouteResidentCfg& c, int k) { return tune::next_kind(k, mask_learn_env(), c.tune_cap_on, c.tune_pf_on, c.tune_k_on); }
+
+// SPEC-recheck-gated step H2: a margin test: the candidate m x step^d of its direction (paired::DirState, the step state of the tune); at a
+// bound, a loss at once (no test, false).
+static bool k_test_begin(RouteResidentCfg& c) {
+    auto& t = c.gs.tune;
+    paired::DirState ds{t.k_first, t.k_stage};
+    const int d = ds.dir();
+    double cand = 0.0;
+    if (!tune::k_mult_candidate(t.k_mult, (double) t.k_step, d, cand)) {
+        ds.update(false, d);
+        t.k_first = ds.first;
+        t.k_stage = ds.stage;
+        return false;
+    }
+    c.auto_k_cand = cand;
+    c.auto_kind = tune::KMult;
+    c.auto_mask = false;
+    c.auto_dir = d;
+    auto_reset_arms(c);
+    return true;
+}
 
 // A cap test: the candidate of its direction (paired::DirState); a candidate at the bound is a loss at once (no test, false).
 static bool cap_test_begin(RouteResidentCfg& c) {
@@ -5784,8 +5951,8 @@ void route_auto_schedule(RouteResidentCfg& c) {
             c.auto_next_kind = rot_next(c, k);
             continue;
         }
-        if (k == tune::Cap || k == tune::Prefetch) {
-            const bool started = k == tune::Cap ? cap_test_begin(c) : pf_test_begin(c);
+        if (k == tune::Cap || k == tune::Prefetch || k == tune::KMult) {
+            const bool started = k == tune::Cap ? cap_test_begin(c) : k == tune::Prefetch ? pf_test_begin(c) : k_test_begin(c);
             if (started) break;
             c.auto_next_kind = rot_next(c, k);
             continue;
@@ -5836,8 +6003,14 @@ void route_auto_pair_done(RouteResidentCfg& c) {
     if (paired::pair_diff(c.auto_pt_tok[0], c.auto_pt_secs[0], c.auto_pt_tok[1], c.auto_pt_secs[1], d)) c.auto_pair.add(d);
     c.auto_pt_tok[0] = c.auto_pt_tok[1] = 0.0;
     c.auto_pt_secs[0] = c.auto_pt_secs[1] = 0.0;
-    const bool blocked = paired::quality_veto(c.auto_fl[0], c.auto_tok[0], c.auto_fl[1], c.auto_tok[1], RouteResidentCfg::kAutoTokMin,
-                                              RouteResidentCfg::kBrakeFlips);
+    bool blocked = paired::quality_veto(c.auto_fl[0], c.auto_tok[0], c.auto_fl[1], c.auto_tok[1], RouteResidentCfg::kAutoTokMin,
+                                        RouteResidentCfg::kBrakeFlips);
+    // SPEC-recheck-gated step H2: the margin test's quality veto is the explore cuts' flips (speed alone never passes the veto)
+    if (c.auto_kind == tune::KMult) {
+        double kc_lo = 0.0, kc_hi = 0.0;
+        route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, kc_lo, kc_hi);
+        blocked = blocked || tune::explore_veto(c.auto_xfl[0], c.auto_xrc[0], c.auto_xfl[1], c.auto_xrc[1], kc_hi, RouteResidentCfg::kExploreMinRc);
+    }
     // SPEC-recheck-cheap change 4: the candidate's cuts per token (Wilson 90%) against twice the base's: no move (reason "cuts")
     const bool cut_blocked = paired::cut_veto(c.auto_cuts[0], c.auto_tok[0], c.auto_cuts[1], c.auto_tok[1], RouteResidentCfg::kAutoTokMin);
     const paired::Rule rule = c.auto_mask ? paired::mask_rule(c.auto_min_effect) : paired::budget_rule(c.auto_min_effect);
@@ -5876,6 +6049,24 @@ static void tune_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
         }
         t.set = true;
         c.auto_next_kind = rot_next(c, tune::Cap);
+    } else if (c.auto_kind == tune::KMult) {
+        // SPEC-recheck-gated step H3: "auto k test m a vs b (k_eff x vs y): pairs N, mean d ..., explore flips f/n vs f/n, -> move|keep (reason)"
+        std::fprintf(stderr, "strata serve: auto k test m %.3f vs %.3f (k_eff %.4f vs %.4f): pairs %lld, mean d %+.4f (se %.4f), "
+                     "explore flips %lld/%lld vs %lld/%lld, -> %s (%s); %.1f vs %.1f tok/s over %d+%d windows\n",
+                     c.auto_k_cand, t.k_mult, c.auto_k_cand * (double) c.fragile_k, t.k_mult * (double) c.fragile_k, pairs, pmean, pse,
+                     c.auto_xfl[1], c.auto_xrc[1], c.auto_xfl[0], c.auto_xrc[0], won ? "move" : "keep", auto_reason_name(why), sc, sb,
+                     (int) c.auto_n[1], (int) c.auto_n[0]);
+        paired::BudgetStep bs{t.k_step, t.k_last_win};
+        bs.update(won, d);
+        t.k_step = bs.step;
+        t.k_last_win = bs.last_win;
+        paired::DirState ds{t.k_first, t.k_stage};
+        ds.update(won, d);
+        t.k_first = ds.first;
+        t.k_stage = ds.stage;
+        if (won) t.k_mult = c.auto_k_cand;
+        t.set = true;
+        c.auto_next_kind = rot_next(c, tune::KMult);
     } else {
         std::fprintf(stderr, "strata serve: auto prefetch test %lld vs %lld: pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
                      "%.1f vs %.1f tok/s over %d+%d windows; flips/100 tok %.2f vs %.2f; cuts %lld vs %lld\n",
@@ -5896,7 +6087,7 @@ static void tune_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
 }
 
 void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
-    if (c.auto_kind == tune::Cap || c.auto_kind == tune::Prefetch) {
+    if (c.auto_kind == tune::Cap || c.auto_kind == tune::Prefetch || c.auto_kind == tune::KMult) {
         tune_test_done(c, won, why);
         return;
     }

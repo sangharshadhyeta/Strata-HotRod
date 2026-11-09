@@ -170,6 +170,64 @@ struct ShiftCal {
     long long not_flip[kBuckets] = {};
 };
 
+// ---- SPEC-recheck-gated step H1: k from evidence above the noise floor (replaces "1.25 x the largest flipped ratio").
+// Every 50 re-checks the ring (the last 200 re-checks: ratio gap/shift, flipped or not) gives r*: the LARGEST flipped ratio t such that the
+// entries with ratio >= t number n_t >= 8 and their flips f_t have a Wilson 90% lower bound above the control's upper bound.  Noise flips
+// (about 7% of exact-vs-exact re-checks, at any ratio) cannot clear that bound at high ratios, so they no longer set k.
+
+constexpr int kEvidenceMinN = 8;     ///< entries with ratio >= t needed for the threshold t
+constexpr int kKRingMin = 50;        ///< a ring this size with no evidence lowers k by half (its step limits are the caller's)
+
+struct KEvidence {
+    bool found = false;   ///< a threshold qualified (r* is set)
+    double r_star = 0.0;  ///< the largest qualifying flipped ratio
+    long long n_t = 0;    ///< entries with ratio >= r*
+    long long f_t = 0;    ///< of those, flipped
+};
+
+/// r* over the first n ring entries (ratios[i], flips[i]).  ctrl_hi: the control's Wilson 90% upper bound of its flip rate (with fewer than
+/// 20 control re-checks it is near 1, so nothing qualifies: no raise, as before).  NaN ratios are not thresholds.
+inline KEvidence k_evidence(const float* ratios, const bool* flips, int n, double ctrl_hi) {
+    KEvidence e;
+    for (int i = 0; i < n; ++i) {
+        if (!flips[i]) continue;
+        const double t = (double) ratios[i];
+        if (!(t == t)) continue;
+        long long nt = 0, ft = 0;
+        for (int j = 0; j < n; ++j)
+            if ((double) ratios[j] >= t) {   // (a NaN ratio is never >= t)
+                ++nt;
+                if (flips[j]) ++ft;
+            }
+        if (nt < kEvidenceMinN) continue;
+        double lo = 0.0, hi = 0.0;
+        paired::wilson90(ft, nt, lo, hi);
+        if (lo > ctrl_hi && (!e.found || t > e.r_star)) {
+            e.found = true;
+            e.r_star = t;
+            e.n_t = nt;
+            e.f_t = ft;
+        }
+    }
+    return e;
+}
+
+/// The target k (before the caller's step limits: up to 1.5x, down to 0.5x per update): 1.25 x r* clamped to [0.005, 50] with evidence;
+/// else half of the old k when the ring has kKRingMin entries; else the old k.
+/// 8 Nov fix (live: k fell 0.039 -> 0.0012 in 15 minutes): "no flip above the noise" is evidence only when the noise is measured - with
+/// fewer than kKCtrlMin control samples the Wilson bound is huge, nothing can exceed it, and halving on every update collapsed k.  So the
+/// lowering needs kKCtrlMin control samples and never goes below kKFloor; otherwise k is held.
+constexpr int kKCtrlMin = 20;
+constexpr float kKFloor = 0.005f;
+inline float k_target(const KEvidence& e, int n_ring, float old, int n_ctrl) {
+    if (e.found) {
+        const double v = 1.25 * e.r_star;
+        return (float) std::min(50.0, std::max(0.005, v));
+    }
+    if (n_ring >= kKRingMin && n_ctrl >= kKCtrlMin) return old > kKFloor ? std::max(kKFloor, 0.5f * old) : old;
+    return old;
+}
+
 /// Everything the gate keeps across requests and restarts.  total: the eligible rows, cumulative (what the logs print and the totals
 /// file keeps).  since: the same, since the last P_HI move (the mover's evidence).  margin_ring: the none rows' margins (running estimate).
 struct State {
@@ -180,6 +238,10 @@ struct State {
     Deciles margin;
     RankTable rank;
     tune::Tune tune;     ///< step G: the cap multipliers and the prefetch count chosen by the paired tuner (persisted)
+    // the control re-checks (the noise floor of k and the brake): the last kCtrlKeep exact-vs-exact re-checks, oldest first (1 = the top-1
+    // flipped), and their cumulative count and flips.  Saved with the state and seeding the window's control ring at load.
+    std::vector<unsigned char> ctrl;
+    long long ctrl_seen = 0, ctrl_flips_total = 0;
     Ring shift;          ///< step F: the moved rows' final row_shift (the cap's median, the calibration deciles)
     ShiftCal cal;        ///< step F: the cut rows' shift decile, split by the verdict
     std::vector<float> margin_ring;
@@ -247,6 +309,37 @@ inline int step(State& s) {
     return dir;
 }
 
+// ---- the control re-checks (the noise floor), persisted with the state.
+
+constexpr size_t kCtrlKeep = 400;   ///< the control re-checks kept (the newest; a decayed window of the noise, not a cumulative sum)
+
+/// One control re-check (flipped or not): the ring keeps the newest kCtrlKeep, the counters are cumulative.
+inline void ctrl_add(State& s, bool flipped) {
+    ++s.ctrl_seen;
+    if (flipped) ++s.ctrl_flips_total;
+    if (s.ctrl.size() >= kCtrlKeep) s.ctrl.erase(s.ctrl.begin());
+    s.ctrl.push_back(flipped ? 1 : 0);
+}
+
+/// Seeds a window's control ring (ring[0..cap), the layout of the window's fr_ctrl): the newest min(size, cap) saved re-checks, oldest first.
+/// Returns the count n (the ring's fill) and sets pos to the next slot (n mod cap), as the ring keeps it.
+inline int ctrl_seed(const State& s, bool* ring, int cap, int& pos) {
+    const int n = (int) std::min<size_t>(s.ctrl.size(), (size_t) cap);
+    const size_t start = s.ctrl.size() - (size_t) n;
+    for (int i = 0; i < n; ++i) ring[i] = s.ctrl[start + (size_t) i] != 0;
+    pos = cap > 0 ? n % cap : 0;
+    return n;
+}
+
+/// The control cadence (STRATA_FRAGILE_CTRL_EVERY = configured, 0 = off): while fewer than kCtrlEarlyN control re-checks exist, at most
+/// kCtrlEarlyEvery eligible windows apart, so the noise floor is measured early; the configured cadence after that.
+constexpr long long kCtrlEarlyN = 20;
+constexpr long long kCtrlEarlyEvery = 128;
+inline long long ctrl_every(long long configured, long long n_ctrl) {
+    if (configured <= 0) return 0;
+    return n_ctrl < kCtrlEarlyN && configured > kCtrlEarlyEvery ? kCtrlEarlyEvery : configured;
+}
+
 // ---- persistence: text, one key per line, keyed by the model's fingerprint (a file of another model is refused).
 
 /// The state as text (the fingerprint on the first line).  Floats are written with 9 digits, so a round trip is exact.
@@ -286,6 +379,14 @@ inline std::string serialize(const State& s, uint64_t fp) {
     out += buf;
     std::snprintf(buf, sizeof buf, "tune_prefetch %lld %d %d\n", s.tune.prefetch, s.tune.pf_first, s.tune.pf_stage);
     out += buf;
+    std::snprintf(buf, sizeof buf, "tune_k %.9g %.9g %d %d %d\n", s.tune.k_mult, (double) s.tune.k_step, s.tune.k_last_win, s.tune.k_first,
+                  s.tune.k_stage);
+    out += buf;
+    std::snprintf(buf, sizeof buf, "ctrl_seen %lld\nctrl_flips %lld\n", s.ctrl_seen, s.ctrl_flips_total);
+    out += buf;
+    out += "ctrl_ring";
+    for (unsigned char v : s.ctrl) out += v ? " 1" : " 0";
+    out += "\n";
     std::snprintf(buf, sizeof buf, "shift_pos %lld\n", (long long) s.shift.pos);
     out += buf;
     out += "shift_ring";
@@ -355,6 +456,26 @@ inline bool parse(const std::string& text, uint64_t fp, State& s) {
             t.tune.prefetch = p;
             t.tune.pf_first = f < 0 ? -1 : 1;
             t.tune.pf_stage = sg != 0 ? 1 : 0;
+        } else if (key == "ctrl_seen") {
+            if (!(ls >> t.ctrl_seen) || t.ctrl_seen < 0) return false;
+        } else if (key == "ctrl_flips") {
+            if (!(ls >> t.ctrl_flips_total) || t.ctrl_flips_total < 0) return false;
+        } else if (key == "ctrl_ring") {
+            long long v = 0;
+            while (ls >> v) {
+                if ((v != 0 && v != 1) || t.ctrl.size() >= kCtrlKeep) return false;   // a 0/1 per re-check, at most kCtrlKeep
+                t.ctrl.push_back((unsigned char) v);
+            }
+        } else if (key == "tune_k") {
+            double m = 0, st = 0;
+            int lw = 0, f = 1, sg = 0;
+            if (!(ls >> m >> st >> lw >> f >> sg)) return false;
+            if (!(m >= tune::kKMultLo && m <= tune::kKMultHi) || !(st > 0.0)) return false;
+            t.tune.k_mult = m;
+            t.tune.k_step = (float) st;
+            t.tune.k_last_win = lw;
+            t.tune.k_first = f < 0 ? -1 : 1;
+            t.tune.k_stage = sg != 0 ? 1 : 0;
         } else if (key == "shift_pos") {
             long long v = 0;
             if (!(ls >> v) || v < 0) return false;

@@ -17094,6 +17094,18 @@ int main(int argc, char** argv) {
                              strata::core::la_tail_read_open_skips.exchange(0, std::memory_order_relaxed) +
                                  (long long) strata::kernels::route_pred_tail_read_take(),
                              strata::core::la_tail_read_held.exchange(0, std::memory_order_relaxed));
+            // SPEC-adaptive-la change 3: the decode read-ahead dispatch's host time since the previous request (the counts are taken and zeroed
+            // here); STRATA_TAIL_ADAPT=1 adds the windows the tail was restricted in (the rule is opt-in: it is not on by default)
+            if (strata::core::la_ra_windows.load(std::memory_order_relaxed) > 0) {
+                const long long ra_ns = strata::core::la_ra_ns.exchange(0, std::memory_order_relaxed);
+                const long long ra_wins = strata::core::la_ra_windows.exchange(0, std::memory_order_relaxed);
+                static const bool tail_adapt_on = [] { const char* e = std::getenv("STRATA_TAIL_ADAPT"); return e != nullptr && std::atoi(e) != 0; }();
+                std::fprintf(stderr, "strata serve: read-ahead dispatch: %.3f ms per request (%.1f us per window), %lld guesses considered, %lld queued%s\n",
+                             (double) ra_ns / 1e6, ra_wins > 0 ? (double) ra_ns / 1e3 / (double) ra_wins : 0.0,
+                             strata::core::la_ra_considered.exchange(0, std::memory_order_relaxed),
+                             strata::core::la_ra_queued.exchange(0, std::memory_order_relaxed),
+                             tail_adapt_on ? (" (tail adapt: " + std::to_string(strata::core::la_tail_restrict_windows.exchange(0, std::memory_order_relaxed)) + " windows restricted to ranks below the floor)").c_str() : "");
+            }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
             if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)
