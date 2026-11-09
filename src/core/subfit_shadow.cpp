@@ -20,6 +20,8 @@ int per_cut_env(const char* v) {
     return std::max(0, std::min(256, n));
 }
 
+bool cpu_ye_env(const char* v) { return v != nullptr && std::atoi(v) != 0; }
+
 Queue::~Queue() {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -115,7 +117,11 @@ void Queue::run() {
             ev = eval_;
         }
         it.ys.assign(it.x.size(), 0.0f);
-        const bool ok = ev && !it.x.empty() && ev(it.layer, it.s, it.x.data(), it.ys.data());
+        bool ok = ev && !it.x.empty() && ev(it.layer, it.s, it.x.data(), it.ys.data());
+        if (ok && it.need_ye) {   // the true expert on the same input (the exact row did not run it at this layer)
+            it.ye.assign(it.x.size(), 0.0f);
+            ok = ev(it.layer, it.e, it.x.data(), it.ye.data());
+        }
         {
             std::lock_guard<std::mutex> lk(mu_);
             busy_ = false;

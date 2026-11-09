@@ -1734,12 +1734,21 @@ void Verifier::subfit_shadow_collect(int l0, int e0, int s0) {
         int k = -1;
         for (int q = 0; q < K; ++q)
             if (ids[(size_t) (l * K + q)] == e) { k = q; break; }
-        if (k < 0) { ++g_shadow_nomatch; continue; }   // the exact row did not pick e at this layer (its input moved)
+        // the exact row did not pick e at this layer (its input moved): skipped, or with STRATA_SUBFIT_SHADOW_CPU_YE=1 the idle-time CPU
+        // computes y_e = e(x) as well (e is not resident: one more expert read, at the idle I/O class)
+        static const bool cpu_ye = strata::core::subfit_shadow::cpu_ye_env(std::getenv("STRATA_SUBFIT_SHADOW_CPU_YE"));
+        if (k < 0) ++g_shadow_nomatch;
+        if (k < 0 && !cpu_ye) continue;
         strata::core::subfit_shadow::Item it;
         it.layer = l;
         it.e = e;
         it.s = s;
         it.x.assign(xs.begin() + l * D, xs.begin() + (l + 1) * D);
+        if (k < 0) {
+            it.need_ye = true;
+            g_shadow->push(std::move(it));
+            continue;
+        }
         it.ye.resize((size_t) D);
         if (cudaMemcpy(it.ye.data(), shd_y_ + (size_t) (l * K + k) * D, sizeof(float) * (size_t) D, cudaMemcpyDeviceToHost) != cudaSuccess) {
             (void) cudaGetLastError();

@@ -178,6 +178,14 @@ void test_queue() {
     CHECK(!done.empty() && std::fabs(done[0].ys[0] - 4.0f) < 1e-6f, "the evaluator's y_s is kept");
     const sh::Stats st = q.take_stats();
     CHECK(st.queued == 11 && st.evaluated == 10 && st.failed == 1, "queued / evaluated / failed counts");
+    sh::Item ny = it;
+    ny.need_ye = true;
+    ny.ye.clear();
+    q.push(std::move(ny));
+    CHECK(q.drain_for_tests(5000), "drains the y_e item");
+    const auto d2 = q.take_done();
+    CHECK(d2.size() == 1 && d2[0].ye.size() == (size_t) N && std::fabs(d2[0].ye[0] - 4.0f) < 1e-6f, "need_ye: the worker computes y_e = e(x) too");
+    CHECK(!sh::cpu_ye_env(nullptr) && sh::cpu_ye_env("1") && !sh::cpu_ye_env("0"), "cpu y_e env: off by default");
     CHECK(sh::per_cut_env(nullptr) == sh::kDefaultPerCut && sh::per_cut_env("0") == 0 && sh::per_cut_env("999") == 256, "env");
 }
 

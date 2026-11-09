@@ -27,12 +27,14 @@ constexpr size_t kMaxQueued = 4096;     ///< items waiting for the CPU (the olde
 constexpr size_t kMaxDone = 8192;       ///< finished samples waiting for the learner (the oldest dropped past it)
 
 int per_cut_env(const char* v);
+bool cpu_ye_env(const char* v);   ///< STRATA_SUBFIT_SHADOW_CPU_YE (opt-in, default off)
 
 struct Item {
     int layer = 0, e = 0, s = 0;
     std::vector<float> x;    ///< the exact input [n]
     std::vector<float> ye;   ///< the true expert's output on it [n]
     std::vector<float> ys;   ///< the stand-in's output on it [n] (filled by the worker)
+    bool need_ye = false;    ///< STRATA_SUBFIT_SHADOW_CPU_YE=1: the exact row did not pick e, so the worker computes y_e = e(x) too
 };
 
 /// eval(layer, s, x, ys_out): the stand-in's output on x; false when it cannot (the item is dropped)
