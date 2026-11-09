@@ -8,7 +8,8 @@
 // Verdict: GO when the pooled rank-16 nudge (or the oracle best candidate) removes >= 40% of the error energy left after the scalar.
 //
 // usage: subfit_fit --samples FILE [--pack DIR] [--profile FILE] [--cands 64] [--max-samples 4000] [--seed 1]
-//                   [--lambda 0.01,0.1,1,10,100] [--check-blob LAYER EXPERT]
+//                   [--lambda 0.01,0.1,1,10,100] [--check-blob LAYER EXPERT] [--dump N]
+//   --dump N: prints the first N records as stored (tag, layer, e, s, rank, w, norms of x, y_s, y_e) and exits (no pack needed).
 #include "fit_math.hpp"
 
 #include "strata/core/expert_source.hpp"
@@ -47,6 +48,7 @@ struct Opts {
     std::vector<double> lambdas = {0.01, 0.1, 1.0, 10.0, 100.0};   // relative to the mean feature energy
     bool check = false;
     int check_layer = 0, check_expert = 0;
+    int dump = 0;                               // --dump N: the first N records as stored, then exit
     double cap_refusals = -1.0, moves = -1.0;   // the request-end lines: "shift cap: moves refused N" and the stand-in moves M (mode estimate)
 };
 
@@ -68,7 +70,7 @@ std::vector<float> to_f(const std::vector<double>& v) { return std::vector<float
 
 void usage() {
     std::fprintf(stderr, "usage: subfit_fit --samples FILE [--pack DIR] [--profile FILE] [--cands 64] [--max-samples 4000] [--seed 1]\n"
-                         "                   [--lambda 0.01,0.1,1,10,100] [--check-blob LAYER EXPERT]\n");
+                         "                   [--lambda 0.01,0.1,1,10,100] [--check-blob LAYER EXPERT] [--dump N]\n");
 }
 
 bool parse(int argc, char** argv, Opts& o) {
@@ -96,6 +98,7 @@ bool parse(int argc, char** argv, Opts& o) {
         }
         if (a == "--cap-refusals" && next(v)) { o.cap_refusals = std::atof(v.c_str()); continue; }
         if (a == "--moves" && next(v)) { o.moves = std::atof(v.c_str()); continue; }
+        if (a == "--dump" && next(v)) { o.dump = std::max(0, std::atoi(v.c_str())); continue; }
         if (a == "--check-blob" && i + 2 < argc) {
             o.check = true;
             o.check_layer = std::atoi(argv[++i]);
@@ -332,6 +335,23 @@ int main(int argc, char** argv) {
     if (hd.n_embd != 2560) {
         std::fprintf(stderr, "subfit_fit: this tool reads n_embd 2560 (the file has %u)\n", hd.n_embd);
         return 2;
+    }
+    if (o.dump > 0) {   // --dump N: the records as the reader stores them (the logger's check: no pack, no evaluation)
+        auto norm = [](const std::vector<float>& v) {
+            double q = 0.0;
+            for (float f : v) q += (double) f * (double) f;
+            return std::sqrt(q);
+        };
+        Record d;
+        for (int k = 0; k < o.dump && rd.next(d, err); ++k)
+            std::printf("#%d tag %d layer %d e %d s %d rank %d w %.6g  |x| %.6g  |y_s| %.6g  |y_e| %.6g  (x %zu, y_s %zu, y_e %zu)\n", k, d.tag,
+                        d.layer, d.e, d.tag == 1 ? d.s : -1, d.rank, d.tag == 2 ? d.w : 0.0f, norm(d.x), norm(d.ys), norm(d.ye), d.x.size(),
+                        d.ys.size(), d.ye.size());
+        if (!err.empty()) {
+            std::fprintf(stderr, "subfit_fit: %s\n", err.c_str());
+            return 2;
+        }
+        return 0;
     }
     const int64_t n_layers = hd.n_layers;
     if (!strata::kernels::cpu::expert_layout_load(o.pack, n_layers, kExperts, err)) {
