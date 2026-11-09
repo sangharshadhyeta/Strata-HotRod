@@ -414,12 +414,17 @@ int main(int argc, char** argv) {
             cand.push_back(c);
         }
         double best_cos = -2.0;
+        bool have_best = false;
         for (int c : cand) {
             if (c == it.e || c == it.s) continue;
             strata::kernels::cpu::native_expert_forward(fm, src.blob(it.layer, c), it.x.data(), h.data(), y.data());
             const double cc = cosine(y.data(), r.ye.data(), NE);
-            if (cc > best_cos) {
-                best_cos = cc;
+            // a non-finite cosine (a zero y_e: 0/0) never wins, but the first candidate still fills hb/yb (the set's arrays must exist:
+            // the analysis reads them; 2026-11-09 the all-zero y_e of the stage-1 file segfaulted it here)
+            const bool finite = std::isfinite(cc);
+            if (!have_best || (finite && cc > best_cos)) {
+                have_best = true;
+                best_cos = finite ? cc : -2.0;
                 it.best = c;
                 it.hb = h;
                 it.yb = y;
