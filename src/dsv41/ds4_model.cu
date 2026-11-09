@@ -4528,6 +4528,7 @@ struct Model::Impl {
                     tune.configure(h.budget, fr_k, std::getenv("STRATA_FRAGILE_K0") != nullptr, br == nullptr || std::atoi(br) != 0);
                     tune_path = o.pack + "/standin-tune.txt";
                     if (const char* ce = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) tune.set_ctrl_every(std::atoll(ce));
+                    if (const char* bl = std::getenv("STRATA_FRAGILE_BRAKE_LEGACY")) if (std::atoi(bl) != 0) tune.set_brake_legacy(true);
                     const bool loaded = tune.load(tune_path);
                     tune_on = true;
                     std::fprintf(stderr, "ds4: stand-ins: the budget tunes itself (%s): %s\n", loaded ? ("loaded " + tune_path).c_str() : "new",

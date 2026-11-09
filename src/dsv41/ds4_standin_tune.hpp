@@ -13,14 +13,16 @@
 //    cancels: the base arm at req_b and the candidate arm at req_b * s^d (s: the step, 1.25 at the start; d: the direction, +1 up
 //    or -1 down).  Runs of kAutoRun tokens alternate between the arms.  A test ends when both arms have kAutoMin tokens.  The
 //    candidate wins at >= 1.02 times the base's speed (tokens per second); then b moves to it.
-//  - The BRAKE gives each request its own budget req_b, which the arms scale.  Re-check flips in a request cut req_b (Wilson 90%
-//    bounds decide, so a few flips do not act); clean stretches grow it back.
+//  - The BRAKE gives each request its own budget req_b, which the arms scale.  It brakes on evidence against measured references
+//    (no fixed thresholds): band re-checks that flip against the control re-checks' noise floor, or a request's flip rate against
+//    the lifetime's.  Clean stretches grow it back.  set_brake_legacy(true) restores the old fixed-threshold rule.
 //  - With the mask learner on (DS4_MASK=learn), every other test is a MASK test: the same interleaved arms, both at req_b, the arms being
 //    the mask's levels for the base (p, g) and for a candidate one step deeper or shallower.  The model decides the step and what a win
 //    keeps (begin / end hooks); this header only schedules it and reports the verdict.  A mask test does not move b.
 // k (the close-call factor) learns from the flips of every 50 re-checks.
 //
-// State that outlives a process is kept in a text file (save / load): lines "budget", "k", "step", "clean", "tests", "lastwin".
+// State that outlives a process is kept in a text file (save / load): lines "budget", "k", "step", "clean", "tests", "lastwin",
+// "alltok", "allfl" (the brake's lifetime counts), "ctrl".
 #pragma once
 
 #include <algorithm>
@@ -47,9 +49,19 @@ public:
     }
 
     // A request starts: its budget is half the base budget (the class start of the Qwen engine) when the brake is on, else b.
+    // The finished request's tokens and flips join the lifetime counts (the brake's reference); when the lifetime passes 200000 tokens
+    // both halve, a slow decay.  The request's band counts reset.
     void begin_request() {
+        all_tok_ += req_tok_all_;
+        all_fl_ += req_fl_all_;
+        req_tok_all_ = req_fl_all_ = 0;
+        if (all_tok_ > 200000) {
+            all_tok_ /= 2;
+            all_fl_ /= 2;
+        }
         req_b_ = brake_on_ ? 0.5f * b_ : b_;
         req_rc_ = req_fl_ = req_tok_ = req_wins_ = 0;
+        req_band_n_ = req_band_f_ = 0;
     }
 
     // The budget the next decode token runs at.  Chooses its arm (a scheduled run of the running test, or the base arm when no test
@@ -79,6 +91,10 @@ public:
     bool mask_testing() const { return mask_testing_; }   ///< the running test is a mask test
     int arm() const { return arm_; }                      ///< the arm of the token being run (valid after budget_for_next_token)
     float req_b() const { return req_b_; }   ///< this request's budget (the base arm's)
+    long long lifetime_tok() const { return all_tok_; }   ///< the brake's lifetime tokens (finished requests)
+    long long lifetime_fl() const { return all_fl_; }     ///< and its flips
+    // The legacy brake (STRATA_FRAGILE_BRAKE_LEGACY=1): the fixed Wilson thresholds of the first port. Default off.
+    void set_brake_legacy(bool on) { brake_legacy_ = on; }
 
     // After a decode token.  secs: its wall time, a re-run included.  rechecked: stand-ins were taken and the gap test sent it to a
     // re-run; gap / risk: its top-two logit gap and risk (used when rechecked); flipped: the re-run's top token differs.
@@ -90,14 +106,24 @@ public:
             ++n_[a];
         }
         ++req_tok_;
+        ++req_tok_all_;
         if (rechecked) {
             ++req_rc_;
-            if (flipped) ++req_fl_;
+            if (flipped) {
+                ++req_fl_;
+                ++req_fl_all_;
+            }
             ++rc_[a];
             if (flipped) ++fl_[a];
             // the k ring: this re-check's ratio and flip, the last kKWindow re-checks
-            ring_ratio_[ring_pos_] = risk > 0.0f && std::isfinite(gap / risk) ? gap / risk : 0.0f;
+            const float ratio = risk > 0.0f && std::isfinite(gap / risk) ? gap / risk : 0.0f;
+            ring_ratio_[ring_pos_] = ratio;
             ring_flip_[ring_pos_] = flipped;
+            // the brake's boundary band: a re-check at ratio >= 0.5 k; its flips there mean flips leak past k
+            if (ratio >= 0.5f * k_) {
+                ++req_band_n_;
+                if (flipped) ++req_band_f_;
+            }
             ring_pos_ = (ring_pos_ + 1) % kKRing;
             if (ring_n_ < kKRing) ++ring_n_;
             if (++rc_total_ % kKWindow == 0) k_update();
@@ -144,6 +170,8 @@ public:
         ok = ok && std::fprintf(f, "clean %.9g\n", b_clean_) > 0;
         ok = ok && std::fprintf(f, "tests %lld\n", tests_) > 0;
         ok = ok && std::fprintf(f, "lastwin %d\n", last_win_) > 0;
+        ok = ok && std::fprintf(f, "alltok %lld\n", all_tok_) > 0;
+        ok = ok && std::fprintf(f, "allfl %lld\n", all_fl_) > 0;
         {   // the control ring, oldest first, as 0/1 characters
             std::string bits;
             for (int i = 0; i < ctrl_cnt_; ++i) bits += ctrl_ring_[(ctrl_pos_ - ctrl_cnt_ + i + kCtrlRing) % kCtrlRing] ? '1' : '0';
@@ -161,7 +189,7 @@ public:
         FILE* f = std::fopen(path.c_str(), "r");
         if (f == nullptr) return false;
         char line[256];
-        double budget = -1.0, k = -1.0, step = -1.0, clean = -1.0, tests = -1.0, lastwin = 2.0;
+        double budget = -1.0, k = -1.0, step = -1.0, clean = -1.0, tests = -1.0, lastwin = 2.0, alltok = 0.0, allfl = 0.0;
         while (std::fgets(line, sizeof line, f) != nullptr) {
             char key[32] = "";
             double v = 0.0;
@@ -179,6 +207,8 @@ public:
             else if (std::strcmp(key, "clean") == 0) clean = v;
             else if (std::strcmp(key, "tests") == 0) tests = v;
             else if (std::strcmp(key, "lastwin") == 0) lastwin = v;
+            else if (std::strcmp(key, "alltok") == 0) alltok = v;
+            else if (std::strcmp(key, "allfl") == 0) allfl = v;
         }
         std::fclose(f);
         if (budget < 0.0) return false;
@@ -189,14 +219,19 @@ public:
         if (clean >= 0.0) b_clean_ = clean;
         if (tests >= 0.0) tests_ = (long long) tests;
         if (lastwin == -1.0 || lastwin == 0.0 || lastwin == 1.0) last_win_ = (int) lastwin;
+        all_tok_ = alltok > 0.0 ? (long long) alltok : 0;   // (a missing line is 0)
+        all_fl_ = allfl > 0.0 ? (long long) allfl : 0;
         return true;
     }
 
     // One line: b, k, req_b, tests, wins, brakes.
     std::string stats() const {
         char buf[256];
-        std::snprintf(buf, sizeof buf, "b %.3f k %.3f req_b %.3f tests %lld wins %lld brakes %lld; noise floor %.3f from %d control re-checks",
-                      (double) b_, (double) k_, (double) req_b_, tests_, wins_, brakes_, ctrl_hi(), ctrl_cnt_);
+        const double all_rate = all_tok_ > 0 ? (double) all_fl_ / (double) all_tok_ : 0.0;
+        std::snprintf(buf, sizeof buf,
+                      "b %.3f k %.3f req_b %.3f tests %lld wins %lld brakes %lld; noise floor %.3f from %d control re-checks"
+                      "; lifetime flips/token %.4f over %lld tokens",
+                      (double) b_, (double) k_, (double) req_b_, tests_, wins_, brakes_, ctrl_hi(), ctrl_cnt_, all_rate, all_tok_);
         return buf;
     }
 
@@ -249,6 +284,10 @@ private:
     long long req_rc_ = 0, req_fl_ = 0;   ///< this request's re-checks and flips since its last brake
     long long req_tok_ = 0;            ///< this request's tokens since its last brake
     long long req_wins_ = 0;           ///< this request's tokens (the grow check every kBrakeWindows)
+    long long req_tok_all_ = 0, req_fl_all_ = 0;   ///< this request's tokens and flips, never reset by a brake (joins the lifetime at begin_request)
+    long long req_band_n_ = 0, req_band_f_ = 0;    ///< this request's boundary band: re-checks at ratio >= 0.5 k, and their flips (reset by a brake)
+    long long all_tok_ = 0, all_fl_ = 0;           ///< the lifetime's tokens and flips (finished requests; saved as "alltok" / "allfl")
+    bool brake_legacy_ = false;        ///< the legacy fixed-threshold brake (set_brake_legacy)
 
     // ---- k ----
     float k_ = 4.0f;
@@ -350,10 +389,65 @@ private:
         arm_ = run_arm_;
     }
 
-    // A grow check every kBrakeWindows tokens of the request: with >= kBrakeMin re-checks and the Wilson 90% upper bounds of its flip
+    // The band brake: the request's boundary band (re-checks at ratio >= 0.5 k) has >= kEvidenceMinN entries and the Wilson 90% lower
+    // bound of its flip rate is above the noise floor (ctrl_hi: the control re-checks' upper bound; 1 with no controls, so no brake
+    // without a measured floor).  Flips just below k mean flips are leaking past k.
+    bool band_brake() const {
+        if (req_band_n_ < kEvidenceMinN) return false;
+        double lo = 0.0, hi = 0.0;
+        wilson90(req_band_f_, req_band_n_, lo, hi);
+        return lo > ctrl_hi();
+    }
+
+    // The rate brake: the request has >= kBrakeTokMin tokens and >= kBrakeFlips flips, and the Wilson 90% lower bound of its flips per
+    // token is above the lifetime's flips-per-token upper bound (1 with no history: no brake without history).
+    bool rate_brake() const {
+        if (req_tok_ < kBrakeTokMin || req_fl_ < kBrakeFlips) return false;
+        double lo = 0.0, hi = 0.0, all_lo = 0.0, all_hi = 0.0;
+        wilson90(req_fl_, req_tok_, lo, hi);
+        wilson90(all_fl_, all_tok_, all_lo, all_hi);
+        return lo > all_hi;
+    }
+
+    // The new grow check (every kBrakeWindows tokens of the request; no minimum re-check count): it does not grow while the band brake
+    // holds, nor while the request's flips per token (point rate, with >= kBrakeFlips flips) are above the lifetime's upper bound.
+    // Otherwise the first check sets req_b = b at once, later checks grow it x 1.25 up to b, and from 0 they go to 0.25 b.
+    void grow_check() {
+        if (brake_legacy_) {
+            grow_check_legacy();
+            return;
+        }
+        if (band_brake()) return;
+        double all_lo = 0.0, all_hi = 0.0;
+        wilson90(all_fl_, all_tok_, all_lo, all_hi);
+        if (req_fl_ >= kBrakeFlips && req_tok_ > 0 && (double) req_fl_ / (double) req_tok_ > all_hi) return;
+        if (req_wins_ == kBrakeWindows) {
+            req_b_ = b_;
+            return;
+        }
+        req_b_ = req_b_ <= 0.0f ? 0.25f * b_ : std::min(b_, req_b_ * 1.25f);
+    }
+
+    // The new brake (after each re-check): the request brakes when the band brake or the rate brake holds.  The budget halves (below
+    // 0.01 it is 0) and the request's counts, band included, reset.  Nothing brakes without history or a measured noise floor.
+    void brake_check() {
+        if (brake_legacy_) {
+            brake_check_legacy();
+            return;
+        }
+        if (!brake_on_ || req_b_ <= 0.0f) return;
+        if (!band_brake() && !rate_brake()) return;
+        const float cut = req_b_ * 0.5f;
+        req_b_ = cut < 0.01f ? 0.0f : cut;
+        ++brakes_;
+        req_rc_ = req_fl_ = req_tok_ = 0;
+        req_band_n_ = req_band_f_ = 0;
+    }
+
+    // LEGACY (set_brake_legacy): the fixed-threshold grow check. A grow check every kBrakeWindows tokens of the request: with >= kBrakeMin re-checks and the Wilson 90% upper bounds of its flip
     // rate per re-check (<= 0.2) and of its flips per token (<= 0.01) the budget grows: x 1.25, never above b; from 0 to 0.25 b.
     // The first check of a request (token kBrakeWindows) sets req_b = b at once when the bounds hold.
-    void grow_check() {
+    void grow_check_legacy() {
         if (req_rc_ < kBrakeMin) return;
         double lo = 0.0, hi = 0.0, tok_lo = 0.0, tok_hi = 0.0;
         wilson90(req_fl_, req_rc_, lo, hi);
@@ -366,10 +460,10 @@ private:
         req_b_ = req_b_ <= 0.0f ? 0.25f * b_ : std::min(b_, req_b_ * 1.25f);
     }
 
-    // After a re-check: the request brakes when (>= kBrakeMin re-checks and the Wilson 90% lower bound of its flip rate per re-check is
-    // above 0.2) or (>= kBrakeFlips flips, >= kBrakeTokMin tokens and the lower bound of flips per token is above 0.01).  The budget
-    // halves (below 0.01 it is 0) and the request's counts reset.
-    void brake_check() {
+    // LEGACY (set_brake_legacy): after a re-check the request brakes when (>= kBrakeMin re-checks and the Wilson 90% lower bound of its
+    // flip rate per re-check is above 0.2) or (>= kBrakeFlips flips, >= kBrakeTokMin tokens and the lower bound of flips per token is
+    // above 0.01).  The budget halves (below 0.01 it is 0) and the request's counts reset.
+    void brake_check_legacy() {
         if (!brake_on_ || req_b_ <= 0.0f) return;
         double lo = 0.0, hi = 0.0, tok_lo = 0.0, tok_hi = 0.0;
         wilson90(req_fl_, req_rc_, lo, hi);

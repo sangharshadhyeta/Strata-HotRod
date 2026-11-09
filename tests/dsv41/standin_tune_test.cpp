@@ -75,11 +75,12 @@ static std::string tmp_path(const char* name) {
 // 1. From b0 = 0.1 with no learned ceiling: the ceiling starts at 2 * b0 and rises as clean tests (no flips over >= 400 tokens) are
 // learned, so the base climbs to the speed knee (0.4) and stops short of the flip region (0.5): the candidates that probe past it
 // lose on quality.  Their probes are the only flips, a small share of the tokens.
-static void test_climb_ceiling() {
+static void test_climb_ceiling(bool legacy) {
     StandinTune t;
     t.configure(0.1f, 4.0f, false, true);
+    if (legacy) t.set_brake_legacy(true);
     Engine e;
-    std::printf("climb (no clean level): b0 0.100\n");
+    std::printf("climb (no clean level, %s brake): b0 0.100\n", legacy ? "legacy" : "new");
     for (int blk = 1; blk <= 20; ++blk) {
         e.run(t, 1000, 1000);
         if (blk % 4 == 0) std::printf("  after %5d tokens: b %.4f req_b %.4f\n", blk * 1000, (double) t.b(), (double) t.req_b());
@@ -92,15 +93,16 @@ static void test_climb_ceiling() {
 
 // 2. With a learned ceiling (clean 0.4, as a clean test would leave it), the base climbs toward the speed knee at 0.4 and
 // stops there: past 0.4 the speed is flat, so no candidate wins, and the flip region (b >= 0.5) is not entered.
-static void test_climb_to_knee() {
+static void test_climb_to_knee(bool legacy) {
     const std::string path = tmp_path("ds4_standin_tune_seed.txt");
     { std::ofstream f(path); f << "budget 0.1\nclean 0.4\n"; }
     StandinTune t;
     t.configure(0.1f, 4.0f, false, true);
+    if (legacy) t.set_brake_legacy(true);
     CHECK(t.load(path));
     std::filesystem::remove(path);
     Engine e;
-    std::printf("climb (clean 0.4): b0 0.100\n");
+    std::printf("climb (clean 0.4, %s brake): b0 0.100\n", legacy ? "legacy" : "new");
     for (int blk = 1; blk <= 30; ++blk) {
         e.run(t, 1000, 1000);
         if (blk % 5 == 0) std::printf("  after %5d tokens: b %.4f req_b %.4f\n", blk * 1000, (double) t.b(), (double) t.req_b());
@@ -110,10 +112,12 @@ static void test_climb_to_knee() {
     CHECK(t.b() < 0.6f);            // does not run past the knee and the flip region
 }
 
-// 3. A request with many flips is braked: req_b halves with each brake, down to 0, and the request's grow never lifts it again.
-static void test_brake() {
+// 3 (legacy). The fixed-threshold brake (set_brake_legacy(true)): a request with many flips is braked: req_b halves with each brake,
+// down to 0, and the request's grow never lifts it again.  The new rule does not brake here (no measured noise floor): see test_brake_new.
+static void test_brake_legacy() {
     StandinTune t;
     t.configure(1.0f, 4.0f, false, true);
+    t.set_brake_legacy(true);
     Engine e;
     e.flip_from = 0.0;
     e.flip_p = 1.0;                 // every re-check flips
@@ -135,6 +139,7 @@ static void test_brake() {
     // a clean request: no flips, the budget grows back to b
     StandinTune c;
     c.configure(1.0f, 4.0f, false, true);
+    c.set_brake_legacy(true);
     Engine q;
     q.flip_p = 0.0;
     c.begin_request();
@@ -219,6 +224,82 @@ static void test_k() {
     }
 }
 
+// Brakes so far in this tuner (the stats line's "brakes N").
+static long long brakes_of(const StandinTune& t) {
+    const std::string s = t.stats();
+    const std::size_t p = s.find("brakes ");
+    long long v = -1;
+    if (p != std::string::npos) std::sscanf(s.c_str() + p, "brakes %lld", &v);
+    return v;
+}
+
+// 3 (new rule). No fixed thresholds: the brake acts on evidence against measured references (the band against the control floor,
+// the request's rate against the lifetime's).
+static void test_brake_new() {
+    {   // (i) no history, many flips at low ratios (ratio 1.0 < 0.5 k = 2) and none in the band: no brake
+        StandinTune t;
+        t.configure(1.0f, 4.0f, false, true);
+        t.begin_request();
+        for (int i = 0; i < 300; ++i) {
+            t.budget_for_next_token();
+            t.end_token(0.01, true, 1.0f, 1.0f, true);
+        }
+        std::printf("new rule (i) no history, low-ratio flips: %s\n", t.stats().c_str());
+        CHECK(brakes_of(t) == 0);
+        CHECK(t.k() == 4.0f);
+    }
+    {   // (ii) controls that never differ (a floor near 0.08) and band re-checks that mostly flip: brakes
+        StandinTune t;
+        t.configure(1.0f, 4.0f, false, true);
+        for (int i = 0; i < 40; ++i) t.note_control(false);
+        t.begin_request();
+        const float start = t.req_b();
+        for (int i = 0; i < 40; ++i) {
+            t.budget_for_next_token();
+            t.end_token(0.01, true, 3.0f, 1.0f, i % 4 != 0);   // ratio 3 >= 0.5 k: in the band; 3 of 4 flip
+        }
+        std::printf("new rule (ii) band flips vs a clean floor: %s\n", t.stats().c_str());
+        CHECK(brakes_of(t) > 0);
+        CHECK(t.req_b() < start);
+    }
+    {   // (iii) a lifetime rate of ~1% (six requests), then a request at ~1%: no brake; a request at ~10%: brakes
+        StandinTune t;
+        t.configure(1.0f, 4.0f, false, true);
+        Engine e;
+        e.flip_from = 0.0;
+        e.flip_p = 0.025;           // 40% re-checked x 2.5% = ~1% of tokens
+        for (int r = 0; r < 6; ++r) {
+            t.begin_request();
+            for (int i = 0; i < 1000; ++i) e.token(t);
+        }
+        t.begin_request();          // folds the sixth request into the lifetime
+        const long long before_low = brakes_of(t);
+        for (int i = 0; i < 1000; ++i) e.token(t);
+        std::printf("new rule (iii) lifetime ~1%% (%lld tokens, %lld flips), request at ~1%%: %s\n", t.lifetime_tok(), t.lifetime_fl(), t.stats().c_str());
+        CHECK(brakes_of(t) == before_low);
+        Engine h;
+        h.flip_from = 0.0;
+        h.flip_p = 0.25;            // ~10% of tokens
+        t.begin_request();
+        const long long before_high = brakes_of(t);
+        for (int i = 0; i < 1000; ++i) h.token(t);
+        std::printf("  request at ~10%%: %s\n", t.stats().c_str());
+        CHECK(brakes_of(t) > before_high);
+    }
+    {   // (iv) a clean request (no re-checks at all) reaches req_b == b at its first check, token 64
+        StandinTune t;
+        t.configure(1.0f, 4.0f, false, true);
+        t.begin_request();
+        for (int i = 1; i <= 64; ++i) {
+            t.budget_for_next_token();
+            if (i == 63) CHECK(t.req_b() == 0.5f);   // not yet: the first check is at token 64
+            t.end_token(0.01, false, 10.0f, 1.0f, false);
+        }
+        CHECK(t.req_b() == t.b());
+        std::printf("new rule (iv) clean request: req_b %.4f b %.4f\n", (double) t.req_b(), (double) t.b());
+    }
+}
+
 // 5. save then load restores b, k, step, clean (checked by saving the loaded state again: the two files are byte-identical).
 static void test_save_load() {
     const std::string a_path = tmp_path("ds4_standin_tune_a.txt");
@@ -270,13 +351,76 @@ static void test_save_load() {
     std::filesystem::remove(b_path + ".nob");
 }
 
+// 6. The lifetime counts (alltok / allfl) join at begin_request, are saved and loaded (missing lines are 0), and halve above 200000.
+static void test_lifetime() {
+    const std::string a_path = tmp_path("ds4_standin_tune_life_a.txt");
+    const std::string b_path = tmp_path("ds4_standin_tune_life_b.txt");
+    const std::string c_path = tmp_path("ds4_standin_tune_life_c.txt");
+    StandinTune a;
+    a.configure(1.0f, 4.0f, false, true);
+    Engine e;
+    e.flip_from = 0.0;
+    e.flip_p = 0.025;
+    for (int r = 0; r < 5; ++r) {
+        a.begin_request();
+        for (int i = 0; i < 1000; ++i) e.token(a);
+    }
+    a.begin_request();   // folds the fifth request
+    CHECK(a.lifetime_tok() == 5000);
+    const long long lf = a.lifetime_fl();
+    CHECK(lf > 0);
+    CHECK(a.save(a_path));
+    const std::string saved = slurp(a_path);
+    CHECK(saved.find("alltok 5000\n") != std::string::npos);
+    CHECK(saved.find("allfl " + std::to_string(lf) + "\n") != std::string::npos);
+
+    StandinTune r;
+    r.configure(1.0f, 4.0f, false, true);
+    CHECK(r.load(a_path));
+    CHECK(r.lifetime_tok() == 5000);
+    CHECK(r.lifetime_fl() == lf);
+    CHECK(r.save(b_path));
+    CHECK(slurp(b_path) == saved);   // the lifetime lines round-trip byte for byte
+
+    {   // a file without the lifetime lines loads with 0
+        { std::ofstream f(c_path); f << "budget 0.2\n"; }
+        StandinTune m;
+        m.configure(1.0f, 4.0f, false, true);
+        CHECK(m.load(c_path));
+        CHECK(m.lifetime_tok() == 0);
+        CHECK(m.lifetime_fl() == 0);
+    }
+    {   // halving: 250 requests of 1000 tokens (no flips): the lifetime stays at or below 200000 and above 100000
+        StandinTune h;
+        h.configure(1.0f, 4.0f, false, true);
+        Engine q;
+        q.flip_p = 0.0;
+        for (int k = 0; k < 250; ++k) {
+            h.begin_request();
+            for (int i = 0; i < 1000; ++i) q.token(h);
+        }
+        h.begin_request();
+        std::printf("lifetime after 250000 tokens: %lld\n", h.lifetime_tok());
+        CHECK(h.lifetime_tok() <= 200000);
+        CHECK(h.lifetime_tok() > 100000);
+    }
+
+    std::filesystem::remove(a_path);
+    std::filesystem::remove(b_path);
+    std::filesystem::remove(c_path);
+}
+
 int main() {
-    test_climb_ceiling();
-    test_climb_to_knee();
-    test_brake();
+    test_climb_ceiling(true);
+    test_climb_ceiling(false);
+    test_climb_to_knee(true);
+    test_climb_to_knee(false);
+    test_brake_legacy();
+    test_brake_new();
     test_k();
     test_k_evidence();
     test_save_load();
+    test_lifetime();
     if (fails == 0) {
         std::printf("PASS ds4_standin_tune_test: all checks passed\n");
         return 0;
