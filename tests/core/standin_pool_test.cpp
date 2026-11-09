@@ -248,12 +248,27 @@ static int test_live(const char* path) {
     return g_fail == 0 ? 0 : 1;
 }
 
+// 9 Nov: the scale is the measured least-squares value, not clipped to [0.5, 2]; only a negative one is held at 0 (a weight)
+static int test_scale_unclipped() {
+    int bad = 0;
+    sdp::Pair p;
+    p.num = 38.0; p.den = 100.0; p.ee = 100.0; p.n = sdp::kReady;
+    const sdp::Est e = sdp::estimate(p, nullptr, nullptr);
+    if (!(e.ready && std::fabs(e.c - 0.38) < 1e-9)) { std::fprintf(stderr, "FAIL: scale 0.38 kept as measured (got %f)\n", e.c); ++bad; }
+    p.num = 300.0;
+    if (std::fabs(sdp::estimate(p, nullptr, nullptr).c - 3.0) > 1e-9) { std::fprintf(stderr, "FAIL: scale 3.0 kept (no upper clip)\n"); ++bad; }
+    p.num = -5.0;
+    if (sdp::estimate(p, nullptr, nullptr).c != 0.0) { std::fprintf(stderr, "FAIL: a negative scale is held at 0\n"); ++bad; }
+    return bad;
+}
+
 int main(int argc, char** argv) {
     test_shrinkage();
     test_readiness_and_parent_choice();
     test_rebuild_groups();
     test_old_table_loads();
     test_balance_step();
+    g_fail += test_scale_unclipped();
     if (argc > 1) test_live(argv[1]);
     else std::printf("live table check skipped (no path given)\n");
     std::printf("standin_pool_test: %d checks passed, %d failed\n", g_pass, g_fail);

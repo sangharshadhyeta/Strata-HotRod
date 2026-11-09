@@ -1225,7 +1225,7 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
 // ---- STRATA_STANDIN_LEARN (opt-in).  A stand-in's output differs from the true expert's.  A flip re-check cuts the window at row r with
 // a stand-in (its first stand-in: layer l, rank k, true expert e, stand-in s).  The cut window captured y_s (the stand-in's down output at
 // layer l, rank k, per row); the exact successor (row 0, same position and prefix) captures y_e at the same layer and rank.  Per pair the
-// decayed least squares over the channels: num += y_s.y_e, den += y_s.y_s, ee += y_e.y_e (decay 0.98); c = num / den clipped to [0.5, 2],
+// decayed least squares over the channels: num += y_s.y_e, den += y_s.y_s, ee += y_e.y_e (decay 0.98); c = num / den (>= 0, no clip),
 // used (the table's scale on the stand-in's weight) after kLrnReady samples, 1 before.  Pairs per layer: LRU of kLrnPerLayer.
 // The pairs persist across runs (standin-learn-<fp>.bin in data/).
 namespace sdp = strata::standin;
@@ -1366,7 +1366,7 @@ struct Verifier::StandinLearnState {
     long long bal_rounds = 0;
 };
 
-// The risk factor of the layer's ready pairs: err = sqrt((ee - 2c num + c^2 den) / ee), factor = clip(err / mean err, 0.25, 4); 1 otherwise.
+// The risk factor of the layer's ready pairs: err = sqrt((ee - 2c num + c^2 den) / ee), factor = err / mean err (no clip); 1 otherwise.
 void Verifier::standin_learn_pe_layer(int64_t l) {
     StandinLearnState& st = *lrn_st_;
     std::vector<float> host((size_t) 512 * 512, 1.0f);
@@ -1383,7 +1383,10 @@ void Verifier::standin_learn_pe_layer(int64_t l) {
     }
     if (!errs.empty() && sum > 0.0) {
         const double mean = sum / (double) errs.size();
-        for (const auto& x : errs) host[(size_t) x.first] = (float) std::min(4.0, std::max(0.25, x.second / mean));
+        for (const auto& x : errs) {   // the measured relative error (9 Nov: no [0.25, 4] clip); a mean of 0 leaves the factor 1
+            const double f = mean > 0.0 ? x.second / mean : 1.0;
+            host[(size_t) x.first] = std::isfinite(f) ? (float) f : 1.0f;
+        }
     }
     const OnDevice on(device_);
     if (cudaMemcpy(lrn_pe_ + (size_t) l * 512 * 512, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
@@ -1631,7 +1634,7 @@ void Verifier::standin_learn_settle(bool exact_ok) {
     sdp::add_sample(st.layer_g[(size_t) l], sxy, sxx, syy);
     sdp::add_sample(st.exp_g[sdp::expert_key(l, e)], sxy, sxx, syy);
     if (!pool && p.n >= kLrnReady) {
-        const float c = (float) std::min(2.0, std::max(0.5, p.num / std::max(p.den, 1e-30)));
+        const float c = (float) std::max(0.0, p.num / std::max(p.den, 1e-30));   // the measured scale (9 Nov: no [0.5, 2] clip; a weight is >= 0)
         if (c != p.c) {
             p.c = c;
             if (st.table_ready) {
@@ -5334,7 +5337,20 @@ bool route_tune_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) 
 // The model's fingerprint and the file's path, given once at serve start (before the first decode window).  Only with FRAGILE on.
 void Verifier::route_tune_open(const std::string& path, uint64_t model_fp) {
     RouteResidentCfg& c = route_resident_cfg();
-    if (!c.fragile_on || path.empty()) return;
+    if (path.empty()) return;
+    if (!c.fragile_on) {
+        // 9 Nov: with the re-check off nothing tunes the budget; the learned one bounds the stand-ins, fixed (route_budget_window): read it
+        // (and only read: tune_open stays false, nothing is written back).  STRATA_ROUTE_BUDGET_FIXED=0: the open tail, the file not read.
+        const char* fx = std::getenv("STRATA_ROUTE_BUDGET_FIXED");
+        if (fx != nullptr && std::atoi(fx) == 0) return;
+        if (std::filesystem::exists(path) && route_tune_read(path, model_fp, c))
+            std::fprintf(stderr, "strata serve: stand-in budget %.3f from %s (re-check off: fixed at the learned value, not tuned)\n",
+                         (double) c.auto_b, path.c_str());
+        else
+            std::fprintf(stderr, "strata serve: stand-in budget %.3f (re-check off: the start value, not tuned; no learned one in %s)\n",
+                         (double) c.auto_b, path.c_str());
+        return;
+    }
     c.tune_open = true;
     c.tune_fp = model_fp;
     c.tune_path = path;
@@ -5763,7 +5779,22 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     strata::kernels::route_mask_control(wc.mask);
     c.win_kind = decode && c.fragile_exact ? 3 : fctl ? 1 : wc.mask ? 2 : 0;
     if (!c.dyn_on && !c.fragile_on) {
-        la_tail_skip_update(c);   // (the static budget_tail decides the tail here: win_tail is never set)
+        // 9 Nov: with the re-check off no tuner runs, so nothing sets the decode budget: ranks lo-9 take ANY resident stand-in (the
+        // margin test; 1e30 in the Qwen config) - the open tail (it broke JSON and code on 24 Oct with an older engine; clean on 9 Nov).
+        // The learned budget as a fixed bound is the default below.  Ranks below the floor keep the rank rule (STRATA_ROUTE_BUDGET_LOW as in the tuned path).
+        // Default on (9 Nov, 37.7 against 39.1 tok/s for the open tail, JSON and answers clean in both: the bound that kept JSON and code
+        // clean on 24 Oct, for ~3.5%).  STRATA_ROUTE_BUDGET_FIXED=0 brings back the open tail.  Prompt windows keep the static budgets.
+        static const bool fixed = [] { const char* v = std::getenv("STRATA_ROUTE_BUDGET_FIXED"); return v == nullptr || std::atoi(v) != 0; }();
+        if (fixed && c.auto_b > 0.0f) {
+            static const bool budget_low_on = [] { const char* v = std::getenv("STRATA_ROUTE_BUDGET_LOW"); return v != nullptr && std::atoi(v) != 0; }();
+            const float bd = decode ? c.auto_b : c.budget;
+            const float td = decode ? c.auto_b : c.budget_tail;
+            const float low = budget_low_on ? bd : (decode ? 0.0f : c.budget);
+            c.win_low = low;
+            c.win_tail = td;
+            strata::kernels::route_cfg_set_budgets(low, td);
+        }
+        la_tail_skip_update(c);   // (with the open tail the static budget_tail decides: win_tail is never set)
         return;
     }
     if (decode && c.fragile_on) route_fragile_zero_shift();   // STRATA_FRAGILE_RECHECK: this window's stand-in moves start at zero

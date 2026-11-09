@@ -353,7 +353,8 @@ When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095`. 
 - **Measured while it serves (with the re-check on):** the stand-in budget and the mask's depth, each by an alternating
   speed test over the same stretch of text (the faster setting is kept only when it does not add flips). A faster or slower
   drive moves them where they belong on that machine. With the re-check off (the default) the values already learned are
-  used as they are.
+  used as they are: the stand-in budget bounds the stand-ins, fixed (`"STRATA_ROUTE_BUDGET_FIXED": "0"` lets any resident
+  stand-in in, about 3% faster).
 - **Learned from your use:** the look-ahead, the mask and the stand-ins (below).
 - **Learned files** sit in `data/`, named by the model's id: `standin-tune-<id>.txt`, `mask-learn-<id>.bin`,
   `standin-learn-<id>.bin`, `subfit-learn-<id>.bin`, `predictor-<id>.bin`, plus `ram-reserve.json`. They hold this machine's values: when you move an

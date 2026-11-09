@@ -57,7 +57,7 @@ struct Est {
     bool ready = false;    // usable: the parent group exists, or the pair's own count reached kReady (and ee > 0)
     bool pooled = false;   // the estimate took a parent's prior
     bool own_expert = false;   // the estimate rests on this expert's own data: its (layer, e) group or the pair itself has >= kReady
-    double c = 1.0;        // clipped to [0.5, 2]
+    double c = 1.0;        // the measured least-squares scale num / den (9 Nov: no clip; >= 0, a mixture weight cannot be negative)
     double err = 0.0;      // sqrt((ee - 2 c num + c^2 den) / ee) over the shrunk sums
 };
 
@@ -77,7 +77,7 @@ inline Est estimate(const Pair& p, const Sums* expert, const Sums* layer) {
     }
     r.ready = (r.pooled || p.n >= kReady) && ee > 0.0;
     r.own_expert = r.ready && (par == expert || p.n >= kReady);
-    r.c = std::min(2.0, std::max(0.5, num / std::max(den, 1e-30)));
+    r.c = std::max(0.0, num / std::max(den, 1e-30));
     if (ee > 0.0) {
         double e2 = (ee - 2.0 * r.c * num + r.c * r.c * den) / ee;
         if (!(e2 > 0.0)) e2 = 0.0;
