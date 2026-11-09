@@ -11,10 +11,11 @@ from serve import server
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, MockEngine, Service, serve
 
-SNAPSHOT = {"v": 1, "time": 0, "span_us": 2000,
+# a v 2 chunk (what the engine writes): rows [window, layer, tokens, demand, jobs, 7 host times, end], reads [io, layer, demand, start, end]
+SNAPSHOT = {"v": 2, "base_ns": 1, "now_us": 1000.0, "first": 0, "last": 0, "gap": 0,
             "layers": [[0, 0, 4, 1, 2, 0.0, 40.0, 41.0, 55.0, 700.0, 710.0, 900.0],
                        [0, 1, 4, 0, 1, 1400.0, 1440.0, 1441.0, 1455.0, 1455.0, 1460.0, 1600.0]],
-            "reads": [[0, 1, 0, 50.0, 800.0]]}
+            "reads": [[0, 1, 0, 50.0, 800.0]], "gaps": []}
 
 
 class TimelineTest(unittest.TestCase):
@@ -62,12 +63,17 @@ class TimelineTest(unittest.TestCase):
         with open(server.TIMELINE_CTL, "rb") as f:
             self.assertEqual(f.read(), b"1")
         self.assertEqual(self.metrics(), {"on": True, "data": None})          # nothing recorded yet
+        old = time.time() - 60                                                 # a stale snapshot shows no rows: its clock has run past them
         with open(server.TIMELINE_FILE, "w") as f:
             json.dump(SNAPSHOT, f)
-        self.assertEqual(self.metrics()["data"]["layers"], SNAPSHOT["layers"])
-        old = time.time() - 60                                                 # a stale snapshot is not shown
         os.utime(server.TIMELINE_FILE, (old, old))
-        self.assertIsNone(self.metrics()["data"])
+        stale = self.metrics()["data"]
+        self.assertEqual(stale["layers"], [])
+        self.assertEqual(stale["reads"], [])
+        fresh_rows = [[1] + r[1:] for r in SNAPSHOT["layers"]]                 # the next windows, written now
+        with open(server.TIMELINE_FILE, "w") as f:
+            json.dump(dict(SNAPSHOT, first=1, last=1, layers=fresh_rows), f)
+        self.assertEqual([r for r in self.metrics()["data"]["layers"] if r[0] == 1], fresh_rows)
         self.assertEqual(self.post({"on": False}), (200, {"on": False}))
         self.assertFalse(os.path.exists(server.TIMELINE_FILE))
         self.assertEqual(self.metrics(), {"on": False, "data": None})
