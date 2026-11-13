@@ -23,6 +23,7 @@
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/serve_stop_bound.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -15233,6 +15234,10 @@ int main(int argc, char** argv) {
             bool first_window = true;
             strata::core::Verifier::route_budget_begin(n);   // STRATA_ROUTE_BUDGET_DYN: this request's first decode window runs at b_lo (n: the prompt tokens, the size class)
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+            // #4677 (upstream Strata, ported by hand): a window commits only the accepted rows this request can still emit (max_new) and ends at
+            // the first EOS, so the conversation the session parks is exactly what the client got and the next continuation reuses it instead of
+            // falling back to an older checkpoint.  On by default; STRATA_SERVE_STOP_BOUND=0 turns it off.  It changes no emitted token.
+            static const bool stop_bound = strata::core::serve_stop_bound_on(std::getenv("STRATA_SERVE_STOP_BOUND"));
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
@@ -15776,6 +15781,10 @@ int main(int argc, char** argv) {
                     chain_kind = 0;
                     int a = 0;
                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
+                    if (stop_bound)
+                        a = std::max(0, strata::core::serve_stop_bound(a + 1, max_new - produced_n, outp.data(), [&](int32_t y) {
+                            return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                        }) - 1);
                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
                     draft_offered += A.T - 1;
@@ -16302,6 +16311,12 @@ int main(int argc, char** argv) {
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (fr_cut >= 1) a = std::min(a, fr_cut - 1);   // STRATA_FRAGILE_RECHECK: rows fr_cut.. are re-decided, not kept
+                // A merged window contains prompt rows: every one must still be committed.  Otherwise do not cache accepted rows whose outputs this
+                // request cannot emit (#4677, upstream Strata).
+                if (stop_bound && !merged)
+                    a = std::max(0, strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
+                        return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                    }) - 1);
                 // STRATA_STANDIN_BALANCE: the committed decode tokens count toward the round (every 256; one round per count)
                 if (!merged && strata::core::Verifier::standin_balance_on())
                     ver.standin_balance_commit(a + 1, drive.d.usage, drive.d.miss, drive.d.keep_bias);
