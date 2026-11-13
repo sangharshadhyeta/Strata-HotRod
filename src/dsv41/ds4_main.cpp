@@ -729,6 +729,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continue;
         }
         const double t0 = now_ms();
+        m.request_begin();   // (the auto RAM store's learning: the available RAM at this request's start)
         std::vector<Pic> pics;
         {
             std::string e;

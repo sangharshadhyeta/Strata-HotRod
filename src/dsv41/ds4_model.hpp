@@ -201,7 +201,9 @@ public:
     void save_profile() const;
     /// A request's end: the HotRod features (stand-ins, the budget's search, the look-ahead learner) report and save
     /// their state so far; nothing when they are off.
-    void request_end(int64_t generated = 0);   // (generated: the request's decode tokens; 200 or more lets the auto RAM store learn its headroom)
+    void request_end(int64_t generated = 0);   // (generated: the request's decode tokens; 200 or more lets the auto RAM store learn its reserve)
+    /// A request's start: the auto RAM store's learning takes the available RAM here (the margin's and the gap's reference). Nothing when off.
+    void request_begin();
     const Stats& stats() const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.

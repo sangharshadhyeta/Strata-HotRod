@@ -190,20 +190,6 @@ std::vector<std::vector<int>> node_cores() {
 // anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
 void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
 void pin_self(int cpu) { os::pin_self(cpu); }
-// the machine's total RAM (MemTotal; the Windows physical total); ~0: not known
-uint64_t ram_total() {
-#if defined(_WIN32)
-    return os::commit().ram;
-#endif
-    std::istringstream mi(read_file("/proc/meminfo"));
-    std::string k;
-    uint64_t kb = 0;
-    while (mi >> k >> kb) {
-        if (k == "MemTotal:") return kb << 10;
-        mi.ignore(64, '\n');
-    }
-    return ~uint64_t{0};
-}
 // the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
 // (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
 uint64_t ram_avail() {
@@ -1892,7 +1878,7 @@ struct Model::Impl {
     // a request's end: the HotRod features report and save what they have so far (the counters are cumulative and
     // stay; the destructor reports the same at a clean shutdown, which a server's kill never reaches)
     void request_end(int64_t generated) {
-        store_hr_request(generated);   // (the RAM free at this request's end, before its buffers are freed; only the auto store learns)
+        store_rr_request(generated);   // (the RAM free at this request's end, before its buffers are freed; only the auto store learns)
         if (d_standin != nullptr) {
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             Standin h{};
@@ -3781,6 +3767,7 @@ struct Model::Impl {
         calibrate_paths();
         ring_setup();      // (DS4_RING: its staging is page-locked before the store's arena is)
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
+        store_rr_sized();  // (the auto store's sizing is done: the RAM the engine takes from here to the first request is the gap)
         ring_start();
         tail_read_init();  // (after the store: it turns the read-ahead off, this may turn the learned one back on)
         vram_reserve_learn();
@@ -7136,76 +7123,129 @@ struct Model::Impl {
             if (kt.first.find(".ffn.experts.") != std::string::npos && kt.first.rfind("mtp.", 0) != 0) b += (double) kt.second.bytes;
         return std::max(48.0, b / 1e9);
     }
-    // ---- the learned RAM headroom of the auto store: <pack>/ram-headroom.txt, "<key> <GB>" a line (the VRAM reserve's pattern).  The key: the
-    // machine's total RAM in GiB (rounded) and the context.  The auto store is the RAM free less this headroom: 12 GB (the system's and the
-    // owner's programs' share) until a start has learned otherwise.  A served request that generated 200 tokens or more leaves the least RAM
-    // free so far (store_hr_min_); the next start's headroom moves half of that spare (min less kRamMargin) down, never below kRamMargin and
-    // never above 12 GB.  DS4_STORE_HEADROOM_GB pins it (no learning); the explicit store sizes never reach this.
-    static constexpr double kStoreHeadroomMax = 12.0;
-    mutable bool store_hr_ready_ = false, store_hr_learn_ = false;
-    mutable double store_hr_ = kStoreHeadroomMax;        // the headroom this process uses
-    mutable double store_hr_file_ = kStoreHeadroomMax;   // the value the file holds for the key (the default when it holds none)
-    mutable double store_hr_min_ = 1e300;                // least free RAM (GB) at the end of the requests that generated >= 200 tokens
-    mutable std::string store_hr_key_;
-    // the RAM that must stay available while serving: 2.5 GiB, the Qwen engine's memory floor.  (Not kRamMargin, 8 GiB: that is the
-    // margin for copying every expert into RAM; at run time 5-7 GB stay available on a 30 GB PC, below it, so the headroom could never fall.)
-    static double kram_margin_gb() { return 2.5 * 1.073741824; }
-    std::string store_hr_key() const {
-        const uint64_t tot = ram_total();
-        const std::string gib = tot == ~uint64_t{0} ? std::string("unknown")
-                                                    : std::to_string((long long) std::llround((double) tot / (double) (1ull << 30))) + "GiB";
-        return gib + "/ctx" + std::to_string((long long) o.max_context);
+    // ---- the learned RAM sizing of the auto store (Qwen's ram-reserve.json, the same key and units as its VRAM reserve): <pack>/ram-reserve.json,
+    // { "<key> gap": MiB, "<key> margin": MiB }, the key the VRAM reserve's key plus " floor2560".  The auto store is the RAM left after the GPU's
+    // weights less gap + margin + floor (2560 MiB, Qwen's memory floor), at most store_cap_gb().  Until a start has learned one of them, the
+    // reserve is 12 GB (the first start's guess).  gap: what the engine allocates after the store was sized, learned from the first served
+    // request of a start that generated kRamLearnTokens or more: the available RAM when the sizing finished less the available RAM at that
+    // request's start, floored at 0.  margin: the largest one-request drop in available RAM (available at a request's start less at its end),
+    // over the requests that generated kRamLearnTokens or more.  A value that moved by kRamSaveMib or more is saved for the next start.
+    // DS4_STORE_HEADROOM_GB=<GB> pins the reserve (no learning); the explicit store sizes never reach this.
+    static constexpr int64_t kRamFloorMib = 2560, kRamLearnTokens = 200, kRamSaveMib = 128;
+    static constexpr double kRamReserveDefaultGb = 12.0;
+    static double mib_to_gb(double mib) { return mib * 1048576.0 / 1e9; }
+    mutable bool store_rr_ready_ = false, store_rr_learn_ = false;
+    mutable double store_rr_gb_ = kRamReserveDefaultGb;      // the reserve this process leaves free (GB)
+    mutable std::string store_rr_key_;
+    mutable int64_t store_rr_gap_ = 0, store_rr_margin_ = 0;   // MiB: the file's values at the load, then this process's
+    mutable int64_t store_rr_gap_saved_ = -1, store_rr_margin_saved_ = -1;   // MiB: what the file holds for the key (-1: no entry)
+    mutable uint64_t store_rr_sized_avail_ = ~uint64_t{0};   // ram_avail() when the auto store's sizing finished
+    mutable uint64_t store_rr_begin_avail_ = ~uint64_t{0};   // ram_avail() at the current request's start
+    mutable bool store_rr_gap_done_ = false;                  // this start has learned its gap (at its first learning request)
+    std::string store_rr_key() const {
+        std::string k = vram_reserve_key();
+        for (char& c : k)
+            if (c == '"' || c == '\\') c = '_';   // (the file is read back by its quotes)
+        return k + " floor" + std::to_string((long long) kRamFloorMib);
     }
-    std::map<std::string, double> store_hr_read() const {
-        std::map<std::string, double> m;
-        std::ifstream f(o.pack + "/ram-headroom.txt");
-        std::string k;
-        double v = 0.0;
-        while (f >> k >> v) m[k] = v;
+    std::map<std::string, int64_t> store_rr_read() const {
+        std::map<std::string, int64_t> m;
+        std::ifstream f(o.pack + "/ram-reserve.json", std::ios::binary);
+        if (!f) return m;
+        std::stringstream ss;
+        ss << f.rdbuf();
+        const std::string s = ss.str();
+        size_t i = 0;
+        while (i < s.size()) {
+            const size_t q1 = s.find('"', i);
+            if (q1 == std::string::npos) break;
+            const size_t q2 = s.find('"', q1 + 1);
+            if (q2 == std::string::npos) break;
+            const size_t c = s.find(':', q2 + 1);
+            if (c == std::string::npos) break;
+            const char* vb = s.c_str() + c + 1;
+            char* ve = nullptr;
+            const long long v = std::strtoll(vb, &ve, 10);
+            if (ve == vb) {
+                i = q2 + 1;
+                continue;
+            }
+            m[s.substr(q1 + 1, q2 - q1 - 1)] = (int64_t) v;
+            i = (size_t) (ve - s.c_str());
+        }
         return m;
     }
     // (the first call of the auto size loads it; an explicit size never calls it, so it prints nothing then)
-    void store_hr_load() const {
-        if (store_hr_ready_) return;
-        store_hr_ready_ = true;
-        store_hr_key_ = store_hr_key();
+    void store_rr_load() const {
+        if (store_rr_ready_) return;
+        store_rr_ready_ = true;
+        store_rr_key_ = store_rr_key();
         if (const char* v = std::getenv("DS4_STORE_HEADROOM_GB")) {
-            store_hr_ = store_hr_file_ = std::max(0.0, std::atof(v));
-            std::fprintf(stderr, "ds4: RAM store: headroom %.1f GB (DS4_STORE_HEADROOM_GB)\n", store_hr_);
+            store_rr_gb_ = std::max(0.0, std::atof(v));
+            std::fprintf(stderr, "ds4: RAM store: headroom %.1f GB (DS4_STORE_HEADROOM_GB)\n", store_rr_gb_);
             return;
         }
-        store_hr_learn_ = true;
-        const auto m = store_hr_read();
-        const auto it = m.find(store_hr_key_);
-        if (it == m.end()) {
-            store_hr_ = store_hr_file_ = kStoreHeadroomMax;
-            std::fprintf(stderr, "ds4: RAM store: headroom %.1f GB (default)\n", store_hr_);
-        } else {
-            store_hr_ = store_hr_file_ = std::min(kStoreHeadroomMax, std::max(kram_margin_gb(), it->second));
-            std::fprintf(stderr, "ds4: RAM store: headroom %.1f GB (learned for %s)\n", store_hr_, store_hr_key_.c_str());
+        store_rr_learn_ = true;
+        const auto m = store_rr_read();
+        const auto g = m.find(store_rr_key_ + " gap"), mg = m.find(store_rr_key_ + " margin");
+        if (g != m.end()) store_rr_gap_saved_ = std::max<int64_t>(0, g->second);
+        if (mg != m.end()) store_rr_margin_saved_ = std::max<int64_t>(0, mg->second);
+        store_rr_gap_ = std::max<int64_t>(0, store_rr_gap_saved_);
+        store_rr_margin_ = std::max<int64_t>(0, store_rr_margin_saved_);
+        if (g == m.end() && mg == m.end()) {
+            store_rr_gb_ = kRamReserveDefaultGb;
+            std::fprintf(stderr, "ds4: RAM store: leaves %.1f GB free (not learned yet: %.1f GB headroom)\n", kRamReserveDefaultGb,
+                         kRamReserveDefaultGb);
+            return;
         }
+        store_rr_gb_ = mib_to_gb((double) (store_rr_gap_ + store_rr_margin_ + kRamFloorMib));
+        std::fprintf(stderr, "ds4: RAM store: leaves gap %.0f + margin %.0f + floor %.0f MiB free (learned for %s)\n", (double) store_rr_gap_,
+                     (double) store_rr_margin_, (double) kRamFloorMib, store_rr_key_.c_str());
     }
-    // a request's end (generated: its decode tokens): the least free RAM so far, and the next start's headroom when it moves by 0.25 GB or more
-    void store_hr_request(int64_t generated) {
-        if (!store_hr_learn_ || generated < 200) return;
-        const uint64_t av = ram_avail();
-        if (av == ~uint64_t{0}) return;
-        store_hr_min_ = std::min(store_hr_min_, (double) av / 1e9);
-        const double spare = store_hr_min_ - kram_margin_gb();
-        const double next = std::min(kStoreHeadroomMax, std::max(kram_margin_gb(), store_hr_ - 0.5 * spare));
-        if (std::fabs(next - store_hr_file_) < 0.25) return;
-        auto m = store_hr_read();
-        m[store_hr_key_] = next;
-        const std::string path = o.pack + "/ram-headroom.txt", tmp = path + ".tmp";
+    // the auto store's sizing is done (init_store): what the engine allocates from here on is the gap
+    void store_rr_sized() {
+        if (store_rr_learn_) store_rr_sized_avail_ = ram_avail();
+    }
+    // a request's start (Model::request_begin): its available RAM, the reference for its drop and, at the first learning request, the gap
+    void request_begin() {
+        if (store_rr_learn_) store_rr_begin_avail_ = ram_avail();
+    }
+    // a request's end (generated: its decode tokens): the first learning request of a start sets the gap, every learning request
+    // (kRamLearnTokens or more) takes its drop into the margin; the file is written when a value moved by kRamSaveMib or more
+    void store_rr_request(int64_t generated) {
+        if (!store_rr_learn_ || generated < kRamLearnTokens) return;
+        const uint64_t begin = store_rr_begin_avail_, end = ram_avail();
+        if (begin == ~uint64_t{0} || end == ~uint64_t{0}) return;
+        if (!store_rr_gap_done_ && store_rr_sized_avail_ != ~uint64_t{0}) {
+            store_rr_gap_done_ = true;
+            store_rr_gap_ = store_rr_sized_avail_ > begin ? (int64_t) ((store_rr_sized_avail_ - begin) >> 20) : 0;
+        }
+        const uint64_t drop = begin > end ? begin - end : 0;
+        store_rr_margin_ = std::max<int64_t>(store_rr_margin_, (int64_t) (drop >> 20));
+        store_rr_save();
+    }
+    void store_rr_save() {
+        const bool gap_moved = store_rr_gap_saved_ < 0 || std::llabs(store_rr_gap_ - store_rr_gap_saved_) >= kRamSaveMib;
+        const bool margin_moved = store_rr_margin_saved_ < 0 || std::llabs(store_rr_margin_ - store_rr_margin_saved_) >= kRamSaveMib;
+        if (!gap_moved && !margin_moved) return;
+        auto m = store_rr_read();
+        if (gap_moved) m[store_rr_key_ + " gap"] = store_rr_gap_;
+        if (margin_moved) m[store_rr_key_ + " margin"] = store_rr_margin_;
+        const std::string path = o.pack + "/ram-reserve.json", tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::trunc);
-            for (const auto& kv : m) f << kv.first << " " << kv.second << "\n";
+            f << "{\n";
+            size_t n = 0;
+            for (const auto& kv : m) f << "  \"" << kv.first << "\": " << kv.second << (++n < m.size() ? ",\n" : "\n");
+            f << "}\n";
         }
         std::error_code ec;
         std::filesystem::rename(tmp, path, ec);
-        std::fprintf(stderr, "ds4: RAM store: headroom %.1f -> %.1f GB for the next start (%.1f GB stayed available, margin %.1f)\n",
-                     store_hr_, next, store_hr_min_, kram_margin_gb());
-        store_hr_file_ = next;
+        if (ec) std::fprintf(stderr, "ds4: RAM store: %s cannot be written (the learned values stay for this run)\n", path.c_str());
+        std::fprintf(stderr, "ds4: RAM store: gap %.0f MiB, margin %.0f MiB learned for the next start\n", (double) store_rr_gap_,
+                     (double) store_rr_margin_);
+        store_rr_gap_saved_ = store_rr_gap_;
+        store_rr_margin_saved_ = store_rr_margin_;
     }
     double store_gb() const {
         static double cached = -2.0;   // (decided once: the layout of the blobs depends on it)
@@ -7216,11 +7256,11 @@ struct Model::Impl {
         else if (gb < 0.0 && cpu_lane_fits_ram()) {   // auto, and the RAM holds every CPU-lane expert beside kRamMargin: they are copied in at load
             auto_copy_all = true;                       // (copy_experts), the demand store would only be a second, smaller copy of them
             gb = 0.0;
-        } else if (gb < 0.0) {   // auto: the RAM free now less the learned headroom (12 GB for the system and the owner's programs until learned), all the experts at most
-            store_hr_load();
+        } else if (gb < 0.0) {   // auto: the RAM free now less the learned reserve (gap + margin + floor; 12 GB until learned), all the experts at most
+            store_rr_load();
             const uint64_t avail = ram_avail();
             avail0_ = avail;
-            const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - store_hr_;
+            const double room = avail == ~uint64_t{0} ? 0.0 : (double) avail / 1e9 - store_rr_gb_;
             gb = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         }
         return cached = gb;
@@ -7246,8 +7286,8 @@ struct Model::Impl {
         }
         const bool uma = integrated && avail0_ != ~uint64_t{0} && avail0_ > avail && (double) (avail0_ - avail) / 1e9 >= 4.0;
         const double ctx_gb = uma ? 1.1e-4 * std::max(0.0, (double) o.max_context - 16384.0) : 0.0;
-        store_hr_load();
-        const double room = (double) avail / 1e9 - store_hr_ - ctx_gb;
+        store_rr_load();
+        const double room = (double) avail / 1e9 - store_rr_gb_ - ctx_gb;
         const double now = room >= 4.0 ? std::min(store_cap_gb(), room) : 0.0;
         if (now < gb)
             std::fprintf(stderr, "ds4: RAM store: %.1f GB of RAM free after the GPU's weights: store sized %.1f GB, not %.1f\n",
@@ -14520,6 +14560,7 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::save_profile() const { p_->save_profile(); }
 void Model::request_end(int64_t generated) { p_->request_end(generated); }
+void Model::request_begin() { p_->request_begin(); }
 const Stats& Model::stats() const {
     Stats& st = p_->st;
     if (p_->store) {   // (the store keeps its own counters: copied in when asked)
