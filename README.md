@@ -303,14 +303,18 @@ not yet safe - do not turn it on). DeepSeek's limit on this PC is the NVMe at ab
 <div align="justify">
 
 You need a recent NVIDIA driver, the CUDA 13 toolkit, gcc-toolset-13 (Rocky Linux 9; other distributions are untested),
-**Python 3.10 or newer with venv** and about 80 GB free on an NVMe. Rocky / Alma / RHEL 9 ship `python3` as 3.9, which is
+**Python 3.10 or newer with venv** and free disk on an NVMe: setup refuses to start below **about 137 GB free** for IQ3_S on a PC whose
+RAM cannot hold the experts (its low-RAM mode, like this 31 GB PC): the 84 GB download, a 50 GB copy of the experts it writes for that mode,
+and room for the MTP layer (setup.py's check, `need = to_fetch + MTP + arena`). Rocky / Alma / RHEL 9 ship `python3` as 3.9, which is
 too old: install `sudo dnf install -y python3.12 python3.12-pip` first (`setup.sh` looks for `python3.13` down to
 `python3.10` by name, then `python3`). The CUDA 13 toolkit and the NVIDIA driver are not installed for you.
 
 What was tested from an empty folder (13 Nov, RTX 3060, Rocky Linux 9, CUDA 13.3, gcc-toolset-13): the `git clone` and
-`setup.sh --check` (which is how the Python problem above was found), and a CMake configure of the clone with setup's
-CUDA flags. A full from-scratch run of the command below (compile, model download, first start) was not repeated on a
-clean machine; the engine and model on this PC were installed by the same steps before.
+`setup.sh --check` (which is how the Python problem above was found), a CMake configure of the clone with setup's CUDA flags,
+and `setup.sh --model IQ3_S ... --build` in the fresh clone up to its disk check (PC check, the `.venv` and its packages, the
+questions; it then stopped at the disk check, because this PC does not have that much free next to the files already on it: the
+84 GB model download, the compile and the first start were **not** run from an empty folder). The engine and model on this PC were
+installed by the same steps earlier.
 
 </div>
 
