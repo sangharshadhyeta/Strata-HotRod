@@ -302,8 +302,15 @@ not yet safe - do not turn it on). DeepSeek's limit on this PC is the NVMe at ab
 
 <div align="justify">
 
-You need a recent NVIDIA driver, the CUDA 13 toolkit, gcc-toolset-13 (Rocky Linux 9; other distributions are untested)
-and about 80 GB free on an NVMe.
+You need a recent NVIDIA driver, the CUDA 13 toolkit, gcc-toolset-13 (Rocky Linux 9; other distributions are untested),
+**Python 3.10 or newer with venv** and about 80 GB free on an NVMe. Rocky / Alma / RHEL 9 ship `python3` as 3.9, which is
+too old: install `sudo dnf install -y python3.12 python3.12-pip` first (`setup.sh` looks for `python3.13` down to
+`python3.10` by name, then `python3`). The CUDA 13 toolkit and the NVIDIA driver are not installed for you.
+
+What was tested from an empty folder (13 Nov, RTX 3060, Rocky Linux 9, CUDA 13.3, gcc-toolset-13): the `git clone` and
+`setup.sh --check` (which is how the Python problem above was found), and a CMake configure of the clone with setup's
+CUDA flags. A full from-scratch run of the command below (compile, model download, first start) was not repeated on a
+clean machine; the engine and model on this PC were installed by the same steps before.
 
 </div>
 
@@ -394,7 +401,8 @@ When it prints `ready: http://127.0.0.1:8095/v1`, open `http://127.0.0.1:8095`. 
 <div align="justify">
 
 About **345 GB free on an NVMe** (139 GB of model, the 203 GB Engram table, 1 GB for pictures), the
-same toolchain, and the Qwen checkout above (the DeepSeek engine builds against its `third_party/llama.cpp`). These are
+same toolchain, and the Qwen checkout above, installed with `--build` (that step downloads the pinned llama.cpp into its
+`third_party/llama.cpp`, which the DeepSeek engine builds against; a fresh clone does not have it). These are
 the commands this PC was set up with; the branch's own `setup.py --model Starw1-2.00bpw-MXFP8` downloads the same files
 and makes the pack, but that route is untested here.
 

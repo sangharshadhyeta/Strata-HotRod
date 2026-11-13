@@ -23,7 +23,8 @@ if [ ! -x .venv/bin/python ]; then
     # Prefer uv's own interpreter: unlike Nix's Python, it works naturally with pip wheels using dlopen.
     PY=3.12
   else
-    for c in python3 python; do
+    # the versioned names first: Rocky / Alma / RHEL 9 ship `python3` as 3.9, with 3.11 and 3.12 beside it as python3.11 / python3.12
+    for c in python3.13 python3.12 python3.11 python3.10 python3 python; do
       if command -v $c >/dev/null 2>&1 && ok_py $c; then
         PY=$c; break
       fi
@@ -47,14 +48,17 @@ if [ ! -x .venv/bin/python ]; then
     if command -v apt-get >/dev/null 2>&1; then
       sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip
     elif command -v dnf >/dev/null 2>&1; then
-      sudo dnf install -y python3 python3-pip
+      # Rocky / Alma / RHEL 9: `python3` is 3.9, too old; 3.12 and 3.11 are in AppStream under their own names (Fedora's python3 is new enough)
+      sudo dnf install -y python3.12 python3.12-pip || sudo dnf install -y python3.11 python3.11-pip || sudo dnf install -y python3 python3-pip
     elif command -v pacman >/dev/null 2>&1; then
       sudo pacman -S --noconfirm python python-pip
     fi
-    PY=python3
-    if ! ok_py $PY; then
-      echo "Please install Python 3.10 or newer with venv (Ubuntu/Debian: sudo apt install python3-venv), then run"
-      echo "./setup.sh again. On NixOS, add uv to environment.systemPackages."
+    for c in python3.13 python3.12 python3.11 python3.10 python3 python; do
+      if command -v $c >/dev/null 2>&1 && ok_py $c; then PY=$c; break; fi
+    done
+    if [ -z "$PY" ]; then
+      echo "Please install Python 3.10 or newer with venv (Ubuntu/Debian: sudo apt install python3-venv; Rocky/Alma/RHEL 9:"
+      echo "sudo dnf install python3.12 python3.12-pip), then run ./setup.sh again. On NixOS, add uv to environment.systemPackages."
       exit 1
     fi
   fi
