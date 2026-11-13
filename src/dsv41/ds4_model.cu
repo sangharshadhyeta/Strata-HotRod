@@ -1878,7 +1878,7 @@ struct Model::Impl {
     // a request's end: the HotRod features report and save what they have so far (the counters are cumulative and
     // stay; the destructor reports the same at a clean shutdown, which a server's kill never reaches)
     void request_end(int64_t generated) {
-        store_rr_request(generated);   // (the RAM free at this request's end, before its buffers are freed; only the auto store learns)
+        (void) generated;   // (the RAM store's learning is at the next request's start: request_begin)
         if (d_standin != nullptr) {
             cudaSetDevice(devs[(size_t) L[0].dev].id);
             Standin h{};
@@ -3767,7 +3767,6 @@ struct Model::Impl {
         calibrate_paths();
         ring_setup();      // (DS4_RING: its staging is page-locked before the store's arena is)
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
-        store_rr_sized();  // (the auto store's sizing is done: the RAM the engine takes from here to the first request is the gap)
         ring_start();
         tail_read_init();  // (after the store: it turns the read-ahead off, this may turn the learned one back on)
         vram_reserve_learn();
@@ -7127,21 +7126,24 @@ struct Model::Impl {
     // { "<key> gap": MiB, "<key> margin": MiB }, the key the VRAM reserve's key plus " floor2560".  The auto store is the RAM left after the GPU's
     // weights less gap + margin + floor (2560 MiB, Qwen's memory floor), at most store_cap_gb().  Until a start has learned one of them, the
     // reserve is 12 GB (the first start's guess).  gap: what the engine allocates after the store was sized, learned from the first served
-    // request of a start that generated kRamLearnTokens or more: the available RAM when the sizing finished less the available RAM at that
-    // request's start, floored at 0.  margin: the largest one-request drop in available RAM (available at a request's start less at its end),
-    // over the requests that generated kRamLearnTokens or more.  A value that moved by kRamSaveMib or more is saved for the next start.
+    // request of a start: the gap grows by how far the available RAM at that request's start was short of floor + margin (over; a surplus
+    // takes it down, never below 0), accumulated across starts (Qwen's rule).  margin: this start's second-largest drop in available RAM over
+    // one request (see request_begin), taken from the second measured request on; the file keeps the largest such value this start saw.
     // DS4_STORE_HEADROOM_GB=<GB> pins the reserve (no learning); the explicit store sizes never reach this.
-    static constexpr int64_t kRamFloorMib = 2560, kRamLearnTokens = 200, kRamSaveMib = 128;
+    static constexpr int64_t kRamFloorMib = 2560;
     static constexpr double kRamReserveDefaultGb = 12.0;
     static double mib_to_gb(double mib) { return mib * 1048576.0 / 1e9; }
-    mutable bool store_rr_ready_ = false, store_rr_learn_ = false;
+    mutable bool store_rr_ready_ = false, store_rr_learn_ = false, store_rr_margin_loaded_ = false;
     mutable double store_rr_gb_ = kRamReserveDefaultGb;      // the reserve this process leaves free (GB)
     mutable std::string store_rr_key_;
-    mutable int64_t store_rr_gap_ = 0, store_rr_margin_ = 0;   // MiB: the file's values at the load, then this process's
+    mutable int64_t store_rr_gap_ = 0, store_rr_margin_ = 0;   // MiB: the file's values at the load; the margin in use is this start's drop (from the 2nd measure)
+    mutable int64_t store_rr_margin_seen_ = 0;                  // MiB: the largest second-largest drop this start has seen (what the file holds)
     mutable int64_t store_rr_gap_saved_ = -1, store_rr_margin_saved_ = -1;   // MiB: what the file holds for the key (-1: no entry)
-    mutable uint64_t store_rr_sized_avail_ = ~uint64_t{0};   // ram_avail() when the auto store's sizing finished
-    mutable uint64_t store_rr_begin_avail_ = ~uint64_t{0};   // ram_avail() at the current request's start
-    mutable bool store_rr_gap_done_ = false;                  // this start has learned its gap (at its first learning request)
+    // Qwen's guard state (bytes): the two largest drops, the reference (available RAM after the last guard), the free given-back RAM then,
+    // the RAM the store took back since the last request's start, and the last give-back; measured requests; the first request of a start
+    uint64_t rw_drop1_ = 0, rw_drop2_ = 0, rw_prev_after_ = 0, rw_prev_free_ = 0, rw_unparked_ = 0, rw_last_given_ = 0;
+    int rw_measured_ = 0;
+    bool rw_first_ = true;
     std::string store_rr_key() const {
         std::string k = vram_reserve_key();
         for (char& c : k)
@@ -7189,7 +7191,10 @@ struct Model::Impl {
         const auto m = store_rr_read();
         const auto g = m.find(store_rr_key_ + " gap"), mg = m.find(store_rr_key_ + " margin");
         if (g != m.end()) store_rr_gap_saved_ = std::max<int64_t>(0, g->second);
-        if (mg != m.end()) store_rr_margin_saved_ = std::max<int64_t>(0, mg->second);
+        if (mg != m.end()) {
+            store_rr_margin_saved_ = std::max<int64_t>(0, mg->second);
+            store_rr_margin_loaded_ = true;
+        }
         store_rr_gap_ = std::max<int64_t>(0, store_rr_gap_saved_);
         store_rr_margin_ = std::max<int64_t>(0, store_rr_margin_saved_);
         if (g == m.end() && mg == m.end()) {
@@ -7202,35 +7207,69 @@ struct Model::Impl {
         std::fprintf(stderr, "ds4: RAM store: leaves gap %.0f + margin %.0f + floor %.0f MiB free (learned for %s)\n", (double) store_rr_gap_,
                      (double) store_rr_margin_, (double) kRamFloorMib, store_rr_key_.c_str());
     }
-    // the auto store's sizing is done (init_store): what the engine allocates from here on is the gap
-    void store_rr_sized() {
-        if (store_rr_learn_) store_rr_sized_avail_ = ram_avail();
-    }
-    // a request's start (Model::request_begin): its available RAM, the reference for its drop and, at the first learning request, the gap
+    // a request's start (Model::request_begin), Qwen's guard calculation on the store (see store_guard for the give-back and take-back):
+    // - the first request of a start: the gap learns over = floor + margin - available (MiB, rounded up when short, as Qwen); the
+    //   file's margin is reset to 0 (this start's margins come from its own drops)
+    // - every later request is a measurement: drop = max(0, available at the previous request's start-after-guard - available now)
+    //   minus the RAM the store took back in between (refill, at most what it took back); the two largest drops of the start are kept,
+    //   and from the second measured request the margin in use is the second-largest drop; the file keeps the largest it saw
+    // Then the guard, then the reference for the next request (available and free given-back RAM, after the guard).
     void request_begin() {
-        if (store_rr_learn_) store_rr_begin_avail_ = ram_avail();
-    }
-    // a request's end (generated: its decode tokens): the first learning request of a start sets the gap, every learning request
-    // (kRamLearnTokens or more) takes its drop into the margin; the file is written when a value moved by kRamSaveMib or more
-    void store_rr_request(int64_t generated) {
-        if (!store_rr_learn_ || generated < kRamLearnTokens) return;
-        const uint64_t begin = store_rr_begin_avail_, end = ram_avail();
-        if (begin == ~uint64_t{0} || end == ~uint64_t{0}) return;
-        if (!store_rr_gap_done_ && store_rr_sized_avail_ != ~uint64_t{0}) {
-            store_rr_gap_done_ = true;
-            store_rr_gap_ = store_rr_sized_avail_ > begin ? (int64_t) ((store_rr_sized_avail_ - begin) >> 20) : 0;
+        if (!store || !store_watch_on()) return;
+        const uint64_t avail0 = ram_avail();
+        if (avail0 == ~uint64_t{0}) return;
+        const uint64_t unparked_prev = rw_unparked_;   // (the RAM the store took back since the last request's start, Qwen's ram_unparked)
+        rw_unparked_ = 0;
+        if (rw_first_) {
+            rw_first_ = false;
+            if (store_rr_learn_) {
+                const int64_t over = (int64_t) ((kRamFloorMib + store_rr_margin_) << 20) - (int64_t) avail0;
+                const int64_t over_mib = over >= 0 ? (over + (1ll << 20) - 1) >> 20 : over / (1ll << 20);
+                store_rr_gap_ = std::max<int64_t>(0, store_rr_gap_ + over_mib);
+                store_rr_margin_seen_ = 0;
+                std::fprintf(stderr, "ds4: RAM store: sizing gap %lld MiB learned for the next start (first request: %.2f GiB available against "
+                                     "a floor of %.2f GiB plus a margin of %.2f GiB)\n",
+                             (long long) store_rr_gap_, avail0 / 1073741824.0, (double) kRamFloorMib / 1024.0,
+                             store_rr_margin_ / 1024.0);
+                store_rr_save();
+            }
+        } else if (store_rr_learn_ && rw_prev_after_ > 0) {   // (every request after the first is a measurement; a rise is a drop of 0)
+            const uint64_t free_now = store_gone_bytes();
+            const uint64_t refill = std::min(rw_prev_free_ > free_now ? rw_prev_free_ - free_now : 0, unparked_prev);
+            const uint64_t raw = avail0 < rw_prev_after_ ? rw_prev_after_ - avail0 : 0;
+            const uint64_t drop = raw > refill ? raw - refill : 0;
+            if (drop > rw_drop1_) {
+                rw_drop2_ = rw_drop1_;
+                rw_drop1_ = drop;
+            } else if (drop > rw_drop2_) {
+                rw_drop2_ = drop;
+            }
+            if (++rw_measured_ >= 2) {
+                const int64_t m2 = (int64_t) ((rw_drop2_ + (1ull << 20) - 1) >> 20);
+                if (m2 != store_rr_margin_) {
+                    const int64_t was = store_rr_margin_;
+                    store_rr_margin_ = m2;
+                    if (rw_measured_ == 2 || std::llabs(m2 - was) > 64)
+                        std::fprintf(stderr, "ds4: RAM store: margin %lld -> %lld MiB (this start's second-largest drop in available RAM over one "
+                                             "request, %d measured)\n", (long long) was, (long long) m2, rw_measured_);
+                }
+                if (m2 > store_rr_margin_seen_) {
+                    store_rr_margin_seen_ = m2;
+                    store_rr_save();
+                }
+            }
         }
-        const uint64_t drop = begin > end ? begin - end : 0;
-        store_rr_margin_ = std::max<int64_t>(store_rr_margin_, (int64_t) (drop >> 20));
-        store_rr_save();
+        store_guard();
+        rw_prev_after_ = ram_avail();
+        rw_prev_free_ = store_gone_bytes();
     }
     void store_rr_save() {
-        const bool gap_moved = store_rr_gap_saved_ < 0 || std::llabs(store_rr_gap_ - store_rr_gap_saved_) >= kRamSaveMib;
-        const bool margin_moved = store_rr_margin_saved_ < 0 || std::llabs(store_rr_margin_ - store_rr_margin_saved_) >= kRamSaveMib;
+        const bool gap_moved = store_rr_gap_saved_ < 0 || store_rr_gap_ != store_rr_gap_saved_;
+        const bool margin_moved = store_rr_margin_saved_ < 0 || store_rr_margin_seen_ != store_rr_margin_saved_;
         if (!gap_moved && !margin_moved) return;
         auto m = store_rr_read();
         if (gap_moved) m[store_rr_key_ + " gap"] = store_rr_gap_;
-        if (margin_moved) m[store_rr_key_ + " margin"] = store_rr_margin_;
+        if (margin_moved) m[store_rr_key_ + " margin"] = store_rr_margin_seen_;
         const std::string path = o.pack + "/ram-reserve.json", tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::trunc);
@@ -7243,9 +7282,9 @@ struct Model::Impl {
         std::filesystem::rename(tmp, path, ec);
         if (ec) std::fprintf(stderr, "ds4: RAM store: %s cannot be written (the learned values stay for this run)\n", path.c_str());
         std::fprintf(stderr, "ds4: RAM store: gap %.0f MiB, margin %.0f MiB learned for the next start\n", (double) store_rr_gap_,
-                     (double) store_rr_margin_);
+                     (double) store_rr_margin_seen_);
         store_rr_gap_saved_ = store_rr_gap_;
-        store_rr_margin_saved_ = store_rr_margin_;
+        store_rr_margin_saved_ = store_rr_margin_seen_;
     }
     double store_gb() const {
         static double cached = -2.0;   // (decided once: the layout of the blobs depends on it)
@@ -7389,6 +7428,11 @@ struct Model::Impl {
             return;
         }
         store = std::move(st);
+        if (store_watch_on()) {   // (the marks the watcher uses from here on, once)
+            const uint64_t low = store_low_bytes();
+            std::fprintf(stderr, "ds4: RAM store: gives back below %.1f GB available, takes back above %.1f GB\n", low / 1e9,
+                         (low + store_band_bytes()) / 1e9);
+        }
         if (const char* pv = std::getenv("DS4_STORE_PROTECT"); pv != nullptr && std::atoi(pv) != 0) {   // (DS4_STORE_PROTECT=1: a guess's slot kept until its position)
             store_protect = true;
             store->set_protect(true);
@@ -9137,26 +9181,67 @@ struct Model::Impl {
         std::error_code ec;
         std::filesystem::rename(tmp, file, ec);
     }
-    // the store gives RAM back when the PC runs short (the owner opened something): below 4 GB free, a 0.7 GB chunk at a time
-    // until 5 GB are free again (checked every 16 windows); it grows again by itself once 8 GB beside its chunk are free
-    void store_watch() {
+    // the RAM store gives chunks back when the PC runs short and takes them back when it is free again (Qwen's guard, ported: the same
+    // floor, margin, band and refill accounting; the unit is a store chunk). Checked at each request's start (request_begin) and every 16
+    // windows (store_watch). DS4_STORE_WATCH=0 turns all of it off; DS4_STORE_HEADROOM_GB pins the reserve (no learning).
+    static bool store_watch_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("DS4_STORE_WATCH");
+            return v == nullptr || *v == '\0' || std::atoi(v) != 0;
+        }();
+        return on;
+    }
+    // the margin is known once this start measured two requests or the file held one; until then the legacy 4 GB mark (12 GB reserve)
+    bool store_margin_known() const { return store_rr_learn_ && (store_rr_margin_loaded_ || rw_measured_ >= 2); }
+    // low = floor + margin (the RAM that must stay available); below it the store gives back, above low + band (with chunks given back) it takes back
+    uint64_t store_low_bytes() const {
+        if (!store_margin_known()) return 4ull << 30;
+        return (uint64_t) (kRamFloorMib + store_rr_margin_) << 20;
+    }
+    // the band: the margin once measured (two requests, or a margin > 0), else what the last give-back had to release (Qwen's G5)
+    uint64_t store_band_bytes() const {
+        return (rw_measured_ >= 2 || store_rr_margin_ > 0) ? (uint64_t) store_rr_margin_ << 20 : rw_last_given_;
+    }
+    uint64_t store_gone_bytes() const {   // the given-back RAM not taken back yet (Qwen's free places)
+        return store ? (uint64_t) store->gone_chunks() * store->chunk_bytes() : 0;
+    }
+    // below low: chunks given back, the deficit rounded up to whole chunks; above low + band with chunks given back: the excess, in whole chunks, taken back
+    void store_guard() {
         if (!store) return;
+        const uint64_t avail = ram_avail();
+        if (avail == ~uint64_t{0}) return;
+        const uint64_t low = store_low_bytes(), band = store_band_bytes(), chunk = std::max<uint64_t>(store->chunk_bytes(), 1ull << 20);
+        if (avail < low) {
+            const uint64_t deficit = low - avail;
+            const size_t want = (size_t) ((deficit + chunk - 1) / chunk);
+            size_t coldest = 0;
+            double use = 0.0;
+            const size_t n = store->shrink_chunks(want, &coldest, &use);
+            rw_last_given_ = (uint64_t) n * chunk;
+            const uint64_t after = ram_avail();
+            std::fprintf(stderr, "ds4: RAM below the floor plus margin (%.2f GiB available, floor + margin %.2f): the RAM store gave back %.2f GiB "
+                                 "(%zu chunks, %.2f GiB available now)\n",
+                         avail / 1073741824.0, low / 1073741824.0, rw_last_given_ / 1073741824.0, n,
+                         after == ~uint64_t{0} ? 0.0 : after / 1073741824.0);
+        } else if (avail > low + band && store->gone_chunks() > 0) {
+            const uint64_t budget = avail - (low + band);
+            const size_t want = (size_t) (budget / chunk);
+            if (want == 0) return;
+            const size_t took = store->regrow_chunks(want);
+            if (took == 0) return;
+            rw_unparked_ += (uint64_t) took * chunk;
+            if (store->gone_chunks() == 0) rw_last_given_ = 0;   // nothing given back: the band is measured again
+            std::fprintf(stderr, "ds4: RAM above the floor plus margin (%.2f GiB available, floor + margin %.2f): %.2f GiB of RAM store chunks "
+                                 "back (%.2f GiB still given back)\n",
+                         avail / 1073741824.0, low / 1073741824.0, (double) took * chunk / 1073741824.0,
+                         store_gone_bytes() / 1073741824.0);
+        }
+    }
+    void store_watch() {
+        if (!store || !store_watch_on()) return;
         static int tick = 0;
         if (++tick % 16 != 0) return;
-        const uint64_t avail = ram_avail();
-        if (avail != ~uint64_t{0} && avail >= (6ull << 30) && store->gone_chunks() > 0) {   // (RAM is back: one given-back chunk, the same tick)
-            const size_t took = store->regrow_chunks(1);
-            if (took > 0) std::fprintf(stderr, "ds4: RAM store: %.1f GB free: took back %zu chunks\n", avail / 1e9, took);
-            return;
-        }
-        if (avail == ~uint64_t{0} || avail >= (4ull << 30)) return;
-        const size_t chunks = 1 + (size_t) (((5ull << 30) - avail) / (700ull << 20));
-        size_t coldest = 0;
-        double use = 0.0;
-        const size_t n = store->shrink_chunks(chunks, &coldest, &use);
-        if (n > 0)
-            std::fprintf(stderr, "ds4: RAM store: %.1f GB free: gave back %zu chunks (coldest: chunk %zu, use %.0f; %zu slots left)\n", avail / 1e9, n,
-                         coldest, use, store->slots_allocated());
+        store_guard();
     }
     void cache_tick_swaps(int T) {
         if (!o.expert_cache || cache_ths.empty()) return;

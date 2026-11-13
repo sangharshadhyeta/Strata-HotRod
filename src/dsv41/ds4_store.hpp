@@ -131,6 +131,8 @@ public:
     size_t slot_bytes() const { return slot_bytes_; }
     size_t slots_allocated() const { return nalloc_ - gone_slots_; }   // (the slots in chunks the store holds, not given back)
     size_t slots_max() const { return nmax_ - gone_slots_; }
+    /// The bytes of one chunk (the unit shrink_chunks gives back and regrow_chunks takes back): kChunk slots.
+    size_t chunk_bytes() const { return kChunk * slot_bytes_; }
     /// The chunks given back (RAM short) and not taken back yet.
     size_t gone_chunks() {
         std::lock_guard<std::mutex> lk(mu_);
