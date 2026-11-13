@@ -492,7 +492,9 @@ def main() -> int:
     if a.config_json:
         apply_source_config(kv, json.loads(pathlib.Path(a.config_json).expanduser().read_text()))
     split = int(kv.get("split.count", 1))
-    if split != len(shards):
+    # a release that counts its Engram table as the last shard (split.count = backbone shards + 1, the Abiray Coder set: the table is named
+    # -00006-of-00006 in its README) is complete when the Engram is given with --engram
+    if split != len(shards) and not (a.engram and split == len(shards) + 1):
         counts = sorted({m.group(1) for m in (re.search(r"-of-(\d{5})\.gguf$", p.name) for p in shards) if m})
         raise SystemExit("%s: %d of the %d shards are here" % (model, len(shards), split) if len(counts) < 2 else
                          "%s: the shards of more than one GGUF split (-of-%s): name the model's own with --shards" %
