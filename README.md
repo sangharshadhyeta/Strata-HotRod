@@ -176,7 +176,7 @@ and every answer we read was correct either way.
 
 **A look-ahead that learns.** Experts for 1, 2 and 4 layers ahead are guessed on the card and read from the SSD before they
 are needed. Each guess is the router's own score plus a small correction learned live from the real routing; its size is
-chosen per layer by a live contest, and it falls back to the plain router if it ever does worse. For Qwen3.8 IQ3_S setup downloads a trained one ([release](https://github.com/sangharshadhyeta/Strata-HotRod/releases/tag/predictor-qwen38-iq3s-v2), 4 MB: 91 / 84 / 77% of the needed experts guessed 1 / 2 / 4 layers ahead) and it keeps learning on your PC; for other models it is off until `STRATA_LA_LEARN=1` starts one.
+chosen per layer by a live contest, and it falls back to the plain router if it ever does worse. For Qwen3.8 IQ3_S setup downloads a trained one ([release](https://github.com/sangharshadhyeta/Strata-HotRod/releases/tag/predictor-qwen38-iq3s-v2), 5.4 MB: 91 / 85 / 78% of the needed experts guessed 1 / 2 / 4 layers ahead) and it keeps learning on your PC; for other models it is off until `STRATA_LA_LEARN=1` starts one. DeepSeek's trained one is a manual download (see the DeepSeek install below).
 
 </div>
 
@@ -325,7 +325,9 @@ scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build -
 
 - `--build` compiles this fork's engine; without it setup downloads upstream's, which lacks these changes. The compiled
   engine was checked against the one measured here: the same speed.
-- For Qwen3.8 IQ3_S it also downloads the learned look-ahead's trained state (4 MB, SHA-256 checked) into `data/`.
+- For Qwen3.8 IQ3_S it also downloads the learned look-ahead's trained state (5.4 MB, SHA-256 checked) into `data/`. It is the
+  `predictor-qwen38-iq3s-v2` release; a later `-v3` (the same file trained for another week) is on the releases page, and
+  setup does not use it yet.
 - For 262K context set `--max-context 262144` in the config's `args`.
 - `--model IQ3_S` is the size tested here. Setup says it wants a 64 GB PC; naming it is the consent, and it runs on 30 GB.
 - `--models-dir /path/on/nvme` puts the model files elsewhere.
@@ -440,6 +442,12 @@ $PY tools/dsv41/pack_gguf.py --model $M \
   --engram-meta $M/unsloth/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf \
   --mmproj $M/../mmproj-BF16.gguf --out /mnt/nvme/strata-data/packs/ds41v
 cp data/dsv41/profile-2.00.bin /mnt/nvme/strata-data/packs/ds41v/expert-profile.bin
+
+# the learned look-ahead (8 MB, trained on this pack's 384 experts; the engine loads it at start and keeps learning).  Optional: without it
+# the look-ahead starts empty and learns from your use.  Setup's DeepSeek route is not used here, so this is a manual download.
+P=/mnt/nvme/strata-data/packs/ds41v/hotrod-predictor.bin
+curl -L -o $P https://github.com/sangharshadhyeta/Strata-HotRod/releases/download/predictor-ds41-starw1-v2/hotrod-predictor-ds41-starw1-v2.bin
+echo "3e27dbab99643d7bc3f6cf72d5a7a28b5cd3a4ca6625c4d4b2a1672a75d5def9  $P" | sha256sum -c -   # must say OK; delete the file if not
 ```
 
 <div align="justify">
