@@ -763,6 +763,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const size_t n_state = st.size();
         size_t c = 0;
         while (c < n_state && c < r.ids.size() && st[c] == r.ids[c]) ++c;
+        if (std::getenv("DS4_REUSE_DEBUG") != nullptr && n_state > 0) {   // (diagnosis: the tokens at the first difference)
+            std::string a, b;
+            for (size_t k = c >= 4 ? c - 4 : 0; k < c + 5; ++k) {
+                if (k < n_state) a += std::to_string(st[k]) + " ";
+                if (k < r.ids.size()) b += std::to_string(r.ids[k]) + " ";
+            }
+            std::fprintf(stderr, "ds4 reuse: first difference at %zu of the state's %zu tokens; around it, state: %s| prompt: %s\n", c, n_state, a.c_str(), b.c_str());
+        }
         // the same tokens with another picture (or none) do not share the state from that picture's span on
         auto same = [](const std::vector<Pic>& v, const Pic& q) {
             for (const Pic& x : v)
