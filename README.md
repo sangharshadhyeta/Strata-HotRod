@@ -17,7 +17,7 @@ Nothing leaves your PC.</p>
   <img alt="Streams from SSD" src="https://img.shields.io/badge/STREAMS%20FROM-SSD-1c7ed6?style=for-the-badge">
   <img alt="30 GB RAM, up to 111 GB model" src="https://img.shields.io/badge/30%20GB%20RAM-111%20GB%20MODEL-d6336c?style=for-the-badge">
   <img alt="12 GB VRAM" src="https://img.shields.io/badge/12%20GB-VRAM-76b900?style=for-the-badge">
-  <img alt="IQ3_S, 78 GB: 50-70 tokens/s (131K context, short answers)" src="https://img.shields.io/badge/IQ3__S%2078%20GB-50--70%20TOK%2FS-e8590c?style=for-the-badge">
+  <img alt="IQ3_S, 78 GB: 50-70 tokens/s (131K context)" src="https://img.shields.io/badge/IQ3__S%2078%20GB-50--70%20TOK%2FS-e8590c?style=for-the-badge">
   <img alt="UD-Q4_K_XL, 111 GB: 15-22 tokens/s (14 Nov, learners still cold)" src="https://img.shields.io/badge/Q4__K__XL%20111%20GB-15--22%20TOK%2FS-e8590c?style=for-the-badge">
 </p>
 
@@ -40,7 +40,7 @@ Nothing leaves your PC.</p>
 <table>
 <tr>
 <td align="center" width="25%"><h2>🧊 78 - 111 GB</h2>of model on a <b>30 GB</b> PC (IQ3_S and UD-Q4_K_XL)</td>
-<td align="center" width="25%"><h2>🔥 50-70 / 15-22</h2>tokens/s on one RTX 3060: IQ3_S (131K context, short answers) / UD-Q4_K_XL</td>
+<td align="center" width="25%"><h2>🔥 50-70 / 15-22</h2>tokens/s on one RTX 3060: IQ3_S (131K context, short answers)</td>
 <td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash: see the <a href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41"><b>upstream-dsv41</b> branch</a></td>
 <td align="center" width="25%"><h2>⚡ 0.4 s</h2>to pick up a 45K-token conversation (next turn, from the saved state)</td>
 </tr>
