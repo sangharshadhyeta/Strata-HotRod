@@ -2853,6 +2853,20 @@ struct Model::Impl {
 #endif
         const int rule_chunk = prefill_chunk_default(own_default, gpu_expert_share(), gguf_copy, file_experts, hip_build, vmin_bytes, kVlRows, multi_tp, defaults_026());
         chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : rule_chunk) : 0;
+        if (prompt_par && o.prefill_chunk < 0 && chunk > 0 && std::getenv("DS4_CHUNK") == nullptr) {   // (the learned chunk: chunk_learn_pass)
+            int lv = 0, ls = 0;
+            double lf = -1;
+            if (chunk_learned_read(lv, ls, lf)) {
+                chunk = std::min(rule_chunk, std::min(kMaxChunk, std::max(1024, lv)));
+                chunk_settled = ls;
+                cl_done = ls != 0;
+                cl_stage = ls != 0 ? 1 : 1;   // (an unsettled file holds the candidate: its first long read is the test)
+                cl_fref = lf;
+                std::fprintf(stderr, "ds4: prompt chunk: %d tokens (learned for this machine%s; the rule said %d)\n", chunk, ls ? ", settled" : ", the candidate to test", rule_chunk);
+            }
+            chunk_rule = rule_chunk;
+            chunk_eff = chunk;
+        }
         if (prompt_par && o.prefill_chunk < 0 && rule_chunk == 4096 && gguf_copy)
             std::fprintf(stderr, "ds4: prompts in chunks of 4096 tokens (the experts are copied into RAM, %.0f GiB of graphics memory; --prefill-chunk N changes it)\n",
                          (double) vmin_bytes / (double) (1ull << 30));
@@ -4609,6 +4623,118 @@ struct Model::Impl {
         std::fprintf(stderr, "ds4: VRAM reserve: the load ended with %lld MiB free%s; the next start keeps %lld MiB (was %lld)\n",
                      (long long) free_mib, ring_bytes != 0 ? " (the ring's slots counted as free)" : "", (long long) now, (long long) old);
     }
+    // ---- the learned prompt chunk (Strata-HotRod): <pack>/prefill-chunk.txt, "<key> <chunk> <settled 0|1> <f_ref in 1/1000>" a line, the key the GPU's name and
+    // memory.  The chunk sizes the chunked pass's arena (VRAM that is then not experts on the card), and every chunk streams the experts it needs from
+    // the SSD again, so a smaller chunk keeps more experts on the card and asks more of the SSD - and of the read time.  The balance is searched live,
+    // read by read, and settles:
+    //  - a pass reports how long the compute waited for the SSD's reads, f = wait / pass time (the engine counts it).  The first figure is the reference
+    //    f_ref (at the chunk the arena was sized for).  The compute per token does not change with the chunk below that (3.0 ms on the RTX 3060 here at 4096,
+    //    3072 and 2048), so what a smaller chunk costs in read time is its extra wait: p = f - f_ref.  The cost accepted is eps (DS4_CHUNK_READ_COST,
+    //    default 0.05: reads up to ~5% slower for the VRAM the smaller arena gives the experts; measured: 3072 +3%, 2048 +16%).
+    //  - f falls about as chunk^-0.66, so one step goes to the chunk where p = eps: chunk' = chunk * (f / (f_ref + eps))^1.5, rounded to 256, within
+    //    [1024, kMaxChunk].  The next read (of >= 2 chunks of the new size, six chunks' worth in all, from one read or several, so small reads count)
+    //    is cut in chunks of that size - the arena allows any size up to its own - and judged the same way: p within 0.6 .. 1.2 eps settles it; a step
+    //    that overshoots (p > 1.2 eps) turns back between the tested sizes; at most five steps.  Settled, it is kept unless a read shows p outside -0.02 .. 1.8 eps.
+    //  - the arena itself is sized at load, so the VRAM follows at the next start, from the file.  --prefill-chunk and DS4_CHUNK are not learned over.
+    std::string chunk_learn_path() const { return o.pack + "/prefill-chunk.txt"; }
+    std::string chunk_learn_key() const {
+        if (devs.empty()) return "";
+        cudaDeviceProp pr{};
+        std::string name = "unknown";
+        if (cudaGetDeviceProperties(&pr, devs[0].id) == cudaSuccess) name = pr.name;
+        for (char& c : name)
+            if (c == ' ') c = '_';
+        return name + "/" + std::to_string(devs[0].total >> 20) + "MiB";
+    }
+    bool chunk_learned_read(int& val, int& settled, double& fref) const {
+        const std::string key = chunk_learn_key();
+        if (key.empty()) return false;
+        std::ifstream f(chunk_learn_path());
+        std::string k;
+        long long v = 0, s = 0, fr = 0;
+        while (f >> k >> v >> s >> fr)
+            if (k == key && v >= 256) {
+                val = (int) v;
+                settled = (int) s;
+                fref = (double) fr / 1000.0;
+                return true;
+            }
+        return false;
+    }
+    int chunk_eff = 0;               // the chunk a pass is cut in (<= chunk, the arena's): the search's candidate; 0: chunk
+    int chunk_settled = 0;           // 1: the file (or the search) settled it
+    double cl_ms = 0, cl_wait = 0, cl_fref = -1;
+    int64_t cl_tok = 0;
+    int cl_stage = 0;                // 0: no figure yet (the reference comes first); 1: the candidate is being read
+    bool cl_done = false;            // settled: never tested again (delete prefill-chunk.txt to search anew)
+    int chunk_rule = 4096;           // the rule's chunk: the search starts here and does not go above it
+    void chunk_learn_write(int value, int settled) {
+        std::map<std::string, std::array<long long, 3>> m;
+        {
+            std::ifstream f2(chunk_learn_path());
+            std::string k;
+            long long v = 0, s = 0, fr = 0;
+            while (f2 >> k >> v >> s >> fr) m[k] = {v, s, fr};
+        }
+        m[chunk_learn_key()] = {(long long) value, (long long) settled, std::llround(cl_fref * 1000.0)};
+        const std::string path = chunk_learn_path(), tmp = path + ".tmp";
+        {
+            std::ofstream f3(tmp, std::ios::trunc);
+            for (const auto& kv : m) f3 << kv.first << " " << kv.second[0] << " " << kv.second[1] << " " << kv.second[2] << "\n";
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+    }
+    void chunk_learn_pass(int n, double ms, double wait_ms) {
+        static const bool off = std::getenv("DS4_CHUNK_LEARN") != nullptr && std::atoi(std::getenv("DS4_CHUNK_LEARN")) == 0;
+        if (off || cl_done || chunk <= 0 || o.prefill_chunk >= 0 || std::getenv("DS4_CHUNK") != nullptr || devs.empty() || ms <= 0) return;
+        const int ce = chunk_eff > 0 ? std::min(chunk_eff, chunk) : chunk;
+        if (n < 2 * ce) return;   // (a pass of at least two chunks)
+        cl_ms += ms;
+        cl_wait += wait_ms;
+        cl_tok += n;
+        if (cl_tok < 6 * (int64_t) ce) return;   // (a steady figure: six chunks' worth, from one read or several)
+        const double f = std::min(1.0, cl_wait / cl_ms);
+        const int64_t toks = cl_tok;
+        cl_ms = cl_wait = 0;
+        cl_tok = 0;
+        const double eps = std::getenv("DS4_CHUNK_READ_COST") != nullptr ? std::min(0.3, std::max(0.01, std::atof(std::getenv("DS4_CHUNK_READ_COST")))) : 0.05;
+        auto r256 = [](double c) { return (int) (std::lround(c / 256.0) * 256); };
+        const int top = std::max(1024, std::min(kMaxChunk, chunk_rule));   // (the search starts at the rule's chunk and goes down, never up: larger chunks read no faster)
+        if (cl_fref < 0) cl_fref = f;   // (the first figure is the reference: the chunk the arena was sized for)
+        const double ft = cl_fref + eps, p = f - cl_fref;
+        int final_c = ce;
+        bool settle = false;
+        if (cl_stage == 0) {   // the reference was just measured: one step to the chunk where the read costs eps more
+            int next = r256((double) ce * std::pow(std::max(f, 0.01) / ft, 1.5));
+            next = std::max(1024, std::min(top, next));
+            if (std::abs(next - ce) < 256) {
+                settle = true;   // (no room to go down)
+            } else {
+                cl_stage = 1;
+                chunk_eff = std::min(next, chunk);
+                chunk_learn_write(next, 0);
+                std::fprintf(stderr, "ds4: prompt chunk %d: waited %.0f%% for the SSD over %lld tokens (the reference; the read cost accepted: %.0f%%): the next read tests %d\n", ce,
+                             100.0 * f, (long long) toks, 100.0 * eps, next);
+                return;
+            }
+        } else {   // the candidate was read: accept it when its extra read time is within 1.6 eps, else back off once by the same model and stop
+            if (p <= 1.6 * eps) settle = true;
+            else {
+                final_c = std::max(ce + 256, std::min(top, r256((double) ce * std::pow(f / ft, 1.5))));
+                settle = true;
+            }
+        }
+        if (settle) {
+            cl_done = true;
+            chunk_settled = 1;
+            chunk_eff = std::min(final_c, chunk);
+            chunk_learn_write(final_c, 1);
+            std::fprintf(stderr, "ds4: prompt chunk %d: waited %.0f%% for the SSD over %lld tokens (reference %.0f%%, read cost %+.0f%% of the %.0f%% accepted): settled at %d%s; not tested again\n", ce,
+                         100.0 * f, (long long) toks, 100.0 * cl_fref, 100.0 * p, 100.0 * eps, final_c,
+                         final_c < chunk ? " (the arena follows at the next start)" : (final_c > chunk ? " (a larger arena at the next start)" : ""));
+        }
+    }
     void tail_read_init() {
         if (const char* v = std::getenv("STRATA_LA_TAIL_READ")) la_tail_read = std::max(0, std::min(3, std::atoi(v)));
         if (const char* v = std::getenv("DS4_STORE_EARLY")) store_early = std::max(0, std::atoi(v));   // (DS4_STORE_EARLY=N: unset or 0 as now)
@@ -5061,6 +5187,11 @@ struct Model::Impl {
     // more than it.
     void vram_reserve_check_tower() {
         if (!(o.vision_lazy && vt.lazy()) || o.reserve_set || devs.empty()) return;
+        if (tower_can_borrow()) {
+            std::fprintf(stderr, "ds4: the picture tower runs in the chunked pass's arena (%.0f MiB of %.0f MiB): no VRAM is kept free for it\n",
+                         (double) (vt.device_bytes() >> 20), (double) (lend_bytes >> 20));
+            return;
+        }
         size_t fr = 0, tot = 0;
         cudaSetDevice(devs[0].id);
         if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
@@ -8201,6 +8332,20 @@ struct Model::Impl {
                          gpu_integrated(d.id) ? "this GPU shares the PC's memory" : "--reserve-mib is too small to take it from");
         return true;
     }
+    // the lazy picture tower can run in the chunked pass's arena: a lazy tower, the arena there and with room for its buffers
+    bool tower_borrowed = false;
+    bool tower_can_borrow() const {
+        return o.vision_lazy && vt.lazy() && lend_on && lend_base != nullptr && lend_bytes >= vt.device_bytes() + ((size_t) 8 << 20);
+    }
+    // the picture turn is over: the tower's graphics memory back (a borrowed block is simply let go), and the arena to the ring
+    void vision_idle_impl() {
+        vt.release_device();
+        if (tower_borrowed) {
+            vt.clear_borrow();
+            tower_borrowed = false;
+            lend_request();
+        }
+    }
     bool encode_image(const uint8_t* rgb, int w, int h, std::vector<uint16_t>& span, std::string& err) {
         if (img_tok < 0) {
             err = "this model has no vision tower (or it is off)";
@@ -8208,6 +8353,14 @@ struct Model::Impl {
         }
         std::vector<uint16_t> rows;
         int nh = 0, nw = 0;
+        // A lazy tower takes its graphics memory for the picture turn from the chunked pass's arena (the ring gives the arena's slots back, as it does
+        // for a prompt pass), not from VRAM kept free for it: the arena is idle between the picture and the prompt that follows it.  The ring gets
+        // the slots back in vision_idle().  Without the arena (or one too small) it takes cudaMalloc, from the reserve, as before.
+        if (tower_can_borrow() && !tower_borrowed) {
+            lend_reclaim();
+            vt.set_borrow(lend_base, lend_bytes);
+            tower_borrowed = true;
+        }
         if (!vt.encode(rgb, w, h, rows, nh, nw, err)) return false;
         const size_t D = (size_t) g.dim;
         span.resize(((size_t) nh * (nw + 1) + 2) * D);
@@ -9512,7 +9665,8 @@ struct Model::Impl {
         // ring otherwise, and the picture turn then fails to allocate ("vision: no graphics memory free for the picture tower"; seen on the RTX 3060
         // with a 920 MiB reserve: 183 MiB free at rest, 319 MiB needed).  When the ring does not fit beside that, it takes the slots that do.
         size_t keep = (size_t) 256 << 20;
-        if (o.vision_lazy && vt.lazy()) keep = std::max(keep, vt.device_bytes() + ((size_t) VisionTower::kLazyMargin << 20));
+        if (o.vision_lazy && vt.lazy() && !tower_can_borrow())   // (a tower that runs in the chunked pass's arena needs no free VRAM of its own)
+            keep = std::max(keep, vt.device_bytes() + ((size_t) VisionTower::kLazyMargin << 20));
         if (fr < (size_t) n * stride + keep) {
             const int fit = fr > keep ? (int) ((fr - keep) / stride) : 0;
             if (fit < 4) {
@@ -13116,7 +13270,8 @@ struct Model::Impl {
                          : keep_env > 0 ? std::max(keep_env, g.win)
                          : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
         const int a = yl > 0 && n - keep >= kYocoMin ? n - keep : 0;
-        const int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
+        const int ce_use = chunk_eff > 0 ? std::min(chunk_eff, chunk) : chunk;   // (the learned-chunk search's candidate: any size up to the arena's)
+        const int nc = (n + ce_use - 1) / ce_use, per = (n + nc - 1) / nc;
         if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "forward_chunks n %d nc %d per %d\n", n, nc, per);
         Run run;
         for (int x = 0; x < n; x += per) {
@@ -13283,6 +13438,16 @@ struct Model::Impl {
             }
             for (double& v : cprof_ms) v = 0;
             prof_chunk = false;
+        }
+        {   // the learned chunk: this pass's tokens and time, and how long the compute waited for the SSD's reads (the busiest device's)
+            double w = 0;
+            bool flow = false;
+            for (size_t di = 0; di < chunks.size(); ++di)
+                if (chunks[di]->flow) {
+                    flow = true;
+                    w = std::max(w, chunks[di]->wait_ms);
+                }
+            if (flow) chunk_learn_pass(n, now_ms() - tl, w);
         }
         if (o.verbose || std::getenv("DS4_FLOW_STATS") != nullptr) {
             const double ms = now_ms() - tl;
@@ -14660,7 +14825,7 @@ int Model::dim() const { return p_->g.dim; }
 bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<uint16_t>& span, std::string& err) {
     return p_->encode_image(rgb, width, height, span, err);
 }
-void Model::vision_idle() { p_->vt.release_device(); }
+void Model::vision_idle() { p_->vision_idle_impl(); }
 bool Model::vision_lazy() const { return p_->vt.lazy(); }
 void Model::set_images(std::vector<Image> images) {
     std::sort(images.begin(), images.end(), [](const Image& a, const Image& b) { return a.start < b.start; });

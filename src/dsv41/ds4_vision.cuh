@@ -51,6 +51,18 @@ public:
     bool resident() const { return ready_; }
     /// Gives the device side back (lazy towers only; the host side stays). The next encode takes it again.
     void release_device();
+    /// A block of device memory the caller owns and has cleared of other use (the chunked pass's arena, with the ring's slots given back): the next
+    /// acquire() carves its buffers from it instead of cudaMalloc, so a picture turn takes no graphics memory of its own.  Anything that does not fit
+    /// comes from cudaMalloc as before.  clear_borrow() after release_device().
+    void set_borrow(void* base, size_t bytes) {
+        borrow_base_ = (uint8_t*) base;
+        borrow_bytes_ = bytes;
+        borrow_used_ = 0;
+    }
+    void clear_borrow() {
+        borrow_base_ = nullptr;
+        borrow_bytes_ = borrow_used_ = 0;
+    }
     static constexpr int64_t kLazyMargin = 192;   // MiB the reserve must hold beyond the device side's size
     /// The patches an image may have (its aligner grid within max_tokens).
     int max_patches() const { return max_n_; }
@@ -71,6 +83,8 @@ private:
     int dev_ = -1, at_ = -1, max_n_ = 0, qb_ = 0, rb_ = 0, cells_ = 0;   // (at_: the device its memory is on)
     size_t dev_bytes_ = 0, slot_n_ = 0;
     std::vector<void*> dallocs_;
+    uint8_t* borrow_base_ = nullptr;   // (set_borrow) the caller's block the buffers are carved from; not in dallocs_, never cudaFree'd here
+    size_t borrow_bytes_ = 0, borrow_used_ = 0;
     uint16_t* host_ = nullptr;          // pinned: every block's [wqkv, wo, w1, w2], then aligner w1, w2
     size_t block_n_ = 0;                // a block's weights (BF16 values)
     size_t al1_off_ = 0, al2_off_ = 0;  // the aligner's weights in host_

@@ -199,6 +199,13 @@ template <class T>
 bool VisionTower::dalloc(T*& p, size_t n, std::string& err) {
     void* v = nullptr;
     const size_t b = (n * sizeof(T) + 255) / 256 * 256;
+    if (borrow_base_ != nullptr && borrow_used_ + b <= borrow_bytes_) {   // (the caller's block: no allocation, nothing to free)
+        v = borrow_base_ + borrow_used_;
+        borrow_used_ += b;
+        dev_bytes_ += b;
+        p = (T*) v;
+        return true;
+    }
     if (cudaMalloc(&v, b) != cudaSuccess) {
         err = "vision: cudaMalloc " + std::to_string(b >> 20) + " MiB on CUDA" + std::to_string(at_) + " failed";
         return false;
@@ -230,6 +237,7 @@ void VisionTower::free_device() {
     cudaSetDevice(cur);
     blas_ = st_ = cs_ = nullptr;
     dallocs_.clear();
+    borrow_used_ = 0;   // (the borrowed block's buffers are simply no longer used)
     pe_w_ = pe_b_ = norm_ = al1_b_ = al2_b_ = nullptr;
     for (auto* v : {&n1_, &n2_, &bqkv_, &bo_})
         for (uint16_t*& q : *v) q = nullptr;
