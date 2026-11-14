@@ -6,7 +6,7 @@
 
 <h2 align="center">A 341 GB model. 31 GB of RAM. 12 GB of VRAM. Zero cloud.</h2>
 
-<p align="center"><b>DeepSeek-V4.1-Flash on one gaming card, streaming from your SSD, at about 5 tokens/s.</b><br>
+<p align="center"><b>DeepSeek-V4.1-Flash on one gaming card, streaming from your SSD, at 7-8 tokens/s over a whole answer (the best answers peak near 10).</b><br>
 Nothing leaves your PC.</p>
 
 <p align="center">
@@ -17,13 +17,13 @@ Nothing leaves your PC.</p>
   <img alt="Streams from SSD" src="https://img.shields.io/badge/STREAMS%20FROM-SSD-1c7ed6?style=for-the-badge">
   <img alt="31 GB RAM, 341 GB model" src="https://img.shields.io/badge/31%20GB%20RAM-341%20GB%20MODEL-d6336c?style=for-the-badge">
   <img alt="12 GB VRAM" src="https://img.shields.io/badge/12%20GB-VRAM-76b900?style=for-the-badge">
-  <img alt="About 5 tokens per second" src="https://img.shields.io/badge/~5-TOK%2FS-e8590c?style=for-the-badge">
+  <img alt="7 to 8 tokens per second, peaking near 10" src="https://img.shields.io/badge/7--8-TOK%2FS-e8590c?style=for-the-badge">
 </p>
 
 <table>
 <tr>
 <td align="center" width="33%"><h2>🐋 341 GB</h2>of DeepSeek-V4.1-Flash files on a <b>31 GB</b> PC</td>
-<td align="center" width="33%"><h2>⚡ about 5</h2>tokens/s on one RTX 3060 12 GB</td>
+<td align="center" width="33%"><h2>⚡ 7-8</h2>tokens/s on one RTX 3060 12 GB (peaks near 10)</td>
 <td align="center" width="33%"><h2>💾 2.8 GB/s</h2>the NVMe is the limit: each token still reads about 2 GB of experts</td>
 </tr>
 </table>
@@ -37,8 +37,8 @@ This is the **DeepSeek branch** (`upstream-dsv41`) of Strata-HotRod: upstream [S
 [`main`](https://github.com/sangharshadhyeta/Strata-HotRod). What was ported, with every measurement:
 [docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md). Upstream's own README for this branch is kept in the history
 ([the last version](https://github.com/sangharshadhyeta/Strata-HotRod/blob/6c02a2e1/README.md)).
-It runs two models: the full model (341 GB, about 6 tokens/s here) and the **Coder**, a half-expert coding version (about 285 GB,
-about 9 tokens/s here); the tables below give each its own numbers.
+It runs two models: the full model (341 GB, 7.5-8 tokens/s over a whole answer here, peaking near 10) and the **Coder**, a half-expert coding version
+(about 285 GB, about 9 tokens/s here); the tables below give each its own numbers.
 
 </div>
 
@@ -58,7 +58,8 @@ Measured on the machine below (answer tokens/s, the same 3 questions, every answ
 <tr><th align="left">Model and setting</th><th align="right">tokens/s</th></tr>
 <tr><td align="left"><b>Coder</b> (14 Nov): pictures on, 262K context, the ring, learned prompt chunk (2816), the picture tower in the prompt arena, 366 experts on the card</td><td align="right"><b>9.1</b> pooled (answers of 272 / 355 / 619 tokens: 10.4 / 9.1 / 8.6)</td></tr>
 <tr><td align="left">The Coder before the elastic arena and the learned chunk (13 Nov)</td><td align="right">7.8</td></tr>
-<tr><td align="left"><b>Full model</b>, the default of 6 Nov: pictures on, 262K context, the ring, stand-ins and the self-setting read-ahead cap (not re-measured since)</td><td align="right"><b>6.33</b> (rounds 5.95 / 6.42 / 6.62)</td></tr>
+<tr><td align="left"><b>Full model</b> (13 Nov, 21:45-22:08, six runs of the same three questions, pictures on, 262K context): the mean over each run's three answers / the best single answer</td><td align="right"><b>7.5 - 7.9</b> / 9.8 - 10.2 (worst answers 6.6 - 6.8)</td></tr>
+<tr><td align="left"><b>Full model</b>, the default of 6 Nov: pictures on, 262K context, the ring, stand-ins and the self-setting read-ahead cap</td><td align="right"><b>6.33</b> (rounds 5.95 / 6.42 / 6.62)</td></tr>
 <tr><td align="left">The full model before the read-ahead cap, the ring off with pictures on (5 Nov)</td><td align="right">4.7 - 5.0</td></tr>
 <tr><td align="left">The first ring + stand-ins default of the full model (1 Nov, 32K, no pictures)</td><td align="right">5.2 / 5.3 / 5.4</td></tr>
 </table>
@@ -68,9 +69,10 @@ Measured on the machine below (answer tokens/s, the same 3 questions, every answ
 **The speed starts high and settles.** A fresh answer runs fastest in its first hundreds of tokens and slows as it gets longer
 (the Coder's three answers above: 10.4, 9.1, 8.6 tokens/s for 272, 355 and 619 tokens), so a live counter shows a peak first;
 the figures in the table are the whole answer's mean, which is what you get over a long one. The Coder's 9.1 is one run of three
-questions (the 7.8 before it, the same three), so read it as "about 8.5-9", not as two decimals. The full model has not been
-re-run with the 13-14 Nov changes (the picture tower in the arena, the learned chunk); they are in the code, and its numbers
-above are the older ones.
+questions (the 7.8 before it, the same three), so read it as "about 8.5-9", not as two decimals. The full model's 13 Nov rows
+are taken from the server log's per-answer lines (the same three questions each time; the best answer in each run was the
+shortest-prompt one, 9.8-10.2, the worst 6.6-6.8); it has not been re-run since the 14 Nov changes (the picture tower in the arena,
+the learned chunk), which are in the code.
 
 </div>
 
