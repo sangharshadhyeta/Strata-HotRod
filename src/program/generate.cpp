@@ -19,10 +19,12 @@
 #include "strata/core/arch_defaults.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/dma_batch.hpp"
+#include "strata/program/adaptive_range.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/serve_stop_bound.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -3420,6 +3422,18 @@ int main(int argc, char** argv) {
                 std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
                 o.native_dense_gguf.push_back(o.ple_gguf);
         }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+        // CUDA, a file that carries the hyper-connection projections as Q8_0 (Unsloth's UD-* files): the Q8_0 read is on by default (upstream
+        // Strata 567c46873, owner yes 2026-11-07, ported by hand).  The GSQ-RCO packs keep them BF16 and stay as they were.  STRATA_HC_Q8=0
+        // turns it off; a value the user set is kept.  Before the first read of the switch (the dense load below).
+        if (std::getenv("STRATA_HC_Q8") == nullptr && strata::core::NativeDense::gguf_carries_q8_hc(o.native_dense_gguf)) {
+#if defined(_WIN32)
+            _putenv_s("STRATA_HC_Q8", "1");
+#else
+            setenv("STRATA_HC_Q8", "1", 0);
+#endif
+        }
+#endif
         // Plan v0.3 (24 Sep): the CPU experts stay on the VNNI kernel.  The llama.cpp-CPU-exact q8_0 contract
         // cost 27.0 vs 17.2 ms/token of pool time and G-C does not need it; `--cpu-oracle-q8-0` still selects it.
     }
@@ -10861,7 +10875,7 @@ int main(int argc, char** argv) {
         Clock::time_point a_t0;
         std::atomic<bool> a_err{false};
         double a_pick_ms = 0;             // the arena's inline choice, summed (the stats line)
-        size_t a_lo = 0, a_hi = 0, a_bi = 0;   // the batch being copied in (a_copy_in), and where the next one starts
+        strata::program::AdaptiveCopyRange a_rng;   // the batch being copied in (a_copy_in), and where the next one starts
         std::vector<AHome> ahomes;   // [0] = CUDA0's cache, [k] = layer split stage k's
         std::unique_ptr<JobThread> ajob;
         // the arena mode (srcp == &arena_src): every expert is in the arena already, so a round is a copy in only - no
@@ -10997,7 +11011,7 @@ int main(int argc, char** argv) {
         };
         auto a_copy_in = [&]() {   // step 2 on the job thread (the serial loop): each source read, then copied in
             std::vector<uint8_t> used(ahomes.size(), 0);
-            for (size_t i = a_lo; i < a_hi; ++i) {   // (the batch; all the round's swaps unless the arena caps it)
+            for (size_t i = a_rng.lo; i < a_rng.hi; ++i) {   // (the batch; all the round's swaps unless the arena caps it)
                 const ASwap& w = aswaps[i];
                 if (const uint8_t* b = a_from(w)) {
                     a_in_one(w, b);
@@ -11008,9 +11022,7 @@ int main(int argc, char** argv) {
                 if (used[hi]) a_mark(ahomes[hi]);
         };
         auto a_post_batch = [&]() {   // step 2: the next batch of copies in goes to the job thread (all of them but for the arena's cap)
-            a_lo = a_bi;
-            a_hi = a_batch > 0 ? std::min(aswaps.size(), a_bi + a_batch) : aswaps.size();
-            a_bi = a_hi;
+            a_rng.next_batch(aswaps.size(), a_batch);
             ajob->post(a_copy_in);
         };
         auto a_stage_in = [&]() {   // step 2's host part on the job thread (the pipelined loop: a_in queues the copies)
@@ -11131,10 +11143,13 @@ int main(int argc, char** argv) {
                     if (pl) {   // the copies in at each card's next gap: after this step, so fenced (see above)
                         a_res_dirty = true;
                         for (const ASwap& w : aswaps) a_in_due[(size_t) w.home] = 1;
+                        // the whole round is one batch: when the pipelined loop drains before step 3, the next tick
+                        // takes step 3 on the serial rule and marks [lo, hi), which an earlier round left otherwise
+                        a_rng.whole_round(aswaps.size());
                         ajob->post(a_stage_in);
                     } else {
                         res_upload();
-                        a_lo = a_hi = a_bi = 0;
+                        a_rng.clear();
                         a_post_batch();
                     }
                     astate = AState::SwapIn;
@@ -11145,15 +11160,15 @@ int main(int argc, char** argv) {
                     if (a_due(a_in_due)) return true;   // (pipelined) a card not seen idle since step 2
                     if (!a_ready(drain || a_wait)) return true;
                     if (a_err.load()) return false;
-                    for (size_t i = pl ? 0 : a_lo; i < (pl ? aswaps.size() : a_hi); ++i) {   // (the batch just landed)
+                    for (size_t i = a_rng.landed_begin(pl); i < a_rng.landed_end(pl, aswaps.size()); ++i) {   // (the batch just landed)
                         const ASwap& w = aswaps[i];
                         host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
                         srcp->release(w.layer, w.in);
                     }
                     if (pl) a_res_dirty = true;
                     else res_upload();
-                    a_swapped += pl ? (int64_t) aswaps.size() : (int64_t) (a_hi - a_lo);
-                    if (!pl && a_bi < aswaps.size()) {   // the arena's cap: the next batch goes now
+                    a_swapped += (int64_t) (a_rng.landed_end(pl, aswaps.size()) - a_rng.landed_begin(pl));
+                    if (!pl && a_rng.more(aswaps.size())) {   // the arena's cap: the next batch goes now
                         for (AHome& h : ahomes) h.used = false;
                         a_post_batch();
                         if (!drain) return true;
@@ -15233,6 +15248,10 @@ int main(int argc, char** argv) {
             bool first_window = true;
             strata::core::Verifier::route_budget_begin(n);   // STRATA_ROUTE_BUDGET_DYN: this request's first decode window runs at b_lo (n: the prompt tokens, the size class)
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+            // #4677 (upstream Strata, ported by hand): a window commits only the accepted rows this request can still emit (max_new) and ends at
+            // the first EOS, so the conversation the session parks is exactly what the client got and the next continuation reuses it instead of
+            // falling back to an older checkpoint.  On by default; STRATA_SERVE_STOP_BOUND=0 turns it off.  It changes no emitted token.
+            static const bool stop_bound = strata::core::serve_stop_bound_on(std::getenv("STRATA_SERVE_STOP_BOUND"));
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
@@ -15776,6 +15795,10 @@ int main(int argc, char** argv) {
                     chain_kind = 0;
                     int a = 0;
                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
+                    if (stop_bound)
+                        a = std::max(0, strata::core::serve_stop_bound(a + 1, max_new - produced_n, outp.data(), [&](int32_t y) {
+                            return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                        }) - 1);
                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
                     draft_offered += A.T - 1;
@@ -16302,6 +16325,12 @@ int main(int argc, char** argv) {
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (fr_cut >= 1) a = std::min(a, fr_cut - 1);   // STRATA_FRAGILE_RECHECK: rows fr_cut.. are re-decided, not kept
+                // A merged window contains prompt rows: every one must still be committed.  Otherwise do not cache accepted rows whose outputs this
+                // request cannot emit (#4677, upstream Strata).
+                if (stop_bound && !merged)
+                    a = std::max(0, strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
+                        return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                    }) - 1);
                 // STRATA_STANDIN_BALANCE: the committed decode tokens count toward the round (every 256; one round per count)
                 if (!merged && strata::core::Verifier::standin_balance_on())
                     ver.standin_balance_commit(a + 1, drive.d.usage, drive.d.miss, drive.d.keep_bias);
