@@ -56,7 +56,7 @@ Measured on the machine below (answer tokens/s, the same 3 questions, every answ
 
 <table width="100%">
 <tr><th align="left">Model and setting</th><th align="right">tokens/s</th></tr>
-<tr><td align="left"><b>Coder</b> (14 Nov): pictures on, 262K context, the ring, learned prompt chunk (2816), the picture tower in the prompt arena, 366 experts on the card</td><td align="right"><b>9.1</b> pooled (answers of 272 / 355 / 619 tokens: 10.4 / 9.1 / 8.6)</td></tr>
+<tr><td align="left"><b>Coder</b> (14 Nov): pictures on, 262K context, the ring, learned prompt chunk (2816), the picture tower in the prompt arena, 362 of its 7,680 experts on the card</td><td align="right"><b>9.1</b> pooled (answers of 272 / 355 / 619 tokens: 10.4 / 9.1 / 8.6)</td></tr>
 <tr><td align="left">The Coder before the elastic arena and the learned chunk (13 Nov)</td><td align="right">7.8</td></tr>
 <tr><td align="left"><b>Full model</b> (13 Nov, 21:45-22:08, six runs of the same three questions, pictures on, 262K context): the mean over each run's three answers / the best single answer</td><td align="right"><b>7.5 - 7.9</b> / 9.8 - 10.2 (worst answers 6.6 - 6.8)</td></tr>
 <tr><td align="left"><b>Full model</b>, the default of 6 Nov: pictures on, 262K context, the ring, stand-ins and the self-setting read-ahead cap</td><td align="right"><b>6.33</b> (rounds 5.95 / 6.42 / 6.62)</td></tr>
@@ -66,13 +66,14 @@ Measured on the machine below (answer tokens/s, the same 3 questions, every answ
 
 <div align="justify">
 
-**The speed starts high and settles.** A fresh answer runs fastest in its first hundreds of tokens and slows as it gets longer
-(the Coder's three answers above: 10.4, 9.1, 8.6 tokens/s for 272, 355 and 619 tokens), so a live counter shows a peak first;
-the figures in the table are the whole answer's mean, which is what you get over a long one. The Coder's 9.1 is one run of three
-questions (the 7.8 before it, the same three), so read it as "about 8.5-9", not as two decimals. The full model's 13 Nov rows
-are taken from the server log's per-answer lines (the same three questions each time; the best answer in each run was the
-shortest-prompt one, 9.8-10.2, the worst 6.6-6.8); it has not been re-run since the 14 Nov changes (the picture tower in the arena,
-the learned chunk), which are in the code.
+**The speed depends on the question.** The same three questions give nearly the same speeds every run. The full model, six runs
+on 13 Nov (from the server log's per-answer lines): the first question (250-284 tokens) 9.8-10.2 tokens/s, the second (295-1,030
+tokens) 8.15-8.45, the third (384-974 tokens) 6.56-6.82. Within one question the answer's length changes little (the third: 6.82 at
+384 tokens, 6.71 at 974). The Coder's answers on 14 Nov, 10.4 / 9.1 / 8.6 for 272 / 355 / 619 tokens, are the same pattern. The
+table's figure is the mean over the three questions. A live counter can read higher early in a chat than that mean; we have not
+measured the speed inside one answer, so we do not explain it. The Coder's 9.1 is one run of three questions (the 7.8 before it, the
+same three): read it as "about 8.5-9", not as two decimals. The full model has not been re-run since the 14 Nov changes (the picture
+tower in the arena, the learned chunk), which are in the code.
 
 </div>
 
@@ -110,7 +111,8 @@ To upstream's DeepSeek engine, on by default when the ring is on (`=0` turns eac
 
 - **Two models, one engine** (14 Nov): the full model and the Coder run on the same engine with the same switches; `setup.py` lists
   both (`--model Starw1-2.00bpw-MXFP8`, `--model Coder-2.00bpw-MXFP8`). The Coder holds half the experts, so more of them fit the
-  card (366 on a 12 GB card against 224) and its answers run faster.
+  card (362 of its 7,680 on this 12 GB card, from the engine's own start line; the full model had 224 of 15,360 on 6 Nov) and its
+  answers run faster.
 - **The picture tower borrows the prompt arena** (14 Nov): the lazy tower (319 MiB, in host memory between pictures) takes its memory
   for a picture turn from the chunked pass's arena, which the ring hands back and takes again after, so no VRAM is kept free for
   it; before this a picture could fail with a CUDA allocation error on a card with a learned reserve.
