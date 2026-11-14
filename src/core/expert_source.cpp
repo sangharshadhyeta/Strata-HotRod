@@ -1144,6 +1144,7 @@ void FileExpertSource::io_worker() {
                 if (!ok) {
                     stage_of_.erase(stage_key_[v]);
                     stage_key_[v] = -1;
+                    stage_pf_[v] = 0;   // (the guess path below clears it too: a failed read is neither used nor unused)
                 }
             }
             stage_cv_.notify_all();
@@ -3436,18 +3437,20 @@ bool FileExpertSource::take_read_ahead(int64_t layer, int64_t expert, uint8_t* d
     if (dst == nullptr || stage_blob_ == 0 || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const int64_t key = layer * n_expert_ + expert;
     size_t v = 0;
+    const uint8_t* src = nullptr;   // the buffer's address, taken under the lock: the pool (stage_buf_) can grow, and the vector move, once it is released
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         const auto it = stage_of_.find(key);
         if (it == stage_of_.end()) return false;
         v = it->second;
         if (stage_busy_[v] || stage_key_[v] != key) return false;   // still being read or queued: not taken, nothing reserved
+        src = stage_buf_[v].get();
         stage_busy_[v] = 1;                                         // held for this copy (a victim is never a busy buffer)
         stage_epoch_[v] = epoch_;
         stage_used_[v] = ++stage_seq_;
         if (stage_pf_[v]) { if (stage_pf_[v] >= 2) ra_outcome(stage_pf_[v] - 2); stage_pf_[v] = 0; io_pf_used_.fetch_add(1, std::memory_order_relaxed); }   // a layer asked for what was read ahead
     }
-    std::memcpy(dst, stage_buf_[v].get(), (size_t) layer_blob_bytes_[(size_t) layer]);
+    std::memcpy(dst, src, (size_t) layer_blob_bytes_[(size_t) layer]);
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_busy_[v] = 0;

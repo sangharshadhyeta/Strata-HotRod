@@ -2296,7 +2296,9 @@ class StrataEngine:
         try:
             if self.proc.poll() is None:
                 try:
-                    self.proc.stdin.write("QUIT\n")
+                    # STOP first: the engine's reader thread takes it at once and ends a running request within a chunk or a window; a QUIT
+                    # alone waits behind it, the 20 s below run out, the engine is terminated and the learners it saves at QUIT are lost
+                    self.proc.stdin.write("STOP\nQUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
                     self.proc.wait(timeout=20)

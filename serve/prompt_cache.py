@@ -61,6 +61,9 @@ class PromptCache:
             except (OSError, ValueError):
                 self._remove(key)         # a sidecar without its state, or an unreadable one
                 continue
+            if not isinstance(meta, dict):   # valid JSON that is not an object ([], null, a number): as unreadable (it was a traceback at start)
+                self._remove(key)
+                continue
             if meta.get("fingerprint") == self.fingerprint and isinstance(meta.get("tokens"), list):
                 self.entries[key] = {"tokens": meta["tokens"], "bytes": size, "used": meta.get("used", 0),
                                      "prompt_len": int(meta.get("prompt_len") or 0)}
@@ -214,8 +217,28 @@ class PromptCache:
             return f"prompt cache: restore of {best_len} tokens refused ({str(e)[:120]}); entry {'dropped' if bad else 'kept'}"
         self.held, self.held_gen = list(self.entries[best_key]["tokens"]), gen
         self.entries[best_key]["used"] = time.time()
+        self._touch(best_key)
         self.stats["restores"] += 1
         return f"prompt cache: restored {best_len} tokens in {time.time() - t0:.2f} s (the engine held {have})"
+
+    def _touch(self, key: str):
+        """The entry's `used` time into its sidecar (the same temp file and replace as a save).  Only the in-memory time was updated before, and
+        _scan reads `used` from the sidecar: an entry restored every day was deleted at a restart once it was older than the age limit since its
+        SAVE.  A failure changes nothing (the restore went through)."""
+        e = self.entries.get(key)
+        if e is None:
+            return
+        meta = {"fingerprint": self.fingerprint, "tokens": e["tokens"], "used": e["used"], "prompt_len": e.get("prompt_len", 0)}
+        tmp = os.path.join(self.dir, key + ".json.tmp")
+        try:
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            os.replace(tmp, os.path.join(self.dir, key + ".json"))
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     # ---- after a request: remember what the engine holds, and save it when the read was long
     def after(self, engine, ids: list[int], generated: list[int], prompt_read: int | None, save: bool = True) -> str | None:
