@@ -56,8 +56,8 @@ of RAM at 50-70 tokens/s.
 
 > ### 🐋 Looking for DeepSeek-V4.1-Flash? It is on another branch.
 > **Go to the [`upstream-dsv41` branch](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41)**: it has its own engine
-> (`strata-dsv41`), its own install steps and its own README, for the full model (about 6 tokens/s on this PC) and the **Coder**
-> (a half-expert coding version, about 9 tokens/s). Everything on this page, `setup.py` included, is for Qwen3.8-Flash-Next.
+> (`strata-dsv41`), its own install steps and its own README, for the full model (IQ2_XXS, 7.5-8 tokens/s over a whole answer on this PC, peaking near 10) and
+> the **Coder** (a half-expert coding version, about 9 tokens/s). Everything on this page, `setup.py` included, is for Qwen3.8-Flash-Next.
 > The two branches are kept apart on purpose.
 
 ## Can Qwen3.8-Flash-Next run on an RTX 3060 12 GB with low RAM?
@@ -277,8 +277,8 @@ its default and what it does: [docs/FEATURES-qwen.md](docs/FEATURES-qwen.md) (ge
 
 **For DeepSeek, go to the [`upstream-dsv41` branch](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41)**: its
 README there is the one to follow. The same ideas ported to upstream Strata's DeepSeek engine run **DeepSeek-V4.1-Flash**
-(Starw1's uncensored GSQ-RCO IQ2_XXS backbone with DeepSeek's MXFP8 Engram, 341 GB of files) on this same PC at **about 6
-tokens/s** (6.33 over three alternated rounds on 6 Nov), and its **Coder** version (half the experts, about 285 GB) at about 9. That
+(Starw1's uncensored GSQ-RCO IQ2_XXS backbone with DeepSeek's MXFP8 Engram, 341 GB of files) on this same PC at **7.5-8
+tokens/s over a whole answer** (the best answers peak near 10; 13 Nov, six runs of three questions; 6.33 on 6 Nov before later changes), and its **Coder** version (half the experts, about 285 GB) at about 9. That
 branch is upstream Strata 0.2.7.1 plus this fork's DeepSeek work, with its own engine, `strata-dsv41`; the two branches are kept
 apart and ported by hand.
 
