@@ -5049,8 +5049,44 @@ struct Model::Impl {
             const double tw = now_ms();
             warm_flow();   // (it writes the chunk buffers: the arena's fills start after it)
             if (o.verbose) std::fprintf(stderr, "ds4: prompt path warmed up in %.0f ms\n", now_ms() - tw);
+            vram_reserve_check_tower();   // (everything the load takes is taken now: what is free is what a picture turn gets)
             if (lend_on) lend_request();
         });
+    }
+    // A lazy picture tower (in host memory between pictures) takes its graphics memory for a picture turn from what is free at rest.  The load-end
+    // learner (vram_reserve_learn) measures before the warm-up and counts the ring's slots back as free, so a reserve learned without pictures can
+    // leave less than the tower needs once everything is up (RTX 3060, 920 MiB reserve: 147-183 MiB free at rest, 319 + 192 MiB needed; a picture turn
+    // then failed to allocate).  Measured here, after the warm-up: a shortfall raises the learned reserve by the shortfall and 128 MiB for the next
+    // start, the same step the load-end learner takes.  The ring also keeps that much free when it is sized (ring_setup), so the next start needs no
+    // more than it.
+    void vram_reserve_check_tower() {
+        if (!(o.vision_lazy && vt.lazy()) || o.reserve_set || devs.empty()) return;
+        size_t fr = 0, tot = 0;
+        cudaSetDevice(devs[0].id);
+        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+        const int64_t free_mib = (int64_t) (fr >> 20);
+        // (half the margin must be there at rest: the ring left the whole margin free when it was sized, and the load took ~30 MiB after that;
+        // the margin is for what an encode takes besides the tower's own buffers)
+        const int64_t need = (int64_t) (vt.device_bytes() >> 20) + VisionTower::kLazyMargin / 2;
+        if (free_mib >= need) return;
+        auto m = vram_reserve_read();
+        const std::string key = vram_reserve_key();
+        const int64_t old = m.count(key) != 0 ? m[key] : o.reserve_mib;
+        const int64_t now = old + (need - free_mib) + 128;
+        m[key] = now;
+        const std::string path = o.pack + "/vram-reserve.txt", tmp = path + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            for (const auto& kv : m) f << kv.first << " " << kv.second << "\n";
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        std::fprintf(stderr, "ds4: the picture tower needs %lld MiB free at rest (%lld + %lld) and %lld MiB are free: the next start keeps %lld MiB (was %lld)\n",
+                     (long long) need, (long long) (vt.device_bytes() >> 20), (long long) VisionTower::kLazyMargin / 2, (long long) free_mib, (long long) now,
+                     (long long) old);
     }
     // ---- the chunked prompt path
     size_t x_cap() const { return (size_t) std::max<int>(kWin, chunk + 2); }   // a window's / chunk's new source rows
@@ -9443,7 +9479,7 @@ struct Model::Impl {
     }
     void ring_setup() {
         const char* env = std::getenv("DS4_RING");
-        const int n = env != nullptr ? std::atoi(env) : 0;
+        int n = env != nullptr ? std::atoi(env) : 0;
         if (n <= 0) return;
 #if defined(STRATA_METAL)
         std::fprintf(stderr, "ds4: ring: off (the Metal path publishes no per-pick flags)\n");
@@ -9471,10 +9507,22 @@ struct Model::Impl {
             (void) cudaGetLastError();
             fr = 0;
         }
-        if (fr < (size_t) n * stride + ((size_t) 256 << 20)) {
-            std::fprintf(stderr, "ds4: ring: off (%.2f GB of VRAM free: %d slots of %.1f MB and 0.25 GB kept would not fit)\n", (double) fr / 1e9, n,
-                         (double) stride / 1e6);
-            return;
+        // What the ring leaves free at rest: 256 MiB, and with a lazy picture tower (in host memory between pictures, loaded onto the card for a
+        // picture turn) the tower's size plus its margin - the reserve the tower was accepted lazy against (VisionTower::load) is spent by the
+        // ring otherwise, and the picture turn then fails to allocate ("vision: no graphics memory free for the picture tower"; seen on the RTX 3060
+        // with a 920 MiB reserve: 183 MiB free at rest, 319 MiB needed).  When the ring does not fit beside that, it takes the slots that do.
+        size_t keep = (size_t) 256 << 20;
+        if (o.vision_lazy && vt.lazy()) keep = std::max(keep, vt.device_bytes() + ((size_t) VisionTower::kLazyMargin << 20));
+        if (fr < (size_t) n * stride + keep) {
+            const int fit = fr > keep ? (int) ((fr - keep) / stride) : 0;
+            if (fit < 4) {
+                std::fprintf(stderr, "ds4: ring: off (%.2f GB of VRAM free: %d slots of %.1f MB and %.2f GB kept would not fit)\n", (double) fr / 1e9, n,
+                             (double) stride / 1e6, (double) keep / 1e9);
+                return;
+            }
+            std::fprintf(stderr, "ds4: ring: %d slots, not %d (%.2f GB of VRAM free, %.2f GB kept free%s)\n", fit, n, (double) fr / 1e9, (double) keep / 1e9,
+                         keep > ((size_t) 256 << 20) ? " for the picture tower's turns" : "");
+            n = fit;
         }
         if (cudaMalloc((void**) &ring_buf, (size_t) n * stride) != cudaSuccess) {
             (void) cudaGetLastError();
