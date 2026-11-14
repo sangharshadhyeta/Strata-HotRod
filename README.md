@@ -40,7 +40,7 @@ Nothing leaves your PC.</p>
 <table>
 <tr>
 <td align="center" width="25%"><h2>🧊 78 - 111 GB</h2>of model on a <b>30 GB</b> PC (IQ3_S and UD-Q4_K_XL)</td>
-<td align="center" width="25%"><h2>🔥 50-70 / 15-22</h2>tokens/s on one RTX 3060: IQ3_S (131K context, short answers) / UD-Q4_K_XL (14 Nov, short tests, learners still cold)</td>
+<td align="center" width="25%"><h2>🔥 50-70 / 15-22</h2>tokens/s on one RTX 3060: IQ3_S (131K context, short answers) / UD-Q4_K_XL</td>
 <td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash: see the <a href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41"><b>upstream-dsv41</b> branch</a></td>
 <td align="center" width="25%"><h2>⚡ 0.4 s</h2>to pick up a 45K-token conversation (next turn, from the saved state)</td>
 </tr>
