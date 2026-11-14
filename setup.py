@@ -97,6 +97,7 @@ HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",   # 2026-10-07 (adds IQ3_S)
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
+    "Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF": "cfe5da6df1b4e22baf864e33f5132a6202c821e3",   # 2026-11-09 (Strata-HotRod's DeepSeek Coder)
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",           # 2026-10-13
@@ -740,6 +741,21 @@ DSV41_STARW1_FILES = {
     "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf": (20870099072, "f49bfdecba1b9d04289fb5d1a86efa3a62830202f3c7b271a664d2651d7d3473"),
     DSV41_MXFP8_ENGRAM: (202758032880, "fdd44bfc8ef37ccf292754c057230197c914907df4e3aa231d55a01d99b1b030"),
 }
+# Strata-HotRod's DeepSeek Coder: Abiray's uncensored build of ISTA-DASLab's Coder release (192 of the 384 routed experts a layer kept, the ones code
+# and tools use; the IQ2_XXS backbone with Abiray's 82 transplanted residual-stream tensors).  Five backbone shards (72.1 GB) and its own picture reader;
+# the n-gram table is the full model's MXFP8 Engram (DSV41_MXFP8_ENGRAM, shared; the repository lists it as a sixth shard by symlink), the drafter and the
+# metadata shard are Unsloth's, as for every set.  Pins from the Hub's LFS sha256 of each file at the pinned revision.
+DSV41_CODER_REPO = "Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF"
+DSV41_CODER_SHARD = "DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-IQ2_XXS-{i:05d}-of-00006.gguf"
+DSV41_CODER_MMPROJ = "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf"
+DSV41_CODER_FILES = {
+    DSV41_CODER_SHARD.format(i=1): (5780704, "108e63d27240da2d99846250727a7b282e05a7fdf2448435e81904b9a98d8a4a"),
+    DSV41_CODER_SHARD.format(i=2): (19776064960, "a503855d07b92bb9cf87583791788019cc5dcf57e46c9f80b99ae597b69fc880"),
+    DSV41_CODER_SHARD.format(i=3): (19939989696, "a402c6d3ff9ebe5213cef3e59c6e7bb95f00f749d07f5491276acc35d01bf0db"),
+    DSV41_CODER_SHARD.format(i=4): (19682533472, "ca5e46dada8e6dd915532ddb0b5dd779d7cc59402ef8cb08fc0030671c559f43"),
+    DSV41_CODER_SHARD.format(i=5): (12719198624, "f375be5b2b08d0f4cacbc09462b97f98e674c5a91e7104815d3b4b9139204f74"),
+    DSV41_CODER_MMPROJ: (972208096, "0fdc4b7693f287e9665940cf42bd39c546ffe4f0def89c569d7d0e45d60d2df1"),
+}
 # today's name -> the name it had in the first release
 DSV41_LEGACY_NAMES = {
     **{DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i): "model-2.00bpw-%05d-of-00004.gguf" % i for i in range(1, 5)},
@@ -754,10 +770,12 @@ DSV41_SHARED = {
     DSV41_SHARD.format(i=1): hf(DSV41_REPO) + "UD-Q8_K_XL/",      # only its metadata is read (pack_gguf --engram-meta)
     DSV41_DSPARK: hf(DSV41_REPO),
     DSV41_MXFP8_ENGRAM: hf(DSV41_STARW1_REPO),                    # (Strata-HotRod's model only)
+    DSV41_CODER_MMPROJ: hf(DSV41_CODER_REPO),                     # (the Coder's own picture reader)
 }
 # (the MXFP8 table's name is its own, so the family's table carries it too, for the lookups by name; the Starw1 shards keep the official
 # names, whose pins here stay the official set's - install_dsv41 reads a model's own pins first)
-DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES, **DSV41_LEGACY_FILES, DSV41_MXFP8_ENGRAM: DSV41_STARW1_FILES[DSV41_MXFP8_ENGRAM]}
+DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES, **DSV41_LEGACY_FILES, DSV41_MXFP8_ENGRAM: DSV41_STARW1_FILES[DSV41_MXFP8_ENGRAM],
+                   **DSV41_CODER_FILES}
 DSV41_PROFILES = ROOT / "data" / "dsv41"           # the shipped hot-expert profiles (profile-2.00.bin, profile-2.25.bin, + .sha256)
 DSV41_CONTEXT = 8192          # the context the engine was checked at (4096 and 8192; 64K is not tried yet)
 DSV41_MAC_VISION = False      # an Apple Silicon Mac: the Metal engine has not run DeepSeek's picture tower (0.2.7.1), so pictures stay off there
@@ -805,6 +823,17 @@ MULTI_FILE_FAMILIES["deepseek41"]["models"] = {
         "source": "Starw1 (huggingface.co/" + DSV41_STARW1_REPO + "), with the DSpark drafter and a small metadata file from Unsloth",
         "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i) for i in range(1, 5)],
         "shared": [DSV41_MXFP8_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK], "sha256": DSV41_STARW1_FILES},
+    "Coder-2.00bpw-MXFP8": {
+        "label": "Coder 2.00 bpw uncensored, MXFP8 Engram (Strata-HotRod)",
+        "about": "the coding version, uncensored (Abiray's build of ISTA-DASLab's Coder): half the experts (192 a layer, the ones code and tools use), "
+                 "72 GB of model + 203 GB n-gram table + 8 GB drafter (284 GB of disk). Runs on a 12 GB card with 32 GB of RAM at about 8.5-9 "
+                 "tokens a second here (the full model: about 6); weaker outside coding, and its quality against the full model is not measured by us",
+        "ram_gb": 32, "recipe": "ista", "subdir": None, "legacy_subdir": None,
+        "profile": None,          # the shipped profiles are for 384 experts a layer: the engine makes this model's own from use
+        "hf": hf(DSV41_CODER_REPO), "mmproj": DSV41_CODER_MMPROJ,
+        "source": "Abiray (huggingface.co/" + DSV41_CODER_REPO + "), a build of ISTA-DASLab's Coder, with the full model's MXFP8 Engram from Starw1 and the DSpark drafter and a small metadata file from Unsloth",
+        "shards": [DSV41_CODER_SHARD.format(i=i) for i in range(1, 6)],
+        "shared": [DSV41_MXFP8_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK], "sha256": DSV41_CODER_FILES},
     "UD-Q8_K_XL": {
         "label": "Unsloth UD-Q8_K_XL",
         "about": "Unsloth Dynamic 8-bit: the experts in MXFP4 as DeepSeek made them, the rest in BF16 (the checkpoint's own precision); "
@@ -825,6 +854,7 @@ REPO_PINS = {
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": DSV41_FILES,
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": DSV41_ISTA_FILES,
+    DSV41_CODER_REPO: DSV41_CODER_FILES,
 }
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 ESP_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
@@ -8332,7 +8362,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     ds_vision = "off" if a.vision in ("no", "off") or (mac and not DSV41_MAC_VISION) else "on"
     if mac and not DSV41_MAC_VISION and a.vision not in ("no", "off"):
         warn("pictures are off for DeepSeek on a Mac: its picture reader has not been run on the Metal engine yet, so it reads text only")
-    shared_names = list(md.get("shared", [])) + ([DSV41_MMPROJ] if ds_vision == "on" else [])
+    shared_names = list(md.get("shared", [])) + ([md.get("mmproj", DSV41_MMPROJ)] if ds_vision == "on" else [])
     shared = [dsv41_find_shared(a, n, folder, shared_dir, pins) for n in shared_names]
     mmproj_file = shared[len(md.get("shared", []))] if ds_vision == "on" else None
     own_files = {f: bool(a.gguf_dir) or f.parent != shared_dir for f in shared}         # a file found outside setup's own folder is the person's
@@ -8474,8 +8504,8 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
             run([sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--out", str(pack),
                  *(["--mmproj", str(mmproj_file)] if mmproj_file else [])])
     if ista:
-        prof = DSV41_PROFILES / md["profile"]          # which experts are used most: the RAM store starts with them (the engine reads <pack>/expert-profile.bin)
-        if prof.is_file() and not (pack / "expert-profile.bin").exists():
+        prof = DSV41_PROFILES / md["profile"] if md.get("profile") else None   # which experts are used most: the RAM store starts with them (the engine reads <pack>/expert-profile.bin)
+        if prof is not None and prof.is_file() and not (pack / "expert-profile.bin").exists():
             pack.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(prof, pack / "expert-profile.bin")
         good, why = dsv41_pack_info(exe, pack, lib_dirs)

@@ -78,7 +78,20 @@ ISTA_SETS = {
                              "engram_bytes": 202_758_032_880,
                              "quality": "the official 2.00 set uncensored (abliterated), with the n-gram table at DeepSeek's own 8-bit "
                                         "precision; its quality against the original model is not measured"},
+    # Strata-HotRod's Coder: Abiray's uncensored build of ISTA-DASLab's Coder release - 192 of the 384 routed experts a layer, the 2.00 set's IQ2_XXS
+    # backbone (5 shards, 72,123,567,456 bytes: 66 GB of experts and the same 6.16 GB of dense weights) - with the full model's MXFP8 Engram.  RAM class: it
+    # runs on this 31 GB PC (an RTX 3060 12 GB), so 32 GB is the measured floor.
+    "Coder-2.00bpw-MXFP8": {"title": "Coder 2.00 bpw uncensored, MXFP8 Engram", "set_bytes": 72_123_567_456, "experts_gb": 65.96,
+                            "experts_per_layer": 192, "profile": None, "ppl": "not measured", "ram_ok_gb": 32.0, "ram_great_gb": 80.0,
+                            "disk_total": 284.0, "engram_bytes": 202_758_032_880,
+                            "quality": "the coding version of the 2.00 set, uncensored: half the experts (the ones code, tools and pictures use), "
+                                       "weaker outside coding; its quality against the full model is not measured here"},
 }
+
+
+def _n_experts(v: dict) -> int:
+    """The routed experts the set holds: 40 layers of the set's own count a layer (384, or 192 for the Coder)."""
+    return LAYERS * int(v.get("experts_per_layer", EXPERTS_PER_LAYER))
 
 
 def _eg(v: dict) -> int:
@@ -210,10 +223,11 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
     keep = [c for c in keep if float(c.get("vram_gb") or 0) >= SMALLEST_CARD_GB]
     keep.sort(key=lambda c: c.get("index", 0))
     n = len(keep)
-    expert_gb = v["experts_gb"] / EXPERTS
+    NE = _n_experts(v)
+    expert_gb = v["experts_gb"] / NE
     set_gb = v["set_bytes"] / GB
     download = ista_download_bytes(model) / GB
-    out: dict[str, Any] = {"variant": model, "cards": [], "experts_total": EXPERTS, "experts_in_vram": 0, "vram_experts_gb": 0.0,
+    out: dict[str, Any] = {"variant": model, "cards": [], "experts_total": NE, "experts_in_vram": 0, "vram_experts_gb": 0.0,
                            "cpu_experts_gb": v["experts_gb"], "weights_gb": _round1(set_gb), "experts_gb": _round1(v["experts_gb"]),
                            "dense_gb": _round1(ISTA_DENSE_GB), "engram_gb": _round1(_eg(v) / GB), "download_gb": _round1(download),
                            "tp": tp_for(n, keep), "args": [], "measured": ISTA_MEASURED, "lines": [], "warnings": [], "ram_gb": ram_gb,
@@ -238,7 +252,7 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
         in_vram = 0
         for c, room, (a, b) in zip(keep, cap, ranges):
             gb = min(room, vram_exp * (room / sum(cap))) if sum(cap) else 0.0
-            ne = min(int(gb / expert_gb), (b - a + 1) * EXPERTS_PER_LAYER)
+            ne = min(int(gb / expert_gb), (b - a + 1) * (NE // LAYERS))
             in_vram += ne
             out["cards"].append({"index": c.get("index"), "name": c.get("name"), "vram_gb": float(c.get("vram_gb") or 0), "layers": [a, b],
                                  "dense_gb": _round1(per_dense), "experts_gb": _round1(ne * expert_gb), "experts": ne})
@@ -248,8 +262,8 @@ def _plan_ista(model: str, cards: list[dict] | None, ram_gb: float | None, disk_
         out["tp"] = tp_for(n, keep)
         out["args"] = _tp_args(n, out["tp"])
         names = " + ".join(f"{c['name'] or 'card ' + str(c['index'])} ({c['vram_gb']:.0f} GB)" for c in out["cards"])
-        lines.append(f"Graphics memory: {names}. About {in_vram:,} of the {EXPERTS:,} experts ({out['vram_experts_gb']:.0f} GB) stay on "
-                     f"the card{'s' if n > 1 else ''}; the other {EXPERTS - in_vram:,} ({out['cpu_experts_gb']:.0f} GB) are computed on the "
+        lines.append(f"Graphics memory: {names}. About {in_vram:,} of the {NE:,} experts ({out['vram_experts_gb']:.0f} GB) stay on "
+                     f"the card{'s' if n > 1 else ''}; the other {NE - in_vram:,} ({out['cpu_experts_gb']:.0f} GB) are computed on the "
                      "CPU from RAM, and the ones RAM cannot hold are read from the SSD when a word needs them.")
         if n >= 2 and out["tp"] == 2:
             lines.append("Two cards share each layer's matrices (--tp 2): measured about twice as fast at reading prompts.")
@@ -293,7 +307,7 @@ def _plan_uma(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
     UMA_MEASURED are the measured 64 GB box.  Never a refusal."""
     v = ISTA_SETS[key]
     total = uma_total_gb(card, ram_gb)
-    expert_gb = v["experts_gb"] / EXPERTS
+    expert_gb = v["experts_gb"] / _n_experts(v)
     set_gb = v["set_bytes"] / GB
     download = ista_download_bytes(model) / GB
     room = max(0.0, total - ISTA_DENSE_GB - UMA_RESERVE_GB)
@@ -305,7 +319,7 @@ def _plan_uma(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
         "variant": model, "cards": [{"index": card.get("index"), "name": card.get("name"), "vram_gb": _round1(total),
                                      "layers": [0, LAYERS - 1], "dense_gb": _round1(ISTA_DENSE_GB),
                                      "experts_gb": _round1(resident), "experts": in_mem}],
-        "experts_total": EXPERTS, "experts_in_vram": in_mem, "vram_experts_gb": _round1(resident), "cpu_experts_gb": 0.0,
+        "experts_total": _n_experts(v), "experts_in_vram": in_mem, "vram_experts_gb": _round1(resident), "cpu_experts_gb": 0.0,
         "weights_gb": _round1(set_gb), "experts_gb": _round1(v["experts_gb"]), "dense_gb": _round1(ISTA_DENSE_GB),
         "engram_gb": _round1(_eg(v) / GB), "download_gb": _round1(download), "tp": 1, "args": [],
         "measured": UMA_MEASURED, "lines": [], "warnings": [], "ram_gb": ram_gb, "context": context,

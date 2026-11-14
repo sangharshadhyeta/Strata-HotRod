@@ -37,6 +37,8 @@ This is the **DeepSeek branch** (`upstream-dsv41`) of Strata-HotRod: upstream [S
 [`main`](https://github.com/sangharshadhyeta/Strata-HotRod). What was ported, with every measurement:
 [docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md). Upstream's own README for this branch is kept in the history
 ([the last version](https://github.com/sangharshadhyeta/Strata-HotRod/blob/6c02a2e1/README.md)).
+It runs two models: the full model (341 GB, about 6 tokens/s here) and the **Coder**, a half-expert coding version (about 285 GB,
+about 9 tokens/s here); the tables below give each its own numbers.
 
 </div>
 
@@ -53,11 +55,24 @@ Measured on the machine below (answer tokens/s, the same 3 questions, every answ
 </div>
 
 <table width="100%">
-<tr><th align="left">Setting</th><th align="right">tokens/s</th></tr>
-<tr><td align="left">The default now (6 Nov): pictures on, 262K context, the ring, stand-ins and the self-setting read-ahead cap</td><td align="right"><b>6.33</b> (rounds 5.95 / 6.42 / 6.62)</td></tr>
-<tr><td align="left">The same before the read-ahead cap, the ring off with pictures on (5 Nov)</td><td align="right">4.7 - 5.0</td></tr>
-<tr><td align="left">The first ring + stand-ins default (1 Nov, 32K, no pictures)</td><td align="right">5.2 / 5.3 / 5.4</td></tr>
+<tr><th align="left">Model and setting</th><th align="right">tokens/s</th></tr>
+<tr><td align="left"><b>Coder</b> (14 Nov): pictures on, 262K context, the ring, learned prompt chunk (2816), the picture tower in the prompt arena, 366 experts on the card</td><td align="right"><b>9.1</b> pooled (answers of 272 / 355 / 619 tokens: 10.4 / 9.1 / 8.6)</td></tr>
+<tr><td align="left">The Coder before the elastic arena and the learned chunk (13 Nov)</td><td align="right">7.8</td></tr>
+<tr><td align="left"><b>Full model</b>, the default of 6 Nov: pictures on, 262K context, the ring, stand-ins and the self-setting read-ahead cap (not re-measured since)</td><td align="right"><b>6.33</b> (rounds 5.95 / 6.42 / 6.62)</td></tr>
+<tr><td align="left">The full model before the read-ahead cap, the ring off with pictures on (5 Nov)</td><td align="right">4.7 - 5.0</td></tr>
+<tr><td align="left">The first ring + stand-ins default of the full model (1 Nov, 32K, no pictures)</td><td align="right">5.2 / 5.3 / 5.4</td></tr>
 </table>
+
+<div align="justify">
+
+**The speed starts high and settles.** A fresh answer runs fastest in its first hundreds of tokens and slows as it gets longer
+(the Coder's three answers above: 10.4, 9.1, 8.6 tokens/s for 272, 355 and 619 tokens), so a live counter shows a peak first;
+the figures in the table are the whole answer's mean, which is what you get over a long one. The Coder's 9.1 is one run of three
+questions (the 7.8 before it, the same three), so read it as "about 8.5-9", not as two decimals. The full model has not been
+re-run with the 13-14 Nov changes (the picture tower in the arena, the learned chunk); they are in the code, and its numbers
+above are the older ones.
+
+</div>
 
 <div align="justify">
 
@@ -79,8 +94,9 @@ help: [docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md).
 <tr><td align="left"><b>Graphics card</b></td><td align="left">NVIDIA GeForce RTX 3060, 12 GB</td></tr>
 <tr><td align="left"><b>Processor, RAM</b></td><td align="left">Intel Core i5-12400F, 31 GB</td></tr>
 <tr><td align="left"><b>Disk</b></td><td align="left">NVMe on a PCIe 3.0 link (about 2.8 GB/s); the model files live on it</td></tr>
-<tr><td align="left"><b>Model</b></td><td align="left">Starw1's DeepSeek-V4.1-Flash-1017 uncensored: the GSQ-RCO IQ2_XXS backbone (138.6 GB) with DeepSeek's MXFP8 Engram (202.8 GB), which is the 341 GB; plus the DSpark drafter (8.0 GB, a separate file) and a 5.8 MB metadata shard from Unsloth</td></tr>
-<tr><td align="left"><b>Engine</b></td><td align="left">Strata 0.2.7.1 (upstream) plus this fork's DeepSeek work, release <code>v0.2.7.1-hotrod.2</code></td></tr>
+<tr><td align="left"><b>Full model</b></td><td align="left">Starw1's DeepSeek-V4.1-Flash-1017 uncensored: the GSQ-RCO IQ2_XXS backbone (138.6 GB) with DeepSeek's MXFP8 Engram (202.8 GB), which is the 341 GB; plus the DSpark drafter (8.0 GB, a separate file) and a 5.8 MB metadata shard from Unsloth. 384 routed experts a layer.</td></tr>
+<tr><td align="left"><b>Coder</b></td><td align="left">Abiray's uncensored build of ISTA-DASLab's Coder release (<code>Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF</code>): 192 of the 384 experts a layer kept (the ones code and tools use), the IQ2_XXS backbone in 5 shards (72.1 GB), with the full model's MXFP8 Engram (202.8 GB, shared with it), the drafter and the metadata shard, and its own picture reader (972 MB): about 285 GB on disk. Its authors report it is byte-identical in the routed experts to ISTA's release and refuses nothing; we have not measured its quality against the full model.</td></tr>
+<tr><td align="left"><b>Engine</b></td><td align="left">Strata 0.2.7.1 (upstream) plus this fork's DeepSeek work (branch <code>upstream-dsv41</code>; no release has been cut for the 13-14 Nov work)</td></tr>
 </table>
 </details>
 
@@ -90,6 +106,14 @@ help: [docs/HOTROD-DSV41-PORT.md](docs/HOTROD-DSV41-PORT.md).
 
 To upstream's DeepSeek engine, on by default when the ring is on (`=0` turns each off):
 
+- **Two models, one engine** (14 Nov): the full model and the Coder run on the same engine with the same switches; `setup.py` lists
+  both (`--model Starw1-2.00bpw-MXFP8`, `--model Coder-2.00bpw-MXFP8`). The Coder holds half the experts, so more of them fit the
+  card (366 on a 12 GB card against 224) and its answers run faster.
+- **The picture tower borrows the prompt arena** (14 Nov): the lazy tower (319 MiB, in host memory between pictures) takes its memory
+  for a picture turn from the chunked pass's arena, which the ring hands back and takes again after, so no VRAM is kept free for
+  it; before this a picture could fail with a CUDA allocation error on a card with a learned reserve.
+- **A learned prompt chunk** (14 Nov, see "On your own PC"): the chunk sizes the arena, and a smaller one keeps more experts on
+  the card; the engine searches once, downwards from 4096, with the read time as the accepted cost, and settles.
 - **A VRAM ring** (`DS4_RING=32`): the learned look-ahead's guesses for the next 1-2 layers are copied from a page-locked
   RAM store into card slots; a pick uses its slot only if the copy has landed in time.
 - **Sticky ring** (`DS4_RING_STICKY`): a landed copy stays until its slot is needed, so a later token that picks the same
@@ -223,6 +247,45 @@ and `--api-key`.
 
 <div align="justify">
 
+**The Coder** (about 285 GB on the NVMe: 72 GB of backbone, the 203 GB table the full model also uses, the drafter, 1 GB for
+pictures) is a second pack beside the full model's, made the same way from its own files. The commands this PC was set up with
+(the full model's Engram and metadata shard are reused from the folder above; the Coder's own picture reader is used, and the
+shipped expert profile is not copied: it is for 384 experts a layer and the Coder has 192, so the engine makes its own):
+
+</div>
+
+```bash
+C=/mnt/nvme/models/deepseek41-coder
+$PY - "$C" <<'EOF'
+import sys
+from huggingface_hub import snapshot_download
+snapshot_download("Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF", local_dir=sys.argv[1],
+                  allow_patterns=["*IQ2_XXS-0000[1-5]-of-00006.gguf", "mmproj-*.gguf", "chat_template.jinja"])
+EOF
+P=DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-IQ2_XXS
+$PY tools/dsv41/pack_gguf.py --model $C --shards $P-0000{1,2,3,4,5}-of-00006.gguf \
+  --engram $M/DeepSeek-V4.1-Flash-Engram-MXFP8.gguf \
+  --engram-meta $M/unsloth/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf \
+  --mmproj $C/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf --out /mnt/nvme/strata-data/packs/ds41c
+```
+
+<div align="justify">
+
+Its config is the full model's with `--pack .../ds41c`, `"model_name": "deepseek-v4.1-flash-coder"` and, in `env`, the switches our
+Coder runs with: `DS4_RING=32`, `DS4_RING_PIN=1`, `STRATA_STANDIN=1`, `DS4_LEND=1`, `DS4_LEND_RING=1`, `DS4_RING_STICKY=1`,
+`DS4_MASK=learn`, `DS4_STANDIN_LEARN=1`, `DS4_STANDIN_BALANCE=1`, `STRATA_LA_EXACT_W=4`, `STRATA_LA_LEARN=1`. Nothing is learned
+yet when a Coder pack is new (no trained look-ahead is published for it; the full model's is for 384 experts), so its first
+hours are slower than the table above, which is a pack that learned from a day of use.
+The installer: `setup.py --model Starw1-2.00bpw-MXFP8` (full) or `--model Coder-2.00bpw-MXFP8` (Coder) downloads the pinned files
+(size and SHA-256 checked), makes the pack and the config. **The Coder entry in the installer was added on 14 Nov and has not been run
+end to end**: a script checked that every file has its size, SHA-256 and download address and that the planner gives numbers for it,
+the repository's own `tools/test_setup_dsv41.py` did not finish in 15 minutes here and was stopped, and a 285 GB download and pack
+were not repeated. The commands above are what produced the measured pack.
+
+</div>
+
+<div align="justify">
+
 **On your own PC** the engine fits itself to the machine; the first hour of use is that fitting, so it starts slower:
 
 - **Measured at start:** the VRAM reserve (per card and context), the RAM store, the CPU lane's threads and which experts
@@ -279,7 +342,13 @@ Upstream's reference for the rest: [docs/DETAILS.md](docs/DETAILS.md) (it covers
 <div align="justify">
 
 - Any other graphics card, any AMD card, Windows, macOS or another Linux.
-- Any other DeepSeek set or size.
+- Any DeepSeek set other than Starw1's full model and the Coder (the official IST-DAS 1.75 / 2.00 / 2.25 sets and Unsloth's
+  UD-Q8_K_XL are in `setup.py` from upstream; we have not run them).
+- The Coder through `setup.py` (its pins and the planner were checked by a script; the download, the pack and the installer's own
+  test file were not run to the end).
+- The full model with the 13-14 Nov changes (its table rows are from 6 Nov).
+- The quality of the Coder against the full model, and the uncensored builds against the originals (their authors' numbers are
+  quoted above as theirs).
 - Several requests at once, or two graphics cards.
 
 </div>
@@ -290,7 +359,8 @@ Upstream's reference for the rest: [docs/DETAILS.md](docs/DETAILS.md) (it covers
 <div align="justify">
 
 The model is DeepSeek-V4.1-Flash by DeepSeek, compressed by Starw1 (the GSQ-RCO IQ2_XXS backbone with DeepSeek's MXFP8
-Engram), with metadata and the picture projector from Unsloth. Strata is by Niko1221 and its contributors; the DeepSeek
+Engram), with metadata and the picture projector from Unsloth. The Coder is ISTA-DASLab's expert-pruned release of it
+(GSQ-RCO), uncensored by Abiray. Strata is by Niko1221 and its contributors; the DeepSeek
 engine comes from Project Maya's maya-ds4. This fork keeps Strata's [MIT License](LICENSE) and copyright notice. The engine
 uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). A few parts and every model have their own
 licenses: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#license). Security: [SECURITY.md](SECURITY.md).
