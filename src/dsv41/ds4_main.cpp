@@ -144,6 +144,16 @@ struct Lines {
         q.pop_front();
         return true;
     }
+    // (DS4_KV_REFRESH) a request, a STOP or the end of the input is waiting
+    bool pending() {
+        std::lock_guard<std::mutex> lk(mu);
+        return !q.empty() || eof || stop.load();
+    }
+    // true when nothing arrived for `ms` milliseconds (the server is idle)
+    bool quiet_for(long long ms) {
+        std::unique_lock<std::mutex> lk(mu);
+        return !cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return !q.empty() || eof || stop.load(); });
+    }
 };
 
 // The drafts between two stats: each draft position (1st, 2nd, ..) - how often it was verified with every draft
@@ -789,6 +799,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 from = (size_t) m.pos();
             else m.reset();
         }
+        if (std::getenv("DS4_REUSE_DEBUG") != nullptr) {   // (diagnosis: why a turn reuses what it does)
+            std::string cps;
+            for (int64_t p : m.check_positions()) cps += std::to_string((long long) p) + " ";
+            std::fprintf(stderr, "ds4 reuse: state %zu tokens, prompt %zu, common prefix %zu, from %zu (continued %d, took %d), pos %lld, checkpoints at: %s\n", n_state,
+                         r.ids.size(), c, from, (int) continued, (int) took, (long long) m.pos(), cps.c_str());
+        }
         if (took || from == 0) held.clear();   // (a slot is text only: the state that comes back holds no pictures)
         if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
             std::printf("ERR the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", r.ids.size(),
@@ -1036,6 +1052,103 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (std::chrono::steady_clock::now() - prof_last >= std::chrono::minutes(2)) {
                 prof_last = std::chrono::steady_clock::now();
                 m.save_profile();
+            }
+        }
+        // DS4_KV_REFRESH=1 (opt-in; Strata addition): the K/V rows of this answer were written by decode steps of one token, the only steps that
+        // take stand-ins (feed_windows: d_standin && T == 1).  While the server is idle (DS4_KV_REFRESH_IDLE_MS of silence, default 3000), the
+        // answer's tokens are read again through feed() - windows or chunks of two or more tokens, which route exactly - from the checkpoint at
+        // the prompt's end, so the conversation the next turn continues holds exact rows.  Best effort: a request that arrives first stops it
+        // (the state is back at the prompt's end and the next request reads the answer again, as it does after a stop).  The next-token
+        // logits before and after are compared and logged: the measure of what the noise was.
+        static const bool kv_refresh = [] {
+            const char* v = std::getenv("DS4_KV_REFRESH");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (kv_refresh && held.empty() && !in.stop.load()) {
+            static const long long idle_ms = [] {
+                const char* v = std::getenv("DS4_KV_REFRESH_IDLE_MS");
+                return v != nullptr ? std::max(0LL, std::atoll(v)) : 0LL;   // (0: the moment the answer is done; a request already waiting skips it)
+            }();
+            const int64_t pos_end = m.pos();
+            const size_t n_gen = pos_end > (int64_t) total ? (size_t) (pos_end - (int64_t) total) : 0;
+            size_t n_ref = std::min<size_t>(n_gen, (size_t) std::max(0LL, produced));
+            // a last window of one token would take stand-ins (T == 1): in the windows path leave that token for the next turn's read
+            if (n_ref >= 2 && n_ref < 512 && n_ref % 16 == 1) --n_ref;
+            if (n_ref >= 2 && m.restorable((int64_t) total) == (int64_t) total && in.quiet_for(idle_ms)) {
+                static int64_t sum_n = 0, sum_same = 0, sum_cmp = 0;
+                static double sum_kl = 0, sum_s = 0;
+                const std::vector<int32_t> gen(m.tokens().begin() + (std::ptrdiff_t) total, m.tokens().begin() + (std::ptrdiff_t) (total + n_ref));
+                std::vector<float> before;
+                const bool have_before = n_ref == n_gen && m.logits(before) && !before.empty() && before.size() % (size_t) m.vocab() == 0;
+                const size_t V = (size_t) m.vocab();
+                const double tr0 = now_ms();
+                std::string rerr;
+                m.set_progress(nullptr);   // (the prompt's PP lines are not this)
+                // A request that arrives meanwhile is made to wait for a refresh that will end soon (the answer's tokens are what that request, if it
+                // continues this conversation, would read anyway - and exactly); one that would take long (n_ref / 40 tok/s above
+                // DS4_KV_REFRESH_MAX_WAIT_S, default 20) is stopped for it.  A STOP, QUIT or the end of the input always stops it.
+                static const double max_wait_s = [] {
+                    const char* v = std::getenv("DS4_KV_REFRESH_MAX_WAIT_S");
+                    return v != nullptr ? std::max(0.0, std::atof(v)) : 20.0;
+                }();
+                const bool protect = (double) n_ref / 40.0 <= max_wait_s;
+                m.set_cancel([&in, protect] { return in.stop.load() || (!protect && in.pending()); });
+                bool rok = m.restore((int64_t) total) && m.pos() == (int64_t) total;
+                if (rok) rok = m.feed(gen.data(), (int) n_ref, 1, rerr);
+                const bool cut = !rok && m.cancelled();
+                m.set_cancel(nullptr);
+                if (!rok) {
+                    // the state past the prompt's end is not usable after a stopped run: back to it; the next request reads the answer
+                    if (!(m.restore((int64_t) total) && m.pos() == (int64_t) total)) {
+                        m.reset();
+                        held.clear();
+                    }
+                    std::fprintf(stderr, "ds4 kv-refresh: %s after %.0f ms; the state is back at the prompt's end (%zu tokens)\n",
+                                 cut ? "a request arrived" : ("failed: " + rerr).c_str(), now_ms() - tr0, total);
+                } else {
+                    const double ms = now_ms() - tr0;
+                    char cmp[200] = "";
+                    std::vector<float> after;
+                    if (have_before && m.logits(after) && after.size() == before.size()) {
+                        // the last row of each: the distribution the next token is drawn from
+                        const float* a = before.data() + before.size() - V;
+                        const float* b = after.data() + after.size() - V;
+                        double ma = a[0], mb = b[0];
+                        for (size_t i = 1; i < V; ++i) {
+                            ma = std::max<double>(ma, a[i]);
+                            mb = std::max<double>(mb, b[i]);
+                        }
+                        double za = 0, zb = 0;
+                        for (size_t i = 0; i < V; ++i) {
+                            za += std::exp((double) a[i] - ma);
+                            zb += std::exp((double) b[i] - mb);
+                        }
+                        double kl = 0;
+                        size_t ia = 0, ib = 0;
+                        for (size_t i = 0; i < V; ++i) {
+                            const double pa = std::exp((double) a[i] - ma) / za, lb = (double) b[i] - mb - std::log(zb);
+                            if (pa > 1e-12) kl += pa * (std::log(pa) - lb);
+                            if (a[i] > a[ia]) ia = i;
+                            if (b[i] > b[ib]) ib = i;
+                        }
+                        ++sum_cmp;
+                        sum_same += ia == ib;
+                        sum_kl += kl;
+                        std::snprintf(cmp, sizeof cmp, "; next token: top-1 %s, KL %.5f nats (over %lld refreshed answers: top-1 same %lld, mean KL %.5f)",
+                                      ia == ib ? "same" : "CHANGED", kl, (long long) sum_cmp, (long long) sum_same, sum_kl / (double) sum_cmp);
+                    }
+                    sum_n += (int64_t) n_ref;
+                    sum_s += ms / 1000.0;
+                    std::fprintf(stderr, "ds4 kv-refresh: %zu answer tokens read again exactly in %.1f s (%.1f tok/s, context %lld)%s\n", n_ref, ms / 1000.0,
+                                 ms > 0 ? 1000.0 * (double) n_ref / ms : 0.0, (long long) m.pos(), cmp);
+                    (void) sum_n;
+                    (void) sum_s;
+                    if (std::getenv("DS4_REUSE_DEBUG") != nullptr) {
+                        std::string cps;
+                        for (int64_t p : m.check_positions()) cps += std::to_string((long long) p) + " ";
+                        std::fprintf(stderr, "ds4 kv-refresh: after it the state holds %zu tokens, pos %lld, checkpoints at: %s\n", m.tokens().size(), (long long) m.pos(), cps.c_str());
+                    }
+                }
             }
         }
     }
