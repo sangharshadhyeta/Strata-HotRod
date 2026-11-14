@@ -225,6 +225,10 @@ void VisionTower::free_device() {
     int cur = 0;
     cudaGetDevice(&cur);
     cudaSetDevice(at_);
+    // work queued on the tower's streams (a failed encode returns with kernels and copies still queued) must finish before the memory goes:
+    // cudaFree of an own buffer synchronises the device, but a borrowed block is never freed here, and the ring is refilling it right after
+    if (st_) cudaStreamSynchronize((cudaStream_t) st_);
+    if (cs_) cudaStreamSynchronize((cudaStream_t) cs_);
     for (int i = 0; i < 2; ++i) {
         if (copied_[i]) cudaEventDestroy((cudaEvent_t) copied_[i]);
         if (used_[i]) cudaEventDestroy((cudaEvent_t) used_[i]);

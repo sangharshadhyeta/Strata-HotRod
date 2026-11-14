@@ -188,7 +188,7 @@ public:
     bool load(const std::string& path) {
         FILE* f = std::fopen(path.c_str(), "r");
         if (f == nullptr) return false;
-        char line[256];
+        char line[kCtrlRing + 16];   // the saved 'ctrl ' line is up to kCtrlRing characters long (256 held the first 250 only)
         double budget = -1.0, k = -1.0, step = -1.0, clean = -1.0, tests = -1.0, lastwin = 2.0, alltok = 0.0, allfl = 0.0;
         while (std::fgets(line, sizeof line, f) != nullptr) {
             char key[32] = "";

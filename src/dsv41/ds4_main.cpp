@@ -750,7 +750,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         e = "a picture's span does not start at an image token of the prompt";
             if (!e.empty()) {
                 std::printf("ERR %s\n", e.c_str());
-                std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
+                // (an ERR ends the request: the server reads no DONE after it, and a stray one would answer the next request)
                 std::fflush(stdout);
                 continue;
             }
@@ -920,7 +920,6 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR %s\n", err.c_str());
-            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
             std::fflush(stdout);
             m.reset();
             held.clear();

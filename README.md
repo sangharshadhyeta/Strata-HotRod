@@ -228,6 +228,15 @@ cp data/dsv41/profile-2.00.bin /mnt/nvme/strata-data/packs/ds41v/expert-profile.
 
 <div align="justify">
 
+- **What `setup.py` writes into `"env"`.** The ring, lend and stand-in switches are off in the engine unless asked for, so setup writes the
+  six that the speeds above were measured with (`DS4_RING=32`, `DS4_RING_PIN`, `STRATA_STANDIN`, `DS4_LEND`, `DS4_LEND_RING`,
+  `DS4_RING_STICKY`) for **one NVIDIA card** only; no other setup was measured, so two cards, AMD and a Mac get none of them.
+  `DS4_RING=32` is a ceiling: the engine takes the slots that fit beside the free VRAM and turns the ring off with fewer than 4.
+  `STRATA_DSV41_RING=0` before setup writes none of them, `STRATA_DSV41_RING=16` sets another ceiling; a setup run again refreshes
+  these six and keeps any other `"env"` entry of yours. Other flags worth knowing on a different machine:
+  `DS4_STORE_HEADROOM_GB` (RAM the store leaves free; unset, the first start leaves 12 GB and later starts use the gap and margin
+  the engine learned) and deleting `<pack>/prefill-chunk.txt` (the learned prompt chunk is keyed by GPU name and VRAM only, so a pack
+  copied to a machine with the same card and a different drive or RAM should search again).
 - `"answer_room": false` and `"reasoning_budget_tokens": 0`: no limit but the context (otherwise DeepSeek's thinking
   stops at 32,768 tokens and a client's cap keeps a quarter for the answer).
 - `--vision off` (or leaving out `--mmproj` when packing) gives text only, and today the faster setup (see the known issue).

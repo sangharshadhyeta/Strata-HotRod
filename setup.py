@@ -6427,6 +6427,9 @@ SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRA
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
 # (0.1.44 dropped them with the rest of SETUP_ENV).
 SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8", "STRATA_ROUTE_TAIL_SKIP"})
+# the DeepSeek engine's ring, lend and stand-in switches (dsv41_ring_env): setup's own in a DeepSeek config, so a run again refreshes them (and
+# STRATA_DSV41_RING=0 removes them instead of leaving the old ones); in any other model's config STRATA_STANDIN and the like are the user's
+SETUP_ENV_DSV41 = frozenset({"DS4_RING", "DS4_RING_PIN", "STRATA_STANDIN", "DS4_LEND", "DS4_LEND_RING", "DS4_RING_STICKY"})
 SETUP_VISION = frozenset({"exe", "cpu_exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 
@@ -6443,6 +6446,8 @@ def carry_over(old: dict, cfg: dict, explicit: list[str] | None = None) -> list[
             cfg[k] = v
             kept.append(k)
     mine = SETUP_ENV if "-unsloth-" in str(cfg.get("model_name") or "") else SETUP_ENV - SETUP_ENV_UNSLOTH
+    if cfg.get("arch") == "deepseek41" or old.get("arch") == "deepseek41":
+        mine = mine | SETUP_ENV_DSV41
     env = {k: v for k, v in (old.get("env") or {}).items() if k not in mine and k not in (cfg.get("env") or {})} \
         if isinstance(old.get("env"), dict) else {}
     if env:
@@ -8229,9 +8234,26 @@ def dsv41_config_env(cards) -> dict:
     changes - and the drafter's own single-token windows (T=1) stay on the async path.  A discrete card keeps the engine's
     default; STRATA_DSV41_ASYNC_T=n overrides the value, STRATA_DSV41_ASYNC_T=8 restores the default."""
     if not cards or not any(c.get("uma") for c in cards):
-        return {}
+        return dsv41_ring_env(cards)
     value = os.environ.get("STRATA_DSV41_ASYNC_T") or "4"
     return {} if value == "8" else {"DS4_ASYNC_T": value}
+
+
+def dsv41_ring_env(cards) -> dict:
+    """The VRAM staging ring, the arena lend and the stand-ins: the switches the speeds in the README were measured with (RTX 3060 12 GB,
+    one card, CUDA).  They are opt-in in the engine, so without them a fresh install runs the slower path.
+
+    DS4_RING=32 is a ceiling, not a fixed size: the engine takes the slots that fit beside the free VRAM (it keeps 256 MiB, and the picture
+    tower's size when it is lazy) and turns the ring off with fewer than 4, and for more than one GPU.  DS4_LEND and DS4_LEND_RING follow the
+    ring by default; they are written out as the measured run had them.  Written only for one NVIDIA card: no other setup was measured.
+    STRATA_DSV41_RING=0 writes none of them, STRATA_DSV41_RING=n sets the ceiling."""
+    asked = os.environ.get("STRATA_DSV41_RING")
+    if asked is not None and (not asked.strip().isdigit() or int(asked) == 0):
+        return {}
+    if len(cards or []) != 1 or cards[0].get("vendor") != "nvidia" or cards[0].get("uma"):
+        return {}
+    return {"DS4_RING": asked.strip() if asked is not None else "32", "DS4_RING_PIN": "1", "STRATA_STANDIN": "1", "DS4_LEND": "1",
+            "DS4_LEND_RING": "1", "DS4_RING_STICKY": "1"}
 
 
 def dsv41_engine_env(lib_dirs) -> dict:

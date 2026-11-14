@@ -4614,12 +4614,16 @@ struct Model::Impl {
         auto m = vram_reserve_read();
         m[vram_reserve_key()] = now;
         const std::string path = o.pack + "/vram-reserve.txt", tmp = path + ".tmp";
+        bool wrote_ok = false;
         {
             std::ofstream f(tmp, std::ios::trunc);
             for (const auto& kv : m) f << kv.first << " " << kv.second << "\n";
+            f.flush();
+            wrote_ok = static_cast<bool>(f);   // a write that failed (a full disk) must not replace the good file with a short one
         }
         std::error_code ec;
-        std::filesystem::rename(tmp, path, ec);
+        if (wrote_ok) std::filesystem::rename(tmp, path, ec);
+        else std::filesystem::remove(tmp, ec);
         std::fprintf(stderr, "ds4: VRAM reserve: the load ended with %lld MiB free%s; the next start keeps %lld MiB (was %lld)\n",
                      (long long) free_mib, ring_bytes != 0 ? " (the ring's slots counted as free)" : "", (long long) now, (long long) old);
     }
@@ -4653,7 +4657,7 @@ struct Model::Impl {
         std::string k;
         long long v = 0, s = 0, fr = 0;
         while (f >> k >> v >> s >> fr)
-            if (k == key && v >= 256) {
+            if (k == key && v >= 256 && v <= (1 << 20)) {   // (bounded before the cast: a damaged file's 2^32 + 1024 must not become 1024)
                 val = (int) v;
                 settled = (int) s;
                 fref = (double) fr / 1000.0;
@@ -4678,12 +4682,16 @@ struct Model::Impl {
         }
         m[chunk_learn_key()] = {(long long) value, (long long) settled, std::llround(cl_fref * 1000.0)};
         const std::string path = chunk_learn_path(), tmp = path + ".tmp";
+        bool wrote_ok = false;
         {
             std::ofstream f3(tmp, std::ios::trunc);
             for (const auto& kv : m) f3 << kv.first << " " << kv.second[0] << " " << kv.second[1] << " " << kv.second[2] << "\n";
+            f3.flush();
+            wrote_ok = static_cast<bool>(f3);   // a failed write (a full disk) must not replace the settled chunk with a short file
         }
         std::error_code ec;
-        std::filesystem::rename(tmp, path, ec);
+        if (wrote_ok) std::filesystem::rename(tmp, path, ec);
+        else std::filesystem::remove(tmp, ec);
     }
     void chunk_learn_pass(int n, double ms, double wait_ms) {
         static const bool off = std::getenv("DS4_CHUNK_LEARN") != nullptr && std::atoi(std::getenv("DS4_CHUNK_LEARN")) == 0;
@@ -5209,12 +5217,16 @@ struct Model::Impl {
         const int64_t now = old + (need - free_mib) + 128;
         m[key] = now;
         const std::string path = o.pack + "/vram-reserve.txt", tmp = path + ".tmp";
+        bool wrote_ok = false;
         {
             std::ofstream f(tmp, std::ios::trunc);
             for (const auto& kv : m) f << kv.first << " " << kv.second << "\n";
+            f.flush();
+            wrote_ok = static_cast<bool>(f);   // a write that failed (a full disk) must not replace the good file with a short one
         }
         std::error_code ec;
-        std::filesystem::rename(tmp, path, ec);
+        if (wrote_ok) std::filesystem::rename(tmp, path, ec);
+        else std::filesystem::remove(tmp, ec);
         std::fprintf(stderr, "ds4: the picture tower needs %lld MiB free at rest (%lld + %lld) and %lld MiB are free: the next start keeps %lld MiB (was %lld)\n",
                      (long long) need, (long long) (vt.device_bytes() >> 20), (long long) VisionTower::kLazyMargin / 2, (long long) free_mib, (long long) now,
                      (long long) old);
@@ -7438,15 +7450,22 @@ struct Model::Impl {
         if (gap_moved) m[store_rr_key_ + " gap"] = store_rr_gap_;
         if (margin_moved) m[store_rr_key_ + " margin"] = store_rr_margin_seen_;
         const std::string path = o.pack + "/ram-reserve.json", tmp = path + ".tmp";
+        bool wrote_ok = false;
         {
             std::ofstream f(tmp, std::ios::trunc);
             f << "{\n";
             size_t n = 0;
             for (const auto& kv : m) f << "  \"" << kv.first << "\": " << kv.second << (++n < m.size() ? ",\n" : "\n");
             f << "}\n";
+            f.flush();
+            wrote_ok = static_cast<bool>(f);   // a failed write (a full disk) must not replace the good file with a short one
         }
         std::error_code ec;
-        std::filesystem::rename(tmp, path, ec);
+        if (wrote_ok) std::filesystem::rename(tmp, path, ec);
+        else {
+            std::filesystem::remove(tmp, ec);
+            ec = std::make_error_code(std::errc::io_error);
+        }
         if (ec) std::fprintf(stderr, "ds4: RAM store: %s cannot be written (the learned values stay for this run)\n", path.c_str());
         std::fprintf(stderr, "ds4: RAM store: gap %.0f MiB, margin %.0f MiB learned for the next start\n", (double) store_rr_gap_,
                      (double) store_rr_margin_seen_);
@@ -8360,6 +8379,11 @@ struct Model::Impl {
             lend_reclaim();
             vt.set_borrow(lend_base, lend_bytes);
             tower_borrowed = true;
+            {   // the tower writes its weights and scratch into the arena: the next reclaim must zero it before a prompt pass uses it as chunk buffers
+                // (lend_reclaim zeroes only a dirty arena, and only the ring's and the fill's copies marked it so far)
+                std::lock_guard<std::mutex> lk(lend_mu);
+                lend_dirty = true;
+            }
         }
         if (!vt.encode(rgb, w, h, rows, nh, nw, err)) return false;
         const size_t D = (size_t) g.dim;
@@ -11595,7 +11619,7 @@ struct Model::Impl {
             ok = ok && std::fwrite(&kv.first, 8, 1, f) == 1 && std::fwrite(&p.num, 8, 1, f) == 1 && std::fwrite(&p.den, 8, 1, f) == 1 &&
                  std::fwrite(&p.ee, 8, 1, f) == 1 && std::fwrite(&p.n, 4, 1, f) == 1 && std::fwrite(&p.c, 4, 1, f) == 1;
         }
-        std::fclose(f);
+        ok = std::fclose(f) == 0 && ok;   // a write error that only shows at the close (a full disk) must not replace the good file
         if (!ok || !os::replace_file(tmp, path)) std::remove(tmp.c_str());
     }
     void learn_free() {

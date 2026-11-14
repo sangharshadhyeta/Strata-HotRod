@@ -52,7 +52,7 @@ int main() {
     }
     // the learner, on the current device; nothing resident (every table entry zero)
     std::string msg;
-    if (!la::alloc(kL, kH, kE, kLo, msg)) {
+    if (!la::alloc(kL, kH, kE, kLo, 3, 4.0f, msg)) {
         std::fprintf(stderr, "lalearn_test: alloc: %s\n", msg.c_str());
         return 2;
     }
