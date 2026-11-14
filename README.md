@@ -40,7 +40,7 @@ Nothing leaves your PC.</p>
 <tr>
 <td align="center" width="25%"><h2>🧊 78 GB</h2>of model on a <b>30 GB</b> PC</td>
 <td align="center" width="25%"><h2>🔥 50-70</h2>tokens/s on one RTX 3060</td>
-<td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash at about 5 tokens/s</td>
+<td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash: see the <a href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41"><b>upstream-dsv41</b> branch</a></td>
 <td align="center" width="25%"><h2>⚡ 0.4 s</h2>to pick up a 45K-token conversation</td>
 </tr>
 </table>
@@ -53,6 +53,12 @@ spreads the experts over the card, RAM and the SSD and guesses ahead which ones 
 of RAM at 50-70 tokens/s.
 
 </div>
+
+> ### 🐋 Looking for DeepSeek-V4.1-Flash? It is on another branch.
+> **Go to the [`upstream-dsv41` branch](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41)**: it has its own engine
+> (`strata-dsv41`), its own install steps and its own README, for the full model (about 6 tokens/s on this PC) and the **Coder**
+> (a half-expert coding version, about 9 tokens/s). Everything on this page, `setup.py` included, is for Qwen3.8-Flash-Next.
+> The two branches are kept apart on purpose.
 
 ## Can Qwen3.8-Flash-Next run on an RTX 3060 12 GB with low RAM?
 
@@ -269,11 +275,12 @@ its default and what it does: [docs/FEATURES-qwen.md](docs/FEATURES-qwen.md) (ge
 
 <div align="justify">
 
-The same ideas ported to upstream Strata's DeepSeek engine run **DeepSeek-V4.1-Flash** (Starw1's uncensored GSQ-RCO
-IQ2_XXS backbone with DeepSeek's MXFP8 Engram, 341 GB of files) on this same PC at **about 5 tokens/s** (4.7-5.5 on the
-calibration prompts; 4.8-5.0 without the ring and stand-ins). It lives on the
-[`upstream-dsv41`](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41) branch (upstream Strata 0.2.7.1
-plus this fork's DeepSeek work), with its own engine, `strata-dsv41`; the two branches are kept apart and ported by hand.
+**For DeepSeek, go to the [`upstream-dsv41` branch](https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41)**: its
+README there is the one to follow. The same ideas ported to upstream Strata's DeepSeek engine run **DeepSeek-V4.1-Flash**
+(Starw1's uncensored GSQ-RCO IQ2_XXS backbone with DeepSeek's MXFP8 Engram, 341 GB of files) on this same PC at **about 6
+tokens/s** (6.33 over three alternated rounds on 6 Nov), and its **Coder** version (half the experts, about 285 GB) at about 9. That
+branch is upstream Strata 0.2.7.1 plus this fork's DeepSeek work, with its own engine, `strata-dsv41`; the two branches are kept
+apart and ported by hand.
 
 What it adds to upstream's DeepSeek engine, on by default when the ring is on (`=0` turns each off):
 
