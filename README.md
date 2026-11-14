@@ -230,8 +230,16 @@ and `--api-key`.
 - **Measured while it serves:** the read-ahead cap (from how long the decode's own reads wait), the copy limit, the
   stand-in budget and the mask's depth (alternating speed tests over the same stretch of text; a setting is kept only when it
   does not add flips). A faster or slower drive moves them where they belong on that machine.
-- **Learned files** sit in the pack folder: `standin-tune.txt`, `vram-reserve.txt`, `mask-learn.bin`, `standin-learn.bin`,
-  `hotrod-predictor.bin`. They hold this machine's values: when you move a pack to another PC, delete all but
+- **The prompt chunk** is searched once and settles (13 Nov): the first long read (the rule's 4096 tokens) measures how long the
+  compute waited for the SSD, one step goes to the smaller chunk where the read costs about 5% more (`DS4_CHUNK_READ_COST`),
+  the next read is cut in that size, and the result is kept in `prefill-chunk.txt` and used for the arena at the next start;
+  it is not tested again (delete the file to search anew, `DS4_CHUNK_LEARN=0` turns it off, `--prefill-chunk N` is never
+  overridden). A smaller chunk is a smaller arena, so more experts stay on the card. On the RTX 3060 12 GB it settled at 2816
+  (reads 134 s against 132 s for 35K tokens). The picture tower runs in that arena for a picture turn, so no VRAM is kept free
+  for it. Other opt-ins: `DS4_KV_REFRESH=1` reads each answer's tokens again exactly right after it (about 9 s for 400 tokens;
+  the next-token change measured was KL 0 to 0.03 nats), `DS4_REUSE_DEBUG=1` prints why a request reused what it did.
+- **Learned files** sit in the pack folder: `standin-tune.txt`, `vram-reserve.txt`, `prefill-chunk.txt`, `mask-learn.bin`,
+  `standin-learn.bin`, `hotrod-predictor.bin`. They hold this machine's values: when you move a pack to another PC, delete all but
   `hotrod-predictor.bin` (the look-ahead belongs to the model and carries over) and let them relearn. Setup downloads our
   trained look-ahead for Starw1-2.00bpw-MXFP8 and never overwrites one your PC has learned.
 - **The learned mask** and the look-ahead's weighting (`STRATA_LA_EXACT_W`, default 4) are on by default with the stand-ins;
