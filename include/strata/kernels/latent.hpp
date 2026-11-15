@@ -27,6 +27,8 @@ void latent_u_grouped(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* 
 bool latent_u_pack_q4_ok(int ELL);
 /// The D matrix [rows, cols] in its raw Q4_0 (fmt 4) or Q8_0 (fmt 8) blocks to f16 (the prompt path's GEMM over a chunk); cols % 32 == 0.
 void latent_dequant_f16(const uint8_t* src, int64_t rows, int cols, int fmt, uint16_t* dst, void* stream);
+/// The same for U rows that latent_u_repack_q4 repacked (Q4_0 only).
+void latent_dequant_packed_f16(const uint8_t* src, int64_t rows, int cols, uint16_t* dst, void* stream);
 void latent_u_repack_q4(uint8_t* u, int64_t rows, int ELL, void* stream);   ///< in place: [nb x 18 B blocks] -> [nb x 16 B nibbles][nb x f16 scales] per row
 
 /// knife-0 (STRATA_LATENT_U_GPU): the CPU share's U computed on the GPU into parts_ directly.

@@ -221,6 +221,31 @@ __global__ void latent_dequant_f16_k(const uint8_t* __restrict__ src, int64_t n_
     }
 }
 
+// the same for U rows repacked by latent_u_repack_q4: per row [nb x 16 B nibbles][nb x f16 scales]
+__global__ void latent_dequant_packed_f16_k(const uint8_t* __restrict__ src, int64_t rows, int nb, uint16_t* __restrict__ dst) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= rows * (int64_t) nb) return;
+    const int64_t row = t / nb;
+    const int b = (int) (t - row * nb);
+    const uint8_t* rp = src + (size_t) row * (size_t) (nb * 18);
+    const float d = __half2float(*(const __half*) (rp + (size_t) nb * 16 + (size_t) b * 2));
+    const uint8_t* nib = rp + (size_t) b * 16;
+    __half* o = (__half*) dst + (size_t) t * 32;
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int byte_ = nib[j];
+        o[j] = __float2half(d * (float) ((byte_ & 0xF) - 8));
+        o[j + 16] = __float2half(d * (float) ((byte_ >> 4) - 8));
+    }
+}
+
+void latent_dequant_packed_f16(const uint8_t* src, int64_t rows, int cols, uint16_t* dst, void* stream) {
+    const int nb = cols / 32;
+    const int64_t n = rows * (int64_t) nb;
+    if (n <= 0) return;
+    latent_dequant_packed_f16_k<<<(unsigned) ((n + 127) / 128), 128, 0, (cudaStream_t) stream>>>(src, rows, nb, dst);
+}
+
 void latent_dequant_f16(const uint8_t* src, int64_t rows, int cols, int fmt, uint16_t* dst, void* stream) {
     const int64_t nb = rows * (int64_t) (cols / 32);
     if (nb <= 0) return;

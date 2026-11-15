@@ -1615,6 +1615,119 @@ static std::string standin_tune_path(const Options& o) {
     const std::filesystem::path dir = std::filesystem::path(p).parent_path();
     return ((dir.empty() ? std::filesystem::path(".") : dir) / "standin-tune.txt").string();
 }
+// ---- the learned prompt chunk (hotrod: the DeepSeek branch's idea of a chunk that settles per machine, our version).
+// A chunk is VRAM the prompt path borrows from the expert cache, and every chunk re-dequantizes / re-streams the experts it uses, so a smaller
+// chunk gives cache back and costs read time.  The DeepSeek learner measures the share of the pass the compute waited for the SSD; this one measures
+// what matters at the end - microseconds per token of real reads - so it is right whether the machine is SSD-bound or compute-bound:
+//   - a long read (>= 6 chunks) at the arena's chunk is the reference (c_a, us_a); the next long read is cut in about 2/3 of it (force_chunk) for the
+//     second point (c_b, us_b);  t(c) = a + b / c is fitted from the two points (a: per-token compute, b: the per-chunk fixed cost);
+//   - the chunk settles at the smallest c (multiples of 256, never below 3/4 of the smaller sample or 512) with t(c) <= (1 + eps) t(c_a), eps =
+//     STRATA_PREFILL_CHUNK_COST (default 0.05);
+//   - the result is kept in <pack>/prefill-chunk.txt keyed by GPU name, VRAM and RAM; at the next start it caps the auto chunk (the arena is sized at
+//     load).  An explicit --prefill N is never touched; STRATA_PREFILL_CHUNK_LEARN=0 turns it off; delete the file to search anew.
+struct ChunkLearn {
+    bool on = false, settled = false;
+    std::string path, key;
+    int chosen = 0, c_a = 0, c_b = 0, probe = 0;
+    double us_a = 0, us_b = 0, eps = 0.05;
+};
+static std::string chunk_learn_key() {
+    cudaDeviceProp pr{};
+    std::string name = "unknown";
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (cudaGetDeviceProperties(&pr, dev) == cudaSuccess) name = pr.name;
+    for (char& c : name) if (c == ' ') c = '_';
+    const long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGE_SIZE);
+    const long long ram_gib = pages > 0 && psz > 0 ? ((long long) pages * psz) >> 30 : 0;
+    return name + "/" + std::to_string((long long) (pr.totalGlobalMem >> 20)) + "MiB/" + std::to_string(ram_gib) + "GiB";
+}
+static bool chunk_learn_eligible(const Options& o) {
+    const char* v = std::getenv("STRATA_PREFILL_CHUNK_LEARN");
+    return o.serve && o.prefill_auto && !o.pack.empty() && (v == nullptr || std::atoi(v) != 0);
+}
+static void chunk_learn_load(ChunkLearn& L, const Options& o) {
+    L = ChunkLearn{};
+    if (!chunk_learn_eligible(o)) return;
+    L.on = true;
+    L.path = o.pack + "/prefill-chunk.txt";
+    L.key = chunk_learn_key();
+    if (const char* v = std::getenv("STRATA_PREFILL_CHUNK_COST")) L.eps = std::min(0.5, std::max(0.01, std::atof(v)));
+    std::ifstream f(L.path);
+    std::string k;
+    int settled = 0, chosen = 0, ca = 0, cb = 0;
+    double ua = 0, ub = 0;
+    while (f >> k >> settled >> chosen >> ca >> ua >> cb >> ub)
+        if (k == L.key) {
+            L.settled = settled != 0; L.chosen = chosen; L.c_a = ca; L.us_a = ua; L.c_b = cb; L.us_b = ub;
+            if (!L.settled && L.c_a > 0 && L.c_b == 0) L.probe = std::max(512, (int) (std::lround(0.67 * L.c_a / 256.0) * 256));
+        }
+}
+static void chunk_learn_store(const ChunkLearn& L) {
+    if (!L.on) return;
+    std::map<std::string, std::string> m;
+    {
+        std::ifstream f(L.path);
+        std::string k, rest;
+        while (f >> k) { std::getline(f, rest); m[k] = rest; }
+    }
+    char buf[160];
+    std::snprintf(buf, sizeof buf, " %d %d %d %.2f %d %.2f", L.settled ? 1 : 0, L.chosen, L.c_a, L.us_a, L.c_b, L.us_b);
+    m[L.key] = buf;
+    const std::string tmp = L.path + ".tmp";
+    bool ok = false;
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        for (const auto& kv : m) f << kv.first << kv.second << "\n";
+        f.flush();
+        ok = static_cast<bool>(f);
+    }
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, L.path, ec); else std::filesystem::remove(tmp, ec);
+}
+// at start: a settled chunk caps the auto chunk (before the loan is planned)
+static void chunk_learn_apply(Options& o) {
+    ChunkLearn L;
+    chunk_learn_load(L, o);
+    if (L.on && L.settled && L.chosen >= 256) {
+        o.prefill_auto_cap = o.prefill_auto_cap > 0 ? std::min<int64_t>(o.prefill_auto_cap, L.chosen) : L.chosen;
+        std::fprintf(stderr, "strata generate: learned prompt chunk %d for this machine (%s): the auto chunk is capped there (STRATA_PREFILL_CHUNK_LEARN=0 turns it off)\n",
+                     L.chosen, L.key.c_str());
+    }
+}
+// after a batched read of `tokens` tokens in `ms` ms, cut in chunks of about c_used tokens
+static void chunk_learn_sample(ChunkLearn& L, int64_t tokens, double ms, int c_used) {
+    if (!L.on || L.settled || tokens < 6 * (int64_t) c_used || ms <= 0 || c_used < 256) return;
+    const double us = ms * 1000.0 / (double) tokens;
+    auto r256 = [](double c) { return (int) (std::lround(c / 256.0) * 256); };
+    if (L.c_a == 0 || c_used == L.c_a) {
+        L.us_a = L.c_a == 0 ? us : 0.5 * (L.us_a + us);
+        L.c_a = c_used;
+        const int p = r256(0.67 * c_used);
+        if (L.c_b == 0 && (p < 512 || p >= c_used)) {   // no room to go down: settled at the reference
+            L.settled = true; L.chosen = 0; L.probe = 0;   // (0: nothing smaller is acceptable: no cap at the next start)
+            std::fprintf(stderr, "strata serve: prompt chunk %d: %.1f us a token over %lld tokens; no smaller chunk to test: settled\n", c_used, us, (long long) tokens);
+        } else if (L.c_b == 0) {
+            L.probe = p;
+            std::fprintf(stderr, "strata serve: prompt chunk %d: %.1f us a token over %lld tokens (the reference); the next long read tests %d\n", c_used, us, (long long) tokens, p);
+        }
+        chunk_learn_store(L);
+        return;
+    }
+    L.c_b = c_used; L.us_b = us; L.probe = 0;
+    const double ia = 1.0 / L.c_a, ib = 1.0 / L.c_b;
+    const double b = (L.us_b - L.us_a) / (ib - ia), a = L.us_a - b * ia;
+    auto t = [&](double c) { return a + b / c; };
+    const int lo = std::max(512, r256(0.75 * std::min(L.c_a, L.c_b)));
+    int best = L.c_a;
+    if (b > 0) { for (int c = lo; c < L.c_a; c += 256) if (t(c) <= (1.0 + L.eps) * t(L.c_a)) { best = c; break; } }
+    else best = std::min(L.c_a, std::max(lo, std::min(L.c_a, L.c_b)));
+    L.settled = true; L.chosen = best < L.c_a ? best : 0;   // a value below the reference caps the next start; none: the auto chunk stays free
+    std::fprintf(stderr, "strata serve: prompt chunk: %.1f us a token at %d, %.1f at %d (model %.1f + %.0f / chunk): settled at %d (read cost accepted: %.0f%%)%s\n",
+                 L.us_a, L.c_a, L.us_b, L.c_b, a, b, best, 100.0 * L.eps, best < L.c_a ? "; the arena follows at the next start" : "; no cap");
+    chunk_learn_store(L);
+}
+
 /// GPU name, total VRAM, context, K/V mode and format, batch and whether a draft is loaded: a short string
 static std::string vram_reserve_key(const Options& o) {
     cudaDeviceProp p{};
@@ -3638,6 +3751,10 @@ int main(int argc, char** argv) {
                 o.prefill_auto = false;
             } else {
                 setenv("STRATA_PREFILL_CPU_SHARE", "0", 0);   // the CPU share computes at the model's width: not for a latent pack
+                // Prompt and decode never run together in serve, so the prompt path borrows the expert cache down to the engine's floor of 128
+                // slots (the auto rule held back 15%): a bigger chunk, fewer per-chunk costs.  Measured 15 Nov, Edge0-145B on the RTX 3060 12 GB, a
+                // 13.5K-token prompt: chunk 1280-1536 -> 1536 with 981 slots lent, read 255-263 -> 291 tok/s.  STRATA_PREFILL_LEND_PCT overrides.
+                setenv("STRATA_PREFILL_LEND_PCT", "100", 0);
             }
             // Stand-ins ON by default for a latent pack (the Qwen branch's setting: ranks 3-9 take any resident stand-in, the edge rank 2 only
             // within 1 logit).  Measured 15 Nov on the RTX 3060 12 GB, SSD mode: decode 6.7-7.6 -> 15.7-16.8 tok/s on three questions whose
@@ -7969,6 +8086,7 @@ int main(int argc, char** argv) {
                          (unsigned long long) pin_mib);
         }
     }
+    chunk_learn_apply(o);   // a settled learned chunk caps the auto chunk (hotrod: see ChunkLearn)
     if (o.prefill_auto_cap > 0) auto_ceiling = std::min<int64_t>(auto_ceiling, o.prefill_auto_cap);   // #1630
     // The auto scan used to walk a fixed list of sizes - 32768, 16384, 8192, 6144, ... - and take the first that
     // fit.  That list is coarse exactly where a rig needs it: this one affords ~8,700 tokens and was handed 8192,
@@ -8646,6 +8764,8 @@ int main(int argc, char** argv) {
                                  "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
         }
         strata::prefill::Prefill sp;
+        ChunkLearn chunk_learn;   // hotrod: the learned prompt chunk (see the struct)
+        chunk_learn_load(chunk_learn, o);
         // the pool is idle while a prompt is read unless batch slots decode between its parts; with
         // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
         // #1607: Windows, the commit limit (RAM + page file) is what ends the engine silently; compare what this run plans
@@ -14501,6 +14621,8 @@ int main(int argc, char** argv) {
                         }
                         strata::prefill::Prefill::set_lm_map_store(lm_map_path(o), lm_key);
                     }
+                    if (chunk_learn.probe > 0 && chunk_learn.probe < sp.chunk() && (r - q) >= 6 * (int64_t) chunk_learn.probe)
+                        sp.force_chunk(chunk_learn.probe, false, false);   // the learner's second point
                     const bool ok = sp.run(ids.data() + q, r - q, q, e);
                     strata::prefill::Prefill::set_on_layer_pass(nullptr);
                     return ok;
@@ -15114,6 +15236,12 @@ int main(int argc, char** argv) {
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
                 const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
                 if (sp_ok) pp_exact = true;
+                if (sp_ok && !win && chunk_learn.on && !chunk_learn.settled && read_to > at) {   // hotrod: a batched read is a sample for the chunk learner
+                    const int64_t rt = read_to - at;
+                    const int64_t C = (chunk_learn.probe > 0 && chunk_learn.probe < sp.chunk() && rt >= 6 * (int64_t) chunk_learn.probe) ? chunk_learn.probe : sp.chunk();
+                    const int64_t nch = (rt + C - 1) / C;
+                    chunk_learn_sample(chunk_learn, rt, std::chrono::duration<double, std::milli>(Clock::now() - tsp).count(), (int) (rt / std::max<int64_t>(1, nch)));
+                }
                 if (trace) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
                     (win ? req_times.windows_ms : req_times.read_ms) += ms;
