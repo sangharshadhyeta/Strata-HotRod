@@ -3651,6 +3651,26 @@ int main(int argc, char** argv) {
                 setenv("STRATA_LA_LEARN", "1", 0);
                 std::fprintf(stderr, "strata generate: latent experts: the learned look-ahead on by default (STRATA_LA_LEARN=0 turns it off)\n");
             }
+            // The residency profile learns too (serve mode): the engine saves what its adaptive tier learned as profile-learned.bin beside the
+            // shipped profile (every 10 minutes and at QUIT), and the next start fills the GPU cache and RAM tier from it when it exists and
+            // has the shipped one's size.  Measured 15 Nov, Edge0-145B, cold start, alternating, two pairs: decode of the first questions
+            // 14.6 / 15.0 -> 20.0 / 21.9 tok/s (short answer), 16.3 / 16.2 -> 18.2 / 19.6 (code), 22.9 / 23.0 -> 25.1 / 25.3 (long); equal by the
+            // fourth question (26.4 / 27.4 vs 26.1 / 26.7).  The answers read correct.  STRATA_LATENT_LEARN_PROFILE=0 turns it off.
+            if (o.serve && !o.expert_profile.empty() && o.expert_profile_save.empty() &&
+                [] { const char* v = std::getenv("STRATA_LATENT_LEARN_PROFILE"); return v == nullptr || std::atoi(v) != 0; }()) {
+                namespace fs = std::filesystem;
+                std::error_code pec;
+                const fs::path shipped = o.expert_profile;
+                const fs::path learned = (shipped.parent_path().empty() ? fs::path(".") : shipped.parent_path()) / "profile-learned.bin";
+                o.expert_profile_save = learned.string();
+                if (fs::exists(learned, pec) && fs::file_size(learned, pec) == fs::file_size(shipped, pec)) {
+                    o.expert_profile = learned.string();
+                    std::fprintf(stderr, "strata generate: latent experts: the learned residency profile %s is used (saved on the way; STRATA_LATENT_LEARN_PROFILE=0 turns it off)\n",
+                                 learned.string().c_str());
+                } else {
+                    std::fprintf(stderr, "strata generate: latent experts: the residency profile will be learned and saved to %s\n", learned.string().c_str());
+                }
+            }
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
