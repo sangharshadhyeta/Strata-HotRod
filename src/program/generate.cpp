@@ -3643,6 +3643,14 @@ int main(int argc, char** argv) {
                 setenv("STRATA_ROUTE_RESIDENT_EDGE", "1", 0);
                 std::fprintf(stderr, "strata generate: latent experts: stand-ins on by default (ranks 3-9, edge 1; STRATA_ROUTE_RESIDENT=0 turns them off)\n");
             }
+            // The learned look-ahead ON by default too (STRATA_LA_LEARN=0 turns it off; its state is saved beside the pack and kept).  Measured
+            // 15 Nov on Edge0-145B, cold start, no pre-trained state, about 15 minutes of use: its guesses of the experts needed 1 / 2 / 4
+            // layers ahead hit 90.7 / 84.5 / 78.6% against the plain router's 85.2 / 76.5 / 70.0%.  Decode speed was the same as with it off
+            // (two rounds of three questions each, within noise): the accuracy is the gain so far, not speed.
+            if (std::getenv("STRATA_LA_LEARN") == nullptr) {
+                setenv("STRATA_LA_LEARN", "1", 0);
+                std::fprintf(stderr, "strata generate: latent experts: the learned look-ahead on by default (STRATA_LA_LEARN=0 turns it off)\n");
+            }
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
