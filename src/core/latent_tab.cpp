@@ -1,4 +1,4 @@
-// src/core/latent_tab.cpp - the session-level latent MoE tables (branch edge0-latent).  The shape (one upload before the cache is sized, the
+// src/core/latent_tab.cpp - the session-level latent MoE tables (branch hotrod-edge0).  The shape (one upload before the cache is sized, the
 // device pair shared through latent_share.hpp) follows Edge0's LatentTab in edge0-strata (MIT, a fork of Strata); the sizing is ours: every
 // number is read off the pack (see the header).
 #include "strata/core/latent_tab.hpp"
@@ -112,8 +112,10 @@ bool latent_dense_choose(const std::string& pack_dir, int64_t n_layers, int64_t 
 LatentTab::~LatentTab() {
     if (latent_shared_d() == d_) latent_shared_d() = nullptr;
     if (latent_shared_u() == u_) latent_shared_u() = nullptr;
+    if (latent_shared_info().labels_dev == labels_dev_) latent_shared_info() = LatentShared{};
     if (d_) cudaFree(d_);
     if (u_) cudaFree(u_);
+    if (labels_dev_) cudaFree(labels_dev_);
 }
 
 bool LatentTab::load(const std::string& pack_dir, int64_t n_layers, int64_t n_embd, int64_t latent, int64_t n_expert, uint64_t free_vram,
@@ -171,6 +173,25 @@ bool LatentTab::load(const std::string& pack_dir, int64_t n_layers, int64_t n_em
     groups_ = ch.groups;
     fmt_ = ch.fmt;
     device_bytes_ = db + ub;
+    // the labels on the device too (the decode path's plan rewrite and U kernel read them there)
+    const size_t lb = labels_.size() * sizeof(int32_t);
+    if (cudaMalloc((void**) &labels_dev_, lb) != cudaSuccess || cudaMemcpy(labels_dev_, labels_.data(), lb, cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "the latent labels could not be uploaded";
+        if (labels_dev_) { cudaFree(labels_dev_); labels_dev_ = nullptr; }
+        cudaFree(d_); cudaFree(u_);
+        d_ = u_ = nullptr;
+        return false;
+    }
+    device_bytes_ += lb;
+    {
+        LatentShared& info = latent_shared_info();
+        info.groups = groups_;
+        info.fmt = fmt_;
+        info.d_layer_bytes = dense_.d_bytes();
+        info.u_layer_bytes = dense_.u_bytes();
+        info.labels_dev = labels_dev_;
+        info.labels_host = labels_.data();
+    }
     latent_shared_d() = d_;
     latent_shared_u() = u_;
     return true;

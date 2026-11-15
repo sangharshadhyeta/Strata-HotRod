@@ -30,6 +30,7 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/latent_tab.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -146,6 +147,8 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <vector>
 
 namespace {
+// the session-level latent MoE tables (hotrod-edge0): loaded once, before the expert cache is sized; empty for a non-latent pack
+strata::core::LatentTab g_lat_tab;
 // STRATA_CONV_PRELOAD: the conversation's routing counts travel with its session file, as `<path>.conv` beside it: written after a
 // SAVE, read after a RESTORE.  Layout (host byte order): "CNV1", i64 n_parts, then per part i64 conv_tokens, i64 size and size
 // floats (the part's conv_counts; size 0 when it kept none).  A stale sidecar is removed by every SAVE that does not write one.
@@ -3618,15 +3621,16 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        // Edge0's latent MoE (native_experts.txt v6): the experts' rows are `expert_embd` wide, not n_embd wide, and a layer
-        // also needs its D/U projections and the expert group labels (STRATA_LATENT_DENSE / _LABELS).  The decode and prompt
-        // paths below read every expert as n_embd wide, so a latent pack must not get that far: refused until the latent
-        // path is in (branch edge0-latent).
-        if (strata::kernels::cpu::expert_layout().latent) {
+        // Edge0's latent MoE (native_experts.txt v6, branch hotrod-edge0): the experts' rows are `expert_embd` wide, not n_embd wide, and a
+        // layer also needs its D/U projections and the expert group labels, which the session-level LatentTab loads before the expert
+        // cache is sized (below).  The decode path (verify windows: D, A at the latent width, U, the CPU pool's share) is in; the chunked
+        // PROMPT path (prefill.cpp), which a native pack cannot run without, still reads every expert at the model's width.  Until it
+        // is ported a latent pack is refused here, by name, instead of generating wrong tokens.
+        if (strata::kernels::cpu::expert_layout().latent && std::getenv("STRATA_LATENT_ALLOW_UNPORTED_PREFILL") == nullptr) {
             const auto& lay = strata::kernels::cpu::expert_layout();
-            std::fprintf(stderr, "strata generate: the experts of %s are latent (%lld wide, hidden %lld): this build has no "
-                                 "latent-MoE path yet, so it does not run them (branch edge0-latent)\n", o.pack.c_str(),
-                         (long long) lay.expert_embd, (long long) lay.expert_ff);
+            std::fprintf(stderr, "strata generate: the experts of %s are latent (%lld wide, hidden %lld): the decode path runs them, but the chunked "
+                                 "prompt path is not ported to them yet, and a native pack cannot run without it (branch hotrod-edge0)\n",
+                         o.pack.c_str(), (long long) lay.expert_embd, (long long) lay.expert_ff);
             return 1;
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
@@ -6272,6 +6276,19 @@ int main(int argc, char** argv) {
                      (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
         return mib + 64;   // a margin for the allocator
     };
+    // Edge0's latent MoE (hotrod-edge0): the session-level D/U tables and the group labels go to the GPU HERE, before the cache is sized from
+    // what is free, so the cache leaves room for them.  Every size is read off the pack (core/latent_tab.hpp); a non-latent pack skips this.
+    if (strata::kernels::cpu::expert_layout().latent) {
+        const auto& lay_l = strata::kernels::cpu::expert_layout();
+        std::string le;
+        if (!g_lat_tab.load(o.pack, (int64_t) g.n_layers, (int64_t) g.n_embd, lay_l.expert_embd, (int64_t) lay_l.n_expert,
+                            (uint64_t) strata::core::device_free_bytes(), le)) {
+            std::fprintf(stderr, "strata generate: %s\n", le.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: latent experts: D/U Q%d_0, %d groups of %lld-wide experts, %.2f GiB on the GPU (the expert cache is sized after it)\n",
+                     g_lat_tab.fmt() == 4 ? 4 : 8, g_lat_tab.groups(), (long long) lay_l.expert_embd, (double) g_lat_tab.device_bytes() / 1073741824.0);
+    }
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
         free_b = strata::core::device_free_bytes(); (void) total_b;

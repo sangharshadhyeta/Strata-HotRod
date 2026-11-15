@@ -1,4 +1,4 @@
-// Adapted from Edge0's edge0-strata (https://github.com/Edge0-AI/Edge0, MIT licence: a fork of Niko1221's Strata), branch edge0-latent.
+// Adapted from Edge0's edge0-strata (https://github.com/Edge0-AI/Edge0, MIT licence: a fork of Niko1221's Strata), branch hotrod-edge0.
 // Taken as it is.
 #include "strata/core/latent_dense.hpp"
 

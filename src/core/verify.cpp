@@ -57,6 +57,8 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/pdl.hpp"
 #include "strata/kernels/ple.hpp"
+#include "strata/core/latent_share.hpp"   // hotrod-edge0: the session's latent D/U tables
+#include "strata/kernels/latent.hpp"      // hotrod-edge0: latent_plan_rows, latent_u_grouped
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -1198,7 +1200,7 @@ Verifier::~Verifier() {
     if (arena_) cudaFree(arena_);
     if (hcount_d_) cudaFree(hcount_d_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_latxl_, h_xlseq_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -2135,6 +2137,30 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
+    // ---- latent MoE (Edge0, branch hotrod-edge0): a pack whose experts run in a latent space.  Everything comes from the pack's layout and the
+    // session-level LatentTab (core/latent_tab.hpp), which the engine loads before the expert cache is sized; no constant of a model or a card.
+    {
+        const auto& lay0 = strata::kernels::cpu::expert_layout();
+        latent_ = lay0.native && lay0.latent;
+        if (latent_) {
+            const strata::core::LatentShared& li = strata::core::latent_shared_info();
+            if (strata::core::latent_shared_d() == nullptr || strata::core::latent_shared_u() == nullptr || li.labels_dev == nullptr ||
+                li.groups <= 0) {
+                err = "verify: this pack's experts are latent, and the session's latent D/U tables are not loaded (the engine loads them before the verifier)";
+                return false;
+            }
+            if (lay0.expert_embd % 32 != 0 || (int64_t) N != g.n_embd) { err = "verify: a latent width that is not a multiple of 32"; return false; }
+            lat_fmt_ = li.fmt;
+            lat_G_ = li.groups;
+            lat_ELL_ = lay0.expert_embd;
+            lat_E_ = lay0.n_expert;
+            lat_d_layer_ = li.d_layer_bytes;
+            lat_u_layer_ = li.u_layer_bytes;
+            lat_d_ = strata::core::latent_shared_d();
+            lat_u_ = strata::core::latent_shared_u();
+            lat_labels_dev_ = li.labels_dev;
+        }
+    }
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
@@ -2154,6 +2180,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    if (latent_ && (!mapped(T * (uint64_t) lat_G_ * (uint64_t) lat_ELL_ * 4, (void**) &h_latxl_, (void**) &m_latxl_) ||
+                    !mapped(64, (void**) &h_xlseq_, (void**) &m_xlseq_))) {
+        err = "verify: mapped latent staging allocation failed";
+        return false;
+    }
     if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
         if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
             err = "verify: mapped balance stamps allocation failed";
@@ -2237,7 +2268,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), latent_ ? strata::kernels::cpu::expert_layout().expert_ff : g.n_ff)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
@@ -2329,6 +2360,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+        if (latent_) {   // the latent stages' scratch: all sized from T, K, the group count and the latent width
+            const uint64_t LG = (uint64_t) lat_G_, LELL = (uint64_t) lat_ELL_;
+            lat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+            lat_xlq_ = b.take<uint8_t>(T * LG * (LELL / 32) * 36);
+            lat_uq_ = b.take<uint8_t>(T * K * (LELL / 32) * 36);
+            lat_xl_ = b.take<float>(T * LG * LELL);
+            lat_yl_ = b.take<float>(T * K * LELL);
+            lat_yfull_ = b.take<float>(T * K * LELL);
+        }
     };
     Bump count;
     carve(count);
@@ -3499,6 +3539,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 16, grp);
         if (!stage_mark(cs, is_qsa_layer(g, l) ? kStAttn : kStGdn, err)) return false;
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
+        if (latent_) {   // hotrod-edge0: the D stage for this group's rows, before the router and the doorbell
+            // not ported yet: these fail loudly instead of running wrong
+            if (G != 1 || lb_ != 0 || device_plan_ || ar_on() || remote_opt_ != nullptr || m_bal_ != nullptr) {
+                err = "verify: a latent pack runs in single-group windows on one GPU without the device plan, the all-resident plan, helper GPUs or the PCIe balance (not ported yet)";
+                return false;
+            }
+            const size_t xrow = (size_t) (N / 32) * 36, xlrow = (size_t) (lat_ELL_ / 32) * 36;
+            quantize_q8_1_rows(mixed_ + (size_t) tb * N, n, (int) N, lat_xq_ + (size_t) tb * xrow, cs);
+            iq_mmvq(lat_fmt_ == 4 ? 2 : 8, lat_d_ + (size_t) l * lat_d_layer_, lat_xq_ + (size_t) tb * xrow,
+                    lat_xl_ + (size_t) tb * lat_G_ * lat_ELL_, (int) N, (int) (lat_G_ * lat_ELL_), n, cs);   // Q8_0 / Q4_0 D, one latent vector per group
+            quantize_q8_1_rows(lat_xl_ + (size_t) tb * lat_G_ * lat_ELL_, n * lat_G_, (int) lat_ELL_, lat_xlq_ + (size_t) tb * lat_G_ * xlrow, cs);
+            // the D rows to the host for the CPU pool, then the doorbell (one stream: the copy has landed when the word is written)
+            cudaMemcpyAsync(m_latxl_ + (size_t) tb * lat_G_ * lat_ELL_, lat_xl_ + (size_t) tb * lat_G_ * lat_ELL_,
+                            (size_t) n * lat_G_ * lat_ELL_ * sizeof(float), cudaMemcpyDeviceToHost, cs);
+            doorbell_publish_value(nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr, m_xlseq_, (uint32_t) (l - lb_) + 1, cs);
+        }
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
         if (!stage_mark(cs, kStFfn, err)) return false;
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
@@ -3933,6 +3989,46 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
+        if (latent_) {
+            // hotrod-edge0: the experts at the latent width.  D ran in `pre` (xlq = the q8_1 rows of xl, row token*G + group).  Here: the GPU's
+            // share (the VRAM groups, the PCIe groups) as A, the CPU pool's A rows merged in, then U for every route into `parts_out`, which
+            // the combine reads as it reads any expert rows - so none of the old hit-add or CPU-row paths below applies.
+            wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
+            copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+            if (!stage_mark(cs, kStPlan, err)) return false;
+            stamp(l, 19, grp);
+            strata::kernels::latent_plan_rows(const_cast<int32_t*>(p_tok), p_dst, p_counts, ids_ + (size_t) tb * K,
+                                              lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_, tb, lat_G_, (int) K, cs);
+            float* ylg = lat_yl_ + (size_t) tb * K * (size_t) lat_ELL_;
+            float* yfull = lat_yfull_ + (size_t) tb * K * (size_t) lat_ELL_;
+            const auto& LF = lay.fmt[(size_t) l];
+            const NativeExpertLayout La = native_expert_layout(LF.gu_type, LF.d_type, (int) lat_ELL_, LF.n_ff);
+            native_expert_grouped(La, p_ptr, p_start, p_counts, p_dst, p_tok, cap, cap, lat_xlq_, hit_scratch_, ylg, cs, 0);   // the VRAM groups
+            stamp(l, 20, grp);
+            if (!stage_mark(cs, kStVram, err)) return false;
+            wait_flag_ge(m_flagB_, ring, cs);                  // the PCIe share is in staging (DMA) or mapped
+            if (!stage_mark(cs, kStPcieWait, err)) return false;
+            if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging (G == 1 here)
+                uint8_t* stage = staging_ + (size_t) (grp * kStagingBlobs) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) kStagingBlobs, cs);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            }
+            stamp(l, 21, grp);
+            native_expert_grouped(La, p_ptr2, p_start2, p_counts + 2, p_dst, p_tok, cap, cap, lat_xlq_, hit_scratch_, ylg, cs, kPcieGroupRows);
+            stamp(l, 22, grp);
+            if (!stage_mark(cs, kStPcieExp, err)) return false;
+            wait_flag_ge(m_flag_, ring, cs);                   // the CPU pool's A rows are in the mapped rows (latent width, stride ELL)
+            if (!stage_mark(cs, kStCpuWait, err)) return false;
+            stamp(l, 23, grp);
+            // the CPU rows into yfull (the GPU's own rows zeroed there), then the GPU's A rows added at their routes: yfull = every route's A row
+            copy_rows_from_mapped(yfull, m_ymiss_ + (size_t) tb * K * (size_t) lat_ELL_, (int64_t) n * K, lat_ELL_, p_dst, p_counts + 1, cs);
+            moe_hit_add(yfull, ylg, p_dst, p_counts + 1, cap, lat_ELL_, cs);
+            const size_t xlrow = (size_t) (lat_ELL_ / 32) * 36;
+            quantize_q8_1_rows(yfull, cap, (int) lat_ELL_, lat_uq_ + (size_t) tb * K * xlrow, cs);
+            strata::kernels::latent_u_grouped(lat_u_ + (size_t) l * lat_u_layer_, lat_uq_ + (size_t) tb * K * xlrow, ids_ + (size_t) tb * K,
+                                              lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_, cap, (int) lat_ELL_, (int) N, parts_out, cs, lat_fmt_);
+            stamp(l, 24, grp);
+        } else
         if (ar_on()) {
             if (!stage_mark(cs, kStPlan, err)) return false;   // no plan wait on this path: plan-wait reads ~0
             stamp(l, 19, grp);
@@ -4575,6 +4671,11 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_xlseq_ != nullptr) {   // hotrod-edge0: the D stage's doorbell restarts with the window, and the CPU pool finds this verifier's D rows
+        *(volatile uint32_t*) h_xlseq_ = 0;
+        strata::core::latent_xl_current() = (const uint8_t*) h_latxl_;
+        strata::core::latent_xlseq_current() = h_xlseq_;
+    }
     // the overlapped split: the next stage's graph is launched after this, and must see THIS window's raise
     if (hflag_out_h_ != nullptr) *(volatile uint32_t*) hflag_out_h_ = 0;
     if (herr_h_ != nullptr) *(volatile uint32_t*) herr_h_ = 0;
@@ -6997,6 +7098,11 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_xlseq_ != nullptr) {   // hotrod-edge0: the D stage's doorbell restarts with the window, and the CPU pool finds this verifier's D rows
+        *(volatile uint32_t*) h_xlseq_ = 0;
+        strata::core::latent_xl_current() = (const uint8_t*) h_latxl_;
+        strata::core::latent_xlseq_current() = h_xlseq_;
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];

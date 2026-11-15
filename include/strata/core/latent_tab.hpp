@@ -1,4 +1,4 @@
-// include/strata/core/latent_tab.hpp - the session-level latent MoE tables (branch edge0-latent).
+// include/strata/core/latent_tab.hpp - the session-level latent MoE tables (branch hotrod-edge0).
 //
 // An Edge0 latent pack's experts run in a latent space: every layer has D projections (hidden -> latent, one per expert group), U
 // projections (latent -> hidden) and a group label per expert.  This loads them ONCE for the session, to the GPU, before the expert cache is
@@ -61,6 +61,7 @@ private:
     std::vector<int32_t> labels_;
     uint8_t* d_ = nullptr;
     uint8_t* u_ = nullptr;
+    int32_t* labels_dev_ = nullptr;
     int groups_ = 0, fmt_ = 0;
     uint64_t device_bytes_ = 0;
 };

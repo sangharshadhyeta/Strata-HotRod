@@ -814,6 +814,21 @@ private:
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
+    // latent MoE (Edge0, branch hotrod-edge0): every pointer stays null for an ordinary pack.  The experts of a latent pack run in a latent
+    // space: D (hidden -> one latent vector per group) before them, U (latent -> hidden, per group) after.  The D/U pair, the group labels
+    // and the sizes come from the session-level LatentTab (core/latent_share.hpp); nothing here is sized by a constant.
+    bool latent_ = false;
+    int lat_fmt_ = 8, lat_G_ = 0;
+    int64_t lat_ELL_ = 0, lat_E_ = 0;
+    size_t lat_d_layer_ = 0, lat_u_layer_ = 0;                // one layer's D and U bytes
+    const uint8_t *lat_d_ = nullptr, *lat_u_ = nullptr;       // the session pair (device, not owned)
+    const int32_t* lat_labels_dev_ = nullptr;                 // [n_layers * n_expert] (device, not owned)
+    uint8_t *lat_xq_ = nullptr, *lat_xlq_ = nullptr, *lat_uq_ = nullptr;   // q8_1 of x [T], of xl [T*G], of yl [T*K]
+    float *lat_xl_ = nullptr, *lat_yl_ = nullptr;             // [T*G, ELL] (D's output), [T*K, ELL] (the GPU's A output)
+    float* lat_yfull_ = nullptr;                              // [T*K, ELL]: the GPU's and the CPU pool's A rows together, U's input
+    float* h_latxl_ = nullptr;   float* m_latxl_ = nullptr;    // mapped: the D rows for the CPU pool (row t*G + g)
+    uint32_t* h_xlseq_ = nullptr; uint32_t* m_xlseq_ = nullptr;   // mapped: the D stage's doorbell (layer + 1 once layer's rows landed)
+
     // device
     void* arena_ = nullptr;
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;

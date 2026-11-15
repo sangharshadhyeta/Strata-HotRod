@@ -1,5 +1,5 @@
 // tests/core/latent_moe_gpu_test.cpp - one layer of Edge0's latent MoE (D -> A -> U -> combine) on the GPU against a CPU
-// reference that shares no kernel with it.  Branch edge0-latent, step 2.
+// reference that shares no kernel with it.  Branch hotrod-edge0, step 2.
 //
 //   latent_moe_gpu_test <Edge0 NVFP4 folder> [layer=0] [T=4]
 //

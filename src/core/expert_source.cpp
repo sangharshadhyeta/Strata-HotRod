@@ -2,6 +2,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/foresight_swap.hpp"
+#include "strata/core/latent_share.hpp"   // hotrod-edge0: the D rows and the group labels the CPU pool reads
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -6055,6 +6056,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
+    // hotrod-edge0 (Edge0's latent MoE): the CPU pool runs the experts' A part at the latent width.  Its input is the D stage's row for
+    // (token, the expert's group) - published to host memory by the GPU, with a doorbell - not the hidden state; its output rows are
+    // `Hout` (the latent width) floats; the GPU does U afterwards.  Everything is read off the pack (the layout, the session's LatentTab).
+    const bool latent = native && lay.latent;
+    const int64_t Hout = latent ? lay.expert_embd : (int64_t) H;
+    const strata::core::LatentShared& lat = strata::core::latent_shared_info();
+    const int lat_G = latent ? lat.groups : 1;
+    if (latent) {
+        if (lat.labels_host == nullptr || lat_G <= 0 || strata::core::latent_xl_current() == nullptr || strata::core::latent_xlseq_current() == nullptr) {
+            d.failed = true;
+            d.fail = "latent CPU share: the D rows or the group labels are not published";
+            d.fail_layer = d.layers;
+            return;
+        }
+        if (d.nact_multi.size() < (size_t) MAXT * (size_t) lat_G * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * (size_t) lat_G * kNativeActBytes);
+    }
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
@@ -6263,6 +6280,34 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
+        if (latent) {
+            // the D stage's rows of this layer are in host memory when its doorbell reaches layer + 1 (verify.cpp's `pre`)
+            const volatile uint32_t* xlseq = strata::core::latent_xlseq_current();
+            const uint32_t want = (uint32_t) d.layers + 1;
+            const auto w0 = std::chrono::steady_clock::now();
+            while (*xlseq < want) {
+                if (std::chrono::steady_clock::now() - w0 > std::chrono::seconds(10)) {
+                    d.failed = true;
+                    d.fail = "latent CPU share: the D rows never arrived for this layer";
+                    d.fail_layer = d.layers;
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            const float* xl = (const float*) strata::core::latent_xl_current();
+            const int32_t* labels = lat.labels_host + (size_t) d.layers * (size_t) d.n_expert;
+            static thread_local std::vector<uint8_t> quantized;
+            quantized.assign((size_t) n_tok * (size_t) lat_G, 0);
+            for (int64_t i = 0; i < n_tok * k; ++i) {   // one activation per (token, group) a CPU entry reads
+                if (kind[i] != -1 || ids[i] < 0 || ids[i] >= d.n_expert) continue;
+                const int64_t t = i / k;
+                const int g = labels[ids[i]];
+                const size_t row = (size_t) t * (size_t) lat_G + (size_t) g;
+                if (quantized[row]) continue;
+                quantized[row] = 1;
+                native_quant_act(lay.fmt[(size_t) d.layers], xl + row * (size_t) Hout, d.nact_multi.data() + row * kNativeActBytes);
+            }
+        } else
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
@@ -6290,7 +6335,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
             const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
+            float* row = out + (size_t) i * Hout;
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";
@@ -6299,7 +6344,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 return;
             }
             if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero
-                std::memset(row, 0, (size_t) H * sizeof(float));
+                std::memset(row, 0, (size_t) Hout * sizeof(float));
                 ++d.tail_skipped;
                 continue;
             }
@@ -6311,7 +6356,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
                 if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
                       (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
-                    std::memset(row, 0, (size_t) H * sizeof(float));
+                    std::memset(row, 0, (size_t) Hout * sizeof(float));
                 continue;
             }
             ++d.cache_refused;
@@ -6333,7 +6378,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
             jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+            // latent: the activation is the (token, group) row quantized above; the group is the expert's label
+            const size_t act_row = latent ? (size_t) t * (size_t) lat_G + (size_t) lat.labels_host[(size_t) d.layers * (size_t) d.n_expert + (size_t) e]
+                                          : (size_t) t;
+            jb.nact[jb.nt] = native ? d.nact_multi.data() + act_row * kNativeActBytes : nullptr;
             jb.out[jb.nt] = row;
             ++jb.nt;
             ++d.multi_entries;
