@@ -3624,14 +3624,16 @@ int main(int argc, char** argv) {
         // Edge0's latent MoE (native_experts.txt v6, branch hotrod-edge0): the experts' rows are `expert_embd` wide, not n_embd wide, and a
         // layer also needs its D/U projections and the expert group labels, which the session-level LatentTab loads before the expert
         // cache is sized (below).  The decode path (verify windows: D, A at the latent width, U, the CPU pool's share) is in; the chunked
-        // PROMPT path (prefill.cpp), which a native pack cannot run without, still reads every expert at the model's width.  Until it
-        // is ported a latent pack is refused here, by name, instead of generating wrong tokens.
-        if (strata::kernels::cpu::expert_layout().latent && std::getenv("STRATA_LATENT_ALLOW_UNPORTED_PREFILL") == nullptr) {
+        // PROMPT path (prefill.cpp) still reads every expert at the model's width, so a latent pack reads its prompt in verify windows
+        // (slow, correct) until that path is ported.
+        if (strata::kernels::cpu::expert_layout().latent) {
             const auto& lay = strata::kernels::cpu::expert_layout();
-            std::fprintf(stderr, "strata generate: the experts of %s are latent (%lld wide, hidden %lld): the decode path runs them, but the chunked "
-                                 "prompt path is not ported to them yet, and a native pack cannot run without it (branch hotrod-edge0)\n",
-                         o.pack.c_str(), (long long) lay.expert_embd, (long long) lay.expert_ff);
-            return 1;
+            if (o.prefill_chunk != 0)
+                std::fprintf(stderr, "strata generate: latent experts (%lld wide, hidden %lld): the chunked prompt path is not ported to them "
+                                     "yet, so --prefill is ignored and the prompt is read in verify windows\n",
+                             (long long) lay.expert_embd, (long long) lay.expert_ff);
+            o.prefill_chunk = 0;
+            o.prefill_auto = false;
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
@@ -3949,7 +3951,7 @@ int main(int argc, char** argv) {
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
-            (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
+            (o.prefill_chunk <= 0 && o.tokens.size() > 1 && !strata::kernels::cpu::expert_layout().latent)) {
             std::fprintf(stderr, "strata generate: %s is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) "
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
@@ -17650,6 +17652,11 @@ int main(int argc, char** argv) {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
+    // hotrod-edge0: a latent pack has no chunked prompt path yet, so the prompt's first n_prompt - 1 tokens are fed through verify
+    // windows (all accepted, outputs dropped) before the first real window; the last prompt token then starts the loop as usual.
+    const bool latent_feed = native_pack && strata::kernels::cpu::expert_layout().latent && o.prefill_chunk <= 0 &&
+                             pos_start == 0 && n_prompt > 1;
+    if (latent_feed) spec_pos = 1;
     if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
         auto read_ids = [](const std::string& path, std::vector<int64_t>& ids) {
             std::ifstream in(path);
@@ -17957,6 +17964,31 @@ int main(int argc, char** argv) {
             extra_sources_reset();
             for (int64_t t : o.tokens) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
             for (int64_t t : produced) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
+        }
+        if (latent_feed) {
+            const int64_t n_feed = n_prompt - 1;
+            const Clock::time_point tf = Clock::now();
+            std::vector<int32_t> fw((size_t) o.spec), fo((size_t) o.spec);
+            for (int64_t q = 0; q < n_feed;) {
+                const int Tf = (int) std::min<int64_t>(o.spec, n_feed - q);
+                for (int i = 0; i < Tf; ++i) fw[(size_t) i] = (int32_t) o.tokens[(size_t) (q + i)];
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
+                if (!ver.run(Tf, fw.data(), q, &drive_pool_multi, &drive, fo.data(), err) || drive.d.failed) {
+                    std::fprintf(stderr, "strata generate: prompt window at %lld failed: %s\n", (long long) q,
+                                 drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                    return 1;
+                }
+                if (!ver.commit(Tf, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+                q += Tf;
+            }
+            if (!ver.wait_commit(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+            p = n_feed;
+            x = (int32_t) o.tokens[(size_t) n_feed];
+            prefill_ms += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
+            std::fprintf(stderr, "strata generate: latent prompt: %lld tokens read in verify windows, %.1f ms\n", (long long) n_feed,
+                         std::chrono::duration<double, std::milli>(Clock::now() - tf).count());
         }
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
