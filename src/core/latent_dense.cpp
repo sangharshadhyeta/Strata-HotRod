@@ -42,14 +42,17 @@ void LatentDense::close() {
 }
 
 bool LatentDense::open(const std::string& path, int64_t n_layers, int64_t n_groups, int64_t n_embd,
-                       int64_t latent_dim, std::string& err) {
+                       int64_t latent_dim, std::string& err, int fmt) {
     close();
     n_layers_ = n_layers; n_groups_ = n_groups; n_embd_ = n_embd; latent_dim_ = latent_dim;
     // Q4DU: STRATA_LATENT_DENSE_FMT=4 selects the Q4_0 pack (18 B/block), 8 or unset the
     // historical Q8_0 one (34 B/block).  The file's size must then match the derived layout -
     // a mismatched file/env pair fails the open with both candidate sizes spelled out.
+    // (an explicit `fmt` from the caller - LatentTab reads it off the file's size - wins over the environment)
     fmt_ = 8;
-    if (const char* f = ::getenv("STRATA_LATENT_DENSE_FMT")) {
+    if (fmt == 4 || fmt == 8) {
+        fmt_ = fmt;
+    } else if (const char* f = ::getenv("STRATA_LATENT_DENSE_FMT")) {
         if (f[0] == '4' && f[1] == 0) fmt_ = 4;
         else if (f[0] == '8' && f[1] == 0) fmt_ = 8;
         else { err = path + ": STRATA_LATENT_DENSE_FMT must be 4 or 8 (got '" + std::string(f) + "')"; return false; }

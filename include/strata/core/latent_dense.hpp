@@ -20,8 +20,10 @@ public:
     LatentDense(const LatentDense&) = delete;
     LatentDense& operator=(const LatentDense&) = delete;
 
+    /// `fmt`: 8 (Q8_0) or 4 (Q4_0) when the caller worked it out (LatentTab derives it from the file's size); 0 keeps
+    /// Edge0's rule (STRATA_LATENT_DENSE_FMT, else 8).  Either way the file's size must match the layout it implies.
     bool open(const std::string& path, int64_t n_layers, int64_t n_groups, int64_t n_embd, int64_t latent_dim,
-              std::string& err);
+              std::string& err, int fmt = 0);
     void close();
 
     bool mapped() const { return base_ != nullptr; }

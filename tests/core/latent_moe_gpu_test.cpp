@@ -13,6 +13,7 @@
 // differ by order 1.  Pass thresholds, fixed before the first run: relative RMS error under 5% at each of the three stages
 // (the D output, the A output, the final combined output).
 #include "strata/core/latent_dense.hpp"
+#include "strata/core/latent_tab.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -130,6 +132,50 @@ int main(int argc, char** argv) {
         for (int g2 = 0; g2 < G; ++g2) per += (g2 ? "," : "") + std::to_string(seen[g2]);
         check(in_range, "layer " + std::to_string(layer) + "'s group labels are all in [0, 8) (experts per group: " + per + ")");
         if (!in_range) return 1;
+    }
+
+    // ---- the session-level table (LatentTab): everything read off the pack, nothing hardcoded to this model or this card
+    strata::core::LatentTab tab;
+    {
+        namespace fs = std::filesystem;
+        const uint64_t q8_bytes = fs::file_size(dir + "/latent_dense_q8.bin"), q4_bytes = fs::file_size(dir + "/latent_dense_q4.bin");
+        int f = 0, g = 0;
+        check(strata::core::latent_dense_identify(q8_bytes, 48, H, ELL, f, g) && f == 8 && g == G, "the Q8 file's size says: Q8_0, 8 groups");
+        check(strata::core::latent_dense_identify(q4_bytes, 48, H, ELL, f, g) && f == 4 && g == G, "the Q4 file's size says: Q4_0, 8 groups");
+        check(!strata::core::latent_dense_identify(q8_bytes + 1, 48, H, ELL, f, g), "a file of another size is not taken for a D/U file");
+        check(!strata::core::latent_dense_identify(q8_bytes, 48, H, ELL + 32, f, g), "nor is it at another latent width");
+        const uint64_t GiB = 1ull << 30;
+        strata::core::LatentDenseChoice c;
+        unsetenv("STRATA_LATENT_DENSE_FMT");
+        unsetenv("STRATA_LATENT_DENSE");
+        std::string e2;
+        check(strata::core::latent_dense_choose(dir, 48, H, ELL, 12 * GiB, 0, c, e2) && c.fmt == 8, "12 GiB free: the Q8 file (it takes under half)");
+        check(strata::core::latent_dense_choose(dir, 48, H, ELL, 5 * GiB, 0, c, e2) && c.fmt == 4, "5 GiB free: the Q4 file (Q8 would take more than half)");
+        check(!strata::core::latent_dense_choose(dir, 48, H, ELL, 1 * GiB, 0, c, e2) && e2.find("GiB") != std::string::npos,
+              "1 GiB free: refused, saying how much is needed (\"" + e2.substr(0, 60) + "...\")");
+        check(strata::core::latent_dense_choose(dir, 48, H, ELL, 5 * GiB, 80, c, e2) && c.fmt == 8, "the share is a flag: 80% of 5 GiB takes the Q8 file");
+        setenv("STRATA_LATENT_DENSE_FMT", "4", 1);
+        check(strata::core::latent_dense_choose(dir, 48, H, ELL, 12 * GiB, 0, c, e2) && c.fmt == 4, "STRATA_LATENT_DENSE_FMT=4 forces the Q4 file");
+        unsetenv("STRATA_LATENT_DENSE_FMT");
+        size_t fb = 0, tb = 0;
+        ck(cudaSetDevice(0), "cudaSetDevice");
+        ck(cudaMemGetInfo(&fb, &tb), "cudaMemGetInfo");
+        std::string e3;
+        const bool loaded = tab.load(dir, 48, H, ELL, E, (uint64_t) fb, e3);
+        check(loaded, "LatentTab loads: " + (loaded ? std::string("Q") + (tab.fmt() == 8 ? "8" : "4") + ", " + std::to_string(tab.groups()) + " groups, " +
+                                                       std::to_string((double) tab.device_bytes() / 1073741824.0).substr(0, 4) + " GiB on the GPU" : e3));
+        if (!loaded) return 1;
+        check(tab.groups() == G && tab.labels().size() == (size_t) 48 * E, "the group count and the labels come out of the files");
+        check(strata::core::latent_shared_d() == tab.d() && strata::core::latent_shared_u() == tab.u(), "the device pair is published for the verify and prompt paths");
+        // the upload is the file: layer 0 and the last layer, D and U, compared byte for byte with the mapped file
+        bool same = true;
+        for (const int64_t l : {int64_t(0), int64_t(47)}) {
+            std::vector<uint8_t> hd(tab.dense().d_bytes()), hu(tab.dense().u_bytes());
+            ck(cudaMemcpy(hd.data(), tab.d() + (size_t) l * tab.dense().d_bytes(), hd.size(), cudaMemcpyDeviceToHost), "tab D back");
+            ck(cudaMemcpy(hu.data(), tab.u() + (size_t) l * tab.dense().u_bytes(), hu.size(), cudaMemcpyDeviceToHost), "tab U back");
+            same = same && std::memcmp(hd.data(), tab.dense().d(l), hd.size()) == 0 && std::memcmp(hu.data(), tab.dense().u(l), hu.size()) == 0;
+        }
+        check(same, "layers 0 and 47 of D and U on the GPU are the file's bytes");
     }
 
     // inputs: hidden states, K distinct experts per token, positive weights summing to 1

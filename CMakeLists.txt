@@ -621,7 +621,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/subfit_samples.cpp src/core/subfit_learn.cpp src/core/subfit_shadow.cpp
     src/core/risk_concentration.cpp)
   # Edge0's latent MoE (branch edge0-latent): the D/U + experts file loaders and the layer module (D -> A -> U -> combine)
-  target_sources(strata_engine PRIVATE src/core/latent_dense.cpp src/latent/latent_moe.cpp)
+  target_sources(strata_engine PRIVATE src/core/latent_dense.cpp src/core/latent_tab.cpp src/latent/latent_moe.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
