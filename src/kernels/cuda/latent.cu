@@ -201,6 +201,32 @@ __global__ void latent_u_p4_k(const uint8_t* __restrict__ u, const uint8_t* __re
     }
 }
 
+// hotrod-edge0 (prompt path): the D matrix [rows, cols] (Q4_0 18-byte or Q8_0 34-byte blocks, raw layout) to f16, for one GEMM over a chunk.
+__global__ void latent_dequant_f16_k(const uint8_t* __restrict__ src, int64_t n_blocks, int fmt, uint16_t* __restrict__ dst) {
+    const int64_t b = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const uint8_t* blk = src + (size_t) b * (fmt == 4 ? 18 : 34);
+    const float d = __half2float(*(const __half*) blk);
+    __half* o = (__half*) dst + (size_t) b * 32;
+    if (fmt == 4) {
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int byte_ = blk[2 + j];
+            o[j] = __float2half(d * (float) ((byte_ & 0xF) - 8));
+            o[j + 16] = __float2half(d * (float) ((byte_ >> 4) - 8));
+        }
+    } else {
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) o[j] = __float2half(d * (float) (int8_t) blk[2 + j]);
+    }
+}
+
+void latent_dequant_f16(const uint8_t* src, int64_t rows, int cols, int fmt, uint16_t* dst, void* stream) {
+    const int64_t nb = rows * (int64_t) (cols / 32);
+    if (nb <= 0) return;
+    latent_dequant_f16_k<<<(unsigned) ((nb + 127) / 128), 128, 0, (cudaStream_t) stream>>>(src, nb, fmt, dst);
+}
+
 bool latent_u_pack_q4_ok(int ELL) { return ELL > 0 && ELL % 32 == 0 && ((ELL / 32) * 18) % 16 == 0 && (ELL / 32) <= 64; }
 
 void latent_u_repack_q4(uint8_t* u, int64_t rows, int ELL, void* stream) {

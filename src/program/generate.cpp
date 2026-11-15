@@ -3624,17 +3624,21 @@ int main(int argc, char** argv) {
         }
         // Edge0's latent MoE (native_experts.txt v6, branch hotrod-edge0): the experts' rows are `expert_embd` wide, not n_embd wide, and a
         // layer also needs its D/U projections and the expert group labels, which the session-level LatentTab loads before the expert
-        // cache is sized (below).  The decode path (verify windows: D, A at the latent width, U, the CPU pool's share) is in; the chunked
-        // PROMPT path (prefill.cpp) still reads every expert at the model's width, so a latent pack reads its prompt in verify windows
-        // (slow, correct) until that path is ported.
+        // cache is sized (below).  Decode (verify windows) and the chunked prompt path (prefill.cpp: D over the chunk by one GEMM, the experts
+        // on the fp16 branch at the latent width, U per row) both run them.  The chunked path has no MMQ / fused kernels, no CPU share and no
+        // peer yet.  STRATA_LATENT_PREFILL=0 reads the prompt in verify windows instead (the first, slower path).
         if (strata::kernels::cpu::expert_layout().latent) {
             const auto& lay = strata::kernels::cpu::expert_layout();
-            if (o.prefill_chunk != 0)
-                std::fprintf(stderr, "strata generate: latent experts (%lld wide, hidden %lld): the chunked prompt path is not ported to them "
-                                     "yet, so --prefill is ignored and the prompt is read in verify windows\n",
-                             (long long) lay.expert_embd, (long long) lay.expert_ff);
-            o.prefill_chunk = 0;
-            o.prefill_auto = false;
+            const bool windows_only = [] { const char* v = std::getenv("STRATA_LATENT_PREFILL"); return v != nullptr && std::atoi(v) == 0; }();
+            if (windows_only) {
+                if (o.prefill_chunk != 0)
+                    std::fprintf(stderr, "strata generate: latent experts (%lld wide, hidden %lld): STRATA_LATENT_PREFILL=0, so --prefill is ignored and "
+                                         "the prompt is read in verify windows\n", (long long) lay.expert_embd, (long long) lay.expert_ff);
+                o.prefill_chunk = 0;
+                o.prefill_auto = false;
+            } else {
+                setenv("STRATA_PREFILL_CPU_SHARE", "0", 0);   // the CPU share computes at the model's width: not for a latent pack
+            }
             // Stand-ins ON by default for a latent pack (the Qwen branch's setting: ranks 3-9 take any resident stand-in, the edge rank 2 only
             // within 1 logit).  Measured 15 Nov on the RTX 3060 12 GB, SSD mode: decode 6.7-7.6 -> 15.7-16.8 tok/s on three questions whose
             // answers read correct.  Already-set variables win; STRATA_ROUTE_RESIDENT=0 turns them off.
@@ -8610,7 +8614,7 @@ int main(int argc, char** argv) {
         return false;
     };
     // hotrod-edge0: a latent pack has no batched prompt path yet; serve reads every prompt in verify windows (read_windows)
-    const bool latent_serve = strata::kernels::cpu::expert_layout().latent;
+    const bool latent_serve = strata::kernels::cpu::expert_layout().latent && o.prefill_chunk <= 0;   // windows only: STRATA_LATENT_PREFILL=0
     if (o.serve) {
         if (o.spec < 2 || (o.prefill_chunk <= 0 && !latent_serve) ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {

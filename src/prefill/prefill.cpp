@@ -20,6 +20,8 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/core/latent_share.hpp"   // hotrod-edge0: a latent pack's D / U / labels
+#include "strata/kernels/latent.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -1126,6 +1128,11 @@ struct Prefill::Impl {
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
+    // hotrod-edge0: a latent pack's prompt path (D over the chunk -> the experts at the latent width -> U into the rows the combine reads)
+    float *lat_xl32 = nullptr, *lat_yl = nullptr;
+    uint16_t *lat_xl16 = nullptr, *lat_dqd = nullptr;
+    uint8_t* lat_ylq = nullptr;
+    int32_t* lat_rid = nullptr;
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
@@ -1327,7 +1334,7 @@ const MmqPlan& mmq_plan() {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
         const char* env = std::getenv("STRATA_PREFILL_MMQ");
-        const bool on = mmq::built() && (env == nullptr || std::atoi(env) != 0);
+        const bool on = mmq::built() && (env == nullptr || std::atoi(env) != 0) && !lay.latent;   // a latent pack: the fp16 branch only (for now)
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fo.assign(p.layer.size(), 0);
@@ -1416,6 +1423,11 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
     if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
+    if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent) {   // hotrod-edge0: the latent prompt path's chunk buffers
+        const size_t G = (size_t) core::latent_shared_info().groups, EL = (size_t) ly.expert_embd;
+        a.take<float>(T * G * EL, ok); a.take<uint16_t>(T * G * EL, ok); a.take<float>(T * K * EL, ok);
+        a.take<uint8_t>(T * K * (EL / 32) * 36, ok); a.take<int32_t>(T * K, ok);
+    }
     if (mp.any) {
         a.take<uint8_t>(mb.xq, ok);
         a.take<float>(mb.h, ok);
@@ -1676,6 +1688,11 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
+        if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent) {   // hotrod-edge0 (same takes as moe_set_bytes)
+            const size_t G = (size_t) core::latent_shared_info().groups, EL = (size_t) ly.expert_embd;
+            m.lat_xl32 = c.take<float>(T * G * EL, ok); m.lat_xl16 = c.take<uint16_t>(T * G * EL, ok); m.lat_yl = c.take<float>(T * K * EL, ok);
+            m.lat_ylq = c.take<uint8_t>(T * K * (EL / 32) * 36, ok); m.lat_rid = c.take<int32_t>(T * K, ok);
+        }
         if (mp.any) {
             m.Xq = c.take<uint8_t>(mb.xq, ok);
             m.H = c.take<float>(mb.h, ok);
@@ -1691,6 +1708,8 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (base == nullptr) ok = false;
     }
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent)   // hotrod-edge0: one layer's D as f16 [G * latent, N]
+        m.lat_dqd = o.take<uint16_t>((size_t) core::latent_shared_info().groups * (size_t) ly.expert_embd * N, ok);
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         const size_t ids_rows = mmq_ids_rows(T);
@@ -2457,6 +2476,8 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+    if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent)   // hotrod-edge0 (as init)
+        o.take<uint16_t>((size_t) core::latent_shared_info().groups * (size_t) ly.expert_embd * N, ok);
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         const size_t ids_rows = mmq_ids_rows(T);
@@ -4084,6 +4105,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // keep MMQ; without the variable nothing here runs.  A native pack's layer takes the native kernels
                     // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: IQ1_M).
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+                    // hotrod-edge0: a latent pack's layer - D (hidden -> one latent vector per group), the experts at the latent width, U (per route)
+                    const bool latent = lay.latent;
+                    const core::LatentShared& lsh = core::latent_shared_info();
+                    const int LG = latent ? (int) lsh.groups : 0;
+                    const int ELL = latent ? (int) lay.expert_embd : 0;
+                    const int64_t Kin = latent ? (int64_t) ELL : (int64_t) N;   // the experts' input width
+                    const int32_t* lat_lab = latent ? lsh.labels_host + (size_t) l * (size_t) m.g->n_expert : nullptr;
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
@@ -4458,7 +4486,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = ids_h[(size_t) i];
                             const int32_t p = fill[(size_t) e]++;
                             slot_h[(size_t) i] = p;
-                            src_h[(size_t) p] = (int32_t) (i / K);
+                            src_h[(size_t) p] = latent ? (int32_t) ((i / K) * LG + lat_lab[e]) : (int32_t) (i / K);   // latent: the xl row token*G + group
                         }
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order, order_peer;
@@ -4615,6 +4643,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     return false;
                                 }
                             }
+                        } else if (latent) {
+                            // D: every token's hidden vector to one latent vector per group (one GEMM over the chunk), f16 rows [token*G + group];
+                            // the experts' input rows are gathered from them by the routing (src_dev was built as token*G + group)
+                            strata::kernels::latent_dequant_f16((const uint8_t*) core::latent_shared_d() + (size_t) l * lsh.d_layer_bytes,
+                                                                (int64_t) LG * ELL, (int) N, lsh.fmt, m.lat_dqd, m.cs);
+                            m.gemm.f16(m.mixed_h, m.lat_dqd, m.lat_xl32, T, (int64_t) LG * ELL, N);
+                            to_f16(m.lat_xl32, m.lat_xl16, T * LG * ELL, m.cs);
+                            gather_rows16(m.lat_xl16, m.src_dev, m.Xs, T * K, ELL, m.cs);
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                         }
@@ -5181,10 +5217,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             pt.mark(kPfGemmGU, cs);
-                            m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                            m.gemm.f16(m.Xs + o0 * Kin, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, Kin);
                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                             pt.mark(kPfGemmD, cs);
-                            m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            if (latent) m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.lat_yl + o0 * ELL, ne, ELL, 640);   // the latent rows; U follows
+                            else m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                             return true;
                         };
                         if (gov) {   // fork: the groups' streams wait for everything queued on m.cs so far (this layer's inputs)
@@ -5279,6 +5316,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     ph(PT_OTHER);
                     pt.mark(kPfCombine, cs);
+                    if (latent) {
+                        // U: every routed row (in expert order, as the experts wrote them) up to the hidden width, straight into Dm for the combine
+                        static thread_local std::vector<int32_t> lat_rid_h;
+                        lat_rid_h.assign((size_t) (T * K), 0);
+                        const int32_t* ids_p = m.grp_host != nullptr ? m.grp_host : m.ids_host.data();
+                        const int32_t* slot_p = m.grp_host != nullptr ? m.grp_host + m.grp_tk : m.slot_host.data();
+                        for (int64_t i = 0; i < T * K; ++i) lat_rid_h[(size_t) slot_p[(size_t) i]] = ids_p[(size_t) i];
+                        if (m.up_ring.h2d(m.lat_rid, lat_rid_h.data(), (size_t) (T * K) * 4, m.cs) != cudaSuccess) {
+                            err = "prefill: the latent row ids' upload failed";
+                            return false;
+                        }
+                        strata::kernels::quantize_q8_1_rows(m.lat_yl, T * K, ELL, m.lat_ylq, m.cs);
+                        strata::kernels::latent_u_grouped((const uint8_t*) core::latent_shared_u() + (size_t) l * lsh.u_layer_bytes, m.lat_ylq, m.lat_rid,
+                                                          lsh.labels_dev + (size_t) l * (size_t) m.g->n_expert, m.g->n_expert, T * K, ELL, (int) N,
+                                                          m.Dm, m.cs, lsh.fmt, LG, lsh.u_packed);
+                    }
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)
                         if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
                         if (!cpu_fut.get()) { err = "prefill: a CPU expert has no blob"; return false; }
