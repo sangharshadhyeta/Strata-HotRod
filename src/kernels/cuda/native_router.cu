@@ -371,6 +371,7 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 // be fed a different latent vector, so it is a worse match).  g_grp_stats: [0] stand-ins taken, [1] of them in another group than the pick.
 __device__ const int32_t* g_grp_labels = nullptr;
 __device__ int g_grp_mode = 0;
+__device__ float g_grp_bonus = 0.0f;   // mode 2: a resident candidate of the missing expert's group gets this many logits on top (a soft preference)
 __device__ unsigned long long g_grp_stats[2];
 static unsigned long long* g_detail = nullptr;   // the decode rows' detail counters (route_detail_alloc), see below
 // The router's device scratch (the look-ahead's logits and weights, its skip counter, the ring flags, and the want / rows / repl /
@@ -562,13 +563,15 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
         int bi = -1;
         const int32_t* glab = (g_grp_labels != nullptr && layer >= 0) ? g_grp_labels + (size_t) layer * 512 : nullptr;
         const bool gonly = glab != nullptr && g_grp_mode == 1;
+        const float gbonus = (glab != nullptr && g_grp_mode == 2) ? g_grp_bonus : 0.0f;
         for (int f = lane; f < 512; f += 32) {
             if (!have(f)) continue;
             if (gonly && glab[f] != glab[e]) continue;   // latent packs: a stand-in of the missing expert's group only
             bool used = false;
             for (int q = 0; q < 10; ++q) used |= my[q] == f;
             if (used) continue;
-            if (l[f] > bv) { bv = l[f]; bi = f; }
+            const float sc = l[f] + ((gbonus != 0.0f && glab[f] == glab[e]) ? gbonus : 0.0f);
+            if (sc > bv) { bv = sc; bi = f; }
         }
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
@@ -578,6 +581,7 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
         }
         bv = __shfl_sync(0xffffffffu, bv, 0);           // every lane decides the same way from here
         bi = __shfl_sync(0xffffffffu, bi, 0);
+        if (bi >= 0 && gbonus != 0.0f) bv = l[bi];      // the bonus only chose the candidate: the margin, place and gap below are the true logit's
         // item 21: the stand-in's place in the router's own ranking of all 512 experts (10 = the router's next choice after its ten
         // picks); a stand-in further down than `maxrank` is refused and the exact expert is fetched instead
         if (bi >= 0 && maxrank > 0) {
@@ -770,9 +774,10 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
     g_cfg_host->budget_tail = budget_tail;
     __sync_synchronize();
 }
-void route_group_set(const int32_t* labels_dev, int mode) {
+void route_group_set(const int32_t* labels_dev, int mode, float bonus) {
     if (cudaMemcpyToSymbol(g_grp_labels, &labels_dev, sizeof labels_dev) != cudaSuccess ||
-        cudaMemcpyToSymbol(g_grp_mode, &mode, sizeof mode) != cudaSuccess)
+        cudaMemcpyToSymbol(g_grp_mode, &mode, sizeof mode) != cudaSuccess ||
+        cudaMemcpyToSymbol(g_grp_bonus, &bonus, sizeof bonus) != cudaSuccess)
         throw std::runtime_error("route_group_set: the symbol copy failed");
 }
 void route_group_stats(unsigned long long out[2]) {

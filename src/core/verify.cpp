@@ -2162,7 +2162,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             lat_u_packed_ = li.u_packed;
             {   // STRATA_LATENT_STANDIN_GROUP: 0 (default) counts the stand-ins that cross groups, 1 forbids them
                 const char* gv = std::getenv("STRATA_LATENT_STANDIN_GROUP");
-                strata::kernels::route_group_set(li.labels_dev, gv != nullptr ? std::atoi(gv) : 0);
+                const char* gb = std::getenv("STRATA_LATENT_STANDIN_GROUP_BONUS");   // logits; > 0: the soft preference (mode 2)
+                const float bonus = gb != nullptr ? (float) std::atof(gb) : 0.0f;
+                const int mode = gv != nullptr ? std::atoi(gv) : (bonus > 0.0f ? 2 : 0);
+                strata::kernels::route_group_set(li.labels_dev, mode, bonus);
             }
         }
     }

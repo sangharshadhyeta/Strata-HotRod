@@ -841,6 +841,7 @@ struct Options {
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
+    bool mtp_window_given = false;   ///< --mtp-window was on the command line (a latent pack with K/V streaming otherwise sets it to the resident cells)
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
@@ -2812,7 +2813,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
         else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
-        else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
+        else if (a == "--mtp-window") { o.mtp_window = std::atoll(next("--mtp-window")); o.mtp_window_given = true; }
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
@@ -3985,6 +3986,14 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
+    // hotrod-edge0: with K/V streaming on, the draft head must attend only to cells that are resident.  Measured 15 Nov on Edge0-145B (one-shot,
+    // 120 tokens, --max-context 32768 --kv-resident 8192, repeatable): the default 32768-cell draft window gave windows of 1-2 tokens (T1:19 T2:17,
+    // 1.85 tokens per round, 13.2-13.5 tok/s); a draft window of 8192 or 4096 gave 2.5-2.6 tokens per round and 15.5-15.9 tok/s (full-resident
+    // K/V: 2.63 per round, 17.9-18.1 tok/s).  --mtp-window overrides.
+    if (strata::kernels::cpu::expert_layout().latent && o.kv_resident > 0 && !o.mtp_window_given && o.mtp_window > o.kv_resident) {
+        std::fprintf(stderr, "strata generate: K/V streaming: the draft head's window is the %lld resident cells (--mtp-window overrides)\n", (long long) o.kv_resident);
+        o.mtp_window = o.kv_resident;
+    }
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
