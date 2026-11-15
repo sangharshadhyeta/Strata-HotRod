@@ -8563,8 +8563,10 @@ int main(int argc, char** argv) {
                          ev, v.why.c_str());
         return false;
     };
+    // hotrod-edge0: a latent pack has no batched prompt path yet; serve reads every prompt in verify windows (read_windows)
+    const bool latent_serve = strata::kernels::cpu::expert_layout().latent;
     if (o.serve) {
-        if (o.spec < 2 || o.prefill_chunk <= 0 ||
+        if (o.spec < 2 || (o.prefill_chunk <= 0 && !latent_serve) ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
             std::fprintf(stderr, "strata serve: needs --spec T and --prefill CHUNK (and a fillable "
                                  "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
@@ -8925,6 +8927,7 @@ int main(int argc, char** argv) {
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
+            if (latent_serve) return 0;   // no batched prompt path, so no buffers for one
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
                 st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
@@ -8988,7 +8991,7 @@ int main(int argc, char** argv) {
             };
             int dev = 0;
             int64_t need = 0, fb = 0;
-            if (!own_fits(o.prefill_chunk, dev, need, fb)) {
+            if (!latent_serve && !own_fits(o.prefill_chunk, dev, need, fb)) {
                 int64_t c = 0;
                 for (const int64_t s : kStepChunks) {
                     int d2 = 0;
@@ -13894,6 +13897,7 @@ int main(int argc, char** argv) {
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
+                if (latent_serve) return true;   // the only prompt path a latent pack has
                 if (no_short || b - a > req_short_read) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
