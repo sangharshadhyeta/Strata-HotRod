@@ -12,6 +12,7 @@
 #include "strata/kernels/dp4a.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -106,8 +107,57 @@ __global__ void latent_u_k(const uint8_t* __restrict__ u_q8, const uint8_t* __re
     if (lane == 0) o[h] = facc;
 }
 
+// hotrod-edge0: U by group.  The per-entry kernel above re-reads the routed group's whole U matrix (H rows) for EVERY entry, ~2.6 MB each
+// on the 145B: 34 entries a layer is ~88 MB of weight traffic for 8 distinct matrices.  Here a block column is one group g and a warp one
+// output row h: the row is copied once into shared memory (coalesced 4-byte words) and dotted against every entry whose group is g, the
+// entries' q8_1 activations (2 KB each) coming from L2.  The dot and the lane order are the per-entry kernel's, so the bits are the same.
+__global__ void latent_u_g_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq, const int32_t* __restrict__ ids,
+                             const int32_t* __restrict__ labels, int E, int cap_entries, int ELL, int H, float* __restrict__ out, int fmt) {
+    extern __shared__ __align__(16) uint8_t srow_all[];
+    const int g = blockIdx.x;
+    const int nb = ELL / 32;
+    const int wrow = nb * (fmt == 4 ? 18 : 34);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int h = (int) (blockIdx.y * (blockDim.x >> 5)) + warp;
+    if (h >= H) return;   // (no block-wide sync below: each warp has its own row buffer)
+    bool any = false;
+    for (int r = 0; r < cap_entries; ++r) {
+        const int32_t e = ids[r];
+        any |= ((e >= 0 && e < E) ? labels[e] : 0) == g;
+    }
+    if (!any) return;
+    uint8_t* srow = srow_all + (size_t) warp * (size_t) wrow;
+    const int* src = (const int*) (u_q8 + ((size_t) g * (size_t) H + (size_t) h) * (size_t) wrow);
+    for (int i = lane; i < wrow / 4; i += 32) ((int*) srow)[i] = src[i];
+    __syncwarp();
+    for (int r = 0; r < cap_entries; ++r) {
+        const int32_t e = ids[r];
+        if (((e >= 0 && e < E) ? labels[e] : 0) != g) continue;
+        const uint8_t* x = ylq + (size_t) r * (size_t) (nb * 36);
+        float facc = 0.0f;
+        if (fmt == 4) {
+            for (int wi = lane; wi < nb * 4; wi += 32) {
+                const int b = wi >> 2, j = (wi & 3) * 4;
+                facc += lat_blk_dot_q4(srow + (size_t) b * 18, x + (size_t) b * 36, j);
+            }
+        } else {
+            for (int wi = lane; wi < nb * 8; wi += 32) {
+                const int b = wi >> 3, j = (wi & 7) * 4;
+                const float dx = __half2float(*(const __half*) (x + (size_t) b * 36));
+                const float dw = __half2float(*(const __half*) (srow + (size_t) b * 34));
+                const int xw = *(const int*) (x + (size_t) b * 36 + 4 + j);
+                const int ww = latent_ld4_i8(srow + (size_t) b * 34 + 2 + j);
+                facc += dx * dw * (float) __dp4a(xw, ww, 0);
+            }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) facc += __shfl_down_sync(0xffffffffu, facc, off);
+        if (lane == 0) out[(size_t) r * (size_t) H + (size_t) h] = facc;
+    }
+}
+
 void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,
-                      int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt) {
+                      int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt, int G) {
     if (cap_entries <= 0) return;
     if (u_q8 == nullptr || ylq == nullptr || ids == nullptr || labels_dev == nullptr || out == nullptr) {
         std::fprintf(stderr, "latent_u_grouped NULL ptr: u=%p ylq=%p ids=%p labels=%p out=%p E=%lld cap=%lld ELL=%d H=%d\n",
@@ -118,6 +168,17 @@ void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* id
     }
     const int warps_per_block = 8;   // 256 threads
     const int rows_per_block = warps_per_block;
+    static const bool by_group = [] { const char* v = std::getenv("STRATA_LATENT_U_BY_GROUP"); return v == nullptr || std::atoi(v) != 0; }();
+    if (by_group && G > 0) {
+        const size_t wrow = (size_t) (ELL / 32) * (size_t) (fmt == 4 ? 18 : 34);
+        const size_t smem = wrow * (size_t) warps_per_block;
+        if (smem <= 48 * 1024 && wrow % 4 == 0) {
+            dim3 gg((unsigned) G, (unsigned) ((H + rows_per_block - 1) / rows_per_block));
+            latent_u_g_k<<<gg, warps_per_block * 32, smem, (cudaStream_t) stream>>>(u_q8, ylq, ids, labels_dev, (int) E, (int) cap_entries,
+                                                                                    ELL, H, out, fmt);
+            return;
+        }
+    }
     dim3 grid((unsigned) cap_entries, (unsigned) ((H + rows_per_block - 1) / rows_per_block));
     latent_u_k<<<grid, warps_per_block * 32, 0, (cudaStream_t) stream>>>(u_q8, ylq, ids, labels_dev, (int) E,
                                                                          (int) cap_entries, ELL, H, out, fmt);

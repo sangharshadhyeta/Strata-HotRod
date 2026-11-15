@@ -340,6 +340,20 @@ int main(int argc, char** argv) {
         report("A   in the decode form (rows rewritten on the device)", yl2_h, ref_yl);
         report("U   via latent_u_grouped (the decode path's U kernel)", y2_h, ref_y);
         check(compare(y2_h, gpu_y).rel_rms < 0.05, "latent_u_grouped agrees with run_layer's per-group U within the same threshold");
+        {   // the by-group kernel (G > 0) must give the per-entry kernel's bits
+            auto* y3 = (float*) dalloc((size_t) cap * H * 4, "y3");
+            ck(cudaMemset(y3, 0xFF, (size_t) cap * H * 4), "y3 clear");
+            strata::kernels::latent_u_grouped(dU, (const uint8_t*) uq2, dIds, dLabels, E, cap, (int) ELL, (int) H, y3, (void*) st, dense.fmt(), 8);
+            ck(cudaStreamSynchronize(st), "by-group sync");
+            ck(cudaGetLastError(), "by-group");
+            std::vector<float> y3_h(y2_h.size());
+            ck(cudaMemcpy(y3_h.data(), y3, y3_h.size() * 4, cudaMemcpyDeviceToHost), "y3 back");
+            size_t diff = 0;
+            for (size_t i = 0; i < y3_h.size(); ++i) diff += std::memcmp(&y3_h[i], &y2_h[i], 4) != 0;
+            std::printf("  U   by-group kernel vs per-entry kernel: %zu of %zu values differ in their bits\n", diff, y3_h.size());
+            check(diff == 0, "latent_u_grouped by group gives the per-entry kernel's bits");
+            cudaFree(y3);
+        }
     }
 
     for (void* p : blobs) cudaFree(p);

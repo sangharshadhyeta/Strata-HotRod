@@ -21,7 +21,10 @@ void latent_plan_rows(int32_t* tok, const int32_t* dst, const int32_t* counts, c
 /// One block per routed entry (cap_entries of them): quantized yl rows (q8_1) times the route's
 /// U[group] slice (Q8_0 or Q4_0 rows [G*H, ELL], fmt 8 or 4); the H-wide result lands at out[r*H .. r*H+H].
 void latent_u_grouped(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* ids, const int32_t* labels_dev,
-                      int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt = 8);
+                      int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt = 8, int G = 0);
+/// G > 0 (the pack's group count) takes the by-group kernel: one block column per group, each weight row read ONCE into shared memory and
+/// dotted against every routed entry of that group (same per-row dot and lane order as the per-entry kernel, so the same bits);
+/// STRATA_LATENT_U_BY_GROUP=0 keeps the per-entry kernel.  G = 0: the per-entry kernel.
 
 /// knife-0 (STRATA_LATENT_U_GPU): the CPU share's U computed on the GPU into parts_ directly.
 /// One block per routed entry; a GPU row (r in dst[0..count)) copies hit_out, a CPU row computes U[labels[ids[r]]] . hq[r].
