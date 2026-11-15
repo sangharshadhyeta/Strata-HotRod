@@ -107,57 +107,112 @@ __global__ void latent_u_k(const uint8_t* __restrict__ u_q8, const uint8_t* __re
     if (lane == 0) o[h] = facc;
 }
 
-// hotrod-edge0: U by group.  The per-entry kernel above re-reads the routed group's whole U matrix (H rows) for EVERY entry, ~2.6 MB each
-// on the 145B: 34 entries a layer is ~88 MB of weight traffic for 8 distinct matrices.  Here a block column is one group g and a warp one
-// output row h: the row is copied once into shared memory (coalesced 4-byte words) and dotted against every entry whose group is g, the
-// entries' q8_1 activations (2 KB each) coming from L2.  The dot and the lane order are the per-entry kernel's, so the bits are the same.
-__global__ void latent_u_g_k(const uint8_t* __restrict__ u_q8, const uint8_t* __restrict__ ylq, const int32_t* __restrict__ ids,
-                             const int32_t* __restrict__ labels, int E, int cap_entries, int ELL, int H, float* __restrict__ out, int fmt) {
-    extern __shared__ __align__(16) uint8_t srow_all[];
-    const int g = blockIdx.x;
-    const int nb = ELL / 32;
-    const int wrow = nb * (fmt == 4 ? 18 : 34);
+// hotrod-edge0: packed Q4_0 U.  The per-entry kernel's Q4 dot builds every dp4a word from byte loads (a Q4_0 block is 18 B: only 2-byte
+// aligned), ~60 instructions per 8 values; nsys on the 145B: 385 us a layer-window, instruction-bound (a by-group variant that read each
+// row once was SLOWER, 518 us, which is how that was found out).  The device copy of U is repacked ONCE at upload into
+// [nb x 16 B nibbles][nb x f16 scales] per row (the same bytes per row), so a lane loads a block's 16 nibble bytes as one int4 and
+// unpacks them with bit operations.  The integer dot is exact, so only the float accumulation order differs from the per-entry kernel.
+__global__ void latent_u_repack_q4_k(uint8_t* __restrict__ u, int64_t rows, int nb) {
+    extern __shared__ __align__(16) uint8_t sm_all[];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int h = (int) (blockIdx.y * (blockDim.x >> 5)) + warp;
-    if (h >= H) return;   // (no block-wide sync below: each warp has its own row buffer)
+    const int64_t row = (int64_t) blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= rows) return;
+    const int wrow = nb * 18;
+    uint8_t* sm = sm_all + (size_t) warp * (size_t) wrow;
+    uint8_t* gp = u + (size_t) row * (size_t) wrow;
+    for (int i = lane; i < wrow / 4; i += 32) ((int*) sm)[i] = ((const int*) gp)[i];
+    __syncwarp();
+    for (int b = lane; b < nb; b += 32) {
+        const uint8_t* blk = sm + (size_t) b * 18;
+        gp[(size_t) nb * 16 + (size_t) b * 2] = blk[0];
+        gp[(size_t) nb * 16 + (size_t) b * 2 + 1] = blk[1];
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) gp[(size_t) b * 16 + k] = blk[2 + k];
+    }
+}
+
+constexpr int kUPackRows = 4;   // output rows a warp keeps in registers: each x block is loaded once for all of them
+__global__ void latent_u_p4_k(const uint8_t* __restrict__ u, const uint8_t* __restrict__ ylq, const int32_t* __restrict__ ids,
+                              const int32_t* __restrict__ labels, int E, int cap_entries, int ELL, int H, float* __restrict__ out) {
+    const int g = blockIdx.x;
+    const int nb = ELL / 32, wrow = nb * 18;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int h0 = ((int) blockIdx.y * (blockDim.x >> 5) + warp) * kUPackRows;
+    if (h0 >= H) return;
     bool any = false;
     for (int r = 0; r < cap_entries; ++r) {
         const int32_t e = ids[r];
         any |= ((e >= 0 && e < E) ? labels[e] : 0) == g;
     }
     if (!any) return;
-    uint8_t* srow = srow_all + (size_t) warp * (size_t) wrow;
-    const int* src = (const int*) (u_q8 + ((size_t) g * (size_t) H + (size_t) h) * (size_t) wrow);
-    for (int i = lane; i < wrow / 4; i += 32) ((int*) srow)[i] = src[i];
-    __syncwarp();
+    int4 nib[kUPackRows][2];
+    float dw[kUPackRows][2];
+    #pragma unroll
+    for (int i = 0; i < kUPackRows; ++i) {
+        const int hh = min(h0 + i, H - 1);   // a row past H repeats the last one (its result is not written)
+        const uint8_t* row = u + ((size_t) g * (size_t) H + (size_t) hh) * (size_t) wrow;
+        #pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            const int b = lane + 32 * s;
+            if (b < nb) {
+                nib[i][s] = *(const int4*) (row + (size_t) b * 16);
+                dw[i][s] = __half2float(*(const __half*) (row + (size_t) nb * 16 + (size_t) b * 2));
+            } else {
+                nib[i][s] = make_int4(0, 0, 0, 0);
+                dw[i][s] = 0.0f;
+            }
+        }
+    }
     for (int r = 0; r < cap_entries; ++r) {
         const int32_t e = ids[r];
         if (((e >= 0 && e < E) ? labels[e] : 0) != g) continue;
         const uint8_t* x = ylq + (size_t) r * (size_t) (nb * 36);
-        float facc = 0.0f;
-        if (fmt == 4) {
-            for (int wi = lane; wi < nb * 4; wi += 32) {
-                const int b = wi >> 2, j = (wi & 3) * 4;
-                facc += lat_blk_dot_q4(srow + (size_t) b * 18, x + (size_t) b * 36, j);
-            }
-        } else {
-            for (int wi = lane; wi < nb * 8; wi += 32) {
-                const int b = wi >> 3, j = (wi & 7) * 4;
-                const float dx = __half2float(*(const __half*) (x + (size_t) b * 36));
-                const float dw = __half2float(*(const __half*) (srow + (size_t) b * 34));
-                const int xw = *(const int*) (x + (size_t) b * 36 + 4 + j);
-                const int ww = latent_ld4_i8(srow + (size_t) b * 34 + 2 + j);
-                facc += dx * dw * (float) __dp4a(xw, ww, 0);
+        float acc[kUPackRows] = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            const int b = lane + 32 * s;
+            if (b >= nb) break;
+            const uint8_t* xb = x + (size_t) b * 36;
+            const float dx = __half2float(*(const __half*) xb);
+            int xq[8];
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) xq[k] = *(const int*) (xb + 4 + 4 * k);
+            #pragma unroll
+            for (int i = 0; i < kUPackRows; ++i) {
+                const unsigned w[4] = {(unsigned) nib[i][s].x, (unsigned) nib[i][s].y, (unsigned) nib[i][s].z, (unsigned) nib[i][s].w};
+                int sumi = 0;
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const unsigned lo = __vsub4(w[k] & 0x0F0F0F0Fu, 0x08080808u);          // elements 4k .. 4k+3, centred (code - 8)
+                    const unsigned hi = __vsub4((w[k] >> 4) & 0x0F0F0F0Fu, 0x08080808u);   // elements 16+4k .. 16+4k+3
+                    sumi = __dp4a(xq[k], (int) lo, sumi);
+                    sumi = __dp4a(xq[4 + k], (int) hi, sumi);
+                }
+                acc[i] += dx * dw[i][s] * (float) sumi;
             }
         }
         #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) facc += __shfl_down_sync(0xffffffffu, facc, off);
-        if (lane == 0) out[(size_t) r * (size_t) H + (size_t) h] = facc;
+        for (int i = 0; i < kUPackRows; ++i) {
+            float v = acc[i];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+            if (lane == 0 && h0 + i < H) out[(size_t) r * (size_t) H + (size_t) (h0 + i)] = v;
+        }
     }
 }
 
+bool latent_u_pack_q4_ok(int ELL) { return ELL > 0 && ELL % 32 == 0 && ((ELL / 32) * 18) % 16 == 0 && (ELL / 32) <= 64; }
+
+void latent_u_repack_q4(uint8_t* u, int64_t rows, int ELL, void* stream) {
+    if (rows <= 0) return;
+    const int nb = ELL / 32;
+    const int warps = 4;
+    const size_t smem = (size_t) warps * (size_t) nb * 18;
+    latent_u_repack_q4_k<<<(unsigned) ((rows + warps - 1) / warps), warps * 32, smem, (cudaStream_t) stream>>>(u, rows, nb);
+}
+
 void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* ids, const int32_t* labels_dev,
-                      int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt, int G) {
+                      int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt, int G, bool packed) {
     if (cap_entries <= 0) return;
     if (u_q8 == nullptr || ylq == nullptr || ids == nullptr || labels_dev == nullptr || out == nullptr) {
         std::fprintf(stderr, "latent_u_grouped NULL ptr: u=%p ylq=%p ids=%p labels=%p out=%p E=%lld cap=%lld ELL=%d H=%d\n",
@@ -168,16 +223,10 @@ void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* id
     }
     const int warps_per_block = 8;   // 256 threads
     const int rows_per_block = warps_per_block;
-    static const bool by_group = [] { const char* v = std::getenv("STRATA_LATENT_U_BY_GROUP"); return v == nullptr || std::atoi(v) != 0; }();
-    if (by_group && G > 0) {
-        const size_t wrow = (size_t) (ELL / 32) * (size_t) (fmt == 4 ? 18 : 34);
-        const size_t smem = wrow * (size_t) warps_per_block;
-        if (smem <= 48 * 1024 && wrow % 4 == 0) {
-            dim3 gg((unsigned) G, (unsigned) ((H + rows_per_block - 1) / rows_per_block));
-            latent_u_g_k<<<gg, warps_per_block * 32, smem, (cudaStream_t) stream>>>(u_q8, ylq, ids, labels_dev, (int) E, (int) cap_entries,
-                                                                                    ELL, H, out, fmt);
-            return;
-        }
+    if (packed && fmt == 4 && G > 0 && latent_u_pack_q4_ok(ELL)) {   // the device U was repacked at upload (latent_u_repack_q4)
+        dim3 gp((unsigned) G, (unsigned) ((H + warps_per_block * kUPackRows - 1) / (warps_per_block * kUPackRows)));
+        latent_u_p4_k<<<gp, warps_per_block * 32, 0, (cudaStream_t) stream>>>(u_q8, ylq, ids, labels_dev, (int) E, (int) cap_entries, ELL, H, out);
+        return;
     }
     dim3 grid((unsigned) cap_entries, (unsigned) ((H + rows_per_block - 1) / rows_per_block));
     latent_u_k<<<grid, warps_per_block * 32, 0, (cudaStream_t) stream>>>(u_q8, ylq, ids, labels_dev, (int) E,

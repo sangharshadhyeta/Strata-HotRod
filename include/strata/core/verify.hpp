@@ -819,6 +819,7 @@ private:
     // and the sizes come from the session-level LatentTab (core/latent_share.hpp); nothing here is sized by a constant.
     bool latent_ = false;
     int lat_fmt_ = 8, lat_G_ = 0;
+    bool lat_u_packed_ = false;   // the device U was repacked (LatentTab): latent_u_grouped takes the int4-load kernel
     int64_t lat_ELL_ = 0, lat_E_ = 0;
     size_t lat_d_layer_ = 0, lat_u_layer_ = 0;                // one layer's D and U bytes
     const uint8_t *lat_d_ = nullptr, *lat_u_ = nullptr;       // the session pair (device, not owned)

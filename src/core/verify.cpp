@@ -2159,6 +2159,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             lat_d_ = strata::core::latent_shared_d();
             lat_u_ = strata::core::latent_shared_u();
             lat_labels_dev_ = li.labels_dev;
+            lat_u_packed_ = li.u_packed;
             {   // STRATA_LATENT_STANDIN_GROUP: 0 (default) counts the stand-ins that cross groups, 1 forbids them
                 const char* gv = std::getenv("STRATA_LATENT_STANDIN_GROUP");
                 strata::kernels::route_group_set(li.labels_dev, gv != nullptr ? std::atoi(gv) : 0);
@@ -4030,7 +4031,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const size_t xlrow = (size_t) (lat_ELL_ / 32) * 36;
             quantize_q8_1_rows(yfull, cap, (int) lat_ELL_, lat_uq_ + (size_t) tb * K * xlrow, cs);
             strata::kernels::latent_u_grouped(lat_u_ + (size_t) l * lat_u_layer_, lat_uq_ + (size_t) tb * K * xlrow, ids_ + (size_t) tb * K,
-                                              lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_, cap, (int) lat_ELL_, (int) N, parts_out, cs, lat_fmt_, (int) lat_G_);
+                                              lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_, cap, (int) lat_ELL_, (int) N, parts_out, cs, lat_fmt_, (int) lat_G_, lat_u_packed_);
             stamp(l, 24, grp);
         } else
         if (ar_on()) {

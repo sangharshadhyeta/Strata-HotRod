@@ -2,6 +2,7 @@
 // device pair shared through latent_share.hpp) follows Edge0's LatentTab in edge0-strata (MIT, a fork of Strata); the sizing is ours: every
 // number is read off the pack (see the header).
 #include "strata/core/latent_tab.hpp"
+#include "strata/kernels/latent.hpp"
 
 #include <cuda_runtime.h>
 
@@ -170,6 +171,22 @@ bool LatentTab::load(const std::string& pack_dir, int64_t n_layers, int64_t n_em
             d_ = u_ = nullptr;
             return false;
         }
+    bool u_packed = false;
+    {   // STRATA_LATENT_U_PACK (default on): Q4_0 U rows repacked once for the decode path's int4-load kernel (see latent.cu)
+        const char* pv = std::getenv("STRATA_LATENT_U_PACK");
+        if (ch.fmt == 4 && (pv == nullptr || std::atoi(pv) != 0) && strata::kernels::latent_u_pack_q4_ok((int) latent)) {
+            const int64_t wrow = (latent / 32) * 18;
+            const int64_t rows = (int64_t) ub / wrow;
+            strata::kernels::latent_u_repack_q4(u_, rows, (int) latent, nullptr);
+            if (cudaDeviceSynchronize() != cudaSuccess || cudaGetLastError() != cudaSuccess) {
+                err = "the latent U repack failed";
+                cudaFree(d_); cudaFree(u_);
+                d_ = u_ = nullptr;
+                return false;
+            }
+            u_packed = true;
+        }
+    }
     groups_ = ch.groups;
     fmt_ = ch.fmt;
     device_bytes_ = db + ub;
@@ -191,6 +208,7 @@ bool LatentTab::load(const std::string& pack_dir, int64_t n_layers, int64_t n_em
         info.u_layer_bytes = dense_.u_bytes();
         info.labels_dev = labels_dev_;
         info.labels_host = labels_.data();
+        info.u_packed = u_packed;
     }
     latent_shared_d() = d_;
     latent_shared_u() = u_;

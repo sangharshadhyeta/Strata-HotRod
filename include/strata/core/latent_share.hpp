@@ -23,6 +23,7 @@ struct LatentShared {
     int fmt = 8;                      ///< 8 = Q8_0, 4 = Q4_0
     size_t d_layer_bytes = 0, u_layer_bytes = 0;
     const int32_t* labels_dev = nullptr;
+    bool u_packed = false;   ///< the device U was repacked for latent_u_grouped(packed = true)
     const int32_t* labels_host = nullptr;
 };
 inline LatentShared& latent_shared_info() { static LatentShared s; return s; }

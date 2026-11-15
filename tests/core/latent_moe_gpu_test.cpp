@@ -113,7 +113,11 @@ int main(int argc, char** argv) {
     const int cap = T * K;
 
     strata::core::LatentDense dense;
-    if (!dense.open(dir + "/latent_dense_q8.bin", 48, G, H, ELL, err)) { std::printf("latent dense: %s\n", err.c_str()); return 2; }
+    const bool q4 = std::getenv("STRATA_TEST_Q4") != nullptr && std::atoi(std::getenv("STRATA_TEST_Q4")) != 0;   // the Q4 D/U file instead of the Q8 one
+    if (!dense.open(dir + (q4 ? "/latent_dense_q4.bin" : "/latent_dense_q8.bin"), 48, G, H, ELL, err, q4 ? 4 : 0)) {
+        std::printf("latent dense: %s\n", err.c_str());
+        return 2;
+    }
     strata::core::LatentA apack;
     const int64_t blob = (int64_t) lay.blob_bytes(layer);
     if (!apack.open(dir + "/experts.bin", 48, E, blob, err)) { std::printf("experts.bin: %s\n", err.c_str()); return 2; }
@@ -340,19 +344,34 @@ int main(int argc, char** argv) {
         report("A   in the decode form (rows rewritten on the device)", yl2_h, ref_yl);
         report("U   via latent_u_grouped (the decode path's U kernel)", y2_h, ref_y);
         check(compare(y2_h, gpu_y).rel_rms < 0.05, "latent_u_grouped agrees with run_layer's per-group U within the same threshold");
-        {   // the by-group kernel (G > 0) must give the per-entry kernel's bits
+        if (dense.fmt() == 4 && strata::kernels::latent_u_pack_q4_ok((int) ELL)) {   // the packed Q4 kernel against the per-entry kernel
+            const size_t ub = (size_t) dense.groups() * (size_t) H * (size_t) (ELL / 32) * 18;
+            auto* dUp = (uint8_t*) dalloc(ub, "dUp");
+            ck(cudaMemcpy(dUp, dU, ub, cudaMemcpyDeviceToDevice), "dUp copy");
+            strata::kernels::latent_u_repack_q4(dUp, (int64_t) dense.groups() * (int64_t) H, (int) ELL, (void*) st);
             auto* y3 = (float*) dalloc((size_t) cap * H * 4, "y3");
             ck(cudaMemset(y3, 0xFF, (size_t) cap * H * 4), "y3 clear");
-            strata::kernels::latent_u_grouped(dU, (const uint8_t*) uq2, dIds, dLabels, E, cap, (int) ELL, (int) H, y3, (void*) st, dense.fmt(), 8);
-            ck(cudaStreamSynchronize(st), "by-group sync");
-            ck(cudaGetLastError(), "by-group");
+            strata::kernels::latent_u_grouped(dUp, (const uint8_t*) uq2, dIds, dLabels, E, cap, (int) ELL, (int) H, y3, (void*) st, 4, (int) dense.groups(), true);
+            ck(cudaStreamSynchronize(st), "packed sync");
+            ck(cudaGetLastError(), "packed");
             std::vector<float> y3_h(y2_h.size());
             ck(cudaMemcpy(y3_h.data(), y3, y3_h.size() * 4, cudaMemcpyDeviceToHost), "y3 back");
-            size_t diff = 0;
-            for (size_t i = 0; i < y3_h.size(); ++i) diff += std::memcmp(&y3_h[i], &y2_h[i], 4) != 0;
-            std::printf("  U   by-group kernel vs per-entry kernel: %zu of %zu values differ in their bits\n", diff, y3_h.size());
-            check(diff == 0, "latent_u_grouped by group gives the per-entry kernel's bits");
-            cudaFree(y3);
+            report("U   packed Q4 kernel vs the per-entry kernel", y3_h, y2_h);
+            check(compare(y3_h, y2_h).rel_rms < 1e-5, "the packed Q4 U kernel agrees with the per-entry kernel (same integer dot, float order only)");
+            cudaEvent_t e0, e1;
+            cudaEventCreate(&e0); cudaEventCreate(&e1);
+            float ms_old = 0, ms_new = 0;
+            const int reps = 200;
+            cudaEventRecord(e0, st);
+            for (int i = 0; i < reps; ++i)
+                strata::kernels::latent_u_grouped(dU, (const uint8_t*) uq2, dIds, dLabels, E, cap, (int) ELL, (int) H, y2, (void*) st, dense.fmt());
+            cudaEventRecord(e1, st); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms_old, e0, e1);
+            cudaEventRecord(e0, st);
+            for (int i = 0; i < reps; ++i)
+                strata::kernels::latent_u_grouped(dUp, (const uint8_t*) uq2, dIds, dLabels, E, cap, (int) ELL, (int) H, y3, (void*) st, 4, (int) dense.groups(), true);
+            cudaEventRecord(e1, st); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms_new, e0, e1);
+            std::printf("  U   time for %lld entries: per-entry kernel %.1f us, packed kernel %.1f us\n", (long long) cap, 1000.0 * ms_old / reps, 1000.0 * ms_new / reps);
+            cudaFree(y3); cudaFree(dUp);
         }
     }
 
