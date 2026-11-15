@@ -3755,6 +3755,10 @@ int main(int argc, char** argv) {
                 // slots (the auto rule held back 15%): a bigger chunk, fewer per-chunk costs.  Measured 15 Nov, Edge0-145B on the RTX 3060 12 GB, a
                 // 13.5K-token prompt: chunk 1280-1536 -> 1536 with 981 slots lent, read 255-263 -> 291 tok/s.  STRATA_PREFILL_LEND_PCT overrides.
                 setenv("STRATA_PREFILL_LEND_PCT", "100", 0);
+                // The expert products on the fp16 path (dequant + GEMM) by default.  The latent MMQ path (STRATA_PREFILL_NVFP4=w4a8) works and reads
+                // the same logits to within int8 rounding (KL 1.6e-6 against the windows, the fp16 path 8e-8), but its extra buffers cost loan: chunk 1280
+                // against 1536, and the read was 329 against 332 tok/s on a 13.5K-token prompt.
+                setenv("STRATA_PREFILL_NVFP4", "fp16", 0);
             }
             // Stand-ins ON by default for a latent pack (the Qwen branch's setting: ranks 3-9 take any resident stand-in, the edge rank 2 only
             // within 1 logit).  Measured 15 Nov on the RTX 3060 12 GB, SSD mode: decode 6.7-7.6 -> 15.7-16.8 tok/s on three questions whose

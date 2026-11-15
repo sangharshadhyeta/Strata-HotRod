@@ -246,6 +246,18 @@ void latent_dequant_packed_f16(const uint8_t* src, int64_t rows, int cols, uint1
     latent_dequant_packed_f16_k<<<(unsigned) ((n + 127) / 128), 128, 0, (cudaStream_t) stream>>>(src, rows, nb, dst);
 }
 
+__global__ void latent_scale_rows_k(float* __restrict__ x, const float* __restrict__ s, int64_t rows, int cols) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * (int64_t) cols) return;
+    x[i] *= s[i / cols];
+}
+
+void latent_scale_rows(float* x, const float* s, int64_t rows, int cols, void* stream) {
+    const int64_t n = rows * (int64_t) cols;
+    if (n <= 0) return;
+    latent_scale_rows_k<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, s, rows, cols);
+}
+
 void latent_dequant_f16(const uint8_t* src, int64_t rows, int cols, int fmt, uint16_t* dst, void* stream) {
     const int64_t nb = rows * (int64_t) (cols / 32);
     if (nb <= 0) return;

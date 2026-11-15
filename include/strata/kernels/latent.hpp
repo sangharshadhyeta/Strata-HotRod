@@ -29,6 +29,8 @@ bool latent_u_pack_q4_ok(int ELL);
 void latent_dequant_f16(const uint8_t* src, int64_t rows, int cols, int fmt, uint16_t* dst, void* stream);
 /// The same for U rows that latent_u_repack_q4 repacked (Q4_0 only).
 void latent_dequant_packed_f16(const uint8_t* src, int64_t rows, int cols, uint16_t* dst, void* stream);
+/// x[r, :] *= s[r] over `rows` rows of `cols` floats (an NVFP4 expert's s_down on the latent rows, before they go to f16).
+void latent_scale_rows(float* x, const float* s, int64_t rows, int cols, void* stream);
 void latent_u_repack_q4(uint8_t* u, int64_t rows, int ELL, void* stream);   ///< in place: [nb x 18 B blocks] -> [nb x 16 B nibbles][nb x f16 scales] per row
 
 /// knife-0 (STRATA_LATENT_U_GPU): the CPU share's U computed on the GPU into parts_ directly.
