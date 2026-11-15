@@ -400,6 +400,8 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     return false;
 #else
     L.native = true;
+    int64_t expert_embd = H, expert_ff = FF;   // v6 (latent A-only) says its own widths in the header
+    bool header_widths = false;
     L.fmt.resize((size_t) n_layers);
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
@@ -413,6 +415,10 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 static const char tag[] = "# strata native experts v";
                 if (line.compare(0, sizeof tag - 1, tag) == 0) {
                     L.version = std::atoi(line.c_str() + sizeof tag - 1);
+                    if (L.version == 5) {   // another engine's Hadamard-folded experts: no kernels here, never run unrotated
+                        err = "native_experts.txt is v5 (Hadamard-folded experts); this engine has no kernels for them";
+                        return false;
+                    }
                     if (L.version > kExpertLayoutVersion) {
                         err = "native_experts.txt is v" + std::to_string(L.version) + "; this engine reads up to v" +
                               std::to_string(kExpertLayoutVersion) + " (the pack was written by a newer tools/"
@@ -425,6 +431,14 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // default, so the header wins.
                 const size_t at = line.find("(n_expert ");
                 if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                // v6: "latent A-only (expert_embd 1792, expert_ff 640)": the experts' rows are latent, not n_embd wide
+                const size_t eb = line.find("expert_embd ");
+                const size_t ef = line.find("expert_ff ");
+                if (eb != std::string::npos && ef != std::string::npos) {
+                    expert_embd = std::atoll(line.c_str() + eb + 12);
+                    expert_ff = std::atoll(line.c_str() + ef + 10);
+                    header_widths = true;
+                }
             }
             continue;
         }
@@ -436,7 +450,19 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (L.version == 6 && !header_widths) {   // the widths come before the first line: a v6 pack without them is not one
+            err = "native_experts.txt is v6 but its header has no 'expert_embd N, expert_ff M' (a latent A-only pack says them)";
+            return false;
+        }
+        if (header_widths && L.version != 6) {
+            err = "native_experts.txt gives expert_embd/expert_ff in a v" + std::to_string(L.version) + " header; only v6 does";
+            return false;
+        }
+        if (expert_embd <= 0 || expert_ff <= 0) {
+            err = "native_experts.txt: expert_embd/expert_ff must be positive";
+            return false;
+        }
+        if (!native_fmt((int) gt, (int) dt, expert_embd, expert_ff, f, err)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -488,6 +514,11 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
     }
     L.total = at;
+    if (header_widths) {
+        L.expert_embd = expert_embd;
+        L.expert_ff = expert_ff;
+        L.latent = expert_embd != H || expert_ff != FF;
+    }
     g_layout = L;
     return true;
 #endif

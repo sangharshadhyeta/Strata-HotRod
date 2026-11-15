@@ -29,6 +29,12 @@ struct ExpertLayout {
     /// and up in shard 3 (native_experts.txt v4, the `gate,up,down` shard column).
     std::vector<std::string> gguf_file;
     int version = 0;                      ///< native_experts.txt's header version (0 = none given)
+    /// v6 (Edge0 latent MoE, branch edge0-latent): the A pack's expert rows are `expert_embd` wide (the latent width ELL,
+    /// 1792 for the 145B), not the model's n_embd, and their hidden width is `expert_ff` (640).  0 = the model's own
+    /// (every other pack).  `latent` is true when the pack says its experts are not n_embd wide: such a pack also needs the
+    /// per-layer D/U projections and the expert group labels, which the layer table does not carry.
+    int64_t expert_embd = 0, expert_ff = 0;
+    bool latent = false;
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
 
@@ -96,6 +102,8 @@ const ExpertLayout& expert_layout();
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
-inline constexpr int kExpertLayoutVersion = 4;
+/// v5 is Hadamard-folded experts (another engine's format; this one has no kernels for it and refuses it by name).
+/// v6 = latent A-only packs (`expert_embd` / `expert_ff` in the header, the five-column NVFP4 line form).
+inline constexpr int kExpertLayoutVersion = 6;
 
 }  // namespace strata::kernels::cpu

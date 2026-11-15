@@ -3618,6 +3618,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        // Edge0's latent MoE (native_experts.txt v6): the experts' rows are `expert_embd` wide, not n_embd wide, and a layer
+        // also needs its D/U projections and the expert group labels (STRATA_LATENT_DENSE / _LABELS).  The decode and prompt
+        // paths below read every expert as n_embd wide, so a latent pack must not get that far: refused until the latent
+        // path is in (branch edge0-latent).
+        if (strata::kernels::cpu::expert_layout().latent) {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            std::fprintf(stderr, "strata generate: the experts of %s are latent (%lld wide, hidden %lld): this build has no "
+                                 "latent-MoE path yet, so it does not run them (branch edge0-latent)\n", o.pack.c_str(),
+                         (long long) lay.expert_embd, (long long) lay.expert_ff);
+            return 1;
+        }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
         // an unsupported dequant type left the prompt path's fp16 buffer unwritten.

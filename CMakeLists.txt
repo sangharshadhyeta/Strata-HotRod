@@ -2034,6 +2034,14 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME expert_multi_test COMMAND expert_multi_test)
   set_tests_properties(expert_multi_test PROPERTIES SKIP_RETURN_CODE 77)   # no AVX-512: skipped
 
+  # Edge0's latent A-only packs (native_experts.txt v6): CPU-only, no model and no GPU (branch edge0-latent)
+  if(STRATA_NATIVE_EXPERTS)
+    add_executable(expert_layout_latent_test tests/core/expert_layout_latent_test.cpp)
+    target_link_libraries(expert_layout_latent_test PRIVATE strata_kernels_cpu)
+    add_test(NAME expert_layout_latent_test COMMAND expert_layout_latent_test)
+    set_tests_properties(expert_layout_latent_test PROPERTIES TIMEOUT 60)
+  endif()
+
   # PR #706: the opt-in AVX-2 Q2_0 bit-plane kernel (STRATA_Q2_BITPLANE=1) against the legacy one, bitwise alone/window
   if(STRATA_BUILD_TESTS AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x64|X86")
     add_executable(q2_bitplane_parity src/kernels/cpu/q2_bitplane_parity.cpp)
