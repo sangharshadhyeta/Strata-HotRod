@@ -2516,6 +2516,45 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
     }
 }
 
+// hotrod-edge0: NVFP4 -> f16 with one thread per 16-value sub-block.  The generic path above runs one 32-thread block per 256 values and decodes the
+// sub-block's scale again for every value; nsys-timed on a 13.5K-token prompt, expert dequant was 29% of the prompt path.  Here a thread decodes its
+// scale once, reads the sub-block's 8 code bytes as two 4-byte words (a block is 36 bytes: 4-byte aligned), and writes its 16 values as two 16-byte
+// stores.  The scale (the tail: s_gate / s_up / s_down) is folded in before the one f16 rounding (the generic path rounds twice).
+__device__ __forceinline__ void nvfp4_sub_to_f16(const block_nvfp4* __restrict__ b, int s, float tail, __half* __restrict__ dst) {
+    const float sc = ue4m3_to_f32_half(b->d[s]) * tail;
+    const uint8_t* q = b->qs + s * 8;
+    const uint32_t w0 = *(const uint32_t*) q, w1 = *(const uint32_t*) (q + 4);
+    __half v[16];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t byte_ = ((j < 4 ? w0 : w1) >> (8 * (j & 3))) & 0xFFu;
+        v[j] = __float2half((float) kvalues_fp4[byte_ & 0xF] * sc);
+        v[j + 8] = __float2half((float) kvalues_fp4[byte_ >> 4] * sc);
+    }
+    *(uint4*) dst = *(const uint4*) &v[0];
+    *(uint4*) (dst + 8) = *(const uint4*) &v[8];
+}
+__global__ void nvfp4_dequant_sub_kernel(const block_nvfp4* __restrict__ src, int64_t n_sub, __half* __restrict__ dst, const float* __restrict__ scale) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_sub) return;
+    nvfp4_sub_to_f16(src + (t >> 2), (int) (t & 3), scale != nullptr ? *scale : 1.0f, dst + t * 16);
+}
+// gate/up of one expert: the two matrices' sub-blocks -> the interleaved rows 2r + parity (as dequant_gu_kernel)
+__global__ void nvfp4_dequant_gu_kernel(const block_nvfp4* __restrict__ gate, const block_nvfp4* __restrict__ up, int64_t n_sub, int64_t n_embd,
+                                        __half* __restrict__ y, const float* __restrict__ tail) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_sub) return;
+    const int parity = blockIdx.y;
+    const int64_t per_row16 = n_embd / 16;
+    const int64_t r = t / per_row16, c16 = t % per_row16;
+    nvfp4_sub_to_f16((parity ? up : gate) + (t >> 2), (int) (t & 3), tail != nullptr ? (parity ? tail[1] : tail[0]) : 1.0f,
+                     y + (2 * r + parity) * n_embd + c16 * 16);
+}
+static bool nvfp4_fast_dq() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DQ_NVFP4_FAST"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
@@ -3491,7 +3530,10 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
-    dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst, scale);
+    if (t == 40 && nvfp4_fast_dq())
+        nvfp4_dequant_sub_kernel<<<(unsigned) ((n / 16 + 255) / 256), 256, 0, (cudaStream_t) stream>>>((const block_nvfp4*) src, n / 16, (__half*) dst, scale);
+    else
+        dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst, scale);
     check("iq_dequant_f16");
 }
 
@@ -3525,8 +3567,12 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     // checked like the other entry points: an unknown type used to leave `dst` unwritten, a wrong prompt and no error
     if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
-    dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
-                                                                                           (__half*) dst, tail);
+    if (t == 40 && n_embd % 64 == 0 && nvfp4_fast_dq())
+        nvfp4_dequant_gu_kernel<<<dim3((unsigned) ((n_ff * (n_embd / 16) + 255) / 256), 2), 256, 0, (cudaStream_t) stream>>>(
+            (const block_nvfp4*) gate, (const block_nvfp4*) up, n_ff * (n_embd / 16), n_embd, (__half*) dst, tail);
+    else
+        dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
+                                                                                               (__half*) dst, tail);
     check("iq_dequant_gu_f16");
 }
 
