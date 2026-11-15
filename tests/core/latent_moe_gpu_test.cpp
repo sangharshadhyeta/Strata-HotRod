@@ -16,6 +16,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/latent.hpp"
 #include "strata/latent/latent_moe.hpp"
 
 #include <cuda_runtime.h>
@@ -257,6 +258,43 @@ int main(int argc, char** argv) {
     report("A   (the NVFP4 experts at the latent width)", gpu_yl, ref_yl);
     report("U   (per-group up-projection, per route)", gpu_y, ref_y);
     report("out (weighted sum over the 10 routed experts)", gpu_out, ref_out);
+
+    // ---- the decode path's own form (verify.cpp): the plan's activation rows come in as plain token rows, the device rewrites them to
+    //      token*G + group (latent_plan_rows), A runs on those rows, then U runs for every routed entry (latent_u_grouped)
+    {
+        std::vector<int32_t> tok_plain((size_t) cap);
+        for (int q = 0; q < cap; ++q) tok_plain[(size_t) q] = plan.dst[(size_t) q] / K;
+        const int32_t counts[4] = {0, cap, 0, 0};   // counts[1] = the GPU entries
+        auto* dCounts = (int32_t*) dalloc(16, "counts");
+        auto* dIds = (int32_t*) dalloc((size_t) cap * 4, "ids");
+        auto* dLabels = (int32_t*) dalloc((size_t) E * 4, "labels");
+        auto* dTok2 = (int32_t*) dalloc((size_t) cap * 4, "tok2");
+        ck(cudaMemcpy(dCounts, counts, 16, cudaMemcpyHostToDevice), "counts copy");
+        ck(cudaMemcpy(dIds, topk.data(), (size_t) cap * 4, cudaMemcpyHostToDevice), "ids copy");
+        ck(cudaMemcpy(dLabels, labels, (size_t) E * 4, cudaMemcpyHostToDevice), "labels copy");
+        ck(cudaMemcpy(dTok2, tok_plain.data(), (size_t) cap * 4, cudaMemcpyHostToDevice), "tok2 copy");
+        strata::kernels::latent_plan_rows(dTok2, dDst, dCounts, dIds, dLabels, E, 0, G, K, (void*) st);
+        ck(cudaStreamSynchronize(st), "latent_plan_rows sync");
+        std::vector<int32_t> tok_gpu((size_t) cap);
+        ck(cudaMemcpy(tok_gpu.data(), dTok2, (size_t) cap * 4, cudaMemcpyDeviceToHost), "tok2 back");
+        check(tok_gpu == plan.tok, "latent_plan_rows: every entry's activation row is token*8 + group, exactly the host plan's");
+
+        auto* yl2 = (float*) dalloc((size_t) cap * ELL * 4, "yl2");
+        auto* y2 = (float*) dalloc((size_t) cap * H * 4, "y2");
+        void* uq2 = dalloc((size_t) cap * (ELL / 32) * 36, "uq2");
+        const strata::kernels::NativeExpertLayout La = strata::kernels::native_expert_layout(40, 40, (int) ELL, (int) I);
+        strata::kernels::native_expert_grouped(La, dPtr, dStart, dN, dDst, dTok2, E, cap, b.xlq, b.scratch, yl2, (void*) st, E);
+        strata::kernels::quantize_q8_1_rows(yl2, cap, ELL, uq2, (void*) st);
+        strata::kernels::latent_u_grouped(dU, (const uint8_t*) uq2, dIds, dLabels, E, cap, (int) ELL, (int) H, y2, (void*) st, dense.fmt());
+        ck(cudaStreamSynchronize(st), "decode form sync");
+        ck(cudaGetLastError(), "decode form");
+        std::vector<float> yl2_h(ref_yl.size()), y2_h(ref_y.size());
+        ck(cudaMemcpy(yl2_h.data(), yl2, yl2_h.size() * 4, cudaMemcpyDeviceToHost), "yl2 back");
+        ck(cudaMemcpy(y2_h.data(), y2, y2_h.size() * 4, cudaMemcpyDeviceToHost), "y2 back");
+        report("A   in the decode form (rows rewritten on the device)", yl2_h, ref_yl);
+        report("U   via latent_u_grouped (the decode path's U kernel)", y2_h, ref_y);
+        check(compare(y2_h, gpu_y).rel_rms < 0.05, "latent_u_grouped agrees with run_layer's per-group U within the same threshold");
+    }
 
     for (void* p : blobs) cudaFree(p);
     std::printf(g_fail ? "latent_moe_gpu_test: %d FAILED\n" : "latent_moe_gpu_test: all passed\n", g_fail);
