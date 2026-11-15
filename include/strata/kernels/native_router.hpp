@@ -70,6 +70,10 @@ struct RouteCfg {
 };
 void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, int maxrank = 0, float want_lo = 1.f, float repl_gap = 0.f, float wmax = 0.f, float budget = 0.f, float budget_tail = 0.f);   ///< before graph capture
 void route_cfg_set_floor(int lo);                                ///< between windows
+/// hotrod-edge0 (latent packs): the device table of group labels [n_layers][512] and the stand-in rule (mode 0: counted only, 1: a stand-in
+/// must be of the missing expert's group).  Before graph capture.  route_group_stats: [0] stand-ins taken, [1] in another group (labels set).
+void route_group_set(const int32_t* labels_dev, int mode);
+void route_group_stats(unsigned long long out[2]);
 void route_cfg_set_budget(float budget);                         ///< between windows (STRATA_ROUTE_BUDGET_DYN)
 void route_cfg_set_budgets(float budget, float budget_tail);     ///< between windows (STRATA_ROUTE_BUDGET_AUTO): both budgets at once
 const RouteCfg* route_cfg_device();

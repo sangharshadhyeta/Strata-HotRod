@@ -3634,6 +3634,15 @@ int main(int argc, char** argv) {
                              (long long) lay.expert_embd, (long long) lay.expert_ff);
             o.prefill_chunk = 0;
             o.prefill_auto = false;
+            // Stand-ins ON by default for a latent pack (the Qwen branch's setting: ranks 3-9 take any resident stand-in, the edge rank 2 only
+            // within 1 logit).  Measured 15 Nov on the RTX 3060 12 GB, SSD mode: decode 6.7-7.6 -> 15.7-16.8 tok/s on three questions whose
+            // answers read correct.  Already-set variables win; STRATA_ROUTE_RESIDENT=0 turns them off.
+            if (std::getenv("STRATA_ROUTE_RESIDENT") == nullptr) {
+                setenv("STRATA_ROUTE_RESIDENT", "1e30", 0);
+                setenv("STRATA_ROUTE_RESIDENT_RANKS", "3-9", 0);
+                setenv("STRATA_ROUTE_RESIDENT_EDGE", "1", 0);
+                std::fprintf(stderr, "strata generate: latent experts: stand-ins on by default (ranks 3-9, edge 1; STRATA_ROUTE_RESIDENT=0 turns them off)\n");
+            }
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
@@ -16846,6 +16855,13 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (latent_serve) {
+                unsigned long long gs[2];
+                strata::kernels::route_group_stats(gs);
+                if (gs[0] > 0)
+                    std::fprintf(stderr, "strata serve: latent stand-ins (since start): %llu taken, %llu in another group than the pick (%.1f%%)\n",
+                                 gs[0], gs[1], 100.0 * (double) gs[1] / (double) gs[0]);
+            }
             if (ram_trace) {   // STRATA_RAM_TRACE=1: this request's RAM line, before the warm runs again below (it reads the drive)
                 RamSnap ram_b;
                 ram_snap(ram_b);

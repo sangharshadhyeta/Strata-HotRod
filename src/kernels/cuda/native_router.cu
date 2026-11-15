@@ -366,6 +366,12 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 // picked when its logit is within `margin` of the replaced one; the weights are then the softmax of the selected
 // logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
 // stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
+// hotrod-edge0: a latent pack's expert groups.  g_grp_labels is the device table [n_layers][512] of group labels (null: not a latent pack).
+// g_grp_mode 0: stand-ins as before, only counted; 1: a stand-in must carry the missing expert's group label (an expert of another group would
+// be fed a different latent vector, so it is a worse match).  g_grp_stats: [0] stand-ins taken, [1] of them in another group than the pick.
+__device__ const int32_t* g_grp_labels = nullptr;
+__device__ int g_grp_mode = 0;
+__device__ unsigned long long g_grp_stats[2];
 static unsigned long long* g_detail = nullptr;   // the decode rows' detail counters (route_detail_alloc), see below
 // The router's device scratch (the look-ahead's logits and weights, its skip counter, the ring flags, and the want / rows / repl /
 // detail counters) is allocated once, on the GPU of the first verifier that asks.  A multi-GPU layer split's other stages run on
@@ -554,8 +560,11 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
         if (lane == 0) ++tail;
         float bv = -INFINITY;
         int bi = -1;
+        const int32_t* glab = (g_grp_labels != nullptr && layer >= 0) ? g_grp_labels + (size_t) layer * 512 : nullptr;
+        const bool gonly = glab != nullptr && g_grp_mode == 1;
         for (int f = lane; f < 512; f += 32) {
             if (!have(f)) continue;
+            if (gonly && glab[f] != glab[e]) continue;   // latent packs: a stand-in of the missing expert's group only
             bool used = false;
             for (int q = 0; q < 10; ++q) used |= my[q] == f;
             if (used) continue;
@@ -620,6 +629,10 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
                 corr = true;
                 corr_add = mv.add;
             }
+        }
+        if (bi >= 0 && take && glab != nullptr && lane == 0) {
+            atomicAdd(g_grp_stats, 1ull);
+            if (glab[bi] != glab[e]) atomicAdd(g_grp_stats + 1, 1ull);
         }
         if (bi >= 0 && take) {
             if (detail != nullptr) {
@@ -756,6 +769,15 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
     g_cfg_host->budget = budget;
     g_cfg_host->budget_tail = budget_tail;
     __sync_synchronize();
+}
+void route_group_set(const int32_t* labels_dev, int mode) {
+    if (cudaMemcpyToSymbol(g_grp_labels, &labels_dev, sizeof labels_dev) != cudaSuccess ||
+        cudaMemcpyToSymbol(g_grp_mode, &mode, sizeof mode) != cudaSuccess)
+        throw std::runtime_error("route_group_set: the symbol copy failed");
+}
+void route_group_stats(unsigned long long out[2]) {
+    out[0] = out[1] = 0;
+    if (cudaMemcpyFromSymbol(out, g_grp_stats, 2 * sizeof(unsigned long long)) != cudaSuccess) (void) cudaGetLastError();
 }
 void route_cfg_set_floor(int lo) {
     if (g_cfg_host == nullptr) return;

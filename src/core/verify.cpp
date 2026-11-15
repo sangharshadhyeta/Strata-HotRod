@@ -2159,6 +2159,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             lat_d_ = strata::core::latent_shared_d();
             lat_u_ = strata::core::latent_shared_u();
             lat_labels_dev_ = li.labels_dev;
+            {   // STRATA_LATENT_STANDIN_GROUP: 0 (default) counts the stand-ins that cross groups, 1 forbids them
+                const char* gv = std::getenv("STRATA_LATENT_STANDIN_GROUP");
+                strata::kernels::route_group_set(li.labels_dev, gv != nullptr ? std::atoi(gv) : 0);
+            }
         }
     }
     // ---- mapped staging
