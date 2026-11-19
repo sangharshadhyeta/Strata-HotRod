@@ -1,4 +1,6 @@
-<p align="center"><i>Coming Soon. <s>A system which rewires the model around the way you use it.</s></i></p>
+<p align="center"><i> <s>A system which rewires the model around the way you use it.</s></i></p>
+
+Watch this first: [NoPlaceLikeLocalhost](https://youtu.be/WSJL4SOIZDg?si=qPTa3jeK4YtDLCPy)
 
 <p align="center"><img src="docs/media/hotrod-hero.gif" width="380" alt="Strata Hot Rod: the Strata hexagon in fire and ice"></p>
 
@@ -17,8 +19,8 @@ Nothing leaves your PC.</p>
   <img alt="Streams from SSD" src="https://img.shields.io/badge/STREAMS%20FROM-SSD-1c7ed6?style=for-the-badge">
   <img alt="30 GB RAM, up to 111 GB model" src="https://img.shields.io/badge/30%20GB%20RAM-111%20GB%20MODEL-d6336c?style=for-the-badge">
   <img alt="12 GB VRAM" src="https://img.shields.io/badge/12%20GB-VRAM-76b900?style=for-the-badge">
-  <img alt="IQ3_S, 78 GB: 50-70 tokens/s (131K context)" src="https://img.shields.io/badge/IQ3__S%2078%20GB-50--70%20TOK%2FS-e8590c?style=for-the-badge">
-  <img alt="UD-Q4_K_XL, 111 GB: 15-22 tokens/s (14 Nov, learners still cold)" src="https://img.shields.io/badge/Q4__K__XL%20111%20GB-15--22%20TOK%2FS-e8590c?style=for-the-badge">
+  <img alt="IQ3_S, 78 GB: 35-45 tokens/s (131K context)" src="https://img.shields.io/badge/IQ3__S%2078%20GB-50--70%20TOK%2FS-e8590c?style=for-the-badge">
+  <img alt="UD-Q4_K_XL, 111 GB: 15-25 tokens/s (14 Nov, learners still cold)" src="https://img.shields.io/badge/Q4__K__XL%20111%20GB-15--22%20TOK%2FS-e8590c?style=for-the-badge">
 </p>
 
 <p align="center">
@@ -40,7 +42,7 @@ Nothing leaves your PC.</p>
 <table>
 <tr>
 <td align="center" width="25%"><h2>🧊 78 - 111 GB</h2>of model on a <b>30 GB</b> PC (IQ3_S and UD-Q4_K_XL)</td>
-<td align="center" width="25%"><h2>🔥 50-70 / 15-22</h2>tokens/s on one RTX 3060: IQ3_S (131K context, short answers)</td>
+<td align="center" width="25%"><h2>🔥 35-45 / 15-25</h2>tokens/s on one RTX 3060: IQ3_S (131K context, short answers)</td>
 <td align="center" width="25%"><h2>🐋 341 GB</h2>DeepSeek-V4.1-Flash: see the <a href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41"><b>upstream-dsv41</b> branch</a></td>
 <td align="center" width="25%"><h2>⚡ 0.4 s</h2>to pick up a 45K-token conversation (next turn, from the saved state)</td>
 </tr>
@@ -51,8 +53,8 @@ Nothing leaves your PC.</p>
 A fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). Strata keeps Qwen's experts in
 RAM and reads from the SSD when RAM is short; its docs call that path much slower. This fork works on that path: it
 spreads the experts over the card, RAM and the SSD and guesses ahead which ones to read, so the 78 GB IQ3_S runs on 30 GB
-of RAM at 50-70 tokens/s (131K context, short answers; the table below has the long prompts), and Unsloth's 111 GB UD-Q4_K_XL
-on the same PC at 15-22 tokens/s in short tests on 14 Nov (131K context, three questions, a 29K-token prompt read at 300-420
+of RAM at 35-45 tokens/s (131K context, short answers; the table below has the long prompts) as confirmed by [NoPlaceLikeLocalhost](https://youtu.be/WSJL4SOIZDg?si=qPTa3jeK4YtDLCPy) , and Unsloth's 111 GB UD-Q4_K_XL
+on the same PC at 15-25 tokens/s in short tests on 14 Nov (131K context, three questions, a 29K-token prompt read at 300-420
 tokens/s; the learners were still cold, and it has not been measured as widely as IQ3_S).
 
 </div>
@@ -76,7 +78,7 @@ tokens/s; the learners were still cold, and it has not been measured as widely a
 <div align="justify">
 
 **Yes.** On one RTX 3060 12 GB with 30 GB of RAM and an NVMe SSD, this fork runs Qwen3.8-Flash-Next (Qwen 3.8 Flash Next,
-125B) as the 78 GB IQ3_S at **50-70 tokens/s** (131K context; 262K fits). The experts that do not fit in RAM are read from
+125B) as the 78 GB IQ3_S at **35-45 tokens/s** (131K context; 262K fits). The experts that do not fit in RAM are read from
 the SSD, and a look-ahead guesses ahead which ones. Measured on one PC: see [How fast](#how-fast) and the "Not tested"
 list at the bottom.
 
