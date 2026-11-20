@@ -220,6 +220,38 @@ class Calibrate(unittest.TestCase):
         self.assertNotIn("sh_stream", cuda["report"])
         self.assertTrue(all(e == {} for e in envs))
 
+    def test_our_features_are_kept_unless_off_is_faster(self):
+        # HotRod's features are ON; one is turned off only when off is more than MIN_GAIN faster on this PC, and the learners are
+        # trained (a restart with STRATA_LA_LEARN=1) before any feature is measured
+        feats = tuple(f for f in CAL.FEATURES if f[0] in ("STRATA_LA_LEARN", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_TAIL_SKIP"))
+
+        def run(off_gain):
+            envs = []
+
+            def start(args, env=None):
+                envs.append(dict(env or {}))
+                rate = 50.0
+                for key, off, _ in feats:
+                    if (env or {}).get(key) == off:
+                        rate *= off_gain.get(key, 1.0)
+                return FakeEngine(args, lambda f, p, w: rate, 6)
+            res = CAL.measure(BASE, [[1, 2, 3]] * 3, start, say=lambda *_: None, features=feats)
+            return res, envs
+        res, envs = run({"STRATA_ROUTE_TAIL_SKIP": 1.10, "STRATA_ROUTE_RESIDENT": 0.40, "STRATA_LA_LEARN": 1.02})
+        self.assertEqual(res["env"], {"STRATA_ROUTE_TAIL_SKIP": "0"})     # faster off by more than 3%: off; a loss or noise: stays on
+        self.assertEqual(set(res["report"]["features"]), {"STRATA_LA_LEARN", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_TAIL_SKIP"})
+        first_feature = next(i for i, e in enumerate(envs) if e.get("STRATA_LA_LEARN") == "1")
+        self.assertEqual(envs[first_feature], {"STRATA_LA_LEARN": "1"})   # the training start comes first and sets nothing else
+        flat, flat_envs = run({})
+        self.assertEqual(flat["env"], {})
+        none = CAL.measure(BASE, [[1, 2, 3]] * 3, lambda a, env=None: FakeEngine(a, lambda f, p, w: 50.0, 6), say=lambda *_: None)
+        self.assertNotIn("features", none["report"])                      # no features given (HIP, tests): no step
+
+    def test_feature_keys_do_not_linger(self):
+        old = {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_ROUTE_RESIDENT": "0", "STRATA_MASK": "learn", "OTHER": "1"}
+        out = CAL.apply_env(old, {"STRATA_ROUTE_TAIL_SKIP": "0"})
+        self.assertEqual(out, {"OTHER": "1", "STRATA_ROUTE_TAIL_SKIP": "0"})   # an older calibration's choices are reset first
+
     def test_a_failed_fork_start_keeps_the_default(self):
         def start(args, env=None):
             if (env or {}).get(CAL.SH_STREAM) == "1":

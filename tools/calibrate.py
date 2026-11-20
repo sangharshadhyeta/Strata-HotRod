@@ -24,6 +24,15 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
                   2x RX 6900 XT on Linux, 6-11% faster with it), so it is measured here, per PC, and written into the
                   config's "env" only when it wins.  The output is identical either way (same token ids).
 
+  our features (HotRod, 21 Nov)
+                  the learners are trained here, and each output-changing or per-window feature is measured against its off
+                  state: the learned look-ahead (STRATA_LA_LEARN), stand-ins (STRATA_ROUTE_RESIDENT), the route tail skip
+                  (STRATA_ROUTE_TAIL_SKIP) and the mask (STRATA_MASK).  Every one is ON by default, because it won on the PC
+                  it was built on (a 12 GB RTX 3060); a PC with a bigger card misses fewer experts, and a feature that costs a
+                  fixed time per window then loses.  A feature is turned OFF here only when off is more than MIN_GAIN faster,
+                  and the choice is written into the config's "env".  The learners start from nothing and train in this run
+                  (no downloaded state); they keep learning live afterwards.
+
 The first two and the prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
 count, the adaptive tier and the shared-expert stream need a restart per value.  Those are decode speed: the prompt
 path streams every expert whatever they say.
@@ -222,8 +231,11 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
+    hip = cfg.get("backend") == "hip"
+    cfg_env = cfg.get("env") or {}
+    features = () if hip else tuple(f for f in FEATURES if f[0] in cfg_env or f[0] in FEATURES_WITHOUT_ENV)
     return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
-                   hip=cfg.get("backend") == "hip")
+                   hip=hip, features=features)
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -272,7 +284,8 @@ def sweep(s, values: list, base_tune: dict, key: str, label: str, say) -> dict:
     return out
 
 
-def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None, hip: bool = False) -> dict:
+def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None, hip: bool = False,
+            features=()) -> dict:
     t0 = time.time()
     report: dict = {}
     say("  Loading the model for the measurements ...")
@@ -375,9 +388,52 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         base_rate = statistics.median(by_adapt[a_best])
     elif by_adapt.get("default"):
         base_rate = statistics.median(by_adapt["default"])
+    # 5b. our features (a restart each), with everything chosen so far.  The learners train first (a feature that learns must be
+    # measured trained: an untrained learner is all cost), then each feature is measured against its off state, greedily: a
+    # feature turned off stays off for the ones after it.
+    env = {}
+    if features:
+        tuned = apply(base_args, settings)
+        if any(f[0] == "STRATA_LA_LEARN" for f in features):
+            say("  Training the learners on this PC (restarts the engine) ...")
+            e = restart(lambda a: start_engine(a, {"STRATA_LA_LEARN": "1"}), tuned, "the learners' training", say, report)
+            if e is not None:
+                try:
+                    st = Session(e, ids_list)
+                    st.warm_up(1)
+                    for _ in range(SEED_PROMPTS // max(1, len(ids_list)) + 1):
+                        st.rate(max_new=TIER_MAX_NEW)
+                finally:
+                    close(e)                               # QUIT: the engine writes what it learned (data/predictor-<id>.bin ...)
+        rep_f = {}
+        for key, off, label in features:
+            if key == "STRATA_LA_LEARN":                   # on = learn (what the training above left); off = 0
+                on_env = {"STRATA_LA_LEARN": "1"}
+            else:
+                on_env = {}
+            by_f = {}
+            for state, extra in (("on", on_env), ("off", {key: off})):
+                say(f"  Measuring {label} {state} (restarts the engine) ...")
+                e = restart(lambda a, x=extra: start_engine(a, {**env, **x}), tuned, f"{label} {state}", say, report)
+                if e is None:
+                    continue
+                try:
+                    sf = Session(e, ids_list)
+                    sf.warm_up(1)
+                    by_f[state] = [sf.rate(max_new=TIER_MAX_NEW), sf.rate(max_new=TIER_MAX_NEW)]
+                    say(f"    {label} {state}: {statistics.median(by_f[state]):.1f} tok/s")
+                finally:
+                    close(e)
+            rep_f[key] = by_f
+            if pick(by_f, "on") == "off":
+                env[key] = off
+                say(f"    {label}: more than {MIN_GAIN:.0%} faster off on this PC - turned off")
+                base_rate = statistics.median(by_f["off"])
+            elif by_f.get("on"):
+                base_rate = statistics.median(by_f["on"])
+        report["features"] = rep_f
     # 6. HIP: the shared-expert stream fork (a restart each), with everything chosen so far.  Both values are set
     # explicitly, so a value the config carried before does not decide the baseline.
-    env = {}
     if hip:
         tuned = apply(base_args, settings)
         by_fork = {}
@@ -446,7 +502,17 @@ def apply(args: list[str], settings: dict) -> list[str]:
     return out
 
 
-ENV_KEYS = (SH_STREAM,)
+# our features: (engine variable, its off value, what it is called).  The variable's ON state is the engine's (or the config's) own.
+FEATURES = (("STRATA_LA_LEARN", "0", "the learned look-ahead"),
+            ("STRATA_ROUTE_RESIDENT", "0", "stand-ins"),
+            ("STRATA_ROUTE_TAIL_SKIP", "0", "the route tail skip"),
+            ("STRATA_MASK", "0", "the mask"))
+# a feature whose variable the config does not carry is the engine's own default (tail skip, the learner's auto rule), or is not
+# in use on this model (stand-ins and the mask are written by setup for the models they were built for): only the first two are
+# measured without being in the config's "env"
+FEATURES_WITHOUT_ENV = ("STRATA_LA_LEARN", "STRATA_ROUTE_TAIL_SKIP")
+SEED_PROMPTS = 6                   # answers of TIER_MAX_NEW tokens the learners train on in this run (two rounds over PROMPTS' texts)
+ENV_KEYS = (SH_STREAM,) + tuple(f[0] for f in FEATURES)
 
 
 def apply_env(env: dict | None, calibrated: dict | None) -> dict:
