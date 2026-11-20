@@ -739,6 +739,8 @@ __global__ void route_resident_k(const float* __restrict__ logits, int32_t* __re
 // floors (thinking / answer / code, a fence tracker) lived here and were removed after the benchmark showed no gain (SPEC 18.1).
 static RouteCfg* g_cfg_host = nullptr;
 static RouteCfg* g_cfg_dev = nullptr;
+// These setters run on the host between launches, so their fence is the host fence the core uses everywhere
+// (std::atomic_thread_fence seq_cst).  GCC's __sync_synchronize is not in MSVC's host, which builds this file too.
 void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int maxrank, float want_lo, float repl_gap, float wmax, float budget, float budget_tail) {
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
@@ -755,25 +757,25 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
     g_cfg_host->wmax = wmax;
     g_cfg_host->budget = budget;
     g_cfg_host->budget_tail = budget_tail;
-    __sync_synchronize();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 void route_cfg_set_floor(int lo) {
     if (g_cfg_host == nullptr) return;
     g_cfg_host->lo = lo;
-    __sync_synchronize();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 // STRATA_ROUTE_BUDGET_DYN: the verifier moves the budget between windows (after a window's sync, before the next launch).
 void route_cfg_set_budget(float budget) {
     if (g_cfg_host == nullptr) return;
     g_cfg_host->budget = budget;
-    __sync_synchronize();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 // STRATA_ROUTE_BUDGET_AUTO: both budgets together, between windows (as route_cfg_set_budget)
 void route_cfg_set_budgets(float budget, float budget_tail) {
     if (g_cfg_host == nullptr) return;
     g_cfg_host->budget = budget;
     g_cfg_host->budget_tail = budget_tail;
-    __sync_synchronize();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 const RouteCfg* route_cfg_device() { return g_cfg_dev; }
 // STRATA_LA_TAIL_READ: the open rule as the host holds it now (the same values the kernels read): any resident stand-in serves a rank at or above lo
@@ -1176,7 +1178,7 @@ void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_
 void route_mask_control(bool on) {
     if (g_mask_ctrl_host == nullptr) return;
     *(volatile int*) g_mask_ctrl_host = on ? 1 : 0;
-    __sync_synchronize();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 // STRATA_FRAGILE_CTRL_EVERY: the window's fragile control flag, written between windows (same contract as route_mask_control).  on = true
 // allocates the flag on first use; false when it cannot be had (then this window is not a control window).  off is a no-op until it exists.
@@ -1204,7 +1206,7 @@ bool route_fragile_hold_ready() { return g_frag_ctrl_host != nullptr; }
 bool route_fragile_hold(uint32_t bits) {
     if (g_frag_ctrl_host == nullptr) return false;
     *(volatile uint32_t*) g_frag_ctrl_host = bits;
-    __sync_synchronize();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     return true;
 }
 // A row count n (the SPEC-recheck-cheap form): rows 0..n-1 held.  n >= 32 holds every row (the all-ones mask).
@@ -1245,7 +1247,7 @@ bool route_shift_cap_alloc() {
 bool route_shift_cap_set(const float* caps, int n) {
     if (g_cap_host == nullptr) return false;
     for (int i = 0; i < 32; ++i) ((volatile float*) g_cap_host)[i] = (caps != nullptr && i < n) ? caps[i] : INFINITY;
-    __sync_synchronize();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     return true;
 }
 // Between requests: the refusals since the last read (moves, row launches), read and reset.  false when none exists.

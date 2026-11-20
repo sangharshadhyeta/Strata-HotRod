@@ -3714,11 +3714,19 @@ bool host_ram_room(uint64_t reserve, HostRamRoom& out) {
     std::ifstream info("/proc/meminfo");
     std::stringstream text;
     text << info.rdbuf();
-    const uint64_t total = detail::meminfo_bytes(text.str(), "MemTotal");
-    const uint64_t avail = detail::meminfo_bytes(text.str(), "MemAvailable");
-    if (total == 0) return false;   // no /proc/meminfo (not Linux): the warm is Linux only anyway
+    uint64_t total = detail::meminfo_bytes(text.str(), "MemTotal");
+    uint64_t avail = detail::meminfo_bytes(text.str(), "MemAvailable");
     // The engine's memory limit: the cgroup's (memory.max, minus its usage) when that is lower than MemAvailable.
     const auto mem = sample_host_memory();
+    if (total == 0) {
+        // No /proc/meminfo (Windows): sample_host_memory's own probe (GlobalMemoryStatusEx: the smaller of free
+        // physical RAM and the commit limit, #1607; its `limit` carries total physical RAM) sizes --resident-budget-gib
+        // auto the same way - the RAM tier itself runs on Windows (VirtualLock pinning).  The page-cache warm below
+        // stays Linux only anyway.  false when that probe fails too.
+        if (!mem || mem->available == 0) return false;
+        total = mem->limit;
+        avail = mem->available;
+    }
     const uint64_t room = mem && mem->available > 0 ? std::min<uint64_t>(avail, mem->available) : avail;
     uint64_t keep = reserve + kernel_high_watermark_bytes();
     if (const char* h = std::getenv("STRATA_PAGECACHE_WARM_HEADROOM_GIB"))

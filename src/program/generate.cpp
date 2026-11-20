@@ -5905,7 +5905,8 @@ int main(int argc, char** argv) {
         std::string room_note;
         uint64_t room = strata::core::host_ram_room_bytes(0, &room_note);
         if (room == 0) {
-            std::fprintf(stderr, "strata generate: --resident-budget-gib auto: no RAM room could be read (/proc/meminfo)\n");
+            std::fprintf(stderr, "strata generate: --resident-budget-gib auto: no RAM room could be read (/proc/meminfo, "
+                                 "or the Windows memory probe)\n");
             return 2;
         }
         // 20 Oct: the memory floor (--conversation-cache-min-free-mib) stays free - the tier takes only the room above it.
