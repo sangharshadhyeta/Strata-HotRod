@@ -560,10 +560,21 @@ With more than one model installed, it asks which one to start. `run-<model>.bat
   E5-2673 v3 with DDR3 and an RTX 4060 Ti on PCIe 3.0 x8, 160 swaps every window measured +7.9% over the default
   (Q2_0, with the swaps taking effect a window later, #764); see #906;
 - on two or more cards (a layer split), the prompt chunks that keep the cards reading at once (`--prefill-pipe`, the
-  prompt read speed of fresh prompts rather than the output speed; see docs/MULTI_GPU.md).
+  prompt read speed of fresh prompts rather than the output speed; see docs/MULTI_GPU.md);
+- (HotRod, 21 Nov) the learners and HotRod's own features: the tuning first trains the learned look-ahead on this PC (a
+  restart with `STRATA_LA_LEARN=1`; the engine saves what it learned when it quits), then measures each of the learned
+  look-ahead (`STRATA_LA_LEARN`), stand-ins (`STRATA_ROUTE_RESIDENT`), the route tail skip (`STRATA_ROUTE_TAIL_SKIP`) and the
+  mask (`STRATA_MASK`) on against off, and turns one off in the config's `env` only when off is more than 3% faster.
+  Every one is on by default because it won on the 12 GB RTX 3060 it was built on. A reviewer measured HotRod on a 24 GB RTX
+  Pro 4000 with DDR5 at 87 tok/s against Strata's 103 (decode) while prompt reading was 10-20% faster: a card that misses
+  fewer experts pays a fixed time per window for features built for one that misses many.
+  Measured on the 3060 (Qwen3.8-Flash-Next UD-Q4_K_XL, 262K, one cold start per arm, decode tok/s on four short questions): base
+  16.1 / 19.7 / 22.9 / 15.8, stand-ins off 6.0 / 8.2 / 9.8 / 5.4, adaptive swaps off 13.3 / 11.1 / 11.0 / 11.7, tail skip off
+  15.1 / 20.2 / 23.0 / 15.2, learned look-ahead off 16.5 / 18.8 / 22.6 / 15.9, mask off 16.2 / 19.7 / 23.9 / 16.4 (two base
+  runs agree within about 1 tok/s): on this card only stand-ins and the swaps pay, the others cost nothing that shows here.
 
-The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup offers to measure them on your PC after an
-install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
+The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup measures them on your PC after the install (HotRod,
+21 Nov: by default; `--no-calibrate` skips it, and a PC that was tuned before is not tuned again); `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
 speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
 (in the settings file next to the data folder's record), so updates keep it.
 

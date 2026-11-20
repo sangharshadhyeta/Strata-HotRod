@@ -239,13 +239,26 @@ class Calibrate(unittest.TestCase):
             return res, envs
         res, envs = run({"STRATA_ROUTE_TAIL_SKIP": 1.10, "STRATA_ROUTE_RESIDENT": 0.40, "STRATA_LA_LEARN": 1.02})
         self.assertEqual(res["env"], {"STRATA_ROUTE_TAIL_SKIP": "0"})     # faster off by more than 3%: off; a loss or noise: stays on
-        self.assertEqual(set(res["report"]["features"]), {"STRATA_LA_LEARN", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_TAIL_SKIP"})
+        self.assertEqual(set(res["report"]["features"]),
+                         {"STRATA_LA_LEARN", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_TAIL_SKIP", "STRATA_POOL_DEP"})
         first_feature = next(i for i, e in enumerate(envs) if e.get("STRATA_LA_LEARN") == "1")
         self.assertEqual(envs[first_feature], {"STRATA_LA_LEARN": "1"})   # the training start comes first and sets nothing else
         flat, flat_envs = run({})
         self.assertEqual(flat["env"], {})
         none = CAL.measure(BASE, [[1, 2, 3]] * 3, lambda a, env=None: FakeEngine(a, lambda f, p, w: 50.0, 6), say=lambda *_: None)
         self.assertNotIn("features", none["report"])                      # no features given (HIP, tests): no step
+
+    def test_an_opt_in_switch_is_turned_on_only_when_on_is_faster(self):
+        feats = tuple(f for f in CAL.FEATURES if f[0] == "STRATA_ROUTE_TAIL_SKIP")
+
+        def run(on_gain):
+            def start(args, env=None):
+                rate = 50.0 * (on_gain if (env or {}).get("STRATA_POOL_DEP") == "1" else 1.0)
+                return FakeEngine(args, lambda f, p, w: rate, 6)
+            return CAL.measure(BASE, [[1, 2, 3]] * 3, start, say=lambda *_: None, features=feats)
+        self.assertEqual(run(1.10)["env"], {"STRATA_POOL_DEP": "1"})
+        self.assertEqual(run(1.02)["env"], {})                            # within MIN_GAIN: stays off
+        self.assertEqual(run(0.90)["env"], {})
 
     def test_feature_keys_do_not_linger(self):
         old = {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_ROUTE_RESIDENT": "0", "STRATA_MASK": "learn", "OTHER": "1"}

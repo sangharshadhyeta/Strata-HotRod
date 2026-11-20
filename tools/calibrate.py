@@ -431,6 +431,26 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
                 base_rate = statistics.median(by_f["off"])
             elif by_f.get("on"):
                 base_rate = statistics.median(by_f["on"])
+        # the opt-in switches: off (the default) against on, on kept only when more than MIN_GAIN faster
+        for key, on, label in OPT_IN_SWITCHES:
+            by_f = {}
+            for state, extra in (("off", {}), ("on", {key: on})):
+                say(f"  Measuring {label} {state} (restarts the engine) ...")
+                e = restart(lambda a, x=extra: start_engine(a, {**env, **x}), tuned, f"{label} {state}", say, report)
+                if e is None:
+                    continue
+                try:
+                    sf = Session(e, ids_list)
+                    sf.warm_up(1)
+                    by_f[state] = [sf.rate(max_new=TIER_MAX_NEW), sf.rate(max_new=TIER_MAX_NEW)]
+                    say(f"    {label} {state}: {statistics.median(by_f[state]):.1f} tok/s")
+                finally:
+                    close(e)
+            rep_f[key] = by_f
+            if pick(by_f, "off") == "on":
+                env[key] = on
+                say(f"    {label}: more than {MIN_GAIN:.0%} faster on this PC - turned on")
+                base_rate = statistics.median(by_f["on"])
         report["features"] = rep_f
     # 6. HIP: the shared-expert stream fork (a restart each), with everything chosen so far.  Both values are set
     # explicitly, so a value the config carried before does not decide the baseline.
@@ -507,12 +527,16 @@ FEATURES = (("STRATA_LA_LEARN", "0", "the learned look-ahead"),
             ("STRATA_ROUTE_RESIDENT", "0", "stand-ins"),
             ("STRATA_ROUTE_TAIL_SKIP", "0", "the route tail skip"),
             ("STRATA_MASK", "0", "the mask"))
+# switches that are OFF by default and bit-exact (they change the speed only): measured the other way round, turned ON only when on is
+# more than MIN_GAIN faster.  STRATA_POOL_DEP: the CPU pool runs a layer's gate/up and down rows as one batch with per-expert dependencies
+# (no barrier between the phases); it tied on a 12 GB RTX 3060 with a 12-core CPU and may pay where the CPU pool is the bottleneck.
+OPT_IN_SWITCHES = (("STRATA_POOL_DEP", "1", "the CPU pool's one-batch layer call"),)
 # a feature whose variable the config does not carry is the engine's own default (tail skip, the learner's auto rule), or is not
 # in use on this model (stand-ins and the mask are written by setup for the models they were built for): only the first two are
 # measured without being in the config's "env"
 FEATURES_WITHOUT_ENV = ("STRATA_LA_LEARN", "STRATA_ROUTE_TAIL_SKIP")
 SEED_PROMPTS = 6                   # answers of TIER_MAX_NEW tokens the learners train on in this run (two rounds over PROMPTS' texts)
-ENV_KEYS = (SH_STREAM,) + tuple(f[0] for f in FEATURES)
+ENV_KEYS = (SH_STREAM,) + tuple(f[0] for f in FEATURES) + tuple(f[0] for f in OPT_IN_SWITCHES)
 
 
 def apply_env(env: dict | None, calibrated: dict | None) -> dict:
