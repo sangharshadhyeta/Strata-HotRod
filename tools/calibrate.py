@@ -582,9 +582,13 @@ def close(eng):
         proc.stdin.write("QUIT\n")
         proc.stdin.flush()
         proc.stdin.close()
-        proc.wait(60)
+        proc.wait(180)     # a big model saves its learned files and frees tens of GB of pinned memory on the way out
     except Exception:
         proc.kill()
+        try:
+            proc.wait(120)   # 21 Nov: a kill that is not waited for let the next restart start while this engine's pinned memory was still
+        except Exception:    # being released: two engines at once, and the memory scope killed one (OOM at 24.9 GB resident in a 29 GB scope)
+            pass
 
 
 DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None,   # None: the engine's own choice
