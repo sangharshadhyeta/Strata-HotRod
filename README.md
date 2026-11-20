@@ -1,6 +1,10 @@
-<p align="center"><i> <s>A system which rewires the model around the way you use it.</s></i></p>
+<p align="center"><i> Coming Soon: <s>A system which rewires the model around the way you use it.</s></i></p>
 
-Watch this first: [NoPlaceLikeLocalhost](https://youtu.be/WSJL4SOIZDg?si=qPTa3jeK4YtDLCPy)
+Watch this first: [NoPlaceLikeLocalhost](https://youtu.be/WSJL4SOIZDg?si=qPTa3jeK4YtDLCPy) - This repo is for the hosters who like to get under the hood, tinker, tune and make things their own. Who believe in building, not just buying; in ingenuity over expensive hardware; and in pushing what they've got to do what others thought it couldn't.
+
+And in the spirit of open source, sharing what they build, learning from each other, and making the whole community better along the way.
+
+Take the machine you have. Make it your own. Share what you learn. See what it'll do.
 
 <p align="center"><img src="docs/media/hotrod-hero.gif" width="380" alt="Strata Hot Rod: the Strata hexagon in fire and ice"></p>
 
