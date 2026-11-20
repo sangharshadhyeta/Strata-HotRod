@@ -533,7 +533,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         arms = (("default", apply(base_args, {}), {}), ("chosen", apply(base_args, decode_settings), env))
         for rnd in range(2):
             for name, a, ev in (arms if rnd % 2 == 0 else arms[::-1]):
-                say(f"  Checking the {name} settings against each other (restarts the engine) ...")
+                say(f"  Final check: all the {name} settings together (restarts the engine) ...")
                 e = restart(lambda x, ev=ev: start_engine(x, dict(ev)) if ev else start_engine(x), a, f"the final check, {name}", say, report)
                 if e is None:
                     continue
