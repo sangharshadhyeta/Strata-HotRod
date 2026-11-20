@@ -179,6 +179,14 @@ def measure_pipe(eng, make, say=print) -> tuple[float, dict]:
                     "pipe_confirm": {str(k): v for k, v in confirm.items()}}
 
 
+def tuned_default_tier(args: list[str]) -> list[str]:
+    """`args` with the adaptive tier's flags removed: the engine's own tier."""
+    out = list(args)
+    for flag in ADAPT_FLAGS:
+        out = with_arg(out, flag, None)
+    return out
+
+
 def ptune(frac: float) -> dict:
     """The per-request tune keys for a PCIe share: none for the engine's own (AUTO), else the fixed value."""
     return {} if frac == AUTO else {"pcie_frac": frac}
@@ -366,6 +374,17 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
                 say(f"    {w} workers: {statistics.median(by_workers[w]):.1f} tok/s")
             finally:
                 close(e)
+        if len(by_workers) > 1 and d_workers in by_workers:   # the default again, last: the arms are bracketed (a warm-up or drift over the series
+            say(f"  Measuring with {d_workers} CPU workers again (restarts the engine) ...")   # lands on the first arm, not on the candidates)
+            e = restart(start_engine, with_arg(tuned, "--pool-workers", None), f"{d_workers} workers again", say, report)
+            if e is not None:
+                try:
+                    sw = Session(e, ids_list)
+                    sw.warm_up(1)
+                    by_workers[d_workers] += [sw.rate(), sw.rate()]
+                    say(f"    {d_workers} workers, again: {statistics.median(by_workers[d_workers][-2:]):.1f} tok/s")
+                finally:
+                    close(e)
         report["workers"] = {str(k): v for k, v in by_workers.items()}
         w_best = pick(by_workers, d_workers) if by_workers else d_workers
         if w_best != d_workers:
@@ -392,6 +411,17 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             say(f"    {statistics.median(by_adapt[key]):.1f} tok/s")
         finally:
             close(e)
+    if len(by_adapt) > 1 and "default" in by_adapt:   # the engine's own tier again, last (see the worker counts above)
+        say("  Measuring the expert tier (the engine default) again (restarts the engine) ...")
+        e = restart(start_engine, tuned_default_tier(tuned), "the expert tier default again", say, report)
+        if e is not None:
+            try:
+                sa = Session(e, ids_list)
+                sa.warm_up(1)
+                by_adapt["default"] += [sa.rate(max_new=TIER_MAX_NEW), sa.rate(max_new=TIER_MAX_NEW)]
+                say(f"    again: {statistics.median(by_adapt['default'][-2:]):.1f} tok/s")
+            finally:
+                close(e)
     a_best = pick(by_adapt, "default") if by_adapt else "default"
     report["adapt"] = by_adapt
     if a_best != "default":
@@ -424,7 +454,10 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             else:
                 on_env = {}
             by_f = {}
-            for state, extra in (("on", on_env), ("off", {key: off})):
+            # on, off, on: the first arm of a restart series pays a warm-up (the page cache, the tier) that a single "on" then "off" would
+            # hand to "off" (the tail skip read 22.5 on / 25.9 off in a first real run and tied in two alternated A/Bs); the default is
+            # measured at both ends and its median is taken over both
+            for state, extra in (("on", on_env), ("off", {key: off}), ("on", on_env)):
                 say(f"  Measuring {label} {state} (restarts the engine) ...")
                 e = restart(lambda a, x=extra: start_engine(a, {**env, **x}), tuned, f"{label} {state}", say, report)
                 if e is None:
@@ -432,8 +465,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
                 try:
                     sf = Session(e, ids_list)
                     sf.warm_up(1)
-                    by_f[state] = [sf.rate(max_new=TIER_MAX_NEW), sf.rate(max_new=TIER_MAX_NEW)]
-                    say(f"    {label} {state}: {statistics.median(by_f[state]):.1f} tok/s")
+                    by_f.setdefault(state, []).extend([sf.rate(max_new=TIER_MAX_NEW), sf.rate(max_new=TIER_MAX_NEW)])
+                    say(f"    {label} {state}: {statistics.median(by_f[state][-2:]):.1f} tok/s")
                 finally:
                     close(e)
             rep_f[key] = by_f
@@ -446,7 +479,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         # the opt-in switches: off (the default) against on, on kept only when more than MIN_GAIN faster
         for key, on, label in OPT_IN_SWITCHES:
             by_f = {}
-            for state, extra in (("off", {}), ("on", {key: on})):
+            for state, extra in (("off", {}), ("on", {key: on}), ("off", {})):   # the default at both ends
                 say(f"  Measuring {label} {state} (restarts the engine) ...")
                 e = restart(lambda a, x=extra: start_engine(a, {**env, **x}), tuned, f"{label} {state}", say, report)
                 if e is None:
@@ -454,8 +487,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
                 try:
                     sf = Session(e, ids_list)
                     sf.warm_up(1)
-                    by_f[state] = [sf.rate(max_new=TIER_MAX_NEW), sf.rate(max_new=TIER_MAX_NEW)]
-                    say(f"    {label} {state}: {statistics.median(by_f[state]):.1f} tok/s")
+                    by_f.setdefault(state, []).extend([sf.rate(max_new=TIER_MAX_NEW), sf.rate(max_new=TIER_MAX_NEW)])
+                    say(f"    {label} {state}: {statistics.median(by_f[state][-2:]):.1f} tok/s")
                 finally:
                     close(e)
             rep_f[key] = by_f

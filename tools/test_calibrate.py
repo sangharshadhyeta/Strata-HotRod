@@ -142,7 +142,8 @@ class Calibrate(unittest.TestCase):
         res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6)
         self.assertEqual(res["settings"].get("--pool-workers"), "3")
         # one start per worker count and per expert-tier candidate, plus the sweep
-        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + len(CAL.ADAPT_CANDIDATES))
+        # (+2: the default worker count and the default tier are measured once more at the end of their series)
+        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + len(CAL.ADAPT_CANDIDATES) + 2)
         self.assertEqual(CAL.arg_value(starts[0], "--spec-min-p"), "0.5")   # measured against the product default
 
     def test_a_failed_restart_keeps_the_measurements_1337(self):
@@ -180,7 +181,7 @@ class Calibrate(unittest.TestCase):
         # the candidates are measured with the worker count chosen before
         res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6, adapt={"160": 1.10})
         self.assertEqual(res["settings"].get("--pool-workers"), "3")
-        self.assertTrue(all(CAL.arg_value(a, "--pool-workers") == "3" for a in starts[-len(CAL.ADAPT_CANDIDATES):]))
+        self.assertTrue(all(CAL.arg_value(a, "--pool-workers") == "3" for a in starts[-len(CAL.ADAPT_CANDIDATES) - 1:]))
         a = CAL.apply(BASE, res["settings"])
         self.assertEqual(CAL.arg_value(a, "--adapt-swaps"), "160")
         self.assertIsNone(CAL.arg_value(CAL.apply(a, {}), "--adapt-swaps"))   # an old calibration's tier goes
