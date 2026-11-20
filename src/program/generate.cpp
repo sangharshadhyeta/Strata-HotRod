@@ -1625,6 +1625,19 @@ static std::string standin_tune_path(const Options& o) {
 //     STRATA_PREFILL_CHUNK_COST (default 0.05);
 //   - the result is kept in <pack>/prefill-chunk.txt keyed by GPU name, VRAM and RAM; at the next start it caps the auto chunk (the arena is sized at
 //     load).  An explicit --prefill N is never touched; STRATA_PREFILL_CHUNK_LEARN=0 turns it off; delete the file to search anew.
+// STRP header: "STRP", u32 version, u32 layers, u32 experts, ...  A learned profile (profile-learned.bin) is used in place of the shipped one when it is
+// for the same layers x experts: the file formats differ by model (an older shipped profile has 4 bytes an entry, the saved one 8), so the sizes may not match.
+static bool profile_dims_match(const std::filesystem::path& a, const std::filesystem::path& b) {
+    auto dims = [](const std::filesystem::path& p, uint32_t* d) {
+        std::ifstream f(p, std::ios::binary);
+        char hdr[16];
+        if (!f.read(hdr, sizeof hdr) || std::memcmp(hdr, "STRP", 4) != 0) return false;
+        std::memcpy(d, hdr + 8, 8);
+        return true;
+    };
+    uint32_t da[2] = {0, 0}, db[2] = {0, 0};
+    return dims(a, da) && dims(b, db) && da[0] == db[0] && da[1] == db[1] && da[0] > 0;
+}
 struct ChunkLearn {
     bool on = false, settled = false;
     std::string path, key;
@@ -1643,8 +1656,10 @@ static std::string chunk_learn_key() {
     return name + "/" + std::to_string((long long) (pr.totalGlobalMem >> 20)) + "MiB/" + std::to_string(ram_gib) + "GiB";
 }
 static bool chunk_learn_eligible(const Options& o) {
+    // a latent pack: on by default (measured on Edge0-145B); any other model: opt-in until it has been measured there (STRATA_PREFILL_CHUNK_LEARN=1)
     const char* v = std::getenv("STRATA_PREFILL_CHUNK_LEARN");
-    return o.serve && o.prefill_auto && !o.pack.empty() && (v == nullptr || std::atoi(v) != 0);
+    const bool want = v != nullptr ? std::atoi(v) != 0 : strata::kernels::cpu::expert_layout().latent;
+    return o.serve && o.prefill_auto && !o.pack.empty() && want;
 }
 static void chunk_learn_load(ChunkLearn& L, const Options& o) {
     L = ChunkLearn{};
@@ -3783,19 +3798,34 @@ int main(int argc, char** argv) {
             // 14.6 / 15.0 -> 20.0 / 21.9 tok/s (short answer), 16.3 / 16.2 -> 18.2 / 19.6 (code), 22.9 / 23.0 -> 25.1 / 25.3 (long); equal by the
             // fourth question (26.4 / 27.4 vs 26.1 / 26.7).  The answers read correct.  STRATA_LATENT_LEARN_PROFILE=0 turns it off.
             if (o.serve && !o.expert_profile.empty() && o.expert_profile_save.empty() &&
-                [] { const char* v = std::getenv("STRATA_LATENT_LEARN_PROFILE"); return v == nullptr || std::atoi(v) != 0; }()) {
+                [] { const char* v = std::getenv("STRATA_LATENT_LEARN_PROFILE"); return v == nullptr || std::atoi(v) != 0; }()) {   // (STRATA_LEARN_PROFILE=1: the same for any other model, below)
                 namespace fs = std::filesystem;
                 std::error_code pec;
                 const fs::path shipped = o.expert_profile;
                 const fs::path learned = (shipped.parent_path().empty() ? fs::path(".") : shipped.parent_path()) / "profile-learned.bin";
                 o.expert_profile_save = learned.string();
-                if (fs::exists(learned, pec) && fs::file_size(learned, pec) == fs::file_size(shipped, pec)) {
+                if (fs::exists(learned, pec) && profile_dims_match(learned, shipped)) {
                     o.expert_profile = learned.string();
                     std::fprintf(stderr, "strata generate: latent experts: the learned residency profile %s is used (saved on the way; STRATA_LATENT_LEARN_PROFILE=0 turns it off)\n",
                                  learned.string().c_str());
                 } else {
                     std::fprintf(stderr, "strata generate: latent experts: the residency profile will be learned and saved to %s\n", learned.string().c_str());
                 }
+            }
+        } else if (o.serve && !o.expert_profile.empty() && o.expert_profile_save.empty() &&
+                   [] { const char* v = std::getenv("STRATA_LEARN_PROFILE"); return v == nullptr || std::atoi(v) != 0; }()) {
+            // any other model: on by default (STRATA_LEARN_PROFILE=0 turns it off), the same as for a latent pack: save what the adaptive tier learned as profile-learned.bin beside
+            // the shipped profile, start from it when it exists and has the shipped one's size
+            namespace fs = std::filesystem;
+            std::error_code pec;
+            const fs::path shipped = o.expert_profile;
+            const fs::path learned = (shipped.parent_path().empty() ? fs::path(".") : shipped.parent_path()) / "profile-learned.bin";
+            o.expert_profile_save = learned.string();
+            if (fs::exists(learned, pec) && profile_dims_match(learned, shipped)) {
+                o.expert_profile = learned.string();
+                std::fprintf(stderr, "strata generate: STRATA_LEARN_PROFILE: the learned residency profile %s is used (saved on the way)\n", learned.string().c_str());
+            } else {
+                std::fprintf(stderr, "strata generate: STRATA_LEARN_PROFILE: the residency profile will be learned and saved to %s\n", learned.string().c_str());
             }
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
@@ -4115,7 +4145,9 @@ int main(int argc, char** argv) {
     // 120 tokens, --max-context 32768 --kv-resident 8192, repeatable): the default 32768-cell draft window gave windows of 1-2 tokens (T1:19 T2:17,
     // 1.85 tokens per round, 13.2-13.5 tok/s); a draft window of 8192 or 4096 gave 2.5-2.6 tokens per round and 15.5-15.9 tok/s (full-resident
     // K/V: 2.63 per round, 17.9-18.1 tok/s).  --mtp-window overrides.
-    if (strata::kernels::cpu::expert_layout().latent && o.kv_resident > 0 && !o.mtp_window_given && o.mtp_window > o.kv_resident) {
+    if ((strata::kernels::cpu::expert_layout().latent ||
+         [] { const char* v = std::getenv("STRATA_MTP_WINDOW_STREAM"); return v != nullptr && std::atoi(v) != 0; }()) &&   // any other model: opt-in
+        o.kv_resident > 0 && !o.mtp_window_given && o.mtp_window > o.kv_resident) {
         std::fprintf(stderr, "strata generate: K/V streaming: the draft head's window is the %lld resident cells (--mtp-window overrides)\n", (long long) o.kv_resident);
         o.mtp_window = o.kv_resident;
     }
