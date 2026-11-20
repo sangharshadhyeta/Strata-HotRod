@@ -37,7 +37,9 @@ class FakeEngine:
 
     def generate(self, ids, max_new, sampling, cancel):
         tune = sampling.get("strata_tune") or {}
-        rate = self.speed(tune.get("pcie_frac", 0.55), tune.get("spec_min_p", self.info["spec_min_p"]), self.workers)
+        self.max_new = max_new
+        arg_f = CAL.arg_value(self.args, "--pcie-frac")
+        rate = self.speed(tune.get("pcie_frac", float(arg_f) if arg_f else 0.55), tune.get("spec_min_p", self.info["spec_min_p"]), self.workers)
         rate *= self.adapt_bonus
         for _ in range(max_new):
             yield 1
@@ -142,8 +144,8 @@ class Calibrate(unittest.TestCase):
         res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6)
         self.assertEqual(res["settings"].get("--pool-workers"), "3")
         # one start per worker count and per expert-tier candidate, plus the sweep
-        # (+2: the default worker count and the default tier are measured once more at the end of their series)
-        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + len(CAL.ADAPT_CANDIDATES) + 2)
+        # (+2: the default worker count and the default tier are measured once more at the end of their series; +4: the final check)
+        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + len(CAL.ADAPT_CANDIDATES) + 2 + 4)
         self.assertEqual(CAL.arg_value(starts[0], "--spec-min-p"), "0.5")   # measured against the product default
 
     def test_a_failed_restart_keeps_the_measurements_1337(self):
@@ -181,7 +183,8 @@ class Calibrate(unittest.TestCase):
         # the candidates are measured with the worker count chosen before
         res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6, adapt={"160": 1.10})
         self.assertEqual(res["settings"].get("--pool-workers"), "3")
-        self.assertTrue(all(CAL.arg_value(a, "--pool-workers") == "3" for a in starts[-len(CAL.ADAPT_CANDIDATES) - 1:]))
+        tier_starts = [a for a in starts if CAL.arg_value(a, "--adapt-swaps") is not None]
+        self.assertTrue(tier_starts and all(CAL.arg_value(a, "--pool-workers") == "3" for a in tier_starts))
         a = CAL.apply(BASE, res["settings"])
         self.assertEqual(CAL.arg_value(a, "--adapt-swaps"), "160")
         self.assertIsNone(CAL.arg_value(CAL.apply(a, {}), "--adapt-swaps"))   # an old calibration's tier goes
@@ -208,7 +211,8 @@ class Calibrate(unittest.TestCase):
             return res, starts, envs
         res, starts, envs = run(1.08)
         self.assertEqual(res["env"], {CAL.SH_STREAM: "1"})
-        self.assertEqual(envs[-2:], [{CAL.SH_STREAM: "0"}, {CAL.SH_STREAM: "1"}])
+        fork_envs = [e for e in envs if CAL.SH_STREAM in e]
+        self.assertEqual(fork_envs[:2], [{CAL.SH_STREAM: "0"}, {CAL.SH_STREAM: "1"}])
         self.assertEqual(starts[-1], starts[-2])                      # the same args for both: only the variable differs
         self.assertGreater(res["report"]["tok_s"], 52.0)              # the reported speed is the fork's
         flat, _, _ = run(1.02)                                        # within noise: the default stays
@@ -275,7 +279,9 @@ class Calibrate(unittest.TestCase):
                 self.info["pcie_auto"] = 1
             def generate(self, ids, max_new, sampling, cancel):
                 tune = sampling.get("strata_tune") or {}
-                self.speed = lambda f, p, w, fixed=("pcie_frac" in tune), want=tune.get("pcie_frac"): 50.0 * (self.bonus(fixed, want))
+                arg_f = CAL.arg_value(self.args, "--pcie-frac")
+                want = tune.get("pcie_frac", float(arg_f) if arg_f else None)
+                self.speed = lambda f, p, w, fixed=want is not None, want=want: 50.0 * (self.bonus(fixed, want))
                 return super().generate(ids, max_new, sampling, cancel)
         def run(bonus):
             class E(Auto):
@@ -288,6 +294,25 @@ class Calibrate(unittest.TestCase):
         self.assertNotIn("--pcie-frac", worse["settings"])
         better = run(lambda f: 1.25 if f == 0.75 else 1.0)
         self.assertEqual(better["settings"].get("--pcie-frac"), "0.75")
+
+    def test_the_final_check_drops_choices_that_lose_together(self):
+        # a PCIe share that wins on the sweep's 128-token answers and loses on the 512-token answers of the later steps: the arbiter drops it
+        def run(long_gain):
+            class E(FakeEngine):
+                def generate(self, ids, max_new, sampling, cancel):
+                    tune = sampling.get("strata_tune") or {}
+                    arg_f = CAL.arg_value(self.args, "--pcie-frac")
+                    f = tune.get("pcie_frac", float(arg_f) if arg_f else 0.55)
+                    self.speed = lambda *_: 50.0 * ((1.10 if max_new < 512 else long_gain) if f == 0.75 else 1.0)
+                    return super().generate(ids, max_new, sampling, cancel)
+            return CAL.measure(BASE, [[1, 2, 3]] * 3, lambda a: E(a, None, 6), say=lambda *_: None)
+        kept = run(1.10)
+        self.assertEqual(kept["settings"].get("--pcie-frac"), "0.75")
+        self.assertIn("final_check", kept["report"])
+        lost = run(0.80)
+        self.assertEqual(lost["settings"], {})
+        self.assertIn("dropped", lost["report"])
+        self.assertEqual(lost["report"]["dropped"]["settings"].get("--pcie-frac"), "0.75")
 
     def test_a_failed_fork_start_keeps_the_default(self):
         def start(args, env=None):

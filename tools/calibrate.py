@@ -521,6 +521,40 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             base_rate = statistics.median(by_fork["1"])
         elif by_fork.get("0"):
             base_rate = statistics.median(by_fork["0"])
+    # 7. the arbiter: everything chosen, together, against the product defaults.  Each choice above was measured alone, against the default,
+    # on short answers and with the noise of one or two samples; their sum can be a loss.  A first real run on the 3060 chose a fixed PCIe
+    # share 0.90 (over the engine's balance), 2 CPU workers, a draft floor 0.7, the tier 80 / 0.97 and the tail skip and mask off, and
+    # that set decoded 13.6 / 15.6 / 17.0 / 9.8 tok/s where the defaults did 15.3 / 20.6 / 24.8 / 14.8 (-25%).  The set is kept only
+    # when it beats the defaults by more than MIN_GAIN, alternated default / chosen / default / chosen with a restart each;
+    # otherwise every choice is dropped and the config keeps the defaults.
+    decode_settings = {k: v for k, v in settings.items() if k != "--prefill-pipe"}   # --prefill-pipe is the prompt read's, measured on its own
+    if decode_settings or env:
+        by_final = {"default": [], "chosen": []}
+        arms = (("default", apply(base_args, {}), {}), ("chosen", apply(base_args, decode_settings), env))
+        for rnd in range(2):
+            for name, a, ev in (arms if rnd % 2 == 0 else arms[::-1]):
+                say(f"  Checking the {name} settings against each other (restarts the engine) ...")
+                e = restart(lambda x, ev=ev: start_engine(x, dict(ev)) if ev else start_engine(x), a, f"the final check, {name}", say, report)
+                if e is None:
+                    continue
+                try:
+                    sf = Session(e, ids_list)
+                    sf.warm_up(1)
+                    by_final[name] += [sf.rate(max_new=TIER_MAX_NEW), sf.rate(max_new=TIER_MAX_NEW)]
+                    say(f"    {name}: {statistics.median(by_final[name][-2:]):.1f} tok/s")
+                finally:
+                    close(e)
+        report["final_check"] = by_final
+        if by_final["default"] and by_final["chosen"]:
+            if pick(by_final, "default") != "chosen":
+                say("    the chosen settings together are not more than "
+                    f"{MIN_GAIN:.0%} faster than the defaults - every choice is dropped, the defaults stay")
+                report["dropped"] = {"settings": dict(decode_settings), "env": dict(env)}
+                settings = {k: v for k, v in settings.items() if k == "--prefill-pipe"}
+                env = {}
+                base_rate = statistics.median(by_final["default"])
+            else:
+                base_rate = statistics.median(by_final["chosen"])
     report["seconds"] = round(time.time() - t0)
     report["tok_s"] = round(base_rate, 1) if base_rate else None
     return {"settings": settings, "env": env, "report": report}
