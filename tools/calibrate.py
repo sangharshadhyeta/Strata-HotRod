@@ -57,6 +57,7 @@ sys.path.insert(0, str(ROOT))
 
 MIN_GAIN = 0.03                    # a setting must beat the default by this much to be kept
 PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75, 0.9, 1.0)   # 1.0: every miss over PCIe, the CPU pool gets no expert
+AUTO = -1.0                        # the PCIe share the engine chooses itself (PcieAuto, STRATA_PCIE_BALANCE): no per-request value is sent
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
 SWEEP_ROUNDS = 3                   # how many times the sweep visits each value (see `sweep`)
 # the adaptive tier's candidates (every, swaps, decay) against the engine's own (None): swapping more and remembering
@@ -178,6 +179,11 @@ def measure_pipe(eng, make, say=print) -> tuple[float, dict]:
                     "pipe_confirm": {str(k): v for k, v in confirm.items()}}
 
 
+def ptune(frac: float) -> dict:
+    """The per-request tune keys for a PCIe share: none for the engine's own (AUTO), else the fixed value."""
+    return {} if frac == AUTO else {"pcie_frac": frac}
+
+
 def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
     """The key with the best median tok/s, or `default_key` unless the best beats it by more than min_gain."""
     med = {k: statistics.median(v) for k, v in measured.items() if v}
@@ -274,13 +280,13 @@ def sweep(s, values: list, base_tune: dict, key: str, label: str, say) -> dict:
     out = {v: [] for v in values}
     for r in range(SWEEP_ROUNDS):
         for v in (values if r % 2 == 0 else values[::-1]):
-            out[v].append(s.rate({**base_tune, key: v}))
+            out[v].append(s.rate({**base_tune, **({} if v == AUTO else {key: v})}))
         say(f"    round {r + 1}/{SWEEP_ROUNDS} {label}: " +
-            "  ".join(f"{v:g} {out[v][-1]:.1f}" for v in values))
+            "  ".join(f"{'auto' if v == AUTO else format(v, 'g')} {out[v][-1]:.1f}" for v in values))
     med = {v: statistics.median(out[v]) for v in values}
     say(f"    {label}, median of {SWEEP_ROUNDS}: " +
-        ", ".join(f"{v:g}: {med[v]:.1f} ({min(out[v]):.1f}-{max(out[v]):.1f})" for v in values) +
-        f" -> best {max(med, key=lambda k: med[k]):g}")
+        ", ".join(f"{'auto' if v == AUTO else format(v, 'g')}: {med[v]:.1f} ({min(out[v]):.1f}-{max(out[v]):.1f})" for v in values) +
+        f" -> best {'auto' if max(med, key=lambda k: med[k]) == AUTO else format(max(med, key=lambda k: med[k]), 'g')}")
     return out
 
 
@@ -293,7 +299,11 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     eng = start_engine(base_args)
     try:
         info = dict(getattr(eng, "info", {}) or {})
-        d_pcie = float(info.get("pcie_frac", 0.55))
+        # 21 Nov: when the engine's share is its own (pcie_auto=1: PcieAuto or STRATA_PCIE_BALANCE, no --pcie-frac in the args) the default is
+        # that, not the number it prints: a fixed share set per request replaces the balance, so measuring 0.55 would measure something the
+        # engine does not run
+        auto_pcie = bool(int(info.get("pcie_auto", 0) or 0)) and arg_value(base_args, "--pcie-frac") is None
+        d_pcie = AUTO if auto_pcie else float(info.get("pcie_frac", 0.55))
         d_minp = float(info.get("spec_min_p", 0.5))
         d_workers = int(info.get("pool_workers", 0)) or None
         s = Session(eng, ids_list)
@@ -309,20 +319,20 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             pipe, rep_pipe = measure_pipe(eng, long_prompt, say)
             report.update(rep_pipe)
         # 1. the PCIe share, at the default draft floor
-        by_pcie = sweep(s, sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}), {"spec_min_p": d_minp}, "pcie_frac",
+        by_pcie = sweep(s, sorted(set(PCIE_FRACS) | {AUTO if auto_pcie else round(d_pcie, 2)}), {"spec_min_p": d_minp}, "pcie_frac",
                         "PCIe share", say)
         best_pcie = max(by_pcie, key=lambda k: statistics.median(by_pcie[k]))
         # 2. the draft floor, at that share
-        by_minp = sweep(s, sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}), {"pcie_frac": best_pcie}, "spec_min_p",
+        by_minp = sweep(s, sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}), ptune(best_pcie), "spec_min_p",
                         "draft floor", say)
         best_minp = max(by_minp, key=lambda k: statistics.median(by_minp[k]))
         # 3. the winner against the default, interleaved, the same number of rounds
-        dflt, cand = (round(d_pcie, 2), round(d_minp, 2)), (best_pcie, best_minp)
+        dflt, cand = (d_pcie if auto_pcie else round(d_pcie, 2), round(d_minp, 2)), (best_pcie, best_minp)
         confirm = {dflt: [], cand: []}
         if cand != dflt:
             for _ in range(SWEEP_ROUNDS):
                 for k in (dflt, cand):
-                    confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
+                    confirm[k].append(s.rate({**ptune(k[0]), "spec_min_p": k[1]}))
         chosen = pick(confirm, dflt) if cand != dflt else dflt
         report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
                       pcie_sweep={str(k): v for k, v in by_pcie.items()},
@@ -334,12 +344,14 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     if pipe:
         settings["--prefill-pipe"] = str(int(pipe))
     if chosen != dflt:
-        settings["--pcie-frac"] = f"{chosen[0]:.2f}"
+        if chosen[0] != AUTO:                          # a fixed share only when it beat the engine's own by more than MIN_GAIN
+            settings["--pcie-frac"] = f"{chosen[0]:.2f}"
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
     # 4. fewer CPU workers (a restart each), with the chosen settings
     if d_workers and len(worker_candidates(d_workers, extra_workers)) > 1:
-        tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
+        tuned = with_arg(with_arg(base_args, "--pcie-frac", None if chosen[0] == AUTO else f"{chosen[0]:.2f}"), "--spec-min-p",
+                         f"{chosen[1]:.2f}")
         by_workers = {}
         for w in worker_candidates(d_workers, extra_workers):
             say(f"  Measuring with {w} CPU workers (restarts the engine) ...")

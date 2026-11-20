@@ -265,6 +265,29 @@ class Calibrate(unittest.TestCase):
         out = CAL.apply_env(old, {"STRATA_ROUTE_TAIL_SKIP": "0"})
         self.assertEqual(out, {"OTHER": "1", "STRATA_ROUTE_TAIL_SKIP": "0"})   # an older calibration's choices are reset first
 
+    def test_the_engines_own_pcie_share_is_the_default(self):
+        # pcie_auto=1 in the engine's INFO: the default is the balance, measured by sending no per-request share; a fixed share replaces it
+        # (and turns the balance off), so it is written only when it beats the balance by more than MIN_GAIN
+        class Auto(FakeEngine):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.info["pcie_auto"] = 1
+            def generate(self, ids, max_new, sampling, cancel):
+                tune = sampling.get("strata_tune") or {}
+                self.speed = lambda f, p, w, fixed=("pcie_frac" in tune), want=tune.get("pcie_frac"): 50.0 * (self.bonus(fixed, want))
+                return super().generate(ids, max_new, sampling, cancel)
+        def run(bonus):
+            class E(Auto):
+                def bonus(self, fixed, want):
+                    return bonus(want) if fixed else 1.0
+            return CAL.measure(BASE, [[1, 2, 3]] * 3, lambda a, env=None: E(a, lambda f, p, w: 50.0, 6), say=lambda *_: None)
+        flat = run(lambda f: 1.02)                                        # a fixed share within noise of the balance: the balance stays
+        self.assertNotIn("--pcie-frac", flat["settings"])
+        worse = run(lambda f: 0.7)
+        self.assertNotIn("--pcie-frac", worse["settings"])
+        better = run(lambda f: 1.25 if f == 0.75 else 1.0)
+        self.assertEqual(better["settings"].get("--pcie-frac"), "0.75")
+
     def test_a_failed_fork_start_keeps_the_default(self):
         def start(args, env=None):
             if (env or {}).get(CAL.SH_STREAM) == "1":
