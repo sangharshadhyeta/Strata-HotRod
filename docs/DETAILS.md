@@ -572,6 +572,12 @@ With more than one model installed, it asks which one to start. `run-<model>.bat
   16.1 / 19.7 / 22.9 / 15.8, stand-ins off 6.0 / 8.2 / 9.8 / 5.4, adaptive swaps off 13.3 / 11.1 / 11.0 / 11.7, tail skip off
   15.1 / 20.2 / 23.0 / 15.2, learned look-ahead off 16.5 / 18.8 / 22.6 / 15.9, mask off 16.2 / 19.7 / 23.9 / 16.4 (two base
   runs agree within about 1 tok/s): on this card only stand-ins and the swaps pay, the others cost nothing that shows here.
+  Two guards keep the tuning from making a PC slower (found in the first real run on the 3060, whose choices - a fixed PCIe share
+  0.90 over the engine's own balance, 2 CPU workers, a draft floor 0.7, the tier 80 / 0.97, the tail skip and the mask off - each
+  won alone on short answers and together decoded 13.6 / 15.6 / 17.0 / 9.8 tok/s where the defaults did 15.3 / 20.6 / 24.8 / 14.8):
+  the default of every restart series is measured at both ends (the first arm of a series pays a warm-up), and at the end the whole
+  chosen set is measured against the product defaults together, default / chosen / default / chosen on 512-token answers; it is
+  kept only if it wins by more than 3%, otherwise every choice is dropped and the report says what was dropped.
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup measures them on your PC after the install (HotRod,
 21 Nov: by default; `--no-calibrate` skips it, and a PC that was tuned before is not tuned again); `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
