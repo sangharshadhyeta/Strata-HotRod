@@ -299,6 +299,22 @@ private:
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
+    // STRATA_POOL_DEP=1 (opt-in; ported 21 Nov from upstream's BW-G idea, written against this pool): a native layer call as ONE batch (mode 7)
+    // instead of gate/up rows, a barrier, the host quantizing every expert's intermediate, a second barrier, down rows.  The batch's tasks are
+    // every expert's gate/up row ranges first (expert-major), then every expert's down row ranges.  A down task waits only for its own expert's
+    // gate/up tasks (`gu_left`), and the first thread that gets there quantizes that expert's intermediate (`quant` 0 -> 1 -> 2), so a worker that
+    // finishes its rows early starts on an expert that is ready instead of idling at the barrier, and the host no longer quantizes in between.
+    // The rows come from the same kernels and the same bytes, so the output is the two-phase batch's bits.  No deadlock: claim() hands the indices
+    // out in order, every gate/up task has a lower index than every down task and waits for nothing, so a down task that waits is waiting for a
+    // task that is already running.  Not for Q2_0 experts (their rows have their own kernels and a different intermediate).
+    struct alignas(64) DepExpert {
+        std::atomic<int32_t> gu_left{0};
+        std::atomic<int32_t> quant{0};
+    };
+    std::unique_ptr<DepExpert[]> dep_;               // kMaxSplitMulti
+    bool dep_on_ = false;                            // STRATA_POOL_DEP, read once in the constructor
+    int dep_nb_ = 0, dep_k_gu_ = 1, dep_k_dn_ = 1;   // the current batch: experts, gate/up tasks per expert, down tasks per expert
+    void dep_task(int i);
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
