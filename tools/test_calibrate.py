@@ -144,8 +144,9 @@ class Calibrate(unittest.TestCase):
         res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6)
         self.assertEqual(res["settings"].get("--pool-workers"), "3")
         # one start per worker count and per expert-tier candidate, plus the sweep
-        # (+2: the default worker count and the default tier are measured once more at the end of their series; +4: the final check)
-        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + len(CAL.ADAPT_CANDIDATES) + 2 + 4)
+        # (+2: the default worker count and the default tier are measured once more at the end of their series; the final check: two
+        # engines a round)
+        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + len(CAL.ADAPT_CANDIDATES) + 2 + 2 * CAL.FINAL_ROUNDS)
         self.assertEqual(CAL.arg_value(starts[0], "--spec-min-p"), "0.5")   # measured against the product default
 
     def test_a_failed_restart_keeps_the_measurements_1337(self):

@@ -531,14 +531,23 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     if decode_settings or env:
         by_final = {"default": [], "chosen": []}
         arms = (("default", apply(base_args, {}), {}), ("chosen", apply(base_args, decode_settings), env))
-        for rnd in range(2):
+        # the workload of the check: the short prompts of every step, and a prompt with a context behind it (about 3,000 tokens of the install's
+        # docs), because the third real run's check won +12% on three short prompts (24.9 / 24.8 against 22.2) while the same set tied on the
+        # standard questions and the 13.5K-token document (-4% on average over two alternated pairs); three rounds, not two, for the same reason
+        final_ids = list(ids_list)
+        if long_prompt is not None:
+            try:
+                final_ids.append(long_prompt(0, FINAL_LONG_TOKENS))
+            except Exception:  # noqa: BLE001 - a prompt source that cannot make one: the short prompts only
+                pass
+        for rnd in range(FINAL_ROUNDS):
             for name, a, ev in (arms if rnd % 2 == 0 else arms[::-1]):
                 say(f"  Final check: all the {name} settings together (restarts the engine) ...")
                 e = restart(lambda x, ev=ev: start_engine(x, dict(ev)) if ev else start_engine(x), a, f"the final check, {name}", say, report)
                 if e is None:
                     continue
                 try:
-                    sf = Session(e, ids_list)
+                    sf = Session(e, final_ids)
                     sf.warm_up(1)
                     by_final[name] += [sf.rate(max_new=TIER_MAX_NEW), sf.rate(max_new=TIER_MAX_NEW)]
                     say(f"    {name}: {statistics.median(by_final[name][-2:]):.1f} tok/s")
@@ -618,6 +627,8 @@ OPT_IN_SWITCHES = (("STRATA_POOL_DEP", "1", "the CPU pool's one-batch layer call
 # in use on this model (stand-ins and the mask are written by setup for the models they were built for): only the first two are
 # measured without being in the config's "env"
 FEATURES_WITHOUT_ENV = ("STRATA_LA_LEARN", "STRATA_ROUTE_TAIL_SKIP")
+FINAL_ROUNDS = 3                   # the final check's alternations (default / chosen, then chosen / default, ...), a restart each
+FINAL_LONG_TOKENS = 3000           # the context of the final check's long prompt
 SEED_PROMPTS = 6                   # answers of TIER_MAX_NEW tokens the learners train on in this run (two rounds over PROMPTS' texts)
 ENV_KEYS = (SH_STREAM,) + tuple(f[0] for f in FEATURES) + tuple(f[0] for f in OPT_IN_SWITCHES)
 
