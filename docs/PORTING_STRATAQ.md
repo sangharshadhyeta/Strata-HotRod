@@ -4,11 +4,34 @@ Status: plan, 21 Nov 2026. Nothing here is built yet. Source read: `qwertie/Stra
 `docs/MEMORY_MANAGER_PLAN.md`, `src/common/serve/paged_start.cpp`, the start of `paged_engine.cpp`. Not read yet:
 the rest of `paged_engine.cpp` (3,077 lines), his AMD docs, his panel code. Nothing of his was built or run.
 
+## Rules (decided 21 Nov)
+
+- **No foundation switch.** Upstream's layout and file names stay our foundation. His restructure (`src/common`, `src/models`, `src/base`, the paged
+  engine) exists only in his fork; upstream has none of it. Adopting it would break path-based porting of upstream changes and tie us to one person's
+  fork (1,951 commits behind upstream, last commit 14 Nov).
+- **Hand-port, copy nothing.** We read his design and write our own version on our tree. No code of his is copied, so his licence notice does not
+  enter our files. We name him in the README/docs for an idea once it ships (held until then).
+- **Not merging upstream either.** Upstream changes are hand-ported too; `tools/upstream_triage.py` sorts the backlog (4,729 commits since our base
+  on 21 Nov: 2,913 clean, 115 light, 1,318 heavy, 383 docs, by file overlap) and `docs/UPSTREAM_PORTS.md` is the ledger.
+- **No PRs to upstream** (they accept none). Anyone, including qwertie, may send PRs to us.
+- **Gate every port:** tokens identical, speed within noise, and the tuner, stand-ins, pool, peer tier and K/V streaming still on. A port that turns
+  one of them off does not go in (rule: integrate, don't replace).
+- **Issue #3 reply:** held, not posted.
+
+## His five reasons (issue #3) and where each lands
+
+| His reason | Our test / step |
+|---|---|
+| Two conversations allocate three full context windows (~10 GB at 200K from the start) | Step 2. Our code: `--batch N` carves N slot sessions of `session_bytes(max_context)` besides the main session (`generate.cpp` ~5868-5925). Measured live 21 Nov (result below) |
+| Start serving once the dense weights are loaded | Step 1 |
+| Three engines, repeated code | Step 4: shared interface as new files, adapters per model |
+| One low-RAM mode that scales | Step 5, with the single scheduler |
+| Live settings, each with a tooltip | Step 3: read-only view first, then editable |
+
 ## What we take, and what we keep
 
 His idea is one engine that owns memory and the decode loop, and a small adapter per model. We take that shape. We keep what we measured and built:
-the online tuner, calibration, stand-ins, route tail skip, the learned look-ahead, the CPU pool, the peer tier, K/V streaming. A port must not switch
-any of these off (rule: integrate, don't replace). If we copy his code we keep his MIT notice; if we take only an idea we name him in the docs.
+the online tuner, calibration, stand-ins, route tail skip, the learned look-ahead, the CPU pool, the peer tier, K/V streaming.
 
 ## Why the three branches are not a `git merge`
 
