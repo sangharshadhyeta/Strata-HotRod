@@ -499,6 +499,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
   endif()
+  # Inkling 2 REUSE check (docs/INKLING-PORT.md): the engine's GDN short-conv kernel (gdn_conv_step) runs Inkling's static short convs as it
+  # is, against the CPU oracle and the reference's seams (GPU + STRATA_INKLING2_GGUF / _ORACLE / _TOKENS; skipped without them)
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(inkling2_conv_parity src/kernels/inkling2_conv_parity.cpp)
+    target_include_directories(inkling2_conv_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(inkling2_conv_parity PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME inkling2_conv_parity COMMAND inkling2_conv_parity)
+  endif()
   # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
   # the capacity rule, selected ids bitwise
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
