@@ -103,7 +103,7 @@ public:
     /// Layer-major progress: called on the thread running run() after each layer's pass over every chunk, with the prompt
     /// position the run has reached in that layer's pass, pos0 + n * (layer + 1) / n_layers (host-side issue, not a GPU
     /// wait).  Empty (the default): nothing.  Not on_chunk's semantics (on_chunk still hands rows over at the tail).
-    static void set_on_layer_pass(std::function<void(int64_t)> fn);
+    static void set_on_layer_pass(std::function<void(int64_t, int64_t)> fn);   // (prompt position reached, the layer just passed)
     /// The per-prompt expert map choice's file (STRATA_PREFILL_LM_MAP_AUTO): lm-map.json's path (empty: in memory only) and the
     /// key its numbers are kept under (the model fingerprint, or the pack path).  generate sets it before the first prompt.
     static void set_lm_map_store(const std::string& path, const std::string& key);

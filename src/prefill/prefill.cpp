@@ -2326,9 +2326,9 @@ void Prefill::set_ram_margin_bytes(uint64_t bytes) { g_ram_margin.store(bytes); 
 uint64_t Prefill::ram_margin_bytes() { return g_ram_margin.load(); }
 // the RAM tier's give-back and the layer-major pass hook: set by generate.cpp on the serve thread, read on that thread
 static std::function<uint64_t(uint64_t)> g_ram_give_back;
-static std::function<void(int64_t)> g_on_layer_pass;
+static std::function<void(int64_t, int64_t)> g_on_layer_pass;
 void Prefill::set_ram_give_back(std::function<uint64_t(uint64_t)> fn) { g_ram_give_back = std::move(fn); }
-void Prefill::set_on_layer_pass(std::function<void(int64_t)> fn) { g_on_layer_pass = std::move(fn); }
+void Prefill::set_on_layer_pass(std::function<void(int64_t, int64_t)> fn) { g_on_layer_pass = std::move(fn); }
 void Prefill::set_lm_map_store(const std::string& path, const std::string& key) {
     LmStore& st = lm_store();
     std::lock_guard<std::mutex> g(st.mu);
@@ -5898,7 +5898,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (!run_chunk(ci * C, PH_LAYER, l)) return false;
             }
             // the serve's progress moves with the passes (the chunks report only at the tail): the run has reached this far
-            if (g_on_layer_pass) g_on_layer_pass(pos0 + n * (l + 1) / g.n_layers);
+            if (g_on_layer_pass) g_on_layer_pass(pos0 + n * (l + 1) / g.n_layers, l);
             if (cudaEventRecord(lmh.ev, cs) != cudaSuccess) {
                 err = std::string("prefill: the layer-major layer event: ") + cudaGetErrorString(cudaGetLastError());
                 return false;

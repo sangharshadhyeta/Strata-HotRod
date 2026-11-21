@@ -10872,6 +10872,7 @@ int main(int argc, char** argv) {
         std::vector<float> usage2(swap2_max > 0 ? (size_t) (g.n_layers * g.n_expert) : 0, 0.0f);
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+        int64_t adapt_layer_limit = -1;   // >= 0: the round looks at the layers below it only (the prefill swap: the layers the read has passed)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size());   // what the unmasked router wanted (13.20)
@@ -10910,15 +10911,27 @@ int main(int argc, char** argv) {
             }
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
+            // The experts a prompt's loan has taken out of VRAM are marked missing (host_res < 0) until the refill puts them back into the SAME slots: they must never be swap CANDIDATES (the
+            // expert would sit in two slots once the refill ran).  Decode rounds are kept out of a loan by their callers (in_prompt_read); the round itself now holds the same line.
+            std::vector<char> lent_mask;
+            for (const PfPart& lp : pf_parts)
+                if (!lp.lent.empty()) {
+                    if (lent_mask.empty()) lent_mask.assign((size_t) (g.n_layers * g.n_expert), 0);
+                    for (const auto& li : lp.lent) lent_mask[(size_t) li.first] = 1;
+                }
             std::vector<std::pair<float, int32_t>> cand, vict;
-            for (int64_t l = 0; l < g.n_layers; ++l) {
+            for (int64_t l = 0; l < (adapt_layer_limit >= 0 ? std::min<int64_t>(adapt_layer_limit, g.n_layers) : g.n_layers); ++l) {
                 cand.clear();
                 vict.clear();
+                // THE BALANCE (STRATA_STANDIN_BALANCE): its keep factors (4 kept, 0.25 given up first, 1 as it was) scale the usage the round compares - candidates and victims alike - so the experts the
+                // learned stand-in errors say are costly to lose stay in VRAM and the cheap ones go first.  (They already did that in the RAM tier's eviction; the VRAM round had no factor.)  The
+                // thresholds stay on the raw usage.  No balance, or no decision yet: every factor is 1 and nothing changes.
+                const float* kbias = drive.d.keep_bias.size() == (size_t) (g.n_layers * g.n_expert) ? drive.d.keep_bias.data() + (size_t) l * (size_t) g.n_expert : nullptr;
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else if (swap_grace == 0 || swap_round - swapped_at[(size_t) (l * g.n_expert + e)] > swap_grace) vict.emplace_back(u[e], e);
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) && !(!lent_mask.empty() && lent_mask[(size_t) (l * g.n_expert + e)])) cand.emplace_back(u[e] * (kbias != nullptr ? kbias[e] : 1.0f), e); }
+                    else if (swap_grace == 0 || swap_round - swapped_at[(size_t) (l * g.n_expert + e)] > swap_grace) vict.emplace_back(u[e] * (kbias != nullptr ? kbias[e] : 1.0f), e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -10944,7 +10957,7 @@ int main(int argc, char** argv) {
                 for (const Swap& s : swaps) { taken[(size_t) (s.layer * g.n_expert + s.in)] = 1; taken[(size_t) (s.layer * g.n_expert + s.out)] = 1; }
                 std::vector<Swap> extra;
                 std::vector<std::pair<float, int32_t>> c2, v2;
-                for (int64_t l = 0; l < g.n_layers; ++l) {
+                for (int64_t l = 0; l < (adapt_layer_limit >= 0 ? std::min<int64_t>(adapt_layer_limit, g.n_layers) : g.n_layers); ++l) {
                     c2.clear();
                     v2.clear();
                     const float* u = drive.d.usage.data() + l * g.n_expert;
@@ -10952,7 +10965,7 @@ int main(int argc, char** argv) {
                     const int32_t* r = host_res.data() + l * g.n_expert;
                     for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                         if (taken[(size_t) (l * g.n_expert + e)]) continue;
-                        if (r[e] < 0) { if (u2[e] >= swap2_min && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) c2.emplace_back(u2[e], e); }
+                        if (r[e] < 0) { if (u2[e] >= swap2_min && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) && !(!lent_mask.empty() && lent_mask[(size_t) (l * g.n_expert + e)])) c2.emplace_back(u2[e], e); }
                         else if (u[e] < swap2_cold && (swap_grace == 0 || swap_round - swapped_at[(size_t) (l * g.n_expert + e)] > swap_grace)) v2.emplace_back(u[e], e);
                     }
                     if (c2.empty() || v2.empty()) continue;
@@ -14847,6 +14860,11 @@ int main(int argc, char** argv) {
             // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
+            // STRATA_PREFILL_SWAP=N (N rounds of the swap per layer the read passes; 0 = off): the swap pipeline, unchanged, runs at each layer boundary of a layer-major read, so the cache is
+            // already the new prompt's when decode starts (the prompt tail's hottest experts, RAM -> VRAM, into the coldest slots that are not lent).  Solo requests on one GPU only.
+            static const int prefill_swap_rounds = [] { const char* v = std::getenv("STRATA_PREFILL_SWAP"); return v != nullptr ? std::max(0, std::atoi(v)) : 0; }();
+            bool prefill_swap_seeded = false;   // the usage was seeded layer by layer during the read: the end-of-read seeding is skipped
+            int64_t prefill_swap_n = 0;          // swaps made during the read
             int64_t req_chunk = 0, req_chunk_len = 0;   // the DONE line's chunk=: the longest batched segment's first chunk
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // --prefill-pipe on a layer split: the segment's chunk is planned ONCE, on its whole length (or taken
@@ -14898,13 +14916,37 @@ int main(int argc, char** argv) {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
                     // a layer-major run reports each layer pass (its chunks report only at the run's tail): the same PP line
                     // as the chunk reports, so the server's prompt progress moves with the GPU
-                    strata::prefill::Prefill::set_on_layer_pass([&](int64_t done) {
+                    strata::prefill::Prefill::set_on_layer_pass([&](int64_t done, int64_t layer) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                         std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
                                     ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
                         strata::core::progress_at("reading the prompt (layer-major), done up to token", done);
                         strata::core::progress_beat();
                         std::fflush(stdout);
+                        // THE PREFILL SWAP: this layer's pass over every chunk is done and the read does not come back to it.  The prompt tail's counts of the layer (final now) seed its usage, as the end-of-read
+                        // seeding does for all layers, and the swap rounds run as they do in decode (adapt, apply_pending) over the layers passed so far.
+                        if (prefill_swap_rounds > 0 && !(o.batch > 0 && batch_on()) && stages.empty() && !multi_gpu && !peer.valid() && !remote_opt && !o.adapt_async &&
+                            !drive.d.usage.empty() && o.adapt_swaps > 0 && o.adapt_every > 0 && !all_experts_resident && layer >= 0 && layer < g.n_layers) {
+                            const std::vector<float>& tc = sp.tail_counts();
+                            const int64_t tt = sp.tail_tokens();
+                            const double dcy = 1.0 - (double) o.adapt_decay;
+                            if (tt > 0 && dcy > 1e-3 && tc.size() == drive.d.usage.size()) {
+                                cudaDeviceSynchronize();   // the layer's expert compute may still be running: no slot a swap overwrites is read after this
+                                apply_pending(true);
+                                const double sc = 3.3 / (double) tt / dcy;   // the steady-state rate, as the end-of-read seeding
+                                for (int64_t e = 0; e < g.n_expert; ++e)
+                                    drive.d.usage[(size_t) (layer * g.n_expert + e)] += (float) (tc[(size_t) (layer * g.n_expert + e)] * sc);
+                                prefill_swap_seeded = true;
+                                const int64_t before = adapt_nswaps;
+                                adapt_layer_limit = layer + 1;
+                                for (int r2 = 0; r2 < prefill_swap_rounds; ++r2) {
+                                    if (!adapt()) { std::fprintf(stderr, "strata serve: prefill swap: a round failed at layer %lld\n", (long long) layer); break; }
+                                    apply_pending(true);
+                                }
+                                adapt_layer_limit = -1;
+                                prefill_swap_n += adapt_nswaps - before;
+                            }
+                        }
                     });
                     // the per-prompt expert map choice's file, once: keyed by the model fingerprint (session_identity), else the pack
                     static bool lm_store_set = false;
@@ -15759,6 +15801,13 @@ int main(int argc, char** argv) {
                 ramp_left = 40; ramp_idx = 0;
                 for (int g = 0; g < 4; ++g) { ramp_n[g] = 0; ramp_ms[g] = ramp_wait[g] = ramp_pool[g] = ramp_adapt[g] = 0.0; ramp_rows[g] = 0; }
             }
+            if (prefill_swap_seeded)
+                std::fprintf(stderr, "strata serve: prefill swap: %lld experts swapped in during the read (%d rounds per layer, the prompt tail's counts seeded the usage layer by layer)\n",
+                             (long long) prefill_swap_n, prefill_swap_rounds);
+            else if (prefill_swap_rounds > 0)
+                std::fprintf(stderr, "strata serve: prefill swap: did not run (batch_on %d, stages %zu, multi_gpu %d, peer %d, remote %d, async %d, usage %zu, adapt_swaps %d, adapt_every %d, all_resident %d, tail tokens %lld, tail counts %zu)\n",
+                             (int) (o.batch > 0 && batch_on()), stages.size(), (int) multi_gpu, (int) peer.valid(), (int) (remote_opt != nullptr), (int) o.adapt_async,
+                             drive.d.usage.size(), o.adapt_swaps, o.adapt_every, (int) all_experts_resident, (long long) sp.tail_tokens(), sp.tail_counts().size());
             tail_refill_plan();   // (the last read's tail when it was not planned at the windows above)
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
@@ -15773,7 +15822,7 @@ int main(int argc, char** argv) {
                     if (p.sp == nullptr || p.sp->tail_tokens() <= 0 || p.sp->tail_counts().empty()) continue;
                     tail_toks = std::max(tail_toks, p.sp->tail_tokens());
                     const double decay = 1.0 - (double) o.adapt_decay;
-                    if (cancelled || decay <= 1e-3 || drive.d.usage.size() != (size_t) (g.n_layers * g.n_expert)) continue;
+                    if (cancelled || prefill_swap_seeded || decay <= 1e-3 || drive.d.usage.size() != (size_t) (g.n_layers * g.n_expert)) continue;
                     const std::vector<float>& tc = p.sp->tail_counts();
                     const double s = 3.3 / (double) p.sp->tail_tokens() / decay;
                     for (int64_t l = p.lb; l < p.le; ++l)
@@ -15782,6 +15831,16 @@ int main(int argc, char** argv) {
                             drive.d.usage[j] += (float) (tc[j] * s);
                         }
                     ++seed_parts;
+                }
+                if (tail_toks > 0 && drive.d.usage.size() == host_res.size()) {   // what is left for the swap after the end-of-read refill
+                    int64_t unmet = 0, cold = 0;
+                    double unmet_picks = 0.0;
+                    for (size_t i = 0; i < host_res.size(); ++i) {
+                        if (host_res[i] < 0 && drive.d.usage[i] >= 2.0f) { ++unmet; unmet_picks += drive.d.usage[i]; }
+                        else if (host_res[i] >= 0 && drive.d.usage[i] < 1.0f) ++cold;
+                    }
+                    std::fprintf(stderr, "strata serve: after the read: %lld non-resident experts have usage >= 2 (the swap's candidates, %.0f picks), %lld resident experts have usage < 1 (its victims)%s\n",
+                                 (long long) unmet, unmet_picks, (long long) cold, prefill_swap_seeded ? " [prefill swap ran]" : "");
                 }
                 if (tail_toks > 0)
                     std::fprintf(stderr, "strata serve: prompt tail: %lld tokens, %lld experts not in VRAM among its hottest; the refill "
