@@ -99,6 +99,19 @@ CUDA ones in `iq_kernels.cu`; the ue4m3 table there is the same convention). The
 | Attention residual over block states; the loop control gate and messages | - | small kernels (a softmax over <= 9 normed states; a rank-64 gate) |
 | Sampler, serve path, conversation cache, MTP plumbing | `sampler.cu`, the serve code in `src/program`, `core/conversation_*`, `core/mtp.hpp` | Inkling's chat template and tokenizer (the o200k-style `inkling2` pre-tokenizer) |
 
+**Reuse checked on the GPU, with the engine's own kernels (22 Nov):**
+
+- `gdn_conv_step` runs Inkling's static short convs unchanged: layer 0's k (1,024 ch), v (1,024) and post-attention (2,304) convs, token by token
+  with the sliding state, match the CPU oracle at 4.5e-8 / 7.2e-8 / 5.0e-8 and the reference seams at 9.0e-8 / 7.2e-8 / 1.0e-7
+  (`src/kernels/inkling2_conv_parity.cpp`).
+- `iq_mmvq(40, ...)`, the NVFP4 kernel of Edge0, runs Inkling's NVFP4 experts unchanged (same block layout, same row sizes as the reader):
+  a real expert of layer 0 for four tokens, gate / up rows through the kernel, the per-expert scale applied, the SITU activation on the host (the
+  one new op), the down rows through the kernel again. Against the CPU oracle's exact-dequant double dots: gate and up within 0.5% of the
+  vector's maximum, h within 0.7%, **the expert's output within 1.1-1.5%**. That is the q8_1 activation quantization every expert on this engine
+  goes through (it is the same path Qwen uses), not float rounding. It is a per-expert figure; what it does to the answer must be
+  measured end to end (log-prob drift and read answers) once the GPU forward exists, not assumed (`src/kernels/inkling2_nvfp4_parity.cpp`).
+- Dense Q8_0 (`native_mmvq`), the KV streaming and the router adaptation are next on the list.
+
 So the GPU engine is: the existing tiers + KV streaming + Q8_0 dense + the conv kernel + NVFP4 / Q8_0 expert kernels (parameterized) +
 five small new kernels (dynamic conv taps, the biased / sinked / windowed attention, the sigmoid router, the attention residual with the
 loop gate, the SITU activation) - each checked against `ops_cpu` and the oracle before it is wired in.

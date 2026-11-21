@@ -506,6 +506,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(inkling2_conv_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(inkling2_conv_parity PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME inkling2_conv_parity COMMAND inkling2_conv_parity)
+    # the engine's NVFP4 expert kernel (iq_mmvq type 40, Edge0's) on Inkling's NVFP4 experts, with the per-expert scales and the SITU activation
+    add_executable(inkling2_nvfp4_parity src/kernels/inkling2_nvfp4_parity.cpp)
+    target_include_directories(inkling2_nvfp4_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(inkling2_nvfp4_parity PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME inkling2_nvfp4_parity COMMAND inkling2_nvfp4_parity)
   endif()
   # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
   # the capacity rule, selected ids bitwise

@@ -313,7 +313,7 @@ inline Mat moe(const GgufFile& g, const Config& c, const LayerTensors& L, const 
     return out;
 }
 
-struct VisitSeams { AttnSeams attn; Mat attn_out, ffn_out, out, loop_q_in, loop_ffn_in; std::vector<int> picks; };
+struct VisitSeams { AttnSeams attn; Mat attn_out, ffn_out, out, loop_q_in, loop_ffn_in, moe_in; std::vector<int> picks; };   // moe_in: the MoE's normed input
 
 /// A core layer's loop control on its input x [T][E] with the pass-before's message `msg`: module 0 attn (q's), 1 k, 2 v, 3 mlp.
 ///   g = [rms(x); rms(msg)] @ down^T (rank 64);  x' = (1 - tanh(g forget^T)) x + tanh(g gain^T) msg     (weightless norms, eps 1e-6)
@@ -389,6 +389,7 @@ inline Mat layer_visit(const GgufFile& g, const Config& c, const Layout& lay, in
     Mat m_in = attn_res(st, T, E, fq.data(), 1)[0];
     if (msgs != nullptr) { m_in = control(g, L, 3, m_in, msgs[3], T, E); vs.loop_ffn_in = m_in; }
     { const Mat w = vec(g, *L.ffn_norm); rms(m_in.data(), T, E, w.data(), c.rms_eps); }
+    vs.moe_in = m_in;
     MoeSeams ms;
     Mat m = moe(g, c, L, m_in, T, &ms);
     vs.picks = ms.picks;
