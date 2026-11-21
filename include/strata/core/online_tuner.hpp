@@ -18,6 +18,14 @@
 // settings interact, and this is the check that the sum of the adopted choices is no worse than doing nothing; when it is, every knob goes back to
 // its default and stays there for burn_windows.
 //
+// TWO MEASURES, NO WEIGHTS (added 21 Nov).  Decode is scored in ms per accepted token; a prompt read is scored in ms per prompt token (prefill()),
+// per block, and a block that read no prompt has no prefill score.  A candidate is adopted only when it WINS on at least one measure (the rule
+// above) and is NOT WORSE on any measure that was measured: its mean change must stay above -tol with a one-sided 1% lower confidence bound.  A
+// candidate that trades one measure for the other is rejected: both win or neither loses, never a weighted sum.  A knob flagged touches_prefill
+// needs paired prefill scores (min_pf_pairs of them) before it can be adopted, and the test is extended, up to max_pairs_pf, until it has them;
+// without the evidence it is rejected.  Other knobs get the prefill check for free whenever the pairs exist.  With no prefill() calls the tuner
+// behaves exactly as before.
+//
 // What is learned is saved (save / load) and applied at the next start, which then begins settled and only re-checks.  The calibration run is the same
 // tuner driven in a burst (a smaller block, no waiting), so what a calibration writes and what live use writes are one file.
 //
@@ -44,6 +52,7 @@ struct TunerKnob {
     int tried = 0;                ///< bit 0: a step up was rejected since the last move, bit 1: a step down
     int prefer = 0;               ///< +1 / -1: the direction of the last adoption (tried first), 0 none
     int64_t burn_until = 0;       ///< window count before which this knob is not tested again (after a guard reset)
+    bool touches_prefill = false; ///< a candidate of this knob needs paired prefill scores before it can be adopted
 };
 
 struct TunerConfig {
@@ -55,6 +64,10 @@ struct TunerConfig {
     int64_t settled_gap = 20000;  ///< windows between two tests once settled
     int64_t burn_windows = 100000;///< a guard reset keeps the knobs at their defaults this long
     int warmup = 64;              ///< windows ignored at the start (the first windows after a start are not the steady state)
+    double tol = 0.03;            ///< a candidate may not be worse than this on any measured measure (lower 1% confidence bound of the mean change)
+    int min_pf_pairs = 3;         ///< paired prefill scores a touches_prefill candidate needs
+    int max_pairs_pf = 24;        ///< pairs a test may be extended to while it waits for prefill scores (prompts arrive when they arrive)
+    int pf_min_tokens = 256;      ///< a block's prompt tokens below this give no prefill score (too short to measure)
 };
 
 class OnlineTuner {
@@ -62,9 +75,10 @@ public:
     explicit OnlineTuner(TunerConfig c = TunerConfig()) : c_(c) {}
 
     /// Registers a knob (before the first window).  Returns its index.
-    int add_knob(const std::string& name, std::vector<double> levels, int def, bool on = true) {
+    int add_knob(const std::string& name, std::vector<double> levels, int def, bool on = true, bool touches_prefill = false) {
         TunerKnob k;
         k.name = name;
+        k.touches_prefill = touches_prefill;
         k.levels = std::move(levels);
         k.def = std::clamp(def, 0, std::max(0, (int) k.levels.size() - 1));
         k.cur = k.def;
@@ -103,10 +117,21 @@ public:
         blk_tok_ += tokens;
         if (++blk_n_ < c_.block) return;
         const double score = blk_ms_ / (double) blk_tok_;
+        const double pf = pf_tok_ >= c_.pf_min_tokens ? pf_ms_ / (double) pf_tok_ : std::nan("");
         blk_ms_ = 0.0;
         blk_tok_ = 0;
         blk_n_ = 0;
-        on_block(score);
+        pf_ms_ = 0.0;
+        pf_tok_ = 0;
+        on_block(score, pf);
+    }
+
+    /// One finished prompt read: its time and the prompt tokens it read (the whole request's read, not a chunk).  It counts for the block in progress,
+    /// which is the one whose settings the read used (a read never spans a block end: blocks end on decode windows).
+    void prefill(double ms, int tokens) {
+        if (knobs_.empty() || !(ms > 0.0) || tokens <= 0 || total_ <= c_.warmup) return;
+        pf_ms_ += ms;
+        pf_tok_ += tokens;
     }
 
     /// Messages for the log (adoptions, rejections of note, guard resets); the caller prints and clears them.
@@ -167,6 +192,7 @@ private:
         bool in_b = false;                 // the block being measured is a B block
         int n_pairs = 0;                   // B blocks this test will have (grows when inconclusive)
         std::vector<double> a, b;          // block scores, in order
+        std::vector<double> a_pf, b_pf;    // the same blocks' prefill scores (NaN: the block read no prompt)
     };
 
     static double t_crit(int df) {         // one-sided 1%
@@ -240,8 +266,12 @@ private:
             cycle_adopted_ = true;
             settled_ = false;
             char buf[200];
-            std::snprintf(buf, sizeof buf, "online tuner: %s %g -> %g (%+.1f%% over %d pairs)", k.name.c_str(), was, k.levels[(size_t) k.cur],
-                          last_gain_ * 100.0, last_pairs_);
+            if (std::isnan(last_pf_gain_))
+                std::snprintf(buf, sizeof buf, "online tuner: %s %g -> %g (%+.1f%% decode over %d pairs)", k.name.c_str(), was, k.levels[(size_t) k.cur],
+                              last_gain_ * 100.0, last_pairs_);
+            else
+                std::snprintf(buf, sizeof buf, "online tuner: %s %g -> %g (%+.1f%% decode, %+.1f%% prefill over %d pairs)", k.name.c_str(), was,
+                              k.levels[(size_t) k.cur], last_gain_ * 100.0, last_pf_gain_ * 100.0, last_pairs_);
             note(buf);
         } else {
             k.tried |= t.dir > 0 ? 1 : 2;
@@ -249,7 +279,36 @@ private:
     }
 
     // a block of the test (or, when nothing is running, the idle bookkeeping) just finished
-    void on_block(double score) {
+    // a paired comparison of one measure: the relative gain of each B block against the mean of the A blocks around it (NaN scores skipped)
+    struct Cmp { int n = 0; double mean = 0.0, t = 0.0, se = 0.0; int slower = 0; };
+    Cmp compare(const std::vector<double>& a, const std::vector<double>& b, int pairs) const {
+        std::vector<double> g;
+        for (int i = 0; i < pairs && (size_t) i < b.size(); ++i) {
+            const double r0 = a.size() > (size_t) i ? a[(size_t) i] : std::nan("");
+            const double r1 = a.size() > (size_t) i + 1 ? a[(size_t) i + 1] : std::nan("");
+            const bool h0 = !std::isnan(r0), h1 = !std::isnan(r1);
+            if (std::isnan(b[(size_t) i]) || (!h0 && !h1)) continue;
+            const double ref = h0 && h1 ? 0.5 * (r0 + r1) : (h0 ? r0 : r1);
+            g.push_back(ref > 0.0 ? (ref - b[(size_t) i]) / ref : 0.0);
+        }
+        Cmp c;
+        c.n = (int) g.size();
+        if (c.n == 0) return c;
+        for (double x : g) c.mean += x;
+        c.mean /= (double) c.n;
+        double var = 0.0;
+        for (double x : g) var += (x - c.mean) * (x - c.mean);
+        var /= (double) std::max(1, c.n - 1);
+        c.se = std::sqrt(var / (double) c.n);
+        c.t = c.se > 0.0 ? c.mean / c.se : (c.mean > 0.0 ? 1e9 : 0.0);
+        for (double x : g) c.slower += x <= 0.0;
+        return c;
+    }
+    bool wins(const Cmp& c) const { return c.n >= 2 && c.mean > c_.min_gain && c.t > t_crit(c.n - 1) && c.slower <= c.n / 6; }
+    // not worse than the margin: the one-sided 1% lower bound of the mean change stays above -tol
+    bool not_worse(const Cmp& c) const { return c.n >= 2 && c.mean - t_crit(c.n - 1) * c.se > -c_.tol; }
+
+    void on_block(double score, double pf = std::nan("")) {
         if (!test_.active) {
             // idle: decide whether to start a test
             if (settled_ && !burst_ && total_ < next_test_at_) return;
@@ -270,39 +329,42 @@ private:
         }
         // a test is running: this block belongs to A (even position) or B (odd)
         (test_.in_b ? test_.b : test_.a).push_back(score);
+        (test_.in_b ? test_.b_pf : test_.a_pf).push_back(pf);
         const bool was_b = test_.in_b;
         test_.in_b = !test_.in_b;
         if (was_b) {
             const size_t i = test_.b.size() - 1;
             const double ref = test_.a.size() > i ? test_.a[i] : test_.a.back();
             if (ref > 0.0 && score > ref * (1.0 + c_.abort_loss)) { finish_test(false); return; }   // a bad candidate costs one block
+            const double pref = test_.a_pf.size() > i ? test_.a_pf[i] : std::nan("");
+            if (!std::isnan(pf) && !std::isnan(pref) && pref > 0.0 && pf > pref * (1.0 + c_.abort_loss)) { finish_test(false); return; }   // ... on either measure
             return;
         }
         // an A block finished: the test can be judged once every B block has both of its neighbours
         if ((int) test_.a.size() < test_.n_pairs + 1) return;
-        std::vector<double> g;
-        for (int i = 0; i < test_.n_pairs; ++i) {
-            const double ref = 0.5 * (test_.a[(size_t) i] + test_.a[(size_t) i + 1]);
-            g.push_back(ref > 0.0 ? (ref - test_.b[(size_t) i]) / ref : 0.0);
+        const Cmp dec = compare(test_.a, test_.b, test_.n_pairs);
+        const Cmp pfc = compare(test_.a_pf, test_.b_pf, test_.n_pairs);
+        const bool pf_known = pfc.n >= c_.min_pf_pairs;
+        last_gain_ = dec.mean;
+        last_pf_gain_ = pf_known ? pfc.mean : std::nan("");
+        last_pairs_ = dec.n;
+        const bool needs_pf = test_.guard ? true : (test_.knob >= 0 && knobs_[(size_t) test_.knob].touches_prefill);
+        // a candidate that must be shown not to cost prefill waits for the prompts: the test is extended while they are missing
+        if (needs_pf && !test_.guard && !pf_known) {
+            if (test_.n_pairs < c_.max_pairs_pf) { ++test_.n_pairs; return; }
+            finish_test(false);          // no prompt arrived in time: no evidence that it is free, so it is not adopted
+            return;
         }
-        double mean = 0.0;
-        for (double x : g) mean += x;
-        mean /= (double) g.size();
-        double var = 0.0;
-        for (double x : g) var += (x - mean) * (x - mean);
-        var /= (double) std::max<size_t>(1, g.size() - 1);
-        const double se = std::sqrt(var / (double) g.size());
-        const double t = se > 0.0 ? mean / se : (mean > 0.0 ? 1e9 : 0.0);
-        last_gain_ = mean;
-        last_pairs_ = (int) g.size();
-        // adoption: the mean gain beats min_gain, the paired t-test passes, AND the candidate was faster in (nearly) every pair - at most one
-        // pair in six may be slower.  Extending an inconclusive test inflates the error rate of the t-test alone; the sign rule keeps the
-        // false adoptions of a flat knob rare (found on the simulated engines: 4 in 20 runs of 30000 windows with the t-test alone).
-        int slower = 0;
-        for (double x : g) slower += x <= 0.0;
-        const bool win = mean > c_.min_gain && t > t_crit((int) g.size() - 1) && slower <= (int) g.size() / 6;
-        if (win) { finish_test(true); return; }
-        if (mean > c_.min_gain * 0.5 && test_.n_pairs < c_.max_pairs) { ++test_.n_pairs; return; }   // inconclusive: more pairs
+        // adoption: it WINS on at least one measure (the decode rule is the one that has always applied: gain, t-test, and at most one pair in six
+        // slower) and does not LOSE on the other.  A win on decode is vetoed by a prefill loss (prefill needs min_pf_pairs pairs to count: fewer =
+        // not measured, no veto), and a win on prefill is vetoed by a decode loss.  A decode-only test is judged exactly as before.
+        const bool win_dec = wins(dec), win_pf = pf_known && wins(pfc);
+        const bool pf_worse = pf_known && !not_worse(pfc);
+        const bool dec_worse = dec.n >= 2 && !not_worse(dec);
+        if ((win_dec && !pf_worse) || (win_pf && !dec_worse)) { finish_test(true); return; }
+        if (pf_known && pfc.mean < -c_.tol) { finish_test(false); return; }          // a clear prefill loss ends the test
+        // inconclusive: a test that is promising on either measure gets more pairs (as before, for decode)
+        if ((dec.mean > c_.min_gain * 0.5 || (pf_known && pfc.mean > c_.min_gain * 0.5)) && test_.n_pairs < c_.max_pairs) { ++test_.n_pairs; return; }
         finish_test(false);
     }
 
@@ -311,13 +373,15 @@ private:
     Test test_;
     std::vector<std::string> events_;
     double blk_ms_ = 0.0;
+    double pf_ms_ = 0.0;
+    int64_t pf_tok_ = 0;
     int64_t blk_tok_ = 0;
     int blk_n_ = 0;
     int64_t total_ = 0, tests_ = 0, adoptions_ = 0, resets_ = 0;
     int64_t next_test_at_ = 0;
     int cursor_ = 0, walked_ = 0;
     bool settled_ = false, burst_ = false, cycle_adopted_ = false, guard_pending_ = false;
-    double last_gain_ = 0.0;
+    double last_gain_ = 0.0, last_pf_gain_ = std::nan("");
     int last_pairs_ = 0;
 };
 
