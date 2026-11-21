@@ -77,6 +77,32 @@ the same visit. A pass-2 or pass-3 pick is already in the same token's pass-1 se
 feature for the looped core is the token's own previous pass, ahead of anything it uses on Qwen. Layer 17, the core's last, is the exception
 (2.9 / 1.9). Over the 48 tokens a core layer touches 58 distinct experts in pass 1 and 77 across the three passes (of 128).
 
+## Reuse audit - what the engine already has (read from the tree, 22 Nov; the rule is: build only what is not here)
+
+What was written so far is **test-only**: `inkling2.hpp` (the file reader, new: no `inkling2` existed), `ops_cpu.hpp` (a plain-float CPU
+forward used as an oracle for the GPU path; it replaces nothing and ships in no engine path) and the tests. One small duplication, on
+purpose and flagged: `ops_cpu.hpp` has its own scalar NVFP4 decode, written independently from gguf-py so the test does not trust the code
+it is meant to check; the engine already has the real ones (`src/kernels/cpu/nvfp4_avx2.cpp`, `nvfp4_avx512.cpp`, `native_expert.cpp`, the
+CUDA ones in `iq_kernels.cu`; the ue4m3 table there is the same convention). The engine path uses those.
+
+| Inkling op | Already in the engine | New |
+| --- | --- | --- |
+| Static short convs (k, v, post-attention, post-MoE; the sliding layers' k / v): 4 taps, 3-row state | `gdn_conv_kernel` / `gdn_conv_step` (`src/kernels/cuda/gdn.cu`): `out[c] = sum state[i] w[i] + x w[last]`, weights `[C][taps]`, the state slides; our folded conv weights are that layout | the one-time folding of the conv scale and residual into the weights (done in `ops_cpu`, to move to load time) |
+| Full layers' dynamic conv taps | - | a small kernel: static taps + per-token `dyn[t][head*4 + lag]` |
+| Dense projections (Q8_0 / BF16): q, k, v, gate, rel, sink, output, the head, the embedding | `native_mmvq.cu` (Q8_0, arbitrary n_in / n_out, packed and rows1 variants); the prompt GEMMs | BF16 for the small sink / conv-proj tensors if not covered |
+| RMSNorm (weighted, weightless), L2 clip | `elementwise.cu` norm kernels | the L2 clip with a per-channel scale |
+| KV cache, **KV streaming** (K/V in pinned RAM, page pool, q8 / q4 KV) | `kv_stream.cu`, `kv_q8.cu`, `kv_q4.cu`: parameterised by `n_head_kv`, `head_dim`, `page_size`, not by Qwen's values | Inkling's 8 full layers use it as is (8 KV heads, head_dim 128); the 40 sliding layers need a 1,024-position ring |
+| Attention | `native_flash_attn.cu` is pinned to scale 1/16, "no ALiBi / softcap / sink"; `qsa_*` is Qwen's sparse indexer | the kernel: relative bias (16 per-head states by distance), a sink logit, sliding window, sigmoid output gate, head_dim 128 |
+| Router | `native_router.cu`: a pinned contract of 512 experts, top-10, **softmax** | sigmoid + selection bias, top-8 of 128, normalized x8 (adapt the kernel's structure) |
+| Expert compute | NVFP4 and Q8_0 expert kernels (CPU and CUDA), the grouped kernels, the per-hit scratch | `s2_expert_grouped.cu` is compiled for Qwen's `H=2560, FF=640` and 2-bit rows (a `static_assert` against `kCompiledGeometry`): the Inkling shapes (2304 / 1152, NVFP4 / Q8_0) need a parameterization pass; the SITU activation (softcaps 4 / 25) and the per-expert F32 scale are new |
+| Tiers: VRAM cache, RAM tier, O_DIRECT NVMe tier, pinned segments, ring, swaps, learners, stand-ins | `core/expert_source.hpp` and friends, as above | keyed by (stored layer, expert); the loop-aware prefetch |
+| Attention residual over block states; the loop control gate and messages | - | small kernels (a softmax over <= 9 normed states; a rank-64 gate) |
+| Sampler, serve path, conversation cache, MTP plumbing | `sampler.cu`, the serve code in `src/program`, `core/conversation_*`, `core/mtp.hpp` | Inkling's chat template and tokenizer (the o200k-style `inkling2` pre-tokenizer) |
+
+So the GPU engine is: the existing tiers + KV streaming + Q8_0 dense + the conv kernel + NVFP4 / Q8_0 expert kernels (parameterized) +
+five small new kernels (dynamic conv taps, the biased / sinked / windowed attention, the sigmoid router, the attention residual with the
+loop gate, the SITU activation) - each checked against `ops_cpu` and the oracle before it is wired in.
+
 ## Rules for this port
 
 - The Qwen path, its layer-major prompt walk and its prefill speeds are not touched. Measured before any shared file changes:
