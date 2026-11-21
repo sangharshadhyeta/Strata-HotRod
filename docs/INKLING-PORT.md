@@ -327,3 +327,12 @@ The slot cache already removed the PCIe wait: misses cost ~3 ms of 42.7. The tok
 where the bytes (~36 MB from VRAM at ~360 GB/s) need ~0.1, the rest launches, the per-visit sync and kernel latency, plus head, tail). A perfect prefetch can save at most ~3 ms (7%).
 Prefetch pays when the engine is transfer-bound: (a) after the compute side is cut to ~20 ms (then the ~16 ms of PCIe a token at a 34% cache is no longer hidden by it), (b) on a
 smaller card or a bigger model (Inkling-2-Small, class C), where NVMe / PCIe is the wall - that is where our learned look-ahead and the loop feature are for. Order: cut the 39 ms first.
+
+## L3b: where the 39 ms goes (nsys, 22 Nov) and the stream fix
+
+Per token (144 tokens profiled, 2,030 launches a token): GPU kernel time ~27 ms of 40-43 wall. `k_gate_up` 7.9 ms (165 us x 48, ~145 GB/s of ~360), `k_down` 4.7, dense Q8_0
+`mmvq` 6.1 (289 launches; the 200K-row head is 1.4 ms of it), `k_matmul` (router, dyn-conv projections) 3.4, `attn_res` 1.6, the norms 0.85, the rest small.
+**Found: ~371 `cudaDeviceSynchronize` a token.** The legacy kernel wrappers (`rms_norm_weighted`, `gdn_conv_step`, the elementwise ops: `sync_if_needed`, `gdn.cu`) synchronize the whole device
+after every launch when given `stream == nullptr`, and the engine passed nullptr everywhere. The engine now runs on one explicit stream (any engine that passes nullptr to these wrappers
+pays the same). Cold 48 tokens, engine alone: 42.7 -> 41.1 ms (23.4 -> 24.3 tok/s); with look-ahead prefetch N=8: 38.5 ms (26.0 tok/s, +6.5%): prefetch starts to pay as the compute shrinks.
+KL unchanged (0.0046). Next: the expert kernels' memory-level parallelism (12.6 ms at ~40% of VRAM bandwidth), the per-visit host gap, fusion of the small launches.
