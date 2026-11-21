@@ -216,6 +216,28 @@ traffic falls to 0.77 GB but the experts phase only halves: the resident experts
 62% head start on passes 2 and 3), the attention side 14.6 -> ~7 ms from fusion; with ~4 ms of round trips, tail and head that is ~31 ms a token = Maya's ~32 tok/s, and our own features
 (look-ahead, the stand-ins) are what can go beyond it. Order: grouped expert kernels, then F3's cache with the copy stream, then the fusion; each measured against `gpu_forward_test` and the oracle.
 
+## Purpose and method: the speed ledger (stated by the owner, 22 Nov)
+
+The point of porting Inkling is **not the port**. It is to find the speed our engine loses on capable systems, where the model fits RAM + VRAM and the SSD should never be touched (the NoPlaceLikeLocalhost video:
+HotRod 18 -> 36 tok/s on a starved 12 GB card, but 103 -> 87 on a roomy 24 GB one). Inkling-Mini is the lab: class B on the 3060 box, and class A on a 24 GB card, with an outside engine (Maya's `maya-ik2`: 32 tok/s here, 112-125 on a
+3090) as the ceiling to measure ourselves against. So every stage is a measurement, recorded here as a ledger, and each finding is mapped back to the Qwen, Edge0 and DeepSeek engines.
+
+**The ladder**, one step at a time, each measured on the same prompts and checked against the oracle (tok/s and KL):
+
+1. **L0** the F2 engine: 9.3 tok/s (experts 88 ms of 106.5: all 1.85 GB a token over PCIe).
+2. **L1** + grouped expert launches (one launch for a group's gate + up + SITU, one for down + combine).
+3. **L2** + the VRAM slot cache over the RAM arena, misses copied on a second stream while the hits compute. This is the class-B baseline and should land near Maya's 32 tok/s.
+4. **L3** + launch fusion and a CUDA graph for the dense stretch between routing syncs.
+5. Then **our features, added ONE at a time on top of L3**, each with its tok/s delta and KL delta: pinned segments, the engine's own look-ahead, the loop-aware prefetch, the exchange / adaptive swaps, the tuner,
+   the stand-ins, KV ring / q8. **A feature that costs speed when the model fits is recorded as such** (the verdict column) - that is the loss the video showed, found where the SSD cannot hide it.
+6. Same ladder on a 24 GB card (class A: everything resident, Maya's graph path as the ceiling) when one is available; the 2x / 4x batching-scale test on class B.
+
+| step | tok/s | KL vs oracle | what it showed |
+| --- | --- | --- | --- |
+| L0 F2 | 9.3 | 5.0e-3 | experts 82% of a token, PCIe-bound; attention side 14.6 ms, router round trip 1.4 |
+| L0 + 14 layers' experts in VRAM | 15.7 | 5.0e-3 | experts 88 -> 43.8 ms, not 88 -> 37: the resident and zero-copy kernels serialize on one stream, ~2,300 launches a token |
+| Maya (reference) | ~32 | 6-7e-3 (its own, Mini) | cache + copy stream + grouped kernels + fused launches; no stand-ins, no SSD |
+
 ## Rules for this port
 
 - The Qwen path, its layer-major prompt walk and its prefill speeds are not touched. Measured before any shared file changes:
