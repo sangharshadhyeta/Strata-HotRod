@@ -310,6 +310,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(model_family_test tests/core/model_family_test.cpp)
   target_link_libraries(model_family_test PRIVATE strata_artifact)
   add_test(NAME model_family_test COMMAND model_family_test)
+  # the inkling2 GGUF (Inkling 2, docs/INKLING-PORT.md M1): the configuration from metadata and its refusals (synthetic), and every
+  # tensor of a real file when STRATA_INKLING2_GGUF names one
+  add_executable(inkling2_gguf_test tests/core/inkling2_gguf_test.cpp)
+  target_link_libraries(inkling2_gguf_test PRIVATE strata_artifact)
+  add_test(NAME inkling2_gguf_test COMMAND inkling2_gguf_test)
   # how --batch cuts a prompt read into pieces (a layer split with no slot decoding must still reach a BYIELD)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)
