@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -73,6 +74,19 @@ struct Engine::Impl {
     void *xq = nullptr, *hq = nullptr, *aq = nullptr;
     std::vector<std::vector<int>> picks;
     int pos_cur = -1;
+    // STRATA_INKLING2_PROFILE=1: wall time per phase of a token, a device sync between phases (so it shows where the time goes, and costs some): A = the visit's
+    // attention side (inputs, projections, convs, attention, attn_out, the stream), B = the router and its host round trip, C = the experts, D = the tail (conv, add); H = the head
+    bool prof = false;
+    double ph[6] = {0, 0, 0, 0, 0, 0};
+    long n_steps = 0;
+    std::chrono::steady_clock::time_point tp;
+    void lap(int phase) {
+        if (!prof) return;
+        CK(cudaDeviceSynchronize());
+        const auto n = std::chrono::steady_clock::now();
+        if (phase >= 0) ph[phase] += std::chrono::duration<double>(n - tp).count();
+        tp = n;
+    }
 
     Impl(const GgufFile& gg, const Config& cc, const Layout& ll, int max_ctx) : g(gg), c(cc), lay(ll), cap(max_ctx) { init(); }
     ~Impl() { for (void* p : allocs) cudaFree(p); for (void* p : pinned) cudaFreeHost(p); }
@@ -96,7 +110,8 @@ struct Engine::Impl {
     /// An expert tensor read into pinned, mapped host memory (zero-copy over PCIe for the kernels): the same idea as the RAM tier's arena (F3 replaces this by
     /// the ExpertStore).  Read with pread from the GGUF in chunks.
     std::vector<void*> pinned;
-    const uint8_t* load_pinned(const TensorInfo& t) {
+    int vram_layers = 0;   // STRATA_INKLING2_VRAM_LAYERS=N: the experts of stored layers 0..N-1 live in VRAM (a measurement of how much of the speed is PCIe); F3 replaces it by the slot cache
+    const uint8_t* load_pinned(const TensorInfo& t, bool to_vram = false) {
         const uint64_t n = tensor_payload_bytes(t), off0 = g.data_start() + t.offset;
         void* host = nullptr;
         CK(cudaHostAlloc(&host, n, cudaHostAllocMapped | cudaHostAllocPortable));
@@ -109,6 +124,14 @@ struct Engine::Impl {
             done += (uint64_t) r;
         }
         ::close(fd);
+        if (to_vram) {   // copied to VRAM, the pinned copy given back
+            void* d = dmalloc(n);
+            CK(cudaMemcpy(d, host, n, cudaMemcpyHostToDevice));
+            pinned.pop_back();
+            CK(cudaFreeHost(host));
+            expert_b += n;
+            return (const uint8_t*) d;
+        }
         void* dp = nullptr;
         CK(cudaHostGetDevicePointer(&dp, host, 0));
         expert_b += n;
@@ -118,6 +141,8 @@ struct Engine::Impl {
     void init() {
         const int64_t E = c.n_embd, H = c.n_head, KV = c.n_head_kv, D = c.head_dim, R = c.rel_states, taps = c.conv_taps, FF = c.n_ff_exp, NE = c.n_expert;
         lw.assign((size_t) c.n_stored, LW{});
+        if (const char* vl = std::getenv("STRATA_INKLING2_VRAM_LAYERS")) vram_layers = std::atoi(vl);
+        prof = std::getenv("STRATA_INKLING2_PROFILE") != nullptr;
         const float dsc = (float) (1.0 / std::sqrt((double) (2 * taps + 1)));
         d_embd = q8(*lay.token_embd, "token_embd");
         d_out = q8(*lay.output, "output");
@@ -155,8 +180,8 @@ struct Engine::Impl {
             w.gu_plane = (uint64_t) 2 * FF * rb_gu;
             w.dn_plane = (uint64_t) E * rb_dn;
             w.gate_bytes = (uint64_t) FF * rb_gu;
-            w.gu_dev = load_pinned(*L.gate_up_exps);
-            w.dn_dev = load_pinned(*L.down_exps);
+            w.gu_dev = load_pinned(*L.gate_up_exps, l < vram_layers);
+            w.dn_dev = load_pinned(*L.down_exps, l < vram_layers);
         }
         (void) NE;
         // per-visit state
@@ -213,6 +238,7 @@ struct Engine::Impl {
         const LayerTensors& L = lay.layers[(size_t) l];
         const LW& w = lw[(size_t) l];
         const bool boundary = l % c.attn_res_block == 0;
+        lap(-1);
         // the three inputs
         if (l == 0) { for (int j = 0; j < 3; ++j) copy(ins + j * E, h, (size_t) E); }
         else {
@@ -265,6 +291,7 @@ struct Engine::Impl {
         copy(x, m_in, (size_t) E);
         rms_w(x, w.ffn_norm);
         // the router and the experts
+        lap(0);
         ik::matmul_f32(w.router, x, rl, 1, (int) E, (int) c.n_expert, nullptr);
         K::inkling2_route(rl, w.router_bias, 1, (int) c.n_expert, (int) c.n_expert_used, c.expert_weight_scale, d_idx, d_w, nullptr);
         int32_t idx[16];
@@ -272,6 +299,7 @@ struct Engine::Impl {
         CK(cudaMemcpy(idx, d_idx, (size_t) c.n_expert_used * 4, cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(wt, d_w, (size_t) c.n_expert_used * 4, cudaMemcpyDeviceToHost));
         picks[(size_t) vis].assign(idx, idx + c.n_expert_used);
+        lap(1);
         CK(cudaMemset(moe, 0, (size_t) E * 4));
         K::quantize_q8_1_rows(x, 1, E, xq, nullptr);
         for (int64_t j = 0; j < c.n_expert_used; ++j) {
@@ -285,10 +313,12 @@ struct Engine::Impl {
             K::iq_mmvq(w.etype, w.dn_dev + (uint64_t) e * w.dn_plane, hq, db, (int) FF, (int) E, 1, nullptr);
             ik::axpy(moe, db, wt[j] * sd, (int) E, nullptr);
         }
+        lap(2);
         K::gdn_conv_step(fs[(size_t) vis], moe, w.ffnpost, mm, E, taps, nullptr);
         cap_seam(sink, vis, "ffn_out", mm, (int) E);
         ik::add(rr, mm, h, (int) E, nullptr);
         cap_seam(sink, vis, "out", h, (int) E);
+        lap(3);
         (void) L;
         return nbl;
     }
@@ -326,6 +356,7 @@ struct Engine::Impl {
             // a block boundary keeps its input in the block list (layer() wrote it at blk[nb_before]); the stream carried on in h
         }
         // the head: the output attention residual, the norm, the logits through the Q8_0 head, the softcap
+        lap(-1);
         copy(blk + (size_t) nb * E, h, (size_t) E);
         ik::attn_res(blk, nb + 1, d_out_res, 1, hd, (int) E, nullptr);
         rms_w(hd, d_out_norm);
@@ -333,6 +364,8 @@ struct Engine::Impl {
         ik::softcap(logits, (int) c.n_vocab_real, c.final_softcap, nullptr);
         if (out) { out->resize((size_t) c.n_vocab_real); CK(cudaMemcpy(out->data(), logits, (size_t) c.n_vocab_real * 4, cudaMemcpyDeviceToHost)); }
         CK(cudaDeviceSynchronize());
+        if (prof) { const auto n = std::chrono::steady_clock::now(); ph[4] += std::chrono::duration<double>(n - tp).count(); tp = n; }
+        ++n_steps;
         pos_cur = pos;
     }
 };
@@ -342,6 +375,14 @@ Engine::~Engine() = default;
 void Engine::step(int64_t token, int pos, std::vector<float>* logits, const SeamSink& sink) { p_->step(token, pos, logits, sink); }
 void Engine::reset() { p_->reset(); }
 const std::vector<std::vector<int>>& Engine::last_picks() const { return p_->picks; }
+std::string Engine::profile() const {
+    if (!p_->prof || p_->n_steps == 0) return {};
+    char b[400];
+    const double n = (double) p_->n_steps;
+    std::snprintf(b, sizeof b, "per token over %ld tokens (ms): attention side %.1f | router + host round trip %.1f | experts %.1f | tail %.1f | head %.1f | total %.1f", p_->n_steps, p_->ph[0] / n * 1e3,
+                  p_->ph[1] / n * 1e3, p_->ph[2] / n * 1e3, p_->ph[3] / n * 1e3, p_->ph[4] / n * 1e3, (p_->ph[0] + p_->ph[1] + p_->ph[2] + p_->ph[3] + p_->ph[4]) / n * 1e3);
+    return b;
+}
 uint64_t Engine::expert_bytes() const { return p_->expert_b; }
 uint64_t Engine::dense_bytes() const { return p_->dense_b; }
 

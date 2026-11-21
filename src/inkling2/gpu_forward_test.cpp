@@ -72,6 +72,7 @@ int main() {
     const double run_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     std::printf("%lld tokens teacher-forced in %.1f s (%.2f tok/s with every expert read zero-copy over PCIe, no cache, one launch a matvec)\n", (long long) T, run_s, (double) T / run_s);
     int fails = 0;
+    if (!eng.profile().empty()) std::printf("%s\n", eng.profile().c_str());
     std::printf("seams of visits 0 / 5 (full) / 18 (first loop message) / 23 (a full layer in pass 2), relative error against the reference (max |d| / max |ref|):\n");
     for (const auto& kv : seams_kept) {
         const size_t colon = kv.first.find(':');

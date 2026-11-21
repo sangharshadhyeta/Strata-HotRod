@@ -188,6 +188,34 @@ the floor of Q8_0 weights times int8 (q8_1) activations; the MoE output then sho
 exactly in the CPU oracle, which matches). So the GPU path's difference is int8 activation noise amplified by routing, the same envelope every expert on this engine has, not a kernel fault.
 The speed is the naive path's (no cache, 8 experts x 3 launches a layer visit, host sync for the picks): the starting point for F3 and the grouped kernels.
 
+## Maya's decode path traced (`maya-ik2`, `src/ik2/ik2_main.cu`, `forward`) against ours (22 Nov)
+
+Why Maya gives ~32 tok/s on this 12 GB card where F2 gave 9.3: Maya's author says a token costs its weight bytes plus its launches. Our F2 profile (`STRATA_INKLING2_PROFILE=1`, per token, a sync between
+phases) says where ours goes:
+
+| ms a token | attention side | router + host round trip | experts | tail | head | total |
+| --- | --- | --- | --- | --- | --- | --- |
+| F2, no cache | 14.6 | 1.4 | **88.0** | 1.0 | 1.6 | 106.5 (9.3 tok/s) |
+| F2, experts of layers 0-13 in VRAM (`STRATA_INKLING2_VRAM_LAYERS=14`, identical numerics) | 14.5 | 1.3 | **43.8** | 0.9 | 1.6 | 62.1 (15.7 tok/s) |
+
+The experts are 82% of a token: 1.85 GB of expert bytes a token (44 NVFP4 visits x ~36 MB + 4 Q8_0 visits x ~68 MB) read zero-copy at ~21 GB/s, the PCIe 4.0 x16 link's practical rate. With 14 layers resident the
+traffic falls to 0.77 GB but the experts phase only halves: the resident experts' kernels and the zero-copy ones run one after another on one stream, 8 experts x 6 launches a visit (~2,300 launches a token).
+
+| | Maya's path (read in the code) | ours now | to match (reuse first) |
+| --- | --- | --- | --- |
+| Embedding | the row decoded **on the host** from the mapped GGUF and copied: no 0.5 GB table in VRAM | Q8_0 table in VRAM (0.49 GB; the head's 0.49 GB too) | host embedding row: ~0.5 GB more for the expert cache (small, do first) |
+| Dense math | weights decoded to FP16 or planar Q8, FP16 activations; fused launches (`mv_q8p_conv`: the conv rides the product; q / k / v / gate one launch `MvAlt`; the three norms one; the sink rides the clips) | iq_mmvq with int8 activations, ~40 launches a visit | fuse; a CUDA graph for the stretch between routing syncs. Accuracy is already on par: Maya's own engine vs the float64 reference on Mini is 45-46 of 47 top-1, KL 6-7e-3; ours 45 of 48, 5.0e-3 |
+| Router | `gemm16` + `route`, the picks copied async to the host, **one stream sync a visit** (the routing round trip) | the same, two small syncs a visit (1.4 ms a token) | one sync |
+| Expert cache | a VRAM slot cache (`ExpertCache`, a tick for its policy); each pick looked up on the host: **hits** use their slot, **misses** copy into a slot on a **second stream** (`g_cs`) while the hits' kernels run (events order them) | none: every expert read over PCIe | **F3**: the VRAM slot tier extracted from the DeepSeek path (`ds4_model.cu`) behind the engine's one seam, with the copy stream and the overlap; our own look-ahead |
+| Misses | the CPU lane (`IK2_CPU`, NVFP4 AVX-512) computes a missing expert when sooner than its copy (0.5 ms against 0.36 ms) | none | the engine's own NVFP4 CPU kernels (`nvfp4_avx2` here: the i5-12400F has no AVX-512), as a later arm |
+| Expert kernels | **grouped**: `experts_gate_up_swiglu` (gate + up + the activation, all of a group's experts, one launch from a pointer array) and `experts_down` (down + combine) | 6 launches an expert | grouped kernels in the DeepSeek branch's `gate_up_kernel<T, NE, RW>` pattern (runtime shapes, the activation fused) with NVFP4 / Q8_0 as the type and SITU as the body; checked against the oracle |
+| Prefetch | the next layer's likely experts while this one runs; two or three layers ahead, or predicting from this layer's input (46% precise), **did not help** | none | our learned look-ahead, plus the loop's own signal (the token's picks of the pass before: 4.9 of 8 shared) |
+| Resident path (everything in VRAM, a 24 GB card) | device-side routing (`route_token`), a CUDA graph a token, 757 launches, 124.8 tok/s on a 3090 | n/a on 12 GB | later, for cards that fit it |
+
+**Projection from the profile** (a plan, not a result): experts 88 -> ~20 ms needs about 85% of the expert bytes to hit the cache plus overlap (a ~7 GB cache holds 44% of the experts by bytes; the loop gives the cache a
+62% head start on passes 2 and 3), the attention side 14.6 -> ~7 ms from fusion; with ~4 ms of round trips, tail and head that is ~31 ms a token = Maya's ~32 tok/s, and our own features
+(look-ahead, the stand-ins) are what can go beyond it. Order: grouped expert kernels, then F3's cache with the copy stream, then the fusion; each measured against `gpu_forward_test` and the oracle.
+
 ## Rules for this port
 
 - The Qwen path, its layer-major prompt walk and its prefill speeds are not touched. Measured before any shared file changes:

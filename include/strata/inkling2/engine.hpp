@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace strata {
@@ -42,6 +43,8 @@ public:
     void reset();
     /// The picks of the last step, per visit: [visit][k] expert ids (for tests and the learners).
     const std::vector<std::vector<int>>& last_picks() const;
+    /// STRATA_INKLING2_PROFILE=1: where a token's time went, by phase (empty otherwise).
+    std::string profile() const;
     /// The routed experts' bytes and the dense weights' bytes in VRAM.
     uint64_t expert_bytes() const;
     uint64_t dense_bytes() const;
