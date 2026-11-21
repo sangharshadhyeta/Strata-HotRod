@@ -190,15 +190,28 @@ struct AttnSeams {   // what the reference records inside the attention (for the
     Mat k_conv, v_conv, q, k, v, r, gated, out;
 };
 
-/// A sliding-window layer's attention (no loop messages): xq = xk = xv = the normed input.  Fills `seams` (the reference's names:
+/// A layer's attention over positions 0..T-1 (no loop messages): q, r, gate and sink come from xq, k from xk, v from xv (a sliding layer
+/// passes the same normed input three times; a full layer its three separately normed inputs).  A full layer's k / v short convs add
+/// per-token dynamic taps, its q and r are scaled by tau(pos), and its attention has no window.  Fills `seams` (the reference's names:
 /// k_conv, v_conv before the clips; q, k, v, r after; attn_gated; and `out` = after attn_output, before the post conv).
-inline Mat attention_sliding(const GgufFile& g, const Config& c, const LayerTensors& L, const Mat& x, int64_t T, AttnSeams& sm) {
-    const int64_t E = c.n_embd, H = c.n_head, KV = c.n_head_kv, D = c.head_dim, R = c.rel_states;
-    Mat q = matmul_t(g, *L.attn_q, x, T), k = matmul_t(g, *L.attn_k, x, T), v = matmul_t(g, *L.attn_v, x, T);
-    Mat r = matmul_t(g, *L.attn_rel, x, T), gate = matmul_t(g, *L.attn_gate, x, T), sink = matmul_t(g, *L.attn_sink_proj, x, T);
-    const Mat kw = fold_conv(vec(g, *L.attn_k_conv), KV * D, c.conv_taps, false), vw = fold_conv(vec(g, *L.attn_v_conv), KV * D, c.conv_taps, false);
-    k = conv(k, T, KV * D, kw, c.conv_taps);
-    v = conv(v, T, KV * D, vw, c.conv_taps);
+inline Mat attention(const GgufFile& g, const Config& c, const LayerTensors& L, const Mat& xq, const Mat& xk, const Mat& xv, int64_t T, AttnSeams& sm) {
+    const int64_t H = c.n_head, KV = c.n_head_kv, D = c.head_dim, R = c.rel_states;
+    const bool sliding = !L.full;
+    Mat q = matmul_t(g, *L.attn_q, xq, T), k = matmul_t(g, *L.attn_k, xk, T), v = matmul_t(g, *L.attn_v, xv, T);
+    Mat r = matmul_t(g, *L.attn_rel, xq, T), gate = matmul_t(g, *L.attn_gate, xq, T), sink = matmul_t(g, *L.attn_sink_proj, xq, T);
+    if (sliding) {
+        const Mat kw = fold_conv(vec(g, *L.attn_k_conv), KV * D, c.conv_taps, false), vw = fold_conv(vec(g, *L.attn_v_conv), KV * D, c.conv_taps, false);
+        k = conv(k, T, KV * D, kw, c.conv_taps);
+        v = conv(v, T, KV * D, vw, c.conv_taps);
+    } else {   // dynamic taps: xk @ k_conv_proj^T (heads x taps per token), scaled as master's layout leaves them unscaled
+        const float dsc = (float) (1.0 / std::sqrt((double) (2 * c.conv_taps + 1)));
+        Mat kd = matmul_t(g, *L.attn_k_conv_proj, xk, T), vd = matmul_t(g, *L.attn_v_conv_proj, xv, T);
+        for (float& z : kd) z *= dsc;
+        for (float& z : vd) z *= dsc;
+        const Mat kw = fold_conv(vec(g, *L.attn_k_conv), KV * D, c.conv_taps, true), vw = fold_conv(vec(g, *L.attn_v_conv), KV * D, c.conv_taps, true);
+        k = conv(k, T, KV * D, kw, c.conv_taps, &kd, KV);
+        v = conv(v, T, KV * D, vw, c.conv_taps, &vd, KV);
+    }
     sm.k_conv = k; sm.v_conv = v;
     const Mat qclip = vec(g, *L.attn_q_clip), rclip = vec(g, *L.attn_rel_clip);   // [H][D], [H][R]
     for (int64_t t = 0; t < T; ++t)
@@ -210,8 +223,15 @@ inline Mat attention_sliding(const GgufFile& g, const Config& c, const LayerTens
     l2clip(k.data(), T * KV, D, c.qk_clip);
     rms(v.data(), T * KV, D, nullptr, c.rms_eps);
     l2clip(r.data(), T * H, R, c.rel_clip);
+    if (!sliding) {   // the full layers' log scaling of q and r: tau = 1 + alpha ln max(1, (pos + 1) / floor)
+        for (int64_t t = 0; t < T; ++t) {
+            const float tau = (float) (1.0 + (double) c.log_scale_alpha * std::log(std::max(1.0, (double) (t + 1) / (double) c.log_scale_floor)));
+            for (int64_t i = 0; i < H * D; ++i) q[(size_t) (t * H * D + i)] *= tau;
+            for (int64_t i = 0; i < H * R; ++i) r[(size_t) (t * H * R + i)] *= tau;
+        }
+    }
     sm.q = q; sm.k = k; sm.v = v; sm.r = r;
-    const int64_t extent = c.window;                                   // a sliding layer's extent is its window
+    const int64_t extent = sliding ? c.window : c.rel_extent;          // a sliding layer's extent is its window
     const Mat proj = vec(g, *L.attn_rel_bias);                          // [extent][R]
     Mat o((size_t) (T * H * D), 0.0f);
     const int64_t grp = H / KV;
@@ -220,7 +240,7 @@ inline Mat attention_sliding(const GgufFile& g, const Config& c, const LayerTens
             const int64_t kvh = h / grp;
             std::vector<double> lg;
             std::vector<int64_t> src;
-            for (int64_t s = std::max<int64_t>(0, t - c.window + 1); s <= t; ++s) {
+            for (int64_t s = sliding ? std::max<int64_t>(0, t - c.window + 1) : 0; s <= t; ++s) {
                 const int64_t dist = t - s;
                 double bias = 0;
                 if (dist < extent) bias = dot(&r[(size_t) ((t * H + h) * R)], &proj[(size_t) (dist * R)], R);
@@ -241,7 +261,6 @@ inline Mat attention_sliding(const GgufFile& g, const Config& c, const LayerTens
     sm.gated = o;
     Mat out = matmul_t(g, *L.attn_output, o, T);
     sm.out = out;
-    (void) E;
     return out;
 }
 
@@ -291,6 +310,69 @@ inline Mat moe(const GgufFile& g, const Config& c, const LayerTensors& L, const 
                 out[(size_t) (t * E + o)] += (float) (dot(h.data(), &dn[(size_t) (o * FF)], FF) * sd * (double) wts[(size_t) t][(size_t) j]);
         }
     }
+    return out;
+}
+
+struct VisitSeams { AttnSeams attn; Mat attn_out, ffn_out, out; std::vector<int> picks; };
+
+/// One layer visit of a first pass (no loop messages) of stored layer `l`.  h: the stream [T][E]; blocks: the block states so far (the
+/// reference appends the layer's input at a block boundary, stored index % block == 0, and the layer's own FFN residual already sees it).
+/// Returns the new stream (r + the MoE's output); `blocks` is updated.
+inline Mat layer_visit(const GgufFile& g, const Config& c, const Layout& lay, int64_t l, const Mat& h, std::vector<Mat>& blocks, int64_t T, VisitSeams& vs) {
+    const LayerTensors& L = lay.layers[(size_t) l];
+    const int64_t E = c.n_embd;
+    Mat ins[3];
+    if (l == 0) {
+        ins[0] = ins[1] = ins[2] = h;
+    } else {   // the attention residual over the block states and the stream, with this layer's query (a full layer has three)
+        std::vector<const Mat*> st;
+        for (const Mat& b : blocks) st.push_back(&b);
+        st.push_back(&h);
+        const Mat q = vec(g, *L.attn_res_query);
+        const int64_t nq = L.full ? 3 : 1;
+        std::vector<Mat> o = attn_res(st, T, E, q.data(), nq);
+        for (int i = 0; i < 3; ++i) ins[i] = nq == 1 ? o[0] : o[(size_t) i];
+    }
+    Mat xs[3];
+    if (!L.full) {
+        Mat n = ins[0];
+        const Mat w = vec(g, *L.attn_norm);
+        rms(n.data(), T, E, w.data(), c.rms_eps);
+        xs[0] = xs[1] = xs[2] = n;
+    } else {
+        const TensorInfo* nw[3] = {L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm};
+        for (int i = 0; i < 3; ++i) {
+            xs[i] = ins[i];
+            const Mat w = vec(g, *nw[i]);
+            rms(xs[i].data(), T, E, w.data(), c.rms_eps);
+        }
+    }
+    Mat a = attention(g, c, L, xs[0], xs[1], xs[2], T, vs.attn);
+    a = conv(a, T, E, fold_conv(vec(g, *L.attn_post_conv), E, c.conv_taps, false), c.conv_taps);
+    vs.attn_out = a;
+    std::vector<Mat> bl = blocks;   // the blocks this layer's FFN residual sees
+    Mat r(h.size());
+    if (l % c.attn_res_block == 0) {
+        bl.push_back(h);
+        r = a;
+    } else {
+        for (size_t i = 0; i < r.size(); ++i) r[i] = h[i] + a[i];
+    }
+    std::vector<const Mat*> st;
+    for (const Mat& b : bl) st.push_back(&b);
+    st.push_back(&r);
+    const Mat fq = vec(g, *L.ffn_res_query);
+    Mat m_in = attn_res(st, T, E, fq.data(), 1)[0];
+    { const Mat w = vec(g, *L.ffn_norm); rms(m_in.data(), T, E, w.data(), c.rms_eps); }
+    MoeSeams ms;
+    Mat m = moe(g, c, L, m_in, T, &ms);
+    vs.picks = ms.picks;
+    m = conv(m, T, E, fold_conv(vec(g, *L.ffn_post_conv), E, c.conv_taps, false), c.conv_taps);
+    vs.ffn_out = m;
+    Mat out(h.size());
+    for (size_t i = 0; i < out.size(); ++i) out[i] = r[i] + m[i];
+    vs.out = out;
+    if (l % c.attn_res_block == 0) blocks.push_back(h);
     return out;
 }
 
