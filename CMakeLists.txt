@@ -527,7 +527,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME inkling2_nvfp4_parity COMMAND inkling2_nvfp4_parity)
     # Inkling 2's own kernels, in a small library so the Qwen binary is unchanged: the router, hand-ported from the DeepSeek branch's route_kernel
     # (sigmoid in place of sqrt-softplus), against the reference's picks (docs/INKLING-PORT.md, "Code used from the DeepSeek branch")
-    add_library(inkling2_kernels STATIC src/kernels/cuda/inkling2_router.cu)
+    add_library(inkling2_kernels STATIC src/kernels/cuda/inkling2_router.cu src/kernels/cuda/inkling2_kernels.cu)
     target_include_directories(inkling2_kernels PUBLIC include)
     target_link_libraries(inkling2_kernels PUBLIC CUDA::cudart)
     add_executable(inkling2_router_parity src/kernels/inkling2_router_parity.cpp)
@@ -539,6 +539,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(ds4_lalearn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
                                ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(ds4_lalearn_test PRIVATE CUDA::cudart)
+    # the Inkling 2 GPU engine (F2): the whole looped forward on the GPU from the engine's reused kernels (Q8_0 / NVFP4 matvecs, the short conv, RMSNorm) and
+    # the new ones, experts read zero-copy from the registered GGUF; its own library, so the Qwen binary is unchanged.  The test runs it against the oracle.
+    add_library(inkling2_engine STATIC src/inkling2/engine.cpp)
+    target_include_directories(inkling2_engine PUBLIC include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(inkling2_engine PUBLIC inkling2_kernels strata_kernels strata_artifact CUDA::cudart)
+    add_executable(inkling2_gpu_forward_test src/inkling2/gpu_forward_test.cpp)
+    target_link_libraries(inkling2_gpu_forward_test PRIVATE inkling2_engine)
+    add_test(NAME inkling2_gpu_forward_test COMMAND inkling2_gpu_forward_test)
   endif()
   # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
   # the capacity rule, selected ids bitwise

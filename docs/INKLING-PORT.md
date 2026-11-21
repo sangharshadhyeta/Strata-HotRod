@@ -168,6 +168,26 @@ interface are not adopted (21 Nov: shared interface as new files, step 4, later)
   - **F4** stand-ins with the budget tuner; **F5** the learned look-ahead with the loop feature (the token's previous pass); **F6** KV: the ring for the 40 sliding visits, q8 KV
     for the 8 full ones; **F7** serve on 8095, speed against Maya's 32.4 tok/s, the batching test; **F8** Inkling-2-Small from the NVMe tier.
 
+## F2 result (22 Nov): Inkling-2-Mini runs on our engine's GPU path
+
+`src/inkling2/engine.cpp` (+ `include/strata/kernels/inkling2_kernels.hpp`, `src/kernels/cuda/inkling2_kernels.cu`; own libraries `inkling2_kernels` / `inkling2_engine`, so the
+Qwen binary is unchanged) runs all 48 visits of a token on the GPU: Q8_0 dense weights and the Q8_0 / NVFP4 experts through the engine's `iq_mmvq`, the static short convs through the
+engine's `gdn_conv_step`, RMSNorm through `rms_norm_weighted`, the router from the DeepSeek branch, and the new kernels (F32 matvec for the small tensors, Q/K/V preparation,
+dynamic-tap conv, the biased / sinked / windowed attention, attention residual, loop gate, SITU). Experts sit in pinned, mapped host memory read from the GGUF (15.80 GB; 1.82 GB of dense
+weights in VRAM; load 17-30 s) and the kernels read them zero-copy over PCIe: no VRAM cache yet (F3). That one access sits behind a single seam for F3 to replace with the `ExpertStore`.
+
+Against the float64 reference on the oracle prompts (teacher-forced, `gpu_forward_test`):
+
+| prompt | top-1 same | mean KL (reference \|\| engine) | worst visit `out` | picks differing | speed |
+| --- | --- | --- | --- | --- | --- |
+| 48 tokens | 45 of 48 | 0.0050 | 7.9% of its max | 1,488 of 18,432 | 9.3 tok/s |
+| 92 tokens, window 32 / extent 48 / floor 16 | 88 of 92 | 0.0059 | 7.1% | 2,783 of 35,328 | 9.3 tok/s |
+
+Where the drift comes from (read from the seams, not assumed): at the first visit every attention-path seam (`q`, `k`, `v`, `attn_gated`, `attn_out`) is within 0.2-0.5% of the reference, which is
+the floor of Q8_0 weights times int8 (q8_1) activations; the MoE output then shows 3.7-4.7% because ~3.6% of the router's picks swap where two experts are near-tied (the picks are compared
+exactly in the CPU oracle, which matches). So the GPU path's difference is int8 activation noise amplified by routing, the same envelope every expert on this engine has, not a kernel fault.
+The speed is the naive path's (no cache, 8 experts x 3 launches a layer visit, host sync for the picks): the starting point for F3 and the grouped kernels.
+
 ## Rules for this port
 
 - The Qwen path, its layer-major prompt walk and its prefill speeds are not touched. Measured before any shared file changes:
