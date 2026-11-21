@@ -235,6 +235,9 @@ public:
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
+    /// After a set_peer that failed because the peer's buffers did not fit: how many MiB the first allocation that failed was short of the free
+    /// memory on the peer card (0 when unknown).  The allocations after it were not tried, so this is a lower bound (peer_retry.hpp).
+    int64_t peer_missing_mib() const;
 
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
