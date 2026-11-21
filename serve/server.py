@@ -2920,6 +2920,26 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
             print(f'[strata] "parallel_context" must be a whole number of tokens (1 or more), not {c!r}: ignored', flush=True)
         else:
             out += ["--batch-context", str(c)]
+    # "parallel_quantum_ms": N - the longest a decoding slot waits between its decode bursts while a long prompt is read beside it (--batch-quantum-ms N; 0 or absent: the prompt
+    # is read in the engine's own chunks).  The user decides between the long-context request (a large N: it reads faster) and the short ones (a small N: they stay lively).
+    qm = cfg.get("parallel_quantum_ms")
+    if qm is not None and qm is not False and "--batch-quantum-ms" not in args:
+        if isinstance(qm, bool) or not isinstance(qm, int) or qm < 0:
+            print(f'[strata] "parallel_quantum_ms" must be a whole number of milliseconds (0 or more), not {qm!r}: ignored', flush=True)
+        elif qm > 0:
+            out += ["--batch-quantum-ms", str(qm)]
+    # "parallel_interleave_gate": PCT (0 to 100; default 50 in the engine, 0 = always interleave): while a long prompt is read beside decoding slots, the slots decode between its pieces only
+    # while their decode speed beside the read AND the read's own speed each keep at least PCT percent of their alone speed; below it the read and the slots take turns whole, the one
+    # that completes more requests per second first (--batch-interleave-gate PCT).  "parallel_defer_pct": PCT (default 200): when the slots go first they keep the read waiting for at most
+    # this percent of the read's own time (--batch-defer-pct PCT).
+    for key, flag, hi in (("parallel_interleave_gate", "--batch-interleave-gate", 100), ("parallel_defer_pct", "--batch-defer-pct", None)):
+        v = cfg.get(key)
+        if v is None or v is False or flag in args:
+            continue
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0 or (hi is not None and v > hi):
+            print(f'[strata] "{key}" must be a whole number of percent{" from 0 to 100" if hi else " (0 or more)"}, not {v!r}: ignored', flush=True)
+        else:
+            out += [flag, str(v)]
     return out
 
 

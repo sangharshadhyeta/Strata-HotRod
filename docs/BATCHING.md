@@ -29,6 +29,32 @@ expert cache and 62% of prefill speed; at 2,048 tokens they took about 7% of the
 `--batch`; one machine, 21 Nov). A request whose prompt plus `max_tokens` would outgrow a slot is never put into one: it waits until the slots are idle and then runs on its
 own at full speed. The engine does not choose a limit for you; it tells you what it measured and keeps your setting.
 
+**The quantum is yours: who matters more, the long request or the short ones?** While a long prompt is read beside decoding slots the two take turns: the prompt is
+read one piece (a chunk), the slots decode, the next piece. A slot therefore waits one piece between its decode bursts. `"parallel_quantum_ms": 1500` in the config
+(`--batch-quantum-ms 1500`) says how long that wait may be: the engine cuts the pieces to what the prompt path reads in that time at its measured speed (whole
+256-token steps, at least 256) while a slot decodes, and reads at the usual chunk when none does. A small quantum keeps the decoding requests lively and slows the
+long read (every piece is a switch); a large one reads the long prompt faster and the others wait longer. It is the quantum of a round-robin scheduler and, in vLLM and
+llama.cpp, the per-iteration token budget; nothing is optimised behind your back. 0 or absent: the engine's own chunks, as before. (An automatic decode share that
+minimised the mean completion time was built and measured on 21 Nov: 6 mixed runs per setting, 174-199 s against 173-195 s, the same. It was dropped.)
+
+**The read policy: interleave only while it pays, else take turns in Smith's order.** Time-slicing a long prompt read with decoding slots costs both sides when a switch is not free:
+on Qwen UD-Q4_K_XL (12 GB, `--batch 4 --batch-context 16384`, three 500-token answers decoding when a 13.5K-token prompt arrives) the interleaved run took 173-195 s, the
+windows beside the read ran at about 0.6 of their alone speed and the read at about 0.57 of its own. The engine measures both (ms per decoded row at the same number of rows in
+the window, with and without a read beside; tokens per ms of the read's pieces beside decoding slots against alone) and lets the slots decode between the pieces only while **both
+keep at least 50 percent** (`"parallel_interleave_gate": 50`, `--batch-interleave-gate 50`; 0 = always interleave, as before). Below it the read and the slots take turns whole,
+in Smith's order (weighted shortest processing time, optimal for the mean completion time of one machine): the slots as a group complete m requests by their m-th smallest
+remaining decode work, index max m / w_m; the read completes one in its own time, index 1 / read time; the higher index goes first. When the slots go first they keep the read
+waiting at most **200 percent of its own time** (`"parallel_defer_pct": 200`, `--batch-defer-pct 200`). A read whose measures are not known yet goes in Smith's order; every 4th
+such read is interleaved so the measures refresh. Measured on the same machine: 500-token slots, 91.8 s mean once the policy engaged (186 s on a first, cold run that interleaved,
+before the cold-start default was changed); 100-token slots, 35.8-37.2 s (read first would be about 73 s). Also with it: a read the slots do not decode between runs in multi-chunk
+pieces (the layer-major run), and with other slots decoding the prompt tail's refill and usage seeding are skipped (they shaped the shared cache for the prompt's own routing).
+
+**The RAM tier and a long read.** The prompt path takes tier places for its working state and the RAM guard (floor + margin) gives places back between requests; what the read borrowed
+goes back first, as far as available RAM stays above floor + margin. On a machine whose available RAM sits at the floor (31 GB with a 17 GiB tier, 21 Nov) that returns little: the
+tier stays smaller after a long read (about 2.1 GiB parked) and the CPU experts run 15-30 percent slower for a few minutes. `STRATA_RAM_READ_RESERVE=1` keeps the learned RAM cost of the
+longest read (bytes per prompt token x its length, at most 4 GiB; learned in ram-reserve.json) free at the next start; off by default, since spare memory held in advance is what the
+give-back exists to avoid.
+
 With MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `STRATA_BATCH_MTP=1` in the server's
 environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch behaviour
 described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers, so check the

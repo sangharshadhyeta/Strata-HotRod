@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace strata::program {
 
@@ -78,6 +79,27 @@ inline double piped_decode_budget_ms(double piece_ms, double share, double cap_m
     double b = std::max(0.0, share) * std::max(0.0, piece_ms);
     if (cap_ms > 0.0) b = std::min(b, cap_ms);
     return std::max(b, std::max(0.0, floor_ms));
+}
+
+/// The read policy (21 Nov): what a prompt read does while slots decode.  Time-slicing costs both sides when a switch is not free (measured on Qwen UD-Q4_K_XL, 12 GB: the windows beside a read ran at
+/// 0.6 of their alone speed and the read at 0.57 of its own, so interleaved took 160-180 s where one after the other takes about 100 s), so it is allowed only while it is efficient:
+///   dec_eff: ms per decoded row with no read / ms per row while a read runs beside   (1 when not measured yet)
+///   pf_eff:  tokens per ms of the read's own pieces beside slots / tokens per ms alone (1 when not measured yet)
+/// Both at least gate_pct percent: kInterleave (the slots decode between the pieces, as before).  Otherwise the two take turns whole, in Smith's order (weighted shortest processing time, optimal for the
+/// mean completion time of one machine): the slots as a group finish m requests by their m-th smallest remaining decode work w_m, so their index is max over m of m / w_m completions per ms; the read
+/// completes one request in read_ms, index 1 / read_ms.  The higher index goes first: kDecodeFirst (the slots run on, up to a cap) or kReadFirst (the whole read at full speed).
+///   slot_work_ms: each decoding slot's remaining decode work at the speed alone;  read_ms: the read's time alone;  gate_pct 0: always kInterleave (the old behaviour)
+enum class ReadMode { kInterleave, kReadFirst, kDecodeFirst };
+inline ReadMode batch_read_mode(const std::vector<double>& slot_work_ms, double read_ms, double dec_eff, double pf_eff, int gate_pct) {
+    if (gate_pct <= 0 || slot_work_ms.empty()) return ReadMode::kInterleave;
+    const double gate = (double) gate_pct / 100.0;
+    if (dec_eff >= gate && pf_eff >= gate) return ReadMode::kInterleave;
+    std::vector<double> w = slot_work_ms;
+    std::sort(w.begin(), w.end());
+    double idx_dec = 0.0;
+    for (size_t m = 0; m < w.size(); ++m) idx_dec = std::max(idx_dec, (double) (m + 1) / std::max(w[m], 1.0));
+    const double idx_read = 1.0 / std::max(read_ms, 1.0);
+    return idx_dec > idx_read ? ReadMode::kDecodeFirst : ReadMode::kReadFirst;
 }
 
 /// Prompts arriving back to back: a piecewise read that starts within kPipedLeadInWindowMs + budget_ms of the

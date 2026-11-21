@@ -194,6 +194,24 @@ class ParallelArgs(unittest.TestCase):
         self.assertEqual(parallel_args({"parallel": "4"}, []), [])                   # said and ignored
         self.assertEqual(parallel_args({"parallel": True}, []), [])
         self.assertEqual(parallel_args({"parallel": 12}, []), ["--batch", "12"])     # the engine warns and caps
+    def test_parallel_quantum_is_the_users_stall_limit(self):
+        # "parallel_quantum_ms": N -> --batch-quantum-ms N; 0 or absent: nothing; a bad value is said and ignored
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_quantum_ms": 1500}, []), ["--batch", "4", "--batch-quantum-ms", "1500"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_quantum_ms": 0}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_quantum_ms": -5}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_quantum_ms": "fast"}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_quantum_ms": 1500}, ["--batch-quantum-ms", "800"]), ["--batch", "4"])
+
+    def test_parallel_read_policy_limits_are_the_users_percent(self):
+        # "parallel_interleave_gate": PCT -> --batch-interleave-gate PCT (0 = always interleave); "parallel_defer_pct": PCT -> --batch-defer-pct PCT; bad values are said and ignored
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_interleave_gate": 60}, []), ["--batch", "4", "--batch-interleave-gate", "60"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_interleave_gate": 0}, []), ["--batch", "4", "--batch-interleave-gate", "0"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_interleave_gate": 150}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_interleave_gate": 0.5}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_defer_pct": 300}, []), ["--batch", "4", "--batch-defer-pct", "300"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_defer_pct": -1}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_interleave_gate": 60}, ["--batch-interleave-gate", "90"]), ["--batch", "4"])
+
     def test_parallel_context_is_the_users_slot_size(self):
         # "parallel_context": C -> --batch-context C, any positive number passed on (the engine clamps it); a bad value is said and ignored
         self.assertEqual(parallel_args({"parallel": 4, "parallel_context": 2048}, []), ["--batch", "4", "--batch-context", "2048"])

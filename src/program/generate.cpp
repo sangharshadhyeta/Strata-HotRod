@@ -824,6 +824,14 @@ struct Options {
     int batch = 0;
     int64_t batch_context = 0;       ///< --batch-context N: each batch slot's session holds N cells, not --max-context's (0 = the same as --max-context). A request that
                                      ///< would outgrow a slot (prompt + max_new) runs on the solo path instead (serve/server.py reads INFO batch_cells=)
+    /// --batch-quantum-ms N (0: off): the longest a decoding slot waits between two of its decode bursts while a prompt is read beside it (a quantum, as in a round-robin
+    /// scheduler).  The prompt is read in pieces of one chunk and the slots decode between the pieces, so a slot waits one piece: the chunk is cut to what the prompt path reads in N ms
+    /// (its measured speed, tokens per ms) while a slot decodes.  Small N: the decoding slots stay lively and the read is slower (every piece is a switch); large N: the other way.
+    int64_t batch_quantum_ms = 0;
+    /// --batch-interleave-gate PCT (default 50; 0: always interleave): the slots decode between the pieces of a prompt read only while the slots' decode speed beside the read AND the read's own speed
+    /// each keep at least PCT percent of their alone speed (batch_read_mode); below it the read and the slots take turns whole, in Smith's order.  --batch-defer-pct PCT (default 200): when the
+    /// slots go first, they may keep the read waiting for at most PCT percent of the read's own time
+    int batch_gate_pct = 50, batch_defer_pct = 200;
     int64_t batch_cells = 0;         ///< the cap in force (0: slots are as large as the main session); set where the slot sessions are carved
     /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
     /// model's: the VRAM they took goes back to the expert cache (opt-in)
@@ -1589,6 +1597,8 @@ static void vram_reserve_note_once(const char* what, const std::string& path) {
     std::fprintf(stderr, "strata generate: VRAM reserve file %s: %s (no learned reserve; the engine goes on)\n",
                  path.c_str(), what);
 }
+/// The bytes the prompt path took from the RAM tier for a read's working state and the guard has not given back yet (21 Nov; one engine per process).
+static std::atomic<uint64_t> g_ram_read_borrowed{0};
 static std::string vram_reserve_path(const Options& o) {
     const std::string& p = !o.expert_profile.empty() ? o.expert_profile : o.expert_profile_save;
     if (p.empty()) return "";
@@ -2937,6 +2947,9 @@ int main(int argc, char** argv) {
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--batch-context") o.batch_context = std::atoll(next("--batch-context"));
+        else if (a == "--batch-interleave-gate") o.batch_gate_pct = (int) std::clamp<long long>(std::atoll(next("--batch-interleave-gate")), 0, 100);
+        else if (a == "--batch-defer-pct") o.batch_defer_pct = (int) std::max<long long>(0, std::atoll(next("--batch-defer-pct")));
+        else if (a == "--batch-quantum-ms") o.batch_quantum_ms = std::max<long long>(0, std::atoll(next("--batch-quantum-ms")));
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") {
             const char* bgv = next("--batch-groups");
@@ -6184,7 +6197,27 @@ int main(int argc, char** argv) {
             if (kg != learned.end() && std::getenv("STRATA_RESIDENT_HEADROOM_GIB") == nullptr) o.resident_headroom = 0;
             const uint64_t learned_b = ((uint64_t) std::max<int64_t>(0, kg != learned.end() ? kg->second : 0) +
                                         (uint64_t) std::max<int64_t>(0, km != learned.end() ? km->second : 0)) << 20;
-            floor_kept += learned_b;
+            // 21 Nov: the READ RESERVE - a long prompt read takes RAM no margin covers (the margin is a start's second-largest drop, so one long read per start never counts): its working state
+            // and the saved conversation, about 70 KB per prompt token on Qwen UD-Q4_K_XL (0.9 GiB at 13.5K).  Learned across starts as the largest drop per token and the longest read seen
+            // (ram-reserve.json " read bpt" / " read tokens"), kept free by the sizing here at most 4 GiB; without it the guard parks 2.5 GiB of the tier at the first long read and the CPU
+            // experts stay slow for minutes (measured on 8095's machine, 21 Nov)
+            uint64_t read_reserve = 0;
+            int64_t rr_bpt = 0, rr_tok = 0;
+            {
+                const auto kb = learned.find(rkey + " read bpt"), kt = learned.find(rkey + " read tokens");
+                // OPT-IN (STRATA_RAM_READ_RESERVE=1): the prompt path gives the tier's RAM back on demand and the guard takes it back as far as floor + margin allows, so spare memory held in advance is
+                // not needed by default; it costs about 0.9 GiB of tier on every start.  The learning above stays, so the figures are on file for whoever wants the reserve.
+                static const bool use_reserve = [] { const char* v = std::getenv("STRATA_RAM_READ_RESERVE"); return v != nullptr && std::atoi(v) != 0; }();
+                if (use_reserve && kb != learned.end() && kt != learned.end() && kb->second > 0 && kt->second > 0) {
+                    rr_bpt = (int64_t) kb->second;
+                    rr_tok = (int64_t) kt->second;
+                    read_reserve = std::min<uint64_t>((uint64_t) rr_bpt * (uint64_t) rr_tok, 4ull << 30);
+                }
+            }
+            floor_kept += learned_b + read_reserve;
+            if (read_reserve > 0)
+                std::fprintf(stderr, "strata generate: --resident-budget-gib auto: %.2f GiB kept free for a long prompt read (learned: %lld bytes per token, longest read %lld tokens)\n",
+                             (double) read_reserve / 1073741824.0, (long long) rr_bpt, (long long) rr_tok);
             room = room > floor_kept ? room - floor_kept : 0;
             if (room == 0)
                 std::fprintf(stderr, "strata generate: --resident-budget-gib auto: no RAM room above the %lld MiB memory floor "
@@ -8665,7 +8698,11 @@ int main(int argc, char** argv) {
         // the RAM tier gives its coldest places back when a layer-major prompt's residuals do not fit (prefill.cpp run_impl);
         // the serve thread runs that between decode windows, the place's usage is read then
         if (resident_ok && src.complement_ready())
-            strata::prefill::Prefill::set_ram_give_back([&](uint64_t bytes) { return src.give_back_ram(bytes, drive.d.usage); });
+            strata::prefill::Prefill::set_ram_give_back([&](uint64_t bytes) {
+                const uint64_t got = src.give_back_ram(bytes, drive.d.usage);
+                g_ram_read_borrowed.fetch_add(got);   // taken for a read's working state: temporary, so it is the first to go back (the guard)
+                return got;
+            });
         // #669 / #765: a big chunk lends many cache slots to the prompt path, and each lent slot's expert is read back
         // from the SSD whenever the RAM could not keep its copy (31 GB: auto:32768 read prompts ~3x slower than auto).
         // Said, never capped: --prefill is the user's, and with the RAM for them it is the faster one (+21-35%).
@@ -12054,6 +12091,15 @@ int main(int argc, char** argv) {
         double bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
+        // the read policy's measures (smoothed): window ms per decoded row with no read / with a read beside; prompt tokens per ms in pieces beside decoding slots; the answer length (tokens) of the slots'
+        // requests that ended on their own (how much a decoding slot has left); reads the policy sent whole (every 4th goes interleaved again to refresh the 'beside' measures)
+        double dec_alone_ms_row = 0, dec_beside_ms_row = 0, pf_beside_tok_ms = 0, len_ewma = 0;
+        int64_t gate_skipped = 0;
+        // the decode efficiency is compared at the SAME number of rows in the window (a window with one slot decoding costs far more per row than one with three): ms per row by rows (1..8),
+        // with no read / with a read beside, and how many windows the 'beside' mean holds
+        double dec_row_alone[9] = {}, dec_row_beside[9] = {};
+        int dec_row_beside_n[9] = {};
+        double pf_tok_per_ms = 0;   // the prompt path's speed with no slot decoding beside it (smoothed over the reads that took 200 ms or more): the quantum's conversion to tokens
         int64_t pipe_rows = 0;   // the pipelined groups' rows, never reset (bt_rows restarts when the slots go idle)
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
@@ -12428,9 +12474,20 @@ int main(int argc, char** argv) {
             bt_run += msd(w0, w1);
             bt_commit += msd(w1, w2);
             ++bt_windows;
+            int win_rows = 0;
             for (int a = 0; a < A; ++a) {
                 bt_rows += keep[active[a]];
+                win_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
+            }
+            if (win_rows > 0) {   // the read policy's decode measure: ms per row, apart for the windows run between a prompt's pieces
+                const double v = msd(w0, w2) / (double) win_rows;
+                double& e = in_prompt_read ? dec_beside_ms_row : dec_alone_ms_row;
+                e = e > 0 ? 0.8 * e + 0.2 * v : v;
+                const int rb = std::min(win_rows, 8);
+                double& eb = in_prompt_read ? dec_row_beside[rb] : dec_row_alone[rb];
+                eb = eb > 0 ? 0.8 * eb + 0.2 * v : v;
+                if (in_prompt_read) ++dec_row_beside_n[rb];
             }
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
@@ -12461,6 +12518,7 @@ int main(int argc, char** argv) {
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        if (eos) len_ewma = len_ewma > 0 ? 0.8 * len_ewma + 0.2 * (double) sl.produced : (double) sl.produced;
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                         break;
@@ -12640,6 +12698,7 @@ int main(int argc, char** argv) {
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                        if (eos) len_ewma = len_ewma > 0 ? 0.8 * len_ewma + 0.2 * (double) sl.produced : (double) sl.produced;
                         sl.active = false;
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
@@ -12763,6 +12822,8 @@ int main(int argc, char** argv) {
         }
         strata::prefill::Prefill::set_ram_margin_bytes(ram_margin);
         // writes one learned RAM value (MiB) under this key, keeping the file's other entries
+        int64_t ram_last_read_tokens = 0;      // the previous request's read length: the guard (at the start of the next request) attributes the RAM drop to it
+        int64_t ram_read_bpt_seen = 0, ram_read_tok_seen = 0;
         auto ram_learn = [&](const char* what, int64_t mib) {
             auto learned = vram_reserve_read(ram_reserve_path(o));
             learned[ram_rkey + what] = mib;
@@ -13017,6 +13078,21 @@ int main(int argc, char** argv) {
                     const uint64_t refill = std::min(ram_prev_free > free_now ? ram_prev_free - free_now : 0, ram_unparked_prev);
                     const uint64_t raw = mem->available < ram_prev_after ? ram_prev_after - mem->available : 0;
                     const uint64_t drop = raw > refill ? raw - refill : 0;
+                    if (ram_last_read_tokens >= 2048 && drop > 0) {   // a long read: bytes of RAM lost per prompt token, and the longest read, kept at their largest
+                        const int64_t bpt = (int64_t) (drop / (uint64_t) ram_last_read_tokens);
+                        if (bpt > ram_read_bpt_seen || ram_last_read_tokens > ram_read_tok_seen) {
+                            ram_read_bpt_seen = std::max(ram_read_bpt_seen, bpt);
+                            ram_read_tok_seen = std::max(ram_read_tok_seen, ram_last_read_tokens);
+                            auto learned_r = vram_reserve_read(ram_reserve_path(o));
+                            const auto ob = learned_r.find(ram_rkey + " read bpt"), ot = learned_r.find(ram_rkey + " read tokens");
+                            if (ob == learned_r.end() || ob->second < ram_read_bpt_seen) learned_r[ram_rkey + " read bpt"] = ram_read_bpt_seen;
+                            if (ot == learned_r.end() || ot->second < ram_read_tok_seen) learned_r[ram_rkey + " read tokens"] = ram_read_tok_seen;
+                            vram_reserve_write(ram_reserve_path(o), learned_r);
+                            std::fprintf(stderr, "strata serve: RAM read reserve learned for the next start: %lld bytes per prompt token, longest read %lld tokens\n",
+                                         (long long) ram_read_bpt_seen, (long long) ram_read_tok_seen);
+                        }
+                    }
+                    ram_last_read_tokens = 0;
                     // G7: automatic, both ways.  The learned margin (last start's) stands only until this start has two
                     // measurements; from then on the margin is this start's own second-largest drop, which can go DOWN as
                     // well as up - a wrong learned value corrects itself within two requests, no file to edit.  The file
@@ -13069,6 +13145,19 @@ int main(int argc, char** argv) {
                                          "parked RAM tier places back to the tier (%.2f GiB still parked)\n",
                                  mem->available / 1073741824.0, got / 1073741824.0,
                                  src.parked_ram_bytes() / 1073741824.0);
+                } else if (mem && g_ram_read_borrowed.load() > 0 && src.parked_ram_bytes() > 0 && mem->available > floor + ram_margin) {
+                    // 21 Nov, the safe part of the take-back: what the prompt path took from the tier for a read's working state is temporary, so it goes back first - but only as far as available RAM
+                    // stays above floor + margin (no band): the margin is kept, so the next request's give-back above does not take it again and the floor is never approached
+                    const uint64_t room = mem->available - (floor + ram_margin);
+                    const uint64_t want = std::min<uint64_t>({g_ram_read_borrowed.load(), room, src.parked_ram_bytes()});
+                    const uint64_t got = want > 0 ? src.unpark_ram(want) : 0;
+                    ram_unparked = got;
+                    const uint64_t had = g_ram_read_borrowed.load();
+                    g_ram_read_borrowed.store(got >= had || src.parked_ram_bytes() == 0 ? 0 : had - got);
+                    if (got > 0)
+                        std::fprintf(stderr, "strata serve: the read's RAM is back (%.2f GiB available, floor %.2f + margin %.2f): %.2f GiB of the tier's places the read took go back to the tier "
+                                             "(%.2f GiB still parked)\n", mem->available / 1073741824.0, floor / 1073741824.0, ram_margin / 1073741824.0, got / 1073741824.0,
+                                     src.parked_ram_bytes() / 1073741824.0);
                 }
                 // the reference for the next request's drop: the available RAM after this guard's adjustment
                 if (const auto now = strata::core::sample_host_memory(); now) ram_prev_after = now->available;
@@ -14419,6 +14508,10 @@ int main(int argc, char** argv) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                if (!batch_on() && ms >= 200.0 && b - pp_from >= 2048) {   // long reads only: a short prompt is dominated by loading experts (~2.7 s whatever its length), not a speed
+                    const double rate = (double) (b - pp_from) / ms;
+                    pf_tok_per_ms = pf_tok_per_ms > 0 ? 0.7 * pf_tok_per_ms + 0.3 * rate : rate;
+                }
                 strata::core::progress_beat();
                 std::fflush(stdout);
                 return true;
@@ -14510,7 +14603,10 @@ int main(int argc, char** argv) {
             // tail expert is set by the refill, the old expert's stays kNotResident (its bytes stay in the RAM tier or on the
             // NVMe).  An expert already in the loan keeps its own pair.  A pair takes a tail expert only when its slot holds that
             // expert's blob (slot bytes from slot_offsets; uniform slots hold any layer).  Once per prompt (tail_planned).
-            static const bool prompt_tail_env = strata::prefill::Prefill::prompt_tail_on();
+            static const bool prompt_tail_env_set = strata::prefill::Prefill::prompt_tail_on();
+            // 21 Nov: with other slots decoding (--batch), the usage table and the cache are theirs too: the tail's refill and usage seeding would shape both for THIS prompt's
+            // routing (a 13.5K-token document) and leave the decoding conversations with 79% VRAM hits instead of ~89% and 150 ms of CPU experts per window; the lent slots go back as they were
+            const bool prompt_tail_env = prompt_tail_env_set && !(o.batch > 0 && batch_on());
             int64_t tail_cand_n = 0, tail_in_vram = 0;   // the tail-hot experts not in VRAM, and those the refill now holds
             bool tail_planned = false;
             auto tail_refill_plan = [&]() {
@@ -14579,9 +14675,19 @@ int main(int argc, char** argv) {
                 // prompt needs, so a large chunk costs a short prompt nothing
                 const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
-                const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
-                                       : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
-                                                                                     : want_full;
+                int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
+                                 : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
+                                                                               : want_full;
+                // --batch-quantum-ms: with a slot decoding, a piece is what the prompt path reads in the quantum (whole 256s, at least 256): the slots wait one piece
+                if (o.batch_quantum_ms > 0 && !o.prefill_head_alias && batch_on()) {
+                    const double rate = pf_tok_per_ms > 0 ? pf_tok_per_ms : 0.3;   // 300 tokens/s until a read has been measured
+                    const int64_t q = std::max<int64_t>(256, (int64_t) ((double) o.batch_quantum_ms * rate) / 256 * 256);
+                    if (q < want_seg) {
+                        want_seg = q;
+                        std::fprintf(stderr, "strata batch: prompt pieces cut to %lld tokens (the %lld ms quantum at %.0f tok/s) while a slot decodes\n",
+                                     (long long) q, (long long) o.batch_quantum_ms, rate * 1000.0);
+                    }
+                }
                 // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
                 const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
                 if (want <= 0) {
@@ -14708,6 +14814,7 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
                 return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
             }();
+            strata::program::ReadMode read_mode_now = strata::program::ReadMode::kInterleave;   // this request's read policy (set before its segments are read)
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
@@ -15132,9 +15239,10 @@ int main(int argc, char** argv) {
                     return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
                 }();
                 const bool pr_on = piped && pr_piece > 0;
+                const bool interleave = read_mode_now == strata::program::ReadMode::kInterleave && decode_share > 0.0 && batch_on();
                 auto piece_now = [&]() -> int64_t {
                     return pr_on ? strata::program::piped_read_piece(pr_piece, C)
-                                 : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C,
+                                 : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), interleave && batch_on(), C,
                                                                      yield_chunks);
                 };
                 // the slots decode through the pipeline for budget_ms, drained before the next read
@@ -15187,6 +15295,10 @@ int main(int argc, char** argv) {
                     const double piece_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     if (pr_on && r < b0) pr_prev_piece_ms = piece_ms;
                     const int64_t piece_tokens = r - q;
+                    if (batch_on() && piece_ms > 0.0 && piece_tokens > 0) {   // the policy's read measure beside decoding slots: this piece's own time
+                        const double v = (double) piece_tokens / piece_ms;
+                        pf_beside_tok_ms = pf_beside_tok_ms > 0 ? 0.7 * pf_beside_tok_ms + 0.3 * v : v;
+                    }
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;
@@ -15225,7 +15337,7 @@ int main(int argc, char** argv) {
                                      std::chrono::duration<double, std::milli>(Clock::now() - td).count());
                         continue;
                     }
-                    if (decode_share <= 0.0 || !batch_on()) continue;
+                    if (!interleave || decode_share <= 0.0 || !batch_on()) continue;
                     const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
                     in_prompt_read = true;
@@ -15366,6 +15478,7 @@ int main(int argc, char** argv) {
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
+            ram_last_read_tokens = n - read_from;   // (for the RAM guard of the next request)
             for (PfPart& p : pf_parts) if (p.sp != nullptr) p.sp->clear_tail();   // STRATA_PROMPT_TAIL: this prompt's routing only
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
@@ -15488,6 +15601,45 @@ int main(int argc, char** argv) {
                     } else {
                         std::fprintf(stderr, "strata batch: co-prefill not done (%s); the prompts are read one by one\n", we.c_str());
                     }
+                }
+            }
+            // THE READ POLICY (batch_read_mode): with slots decoding, does this read interleave with them, or do the two take turns, and which goes first?
+            if (o.batch > 0 && stages.empty() && batch_on() && n > at && o.batch_gate_pct > 0 && dec_alone_ms_row > 0.0) {
+                int n_act = 0;
+                for (const BSlot& bsl : bs) if (bsl.active) ++n_act;
+                // unknown (no window or piece measured beside a read yet) counts as NOT efficient: the first reads go in Smith's order, and every 4th goes interleaved (below) and measures it
+                double dec_eff = 0.0;
+                {
+                    int best = -1;
+                    for (int rb = 1; rb <= 8; ++rb)
+                        if (dec_row_alone[rb] > 0.0 && dec_row_beside[rb] > 0.0 && (best < 0 || dec_row_beside_n[rb] > dec_row_beside_n[best])) best = rb;
+                    if (best > 0) dec_eff = dec_row_alone[best] / dec_row_beside[best];
+                }
+                const double pf_eff = pf_tok_per_ms > 0.0 && pf_beside_tok_ms > 0.0 ? pf_beside_tok_ms / pf_tok_per_ms : 0.0;
+                const double read_ms = (double) (n - at) / (pf_tok_per_ms > 0.0 ? pf_tok_per_ms : 0.3);
+                const double ms_tok_slot = dec_alone_ms_row * (double) n_act;   // each slot gets rows / n_act tokens per window
+                const double est_total = len_ewma > 0 ? len_ewma : 256.0;
+                std::vector<double> work;
+                for (const BSlot& bsl : bs)
+                    if (bsl.active) {
+                        const double cap = (double) std::max<int64_t>(bsl.max_new - bsl.produced, 1);
+                        work.push_back(std::min(std::max(est_total - (double) bsl.produced, 16.0), cap) * ms_tok_slot);
+                    }
+                strata::program::ReadMode m = strata::program::batch_read_mode(work, read_ms, dec_eff, pf_eff, o.batch_gate_pct);
+                if (m != strata::program::ReadMode::kInterleave && (gate_skipped++ % 4) == 3) m = strata::program::ReadMode::kInterleave;   // refresh the 'beside' measures now and then
+                read_mode_now = m;
+                std::fprintf(stderr, "strata batch: read policy: %s (decode %.0f%%, read %.0f%% of the alone speed, gate %d%%; read ~%.0f s alone, %d slots with ~%.0f tokens each left)\n",
+                             m == strata::program::ReadMode::kInterleave ? "interleave" : m == strata::program::ReadMode::kDecodeFirst ? "the slots first" : "the read first",
+                             100.0 * dec_eff, 100.0 * pf_eff, o.batch_gate_pct, read_ms / 1000.0, n_act, est_total);
+                if (m == strata::program::ReadMode::kDecodeFirst) {   // the slots run on, whole windows, until they are done or the read has waited defer_pct of its own time
+                    const double cap_ms = (double) o.batch_defer_pct / 100.0 * read_ms;
+                    const auto td = Clock::now();
+                    while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < cap_ms) {
+                        if (!batch_step()) { std::printf("ERR a batch window failed\n"); std::fflush(stdout); return 1; }
+                    }
+                    std::fprintf(stderr, "strata batch: the slots ran %.1f s before the read%s\n", std::chrono::duration<double, std::milli>(Clock::now() - td).count() / 1000.0,
+                                 batch_on() ? " (the cap: the read goes now, the slots wait)" : " (they are done)");
+                    if (batch_on()) read_mode_now = strata::program::ReadMode::kReadFirst;
                 }
             }
             for (const int64_t to : cuts) {

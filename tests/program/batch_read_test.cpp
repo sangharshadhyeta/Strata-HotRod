@@ -5,7 +5,9 @@
 #include <cstring>
 #include <iterator>
 
+using strata::program::batch_read_mode;
 using strata::program::batch_read_piece;
+using strata::program::ReadMode;
 using strata::program::concurrent_read_off;
 using strata::program::ConcurrentReadSetup;
 using strata::program::piped_decode_budget_ms;
@@ -83,6 +85,18 @@ int main() {
     CHECK(!piped_read_lead_in(true, true, -1.0, 400.0));
     CHECK(!piped_read_lead_in(false, true, 0.0, 400.0));
     CHECK(!piped_read_lead_in(true, false, 0.0, 400.0));
+    // the read policy: efficient interleaving stays; otherwise Smith's order
+    const std::vector<double> three_shorts = {55000.0, 55000.0, 55000.0};   // 3 slots with ~55 s of decoding left, the read 41 s alone
+    CHECK(batch_read_mode(three_shorts, 41000.0, 0.9, 0.9, 50) == ReadMode::kInterleave);       // both efficient
+    CHECK(batch_read_mode(three_shorts, 41000.0, 0.6, 0.67, 50) == ReadMode::kInterleave);      // 0.6 and 0.67 pass a 50% gate (the speeds the user called good)
+    CHECK(batch_read_mode(three_shorts, 41000.0, 0.6, 0.57, 75) == ReadMode::kDecodeFirst);     // the measured 21 Nov numbers fail a 75% gate: 3/55000 > 1/41000, decode first
+    CHECK(batch_read_mode(three_shorts, 41000.0, 0.4, 0.9, 50) == ReadMode::kDecodeFirst);      // decode efficiency below the gate
+    CHECK(batch_read_mode(three_shorts, 41000.0, 0.9, 0.4, 50) == ReadMode::kDecodeFirst);      // read efficiency below the gate
+    CHECK(batch_read_mode({200000.0, 200000.0, 200000.0}, 41000.0, 0.4, 0.4, 50) == ReadMode::kReadFirst);   // slots with 200 s left each: the read first (3/200000 < 1/41000)
+    CHECK(batch_read_mode({2000.0, 2000.0, 90000.0}, 41000.0, 0.4, 0.4, 50) == ReadMode::kDecodeFirst);      // two nearly done: m = 2 gives 2/2000 = 1e-3 > 1/41000
+    CHECK(batch_read_mode(three_shorts, 500.0, 0.4, 0.4, 50) == ReadMode::kReadFirst);          // a short read (0.5 s) beats any slot group: 1/500 > 3/55000
+    CHECK(batch_read_mode(three_shorts, 41000.0, 0.1, 0.1, 0) == ReadMode::kInterleave);        // gate 0: always interleave
+    CHECK(batch_read_mode({}, 41000.0, 0.1, 0.1, 50) == ReadMode::kInterleave);                 // no slot: nothing to order
     if (fails == 0) std::printf("batch_read_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
