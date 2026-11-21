@@ -294,6 +294,15 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 namespace {
 
 #if defined(__linux__)
+/// True when `path` is a cgroup v2 group whose cgroup.controllers is readable and does not list "memory".
+bool cgroup_lacks_memory_controller(const std::filesystem::path& path) {
+    std::ifstream input(path / "cgroup.controllers");
+    if (!input) return false;
+    for (std::string name; input >> name;)
+        if (name == "memory") return false;
+    return input.eof();
+}
+
 bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current,
                              detail::CgroupMemoryStat& stat) {
     std::ifstream input(path / "memory.stat");
@@ -383,9 +392,12 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             std::string limit;
             uint64_t current = 0;
             const bool readable = bool(limit_file >> limit) && bool(current_file >> current);
-            // The host's root cgroup has no memory.max; ordinary child groups must expose their limits.
-            if (!readable && !(path == root && !std::filesystem::exists(path / "memory.max") &&
-                               std::filesystem::exists(path / "cgroup.controllers"))) return false;
+            // The host's root cgroup has no memory.max; ordinary child groups must expose their limits - unless the
+            // parent leaves the memory controller off, so the group's cgroup.controllers does not list it (elogind
+            // sessions on sysvinit hosts, such as Devuan): no limit at that level.
+            if (!readable && !(!std::filesystem::exists(path / "memory.max") &&
+                               (path == root ? std::filesystem::exists(path / "cgroup.controllers")
+                                             : cgroup_lacks_memory_controller(path)))) return false;
             if (readable && limit != "max") {
                 try {
                     size_t consumed = 0;
@@ -3715,11 +3727,19 @@ bool host_ram_room(uint64_t reserve, HostRamRoom& out) {
     std::ifstream info("/proc/meminfo");
     std::stringstream text;
     text << info.rdbuf();
-    const uint64_t total = detail::meminfo_bytes(text.str(), "MemTotal");
-    const uint64_t avail = detail::meminfo_bytes(text.str(), "MemAvailable");
-    if (total == 0) return false;   // no /proc/meminfo (not Linux): the warm is Linux only anyway
+    uint64_t total = detail::meminfo_bytes(text.str(), "MemTotal");
+    uint64_t avail = detail::meminfo_bytes(text.str(), "MemAvailable");
     // The engine's memory limit: the cgroup's (memory.max, minus its usage) when that is lower than MemAvailable.
     const auto mem = sample_host_memory();
+    if (total == 0) {
+        // No /proc/meminfo (Windows): sample_host_memory's own probe (GlobalMemoryStatusEx: the smaller of free
+        // physical RAM and the commit limit, #1607; its `limit` carries total physical RAM) sizes --resident-budget-gib
+        // auto the same way - the RAM tier itself runs on Windows (VirtualLock pinning).  The page-cache warm below
+        // stays Linux only anyway.  false when that probe fails too.
+        if (!mem || mem->available == 0) return false;
+        total = mem->limit;
+        avail = mem->available;
+    }
     const uint64_t room = mem && mem->available > 0 ? std::min<uint64_t>(avail, mem->available) : avail;
     uint64_t keep = reserve + kernel_high_watermark_bytes();
     if (const char* h = std::getenv("STRATA_PAGECACHE_WARM_HEADROOM_GIB"))
@@ -3919,6 +3939,14 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: RAM budget %.2f GiB: %lld of the %.2f GiB of experts the GPU cache does "
                              "not hold, by profile rank; the rest are read from the files\n",
                      (double) budget_bytes / 1073741824.0, (long long) held, (double) bytes / 1073741824.0);
+        {   // the storage profile: does the RAM tier hold every expert the GPU cache does not?
+            int64_t non_gpu = 0;
+            for (uint64_t off : offsets) non_gpu += off != kNoComplement;
+            all_in_ram_ = non_gpu > 0 && held >= non_gpu;
+            std::fprintf(stderr, "FileExpertSource: storage: %lld experts in the GPU cache, %lld in RAM, %lld only in the files%s\n",
+                         (long long) ((int64_t) offsets.size() - non_gpu), (long long) held, (long long) (non_gpu - held),
+                         all_in_ram_ ? " - every expert is in VRAM or RAM: no read from the files is ever needed" : "");
+        }
         // The prompt path's lend region under a budget.  Until now a budget turned the loan off (`lend_from_slot = -1`
         // below), so every lent slot's expert was read from the pack during every prompt chunk and again when the slot
         // was refilled after the prompt - even with room left in the budget.  Measured on an RX 6900 XT 16 GB with

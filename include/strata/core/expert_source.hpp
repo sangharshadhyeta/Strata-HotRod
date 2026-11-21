@@ -158,7 +158,8 @@ int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std:
 /// The RAM this process may fill, sized the one way the page-cache warm's auto and `--resident-budget-gib auto` both use:
 /// the smaller of MemAvailable and the engine's memory limit's available, less `reserve` (what the engine allocates later)
 /// and the kernel's high watermarks.  STRATA_PAGECACHE_WARM_HEADROOM_GIB, when set, replaces that sum.  `note` receives
-/// the sizing for a log line.  0 when /proc/meminfo cannot be read.
+/// the sizing for a log line.  0 when neither /proc/meminfo nor the platform's own probe (Windows: GlobalMemoryStatusEx)
+/// can be read.
 uint64_t host_ram_room_bytes(uint64_t reserve, std::string* note = nullptr);
 
 /// Where one routed expert's bytes come from.
@@ -841,6 +842,11 @@ public:
     bool promotions_pending() const;
     /// True when (layer, expert) is held by the RAM tier now (a place, or the exchange ownership table; see ram_tier).
     bool in_ram_tier(int64_t layer, int64_t expert) const;
+    /// True when the RAM tier holds EVERY expert the GPU cache does not (set when the complement is sized): no expert is file-resident, so no read
+    /// from the files can ever be needed and the file tier's read-ahead has nothing to do (HotRod, 21 Nov; the scheduler's storage profile).  A big-RAM
+    /// PC is in this state; a PC whose RAM is smaller than the experts is not.  Today it is reported (log, INFO); the scheduler acts on it.
+    bool all_in_ram() const { return all_in_ram_; }
+    bool all_in_ram_ = false;   ///< see all_in_ram() (set when the complement is sized; one writer, read after the start)
     /// STRATA_CONV_FILL: promotes the candidates, in order, on ONE background thread (the look-ahead promotion, promote_read,
     /// with the same free-place rule; a full queue waits 2 ms and retries the same candidate, 2000 times at most).  A new call
     /// stops and joins the previous thread first; close() does the same.  Prints one line when the thread ends.

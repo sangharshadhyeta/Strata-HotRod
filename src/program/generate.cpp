@@ -3311,6 +3311,27 @@ int main(int argc, char** argv) {
         return 2;
     }
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
+    // The residency profile learns by default (serve mode; HotRod, 21 Nov; STRATA_LEARN_PROFILE=0 turns it off): the engine saves what its adaptive
+    // tier learned as profile-learned.bin beside the shipped profile (every 10 minutes and at QUIT), and the next start fills the GPU cache and the RAM
+    // tier from it when it exists and is for the same layers x experts.  Qwen UD-Q4_K_XL on a 12 GB RTX 3060 at 262K, cold start: the first questions
+    // 16.1 -> 16.1 / 19.7 -> 22.3 / 22.9 -> 24.6 tok/s on the second start (one draw, inside the +-1.5 tok/s run-to-run noise); on Edge0-145B 14.6 -> 20.0.
+    // An --expert-profile-save of its own wins.
+    if (o.serve && !o.expert_profile.empty() && o.expert_profile_save.empty() &&
+        [] { const char* v = std::getenv("STRATA_LEARN_PROFILE"); return v == nullptr || std::atoi(v) != 0; }()) {
+        namespace fs = std::filesystem;
+        std::error_code pec;
+        const fs::path shipped = o.expert_profile;
+        const fs::path learned = (shipped.parent_path().empty() ? fs::path(".") : shipped.parent_path()) / "profile-learned.bin";
+        o.expert_profile_save = learned.string();
+        if (fs::exists(learned, pec) && profile_dims_match(learned, shipped)) {
+            o.expert_profile = learned.string();
+            std::fprintf(stderr, "strata generate: the learned residency profile %s is used (saved on the way; STRATA_LEARN_PROFILE=0 turns it off)\n",
+                         learned.string().c_str());
+        } else {
+            std::fprintf(stderr, "strata generate: the residency profile will be learned and saved to %s (STRATA_LEARN_PROFILE=0 turns it off)\n",
+                         learned.string().c_str());
+        }
+    }
     // The RAM tier is the default in files mode (--mmap-experts with a static profile and no RAM budget given): VRAM -> RAM ->
     // NVMe, the tier an overlay on files mode's I/O, the look-ahead promoting into it - the same settings as
     // --resident-budget-gib auto, set here where that flag's are.  20 Oct, 262144 context: decode +5% (8.5k) / +11% (45k),
@@ -6126,7 +6147,8 @@ int main(int argc, char** argv) {
         std::string room_note;
         uint64_t room = strata::core::host_ram_room_bytes(0, &room_note);
         if (room == 0) {
-            std::fprintf(stderr, "strata generate: --resident-budget-gib auto: no RAM room could be read (/proc/meminfo)\n");
+            std::fprintf(stderr, "strata generate: --resident-budget-gib auto: no RAM room could be read (/proc/meminfo, "
+                                 "or the Windows memory probe)\n");
             return 2;
         }
         // 20 Oct: the memory floor (--conversation-cache-min-free-mib) stays free - the tier takes only the room above it.

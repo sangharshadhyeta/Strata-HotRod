@@ -570,15 +570,16 @@ With more than one model installed, it asks which one to start. `run-<model>.bat
   measures the adopted set against all defaults and puts every knob back if the defaults are faster. What it learned is `<pack>/online-tune.txt`
   and the next start begins from it. `STRATA_ONLINE_TUNE=0` turns it off. It is on by default, so a PC that is never calibrated is tuned live.
   `--calibrate` runs the same tuner as a burst (one engine start, `STRATA_ONLINE_TUNE=burst`, the learners training with `STRATA_LA_LEARN=1`, real
-  answers until the state file says settled), with no restarts: minutes instead of the 80-90 of the first version, which tuned one setting at a
-  time and restarted the engine about 30 times. Its picks each won alone on short answers and together decoded 13.6 / 15.6 / 17.0 / 9.8 tok/s where
-  the defaults did 15.3 / 20.6 / 24.8 / 15.8. The worker count, the learned look-ahead's buffers and stand-ins are not tuned live (they are fixed at
-  start; stand-ins were worth 2.5x on a 12 GB card).
+  answers until the state file says settled), with no restarts: 275 seconds on the 3060 (model load included), against the 80-90 minutes of the first
+  version, which tuned one setting at a time and restarted the engine about 30 times; its picks each won alone on short answers and together decoded
+  13.6 / 15.6 / 17.0 / 9.8 tok/s where the defaults did 15.3 / 20.6 / 24.8 / 15.8. The worker count, the learned look-ahead's buffers and stand-ins
+  are not tuned live (fixed at start; stand-ins were worth 2.5x on a 12 GB card).
   Measured on the 12 GB RTX 3060 (Qwen3.8-Flash-Next UD-Q4_K_XL, 262K, cold start, no saved state, 14 long answers): it settled on the defaults (64
   swaps, decay 0.7, draft floor 0.5, tail skip 7) - nothing was more than 3% faster - at 25.6 tok/s on average against 25.4 with the tuner off.
   Simulated engines (src/core/online_tuner_test.cpp, noise 25% a window, drift, 20 seeds): a real 8% win is found in 20/20 runs, drift alone
   adopts nothing, a pair of settings that help alone and hurt together never ends slower than the defaults, a bad candidate runs in under 2% of the
-  windows. Not measured: a card with more VRAM, where the defaults may be further from the best.
+  windows. Not measured: a card with more VRAM, where the defaults may be further from the best. The design of the next step, one scheduler for
+  where experts live and when they move: docs/SCHEDULER.md.
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup runs the engine's tuner on your PC after the install (HotRod,
 21 Nov: by default; `--no-calibrate` skips it, and the engine keeps tuning itself live either way; a PC that was tuned before is not tuned again); `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
