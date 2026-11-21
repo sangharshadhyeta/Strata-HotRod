@@ -107,7 +107,9 @@ with each model passing its own test before the next step.
 0. **Edge0 into main.** Fast-forward `main` to `hotrod-edge0` once the Edge0 model has had a live smoke run after the last merge (not yet done).
    Until then Edge0's model is a branch-only feature.
 1. **Fast start.** Say READY once the dense weights are loaded; fill the expert pools while serving (GPU pools first in the profile's order, then
-   RAM), with `EXPERT_FILL` in the memory report. His numbers (Strix Halo): Qwen READY after 9-10 s instead of 38 s. Ours takes about 4-5 minutes.
+   RAM), with `EXPERT_FILL` in the memory report. His numbers (Strix Halo): Qwen READY after 9-10 s instead of 38 s. Ours, measured 21 Nov on Qwen UD-Q4_K_XL (12 GB card, 31 GB RAM, NVMe): READY after 18-23 s
+   (warm and cold file cache), the first answer at ready 14-23 tok/s against 22-25 once warm, a 13.5K-token prompt right at ready 321 tok/s against 332 (-3.5%); the earlier
+   "4-5 minutes" does not hold on this machine.  Little to win here: not built (a slower disk or a bigger model could change that).
    Test here: time to READY and first-token speed before and after, same prompt, tokens identical. Risk: a request during the fill meets cold
    experts; the fill must yield to a request (our tuner already skips windows while a request is not running).
 2. **Check the conversation-memory claim.** His finding: two conversation slots allocate three context windows. Measure our allocation per slot at
@@ -120,7 +122,8 @@ with each model passing its own test before the next step.
    the bar to keep).
 5. **One scheduler on that engine** (docs/SCHEDULER.md): the single owner of slot/RAM/file placement, the drive model, admission. Large-RAM setups
    skip file read-ahead when `all_in_ram()`; needs a big-RAM machine to test.
-6. **Edge0** as a third adapter (latent attention path), after step 4 passes for both others.
+6. **Edge0** as a third adapter (the same `qwen4exp` architecture and dense backbone as Qwen, with latent experts: D/U Q4_0 in 8 groups of 1792-wide experts, 512 per layer; checked in
+   the engine log 21 Nov, when the current binary served Edge0-145B at 23-29 tok/s with stand-ins), after step 4 passes for both others.
 
 ## AMD
 

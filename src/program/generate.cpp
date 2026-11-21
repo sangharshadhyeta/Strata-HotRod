@@ -12099,6 +12099,10 @@ int main(int argc, char** argv) {
         // with no read / with a read beside, and how many windows the 'beside' mean holds
         double dec_row_alone[9] = {}, dec_row_beside[9] = {};
         int dec_row_beside_n[9] = {};
+        // the RAMP after a read: the first 40 batch windows after a read ends, in four groups (1-4, 5-8, 9-16, 17-40): total ms, rows and count, printed once - where the slow start of the slots goes
+        int ramp_left = 0, ramp_idx = 0, ramp_n[4] = {};
+        double ramp_ms[4] = {}, ramp_wait[4] = {}, ramp_pool[4] = {}, ramp_adapt[4] = {}, ramp_wait_prev = 0, ramp_pool_prev = 0, ramp_adapt_prev = 0;
+        int64_t ramp_rows[4] = {};
         double pf_tok_per_ms = 0;   // the prompt path's speed with no slot decoding beside it (smoothed over the reads that took 200 ms or more): the quantum's conversion to tokens
         int64_t pipe_rows = 0;   // the pipelined groups' rows, never reset (bt_rows restarts when the slots go idle)
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
@@ -12488,6 +12492,25 @@ int main(int argc, char** argv) {
                 double& eb = in_prompt_read ? dec_row_beside[rb] : dec_row_alone[rb];
                 eb = eb > 0 ? 0.8 * eb + 0.2 * v : v;
                 if (in_prompt_read) ++dec_row_beside_n[rb];
+                if (ramp_left > 0 && !in_prompt_read) {
+                    const int g = ramp_idx < 4 ? 0 : ramp_idx < 8 ? 1 : ramp_idx < 16 ? 2 : 3;
+                    ramp_ms[g] += msd(w0, w2);
+                    {   // the split of this window: the GPU-reach wait and the CPU experts (the verifier's running totals), and the adaptive tier's wait
+                        const double wt = stage_verifier(0).ms_wait, pl = stage_verifier(0).ms_pool;
+                        if (ramp_idx > 0) { ramp_wait[g] += wt - ramp_wait_prev; ramp_pool[g] += pl - ramp_pool_prev; ramp_adapt[g] += bt_adapt_wait - ramp_adapt_prev; }
+                        ramp_wait_prev = wt; ramp_pool_prev = pl; ramp_adapt_prev = bt_adapt_wait;
+                    }
+                    ramp_rows[g] += win_rows;
+                    ++ramp_n[g];
+                    ++ramp_idx;
+                    if (--ramp_left == 0) {
+                        static const char* names[4] = {"1-4", "5-8", "9-16", "17-40"};
+                        for (int q = 0; q < 4; ++q)
+                            std::fprintf(stderr, "strata batch: ramp after a read, windows %s: %.0f ms/window = GPU-reach wait %.0f + CPU experts %.0f + adaptive tier wait %.1f (%.2f rows)\n", names[q],
+                                         ramp_n[q] ? ramp_ms[q] / ramp_n[q] : 0.0, ramp_n[q] ? ramp_wait[q] / ramp_n[q] : 0.0, ramp_n[q] ? ramp_pool[q] / ramp_n[q] : 0.0,
+                                         ramp_n[q] ? ramp_adapt[q] / ramp_n[q] : 0.0, ramp_n[q] ? (double) ramp_rows[q] / ramp_n[q] : 0.0);
+                    }
+                }
             }
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
@@ -15728,6 +15751,13 @@ int main(int argc, char** argv) {
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
+            }
+            // STRATA_RAMP_LOG=1 (diagnostic, off by default): the first 40 windows after a read, split into GPU-reach wait, CPU experts and the adaptive tier's wait.  Measured 21 Nov (Qwen, 12 GB,
+            // --batch 4): the slots' CPU experts run 160-260 ms (settled: 83) for about 8-16 windows after a read - 2-4 s per read, under 5 percent of a mixed run
+            static const bool ramp_log_on = [] { const char* v = std::getenv("STRATA_RAMP_LOG"); return v != nullptr && std::atoi(v) != 0; }();
+            if (ramp_log_on && o.batch > 0 && batch_on()) {   // the slots decode on after this read: their first windows are measured (the ramp line)
+                ramp_left = 40; ramp_idx = 0;
+                for (int g = 0; g < 4; ++g) { ramp_n[g] = 0; ramp_ms[g] = ramp_wait[g] = ramp_pool[g] = ramp_adapt[g] = 0.0; ramp_rows[g] = 0; }
             }
             tail_refill_plan();   // (the last read's tail when it was not planned at the windows above)
             if (!refill(err)) {
