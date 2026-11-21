@@ -950,6 +950,8 @@ class StrataEngine:
         self.batch = int(self.info.get("batch_slots") or 0)
         # --batch-context: the cells a slot's session holds (0: as many as the main session); a request that would outgrow one runs solo
         self.slot_cells = int(self.info.get("batch_cells") or 0)
+        # CO-PREFILL (the engine's opt-in STRATA_COPREFILL, announced as INFO coprefill=1): the prompts waiting beside a request are read into their own slots together with it
+        self.coprefill = self.info.get("coprefill") == "1" and self.batch > 1
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
@@ -989,6 +991,7 @@ class StrataEngine:
             self.slot_cv = threading.Condition()
             self.waiting = 0                            # requests waiting for the control lines (ctl)
             self.long_waiters = 0                       # --batch-context: requests too long for a slot, waiting for the slots to go idle
+            self.warm_slot: dict = {}                   # co-prefill: request id -> the slot reserved for it by the request whose read warmed it
             self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
@@ -1478,11 +1481,11 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False, need: int = 0):
+    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False, need: int = 0, ids=None, rid=None):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
         `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
-        entry = [plen, time.monotonic(), new, need]     # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST, tokens it needs: prompt + max_new, 0 = unknown)
+        entry = [plen, time.monotonic(), new, need, ids, None, rid]   # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST, tokens it needs: prompt + max_new (0 = unknown), its prompt ids (co-prefill), -, its id)
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1567,6 +1570,57 @@ class StrataEngine:
             # request must not go back to solo then - the two would race for the engine and the long one would run first)
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0 and self.long_waiters == 0
 
+    COPREFILL_MAX_TOKENS = 1536     # a waiting prompt this long or shorter is read together with the request in hand
+    COPREFILL_MAX_TOTAL = 6000      # ... and at most this many tokens in all (the prompt path's chunk)
+
+    def _collect_warm(self, rid) -> str:
+        """CO-PREFILL: the `warm=` key for the request about to be sent to a slot: the short prompts waiting for the control lines, each with a free slot reserved for it (that
+        request takes the slot when its turn comes), so the engine reads them all in one layer-major run and each finds its slot warm.  "" when the engine does not offer it or
+        fewer than two short prompts are waiting."""
+        if not self.coprefill:
+            return ""
+        items, total = [], 0
+        with self.slot_cv:
+            for e in list(self.wait_lens):
+                ids = e[4] if len(e) > 6 else None
+                erid = e[6] if len(e) > 6 else None
+                if ids is None or erid is None or erid == rid or erid in self.warm_slot:
+                    continue
+                if not 2 <= len(ids) <= self.COPREFILL_MAX_TOKENS or total + len(ids) > self.COPREFILL_MAX_TOTAL:
+                    continue
+                if self.slot_cells > 0 and (e[3] > self.slot_cells or len(ids) > self.slot_cells):
+                    continue
+                slot = self.pick_slot(ids)
+                if slot is None:
+                    break
+                self.slot_busy[slot] = True
+                self.slot_claims.add(slot)
+                self.warm_slot[erid] = slot
+                items.append((erid, slot, ids))
+                total += len(ids)
+                if len(items) >= 7:
+                    break
+            if len(items) < 2:                      # one waiting prompt is no co-prefill: it is read in its turn as usual; give the reservation back
+                for erid, slot, _ in items:
+                    self.warm_slot.pop(erid, None)
+                    self.slot_busy[slot] = False
+                    self.slot_claims.discard(slot)
+                if items:
+                    self.slot_cv.notify_all()
+                return ""
+            for _, slot, ids in items:
+                self.slot_held[slot] = list(ids[:-1])
+        return " warm=" + ";".join(f"{slot}:{','.join(str(int(t)) for t in ids)}" for _, slot, ids in items)
+
+    def _release_warm(self, rid) -> None:
+        """A slot reserved for a request that never took it (cancelled, an error): back to the pool."""
+        slot = self.warm_slot.pop(rid, None)
+        if slot is not None:
+            with self.slot_cv:
+                self.slot_busy[slot] = False
+                self.slot_claims.discard(slot)
+                self.slot_cv.notify_all()
+
     def _waiter_fits_slot(self) -> bool:
         """Some request waits for the control lines that could be taken into a batch slot (its prompt + max_new within --batch-context; unknown counts as fitting)."""
         with self.slot_cv:
@@ -1604,8 +1658,11 @@ class StrataEngine:
         orig_len = len(prompt)  # a leg that continues (prompt + what it generated) names where the reply began: pen_from, the penalty window's start
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
-        ok = yield from self._take_control(cancel, len(prompt), new=True, need=len(prompt) + int(max_new))
+        rid = object()                                  # this request's identity for a co-prefill reservation
+        ok = yield from self._take_control(cancel, len(prompt), new=True, need=len(prompt) + int(max_new),
+                                           ids=None if embeddings else list(prompt), rid=rid)
         if not ok:
+            self._release_warm(rid)
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
         btrace("ctl acquired")
@@ -1709,10 +1766,13 @@ class StrataEngine:
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
                         while True:
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = self.warm_slot.pop(rid, None)      # co-prefill: a slot already claimed for this request, warm with its prompt
+                                if slot is None:
+                                    slot = self.pick_slot(prompt)
+                                    if slot is not None:
+                                        self.slot_busy[slot] = True
+                                        self.slot_claims.add(slot)
                                 if slot is not None:
-                                    self.slot_busy[slot] = True
-                                    self.slot_claims.add(slot)
                                     if admit_wait:
                                         admit_wait = False
                                         self.admitting = max(0, self.admitting - 1)
@@ -1759,7 +1819,8 @@ class StrataEngine:
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
                     pf = f" pen_from={orig_len - 1}" if len(prompt) > orig_len else ""
-                    head = f"BGENI {slot} {left}{keys}{pf} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}{pf}"
+                    warm = "" if embeddings else self._collect_warm(rid)
+                    head = f"BGENI {slot} {left}{keys}{pf} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}{pf}{warm}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
@@ -1878,6 +1939,7 @@ class StrataEngine:
                             break
                         return
         finally:
+            self._release_warm(rid)                     # a slot reserved for this request by a co-prefill that it did not take
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
             try:

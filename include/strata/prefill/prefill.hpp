@@ -191,6 +191,18 @@ public:
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 
+    /// CO-PREFILL (docs/CO_PREFILL.md; the engine's opt-in STRATA_COPREFILL): several FRESH prompts, each read into its own session, in ONE layer-major run, so a layer's
+    /// experts are loaded once for all of them (a short prompt's read is dominated by loading experts: 74 tokens read 7 GB from the SSD).  Each job is `n` tokens at
+    /// positions [0, n) of its session, n at most one chunk (chunk()); the session must be clean (session_zero: ple_prev -1) and has the main session's geometry.  The
+    /// sessions need not carry the PLE tables: each job borrows the main session's and keeps its own history.  Same results as run() per job.  False with `err` starting
+    /// "co-prefill:" and NOTHING read when the layer-major path cannot take the run (the caller reads the prompts one by one); any other error is a failed read.
+    struct MultiJob {
+        const int64_t* tokens = nullptr;
+        int64_t n = 0;
+        core::SessionState* ss = nullptr;
+    };
+    bool run_multi(const std::vector<MultiJob>& jobs, std::string& err);
+
     const PrefillStats& stats() const { return stats_; }
 
     /// STRATA_PROMPT_TAIL (default on; 0: off, the vectors stay empty).  The routing of the last chunk of the last run
@@ -317,6 +329,8 @@ private:
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
+    struct MultiCtx;                    ///< run_multi's job table, alive only inside that call
+    MultiCtx* multi_ = nullptr;
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)

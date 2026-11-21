@@ -11814,7 +11814,9 @@ int main(int argc, char** argv) {
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups) +
-                                       (o.batch_cells > 0 ? " batch_cells=" + std::to_string(o.batch_cells) : std::string())).c_str() : "");
+                                       (o.batch_cells > 0 ? " batch_cells=" + std::to_string(o.batch_cells) : std::string()) +
+                                       ([] { const char* v = std::getenv("STRATA_COPREFILL"); return v != nullptr && std::atoi(v) != 0; }() && !o.batch_mtp
+                                                 ? std::string(" coprefill=1") : std::string())).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -13457,6 +13459,11 @@ int main(int argc, char** argv) {
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
+            // CO-PREFILL (STRATA_COPREFILL, opt-in; docs/CO_PREFILL.md): warm=<slot>:<ids>;<slot>:<ids> - OTHER waiting short prompts of the server, whose prefixes (all but each last
+            // token) are read into their own batch slots in one layer-major run before this request's read; their own requests then find the slot warm.  Unknown to an older engine
+            // (skipped like any unknown key).
+            struct WarmJob { int slot = -1; std::vector<int64_t> ids; };
+            std::vector<WarmJob> req_warm;
             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
@@ -13472,6 +13479,22 @@ int main(int argc, char** argv) {
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "pen_from") req_pen_from = std::atoll(tok.c_str() + eq + 1);
+                    else if (key == "warm") {
+                        const std::string v = tok.substr(eq + 1);
+                        for (size_t at = 0; at < v.size() && req_warm.size() < 7;) {
+                            const size_t semi = v.find(';', at);
+                            const std::string item = v.substr(at, semi == std::string::npos ? std::string::npos : semi - at);
+                            const size_t colon = item.find(':');
+                            if (colon != std::string::npos) {
+                                WarmJob w;
+                                w.slot = std::atoi(item.c_str());
+                                std::string wpe;
+                                if (parse_i64_list(item.c_str() + colon + 1, w.ids, wpe)) req_warm.push_back(std::move(w));
+                            }
+                            if (semi == std::string::npos) break;
+                            at = semi + 1;
+                        }
+                    }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
@@ -15367,6 +15390,59 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+            // CO-PREFILL: the prompts the server sent with this request (warm=) are read into their slots together, so each layer's experts load once for all of them
+            static const bool co_prefill_on = [] { const char* v = std::getenv("STRATA_COPREFILL"); return v != nullptr && std::atoi(v) != 0; }();
+            if (co_prefill_on && !req_warm.empty() && o.batch > 0 && !batch_mtp && !slot_draft_keep && stages.empty() && !multi_gpu && o.peer_device < 0 &&
+                !pf_parts.empty() && !cancelled) {
+                std::vector<std::vector<int64_t>> pres;
+                std::vector<int> warm_slots;
+                std::vector<strata::prefill::Prefill::MultiJob> jobs;
+                pres.reserve(req_warm.size());
+                int64_t total = 0;
+                for (const WarmJob& w : req_warm) {
+                    const size_t b = (size_t) w.slot;
+                    if (w.slot < 0 || b >= bs.size() || bs[b].active || w.ids.size() < 2 || (int64_t) w.ids.size() - 1 > bslot_ss[0][b]->max_cells ||
+                        std::find(warm_slots.begin(), warm_slots.end(), w.slot) != warm_slots.end())
+                        continue;
+                    pres.emplace_back(w.ids.begin(), w.ids.end() - 1);
+                    warm_slots.push_back(w.slot);
+                    total += (int64_t) pres.back().size();
+                }
+                for (size_t j = 0; j < pres.size(); ++j)
+                    jobs.push_back({pres[j].data(), (int64_t) pres[j].size(), bslot_ss[0][(size_t) warm_slots[j]].get()});
+                if (jobs.size() >= 2) {
+                    const auto tw = Clock::now();
+                    std::string we;
+                    bool read_ok = lend(total, we, 0);
+                    if (read_ok) {
+                        for (const int b : warm_slots) {
+                            bs[(size_t) b] = BSlot{};   // the slot's old conversation goes: its session is rewritten
+                            strata::core::session_zero(*bslot_ss[0][(size_t) b], g, nullptr, nullptr);
+                        }
+                        if (cudaDeviceSynchronize() != cudaSuccess) { we = "co-prefill: device sync failed"; read_ok = false; }
+                        if (read_ok) read_ok = sp.run_multi(jobs, we);
+                        if (cudaDeviceSynchronize() != cudaSuccess && read_ok) { we = "co-prefill: device sync failed"; read_ok = false; }
+                    }
+                    std::string re;
+                    if (!refill(re)) {   // the loan always goes back
+                        std::printf("ERR refilling a lent slot failed: %s\n", re.c_str());
+                        return 1;
+                    }
+                    if (read_ok) {
+                        for (size_t j = 0; j < warm_slots.size(); ++j) {
+                            BSlot& sl = bs[(size_t) warm_slots[j]];
+                            sl = BSlot{};
+                            sl.ids.assign(pres[j].begin(), pres[j].end());
+                            sl.cached = o.prompt_cache > 0;
+                            sl.cvec = cvec_cached;
+                        }
+                        std::fprintf(stderr, "strata batch: co-prefill read %zu prompts (%lld tokens) into slots in %.1f ms\n", warm_slots.size(), (long long) total,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
+                    } else {
+                        std::fprintf(stderr, "strata batch: co-prefill not done (%s); the prompts are read one by one\n", we.c_str());
+                    }
+                }
+            }
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();

@@ -51,6 +51,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -2826,6 +2827,12 @@ struct PrefillStandin {
 };
 }  // namespace
 
+struct Prefill::MultiCtx {
+    std::vector<int64_t> len;
+    std::vector<core::SessionState*> ss;
+    std::vector<std::array<int32_t, 2>> prev0, prev_out;
+};
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     // solid.cpp's silent-corruption bug class (a failed prefill copy still published its slot): a copy call that RETURNS an error (an argument error is not
     // a stream error, so the stream check at the end of the chunk does not see it) is recorded here and fails the request, loudly
@@ -2944,6 +2951,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
+    core::SessionState& ss_main = ss;   // (co-prefill: run_chunk shadows `ss` with the chunk's own session)
     const bool ple_on = ss.ple.ready() && LB <= 1 && 1 < LE;
     // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
     // STRATA_PLE_BATCH=0 keeps the per-token block (the A/B)
@@ -2955,10 +2963,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(C, n - c0);
+    auto ple_gather = [this, &m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = multi_ != nullptr ? multi_->len[(size_t) (c0 / C)] : std::min(C, n - c0);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
+        if (multi_ != nullptr) {   // co-prefill: a job starts from its own session's history, not from the job before it in the padded array
+            pv[0] = multi_->prev0[(size_t) (c0 / C)][0];
+            pv[1] = multi_->prev0[(size_t) (c0 / C)][1];
+        }
         for (int64_t t = 0; t < T; ++t) {
             const int32_t tok = (int32_t) tokens[c0 + t];
             strata::kernels::ngram_rows(&tok, pv, 1, ss.ple.consts,
@@ -3126,7 +3138,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     };
     bool lm_skip_cpu_share = false;   // set once the layer-major path is taken: its chunks do not hold the CPU pool
     auto run_chunk = [&](int64_t c0, int phase, int64_t lay) -> bool {
-        const int64_t T = std::min(C, n - c0), p0 = pos0 + c0, ci = c0 / C;
+        const int64_t ci = c0 / C;
+        const bool mj = multi_ != nullptr;   // co-prefill: this chunk is a whole prompt of its own session
+        const int64_t T = mj ? multi_->len[(size_t) ci] : std::min(C, n - c0), p0 = mj ? 0 : pos0 + c0;
+        core::SessionState job_ss;
+        if (mj) {
+            job_ss = *multi_->ss[(size_t) ci];
+            job_ss.ple = ss_main.ple;                                  // the main session's PLE tables and scratch ...
+            job_ss.ple.hist = multi_->ss[(size_t) ci]->ple_hist;       // ... with this prompt's own history
+        }
+        core::SessionState& ss = mj ? job_ss : ss_main;
         const int64_t l_from = phase == PH_LAYER ? lay : LB;
         const int64_t l_to = phase == PH_LAYER ? lay + 1 : phase == PH_TAIL ? LB : LE;   // TAIL: no layers
         const bool setup = phase == PH_FULL || phase == PH_SETUP;
@@ -3317,6 +3338,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             return true;
         };
         if (setup) {
+            if (mj) {
+                int32_t pj[2] = {multi_->prev0[(size_t) ci][0], multi_->prev0[(size_t) ci][1]};
+                for (int64_t t = 0; t < T; ++t) { pj[0] = pj[1]; pj[1] = (int32_t) tokens[c0 + t]; }
+                multi_->prev_out[(size_t) ci][0] = pj[0];
+                multi_->prev_out[(size_t) ci][1] = pj[1];
+            } else
             for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
             // ---- the QSA step records of every position in the chunk
             for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
@@ -5669,6 +5696,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill: layer-major not taken for this prompt (%lld tokens, chunk %lld): %s\n",
                      (long long) n, (long long) C, why);
     }
+    if (multi_ != nullptr && !lm) {   // co-prefill needs the layer-major path (nothing has been read yet)
+        err = "co-prefill: the layer-major path is not available for this run";
+        return false;
+    }
     // The expert map for this prompt (STRATA_PREFILL_LM_MAP_AUTO, see LmChoice): the static budget unless the choice is on.
     // Skipped, the map's region is the residuals' room too (lm_dev0 below), so this arm reads as STRATA_PREFILL_LM_MAP_MIB=0.
     bool lm_map_use = lm_map_budget() > 0;
@@ -5920,8 +5951,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
-    ss.ple_prev[0] = prev[0];
-    ss.ple_prev[1] = prev[1];
+    if (multi_ != nullptr) {
+        for (size_t j = 0; j < multi_->ss.size(); ++j) {
+            multi_->ss[j]->ple_prev[0] = multi_->prev_out[j][0];
+            multi_->ss[j]->ple_prev[1] = multi_->prev_out[j][1];
+        }
+    } else {
+        ss.ple_prev[0] = prev[0];
+        ss.ple_prev[1] = prev[1];
+    }
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         cudaStreamSynchronize(m.cs);
         auto bad = [&](const float* d, int64_t n) {
@@ -6055,6 +6093,50 @@ bool Prefill::reserve_uploads(int64_t T) {
     }
     if (next_ != nullptr) ok = next_->reserve_uploads(T) && ok;
     return ok;
+}
+
+bool Prefill::run_multi(const std::vector<MultiJob>& jobs, std::string& err) {
+#if defined(STRATA_GPU_METAL)
+    (void) jobs;
+    err = "co-prefill: not on this platform";
+    return false;
+#else
+    const int64_t C = chunk();
+    const size_t k = jobs.size();
+    if (multi_ != nullptr || k < 2 || k > 8 || C <= 0) { err = "co-prefill: two to eight prompts, one run at a time"; return false; }
+    for (const MultiJob& j : jobs)
+        if (j.tokens == nullptr || j.ss == nullptr || j.n < 1 || j.n > C) { err = "co-prefill: each prompt must be 1 to one chunk of tokens"; return false; }
+    // the padded array: prompt j at [j * C, j * C + n_j), so chunk j IS prompt j and the layer-major buffers' offsets work unchanged
+    std::vector<int64_t> padded(k * (size_t) C, 0);
+    MultiCtx ctx;
+    for (size_t j = 0; j < k; ++j) {
+        std::copy_n(jobs[j].tokens, (size_t) jobs[j].n, padded.begin() + (std::ptrdiff_t) (j * (size_t) C));
+        ctx.len.push_back(jobs[j].n);
+        ctx.ss.push_back(jobs[j].ss);
+        ctx.prev0.push_back({jobs[j].ss->ple_prev[0], jobs[j].ss->ple_prev[1]});
+        ctx.prev_out.push_back({jobs[j].ss->ple_prev[0], jobs[j].ss->ple_prev[1]});
+    }
+    // the callbacks belong to a request's own read: none here
+    auto saved_chunk = std::move(on_chunk);
+    auto saved_stage = std::move(on_stage_chunk);
+    auto saved_stop = std::move(should_stop);
+    auto saved_stop_at = std::move(stop_at_chunk);
+    on_chunk = nullptr;
+    on_stage_chunk = nullptr;
+    should_stop = nullptr;
+    stop_at_chunk = nullptr;
+    force_chunk(C, false, false);
+    multi_ = &ctx;
+    t_lm_choice = {};
+    const bool ok = run_impl(padded.data(), (int64_t) (k * (size_t) C), 0, err);
+    multi_ = nullptr;
+    force_chunk_ = 0;
+    on_chunk = std::move(saved_chunk);
+    on_stage_chunk = std::move(saved_stage);
+    should_stop = std::move(saved_stop);
+    stop_at_chunk = std::move(saved_stop_at);
+    return ok;
+#endif
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
