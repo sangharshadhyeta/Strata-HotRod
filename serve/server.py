@@ -951,7 +951,9 @@ class StrataEngine:
         # --batch-context: the cells a slot's session holds (0: as many as the main session); a request that would outgrow one runs solo
         self.slot_cells = int(self.info.get("batch_cells") or 0)
         # CO-PREFILL (the engine's opt-in STRATA_COPREFILL, announced as INFO coprefill=1): the prompts waiting beside a request are read into their own slots together with it
-        self.coprefill = self.info.get("coprefill") == "1" and self.batch > 1
+        self.coprefill = str(self.info.get("coprefill")) == "1" and self.batch > 1
+        if os.environ.get("STRATA_COPREFILL"):
+            print(f"[strata] co-prefill: engine offers it={self.info.get('coprefill')!r}, batch={self.batch}, on={self.coprefill}", flush=True)
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
@@ -1610,6 +1612,7 @@ class StrataEngine:
                 return ""
             for _, slot, ids in items:
                 self.slot_held[slot] = list(ids[:-1])
+        print(f"[strata] co-prefill: warming {len(items)} waiting prompts beside request", flush=True)
         return " warm=" + ";".join(f"{slot}:{','.join(str(int(t)) for t in ids)}" for _, slot, ids in items)
 
     def _release_warm(self, rid) -> None:

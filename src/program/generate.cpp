@@ -15392,8 +15392,12 @@ int main(int argc, char** argv) {
             };
             // CO-PREFILL: the prompts the server sent with this request (warm=) are read into their slots together, so each layer's experts load once for all of them
             static const bool co_prefill_on = [] { const char* v = std::getenv("STRATA_COPREFILL"); return v != nullptr && std::atoi(v) != 0; }();
+            if (!req_warm.empty())
+                std::fprintf(stderr, "strata batch: co-prefill asked for %zu prompts (on=%d batch=%d batch_mtp=%d draft_keep=%d stages=%zu multi_gpu=%d peer=%d pf_parts=%zu cancelled=%d)\n",
+                             req_warm.size(), (int) co_prefill_on, o.batch, (int) batch_mtp, (int) slot_draft_keep, stages.size(), (int) multi_gpu, o.peer_device,
+                             pf_parts.size(), (int) cancelled);
             if (co_prefill_on && !req_warm.empty() && o.batch > 0 && !batch_mtp && !slot_draft_keep && stages.empty() && !multi_gpu && o.peer_device < 0 &&
-                !pf_parts.empty() && !cancelled) {
+                !cancelled) {
                 std::vector<std::vector<int64_t>> pres;
                 std::vector<int> warm_slots;
                 std::vector<strata::prefill::Prefill::MultiJob> jobs;
