@@ -161,7 +161,7 @@ alternative to the CUDA1-3 caches above, not a third tier beside them.
 
 Through the server, list both cards in the config's `"gpu"` (e.g. `[0, 1]`, numbered as nvidia-smi numbers them)
 and add `--peer-device 1` to its `"args"`; the number is the card's position in that list (with `"gpu": [2, 0]`,
-`--peer-device 1` is nvidia-smi's card 0). Several GPUs in `"gpu"` are otherwise a layer split: the server adds
+`--peer-device 1` is nvidia-smi's card 0). `--peer-device 0` would name the primary card as its own helper, so the engine refuses it with a message (it used to start single-card without a word, the helper card idle). Several GPUs in `"gpu"` are otherwise a layer split: the server adds
 `--layer-split` only when `--peer-device` is not among the args. A complete peer-mode config for two 12 GB cards (the shape the
 community run above used; no `layer_split` key):
 

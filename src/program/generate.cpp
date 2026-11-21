@@ -3704,6 +3704,14 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // --peer-device N is the card's position in the "gpu" list and position 0 is the primary, so 0 would make the primary its own helper.  It used to fall through (the tier needs N >= 1 and the "off" tests say N < 0): the
+    // engine ran single-card without a word, the helper card idle - a community report, 21 Nov: "gpu": [1, 0] with --peer-device 0.  Refuse it and say what to write.
+    if (o.peer_device == 0) {
+        std::fprintf(stderr, "strata generate: --peer-device 0 names the primary card as its own helper: the number is the card's position in the \"gpu\" list and the first card is the primary, so the helper is 1 or higher "
+                             "(with \"gpu\": [1, 0] the helper is --peer-device 1, which is nvidia-smi's card 0); without a second card leave --peer-device out\n");
+        return 2;
+    }
+
     if (o.native_flash_attn_short && o.max_context > 256) {
         std::fprintf(stderr, "strata generate: --native-flash-attn-short requires --max-context <=256\n");
         return 2;

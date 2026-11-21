@@ -57,6 +57,8 @@ the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./
 start the model directly; `./setup.sh --setup` installs another model or changes the settings. Other distributions,
 WSL and compiling: [details](DETAILS.md#linux).
 
+Run the options through `./setup.sh` (it starts `setup.py` with the private `.venv`). Calling `setup.py` with the system `python3` stops on Debian and Ubuntu with "externally-managed-environment" (PEP 668) once `.venv` exists; if you call it directly, use `.venv/bin/python3 setup.py ...`.
+
 On Nix/NixOS, you can use the flake:
 
 ```bash
