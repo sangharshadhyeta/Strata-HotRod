@@ -48,6 +48,8 @@ void axpy(float* acc, const float* y, float a, int n, void* stream);
 void add(const float* a, const float* b, float* out, int n, void* stream);
 void softcap(float* x, int n, float cap, void* stream);
 
+// (The grouped experts and the router are model-independent and live in moe_group.hpp, shared with the other engines.)
+
 /// A Q8_0 row (ggml block_q8_0: half scale + 32 int8) of `n` values to float (the token embedding).
 void dequant_q8_0_row(const void* row, float* out, int n, void* stream);
 

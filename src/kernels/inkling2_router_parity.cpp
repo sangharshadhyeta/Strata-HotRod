@@ -7,7 +7,7 @@
 // and a non-finite row (all NaN) yields valid, distinct expert ids (the guard).  Needs a GPU and STRATA_INKLING2_GGUF / _ORACLE / _TOKENS; else skipped.
 #include "strata/inkling2/npy.hpp"
 #include "strata/inkling2/ops_cpu.hpp"
-#include "strata/kernels/inkling2_router.hpp"
+#include "strata/kernels/moe_group.hpp"
 
 #include <cuda_runtime.h>
 
@@ -54,7 +54,7 @@ int main() {
         cudaMalloc(&d_i, (size_t) (T * K8) * 4); cudaMalloc(&d_w, (size_t) (T * K8) * 4);
         cudaMemcpy(d_l, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(d_b, bias.data(), bias.size() * 4, cudaMemcpyHostToDevice);
-        K::inkling2_route(d_l, d_b, (int) T, (int) NE, (int) K8, c.expert_weight_scale, d_i, d_w, nullptr);
+        K::moe::route(d_l, d_b, (int) T, (int) NE, (int) K8, c.expert_weight_scale, K::moe::Score::Sigmoid, d_i, d_w, nullptr);
         std::vector<int32_t> idx((size_t) (T * K8));
         C::Mat w((size_t) (T * K8));
         cudaMemcpy(idx.data(), d_i, idx.size() * 4, cudaMemcpyDeviceToHost);
@@ -86,7 +86,7 @@ int main() {
         cudaMalloc(&d_l, NE * 4); cudaMalloc(&d_b, NE * 4); cudaMalloc(&d_i, K8 * 4); cudaMalloc(&d_w, K8 * 4);
         cudaMemcpy(d_l, nan_row.data(), NE * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(d_b, zb.data(), NE * 4, cudaMemcpyHostToDevice);
-        K::inkling2_route(d_l, d_b, 1, (int) NE, (int) K8, 8.0f, d_i, d_w, nullptr);
+        K::moe::route(d_l, d_b, 1, (int) NE, (int) K8, 8.0f, K::moe::Score::Sigmoid, d_i, d_w, nullptr);
         std::vector<int32_t> idx((size_t) K8);
         cudaMemcpy(idx.data(), d_i, K8 * 4, cudaMemcpyDeviceToHost);
         cudaFree(d_l); cudaFree(d_b); cudaFree(d_i); cudaFree(d_w);

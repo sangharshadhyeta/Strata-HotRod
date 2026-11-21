@@ -5,8 +5,8 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/inkling2_kernels.hpp"
-#include "strata/kernels/inkling2_router.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/moe_group.hpp"
 
 #include <cuda_runtime.h>
 
@@ -28,6 +28,7 @@ namespace {
 
 namespace K = strata::kernels;
 namespace ik = strata::kernels::ik;
+namespace M = strata::kernels::moe;
 namespace C = strata::inkling2::cpu;
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::fprintf(stderr, "inkling2 engine: %s: %s (%s:%d)\n", #x, cudaGetErrorString(e_), __FILE__, __LINE__); std::exit(1); } } while (0)
@@ -51,6 +52,7 @@ struct Engine::Impl {
         float *kproj = nullptr, *vproj = nullptr, *res_q = nullptr, *ffn_res_q = nullptr, *ffn_norm = nullptr, *router = nullptr, *router_bias = nullptr;
         float *ld[4] = {}, *lf[4] = {}, *lg[4] = {};
         std::vector<float> gs, ds;                         // per-expert scales (NVFP4)
+        float *gs_d = nullptr, *ds_d = nullptr;            // the same on the device (null: scale 1)
         const uint8_t *gu_dev = nullptr, *dn_dev = nullptr;  // the experts, device-addressable (registered mapping)
         uint64_t gu_plane = 0, dn_plane = 0, gate_bytes = 0;
         int etype = 0;
@@ -69,8 +71,11 @@ struct Engine::Impl {
     float *q = nullptr, *k = nullptr, *v = nullptr, *r = nullptr, *gate = nullptr, *sinkv = nullptr, *kc = nullptr, *vc = nullptr, *dynk = nullptr, *dynv = nullptr;
     float *att = nullptr, *proj = nullptr, *a = nullptr, *rr = nullptr, *m_in = nullptr, *x = nullptr, *rl = nullptr, *gb = nullptr, *ub = nullptr, *hb = nullptr, *db = nullptr;
     float *moe = nullptr, *mm = nullptr, *ov = nullptr, *cat = nullptr, *g64 = nullptr, *fgt = nullptr, *gnn = nullptr, *logits = nullptr, *hd = nullptr;
-    int32_t* d_idx = nullptr;
+    int32_t* d_idx = nullptr;       // [visit][16] the router's picks
+    int32_t* h_idx = nullptr;       // pinned copy of them
     float* d_w = nullptr;
+    const uint8_t **d_gu_ptr = nullptr, **d_dn_ptr = nullptr;   // the grouped experts' addresses for the visit
+    float *d_sg = nullptr, *d_wd = nullptr, *d_hh = nullptr, *d_yy = nullptr;
     void *xq = nullptr, *hq = nullptr, *aq = nullptr;
     std::vector<std::vector<int>> picks;
     int pos_cur = -1;
@@ -175,7 +180,7 @@ struct Engine::Impl {
             w.router = up(C::vec(g, *L.router)); w.router_bias = up(C::vec(g, *L.router_bias));
             if (L.core) for (int j = 0; j < 4; ++j) { w.ld[j] = up(C::vec(g, *L.loop_down[j])); w.lf[j] = up(C::vec(g, *L.loop_forget[j])); w.lg[j] = up(C::vec(g, *L.loop_gain[j])); }
             w.etype = L.expert_nvfp4 ? 40 : 8;
-            if (L.expert_nvfp4) { w.gs = C::vec(g, *L.gate_up_scale); w.ds = C::vec(g, *L.down_scale); }
+            if (L.expert_nvfp4) { w.gs = C::vec(g, *L.gate_up_scale); w.ds = C::vec(g, *L.down_scale); w.gs_d = up(w.gs); w.ds_d = up(w.ds); }
             const uint64_t rb_gu = C::row_bytes(L.gate_up_exps->type, E), rb_dn = C::row_bytes(L.down_exps->type, FF);
             w.gu_plane = (uint64_t) 2 * FF * rb_gu;
             w.dn_plane = (uint64_t) E * rb_dn;
@@ -198,7 +203,10 @@ struct Engine::Impl {
         att = fmalloc(H * D); proj = fmalloc(E); a = fmalloc(E); rr = fmalloc(E); m_in = fmalloc(E); x = fmalloc(E); rl = fmalloc(c.n_expert);
         gb = fmalloc(FF); ub = fmalloc(FF); hb = fmalloc(FF); db = fmalloc(E); moe = fmalloc(E); mm = fmalloc(E); ov = fmalloc(E);
         cat = fmalloc(2 * E); g64 = fmalloc(c.gate_rank); fgt = fmalloc(E); gnn = fmalloc(E); logits = fmalloc((size_t) c.n_vocab); hd = fmalloc(E);
-        d_idx = (int32_t*) dmalloc(16 * 4); d_w = fmalloc(16);
+        d_idx = (int32_t*) dmalloc((size_t) c.n_visits * 16 * 4); d_w = fmalloc(16);   // every visit's picks stay on the device; the host reads them once a token
+        { void* hp = nullptr; CK(cudaHostAlloc(&hp, (size_t) c.n_visits * 16 * 4, cudaHostAllocPortable)); pinned.push_back(hp); h_idx = (int32_t*) hp; }
+        d_gu_ptr = (const uint8_t**) dmalloc(16 * sizeof(void*)); d_dn_ptr = (const uint8_t**) dmalloc(16 * sizeof(void*));
+        d_sg = fmalloc(16); d_wd = fmalloc(16); d_hh = fmalloc((size_t) 16 * FF); d_yy = fmalloc((size_t) 16 * E);
         xq = dmalloc((size_t) (E / 32) * 36 * 2); hq = dmalloc((size_t) (FF / 32) * 36 * 2); aq = dmalloc((size_t) (H * D / 32) * 36 * 2);
         picks.assign((size_t) c.n_visits, {});
     }
@@ -293,26 +301,16 @@ struct Engine::Impl {
         // the router and the experts
         lap(0);
         ik::matmul_f32(w.router, x, rl, 1, (int) E, (int) c.n_expert, nullptr);
-        K::inkling2_route(rl, w.router_bias, 1, (int) c.n_expert, (int) c.n_expert_used, c.expert_weight_scale, d_idx, d_w, nullptr);
-        int32_t idx[16];
-        float wt[16];
-        CK(cudaMemcpy(idx, d_idx, (size_t) c.n_expert_used * 4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(wt, d_w, (size_t) c.n_expert_used * 4, cudaMemcpyDeviceToHost));
-        picks[(size_t) vis].assign(idx, idx + c.n_expert_used);
+        const int Kx = (int) c.n_expert_used;
+        int32_t* idxv = d_idx + (size_t) vis * 16;   // this visit's picks stay on the device (the host reads them once a token)
+        M::route(rl, w.router_bias, 1, (int) c.n_expert, Kx, c.expert_weight_scale, M::Score::Sigmoid, idxv, d_w, nullptr);
+        CK(cudaMemcpyAsync(h_idx + (size_t) vis * 16, idxv, (size_t) Kx * 4, cudaMemcpyDeviceToHost, nullptr));
         lap(1);
-        CK(cudaMemset(moe, 0, (size_t) E * 4));
-        K::quantize_q8_1_rows(x, 1, E, xq, nullptr);
-        for (int64_t j = 0; j < c.n_expert_used; ++j) {
-            const int e = idx[j];
-            const uint8_t* plane = w.gu_dev + (uint64_t) e * w.gu_plane;
-            K::iq_mmvq(w.etype, plane, xq, gb, (int) E, (int) FF, 1, nullptr);
-            K::iq_mmvq(w.etype, plane + w.gate_bytes, xq, ub, (int) E, (int) FF, 1, nullptr);
-            const float sg = w.gs.empty() ? 1.0f : w.gs[(size_t) e], sd = w.ds.empty() ? 1.0f : w.ds[(size_t) e];
-            ik::situ(gb, ub, hb, (int) FF, sg, c.situ_beta, c.situ_linear_beta, nullptr);
-            K::quantize_q8_1_rows(hb, 1, FF, hq, nullptr);
-            K::iq_mmvq(w.etype, w.dn_dev + (uint64_t) e * w.dn_plane, hq, db, (int) FF, (int) E, 1, nullptr);
-            ik::axpy(moe, db, wt[j] * sd, (int) E, nullptr);
-        }
+        // the grouped experts: 4 launches for all of the visit's picks, FP32 activations (no int8 quantization of the input)
+        M::experts_prepare(idxv, d_w, w.gu_dev, w.gu_plane, w.dn_dev, w.dn_plane, w.gs_d, w.ds_d, Kx, d_gu_ptr, d_dn_ptr, d_sg, d_wd, nullptr);
+        M::experts_gate_up(d_gu_ptr, w.etype, w.gate_bytes, x, (int) E, (int) FF, d_sg, M::Act{M::ActKind::Situ, c.situ_beta, c.situ_linear_beta}, d_hh, Kx, nullptr);
+        M::experts_down(d_dn_ptr, w.etype, d_hh, (int) E, (int) FF, d_yy, Kx, nullptr);
+        M::experts_combine(d_yy, d_wd, Kx, (int) E, moe, nullptr);
         lap(2);
         K::gdn_conv_step(fs[(size_t) vis], moe, w.ffnpost, mm, E, taps, nullptr);
         cap_seam(sink, vis, "ffn_out", mm, (int) E);
@@ -363,7 +361,8 @@ struct Engine::Impl {
         mmvq_f(8, d_out, hd, (int) E, (int) c.n_vocab, logits, xq);
         ik::softcap(logits, (int) c.n_vocab_real, c.final_softcap, nullptr);
         if (out) { out->resize((size_t) c.n_vocab_real); CK(cudaMemcpy(out->data(), logits, (size_t) c.n_vocab_real * 4, cudaMemcpyDeviceToHost)); }
-        CK(cudaDeviceSynchronize());
+        CK(cudaDeviceSynchronize());   // the one sync of a token (no host round trip inside a visit any more)
+        for (int vv = 0; vv < c.n_visits; ++vv) picks[(size_t) vv].assign(h_idx + (size_t) vv * 16, h_idx + (size_t) vv * 16 + c.n_expert_used);
         if (prof) { const auto n = std::chrono::steady_clock::now(); ph[4] += std::chrono::duration<double>(n - tp).count(); tp = n; }
         ++n_steps;
         pos_cur = pos;

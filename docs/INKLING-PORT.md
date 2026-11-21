@@ -250,3 +250,23 @@ HotRod 18 -> 36 tok/s on a starved 12 GB card, but 103 -> 87 on a roomy 24 GB on
 Maya (mw00 / peasantsmith): the `inkling2` specification (`docs/INKLING2.md`), `ref/inkling2.py`, and `maya-ik2`, with its
 contributors @alesha-pro, @mrsirg97-rgb, @OscarSheng and @cobra91 as named in Maya's v1.1.72 changelog. The model is
 thinkingmachines' Inkling-2-Mini (Apache 2.0); the GGUF layout is llama.cpp's `inkling2` conversion as shipped by unsloth.
+
+## L1 result: grouped experts as a shared library (22 Nov)
+
+`include/strata/kernels/moe_group.hpp` + `src/kernels/cuda/moe_group.cu` (library `strata_moe_group`) hold the router (score mode: sigmoid or DeepSeek's
+sqrt-softplus) and the grouped experts (`experts_prepare / gate_up / down / combine`): run-time shapes, NVFP4 and Q8_0 decode, the activation a parameter
+(SwiGLU, DeepSeek's clamped SwiGLU, Inkling's SITU), optional per-expert scales, experts reached by a pointer array (any tier that can give an expert's address can
+drive them). Nothing Inkling-specific is in them, so Qwen / Edge0 / DeepSeek can call them behind their own switches; none does yet (the feature gate comes with that).
+`moe_group_parity` checks them against the CPU oracle: layer 0 NVFP4 and layer 20 Q8_0 rel ~2e-7, all three activations, both router scores.
+
+Engine change: one `route` + 4 launches a visit instead of 6 launches per expert; picks stay on the device and the host reads them once a token.
+
+| step | all experts over PCIe | experts of layers 0-13 in VRAM |
+|---|---|---|
+| L0 (per-expert launches, int8 activations) | 9.3 tok/s | 11.4 |
+| L1 (grouped, FP32 activations) | 9.8 tok/s | 16.0 |
+
+- All-over-PCIe barely moves: it is bandwidth-bound (1.85 GB/token at ~21 GB/s), as the profile said. The launch savings show once bytes are not the limit (+40%).
+- Lesson: the first dot mapping (byte loads per lane) lost 40% over PCIe (117 ms experts); 32-bit/16-bit per-lane loads restore it. Wide loads matter for zero-copy.
+- KL against the oracle varies 0.0034-0.0073 with the summation order of the dots: near-tie router picks (~6% of picks differ), the same envelope as Maya's engine, not an error.
+- Next: L2 (VRAM slot cache + copy stream, class B), then L3 (fusion / graph).
