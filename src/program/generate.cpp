@@ -15396,9 +15396,9 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: co-prefill asked for %zu prompts (on=%d batch=%d batch_mtp=%d draft_keep=%d stages=%zu multi_gpu=%d peer=%d pf_parts=%zu cancelled=%d)\n",
                              req_warm.size(), (int) co_prefill_on, o.batch, (int) batch_mtp, (int) slot_draft_keep, stages.size(), (int) multi_gpu, o.peer_device,
                              pf_parts.size(), (int) cancelled);
-            if (co_prefill_on && !req_warm.empty() && o.batch > 0 && !batch_mtp && !slot_draft_keep && stages.empty() && !multi_gpu && o.peer_device < 0 &&
+            if (co_prefill_on && !req_warm.empty() && o.batch > 0 && !batch_mtp && !(slot_draft_keep && resume > 0) && stages.empty() && !multi_gpu && o.peer_device < 0 &&
                 !cancelled) {
-                std::vector<std::vector<int64_t>> pres;
+                std::vector<std::vector<int64_t>> pres, req_warm_ids;   // the prefixes read; the full prompts (the drafter's next tokens)
                 std::vector<int> warm_slots;
                 std::vector<strata::prefill::Prefill::MultiJob> jobs;
                 pres.reserve(req_warm.size());
@@ -15409,6 +15409,7 @@ int main(int argc, char** argv) {
                         std::find(warm_slots.begin(), warm_slots.end(), w.slot) != warm_slots.end())
                         continue;
                     pres.emplace_back(w.ids.begin(), w.ids.end() - 1);
+                    req_warm_ids.push_back(w.ids);
                     warm_slots.push_back(w.slot);
                     total += (int64_t) pres.back().size();
                 }
@@ -15424,7 +15425,24 @@ int main(int argc, char** argv) {
                             strata::core::session_zero(*bslot_ss[0][(size_t) b], g, nullptr, nullptr);
                         }
                         if (cudaDeviceSynchronize() != cudaSuccess) { we = "co-prefill: device sync failed"; read_ok = false; }
-                        if (read_ok) read_ok = sp.run_multi(jobs, we);
+                        // the slot drafter's K/V (the default, STRATA_SLOT_DRAFT_KEEP): the main drafter runs each prompt's prompt pass from the rows the read
+                        // hands over, then that K/V is the slot's image - exactly what a slot that read its prompt on the usual path holds.  (The request's own
+                        // read then starts at 0 - `resume` is 0 here - so the main drafter's state it overwrites is not one it needs.)
+                        std::function<bool(size_t, const float*, int64_t, std::string&)> on_job;
+                        if (use_mtp && slot_draft_keep)
+                            on_job = [&](size_t j, const float* R_rows, int64_t T, std::string& e) -> bool {
+                                std::vector<int32_t> nx((size_t) T);
+                                for (int64_t t = 0; t < T; ++t) nx[(size_t) t] = (int32_t) req_warm_ids[j][(size_t) (t + 1)];
+                                const strata::core::OnDevice on_mtp(mtp.device());
+                                mtp.set_prompt_len(T);
+                                if (!mtp.prefill(R_rows, nx.data(), T, 0, e)) return false;
+                                slot_draft_take(warm_slots[j], T);
+                                SlotDraft& d = slot_draft[(size_t) warm_slots[j]];
+                                d.n = d.head = 0;
+                                d.cell0 = T;
+                                return true;
+                            };
+                        if (read_ok) read_ok = sp.run_multi(jobs, we, on_job);
                         if (cudaDeviceSynchronize() != cudaSuccess && read_ok) { we = "co-prefill: device sync failed"; read_ok = false; }
                     }
                     std::string re;

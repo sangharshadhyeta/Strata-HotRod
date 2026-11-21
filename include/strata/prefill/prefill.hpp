@@ -201,7 +201,9 @@ public:
         int64_t n = 0;
         core::SessionState* ss = nullptr;
     };
-    bool run_multi(const std::vector<MultiJob>& jobs, std::string& err);
+    /// `on_job(job, R_rows, T, err)` (optional): called as each prompt's final residual rows are ready (device pointer, the prompt's own length), the drafter's prompt pass.
+    bool run_multi(const std::vector<MultiJob>& jobs, std::string& err,
+                   const std::function<bool(size_t job, const float* R_rows, int64_t T, std::string& err)>& on_job = {});
 
     const PrefillStats& stats() const { return stats_; }
 

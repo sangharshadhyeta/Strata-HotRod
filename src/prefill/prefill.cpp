@@ -2828,6 +2828,7 @@ struct PrefillStandin {
 }  // namespace
 
 struct Prefill::MultiCtx {
+    std::function<bool(size_t, const float*, int64_t, std::string&)> on_job;
     std::vector<int64_t> len;
     std::vector<core::SessionState*> ss;
     std::vector<std::array<int32_t, 2>> prev0, prev_out;
@@ -5650,7 +5651,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (on_chunk || on_stage_chunk) {
+        if (on_chunk || on_stage_chunk || (mj && multi_->on_job)) {
             const auto toc = Clock::now();
             if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
@@ -5658,7 +5659,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             const auto toc2 = Clock::now();
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+            if (mj && multi_->on_job) {
+                if (!multi_->on_job((size_t) ci, m.R, T, err)) return false;
+            } else if (on_chunk && !on_chunk(m.R, T, p0, err)) {
+                return false;
+            }
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
@@ -6095,7 +6100,8 @@ bool Prefill::reserve_uploads(int64_t T) {
     return ok;
 }
 
-bool Prefill::run_multi(const std::vector<MultiJob>& jobs, std::string& err) {
+bool Prefill::run_multi(const std::vector<MultiJob>& jobs, std::string& err,
+                        const std::function<bool(size_t, const float*, int64_t, std::string&)>& on_job) {
 #if defined(STRATA_GPU_METAL)
     (void) jobs;
     err = "co-prefill: not on this platform";
@@ -6109,6 +6115,7 @@ bool Prefill::run_multi(const std::vector<MultiJob>& jobs, std::string& err) {
     // the padded array: prompt j at [j * C, j * C + n_j), so chunk j IS prompt j and the layer-major buffers' offsets work unchanged
     std::vector<int64_t> padded(k * (size_t) C, 0);
     MultiCtx ctx;
+    ctx.on_job = on_job;
     for (size_t j = 0; j < k; ++j) {
         std::copy_n(jobs[j].tokens, (size_t) jobs[j].n, padded.begin() + (std::ptrdiff_t) (j * (size_t) C));
         ctx.len.push_back(jobs[j].n);
