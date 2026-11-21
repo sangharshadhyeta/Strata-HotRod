@@ -5653,6 +5653,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // the CPU share (small chunks' experts on the pool) does not decide it: a layer-major run simply skips the share
     bool lm = lm_env && n > C && LB == 0 && LE == g.n_layers && hand_in_ == nullptr && next_ == nullptr && !helped &&
               m.pp == nullptr && !walk_all;
+    {   // STRATA_PREFILL_LM_DEBUG=1: every input of the layer-major decision for each read (found why --batch never took it: 21 Nov)
+        static const bool lm_dbg = [] { const char* v = std::getenv("STRATA_PREFILL_LM_DEBUG"); return v != nullptr && std::atoi(v) != 0; }();
+        if (lm_dbg)
+            std::fprintf(stderr, "strata prefill: layer-major decision: n=%lld C=%lld LB=%lld LE=%lld/%lld hand_in=%d next=%d helped=%d pp=%d walk_all=%d env=%d -> %s\n",
+                         (long long) n, (long long) C, (long long) LB, (long long) LE, (long long) g.n_layers, hand_in_ != nullptr, next_ != nullptr,
+                         (int) helped, m.pp != nullptr, (int) walk_all, (int) lm_env, lm ? "taken" : "not taken");
+    }
     if (!lm && lm_env && n > C && hand_in_ == nullptr) {   // a multi-chunk prompt that could have used it: the first condition that failed
         const char* why = LB != 0 || LE != g.n_layers ? "a layer split"
                         : next_ != nullptr ? "a pipeline stage"

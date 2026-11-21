@@ -19,11 +19,16 @@ namespace strata::program {
 /// enough to keep the pipeline full, short enough that a BYIELD is taken within a few chunks (it used to wait for the
 /// whole prompt, and the long prompt then held its slot: "ERR BGEN: no such free slot" for the request that should
 /// have taken over).
+/// A SINGLE GPU did the same until 21 Nov, and it cost a lot: a prompt of 13.5K tokens in 3 chunks was read as 3 separate
+/// runs, and the layer-major path (each routed expert streamed once per run, not once per chunk; it needs more than one
+/// chunk in a run) never applied: 272 tok/s against 336 without --batch.  No slot decoding means none can start in the
+/// middle of the read (an admission is a command, taken at a piece's end), so the read goes in pieces of several chunks.
 inline int64_t batch_read_piece(bool batch, bool piped, bool layer_split, bool beside_slots, int64_t chunk,
                                 int64_t chunks_per_piece) {
     if (!batch || piped) return 0;
     chunk = std::max<int64_t>(chunk, 1);
-    if (!layer_split || beside_slots) return chunk;
+    (void) layer_split;   // (the same rule on a single GPU and on a layer split; the caller picks chunks_per_piece for each)
+    if (beside_slots) return chunk;
     return chunks_per_piece > 0 ? chunk * chunks_per_piece : 0;
 }
 

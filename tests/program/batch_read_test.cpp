@@ -20,7 +20,9 @@ int main() {
     CHECK(batch_read_piece(false, false, false, false, 2048, 8) == 0);
     CHECK(batch_read_piece(true, true, true, false, 2048, 8) == 0);
     // one GPU: a chunk per piece, whether or not a slot decodes (the yield point is the chunk boundary)
-    CHECK(batch_read_piece(true, false, false, false, 2048, 8) == 2048);
+    CHECK(batch_read_piece(true, false, false, false, 2048, 8) == 8 * 2048);   // a single GPU, no slot decoding: several chunks (layer-major applies)
+    CHECK(batch_read_piece(true, false, false, false, 2048, 4) == 4 * 2048);
+    CHECK(batch_read_piece(true, false, false, false, 2048, 0) == 0);
     CHECK(batch_read_piece(true, false, false, true, 2048, 8) == 2048);
     // layer split with slots decoding: a chunk per piece as before
     CHECK(batch_read_piece(true, false, true, true, 2048, 8) == 2048);
@@ -30,7 +32,8 @@ int main() {
     // STRATA_BATCH_YIELD_CHUNKS=0 keeps the old single run
     CHECK(batch_read_piece(true, false, true, false, 2048, 0) == 0);
     // a degenerate chunk never gives a zero piece
-    CHECK(batch_read_piece(true, false, false, false, 0, 8) == 1);
+    CHECK(batch_read_piece(true, false, false, true, 0, 8) == 1);   // beside decoding slots: one chunk (never 0)
+    CHECK(batch_read_piece(true, false, false, false, 0, 8) == 8);  // no slot decoding: 8 chunks of at least 1 token
     // a piece is always a multiple of the chunk
     for (int64_t c : {256, 1000, 2048, 4096})
         for (int64_t k : {1, 3, 8, 16}) CHECK(batch_read_piece(true, false, true, false, c, k) % c == 0);

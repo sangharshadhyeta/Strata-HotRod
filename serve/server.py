@@ -948,6 +948,8 @@ class StrataEngine:
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
+        # --batch-context: the cells a slot's session holds (0: as many as the main session); a request that would outgrow one runs solo
+        self.slot_cells = int(self.info.get("batch_cells") or 0)
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
@@ -986,6 +988,7 @@ class StrataEngine:
         if "slot_cv" not in self.__dict__:
             self.slot_cv = threading.Condition()
             self.waiting = 0                            # requests waiting for the control lines (ctl)
+            self.long_waiters = 0                       # --batch-context: requests too long for a slot, waiting for the slots to go idle
             self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
@@ -1560,7 +1563,9 @@ class StrataEngine:
                 not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
             return False
         with self.slot_cv:
-            return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
+            # (a request too long for a slot that waits for the slots to go idle holds no control lines, so `waiting` does not count it: a lone slot
+            # request must not go back to solo then - the two would race for the engine and the long one would run first)
+            return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0 and self.long_waiters == 0
 
     def _shorter_waiting(self, plen: int) -> bool:
         """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
@@ -1584,6 +1589,9 @@ class StrataEngine:
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
+        # --batch-context: a request whose prompt + max_new would outgrow a slot's session never goes to a slot (not by a wait at the top, not when
+        # another request arrives while it runs solo, not by giving way to a shorter one): it runs on the solo path, to its end
+        slot_ok = not (self.slot_cells > 0 and left > 1 and len(prompt) + left > self.slot_cells)
         orig_len = len(prompt)  # a leg that continues (prompt + what it generated) names where the reply began: pen_from, the penalty window's start
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
@@ -1606,6 +1614,26 @@ class StrataEngine:
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
+                    # --batch-context: too long for a slot's session: it runs on the solo path, which needs the slots idle
+                    must_wait = not slot_ok and left > 1 and any(self.slot_busy)
+                    if not slot_ok and left > 1 and not must_wait:
+                        alone = True
+                if must_wait:
+                    # the control lines are given back while it waits (a slot's admission needs them, so waiting with them is the deadlock the
+                    # slot wait below documents); it takes them again at the top and looks once more
+                    if holding:
+                        self.ctl.release()
+                        holding = False
+                    with self.slot_cv:
+                        self.long_waiters += 1
+                        try:
+                            while any(self.slot_busy) and not cancel.is_set() and self.alive():
+                                self.slot_cv.wait(timeout=1.0)
+                        finally:
+                            self.long_waiters -= 1
+                    if cancel.is_set():
+                        return
+                    continue
                 if alone and left > 1:
                     pf = f" pen_from={orig_len - 1}" if len(prompt) > orig_len else ""
                     head = f"GENI {left}{keys}{pf} {embeddings}" if embeddings else f"GEN {left}{keys}{pf}"
@@ -1616,11 +1644,11 @@ class StrataEngine:
                     self._ctl_erred = False
                     def others():
                         with self.slot_cv:
-                            return self.waiting > 0
+                            return slot_ok and self.waiting > 0
 
                     def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
                         nonlocal reserved
-                        if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
+                        if (slot_ok and reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             with self.slot_cv:          # the slot the part read will wait in
                                 reserved = self.pick_slot(prompt)

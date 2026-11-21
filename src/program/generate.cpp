@@ -822,6 +822,9 @@ struct Options {
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
+    int64_t batch_context = 0;       ///< --batch-context N: each batch slot's session holds N cells, not --max-context's (0 = the same as --max-context). A request that
+                                     ///< would outgrow a slot (prompt + max_new) runs on the solo path instead (serve/server.py reads INFO batch_cells=)
+    int64_t batch_cells = 0;         ///< the cap in force (0: slots are as large as the main session); set where the slot sessions are carved
     /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
     /// model's: the VRAM they took goes back to the expert cache (opt-in)
     bool trim_stage_weights = false;
@@ -1065,6 +1068,8 @@ void usage() {
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
+                 "  --batch-context N    --batch: each slot's session holds N cells instead of --max-context's: the slots cost less VRAM and pinned RAM, so\n"
+                 "                       the expert cache keeps them. A request that would outgrow a slot runs on the solo path (default 0: as large as --max-context)\n"
                  "  --batch-mtp          --batch (opt-in, needs --mtp and --spec): each slot also verifies one MTP proposal per\n"
                  "                       window (STRATA_BATCH_MTP=1 does the same); works on one GPU and on a layer split (the\n"
                  "                       slot drafters sit on the last stage's GPU; not with --batch-groups); needs VRAM per slot\n"
@@ -1757,6 +1762,8 @@ static std::string vram_reserve_key(const Options& o) {
         if (c == '"' || c == '\\') c = '_';   // the file is read back by its quotes: a key keeps none
     return name + " " + std::to_string(total_mib) + "MiB ctx" + std::to_string((long long) o.max_context) + " kv" +
            std::to_string((long long) o.kv_resident) + "/" + o.kv + " b" + std::to_string(o.batch) +
+           // --batch-context: slots of different sizes cost different amounts of RAM and VRAM, so what one learned must not size the other
+           (o.batch > 0 && o.batch_context > 0 ? "c" + std::to_string((long long) o.batch_context) : std::string()) +
            (o.mtp.empty() ? " nodraft" : " draft");
 }
 /// The key of the RAM entries (ram-reserve.json): the VRAM key, the vision path (--vision: its embeddings and image buffers
@@ -2929,6 +2936,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
+        else if (a == "--batch-context") o.batch_context = std::atoll(next("--batch-context"));
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") {
             const char* bgv = next("--batch-groups");
@@ -5867,18 +5875,21 @@ int main(int argc, char** argv) {
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
         int fit = o.batch;   // the slots every stage could carve
+        // --batch-context: the slot sessions hold fewer cells than the main one (a conversation that would outgrow one runs solo)
+        const int64_t slot_cells = (o.batch_context > 0 && o.batch_context < o.max_context) ? o.batch_context : o.max_context;
+        o.batch_cells = slot_cells < o.max_context ? slot_cells : 0;
         uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
+            const uint64_t bytes = strata::core::session_bytes(g, slot_cells, K, lo, hi);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, slot_cells, K, buf, *u, lo, hi) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
@@ -11800,7 +11811,8 @@ int main(int argc, char** argv) {
                         strata::prefill::Prefill::pipe_setting(),
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups) +
+                                       (o.batch_cells > 0 ? " batch_cells=" + std::to_string(o.batch_cells) : std::string())).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -14759,10 +14771,15 @@ int main(int argc, char** argv) {
                 };
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
                 // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
-                static const int64_t yield_chunks = [] {
+                // (a single GPU: 4 chunks by default - about 70 s of reading at 340 tok/s, so a request that arrives meanwhile waits at most that
+                // long for a piece's end - against 8 on a layer split; STRATA_BATCH_YIELD_CHUNKS sets both)
+                const bool yield_env = std::getenv("STRATA_BATCH_YIELD_CHUNKS") != nullptr;
+                const int64_t yield_chunks = [&] {
                     const char* v = std::getenv("STRATA_BATCH_YIELD_CHUNKS");
-                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
+                    if (v != nullptr) return (int64_t) std::max(0, std::atoi(v));
+                    return stages.empty() ? (int64_t) 4 : (int64_t) 8;
                 }();
+                (void) yield_env;
                 // a piece's chunk: the buffers' chunk, or with a plan as many whole planned chunks as that holds (the
                 // stages still pipeline inside a piece, and every piece starts on the plan's grid)
                 const int64_t C = planned ? std::max<int64_t>(1, sp.chunk() / plan.chunk) * plan.chunk

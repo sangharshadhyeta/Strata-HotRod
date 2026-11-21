@@ -6811,8 +6811,10 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     }
     for (SessionState* x : slots) {
         if (x == nullptr || x->layer_lo != ss_->layer_lo || x->layer_hi != ss_->layer_hi ||
-            x->max_cells != ss_->max_cells || x->gdn_ord0 != ss_->gdn_ord0 || x->qsa_ord0 != ss_->qsa_ord0) {
-            err = "verify: a slot's session is not carved like the stage's own (layer range, context)";
+            x->max_cells > ss_->max_cells || x->gdn_ord0 != ss_->gdn_ord0 || x->qsa_ord0 != ss_->qsa_ord0) {
+            // (a slot may hold FEWER cells than the stage's own session, --batch-context: the verifier's scratch is sized from the stage's own, and
+            // the window's positions are checked against each slot's own max_cells further down; a larger one would overrun that scratch)
+            err = "verify: a slot's session is not carved like the stage's own (layer range) or holds more cells than it (context)";
             return false;
         }
     }
