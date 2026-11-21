@@ -120,6 +120,33 @@ So the GPU engine is: the existing tiers + KV streaming + Q8_0 dense + the conv 
 five small new kernels (dynamic conv taps, the biased / sinked / windowed attention, the sigmoid router, the attention residual with the
 loop gate, the SITU activation) - each checked against `ops_cpu` and the oracle before it is wired in.
 
+## Code used from the DeepSeek branch (`upstream-dsv41`, `src/dsv41/`; allowed 22 Nov, "as required", the whole branch is to be ported here later)
+
+Read from the branch without switching it. What matches Inkling, and what is done:
+
+| DeepSeek code | Use for Inkling | State |
+| --- | --- | --- |
+| `route_kernel` (`ds4_kernels.cu`): biased top-k (selection key = score + bias, lowest index on a tie), weights = picked score / sum x route scale, a guard for non-finite gate input | Inkling's router has the same structure; the score is sigmoid, not sqrt-softplus | **hand-ported** as `src/kernels/cuda/inkling2_router.cu` (own small library `inkling2_kernels`, so Qwen's binary is unchanged), sigmoid scoring, a row stride of n (the original's is a fixed 1,024), without its `DS4_MASK` / vector-length extras; test `inkling2_router_parity`: on 6 layers x 48 tokens the picks equal the reference's seam (0 of 384 differ per layer), weights within 5.8e-7. **Found by that test, to check in DeepSeek's original at the full port:** its non-finite guard marks a pick with `-FLT_MAX`, which ties with the scan's start value, so with non-finite scores the same expert comes out repeatedly (indexes stay valid, as its comment promises, but they are not distinct); here a `taken` flag fixes it |
+| `swiglu_kernel` and the clamped swiglu fused into `gate_up_kernel` | Inkling's SITU activation is the same place with a different body (tanh softcaps instead of a clamp) | the SITU is on the host in the NVFP4 check; the device version replaces the clamp's body |
+| `gate_up_kernel<T, NE, RW>` / `down_kernel`: expert kernels templated on the weight type with `n_embd` / `n_ff` as run-time arguments | The pattern for a fused expert kernel that is not compiled for Qwen's 2560 / 640; DeepSeek's types are i-quants, NVFP4 would be a new `T` | not used yet: the base's `iq_mmvq(40)` + a small activation kernel is the verified path; fuse later if a profile asks |
+| `route_ahead_kernel`, `route_publish_kernel` (look-ahead routing) | The loop-aware prefetch | to read when that step is reached |
+| `attn_sink` (a learned logit per head), `sliding_window` | Inkling's sink is a projection of each token, not a constant | different: not reused |
+| Its tiers (`ds4_store.hpp`, `ds4_pool.hpp`) | Not used: Inkling uses the base `core/` tiers | - |
+
+**Debt to settle at the full DeepSeek port:** `inkling2_router.cu` and DeepSeek's `route_kernel` are then two routers that differ by one line. They become
+one kernel with a scoring mode (qwertie's rule, which we share: do not copy a file to make a variant), and the `inkling2_router_parity` test stays as
+its guard.
+
+**How qwertie (Strataq) organized several models in one tree** (read from his `docs/ARCHITECTURE.md` on 22 Nov; nothing of his is copied, and we do not switch to his layout,
+per the 21 Nov decision): layers, each using only the ones below. `src/base` (device runtime interface, platform services), `src/common` (model-independent:
+artifact / GGUF, the expert store with RAM tier, VRAM slots, prefetch and eviction, kernels for any model, sampler, the serve loop, speculative decoding, conversation
+state), `src/models/common` (geometry, layout tables, GDN / gated attention / MoE-routing layers shared by several families), `src/models/<family>` (`deepseekv41`,
+`qwen36`, `qwen38`; a family never uses another), `src/program` (one thin `main()` each). Each engine program is a command loop plus a model behind a `PagedModel`
+interface. His rules: do not copy a file to make a variant (share it, put the difference behind an interface); code in `common` / `models` does not call the CUDA
+runtime directly; settings in a struct, not file-wide globals; `main()` parses arguments and calls a library. Ours already follows the folder-per-family shape
+(`src/qwen35`, and `src/dsv41` on the DeepSeek branch), so Inkling gets `src/inkling2` and the shared parts stay in `core/` and the kernels; his paged engine and his
+interface are not adopted (21 Nov: shared interface as new files, step 4, later).
+
 ## Rules for this port
 
 - The Qwen path, its layer-major prompt walk and its prefill speeds are not touched. Measured before any shared file changes:

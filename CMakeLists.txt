@@ -511,6 +511,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(inkling2_nvfp4_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(inkling2_nvfp4_parity PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME inkling2_nvfp4_parity COMMAND inkling2_nvfp4_parity)
+    # Inkling 2's own kernels, in a small library so the Qwen binary is unchanged: the router, hand-ported from the DeepSeek branch's route_kernel
+    # (sigmoid in place of sqrt-softplus), against the reference's picks (docs/INKLING-PORT.md, "Code used from the DeepSeek branch")
+    add_library(inkling2_kernels STATIC src/kernels/cuda/inkling2_router.cu)
+    target_include_directories(inkling2_kernels PUBLIC include)
+    target_link_libraries(inkling2_kernels PUBLIC CUDA::cudart)
+    add_executable(inkling2_router_parity src/kernels/inkling2_router_parity.cpp)
+    target_include_directories(inkling2_router_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(inkling2_router_parity PRIVATE inkling2_kernels strata_kernels CUDA::cudart)
+    add_test(NAME inkling2_router_parity COMMAND inkling2_router_parity)
   endif()
   # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
   # the capacity rule, selected ids bitwise
