@@ -53,6 +53,25 @@ Decode speed, same day and flags, same questions, 200K, greedy, MTP on (server's
 On this 12 GB card two concurrent answers (20 tok/s in all) are slower than one answer without `--batch` (25 tok/s), and a single request loses about 40%:
 the 40% smaller expert cache costs more than batching gains. One run per leg, so the size is approximate; the direction is large.
 
+## How we make each of his ideas better (decided 21 Nov; plans, none built or measured yet unless stated)
+
+1. **Conversation memory: sized per request.** Each request declares `max_new`, so at admission the engine knows `prompt + max_new`. Slot K/V comes from one
+   fixed pool and is cut to that size, freed at BDONE; K/V streaming already keeps the resident window small and the rest in pinned RAM. A conversation then
+   costs what it uses. Stage 1 (static, built): `--batch-context N`. Open: the batch windows are CUDA graphs with fixed K/V pointers, so per-request pieces
+   need stable addresses or a re-capture; check that before building the pool.
+2. **Fast start: stand-ins cover the fill.** READY once the dense weights are loaded; the experts fill in the learned profile's order, hottest first, and
+   stand-ins (ranks 3-9) cover the experts still missing, so the answers during the fill are usable. Test: time to READY and the speed of the first answers.
+3. **Live settings: the tuner picks them.** His panel lets the user change many settings by hand. We show the settings and allow an override, but the online
+   tuner (include/strata/core/online_tuner.hpp) settles the values (decode share, rows per step, lookahead, slot budget) itself. The user sees what was chosen.
+4. **Decode while a prompt is read.** Stand-ins keep decode going from the experts that stayed resident; the learned prompt chunk (`STRATA_PREFILL_CHUNK_LEARN`,
+   on only for latent packs today) is the dial between prefill speed and decode gaps; one bulk restore of the lent slots after the prompt. Baseline to protect
+   (21 Nov, Qwen Q4_K_XL, 13,562-token prompts, no `--batch`): prefill 334-338 tok/s, decode after it 21-25 tok/s, no dip seen. Measure first.
+5. **One memory mode from low RAM to high RAM.** The storage profile (`all_in_ram()`) already says where the experts are; the single scheduler (docs/SCHEDULER.md)
+   makes it one rule, including skipping file read-ahead when everything is in RAM (needs a big-RAM machine to test).
+
+Order: finish the prefill comparison and the routing re-test; commit `--batch-context`, the verifier relaxation and the routing fix; the default from the
+resident window; the per-request pool (after the graph check); fast start; the tuner's batch knobs.
+
 ## What we take, and what we keep
 
 His idea is one engine that owns memory and the decode loop, and a small adapter per model. We take that shape. We keep what we measured and built:
