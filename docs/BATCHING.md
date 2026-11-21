@@ -22,6 +22,13 @@ asked, with a note when it is more than setup would recommend.
 "parallel": 2
 ```
 
+**The slot size is yours too.** Each slot's session holds as many tokens as the model's `--max-context` unless you say otherwise: `"parallel_context": 2048` in the
+config (the engine's `--batch-context 2048`) gives every slot a session of that many tokens. Any positive number is kept as asked (the engine clamps it to
+`--max-context`). A smaller slot leaves more VRAM and RAM to the experts: on a 12 GB card with Qwen UD-Q4_K_XL at 200K, two slots as large as the context took 40% of the
+expert cache and 62% of prefill speed; at 2,048 tokens they took about 7% of the cache and, on a single GPU, none of the prefill speed (344 tok/s against 335-348 without
+`--batch`; one machine, 21 Nov). A request whose prompt plus `max_tokens` would outgrow a slot is never put into one: it waits until the slots are idle and then runs on its
+own at full speed. The engine does not choose a limit for you; it tells you what it measured and keeps your setting.
+
 With MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `STRATA_BATCH_MTP=1` in the server's
 environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch behaviour
 described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers, so check the

@@ -1478,11 +1478,11 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False):
+    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False, need: int = 0):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
         `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
-        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
+        entry = [plen, time.monotonic(), new, need]     # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST, tokens it needs: prompt + max_new, 0 = unknown)
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1567,6 +1567,15 @@ class StrataEngine:
             # request must not go back to solo then - the two would race for the engine and the long one would run first)
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0 and self.long_waiters == 0
 
+    def _waiter_fits_slot(self) -> bool:
+        """Some request waits for the control lines that could be taken into a batch slot (its prompt + max_new within --batch-context; unknown counts as fitting)."""
+        with self.slot_cv:
+            if self.waiting <= 0:
+                return False
+            if self.slot_cells <= 0 or not self.wait_lens:
+                return True
+            return any(len(e) < 4 or e[3] <= 0 or e[3] <= self.slot_cells for e in self.wait_lens)
+
     def _shorter_waiting(self, plen: int) -> bool:
         """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
         with self.slot_cv:
@@ -1595,7 +1604,7 @@ class StrataEngine:
         orig_len = len(prompt)  # a leg that continues (prompt + what it generated) names where the reply began: pen_from, the penalty window's start
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
-        ok = yield from self._take_control(cancel, len(prompt), new=True)
+        ok = yield from self._take_control(cancel, len(prompt), new=True, need=len(prompt) + int(max_new))
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -1643,8 +1652,9 @@ class StrataEngine:
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
                     self._ctl_erred = False
                     def others():
-                        with self.slot_cv:
-                            return slot_ok and self.waiting > 0
+                        # a request running solo is moved into a slot (slower) only for a waiter that can take a slot too; one too long for a slot would just
+                        # wait for it, so the solo request finishes at full speed first (--batch-context)
+                        return slot_ok and self._waiter_fits_slot()
 
                     def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
                         nonlocal reserved
@@ -2836,7 +2846,16 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
     if n > PARALLEL_MAX and "--batch-mtp" not in args and os.environ.get("STRATA_BATCH_MTP", "0") in ("", "0"):
         print(f'[strata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
               f"{PARALLEL_MAX}", flush=True)
-    return ["--batch", str(n)]
+    out = ["--batch", str(n)]
+    # "parallel_context": C - the tokens each slot's session holds (--batch-context C; the engine's default is --max-context, the largest and costliest slot).  Any positive
+    # number is passed on (the user decides; the engine clamps it to --max-context).  A request that would outgrow a slot runs on its own, after the slots go idle.
+    c = cfg.get("parallel_context")
+    if c is not None and c is not False and "--batch-context" not in args:
+        if isinstance(c, bool) or not isinstance(c, int) or c < 1:
+            print(f'[strata] "parallel_context" must be a whole number of tokens (1 or more), not {c!r}: ignored', flush=True)
+        else:
+            out += ["--batch-context", str(c)]
+    return out
 
 
 def profile_shape(path: str) -> tuple[int, int] | None:

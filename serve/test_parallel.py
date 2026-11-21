@@ -194,6 +194,18 @@ class ParallelArgs(unittest.TestCase):
         self.assertEqual(parallel_args({"parallel": "4"}, []), [])                   # said and ignored
         self.assertEqual(parallel_args({"parallel": True}, []), [])
         self.assertEqual(parallel_args({"parallel": 12}, []), ["--batch", "12"])     # the engine warns and caps
+    def test_parallel_context_is_the_users_slot_size(self):
+        # "parallel_context": C -> --batch-context C, any positive number passed on (the engine clamps it); a bad value is said and ignored
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_context": 2048}, []), ["--batch", "4", "--batch-context", "2048"])
+        self.assertEqual(parallel_args({"parallel": 2, "parallel_context": 1}, []), ["--batch", "2", "--batch-context", "1"])
+        self.assertEqual(parallel_args({"parallel": 4}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_context": 0}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_context": "big"}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_context": True}, []), ["--batch", "4"])
+        self.assertEqual(parallel_args({"parallel_context": 2048}, []), [])   # no parallel: no slots, nothing to size
+        # an explicit engine flag in the config's args wins
+        self.assertEqual(parallel_args({"parallel": 4, "parallel_context": 2048}, ["--batch-context", "4096"]), ["--batch", "4"])
+
     def test_parallel_above_the_window_says_so_unless_batch_mtp(self):
         import contextlib, io, os
         def said(args, env):
