@@ -7337,12 +7337,12 @@ bool Verifier::sample_rows(int S, std::string& err) {
             bool judged = false;
             if (n == 2 && q != nullptr) {
                 if (d_spec_ == nullptr &&
-                    cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) != cudaSuccess) {
+                    cudaMalloc((void**) &d_spec_, (size_t) strata::kernels::kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) != cudaSuccess) {
                     (void) cudaGetLastError();
                     d_spec_ = nullptr;
                 }
                 if (d_spec_ != nullptr) {
-                    int32_t* d_q = d_spec_ + kVerifyMaxT;
+                    int32_t* d_q = d_spec_ + strata::kernels::kVerifyMaxT;
                     strata::kernels::SamplerParams gp = sp;
                     gp.counter = (uint64_t) last_pos_b_[t];
                     int32_t proposal = last_tokens_[t + 1];
