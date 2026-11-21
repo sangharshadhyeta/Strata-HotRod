@@ -399,6 +399,10 @@ public:
     // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
+    /// The opposite of init_slots (the live BATCHSET command, docs/LIVE_BATCH.md): destroys every captured batch graph (they were captured against the
+    /// slots' memory), frees the batch arena and the commit staging, and forgets the slots, so init_slots can run again over new sessions.  The caller has
+    /// synchronized the device and no batch window is in flight.  A no-op when no slots are set.
+    void release_slots();
     int n_slots() const { return (int) slots_.size(); }
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
@@ -414,6 +418,10 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    /// The VRAM the batch graphs leave free (the engine's --vram-reserve-mib): a new batch window graph is captured only above it; below it the least recently used
+    /// layouts are freed first (they are captured again when needed).  Without it the captures took the last free MiB and the next long prompt's buffers found none:
+    /// the engine died with "out of memory" (--batch 8 --batch-mtp on a 12 GB card, 21 Nov).  0 = no floor (the old behaviour).
+    void set_batch_graph_floor(uint64_t bytes) { batch_graph_floor_ = bytes; }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -438,6 +446,13 @@ public:
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
         if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
         if (next_) next_->set_slot_sampling(slot, sp);
+    }
+    /// PROBABILISTIC DRAFT ACCEPTANCE in batch windows (spec_prob.hpp; the flag the solo path uses, STRATA_SPEC_PROB): the drafter's q list (host, kSpecQStride int32s)
+    /// for the proposal in `slot`'s NEXT batch window.  sample_rows then judges that slot's two rows (the token and its proposal) by rejection sampling - accept with
+    /// min(1, p/q), the residual sample on a reject, out[t] = the proposal when kept - instead of keeping the proposal only when it equals the target's sample.  Taken
+    /// once: the pointer is forgotten after the window.  Single GPU only (the caller does not set it on a layer split).
+    void set_slot_spec_q(int slot, const int32_t* q) {
+        if (slot >= 0 && slot < (int) slot_q_.size()) slot_q_[(size_t) slot] = q;
     }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
@@ -561,6 +576,7 @@ private:
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
+    uint64_t batch_graph_floor_ = 0;       ///< set_batch_graph_floor
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
@@ -592,6 +608,7 @@ private:
     std::chrono::steady_clock::time_point ext_checked_{};   ///< batch_poll's last check with external serving
     int32_t b_out_[8] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
+    std::vector<const int32_t*> slot_q_;   ///< set_slot_spec_q: the drafter's q list per slot for the next window (nullptr: none)
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;

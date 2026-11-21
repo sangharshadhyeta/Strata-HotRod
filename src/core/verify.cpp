@@ -6836,9 +6836,36 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     slots_ = slots;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
+    slot_q_.assign(slots.size(), nullptr);
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s\n", (long long) S,
                  (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "");
     return true;
+}
+
+void Verifier::release_slots() {
+    if (slots_.empty() && arena_b_ == nullptr && exec_bm_.empty() && commit_bm_.empty() && h_commitb_ == nullptr) return;
+    const OnDevice on_device(device_);
+    if (cs_) cudaStreamSynchronize(cs_);
+    for (auto& kv : exec_bm_)
+        if (kv.second) cudaGraphExecDestroy(kv.second);
+    exec_bm_.clear();
+    for (auto& kv : commit_bm_)
+        if (kv.second) cudaGraphExecDestroy(kv.second);
+    commit_bm_.clear();
+    bm_used_.clear();
+    bm_tick_ = 0;
+    if (arena_b_) { cudaFree(arena_b_); arena_b_ = nullptr; }
+    commitb_ = nullptr;
+    tail_snap_b_ = nullptr;
+    if (h_commitb_) { cudaFreeHost(h_commitb_); h_commitb_ = nullptr; }
+    m_commitb_ = nullptr;
+    slots_.clear();
+    slot_sp_.clear();
+    slot_q_.clear();
+    last_batch_ = false;
+    batch_rec_ = false;
+    for (int& r : last_rows_) r = 0;
+    for (int64_t& p : last_pos_b_) p = 0;
 }
 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
@@ -7021,8 +7048,18 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
     // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
-    cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
     int freed = 0;
+    // keep the floor (set_batch_graph_floor): free the least recently used layouts BEFORE the capture takes the last of the VRAM a prompt's buffers need
+    if (batch_graph_floor_ > 0) {
+        constexpr uint64_t kGraphMargin = 64ull << 20;   // a batch graph pair is 20-30 MiB
+        for (bool evicted = true; evicted;) {
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) != cudaSuccess || (uint64_t) fb >= batch_graph_floor_ + kGraphMargin) break;
+            if (!evict_batch_graph(key, evicted, err)) return false;
+            if (evicted) ++freed;   // (nothing older to free: capture anyway)
+        }
+    }
+    cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
     for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
         (void) cudaGetLastError();
         if (!evict_batch_graph(key, evicted, err)) return false;
@@ -7286,15 +7323,52 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
 
 bool Verifier::sample_rows(int S, std::string& err) {
     bool any = false;
-    for (int t = 0; t < S; ++t) {
-        strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
-        sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        sp.penalty_last_n = 0;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
-                                       m_out_ + t, cs_);
-        any = true;
+    for (int t = 0; t < S;) {
+        const int slot = last_rows_[t];
+        int n = 1;   // the slot's contiguous rows: one, or two (the token and its proposal, --batch-mtp)
+        while (t + n < S && last_rows_[t + n] == slot) ++n;
+        strata::kernels::SamplerParams sp = slot_sp_[(size_t) slot];
+        if (!(sp.greedy || sp.temperature <= 0.0f)) {
+            sp.penalty_last_n = 0;
+            // STRATA_SPEC_PROB: the slot's proposal was drawn from the drafter's q, so judge it by rejection sampling (spec_prob.hpp): row t judges the proposal
+            // last_tokens_[t + 1], with the same uniforms as the solo window at this position (counter = the first row's position).  Where the kernel cannot run the
+            // rows are sampled one by one as before: the proposal is then kept when it equals the target's sample, which is still exactly the target's distribution.
+            const int32_t* q = (size_t) slot < slot_q_.size() ? slot_q_[(size_t) slot] : nullptr;
+            bool judged = false;
+            if (n == 2 && q != nullptr) {
+                if (d_spec_ == nullptr &&
+                    cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    d_spec_ = nullptr;
+                }
+                if (d_spec_ != nullptr) {
+                    int32_t* d_q = d_spec_ + kVerifyMaxT;
+                    strata::kernels::SamplerParams gp = sp;
+                    gp.counter = (uint64_t) last_pos_b_[t];
+                    int32_t proposal = last_tokens_[t + 1];
+                    if (cudaMemcpyAsync(d_spec_, &proposal, sizeof(int32_t), cudaMemcpyHostToDevice, cs_) == cudaSuccess &&
+                        cudaMemcpyAsync(d_q, q, (size_t) strata::core::kSpecQStride * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) == cudaSuccess)
+                        judged = strata::kernels::sample_tokens_spec(head_logits_ + (size_t) t * (size_t) n_vocab_, 2, (int) n_vocab_, nullptr, 0, gp,
+                                                                     d_spec_, d_q, 1, m_out_ + t, cs_);
+                    if (judged) {
+                        // the copies above read `proposal` and the next group reuses d_spec_: finish them before this frame ends
+                        if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+                        ++spec_windows;
+                    }
+                }
+            }
+            if (!judged)
+                for (int j = 0; j < n; ++j) {
+                    strata::kernels::SamplerParams rp = sp;
+                    rp.counter = (uint64_t) last_pos_b_[t + j];   // Philox(seed, position): the solo window's draw for this position
+                    strata::kernels::sample_tokens(head_logits_ + (size_t) (t + j) * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, rp,
+                                                   m_out_ + t + j, cs_);
+                }
+            any = true;
+        }
+        t += n;
     }
+    for (const int32_t*& q : slot_q_) q = nullptr;   // taken once
     if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
     return true;
 }

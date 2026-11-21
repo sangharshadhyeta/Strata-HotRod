@@ -9502,6 +9502,7 @@ int main(int argc, char** argv) {
                     // --batch-mtp: every stage runs the same 2-rows-per-slot windows as the first (up to kVerifyMaxT
                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
+                    gs.ver.set_batch_graph_floor((uint64_t) std::max(o.vram_reserve_mib, 0) << 20);   // the batch graphs keep --vram-reserve-mib free (a long prompt's buffers)
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                        batch_mtp ? strata::kernels::kVerifyMaxT
                                                  : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
@@ -9583,6 +9584,7 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        ver.set_batch_graph_floor((uint64_t) std::max(o.vram_reserve_mib, 0) << 20);   // the batch graphs keep --vram-reserve-mib free (a long prompt's buffers)
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -11926,7 +11928,11 @@ int main(int argc, char** argv) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
                 return false;
             }
-            if (src.complement_ready()) {
+            // STRATA_VRAM_COMPLEMENT=1 (experiment, 21 Nov): allow the resize with the RAM tier on.  The first design assumed every expert has a RAM copy to
+            // fall back on ("their experts become CPU misses"); with the RAM tier only part of the model does, so a dropped expert is served by the file
+            // tier like any other miss.  Whether that holds is what this switch is for.
+            static const bool vram_complement_ok = [] { const char* v = std::getenv("STRATA_VRAM_COMPLEMENT"); return v != nullptr && std::atoi(v) != 0; }();
+            if (src.complement_ready() && !vram_complement_ok) {
                 e = "VRAM: not with the resident low-RAM mode (the cache holds experts RAM does not)";
                 return false;
             }
@@ -12344,6 +12350,7 @@ int main(int argc, char** argv) {
                         }
                         tok[S] = bs[(size_t) b].draft[0];
                         pos[S] = bs[(size_t) b].p + 1;
+                        if (stages.empty() && slot_mtp[(size_t) b]->prob()) ver.set_slot_spec_q(b, slot_mtp[(size_t) b]->spec_q());   // the proposal's q (STRATA_SPEC_PROB)
                         ++S;
                     }
                 }
@@ -16478,7 +16485,7 @@ int main(int argc, char** argv) {
                 // write, no copy), and the layers that wanted a place get one back - between windows, with the same guards as the
                 // RAM_ADAPT swaps below (no adaptive round in flight, nothing pending, no pool job reading the copy)
                 if (src.promotions_pending() && pending.empty() && (!ajob || astate == AState::Idle) && !multi_gpu && !peer.valid() &&
-                    !remote_opt && o.batch == 0) {
+                    !remote_opt && (o.batch == 0 || !batch_on())) {   // (batch_on: only while slots decode; a batch-capable engine's solo decode keeps this)
                     std::vector<char> gpu_busy(host_res.size());
                     for (size_t k = 0; k < gpu_busy.size(); ++k) gpu_busy[k] = host_res[k] >= 0;
                     src.publish_promotions(drive.d.usage, gpu_busy);
@@ -16496,7 +16503,7 @@ int main(int argc, char** argv) {
                 }();
                 if (ram_adapt_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu && !peer.valid() &&
-                    !remote_opt && o.batch == 0) {
+                    !remote_opt && (o.batch == 0 || !batch_on())) {   // (the same: only while slots decode)
                     constexpr float kRamAdaptRouted = 2.0f, kRamAdaptUnused = 0.5f;
                     struct RamSwap { float gain; int32_t layer, in, out; };
                     std::vector<RamSwap> swaps;
@@ -17079,6 +17086,13 @@ int main(int argc, char** argv) {
                 const auto tc1 = Clock::now();
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
+                    if (batch_mtp && stages.empty()) {
+                        // STRATA_SPEC_PROB (the flag the solo path uses): a sampled request's slot drafter samples its proposals from q and the window judges them by rejection
+                        // sampling (a no-op where the mode is off, for a greedy request or below STRATA_SPEC_MIN_TEMP). Penalties are not applied in batch windows.
+                        strata::kernels::SamplerParams dsp = req_sp;
+                        dsp.penalty_last_n = 0;
+                        slot_mtp[(size_t) admit_slot]->set_draft_sampling(dsp);   // (before the slot's first draft below)
+                    }
                     BSlot& sl = bs[(size_t) admit_slot];
                     if (ckpt_pool.on())
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
