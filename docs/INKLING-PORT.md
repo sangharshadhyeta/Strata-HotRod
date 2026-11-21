@@ -336,3 +336,7 @@ Per token (144 tokens profiled, 2,030 launches a token): GPU kernel time ~27 ms 
 after every launch when given `stream == nullptr`, and the engine passed nullptr everywhere. The engine now runs on one explicit stream (any engine that passes nullptr to these wrappers
 pays the same). Cold 48 tokens, engine alone: 42.7 -> 41.1 ms (23.4 -> 24.3 tok/s); with look-ahead prefetch N=8: 38.5 ms (26.0 tok/s, +6.5%): prefetch starts to pay as the compute shrinks.
 KL unchanged (0.0046). Next: the expert kernels' memory-level parallelism (12.6 ms at ~40% of VRAM bandwidth), the per-visit host gap, fusion of the small launches.
+
+Unrolling the expert dot loops (`#pragma unroll 4`, several blocks' loads in flight): cold 41.1 -> 40.4 ms (24.8 tok/s), with prefetch N=8 38.0 ms (26.3 tok/s); `moe_group_parity` unchanged
+(2e-7). Small: the expert kernels are not limited by loads in flight alone; the remaining ~13 ms between kernel time (~27 ms) and wall is the per-visit host gap (router picks to host,
+slot placement, then the expert launches) and the ~2,000 small launches a token. Qwen check after this change (3 prompts): 19.8 / 18.7 / 20.6 tok/s (mean 19.7, clean main 19.3), 13.6K read 333.5 tok/s (338.1; run-to-run spread 333-343): unchanged.

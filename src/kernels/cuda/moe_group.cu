@@ -99,6 +99,7 @@ __device__ __forceinline__ float dot_nvfp4(const uint8_t* row, const float* xs, 
     const int lane = threadIdx.x & 31, w = lane & 7, sbi = w >> 1, jo = 4 * (w & 1);
     const int nb = n >> 6;
     float acc = 0.0f;
+#pragma unroll 4   // several blocks' loads in flight: the loop is memory-latency bound
     for (int b0 = 0; b0 < nb; b0 += 4) {
         const int b = b0 + (lane >> 3);
         if (b < nb) {
@@ -123,6 +124,7 @@ __device__ __forceinline__ float dot_q8_0(const uint8_t* row, const float* xs, i
     const int lane = threadIdx.x & 31, w = lane & 15;
     const int nb = n >> 5;
     float acc = 0.0f;
+#pragma unroll 4
     for (int b0 = 0; b0 < nb; b0 += 2) {
         const int b = b0 + (lane >> 4);
         if (b < nb) {
