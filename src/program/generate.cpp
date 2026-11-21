@@ -38,6 +38,7 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
+#include "strata/core/online_tuner.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -10479,6 +10480,76 @@ int main(int argc, char** argv) {
                              gs.link_gbps, gs.pcie_frac);
             }
         };
+        // ---- the online tuner (include/strata/core/online_tuner.hpp, 21 Nov): the engine settles on its own settings from the decode windows it
+        // runs - the adaptive tier's swap count and decay, the draft floor, the route tail skip - by comparing each against the setting in use on
+        // interleaved blocks of windows and keeping what is more than 3% faster; a guard checks that the sum of what it adopted is no slower than
+        // the defaults.  A request that names its own draft floor keeps it.  What it learned is <pack>/online-tune.txt (the next start begins
+        // from it, settled).  STRATA_ONLINE_TUNE=0 turns it off; =burst is the calibration's faster schedule.
+        strata::core::OnlineTuner online_tuner;
+        double tuner_minp = -1.0;
+        bool tuner_on = false;
+        std::string tuner_path, tuner_saved;
+        auto tuner_levels = [](std::vector<double> base, double actual) {   // the fixed levels plus the value in use, sorted, unique
+            base.push_back(actual);
+            std::sort(base.begin(), base.end());
+            base.erase(std::unique(base.begin(), base.end(), [](double a, double b) { return std::fabs(a - b) < 1e-9; }), base.end());
+            return base;
+        };
+        auto tuner_def = [](const std::vector<double>& lv, double actual) {
+            int d = 0;
+            for (int i = 0; i < (int) lv.size(); ++i)
+                if (std::fabs(lv[(size_t) i] - actual) < 1e-9) d = i;
+            return d;
+        };
+        {
+            const char* ev = std::getenv("STRATA_ONLINE_TUNE");
+            const bool tuner_off = ev != nullptr && ev[0] == '0';
+            if (o.serve && !tuner_off && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && n_stages == 1) {
+                const bool burst = ev != nullptr && std::strcmp(ev, "burst") == 0;
+                if (burst) online_tuner.set_burst(true);
+                const bool tier_on = !drive.d.usage.empty() && o.adapt_swaps > 0;
+                const double sw = (double) o.adapt_swaps;
+                const auto lv_sw = tuner_levels({std::round(sw * 0.5), std::min(128.0, std::round(sw * 1.5))}, sw);
+                online_tuner.add_knob("adapt_swaps", lv_sw, tuner_def(lv_sw, sw), tier_on);
+                const auto lv_dc = tuner_levels({0.5, 0.85, 0.95}, (double) o.adapt_decay);
+                online_tuner.add_knob("adapt_decay", lv_dc, tuner_def(lv_dc, (double) o.adapt_decay), tier_on);
+                const auto lv_mp = tuner_levels({0.3, 0.4, 0.6, 0.7}, o.spec_min_p);
+                online_tuner.add_knob("spec_min_p", lv_mp, tuner_def(lv_mp, o.spec_min_p), o.spec_min_p > 0.0);
+                const int tr = strata::core::tail_skip_rank();
+                online_tuner.add_knob("tail_skip", {0.0, (double) std::max(tr, 1)}, 1, tr > 0);
+                tuner_on = true;
+                tuner_path = o.pack.empty() ? std::string() : (std::filesystem::path(o.pack) / "online-tune.txt").string();
+                if (!tuner_path.empty()) {
+                    std::ifstream tf(tuner_path);
+                    std::stringstream tss;
+                    tss << tf.rdbuf();
+                    if (online_tuner.load(tss.str()) > 0)
+                        std::fprintf(stderr, "strata serve: online tuner: started from %s (%s)\n", tuner_path.c_str(),
+                                     online_tuner.settled() ? "settled" : "tuning");
+                }
+                std::fprintf(stderr, "strata serve: online tuner on%s: it compares settings on the decode windows it runs and keeps what is more than 3%% "
+                                     "faster (STRATA_ONLINE_TUNE=0 turns it off)\n", burst ? " (burst)" : "");
+            }
+        }
+        auto tuner_apply = [&]() {
+            for (int i = 0; i < online_tuner.knob_count(); ++i) {
+                const strata::core::TunerKnob& k = online_tuner.knob(i);
+                if (!k.on) continue;
+                const double v = online_tuner.value(i);
+                if (k.name == "adapt_swaps") o.adapt_swaps = (int) v;
+                else if (k.name == "adapt_decay") o.adapt_decay = (float) v;
+                else if (k.name == "spec_min_p") tuner_minp = v;
+                else if (k.name == "tail_skip") strata::core::set_tail_skip_rank((int) v);
+            }
+        };
+        auto tuner_save = [&](bool force) {
+            if (!tuner_on || tuner_path.empty()) return;
+            const std::string text = online_tuner.save();
+            if (!force && text == tuner_saved) return;
+            std::ofstream tf(tuner_path, std::ios::trunc);
+            if (tf) { tf << text; tuner_saved = text; }
+        };
+        if (tuner_on) tuner_apply();
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
         std::vector<double> heat;
@@ -13337,7 +13408,8 @@ int main(int argc, char** argv) {
             int64_t req_pin = 0;
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
-            double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            double req_pcie_frac = o.pcie_frac, req_spec_min_p = (tuner_on && tuner_minp >= 0.0) ? tuner_minp : o.spec_min_p;
+            bool req_spec_named = false;   // the request names its own draft floor: the online tuner leaves it alone
             double req_pipe = -1.0;   // --prefill-pipe for this request (setup's calibration of a layer split)
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
             // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
@@ -13372,7 +13444,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
-                    else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "spec_min_p") { req_spec_min_p = std::clamp((double) fv, 0.0, 1.0); req_spec_named = true; }
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "img_keys") {
@@ -16627,6 +16699,7 @@ int main(int argc, char** argv) {
                     draft_offered += T - 1;
                     draft_accepted += a;
                 }
+                const bool tuner_ok = !merged && !first_window;   // a steady-state decode window: the online tuner times it
                 first_window = false;
                 rb_fresh = false;
                 bool eos = false;
@@ -16673,6 +16746,14 @@ int main(int argc, char** argv) {
                 if (!drafted) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
+                }
+                if (tuner_on && tuner_ok && !eos) {   // every thread of this window is joined: the settings may change now
+                    online_tuner.window(std::chrono::duration<double, std::milli>(Clock::now() - round0).count(), a + 1);
+                    tuner_apply();
+                    if (!req_spec_named && tuner_minp >= 0.0) req_spec_min_p = tuner_minp;
+                    const std::vector<std::string> tev = online_tuner.take_events();
+                    for (const std::string& m : tev) std::fprintf(stderr, "strata serve: %s\n", m.c_str());
+                    if (!tev.empty()) tuner_save(true);
                 }
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
@@ -16745,6 +16826,7 @@ int main(int argc, char** argv) {
                              (long long) rb_rewinds, (long long) rb_regen, (long long) kRbHold);
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            tuner_save(false);   // what the online tuner holds now (only written when it changed)
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());

@@ -561,26 +561,27 @@ With more than one model installed, it asks which one to start. `run-<model>.bat
   (Q2_0, with the swaps taking effect a window later, #764); see #906;
 - on two or more cards (a layer split), the prompt chunks that keep the cards reading at once (`--prefill-pipe`, the
   prompt read speed of fresh prompts rather than the output speed; see docs/MULTI_GPU.md);
-- (HotRod, 21 Nov) the learners and HotRod's own features: the tuning first trains the learned look-ahead on this PC (a
-  restart with `STRATA_LA_LEARN=1`; the engine saves what it learned when it quits), then measures each of the learned
-  look-ahead (`STRATA_LA_LEARN`), stand-ins (`STRATA_ROUTE_RESIDENT`), the route tail skip (`STRATA_ROUTE_TAIL_SKIP`) and the
-  mask (`STRATA_MASK`) on against off, and turns one off in the config's `env` only when off is more than 3% faster.
-  Every one is on by default because it won on the 12 GB RTX 3060 it was built on. A reviewer measured HotRod on a 24 GB RTX
-  Pro 4000 with DDR5 at 87 tok/s against Strata's 103 (decode) while prompt reading was 10-20% faster: a card that misses
-  fewer experts pays a fixed time per window for features built for one that misses many.
-  Measured on the 3060 (Qwen3.8-Flash-Next UD-Q4_K_XL, 262K, one cold start per arm, decode tok/s on four short questions): base
-  16.1 / 19.7 / 22.9 / 15.8, stand-ins off 6.0 / 8.2 / 9.8 / 5.4, adaptive swaps off 13.3 / 11.1 / 11.0 / 11.7, tail skip off
-  15.1 / 20.2 / 23.0 / 15.2, learned look-ahead off 16.5 / 18.8 / 22.6 / 15.9, mask off 16.2 / 19.7 / 23.9 / 16.4 (two base
-  runs agree within about 1 tok/s): on this card only stand-ins and the swaps pay, the others cost nothing that shows here.
-  Two guards keep the tuning from making a PC slower (found in the first real run on the 3060, whose choices - a fixed PCIe share
-  0.90 over the engine's own balance, 2 CPU workers, a draft floor 0.7, the tier 80 / 0.97, the tail skip and the mask off - each
-  won alone on short answers and together decoded 13.6 / 15.6 / 17.0 / 9.8 tok/s where the defaults did 15.3 / 20.6 / 24.8 / 14.8):
-  the default of every restart series is measured at both ends (the first arm of a series pays a warm-up), and at the end the whole
-  chosen set is measured against the product defaults together, default / chosen / default / chosen on 512-token answers; it is
-  kept only if it wins by more than 3%, otherwise every choice is dropped and the report says what was dropped.
+- (HotRod, 21 Nov) **the engine tunes itself**. While it decodes it compares the adaptive tier's swap count and decay, the draft floor and the
+  route tail skip on interleaved blocks of its own windows (A B A B ... A, 48 windows a block, milliseconds per accepted token, each B against the
+  mean of the two A blocks around it so a drift cancels). A setting is adopted only when it is more than 3% faster by a paired t-test (1%) and
+  faster in nearly every pair; an inconclusive test gets more pairs (up to 8); a candidate block 25% slower ends its test at once. Knobs are walked
+  round robin, one level at a time, each way, and a winner is pushed on in the same direction (hill climbing, not random). When a whole cycle adopts
+  nothing it is settled and runs one test per 20,000 windows (about 1.5% of the windows); after a cycle in which two or more knobs moved, a guard
+  measures the adopted set against all defaults and puts every knob back if the defaults are faster. What it learned is `<pack>/online-tune.txt`
+  and the next start begins from it. `STRATA_ONLINE_TUNE=0` turns it off. It is on by default, so a PC that is never calibrated is tuned live.
+  `--calibrate` runs the same tuner as a burst (one engine start, `STRATA_ONLINE_TUNE=burst`, the learners training with `STRATA_LA_LEARN=1`, real
+  answers until the state file says settled), with no restarts: minutes instead of the 80-90 of the first version, which tuned one setting at a
+  time and restarted the engine about 30 times. Its picks each won alone on short answers and together decoded 13.6 / 15.6 / 17.0 / 9.8 tok/s where
+  the defaults did 15.3 / 20.6 / 24.8 / 15.8. The worker count, the learned look-ahead's buffers and stand-ins are not tuned live (they are fixed at
+  start; stand-ins were worth 2.5x on a 12 GB card).
+  Measured on the 12 GB RTX 3060 (Qwen3.8-Flash-Next UD-Q4_K_XL, 262K, cold start, no saved state, 14 long answers): it settled on the defaults (64
+  swaps, decay 0.7, draft floor 0.5, tail skip 7) - nothing was more than 3% faster - at 25.6 tok/s on average against 25.4 with the tuner off.
+  Simulated engines (src/core/online_tuner_test.cpp, noise 25% a window, drift, 20 seeds): a real 8% win is found in 20/20 runs, drift alone
+  adopts nothing, a pair of settings that help alone and hurt together never ends slower than the defaults, a bad candidate runs in under 2% of the
+  windows. Not measured: a card with more VRAM, where the defaults may be further from the best.
 
-The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup measures them on your PC after the install (HotRod,
-21 Nov: by default; `--no-calibrate` skips it, and a PC that was tuned before is not tuned again); `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
+The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup runs the engine's tuner on your PC after the install (HotRod,
+21 Nov: by default; `--no-calibrate` skips it, and the engine keeps tuning itself live either way; a PC that was tuned before is not tuned again); `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
 speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
 (in the settings file next to the data folder's record), so updates keep it.
 
