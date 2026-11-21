@@ -15396,7 +15396,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: co-prefill asked for %zu prompts (on=%d batch=%d batch_mtp=%d draft_keep=%d stages=%zu multi_gpu=%d peer=%d pf_parts=%zu cancelled=%d)\n",
                              req_warm.size(), (int) co_prefill_on, o.batch, (int) batch_mtp, (int) slot_draft_keep, stages.size(), (int) multi_gpu, o.peer_device,
                              pf_parts.size(), (int) cancelled);
-            if (co_prefill_on && !req_warm.empty() && o.batch > 0 && !batch_mtp && !(slot_draft_keep && resume > 0) && stages.empty() && !multi_gpu && o.peer_device < 0 &&
+            if (co_prefill_on && !req_warm.empty() && o.batch > 0 && !batch_mtp && stages.empty() && !multi_gpu && o.peer_device < 0 &&
                 !cancelled) {
                 std::vector<std::vector<int64_t>> pres, req_warm_ids;   // the prefixes read; the full prompts (the drafter's next tokens)
                 std::vector<int> warm_slots;
@@ -15418,7 +15418,22 @@ int main(int argc, char** argv) {
                 if (jobs.size() >= 2) {
                     const auto tw = Clock::now();
                     std::string we;
-                    bool read_ok = lend(total, we, 0);
+                    // a request that continues the held conversation (every chat prompt shares its template's start with it) needs the main drafter's K/V of the cells
+                    // it reuses: the warm runs the drafter's prompt pass on other prompts, so that K/V goes aside first and comes back after (the same save the slot image takes)
+                    strata::core::ConversationKv main_draft_img;
+                    bool main_draft_saved = false;
+                    if (use_mtp && slot_draft_keep && resume > 0) {
+                        const strata::core::OnDevice on_mtp(mtp.device());
+                        std::string de;
+                        try {
+                            main_draft_saved = mtp.idle(de) &&
+                                strata::core::conversation_kv_save(main_draft_img, mtp.kv_state(), draft_geometry, resume, false, de);
+                        } catch (const std::bad_alloc&) {
+                            main_draft_saved = false;
+                        }
+                        if (!main_draft_saved) we = "co-prefill: the main drafter's K/V could not be set aside";
+                    }
+                    bool read_ok = (!(use_mtp && slot_draft_keep && resume > 0) || main_draft_saved) && lend(total, we, 0);
                     if (read_ok) {
                         for (const int b : warm_slots) {
                             bs[(size_t) b] = BSlot{};   // the slot's old conversation goes: its session is rewritten
@@ -15444,6 +15459,16 @@ int main(int argc, char** argv) {
                             };
                         if (read_ok) read_ok = sp.run_multi(jobs, we, on_job);
                         if (cudaDeviceSynchronize() != cudaSuccess && read_ok) { we = "co-prefill: device sync failed"; read_ok = false; }
+                    }
+                    if (main_draft_saved) {
+                        const strata::core::OnDevice on_mtp(mtp.device());
+                        std::string de;
+                        if (!mtp.idle(de) || !strata::core::conversation_kv_restore(main_draft_img, mtp.kv_state(), draft_geometry, resume, false, de) ||
+                            cudaDeviceSynchronize() != cudaSuccess) {
+                            std::printf("ERR co-prefill: the main drafter's K/V did not come back: %s\n", de.c_str());
+                            return 1;
+                        }
+                        mtp.set_prompt_len(n);
                     }
                     std::string re;
                     if (!refill(re)) {   // the loan always goes back
