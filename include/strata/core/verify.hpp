@@ -334,6 +334,9 @@ public:
     bool standin_learn_save(const std::string& path, std::string& msg) const;
     void standin_learn_cut(int row);
     void standin_learn_settle(bool exact_ok);
+    /// One sample's three sums (y_s.y_e, y_s.y_s, y_e.y_e) for the pair (layer, true expert e, stand-in s) into the stand-in learner: the pair, its (layer, e) group and its layer group, and the device
+    /// table once the pair is ready.  standin_learn_settle ends in it; the samples a prompt read takes enter here.  Between windows only (it may write the device table).  A no-op when the learner is off.
+    void standin_learn_add_sums(int64_t layer, int64_t e, int64_t s, double sxy, double sxx, double syy);
     /// STRATA_SUBFIT_LOG=1 (static: one sample file per process): the path is set at startup, the file opens at the first decode window,
     /// and subfit_probe_collect() runs after each window that was a probe window (between windows: the host reads the probe buffers).
     static void subfit_set_path(const std::string& path);

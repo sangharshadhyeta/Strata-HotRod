@@ -1601,6 +1601,17 @@ void Verifier::standin_learn_settle(bool exact_ok) {
         ++g_sub_learn_req;
     }
     if (shd_on_ && g_sub_learn && !st.pend.shadow.empty()) subfit_shadow_collect((int) l, (int) e, (int) s);
+    standin_learn_add_sums(l, e, s, sxy, sxx, syy);
+}
+
+// One sample's three sums (y_s.y_e, y_s.y_s, y_e.y_e) for the pair (layer l, true expert e, stand-in s): the pair, its (layer, e) group and its layer group, the device table when the pair is
+// ready.  standin_learn_settle ends in it (a flip re-check's sample); the samples a prompt read takes enter here.  Between windows only: it may write the device table.
+void Verifier::standin_learn_add_sums(int64_t l, int64_t e, int64_t s, double sxy, double sxx, double syy) {
+    if (lrn_st_ == nullptr) return;
+    StandinLearnState& st = *lrn_st_;
+    const int64_t n_exp = 512;
+    if (!std::isfinite(sxy) || !std::isfinite(sxx) || !std::isfinite(syy) || !(sxx > 0.0)) return;
+    if (l < 0 || l >= st.layers || e < 0 || e >= n_exp || s < 0 || s >= n_exp) return;
     const uint64_t key = lrn_key(l, e, s);
     const bool pool = standin_pool_apply_env();
     if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
