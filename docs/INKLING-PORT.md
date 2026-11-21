@@ -270,3 +270,21 @@ Engine change: one `route` + 4 launches a visit instead of 6 launches per expert
 - Lesson: the first dot mapping (byte loads per lane) lost 40% over PCIe (117 ms experts); 32-bit/16-bit per-lane loads restore it. Wide loads matter for zero-copy.
 - KL against the oracle varies 0.0034-0.0073 with the summation order of the dots: near-tie router picks (~6% of picks differ), the same envelope as Maya's engine, not an error.
 - Next: L2 (VRAM slot cache + copy stream, class B), then L3 (fusion / graph).
+
+## L2 result: VRAM slot cache, class B (22 Nov)
+
+`include/strata/kernels/moe_slot_cache.hpp` (`moe::SlotCache`, header-only, no model's numbers): the caller gives layers, experts, the bytes of an expert's two planes and where an
+expert's bytes are on the host; per visit `place()` copies the misses into least-recently-used VRAM slots on a copy stream (a hit costs nothing) and returns slot addresses for
+`moe::experts_gate_up / down`. Switches are model-neutral: `STRATA_MOE_SLOTS=N` (0 = off, unset = what free VRAM holds less `STRATA_MOE_SLOT_MARGIN_MB`, 1500).
+The engine reads the router's picks once a visit (one sync), then the kernels read slot addresses. Not tied to Inkling: any engine whose experts sit in pinned RAM can use it.
+
+| step (48-token oracle prompt, cold cache) | tok/s | experts ms/token |
+|---|---|---|
+| L1, all experts zero-copy over PCIe | 9.7 | 82 |
+| L2, slot cache 1036 experts (8.8 GB, 34%), 86% hits | 22.3 | 24 |
+
+KL against the oracle is identical with and without the cache (0.0046): the cache moves bytes, not values. Run is cold (48 tokens), so steady-state hit rate is higher.
+Not yet done: overlap of the copies with compute (needs the picks before the visit: look-ahead / loop-aware prefetch, our idea to add one at a time), L3 fusion / graph.
+
+Qwen check after the change (3 prompts, Strata-edge0 binary, 262144): 18.0 / 18.9 / 21.0 tok/s (mean 19.3, clean main 19.3), 13.6K-token read 339.7 tok/s (clean main 338.1):
+unchanged, as expected: neither library is linked into the `strata` binary. Qwen's own types (IQ) are not decoded by `moe_group` yet.

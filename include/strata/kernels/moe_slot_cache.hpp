@@ -1,0 +1,107 @@
+// include/strata/kernels/moe_slot_cache.hpp - a model-independent VRAM slot cache for MoE experts (class B: the experts sit in pinned RAM, the hot ones in VRAM).
+//
+// Nothing here knows a model: the caller says how many layers and experts there are, how many bytes an expert's two planes take, and where an expert's bytes are on the
+// host (a base pointer + plane size per layer and plane).  Per layer visit the host reads the router's picks, `place` copies the missing experts into least-recently-used
+// slots on a copy stream (a hit costs nothing) and hands back the slot addresses for moe::experts_gate_up / experts_down; the compute stream waits on an event.
+// Switches (read by `from_env`, shared by every engine that uses it): STRATA_MOE_SLOTS=N (0 = off), STRATA_MOE_SLOT_MARGIN_MB (VRAM left free when N is automatic; 1500).
+#pragma once
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+namespace strata::kernels::moe {
+
+class SlotCache {
+public:
+    SlotCache() = default;
+    SlotCache(const SlotCache&) = delete;
+    SlotCache& operator=(const SlotCache&) = delete;
+    ~SlotCache() {
+        if (mem_) cudaFree(mem_);
+        if (cs_) cudaStreamDestroy(cs_);
+        if (ev_) cudaEventDestroy(ev_);
+        if (summary_ && hits_ + miss_ > 0) std::fprintf(stderr, "moe slot cache: %ld hits, %ld misses (%.1f%% hit)\n", hits_, miss_, 100.0 * hits_ / (double) (hits_ + miss_));
+    }
+    /// n_slots < 0: automatic (the free VRAM less the margin); 0: off.  Returns whether a cache exists (fewer than one visit's picks = none).
+    bool init(long n_slots, size_t gu_bytes, size_t dn_bytes, int n_layers, int n_experts, int max_k, const char* tag = "moe") {
+        gu_ = gu_bytes; dn_ = dn_bytes; ne_ = n_experts; maxk_ = max_k;
+        if (n_slots == 0 || gu_ + dn_ == 0) return false;
+        if (n_slots < 0) {
+            size_t freeb = 0, totalb = 0;
+            if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) return false;
+            const char* m = std::getenv("STRATA_MOE_SLOT_MARGIN_MB");
+            const size_t margin = (size_t) (m ? std::atoll(m) : 1500) << 20;
+            n_slots = (long) ((freeb > margin ? freeb - margin : 0) / (gu_ + dn_));
+        }
+        n_slots = std::min<long>(n_slots, (long) n_layers * n_experts);
+        if (n_slots < max_k) return false;
+        n_ = (int) n_slots;
+        if (cudaMalloc((void**) &mem_, (size_t) n_ * (gu_ + dn_)) != cudaSuccess) { mem_ = nullptr; n_ = 0; return false; }
+        cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming);
+        key_.assign((size_t) n_, -1); used_.assign((size_t) n_, 0);
+        map_.assign((size_t) n_layers * n_experts, -1);
+        summary_ = true;
+        std::fprintf(stderr, "%s: VRAM slot cache of %d experts (%.1f GB; %.0f%% of the %ld experts)\n", tag, n_, (double) n_ * (gu_ + dn_) / 1e9, 100.0 * n_ / (double) ((long) n_layers * n_experts),
+                     (long) n_layers * n_experts);
+        return true;
+    }
+    /// STRATA_MOE_SLOTS: unset = automatic.
+    static long slots_from_env() { const char* e = std::getenv("STRATA_MOE_SLOTS"); return e ? std::atol(e) : -1; }
+    bool active() const { return n_ > 0; }
+    int slots() const { return n_; }
+    long hits() const { return hits_; }
+    long misses() const { return miss_; }
+
+    /// Place the K picks `idx` of layer `layer`: expert e's gate+up plane is at gu_src + e * gu_plane on the host, its down plane at dn_src + e * dn_plane (each <= the slot's
+    /// planes).  Writes the slot addresses to gu_ptr[s] / dn_ptr[s] (host arrays).  The copies of misses go on the copy stream; `wait_on` (the compute stream) waits for them.
+    void place(int layer, const int32_t* idx, int K, const uint8_t* gu_src, size_t gu_plane, const uint8_t* dn_src, size_t dn_plane, const uint8_t** gu_ptr, const uint8_t** dn_ptr,
+               cudaStream_t wait_on) {
+        ++clock_;
+        bool copied = false;
+        int slot_of[16];
+        for (int s = 0; s < K && s < 16; ++s) {
+            const int64_t k = (int64_t) layer * ne_ + idx[s];
+            int sl = map_[(size_t) k];
+            if (sl >= 0) ++hits_;
+            else {
+                ++miss_;
+                int64_t best = INT64_MAX;
+                for (int i = 0; i < n_; ++i)   // the least recently used slot (a free one has last use 0)
+                    if (used_[(size_t) i] < best) best = used_[(size_t) i], sl = i;
+                if (key_[(size_t) sl] >= 0) map_[(size_t) key_[(size_t) sl]] = -1;
+                key_[(size_t) sl] = k; map_[(size_t) k] = sl;
+                uint8_t* dst = mem_ + (size_t) sl * (gu_ + dn_);
+                cudaMemcpyAsync(dst, gu_src + (size_t) idx[s] * gu_plane, gu_plane, cudaMemcpyHostToDevice, cs_);
+                cudaMemcpyAsync(dst + gu_, dn_src + (size_t) idx[s] * dn_plane, dn_plane, cudaMemcpyHostToDevice, cs_);
+                copied = true;
+            }
+            used_[(size_t) sl] = clock_;   // set now: a pick made earlier in this visit is never the victim
+            slot_of[s] = sl;
+        }
+        for (int s = 0; s < K && s < 16; ++s) {
+            uint8_t* base = mem_ + (size_t) slot_of[s] * (gu_ + dn_);
+            gu_ptr[s] = base; dn_ptr[s] = base + gu_;
+        }
+        if (copied) { cudaEventRecord(ev_, cs_); cudaStreamWaitEvent(wait_on, ev_, 0); }
+    }
+
+private:
+    int n_ = 0, ne_ = 0, maxk_ = 0;
+    size_t gu_ = 0, dn_ = 0;
+    uint8_t* mem_ = nullptr;
+    cudaStream_t cs_ = nullptr;
+    cudaEvent_t ev_ = nullptr;
+    std::vector<int64_t> key_, used_;
+    std::vector<int> map_;
+    int64_t clock_ = 0;
+    long hits_ = 0, miss_ = 0;
+    bool summary_ = false;
+};
+
+}  // namespace strata::kernels::moe

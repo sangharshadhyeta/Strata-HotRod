@@ -7,6 +7,7 @@
 #include "strata/kernels/inkling2_kernels.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/moe_group.hpp"
+#include "strata/kernels/moe_slot_cache.hpp"
 
 #include <cuda_runtime.h>
 
@@ -54,6 +55,8 @@ struct Engine::Impl {
         std::vector<float> gs, ds;                         // per-expert scales (NVFP4)
         float *gs_d = nullptr, *ds_d = nullptr;            // the same on the device (null: scale 1)
         const uint8_t *gu_dev = nullptr, *dn_dev = nullptr;  // the experts, device-addressable (registered mapping)
+        const uint8_t *host_gu = nullptr, *host_dn = nullptr;  // the same bytes on the host (pinned): the slot cache copies from here
+        bool resident = false;                                 // experts already in VRAM (STRATA_INKLING2_VRAM_LAYERS): bypass the cache
         uint64_t gu_plane = 0, dn_plane = 0, gate_bytes = 0;
         int etype = 0;
     };
@@ -94,7 +97,8 @@ struct Engine::Impl {
     }
 
     Impl(const GgufFile& gg, const Config& cc, const Layout& ll, int max_ctx) : g(gg), c(cc), lay(ll), cap(max_ctx) { init(); }
-    ~Impl() { for (void* p : allocs) cudaFree(p); for (void* p : pinned) cudaFreeHost(p); }
+    ~Impl() {
+        for (void* p : allocs) cudaFree(p); for (void* p : pinned) cudaFreeHost(p); }
 
     void* dmalloc(size_t n) { void* p = nullptr; CK(cudaMalloc(&p, n)); allocs.push_back(p); return p; }
     float* fmalloc(size_t n) { return (float*) dmalloc(n * 4); }
@@ -116,7 +120,7 @@ struct Engine::Impl {
     /// the ExpertStore).  Read with pread from the GGUF in chunks.
     std::vector<void*> pinned;
     int vram_layers = 0;   // STRATA_INKLING2_VRAM_LAYERS=N: the experts of stored layers 0..N-1 live in VRAM (a measurement of how much of the speed is PCIe); F3 replaces it by the slot cache
-    const uint8_t* load_pinned(const TensorInfo& t, bool to_vram = false) {
+    const uint8_t* load_pinned(const TensorInfo& t, bool to_vram = false, const uint8_t** host_out = nullptr) {
         const uint64_t n = tensor_payload_bytes(t), off0 = g.data_start() + t.offset;
         void* host = nullptr;
         CK(cudaHostAlloc(&host, n, cudaHostAllocMapped | cudaHostAllocPortable));
@@ -138,9 +142,28 @@ struct Engine::Impl {
             return (const uint8_t*) d;
         }
         void* dp = nullptr;
+        if (host_out) *host_out = (const uint8_t*) host;
         CK(cudaHostGetDevicePointer(&dp, host, 0));
         expert_b += n;
         return (const uint8_t*) dp;
+    }
+
+    // ---- the VRAM slot cache (class B: the experts are in RAM, hot ones in VRAM): the shared moe::SlotCache (STRATA_MOE_SLOTS, STRATA_MOE_SLOT_MARGIN_MB).
+    // Per visit the host reads the picks (one sync), misses are copied on the cache's copy stream, the kernels read slot addresses.
+    M::SlotCache scache;
+    const uint8_t **h_gu_ptr = nullptr, **h_dn_ptr = nullptr;   // pinned address tables
+    void init_cache() {
+        size_t gu = 0, dn = 0;
+        for (const LW& w : lw) if (!w.resident) { gu = std::max<size_t>(gu, w.gu_plane); dn = std::max<size_t>(dn, w.dn_plane); }
+        if (!scache.init(M::SlotCache::slots_from_env(), gu, dn, (int) c.n_stored, (int) c.n_expert, (int) c.n_expert_used, "inkling2 engine")) return;
+        void* hp = nullptr;
+        CK(cudaHostAlloc(&hp, 32 * sizeof(void*), cudaHostAllocPortable)); pinned.push_back(hp);
+        h_gu_ptr = (const uint8_t**) hp; h_dn_ptr = h_gu_ptr + 16;
+    }
+    void place_experts(int l, const LW& w, const int32_t* idx, int K) {
+        scache.place(l, idx, K, w.host_gu, w.gu_plane, w.host_dn, w.dn_plane, h_gu_ptr, h_dn_ptr, nullptr);
+        CK(cudaMemcpyAsync(d_gu_ptr, h_gu_ptr, (size_t) K * sizeof(void*), cudaMemcpyHostToDevice, nullptr));
+        CK(cudaMemcpyAsync(d_dn_ptr, h_dn_ptr, (size_t) K * sizeof(void*), cudaMemcpyHostToDevice, nullptr));
     }
 
     void init() {
@@ -185,8 +208,9 @@ struct Engine::Impl {
             w.gu_plane = (uint64_t) 2 * FF * rb_gu;
             w.dn_plane = (uint64_t) E * rb_dn;
             w.gate_bytes = (uint64_t) FF * rb_gu;
-            w.gu_dev = load_pinned(*L.gate_up_exps, l < vram_layers);
-            w.dn_dev = load_pinned(*L.down_exps, l < vram_layers);
+            w.resident = l < vram_layers;
+            w.gu_dev = load_pinned(*L.gate_up_exps, w.resident, &w.host_gu);
+            w.dn_dev = load_pinned(*L.down_exps, w.resident, &w.host_dn);
         }
         (void) NE;
         // per-visit state
@@ -209,6 +233,7 @@ struct Engine::Impl {
         d_sg = fmalloc(16); d_wd = fmalloc(16); d_hh = fmalloc((size_t) 16 * FF); d_yy = fmalloc((size_t) 16 * E);
         xq = dmalloc((size_t) (E / 32) * 36 * 2); hq = dmalloc((size_t) (FF / 32) * 36 * 2); aq = dmalloc((size_t) (H * D / 32) * 36 * 2);
         picks.assign((size_t) c.n_visits, {});
+        init_cache();
     }
 
     void reset() {
@@ -307,7 +332,13 @@ struct Engine::Impl {
         CK(cudaMemcpyAsync(h_idx + (size_t) vis * 16, idxv, (size_t) Kx * 4, cudaMemcpyDeviceToHost, nullptr));
         lap(1);
         // the grouped experts: 4 launches for all of the visit's picks, FP32 activations (no int8 quantization of the input)
-        M::experts_prepare(idxv, d_w, w.gu_dev, w.gu_plane, w.dn_dev, w.dn_plane, w.gs_d, w.ds_d, Kx, d_gu_ptr, d_dn_ptr, d_sg, d_wd, nullptr);
+        if (scache.active() && !w.resident) {   // class B: the host learns the picks (one sync a visit), misses are copied into VRAM slots, hits cost nothing
+            CK(cudaStreamSynchronize(nullptr));
+            place_experts((int) l, w, h_idx + (size_t) vis * 16, Kx);
+            M::experts_scales(idxv, d_w, w.gs_d, w.ds_d, Kx, d_sg, d_wd, nullptr);
+        } else {
+            M::experts_prepare(idxv, d_w, w.gu_dev, w.gu_plane, w.dn_dev, w.dn_plane, w.gs_d, w.ds_d, Kx, d_gu_ptr, d_dn_ptr, d_sg, d_wd, nullptr);
+        }
         M::experts_gate_up(d_gu_ptr, w.etype, w.gate_bytes, x, (int) E, (int) FF, d_sg, M::Act{M::ActKind::Situ, c.situ_beta, c.situ_linear_beta}, d_hh, Kx, nullptr);
         M::experts_down(d_dn_ptr, w.etype, d_hh, (int) E, (int) FF, d_yy, Kx, nullptr);
         M::experts_combine(d_yy, d_wd, Kx, (int) E, moe, nullptr);

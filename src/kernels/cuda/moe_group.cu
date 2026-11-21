@@ -155,6 +155,14 @@ __global__ void k_prepare(const int32_t* idx, const float* rw, const uint8_t* gu
     wd[s] = rw[s] * (ds ? ds[e] : 1.0f);
 }
 
+__global__ void k_scales(const int32_t* idx, const float* rw, const float* gs, const float* ds, int K, float* sg, float* wd) {
+    const int s = threadIdx.x;
+    if (s >= K) return;
+    const int e = idx[s];
+    sg[s] = gs ? gs[e] : 1.0f;
+    wd[s] = rw[s] * (ds ? ds[e] : 1.0f);
+}
+
 constexpr int kEW = 8, kER = 2;   // warps a block, rows a warp
 
 // grid (ceil(FF / (kEW kER)), K), kEW * 32 threads, C floats of shared memory.
@@ -214,6 +222,9 @@ void route(const float* logits, const float* bias, int T, int n, int k, float ro
 void experts_prepare(const int32_t* idx, const float* route_w, const uint8_t* gu_base, size_t gu_plane, const uint8_t* dn_base, size_t dn_plane, const float* gate_up_scale,
                      const float* down_scale, int K, const uint8_t** gu_ptr, const uint8_t** dn_ptr, float* sg, float* wd, void* stream) {
     k_prepare<<<1, 32, 0, (cudaStream_t) stream>>>(idx, route_w, gu_base, gu_plane, dn_base, dn_plane, gate_up_scale, down_scale, K, gu_ptr, dn_ptr, sg, wd);
+}
+void experts_scales(const int32_t* idx, const float* route_w, const float* gate_up_scale, const float* down_scale, int K, float* sg, float* wd, void* stream) {
+    k_scales<<<1, 32, 0, (cudaStream_t) stream>>>(idx, route_w, gate_up_scale, down_scale, K, sg, wd);
 }
 void experts_gate_up(const uint8_t* const* gu_ptr, int ty, size_t up_off, const float* x, int C, int FF, const float* sg, Act act, float* h, int K, void* stream) {
     if (!type_supported(ty)) { std::fprintf(stderr, "moe::experts_gate_up: ggml type %d has no decode here\n", ty); std::exit(1); }

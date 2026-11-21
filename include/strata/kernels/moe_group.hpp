@@ -29,6 +29,8 @@ struct Act { ActKind kind = ActKind::Silu; float p0 = 0.0f, p1 = 0.0f; };
 /// (route weight x down scale).  Either scale array may be null (= 1).
 void experts_prepare(const int32_t* idx, const float* route_w, const uint8_t* gu_base, size_t gu_plane, const uint8_t* dn_base, size_t dn_plane, const float* gate_up_scale,
                      const float* down_scale, int K, const uint8_t** gu_ptr, const uint8_t** dn_ptr, float* sg, float* wd, void* stream);
+/// The same without the addresses, for a tier that places experts itself (a VRAM slot cache: the host writes gu_ptr / dn_ptr): only the scales and combine weights.
+void experts_scales(const int32_t* idx, const float* route_w, const float* gate_up_scale, const float* down_scale, int K, float* sg, float* wd, void* stream);
 /// h[s][r] = act(gate_r . x, up_r . x) for r < FF: slot s's plane holds the gate rows, then (at up_off bytes) the up rows; `ty` the ggml type (40 NVFP4, 8 Q8_0); x [C] float.
 void experts_gate_up(const uint8_t* const* gu_ptr, int ty, size_t up_off, const float* x, int C, int FF, const float* sg, Act act, float* h, int K, void* stream);
 /// y[s][c] = down_c . h[s] for c < C (h [K][FF]; slot s's down rows at dn_ptr[s]).
