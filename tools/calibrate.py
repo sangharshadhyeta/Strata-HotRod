@@ -1,37 +1,29 @@
-"""Tune the engine's hardware-dependent settings on this PC (setup's --calibrate).
+"""Tune the engine for this PC (setup's --calibrate).
 
-Three settings depend on the machine more than on the model, and the defaults are right for the PC they were
-measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
-  --pcie-frac     the share of the experts missing from VRAM that are copied over PCIe and run on the GPU instead of
-                  on the CPU.  A fast PCIe link and a slow CPU want more; a laptop's x8 link or a fast CPU want less.
-  --spec-min-p    how sure the draft layer must be to extend a verify window by another guess.  A slower CPU pays more
-                  per extra window row (more experts per window), so it wants a higher floor.
-  --pool-workers  the CPU threads that compute experts.  Every physical core is not always best: on hybrid CPUs the
-                  efficiency cores can make the whole window wait for them.
-  --adapt-every / --adapt-swaps / --adapt-decay
-                  how the VRAM expert tier follows the conversation: how often, how many experts it swaps in, how fast
-                  its use counts fade.  A PC whose CPU reads the missed experts slowly (DDR3, ~24 GB/s) gains from
-                  swapping more: 160 swaps every window measured +7.9% over the default tier on a Xeon E5-2673 v3 (DDR3) with an
-                  RTX 4060 Ti on PCIe 3.0 x8 (Q2_0; with the swaps taking effect a window later, #764).
-  --prefill-pipe  a layer split only: the prompt chunks that keep the stages reading at once.  The best chunk count
-                  depends on b/a, the fixed cost of a chunk over that of a token, which differs by an order of
-                  magnitude between rigs (about 700 tokens on four GP100 dies, 5000 on two RTX 3090 Ti) and costs
-                  when it is wrong (a fixed 1024 read 22-36% slower on two RTX 4090) - so it is measured here, once,
-                  as the prompt read speed of fresh prompts, rather than guessed or learned while the PC serves.
+The engine tunes itself.  While it decodes it compares settings on interleaved blocks of its own windows (include/strata/core/online_tuner.hpp):
+the adaptive expert tier's swap count and decay, the draft floor (--spec-min-p) and the route tail skip.  It keeps a setting only when it is more
+than 3% faster by a paired test, checks that the sum of what it adopted is no slower than the defaults, and saves what it learned per model
+(<pack>/online-tune.txt); the next start begins from it.  Without a calibration this happens live, in the first minutes of use.
+
+A calibration does the SAME thing on a schedule.  It starts the engine once with STRATA_ONLINE_TUNE=burst (smaller blocks, no waiting between
+tests) and STRATA_LA_LEARN=1 (the learners train on this PC; no trained state is downloaded), sends a few real answers at a time - short
+prompts and one with a context behind it - until the engine's state file says it has settled, and quits, which writes the tuner's state and the
+learners' files.  No restarts: about 10-20 minutes.  (The first version tuned one setting at a time and restarted the engine about 30 times;
+its picks each won alone on short answers and together decoded about 25% slower, the same setting read 19.1 or 26.3 tok/s depending on whether
+its arm ran first or last, and it took 80-90 minutes - see docs/DETAILS.md.)
+
+What stays a measurement of its own here:
+  --prefill-pipe  a layer split only: the prompt chunks that keep the stages reading at once.  The best chunk count depends on b/a, the fixed
+                  cost of a chunk over that of a token, which differs by an order of magnitude between rigs (about 700 tokens on four GP100
+                  dies, 5000 on two RTX 3090 Ti) and costs when it is wrong (a fixed 1024 read 22-36% slower on two RTX 4090) - so it is
+                  measured here, once, as the prompt read speed of fresh prompts, rather than guessed or learned while the PC serves.
   STRATA_SH_STREAM (AMD only)
-                  the shared expert on its own stream.  Off by default on HIP (#816: an RX 6800 on Windows and 4x R9700
-                  decode 12-45% faster without it), but the same card family on another PC goes the other way (#1272:
-                  2x RX 6900 XT on Linux, 6-11% faster with it), so it is measured here, per PC, and written into the
-                  config's "env" only when it wins.  The output is identical either way (same token ids).
+                  the shared expert on its own stream: an engine variable read at start, so the tuner cannot change it live.  Off by default on
+                  HIP (#816: an RX 6800 on Windows and 4x R9700 decode 12-45% faster without it), but the same card family on another PC goes
+                  the other way (#1272: 2x RX 6900 XT on Linux, 6-11% faster with it), so it is measured here, per PC, with a restart per value,
+                  and written into the config's "env" only when it wins.  The output is identical either way (same token ids).
 
-The first two and the prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
-count, the adaptive tier and the shared-expert stream need a restart per value.  Those are decode speed: the prompt
-path streams every expert whatever they say.
-
-A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
-adaptive expert tier and the OS make single measurements noisy by a few percent.
-
-    python tools/calibrate.py strata-q2_0.json        # measure and print; setup.py --calibrate also saves it
+    python tools/calibrate.py strata-q2_0.json        # run and print; setup.py --calibrate also saves it
 """
 from __future__ import annotations
 
@@ -47,14 +39,11 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
 MIN_GAIN = 0.03                    # a setting must beat the default by this much to be kept
-PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75, 0.9, 1.0)   # 1.0: every miss over PCIe, the CPU pool gets no expert
-SPEC_MIN_PS = (0.3, 0.5, 0.7)
-SWEEP_ROUNDS = 3                   # how many times the sweep visits each value (see `sweep`)
+SWEEP_ROUNDS = 3                   # the prompt chunks' paired rounds (measure_pipe)
 # the adaptive tier's candidates (every, swaps, decay) against the engine's own (None): swapping more and remembering
 # longer, the rest of the set as the engine has it
 # HIP: the shared-expert stream fork, off (the HIP default) against on; an engine environment variable, not an argument
 SH_STREAM = "STRATA_SH_STREAM"
-ADAPT_CANDIDATES = (None, ("1", "80", "0.97"), ("1", "160", "0.97"))
 ADAPT_FLAGS = ("--adapt-every", "--adapt-swaps", "--adapt-decay")
 MAX_NEW = 128
 # the expert tier follows a text over some windows: 128-token answers end before it shows (on a Xeon E5-2673 v3 with
@@ -90,30 +79,8 @@ def with_arg(args: list[str], flag: str, value: str | None) -> list[str]:
     return out
 
 
-def worker_candidates(default: int, extra=()) -> list[int]:
-    """The engine's own count, and fewer: two thirds, a half and a quarter (at least 2), plus `extra` (the P-cores
-    minus one on a hybrid CPU, one socket's cores minus one on a 2-socket PC), without repeats.  Bench #780 #815
-    #707 #674: 4 beat 15 by 28.7% on 8P + 16E; 17-18 beat 35 by ~20% on 2-socket Xeons."""
-    c = [default]
-    for w in (round(default * 2 / 3), round(default / 2), round(default / 4), *extra):
-        if 2 <= w < default and w not in c:
-            c.append(w)
-    return c
 
 
-def host_worker_extras() -> list[int]:
-    """P-cores - 1 (hybrid CPU) and one socket's cores - 1 (several sockets) of this PC: more counts to try."""
-    try:
-        import setup
-        out = []
-        cores, sockets = setup.cpu_cores(), setup.cpu_sockets()
-        if cores:
-            out.append(cores[0] - 1)
-        if sockets and sockets[0] >= 2:
-            out.append(sockets[1] - 1)
-        return out
-    except Exception:
-        return []
 
 
 def doc_prompt(tok):
@@ -169,6 +136,10 @@ def measure_pipe(eng, make, say=print) -> tuple[float, dict]:
                     "pipe_confirm": {str(k): v for k, v in confirm.items()}}
 
 
+
+
+
+
 def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
     """The key with the best median tok/s, or `default_key` unless the best beats it by more than min_gain."""
     med = {k: statistics.median(v) for k, v in measured.items() if v}
@@ -222,8 +193,9 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
-                   hip=cfg.get("backend") == "hip")
+    hip = cfg.get("backend") == "hip"
+    features = () if hip else ("STRATA_LA_LEARN",)     # the learners train in the same run (CUDA; the HIP engines have none)
+    return measure(engine_args(cfg), ids_list, start_engine, say, doc_prompt(tok), hip=hip, features=features)
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -249,135 +221,109 @@ def engine_error(log: str | None, since: int = 0) -> str | None:
     return next((x for x in reversed(lines) if x.startswith(("strata", "ERR"))), lines[-1] if lines else None)
 
 
-def sweep(s, values: list, base_tune: dict, key: str, label: str, say) -> dict:
-    """Every value, `SWEEP_ROUNDS` times, one round visiting all of them and every other round in reverse order.
 
-    A single rate per value cannot order neighbours.  #1332 has 0.75 to 0.95 inside each other's noise at 72.7,
-    69.0, 71.0 and 71.9, and that box moved 8-28% between engine starts at an unchanged setting; a 5080/Xeon box
-    reports +9.57 tok/s between two blocks at an unchanged setting (p = 0.00004), larger than the effect being
-    hunted.  Rotating the values inside one engine start puts that drift on every value the same number of times,
-    and the median over the rounds keeps a single bad sample from deciding.  The caller takes the winner from the
-    medians, so every value keeps the same chance the others had.
-    """
-    out = {v: [] for v in values}
-    for r in range(SWEEP_ROUNDS):
-        for v in (values if r % 2 == 0 else values[::-1]):
-            out[v].append(s.rate({**base_tune, key: v}))
-        say(f"    round {r + 1}/{SWEEP_ROUNDS} {label}: " +
-            "  ".join(f"{v:g} {out[v][-1]:.1f}" for v in values))
-    med = {v: statistics.median(out[v]) for v in values}
-    say(f"    {label}, median of {SWEEP_ROUNDS}: " +
-        ", ".join(f"{v:g}: {med[v]:.1f} ({min(out[v]):.1f}-{max(out[v]):.1f})" for v in values) +
-        f" -> best {max(med, key=lambda k: med[k]):g}")
+
+# ---- the calibration is the engine's online tuner, driven in a burst (HotRod, 21 Nov) ----------------------------------------------------------
+# The engine settles on a good configuration by itself while it decodes (include/strata/core/online_tuner.hpp): it compares the adaptive tier's swap
+# count and decay, the draft floor and the route tail skip on interleaved blocks of real windows, keeps what is more than 3% faster, and checks that
+# the sum of what it adopted is no slower than the defaults.  Without a calibration that happens live, in the first minutes of use.  A calibration
+# does the SAME thing on a schedule: one engine start with STRATA_ONLINE_TUNE=burst (smaller blocks, no waiting between tests) and the learners
+# training (STRATA_LA_LEARN=1), a few real answers at a time until the engine's state file says "settled 1", then QUIT, which writes what the engine
+# learned: the tuner's <pack>/online-tune.txt (the next start begins from it) and the learners' files.  No restarts, so about 10-20 minutes instead
+# of 80-90 (the one-factor-at-a-time version restarted the engine about 30 times, and its picks added up to a loss: see docs/DETAILS.md).
+ONLINE_STATE = "online-tune.txt"
+ONLINE_MAX_SECONDS = 25 * 60       # the burst's time cap; it stops earlier when the engine reports settled
+ONLINE_MAX_ROUNDS = 120            # ... and after this many rounds (each round answers every prompt once)
+ONLINE_LONG_TOKENS = 3000          # the context of the burst's long prompt (real use has long contexts; the tuner must see their windows too)
+ENV_KEYS = (SH_STREAM, "STRATA_LA_LEARN", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_TAIL_SKIP", "STRATA_MASK", "STRATA_POOL_DEP")   # older choices reset
+
+
+def online_state_path(args: list[str]) -> Path | None:
+    pack = arg_value(args, "--pack")
+    return Path(pack) / ONLINE_STATE if pack else None
+
+
+def read_online_state(path: Path | None) -> dict:
+    """The engine's saved tuner state as {knob: level, "settled": 0|1}; empty when there is none."""
+    out: dict = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines() if path else []:
+            p = line.split()
+            if len(p) == 3 and p[0] == "knob":
+                out[p[1]] = float(p[2])
+            elif len(p) == 2 and p[0] == "settled":
+                out["settled"] = int(p[1])
+    except (OSError, ValueError):
+        return {}
     return out
 
 
-def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None, hip: bool = False) -> dict:
+def measure(base_args: list[str], ids_list, start_engine, say=print, long_prompt=None, hip: bool = False, features=(),
+            max_seconds: float = ONLINE_MAX_SECONDS, max_rounds: int = ONLINE_MAX_ROUNDS) -> dict:
+    """One engine start in the tuner's burst mode.  `features`: the engine switches to learn (STRATA_LA_LEARN: the look-ahead's learner)."""
     t0 = time.time()
     report: dict = {}
-    say("  Loading the model for the measurements ...")
-    base_args = apply(base_args, {})                   # the product defaults: what the measurements must beat
-    eng = start_engine(base_args)
+    base_args = apply(base_args, {})                   # the product defaults: what the tuner starts from and must beat
+    state = online_state_path(base_args)
+    if state is not None:
+        try:
+            state.unlink()                             # a calibration learns this PC afresh
+        except OSError:
+            pass
+    env = {"STRATA_ONLINE_TUNE": "burst"}
+    if "STRATA_LA_LEARN" in features:
+        env["STRATA_LA_LEARN"] = "1"
+    say("  Loading the model; the engine tunes itself on real answers (a few minutes) ...")
+    eng = start_engine(base_args, env)
+    pipe = 0
+    rounds = 0
     try:
         info = dict(getattr(eng, "info", {}) or {})
-        d_pcie = float(info.get("pcie_frac", 0.55))
-        d_minp = float(info.get("spec_min_p", 0.5))
-        d_workers = int(info.get("pool_workers", 0)) or None
         s = Session(eng, ids_list)
         s.warm_up()
-        # 0. a layer split's prompt chunks (prompt read speed; independent of the decode settings below)
-        pipe = 0
-        # the engine's own count of prompt stages where it reports one (a split can leave one, e.g.
-        # --split-skip-if-fits), else the flag
+        # 0. a layer split's prompt chunks (prompt read speed; independent of the decode settings the tuner owns)
         stages = info.get("prefill_stages")
         split = stages > 1 if isinstance(stages, int) else "--layer-split" in base_args
         if long_prompt is not None and split:
             say("  Measuring the prompt chunks of the layer split ...")
             pipe, rep_pipe = measure_pipe(eng, long_prompt, say)
             report.update(rep_pipe)
-        # 1. the PCIe share, at the default draft floor
-        by_pcie = sweep(s, sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}), {"spec_min_p": d_minp}, "pcie_frac",
-                        "PCIe share", say)
-        best_pcie = max(by_pcie, key=lambda k: statistics.median(by_pcie[k]))
-        # 2. the draft floor, at that share
-        by_minp = sweep(s, sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}), {"pcie_frac": best_pcie}, "spec_min_p",
-                        "draft floor", say)
-        best_minp = max(by_minp, key=lambda k: statistics.median(by_minp[k]))
-        # 3. the winner against the default, interleaved, the same number of rounds
-        dflt, cand = (round(d_pcie, 2), round(d_minp, 2)), (best_pcie, best_minp)
-        confirm = {dflt: [], cand: []}
-        if cand != dflt:
-            for _ in range(SWEEP_ROUNDS):
-                for k in (dflt, cand):
-                    confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
-        chosen = pick(confirm, dflt) if cand != dflt else dflt
-        report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
-                      pcie_sweep={str(k): v for k, v in by_pcie.items()},
-                      min_p_sweep={str(k): v for k, v in by_minp.items()},
-                      confirm={f"{k[0]}/{k[1]}": v for k, v in confirm.items()})
+        prompts = list(ids_list)
+        if long_prompt is not None:
+            try:
+                prompts.append(long_prompt(0, ONLINE_LONG_TOKENS))
+            except Exception:  # noqa: BLE001 - a prompt source that cannot make one: the short prompts only
+                pass
+        sb = Session(eng, prompts)
+        rates = []
+        while rounds < max_rounds and time.time() - t0 < max_seconds:
+            rates.append(sb.rate(max_new=TIER_MAX_NEW))
+            rounds += 1
+            st = read_online_state(state)
+            if rounds % 4 == 0:
+                say(f"    round {rounds}: {rates[-1]:.1f} tok/s" + ("; the engine reports its settings settled" if st.get("settled") else ""))
+            if st.get("settled"):
+                break
+        report["rates"] = [round(r, 1) for r in rates]
     finally:
-        close(eng)
+        close(eng)                                     # QUIT: the engine writes the tuner's state and the learners' files
+    learned = read_online_state(state)
+    report["tuner"] = learned
+    report["settled"] = bool(learned.get("settled"))
+    report["rounds"] = rounds
+    if not learned:
+        say("    the engine wrote no tuner state (its tuner is off here, or this engine has none): nothing to keep")
+    elif not report["settled"]:
+        say("    the time cap came before the tuner settled: what it has is kept, and it carries on live")
+    else:
+        say("    settled: " + ", ".join(f"{k} {v:g}" for k, v in learned.items() if k != "settled"))
     settings = {}
     if pipe:
         settings["--prefill-pipe"] = str(int(pipe))
-    if chosen != dflt:
-        settings["--pcie-frac"] = f"{chosen[0]:.2f}"
-        settings["--spec-min-p"] = f"{chosen[1]:.2f}"
-    base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
-    # 4. fewer CPU workers (a restart each), with the chosen settings
-    if d_workers and len(worker_candidates(d_workers, extra_workers)) > 1:
-        tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
-        by_workers = {}
-        for w in worker_candidates(d_workers, extra_workers):
-            say(f"  Measuring with {w} CPU workers (restarts the engine) ...")
-            e = restart(start_engine, with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)), f"{w} workers",
-                        say, report)
-            if e is None:
-                continue
-            try:
-                sw = Session(e, ids_list)
-                sw.warm_up(1)
-                by_workers[w] = [sw.rate(), sw.rate()]
-                say(f"    {w} workers: {statistics.median(by_workers[w]):.1f} tok/s")
-            finally:
-                close(e)
-        report["workers"] = {str(k): v for k, v in by_workers.items()}
-        w_best = pick(by_workers, d_workers) if by_workers else d_workers
-        if w_best != d_workers:
-            settings["--pool-workers"] = str(w_best)
-            base_rate = statistics.median(by_workers[w_best])
-        elif by_workers.get(d_workers):
-            base_rate = statistics.median(by_workers[d_workers])
-    # 5. the adaptive expert tier (a restart each), with everything chosen so far
-    tuned = apply(base_args, settings)
-    by_adapt = {}
-    for cand in ADAPT_CANDIDATES:
-        key = "default" if cand is None else "/".join(cand)
-        args = tuned
-        for flag, v in zip(ADAPT_FLAGS, cand or (None,) * len(ADAPT_FLAGS)):
-            args = with_arg(args, flag, v)
-        say(f"  Measuring the expert tier {'(the engine default)' if cand is None else 'every ' + cand[0] + ', ' + cand[1] + ' swaps, decay ' + cand[2]} (restarts the engine) ...")
-        e = restart(start_engine, args, "the expert tier " + key, say, report)
-        if e is None:
-            continue
-        try:
-            sa = Session(e, ids_list)
-            sa.warm_up(1)
-            by_adapt[key] = [sa.rate(max_new=TIER_MAX_NEW), sa.rate(max_new=TIER_MAX_NEW)]
-            say(f"    {statistics.median(by_adapt[key]):.1f} tok/s")
-        finally:
-            close(e)
-    a_best = pick(by_adapt, "default") if by_adapt else "default"
-    report["adapt"] = by_adapt
-    if a_best != "default":
-        for flag, v in zip(ADAPT_FLAGS, a_best.split("/")):
-            settings[flag] = v
-        base_rate = statistics.median(by_adapt[a_best])
-    elif by_adapt.get("default"):
-        base_rate = statistics.median(by_adapt["default"])
-    # 6. HIP: the shared-expert stream fork (a restart each), with everything chosen so far.  Both values are set
+    env_out: dict = {}
+    base_rate = statistics.median(report["rates"][-3:]) if report.get("rates") else None
+    # HIP: the shared-expert stream fork (a restart each), the one setting the tuner cannot change while running.  Both values are set
     # explicitly, so a value the config carried before does not decide the baseline.
-    env = {}
     if hip:
         tuned = apply(base_args, settings)
         by_fork = {}
@@ -396,13 +342,14 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
                 close(e)
         report["sh_stream"] = by_fork
         if pick(by_fork, "0") == "1":
-            env[SH_STREAM] = "1"
+            env_out[SH_STREAM] = "1"
             base_rate = statistics.median(by_fork["1"])
         elif by_fork.get("0"):
             base_rate = statistics.median(by_fork["0"])
     report["seconds"] = round(time.time() - t0)
     report["tok_s"] = round(base_rate, 1) if base_rate else None
-    return {"settings": settings, "env": env, "report": report}
+    return {"settings": settings, "env": env_out, "report": report}
+
 
 
 def restart(start_engine, args, what, say, report):
@@ -427,9 +374,13 @@ def close(eng):
         proc.stdin.write("QUIT\n")
         proc.stdin.flush()
         proc.stdin.close()
-        proc.wait(60)
+        proc.wait(180)     # a big model saves its learned files and frees tens of GB of pinned memory on the way out
     except Exception:
         proc.kill()
+        try:
+            proc.wait(120)   # 21 Nov: a kill that is not waited for let the next restart start while this engine's pinned memory was still
+        except Exception:    # being released: two engines at once, and the memory scope killed one (OOM at 24.9 GB resident in a 29 GB scope)
+            pass
 
 
 DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None,   # None: the engine's own choice
@@ -446,7 +397,6 @@ def apply(args: list[str], settings: dict) -> list[str]:
     return out
 
 
-ENV_KEYS = (SH_STREAM,)
 
 
 def apply_env(env: dict | None, calibrated: dict | None) -> dict:

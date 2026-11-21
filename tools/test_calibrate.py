@@ -37,7 +37,9 @@ class FakeEngine:
 
     def generate(self, ids, max_new, sampling, cancel):
         tune = sampling.get("strata_tune") or {}
-        rate = self.speed(tune.get("pcie_frac", 0.55), tune.get("spec_min_p", self.info["spec_min_p"]), self.workers)
+        self.max_new = max_new
+        arg_f = CAL.arg_value(self.args, "--pcie-frac")
+        rate = self.speed(tune.get("pcie_frac", float(arg_f) if arg_f else 0.55), tune.get("spec_min_p", self.info["spec_min_p"]), self.workers)
         rate *= self.adapt_bonus
         for _ in range(max_new):
             yield 1
@@ -55,8 +57,8 @@ BASE = ["--pack", "p", "--spec", "4", "--spec-min-p", "0.5", "--max-context", "8
 class Calibrate(unittest.TestCase):
     def run_with(self, speed, workers=6, base=BASE, adapt=None, read=None, reads=None):
         starts = []
-        res = CAL.measure(base, [[1, 2, 3]] * 3, lambda a: FakeEngine(a, speed, workers, starts, adapt, read, reads),
-                          say=lambda *_: None, long_prompt=lambda i, n: [1] * n)
+        res = CAL.measure(base, [[1, 2, 3]] * 3, lambda a, env=None: FakeEngine(a, speed, workers, starts, adapt, read, reads),
+                          say=lambda *_: None, long_prompt=lambda i, n: [1] * n, max_rounds=2)
         return res, starts
 
     def test_prefill_pipe_on_a_layer_split(self):
@@ -114,84 +116,11 @@ class Calibrate(unittest.TestCase):
                 super().__init__(*a, **k)
                 self.info["prefill_stages"] = 1
         res = CAL.measure(BASE + ["--layer-split", "auto"], [[1, 2, 3]] * 3,
-                          lambda a: OneStage(a, lambda f, p, w: 50.0, 6, None, None,
-                                             lambda v: 600.0 if v == 1536 else 500.0, reads),
-                          say=lambda *_: None, long_prompt=lambda i, n: [1] * n)
+                          lambda a, env=None: OneStage(a, lambda f, p, w: 50.0, 6, None, None,
+                                                       lambda v: 600.0 if v == 1536 else 500.0, reads),
+                          say=lambda *_: None, long_prompt=lambda i, n: [1] * n, max_rounds=2)
         self.assertEqual(reads, [])
         self.assertNotIn("--prefill-pipe", res["settings"])
-
-    def test_defaults_kept_when_flat(self):
-        res, _ = self.run_with(lambda f, p, w: 50.0)
-        self.assertEqual(res["settings"], {})
-
-    def test_small_gain_is_noise(self):
-        # 2% better at pcie 0.35: below MIN_GAIN, so the default stays
-        res, _ = self.run_with(lambda f, p, w: 51.0 if abs(f - 0.35) < 1e-6 else 50.0)
-        self.assertEqual(res["settings"], {})
-
-    def test_finds_pcie_and_min_p(self):
-        def speed(f, p, w):
-            return 50.0 + (10.0 if abs(f - 0.2) < 1e-6 else 0.0) + (5.0 if abs(p - 0.7) < 1e-6 else 0.0)
-        res, _ = self.run_with(speed)
-        self.assertEqual(res["settings"].get("--pcie-frac"), "0.20")
-        self.assertEqual(res["settings"].get("--spec-min-p"), "0.70")
-        self.assertNotIn("--pool-workers", res["settings"])
-
-    def test_fewer_workers(self):
-        # a hybrid CPU: half the workers is 20% faster
-        res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6)
-        self.assertEqual(res["settings"].get("--pool-workers"), "3")
-        # one start per worker count and per expert-tier candidate, plus the sweep
-        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + len(CAL.ADAPT_CANDIDATES))
-        self.assertEqual(CAL.arg_value(starts[0], "--spec-min-p"), "0.5")   # measured against the product default
-
-    def test_a_failed_restart_keeps_the_measurements_1337(self):
-        # the top PCIe share wins by far; every later restart (the worker counts, the expert tier) fails to start
-        n = {"starts": 0}
-
-        def start(args):
-            n["starts"] += 1
-            if n["starts"] > 1:
-                raise RuntimeError("the engine exited before it was ready: cudaMalloc failed (213 MiB free)")
-            return FakeEngine(args, lambda f, p, w: 80.0 if f == 0.75 else 50.0, 6)
-        said = []
-        res = CAL.measure(BASE, [[1, 2, 3]] * 3, start, say=said.append)
-        self.assertEqual(res["settings"].get("--pcie-frac"), "0.75")        # steps 1-3 survived
-        self.assertGreater(len(res["report"]["failed_starts"]), 1)
-        self.assertTrue(any("did not start" in x and "cudaMalloc" in x for x in said))
-        self.assertEqual(res["report"]["workers"], {})
-        self.assertEqual(res["report"]["adapt"], {})
-
-    def test_one_failing_worker_count_only_drops_that_candidate_1337(self):
-        def start(args):
-            if CAL.arg_value(args, "--pool-workers") == "3":
-                raise RuntimeError("out of memory")
-            return FakeEngine(args, lambda f, p, w: 60.0 if w == 2 else 50.0, 6)
-        res = CAL.measure(BASE, [[1, 2, 3]] * 3, start, say=lambda *_: None)
-        self.assertEqual(res["settings"].get("--pool-workers"), "2")
-        self.assertEqual(list(res["report"]["failed_starts"]), ["3 workers"])
-
-    def test_adaptive_tier(self):
-        # a slow-RAM PC: swapping 160 experts per round is 10% faster, 80 is 2% (noise)
-        res, starts = self.run_with(lambda f, p, w: 50.0, adapt={"160": 1.10, "80": 1.02})
-        self.assertEqual([res["settings"].get(f) for f in CAL.ADAPT_FLAGS], ["1", "160", "0.97"])
-        flat, _ = self.run_with(lambda f, p, w: 50.0, adapt={"160": 1.02})
-        self.assertFalse(any(f in flat["settings"] for f in CAL.ADAPT_FLAGS))
-        # the candidates are measured with the worker count chosen before
-        res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6, adapt={"160": 1.10})
-        self.assertEqual(res["settings"].get("--pool-workers"), "3")
-        self.assertTrue(all(CAL.arg_value(a, "--pool-workers") == "3" for a in starts[-len(CAL.ADAPT_CANDIDATES):]))
-        a = CAL.apply(BASE, res["settings"])
-        self.assertEqual(CAL.arg_value(a, "--adapt-swaps"), "160")
-        self.assertIsNone(CAL.arg_value(CAL.apply(a, {}), "--adapt-swaps"))   # an old calibration's tier goes
-
-    def test_old_calibration_is_the_baseline_reset(self):
-        # a config tuned earlier: the measurement starts from the product defaults, not from those values
-        base = CAL.apply(BASE, {"--pcie-frac": "0.20", "--pool-workers": "3", "--spec-min-p": "0.70"})
-        _, starts = self.run_with(lambda f, p, w: 50.0, base=base)
-        self.assertIsNone(CAL.arg_value(starts[0], "--pcie-frac"))
-        self.assertIsNone(CAL.arg_value(starts[0], "--pool-workers"))
-        self.assertEqual(CAL.arg_value(starts[0], "--spec-min-p"), "0.5")
 
     def test_sh_stream_is_measured_on_hip_only(self):
         # #1272 / #816: the shared-expert fork is measured off (the HIP default) against on, each with a restart and
@@ -203,11 +132,12 @@ class Calibrate(unittest.TestCase):
                 envs.append(dict(env or {}))
                 fork = (env or {}).get(CAL.SH_STREAM) == "1"
                 return FakeEngine(args, lambda f, p, w: 50.0 * (bonus if fork else 1.0), 6, starts)
-            res = CAL.measure(BASE, [[1, 2, 3]] * 3, start, say=lambda *_: None, hip=hip)
+            res = CAL.measure(BASE, [[1, 2, 3]] * 3, start, say=lambda *_: None, hip=hip, max_rounds=2)
             return res, starts, envs
         res, starts, envs = run(1.08)
         self.assertEqual(res["env"], {CAL.SH_STREAM: "1"})
-        self.assertEqual(envs[-2:], [{CAL.SH_STREAM: "0"}, {CAL.SH_STREAM: "1"}])
+        fork_envs = [e for e in envs if CAL.SH_STREAM in e]
+        self.assertEqual(fork_envs[:2], [{CAL.SH_STREAM: "0"}, {CAL.SH_STREAM: "1"}])
         self.assertEqual(starts[-1], starts[-2])                      # the same args for both: only the variable differs
         self.assertGreater(res["report"]["tok_s"], 52.0)              # the reported speed is the fork's
         flat, _, _ = run(1.02)                                        # within noise: the default stays
@@ -218,16 +148,57 @@ class Calibrate(unittest.TestCase):
         cuda, _, envs = run(1.50, hip=False)                          # not AMD: no step, no engine variable
         self.assertEqual(cuda["env"], {})
         self.assertNotIn("sh_stream", cuda["report"])
-        self.assertTrue(all(e == {} for e in envs))
+        self.assertTrue(all(CAL.SH_STREAM not in e for e in envs))
 
-    def test_a_failed_fork_start_keeps_the_default(self):
-        def start(args, env=None):
-            if (env or {}).get(CAL.SH_STREAM) == "1":
-                raise RuntimeError("out of memory")
-            return FakeEngine(args, lambda f, p, w: 50.0, 6)
-        res = CAL.measure(BASE, [[1, 2, 3]] * 3, start, say=lambda *_: None, hip=True)
-        self.assertEqual(res["env"], {})
-        self.assertIn(f"{CAL.SH_STREAM}=1", res["report"]["failed_starts"])
+    def test_feature_keys_do_not_linger(self):
+        old = {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_ROUTE_RESIDENT": "0", "STRATA_MASK": "learn", "OTHER": "1"}
+        out = CAL.apply_env(old, {"STRATA_ROUTE_TAIL_SKIP": "0"})
+        self.assertEqual(out, {"OTHER": "1", "STRATA_ROUTE_TAIL_SKIP": "0"})   # an older calibration's choices are reset first
+
+    def test_the_burst_runs_the_engines_tuner_until_it_settles(self):
+        # one engine start with the tuner's burst schedule and the learners training; real answers until the engine's state file says
+        # settled; no restarts; what the engine learned is reported, and the settings are not rewritten from outside
+        with tempfile.TemporaryDirectory() as pack:
+            state = Path(pack) / CAL.ONLINE_STATE
+            state.write_text("knob adapt_swaps 99\nsettled 1\n")      # an older state: a calibration learns afresh, so it is removed first
+            envs, calls = [], {"n": 0}
+
+            class Tuning(FakeEngine):
+                def generate(self, ids, max_new, sampling, cancel):
+                    calls["n"] += 1
+                    if calls["n"] == 3 * 4:                           # after four rounds of three prompts the engine has settled
+                        state.write_text("knob adapt_swaps 96\nknob spec_min_p 0.5\nsettled 1\n")
+                    return super().generate(ids, max_new, sampling, cancel)
+
+            def start(args, env=None):
+                envs.append(dict(env or {}))
+                self.assertFalse(state.exists() and calls["n"] == 0, "the old state must be gone before the engine starts")
+                return Tuning(args, lambda f, p, w: 50.0, 6)
+            res = CAL.measure(BASE[2:] + ["--pack", pack], [[1, 2, 3]] * 3, start, say=lambda *_: None, features=("STRATA_LA_LEARN",))
+            self.assertEqual(len(envs), 1)                             # one start, no restarts
+            self.assertEqual(envs[0], {"STRATA_ONLINE_TUNE": "burst", "STRATA_LA_LEARN": "1"})
+            self.assertTrue(res["report"]["settled"])
+            self.assertEqual(res["report"]["tuner"], {"adapt_swaps": 96.0, "spec_min_p": 0.5, "settled": 1})
+            self.assertLessEqual(res["report"]["rounds"], 6)
+            self.assertEqual(res["settings"], {})
+            self.assertEqual(res["env"], {})
+
+    def test_the_burst_stops_at_its_cap_when_nothing_settles(self):
+        with tempfile.TemporaryDirectory() as pack:
+            res = CAL.measure(["--pack", pack], [[1, 2, 3]] * 3, lambda a, env=None: FakeEngine(a, lambda f, p, w: 50.0, 6),
+                              say=lambda *_: None, max_rounds=3)
+            self.assertFalse(res["report"]["settled"])
+            self.assertEqual(res["report"]["rounds"], 3)
+            self.assertEqual(res["report"]["tuner"], {})
+
+    def test_online_state_is_read_tolerantly(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "s.txt"
+            p.write_text("knob a 1.5\nbroken line\nknob b notanumber\nsettled 1\n")
+            self.assertEqual(CAL.read_online_state(p), {})            # a malformed file is no state
+            p.write_text("knob a 1.5\nsettled 0\n")
+            self.assertEqual(CAL.read_online_state(p), {"a": 1.5, "settled": 0})
+        self.assertEqual(CAL.read_online_state(None), {})
 
     def test_apply_env(self):
         old = {"STRATA_ROCBLAS_TUNING": "tools/hip", CAL.SH_STREAM: "1"}
@@ -266,7 +237,7 @@ class Calibrate(unittest.TestCase):
             (tok / "token_type.json").write_text(json.dumps([1, 1]))
             seen = []
             saved = CAL.measure
-            CAL.measure = lambda args, ids_list, start_engine, say=print, extra=(), long_prompt=None, hip=False: (
+            CAL.measure = lambda args, ids_list, start_engine, say=print, long_prompt=None, hip=False, features=(): (
                 seen.append((args, hip)) or {})
             fake = type("ST", (), {"Tokenizer": lambda *a: type("T", (), {"encode": lambda s, t, **k: [0]})()})
             try:
@@ -293,15 +264,6 @@ class Calibrate(unittest.TestCase):
             self.assertEqual(CAL.engine_error(str(log), log.stat().st_size), None)   # nothing new since
             self.assertIsNone(CAL.engine_error(None))
             self.assertIsNone(CAL.engine_error(str(Path(d) / "missing.log")))
-
-    def test_worker_candidates(self):
-        self.assertEqual(CAL.worker_candidates(6), [6, 4, 3, 2])
-        self.assertEqual(CAL.worker_candidates(23), [23, 15, 12, 6])        # a quarter: 4 beat 15 on 8P + 16E
-        self.assertEqual(CAL.worker_candidates(23, (7,)), [23, 15, 12, 6, 7])   # P-cores - 1
-        self.assertEqual(CAL.worker_candidates(35, (17,)), [35, 23, 18, 9, 17])  # 2 sockets: one socket's cores - 1
-        self.assertEqual(CAL.worker_candidates(6, (6, 1, 9)), [6, 4, 3, 2])      # none above the default, none below 2
-        self.assertEqual(CAL.worker_candidates(3), [3, 2])
-        self.assertEqual(CAL.worker_candidates(1), [1])
 
     def test_pick(self):
         self.assertEqual(CAL.pick({"a": [50, 51, 49], "b": [53, 52, 60]}, "a"), "b")

@@ -2371,7 +2371,8 @@ def hotrod_default_env(family: str, model: str, hip: bool) -> dict:
     # in SETUP_ENV so a setup run again removes them from an older config.  21 Oct (user): rank 2 takes a stand-in only within
     # 1 logit (the edge rank below 3-9, the mechanism SPEC E1 used for rank 1); ranks 3-9 take any stand-in
     return {"STRATA_ROUTE_RESIDENT": "1e30", "STRATA_ROUTE_RESIDENT_RANKS": "3-9", "STRATA_ROUTE_RESIDENT_EDGE": "1",
-            "STRATA_SWAP2_MAX": "2", "STRATA_SWAP2_GAP": "1", "STRATA_KV_GROW_INIT": "4096"}
+            "STRATA_SWAP2_MAX": "2", "STRATA_SWAP2_GAP": "1", "STRATA_KV_GROW_INIT": "4096",
+            "STRATA_LA_LEARN": "1"}   # 21 Nov: the learner trains on this PC (no downloaded state); the calibration may turn it off
 
 
 # --expert-predictor on (opt-in, off by default; NOT measured on the engine yet): the published per-layer linear expert
@@ -2436,6 +2437,16 @@ HOTROD_PREDICTOR_MODELS = ("IQ3_S",)
 def fetch_hotrod_predictor(family: str, model: str) -> None:
     """data/predictor-<model id>.bin for Qwen3.8 IQ3_S: a ~4 MB download, once, SHA-256 checked.  Kept as it is when it is
     already there (it is what this PC has learned since)."""
+    # 21 Nov (owner decision): no download.  A state trained on another PC and another use is not this PC's; the learned look-ahead
+    # starts from nothing, trains during the calibration (tools/calibrate.py) and keeps learning live.  A file an older install
+    # already has is kept as it is.  The download code below stays for a release that publishes a state on purpose
+    # (HOTROD_PREDICTOR_DOWNLOAD=1), and for nothing else.
+    if os.environ.get("HOTROD_PREDICTOR_DOWNLOAD") != "1":
+        if (ROOT / "data" / HOTROD_PREDICTOR).is_file():
+            ok("learned look-ahead: kept (this PC's own learned state)")
+        else:
+            ok("learned look-ahead: trains on this PC (during the tuning and then live); no download")
+        return
     if family not in HOTROD_PREDICTOR_FAMILIES or model not in HOTROD_PREDICTOR_MODELS:
         return
     dst = ROOT / "data" / HOTROD_PREDICTOR
@@ -4650,7 +4661,7 @@ SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", 
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
                        "STRATA_ROUTE_TAIL_SKIP", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_RESIDENT_RANKS", "STRATA_SWAP2_MAX",
                        "STRATA_SWAP2_GAP", "STRATA_KV_GROW_INIT", "STRATA_ROUTE_RESIDENT_EDGE", "STRATA_ROUTE_RAM_FLOOR",
-                       "STRATA_ROUTE_RAM_FLOOR_ANYTIER", "STRATA_ROUTE_RAM_FLOOR_RANK0", "STRATA_LA_MODEL"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
+                       "STRATA_ROUTE_RAM_FLOOR_ANYTIER", "STRATA_ROUTE_RAM_FLOOR_RANK0", "STRATA_LA_MODEL", "STRATA_LA_LEARN"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
 # (0.1.44 dropped them with the rest of SETUP_ENV).
@@ -6197,6 +6208,8 @@ def main() -> int:
     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--no-calibrate", action="store_true",
+                    help="do not tune the engine's settings for this PC after the install (the default tunes: about 15-30 minutes)")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), then start the model")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
@@ -7282,10 +7295,13 @@ def main() -> int:
         say("  " + line)
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
-    # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
-    if cal is None and not hip and not a.no_start and not a.yes and ask(
-            "Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow card; the PC is busy "
-            "meanwhile; later: START-HERE --calibrate)", ["y", "n"], "y", a.yes) == "y":
+    # 21 Nov (owner decision): the tuning runs by default - the defaults were measured on one PC, and the video of a 24 GB card
+    # showed what a feature built for a 12 GB one costs there.  --no-calibrate skips it; a PC already tuned (cal) is not tuned again;
+    # --yes runs it too (it only asks when someone can answer, and the answer defaults to yes)
+    if cal is None and not hip and not a.no_start and not getattr(a, "no_calibrate", False) and (a.yes or ask(
+            "Tune Strata for this PC now? It measures a few engine settings and trains the learners on this PC (about 15-30 minutes, "
+            "longer on a slow card; the PC is busy meanwhile; --no-calibrate skips it, START-HERE --calibrate does it later)",
+            ["y", "n"], "y", a.yes) == "y"):
         tuned = calibrate_config(cfg_path)
     else:
         tuned = None                                   # not asked for: nothing to repeat below
