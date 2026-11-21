@@ -53,6 +53,20 @@ Decode speed, same day and flags, same questions, 200K, greedy, MTP on (server's
 On this 12 GB card two concurrent answers (20 tok/s in all) are slower than one answer without `--batch` (25 tok/s), and a single request loses about 40%:
 the 40% smaller expert cache costs more than batching gains. One run per leg, so the size is approximate; the direction is large.
 
+### Measured 21 Nov: prefill speed under `--batch` (13.5K-token prompts, unique, nothing reused, 200K, Qwen UD-Q4_K_XL, 12 GB; 3 runs per config, one engine start each)
+
+| config | prefill tok/s | decode after the prompt tok/s | auto chunk | cache slots the prompt borrows |
+|---|---|---|---|---|
+| no `--batch` | 335.6 / 333.7 / 338.3 | 21.3 / 23.7 / 24.9 | 6,144 | 1,161 |
+| `--batch 2`, slots as large as `--max-context` (old) | 129.9 / 126.1 / 124.6 | 16.1 / 15.8 / 14.4 | 2,048 | 643 |
+| `--batch 2 --batch-context 32768` | 219.8 / 215.9 / 212.8 | 22.2 / 19.5 / 24.5 | 4,096 | 900 |
+| `--batch 2 --batch-context 2048` | 270.3 / 268.5 / 261.3 | 27.2 / 25.9 / 26.8 | 6,144 | 1,158 |
+
+The old full-size slots cost about 62% of prefill: they shrank the cache, so the auto chunk fell to 2,048 and the prompt could borrow only 643 slots. The cap
+gives most of it back. At 2K the chunk and the borrowed slots equal no-batch's, yet prefill is still about 20% lower: not explained yet (one thing in batch
+mode, perhaps the slot sessions or the batch windows, still takes something the prompt path uses). So the resident-window default (32K) restores only part of
+prefill; a smaller default or the per-request pool matters for prefill, not only for memory.
+
 ## How we make each of his ideas better (decided 21 Nov; plans, none built or measured yet unless stated)
 
 1. **Conversation memory: sized per request.** Each request declares `max_new`, so at admission the engine knows `prompt + max_new`. Slot K/V comes from one
