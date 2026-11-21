@@ -3938,6 +3938,14 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: RAM budget %.2f GiB: %lld of the %.2f GiB of experts the GPU cache does "
                              "not hold, by profile rank; the rest are read from the files\n",
                      (double) budget_bytes / 1073741824.0, (long long) held, (double) bytes / 1073741824.0);
+        {   // the storage profile: does the RAM tier hold every expert the GPU cache does not?
+            int64_t non_gpu = 0;
+            for (uint64_t off : offsets) non_gpu += off != kNoComplement;
+            all_in_ram_ = non_gpu > 0 && held >= non_gpu;
+            std::fprintf(stderr, "FileExpertSource: storage: %lld experts in the GPU cache, %lld in RAM, %lld only in the files%s\n",
+                         (long long) ((int64_t) offsets.size() - non_gpu), (long long) held, (long long) (non_gpu - held),
+                         all_in_ram_ ? " - every expert is in VRAM or RAM: no read from the files is ever needed" : "");
+        }
         // The prompt path's lend region under a budget.  Until now a budget turned the loan off (`lend_from_slot = -1`
         // below), so every lent slot's expert was read from the pack during every prompt chunk and again when the slot
         // was refilled after the prompt - even with room left in the budget.  Measured on an RX 6900 XT 16 GB with
