@@ -147,6 +147,27 @@ runtime directly; settings in a struct, not file-wide globals; `main()` parses a
 (`src/qwen35`, and `src/dsv41` on the DeepSeek branch), so Inkling gets `src/inkling2` and the shared parts stay in `core/` and the kernels; his paged engine and his
 interface are not adopted (21 Nov: shared interface as new files, step 4, later).
 
+## How Inkling gets ALL our features (found 22 Nov, read from both trees; the engine path starts here)
+
+- **The Qwen3.8 tiers are wired to Qwen's engine, not to an interface.** `ExpertSource` is a clean interface, but `ExpertDispatch` (the per-layer
+  VRAM hits, the CPU pool, the look-ahead tables `[n_layers][2][8][10]`) is driven from `generate.cpp` / `core/verify.cpp` / `layer.cpp` with Qwen's compiled
+  geometry. Qwen3.6's path (`src/qwen35`, 4,813 lines) uses none of it (no `ExpertSource`, cache, stand-ins or KV streaming): it is **not** a template for features.
+- **DeepSeek's `src/dsv41` is.** It is a standalone family path that already carries our features re-implemented and parameterised on the expert count:
+  `ds4_store.hpp` (780 lines: the RAM tier as a slot arena with a replacement policy, whole experts by unbuffered reads, filled on demand and ahead of time by the
+  look-ahead, blobs in the engine's gate | up | down layout, zero-copy to the GPU over PCIe when the arena is registered), `ds4_os.hpp` and `ds4_pool.hpp`
+  (OS services and CPU workers; both carry Project Maya's MIT notice, so `third_party/project-maya/NOTICE.md` comes with them), `ds4_timeline.hpp`,
+  `ds4_standin_tune.hpp` (572: the stand-in budget tuner, "the Qwen engine's rules ported to one token per step"), `ds4_lalearn.cu` / `.cuh` (the learned
+  look-ahead ported from `native_router.cu`, rows padded to 512 with the real expert count passed in), `ds4_launch.h`, `ds4_experts_rule.hpp`.
+  The closure is about 3,500 lines, mostly headers, with no dependence on DeepSeek's forward pass. **What is not in those files:** the VRAM slot tier, the ring and
+  the lend live inside the 14.9K-line `ds4_model.cu` (store set-up at ~7532-7611, the per-token budget at ~11925): to be extracted, not copied.
+- **Stages** (each ends with the feature gate: start-up feature lines equal to the clean build's, tokens identical, speed within noise, the area's tests pass):
+  - **F1** bring the closure over to `src/dsv41/` under the same names (so the full DeepSeek port later is only adding files), with the Maya notice and their own tests.
+  - **F2** the Inkling engine skeleton on the GPU: the reused kernels (conv, Q8_0, NVFP4 experts) + the new ones (dynamic taps, biased / sinked / windowed attention, attention residual and
+    loop gate, SITU, L2 clip), experts read through the `ExpertStore` arena zero-copy (all in RAM): first end-to-end run, GPU log-probs against the oracle.
+  - **F3** the VRAM slot cache and swaps, extracted from `ds4_model.cu` and keyed by (stored layer, expert).
+  - **F4** stand-ins with the budget tuner; **F5** the learned look-ahead with the loop feature (the token's previous pass); **F6** KV: the ring for the 40 sliding visits, q8 KV
+    for the 8 full ones; **F7** serve on 8095, speed against Maya's 32.4 tok/s, the batching test; **F8** Inkling-2-Small from the NVMe tier.
+
 ## Rules for this port
 
 - The Qwen path, its layer-major prompt walk and its prefill speeds are not touched. Measured before any shared file changes:
