@@ -54,6 +54,29 @@ test oracle and a specification; the engine code is written here, in this engine
 - **Next:** (a) a long-context oracle; (b) incremental decode: KV for the 8 full-attention layers' visits and the sliding window, the conv
   states (3 rows per conv), per-position block states; (c) the CUDA kernels, each checked against `ops_cpu`; (d) the expert tiers.
 
+## Same concepts as Edge0 and Qwen (decided 22 Nov, on the user's instruction: no bare port)
+
+The engine path is `src/inkling2/`, beside `src/qwen35/` (Qwen3.6 got its own path the same way) and on top of the shared `core/`: of
+`include/strata/core`, `expert_source.hpp` (1,580 lines, no Qwen reference), `standin_pool.hpp`, `recheck_gate.hpp`, `pinned*.hpp`,
+`expert_cache.hpp` and the learners are model-agnostic (a few `512` expert-count limits, which Inkling's 128 fits under); `layer.hpp`
+and `geometry.hpp` are Qwen's forward and shapes and are not reused. What carries over, and what is different here:
+
+| Concept (Qwen / Edge0) | For Inkling |
+| --- | --- |
+| VRAM expert cache (adaptive slots), RAM tier (`--resident-budget-gib auto`), O_DIRECT NVMe tier, pinned segments with the computed reserve | Experts are keyed by (stored layer, expert): 24 x 128 = 3,072, 4.5 MB each in NVFP4 (layers 0-19: gate_up 2.99 MB + down 1.49 MB), 8.5 MB in Q8_0 (20-23). Mini's 15.8 GB of experts fit this box's RAM tier whole; Inkling-2-Small (594 B) goes to the NVMe tier |
+| Stand-ins / residency-biased routing (ranks 3-9, edge 1 on Qwen: top-10) | Top-8 of 128 with a sigmoid router whose picked scores are renormalized x8: the rank policy is re-derived, not copied, and quality is judged by reading answers and by log-prob drift against the oracle (no numeric verdict alone) |
+| Learned look-ahead, router prediction, re-check gate | The loop gives a stronger predictor than anything on Qwen: see below |
+| Layer-major prompt walk (experts read once per chunk) | A chunk runs its 48 visits in order; the core's three passes need the same layer's experts three times, 12 visits apart, so the passes are where a resident cache pays |
+| KV streaming (K/V in pinned RAM) | The KV is small (sliding layers keep 1,024 positions; 8 full layers ~32 KB / token), so 256K context is 4-8 GB: streaming matters only on small cards |
+| MTP / drafting | Inkling's drafter is a separate 5-layer DSpark-style head (`mtp.safetensors`), not in the GGUF: later |
+| Adaptive swaps, PCIe model, `--pcie-frac`, learners that start with the engine | Unchanged in principle; every learner starts from this engine's own measurements |
+
+**Measured on the 48-token oracle (22 Nov; one text, so a signal, not a tuning number):** for the same token, a core layer's 8 picks in
+pass 2 share 4.9 experts with its pass-1 picks (pass 2 vs 3: 4.4; 1 vs 3: 3.65), against 0.5 for chance and 3.4 for the previous token at
+the same visit. A pass-2 or pass-3 pick is already in the same token's pass-1 set of that layer 54% of the time. So the look-ahead's best
+feature for the looped core is the token's own previous pass, ahead of anything it uses on Qwen. Layer 17, the core's last, is the exception
+(2.9 / 1.9). Over the 48 tokens a core layer touches 58 distinct experts in pass 1 and 77 across the three passes (of 128).
+
 ## Rules for this port
 
 - The Qwen path, its layer-major prompt walk and its prefill speeds are not touched. Measured before any shared file changes:

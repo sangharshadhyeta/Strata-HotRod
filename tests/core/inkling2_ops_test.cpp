@@ -73,7 +73,13 @@ int main() {
     std::string e = I::parse_config(g.metadata(), c);
     if (e.empty()) e = I::load_layout(g, c, lay);
     if (!e.empty()) { std::printf("FAIL: %s\n", e.c_str()); return 1; }
-    std::printf("tokens %lld, %lld visits\n", (long long) T, (long long) c.n_visits);
+    // a shrunken-hyperparameter oracle (the reference run with a smaller window, relative extent and log-scaling floor, so a ~100-token prompt
+    // exercises the window mask, the extent cutoff and tau > 1): the same values are applied here
+    if (std::getenv("STRATA_INKLING2_WINDOW")) c.window = std::atoll(std::getenv("STRATA_INKLING2_WINDOW"));
+    if (std::getenv("STRATA_INKLING2_EXTENT")) c.rel_extent = std::atoll(std::getenv("STRATA_INKLING2_EXTENT"));
+    if (std::getenv("STRATA_INKLING2_FLOOR")) c.log_scale_floor = std::atoll(std::getenv("STRATA_INKLING2_FLOOR"));
+    std::printf("tokens %lld, %lld visits, window %lld, full extent %lld, log-scaling floor %lld\n", (long long) T, (long long) c.n_visits,
+                (long long) c.window, (long long) c.rel_extent, (long long) c.log_scale_floor);
 
     {   // the embedding
         std::vector<int64_t> sh;
