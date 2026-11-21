@@ -309,3 +309,21 @@ KL identical (0.0046): placement only. Findings:
   token's pass-1 experts rather than prediction (about 96 experts, 430 MB, fit the cache).
 
 Qwen check (3 prompts): 17.3 / 19.8 / 22.6 tok/s (mean 19.9, clean main 19.3), 13.6K-token read 343.1 tok/s (338.1): unchanged.
+
+## Why prefetch cannot pay yet: the floor (22 Nov)
+
+Two checks on the control arm above. (1) Without the profiler (its `lap()` syncs the whole device, which also waits for the copy stream) the arms read the same: 22.1-22.3 tok/s without
+prefetch, 22.3 (N=4), 22.5-22.9 (N=8), 20.2-20.8 (N=12). (2) `STRATA_INKLING2_BENCH=1` in `gpu_forward_test` times the engine alone (no seam copies - each "out" seam was a synchronous
+copy per visit - and no host softmax), cold cache then warm:
+
+| 48 tokens | ms/token | tok/s |
+|---|---|---|
+| cold cache | 42.7 | 23.4 |
+| warm cache (same tokens again: the floor, few misses) | 39.7 | 25.2 |
+| every expert zero-copy over PCIe | 99.5 | 10.0 |
+| cold, prefetch N=8 | 41.9 | 23.9 |
+
+The slot cache already removed the PCIe wait: misses cost ~3 ms of 42.7. The token is now **compute / launch / sync bound at ~39 ms** (attention side ~15, experts ~21 = 0.44 ms a visit
+where the bytes (~36 MB from VRAM at ~360 GB/s) need ~0.1, the rest launches, the per-visit sync and kernel latency, plus head, tail). A perfect prefetch can save at most ~3 ms (7%).
+Prefetch pays when the engine is transfer-bound: (a) after the compute side is cut to ~20 ms (then the ~16 ms of PCIe a token at a 34% cache is no longer hidden by it), (b) on a
+smaller card or a bigger model (Inkling-2-Small, class C), where NVMe / PCIe is the wall - that is where our learned look-ahead and the loop feature are for. Order: cut the 39 ms first.

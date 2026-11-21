@@ -51,6 +51,16 @@ int main() {
     std::map<std::string, std::vector<float>> seams_kept;
     const auto keep = [](int visit) { return visit == 0 || visit == 5 || visit == 18 || visit == 23; };
     std::vector<float> lp((size_t) (T * c.n_vocab_real));
+    if (std::getenv("STRATA_INKLING2_BENCH")) {   // the engine alone: no seam copies, no host softmax; pass 1 starts with a cold cache, pass 2 with the same tokens warm (a floor: no misses)
+        for (int pass = 1; pass <= 2; ++pass) {
+            eng.reset();
+            const auto tb = std::chrono::steady_clock::now();
+            for (int64_t t = 0; t < T; ++t) eng.step(toks[(size_t) t], (int) t, nullptr, {});
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
+            std::printf("BENCH pass %d (%s cache, no seam capture): %.2f tok/s, %.1f ms/token\n", pass, pass == 1 ? "cold" : "warm", (double) T / s, s / (double) T * 1e3);
+        }
+        eng.reset();
+    }
     const auto t1 = std::chrono::steady_clock::now();
     for (int64_t t = 0; t < T; ++t) {
         std::vector<float> logits;
