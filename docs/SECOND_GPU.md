@@ -140,6 +140,11 @@ alternative to the CUDA1-3 caches above, not a third tier beside them.
 - `--peer-device N` (default off): enable the tier on CUDA device N (N >= 1).
 - `--peer-reserve-mib M` (default 600): leave M MiB free on the peer card; the
   cache takes what remains. The prompt-path buffers need this headroom.
+  On two 12 GB cards with a 16,384-token prompt chunk the default was not enough (a community run on 2x RTX 3060 12 GB, issue #2):
+  the cache filled, the buffers did not fit, the log said `prefill peer: the peer's buffers do not fit`, and every prompt row
+  stayed on the primary card. With `--peer-reserve-mib 1200` the peer computed its prompt rows with 542 MiB left free. The default
+  stays 600 (a larger card needs less, and the buffers' size depends on the chunk and `--peer-prefill-rows`); when the message
+  appears it now says how much the buffers asked for and how much was free.
   Keep a few hundred MiB free on both cards beyond this: the prompt path loads its kernels and cuBLAS on first use
   (a start with 5 MiB left on the peer and 485 MiB on the primary stopped at the first prompt with "cuBLAS status 14").
 - Whether the two cards can really exchange data is tested once at start (#2666): two RTX A4000 behind a host
@@ -157,7 +162,31 @@ alternative to the CUDA1-3 caches above, not a third tier beside them.
 Through the server, list both cards in the config's `"gpu"` (e.g. `[0, 1]`, numbered as nvidia-smi numbers them)
 and add `--peer-device 1` to its `"args"`; the number is the card's position in that list (with `"gpu": [2, 0]`,
 `--peer-device 1` is nvidia-smi's card 0). Several GPUs in `"gpu"` are otherwise a layer split: the server adds
-`--layer-split` only when `--peer-device` is not among the args.
+`--layer-split` only when `--peer-device` is not among the args. A complete peer-mode config for two 12 GB cards (the shape the
+community run above used; no `layer_split` key):
+
+```json
+{
+  "gpu": [0, 1],
+  "args": ["--pack", "<pack>", "--native", "<model.gguf>", "--expert-profile", "data/expert-profile.bin",
+           "--expert-cache", "auto", "--peer-device", "1", "--peer-reserve-mib", "1200",
+           "--prefill", "auto:16384", "--spec", "4", "--spec-min-p", "0.5", "--max-context", "262144", "--kv", "int8"]
+}
+```
+
+`"gpu": [0, 1]` with `"layer_split"` and `--expert-cache` is refused (`--expert-cache-remote with a layer split needs a GPU that
+runs no stage`), as is `--peer-device` beside `--expert-cache-device1..3`; on two 12 GB cards the peer tier above is the shape that
+starts with an expert cache.
+
+### Measured: two RTX 3060 12 GB
+
+One community machine (issue #2, 20 Nov 2026; Ryzen 9 5950X 16 cores, 64 GB, NVMe, Ubuntu 24.04, no NVLink so the peer route ran
+through mapped host memory; Qwen3.8-Flash-Next IQ3_S, 262,144 context, `--kv int8`; answers read and checked by hand). Same-machine
+A/B, one 3060 against the peer tier: decode 54-58 against 58-61 tok/s (+2 to +4); a 31K-token prompt read in 40.9 s on one card
+against 31.2-41.3 s with the peer (the report's own summary: about 25-30% faster long-prompt reads once the peer's prompt rows are on);
+a 196,091-token prompt read at 876 tok/s, and the next turn of that conversation (196,086 tokens cached) took 2.8 s. Equal answers
+were checked by hand, not by the bit-exactness gate. The report notes its machine (16 cores, 64 GB) differs from this repository's
+reference PC (i5-12400F, 30 GB), so only its same-machine deltas carry over.
 
 `--peer-device` requires `--expert-profile` and an enabled expert cache, and
 the device must be visible; it refuses otherwise. It also refuses

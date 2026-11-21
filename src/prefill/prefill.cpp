@@ -2165,8 +2165,10 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         for (int i = 0; ok && i < PeerPrefill::kGrpEv; ++i)
             ok = cudaEventCreateWithFlags(&pp->ev_grp[i], cudaEventDisableTiming) == cudaSuccess;
     }
+    size_t asked = 0;   // what the peer's prompt buffers have asked for so far (for the failure message: how much room they need)
     auto take = [&](size_t bytes) -> void* {
         void* p = nullptr;
+        if (ok) asked += bytes;
         if (!ok || cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
         pp->owned.push_back(p);
         return p;
@@ -2281,7 +2283,12 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     size_t fb = 0, tb = 0;
     cudaMemGetInfo(&fb, &tb);
     cudaSetDevice(prev);
-    if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
+    if (!ok) {
+        err = "prefill peer: the peer's buffers do not fit: they asked for " + std::to_string(asked >> 20) + " MiB (counted up to the one that failed) and "
+              + std::to_string(fb >> 20) + " MiB are free on it - raise --peer-reserve-mib (two 12 GB cards ran with 1200; see docs/SECOND_GPU.md) "
+                "or lower --peer-prefill-rows";
+        return false;
+    }
     std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk (up to %lld rows per "
                          "layer%s%s); %zu MiB left free on it\n", pp->dev, (long long) pp->cap_rows,
                  pp->p2p ? "" : (pp->sums ? (pp->f16 ? ", no P2P: through mapped host memory in FP16, one weighted sum per token back"
