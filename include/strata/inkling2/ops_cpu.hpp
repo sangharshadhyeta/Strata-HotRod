@@ -313,12 +313,30 @@ inline Mat moe(const GgufFile& g, const Config& c, const LayerTensors& L, const 
     return out;
 }
 
-struct VisitSeams { AttnSeams attn; Mat attn_out, ffn_out, out; std::vector<int> picks; };
+struct VisitSeams { AttnSeams attn; Mat attn_out, ffn_out, out, loop_q_in, loop_ffn_in; std::vector<int> picks; };
 
-/// One layer visit of a first pass (no loop messages) of stored layer `l`.  h: the stream [T][E]; blocks: the block states so far (the
-/// reference appends the layer's input at a block boundary, stored index % block == 0, and the layer's own FFN residual already sees it).
-/// Returns the new stream (r + the MoE's output); `blocks` is updated.
-inline Mat layer_visit(const GgufFile& g, const Config& c, const Layout& lay, int64_t l, const Mat& h, std::vector<Mat>& blocks, int64_t T, VisitSeams& vs) {
+/// A core layer's loop control on its input x [T][E] with the pass-before's message `msg`: module 0 attn (q's), 1 k, 2 v, 3 mlp.
+///   g = [rms(x); rms(msg)] @ down^T (rank 64);  x' = (1 - tanh(g forget^T)) x + tanh(g gain^T) msg     (weightless norms, eps 1e-6)
+inline Mat control(const GgufFile& gf, const LayerTensors& L, int module, const Mat& x, const Mat& msg, int64_t T, int64_t E) {
+    Mat xn = x, mn = msg;
+    rms(xn.data(), T, E, nullptr, 1e-6f);
+    rms(mn.data(), T, E, nullptr, 1e-6f);
+    Mat cat((size_t) (T * 2 * E));
+    for (int64_t t = 0; t < T; ++t) {
+        std::memcpy(&cat[(size_t) (t * 2 * E)], &xn[(size_t) (t * E)], (size_t) E * 4);
+        std::memcpy(&cat[(size_t) (t * 2 * E + E)], &mn[(size_t) (t * E)], (size_t) E * 4);
+    }
+    const Mat gg = matmul_t(gf, *L.loop_down[module], cat, T);
+    Mat forget = matmul_t(gf, *L.loop_forget[module], gg, T), gain = matmul_t(gf, *L.loop_gain[module], gg, T);
+    Mat y(x.size());
+    for (size_t i = 0; i < y.size(); ++i) y[i] = (1.0f - std::tanh(forget[i])) * x[i] + std::tanh(gain[i]) * msg[i];
+    return y;
+}
+
+/// One layer visit of stored layer `l`.  h: the stream [T][E]; blocks: the block states so far (the reference appends the layer's input at a
+/// block boundary, stored index % block == 0, and the layer's own FFN residual already sees it).  `msgs`: the four messages (q's, k's,
+/// v's, the MoE's) of a core layer in a pass after the first, else null.  Returns the new stream (r + the MoE's output); `blocks` is updated.
+inline Mat layer_visit(const GgufFile& g, const Config& c, const Layout& lay, int64_t l, const Mat& h, std::vector<Mat>& blocks, int64_t T, VisitSeams& vs, const Mat* msgs = nullptr) {
     const LayerTensors& L = lay.layers[(size_t) l];
     const int64_t E = c.n_embd;
     Mat ins[3];
@@ -333,12 +351,18 @@ inline Mat layer_visit(const GgufFile& g, const Config& c, const Layout& lay, in
         std::vector<Mat> o = attn_res(st, T, E, q.data(), nq);
         for (int i = 0; i < 3; ++i) ins[i] = nq == 1 ? o[0] : o[(size_t) i];
     }
+    if (msgs != nullptr) {   // before the input norms: a sliding layer then norms three different inputs
+        for (int j = 0; j < 3; ++j) ins[j] = control(g, L, j, ins[j], msgs[j], T, E);
+        vs.loop_q_in = ins[0];
+    }
     Mat xs[3];
     if (!L.full) {
-        Mat n = ins[0];
         const Mat w = vec(g, *L.attn_norm);
-        rms(n.data(), T, E, w.data(), c.rms_eps);
-        xs[0] = xs[1] = xs[2] = n;
+        for (int j = 0; j < 3; ++j) {
+            if (j > 0 && msgs == nullptr) { xs[j] = xs[0]; continue; }
+            xs[j] = ins[j];
+            rms(xs[j].data(), T, E, w.data(), c.rms_eps);
+        }
     } else {
         const TensorInfo* nw[3] = {L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm};
         for (int i = 0; i < 3; ++i) {
@@ -363,6 +387,7 @@ inline Mat layer_visit(const GgufFile& g, const Config& c, const Layout& lay, in
     st.push_back(&r);
     const Mat fq = vec(g, *L.ffn_res_query);
     Mat m_in = attn_res(st, T, E, fq.data(), 1)[0];
+    if (msgs != nullptr) { m_in = control(g, L, 3, m_in, msgs[3], T, E); vs.loop_ffn_in = m_in; }
     { const Mat w = vec(g, *L.ffn_norm); rms(m_in.data(), T, E, w.data(), c.rms_eps); }
     MoeSeams ms;
     Mat m = moe(g, c, L, m_in, T, &ms);
@@ -374,6 +399,84 @@ inline Mat layer_visit(const GgufFile& g, const Config& c, const Layout& lay, in
     vs.out = out;
     if (l % c.attn_res_block == 0) blocks.push_back(h);
     return out;
+}
+
+/// The embedding of `toks`: Q8_0 rows of the token table, RMS-normed with token_embd_norm.
+inline Mat embed(const GgufFile& g, const Config& c, const Layout& lay, const std::vector<int64_t>& toks) {
+    const int64_t T = (int64_t) toks.size(), E = c.n_embd;
+    Mat h((size_t) (T * E));
+    for (int64_t t = 0; t < T; ++t) dequant_row(g, *lay.token_embd, 0, toks[(size_t) t], &h[(size_t) (t * E)]);
+    const Mat w = vec(g, *lay.token_embd_norm);
+    rms(h.data(), T, E, w.data(), c.rms_eps);
+    return h;
+}
+
+/// The whole model on `toks` (teacher-forced, positions 0..T-1): the prelude once, the core `num_loops` times (a pass after the first reads
+/// the one before it through the messages), the rest once, then the output attention residual, norm, head, softcap and log-softmax over the
+/// real vocabulary.  Returns logprobs [T][n_vocab_real].  `on_visit(v, seams)` sees every visit (v counts visits, 0..n_visits-1).
+template <class F> inline Mat forward(const GgufFile& g, const Config& c, const Layout& lay, const std::vector<int64_t>& toks, F&& on_visit) {
+    const int64_t T = (int64_t) toks.size(), E = c.n_embd;
+    Mat h = embed(g, c, lay, toks);
+    std::vector<Mat> blocks;
+    int64_t visit = 0;
+    const auto run = [&](int64_t l, const Mat* msgs) {
+        VisitSeams vs;
+        h = layer_visit(g, c, lay, l, h, blocks, T, vs, msgs);
+        on_visit(visit++, vs);
+    };
+    for (int64_t l = 0; l < c.core_start; ++l) run(l, nullptr);
+    const Mat pre_h = h;
+    const std::vector<Mat> pre_blocks = blocks;
+    const Mat lrq = vec(g, *lay.loop_res_query), lkq = vec(g, *lay.loop_kv_res_query);   // [2 core_len][E]
+    for (int64_t p = 0; p < c.num_loops; ++p) {
+        std::vector<Mat> bank;
+        Mat last;
+        if (p > 0) {   // the pass before: the blocks it added after its first, and its final stream; this pass restarts from the prelude
+            bank.assign(blocks.begin() + (int64_t) pre_blocks.size() + 1, blocks.end());
+            last = h;
+            h = pre_h;
+            blocks = pre_blocks;
+        }
+        for (int64_t l = c.core_start; l < c.core_end; ++l) {
+            if (p == 0) { run(l, nullptr); continue; }
+            const int64_t i = l - c.core_start;
+            std::vector<const Mat*> st;
+            for (const Mat& b : bank) st.push_back(&b);
+            st.push_back(&last);
+            std::vector<Mat> mq = attn_res(st, T, E, &lrq[(size_t) (2 * i * E)], 2);    // [q's message, the MoE's message]
+            std::vector<Mat> mk = attn_res(st, T, E, &lkq[(size_t) (2 * i * E)], 2);    // [k's message, v's message]
+            const Mat msgs[4] = {mq[0], mk[0], mk[1], mq[1]};
+            run(l, msgs);
+        }
+    }
+    for (int64_t l = c.core_end; l < c.n_stored; ++l) run(l, nullptr);
+    // the head: the output attention residual (its query), the output norm, the logits (softcapped), log-softmax over the real rows
+    std::vector<const Mat*> st;
+    for (const Mat& b : blocks) st.push_back(&b);
+    st.push_back(&h);
+    const Mat oq = vec(g, *lay.output_res_query);
+    Mat x = attn_res(st, T, E, oq.data(), 1)[0];
+    { const Mat w = vec(g, *lay.output_norm); rms(x.data(), T, E, w.data(), c.rms_eps); }
+    const int64_t NV = c.n_vocab_real;
+    Mat lp((size_t) (T * NV));
+    std::vector<float> row((size_t) E);
+    for (int64_t v = 0; v < NV; ++v) {   // one row of the head at a time: the whole matrix as floats would be 1.9 GB
+        dequant_row(g, *lay.output, 0, v, row.data());
+        for (int64_t t = 0; t < T; ++t) {
+            const double z = dot(&x[(size_t) (t * E)], row.data(), E) / (double) c.final_softcap;
+            lp[(size_t) (t * NV + v)] = (float) (std::tanh(z) * (double) c.final_softcap);
+        }
+    }
+    for (int64_t t = 0; t < T; ++t) {
+        float* r = &lp[(size_t) (t * NV)];
+        double mx = -1e300;
+        for (int64_t v = 0; v < NV; ++v) mx = std::max(mx, (double) r[v]);
+        double z = 0;
+        for (int64_t v = 0; v < NV; ++v) z += std::exp((double) r[v] - mx);
+        const double lse = mx + std::log(z);
+        for (int64_t v = 0; v < NV; ++v) r[v] = (float) ((double) r[v] - lse);
+    }
+    return lp;
 }
 
 }  // namespace cpu

@@ -1,11 +1,10 @@
-// tests/core/inkling2_ops_test.cpp - Inkling 2's CPU ops (include/strata/inkling2/ops_cpu.hpp) against the float64 reference's seams
-// (Maya's ref/inkling2.py dumps, docs/INKLING-PORT.md M0): the oracle for each op, one seam at a time.
+// tests/core/inkling2_ops_test.cpp - Inkling 2's CPU forward (include/strata/inkling2/ops_cpu.hpp) against the float64 reference's seams
+// (Maya's ref/inkling2.py dumps, docs/INKLING-PORT.md M0): every layer visit, one seam at a time, then the log-probabilities.
 //
 //   STRATA_INKLING2_GGUF    the Inkling-2-Mini GGUF            STRATA_INKLING2_ORACLE   the reference's --dump-dir (blk.V.<seam>.npy)
 //   STRATA_INKLING2_TOKENS  the comma-separated token ids the reference ran on
-//   STRATA_INKLING2_VISITS  how many first-pass visits to run (default 18: the prelude and the core's first pass; at most 18)
-// Unset = skipped (exit 0).  Visits are CHAINED (each takes the previous one's output from this code, not from the oracle), so a drift
-// would show; a seam passes when its largest error, relative to the seam's largest value, is below the bound printed.
+// Unset = skipped (exit 0).  The forward is one chain (each visit takes this code's previous output, not the oracle's), so a drift would
+// show; a seam passes when its largest error, relative to the seam's largest value, is below the bound printed.
 #include "strata/inkling2/ops_cpu.hpp"
 
 #include <cstdio>
@@ -74,29 +73,20 @@ int main() {
     std::string e = I::parse_config(g.metadata(), c);
     if (e.empty()) e = I::load_layout(g, c, lay);
     if (!e.empty()) { std::printf("FAIL: %s\n", e.c_str()); return 1; }
-    int64_t nvis = std::getenv("STRATA_INKLING2_VISITS") ? std::atoll(std::getenv("STRATA_INKLING2_VISITS")) : c.core_end;
-    nvis = std::min<int64_t>(nvis, c.core_end);   // the first pass: visits 0 .. core_end - 1 run stored layers 0 .. core_end - 1 once
-    std::printf("tokens %lld, first-pass visits 0..%lld\n", (long long) T, (long long) nvis - 1);
-    const int64_t E = c.n_embd;
+    std::printf("tokens %lld, %lld visits\n", (long long) T, (long long) c.n_visits);
 
-    // ---- the embedding: Q8_0 rows of the token table, RMS-normed with token_embd_norm
-    C::Mat h((size_t) (T * E));
-    for (int64_t t = 0; t < T; ++t) C::dequant_row(g, *lay.token_embd, 0, toks[(size_t) t], &h[(size_t) (t * E)]);
-    { const C::Mat w = C::vec(g, *lay.token_embd_norm); C::rms(h.data(), T, E, w.data(), c.rms_eps); }
-    {   std::vector<int64_t> sh; const C::Mat ref = load_npy(dir + "/embd.npy", sh);
-        const double r = rel_err(h, ref);
+    {   // the embedding
+        std::vector<int64_t> sh;
+        const double r = rel_err(C::embed(g, c, lay, toks), load_npy(dir + "/embd.npy", sh));
         const bool ok = r >= 0 && r < kBound;
         (ok ? g_ok : g_fail)++;
         std::printf("%s embd rel %.2e\n", ok ? "ok  " : "FAIL", r);
     }
-
-    std::vector<C::Mat> blocks;
-    for (int64_t v = 0; v < nvis; ++v) {
-        C::VisitSeams vs;
-        h = C::layer_visit(g, c, lay, v, h, blocks, T, vs);
-        struct S { const char* name; const C::Mat* got; } seams[] = {
-            {"k_conv", &vs.attn.k_conv}, {"v_conv", &vs.attn.v_conv}, {"q", &vs.attn.q}, {"k", &vs.attn.k}, {"v", &vs.attn.v},
-            {"r", &vs.attn.r}, {"attn_gated", &vs.attn.gated}, {"attn_out", &vs.attn_out}, {"ffn_out", &vs.ffn_out}, {"out", &vs.out}};
+    const auto on_visit = [&](int64_t v, const C::VisitSeams& vs) {
+        struct S { const char* name; const C::Mat* got; };
+        std::vector<S> seams = {{"k_conv", &vs.attn.k_conv}, {"v_conv", &vs.attn.v_conv}, {"q", &vs.attn.q}, {"k", &vs.attn.k}, {"v", &vs.attn.v},
+                                {"r", &vs.attn.r}, {"attn_gated", &vs.attn.gated}, {"attn_out", &vs.attn_out}, {"ffn_out", &vs.ffn_out}, {"out", &vs.out}};
+        if (!vs.loop_q_in.empty()) { seams.push_back({"loop_q_in", &vs.loop_q_in}); seams.push_back({"loop_ffn_in", &vs.loop_ffn_in}); }
         double worst = 0;
         std::string worst_name;
         bool ok = true;
@@ -110,9 +100,29 @@ int main() {
         for (size_t i = 0; i < vs.picks.size() && i < pr.size(); ++i) bad += vs.picks[i] != (int) pr[i];
         if (vs.picks.size() != pr.size() || bad != 0) ok = false;
         (ok ? g_ok : g_fail)++;
-        std::printf("%s visit %2lld (%s%s): worst seam %s rel %.2e, picks differ %d of %zu\n", ok ? "ok  " : "FAIL", (long long) v,
-                    lay.layers[(size_t) v].full ? "full" : "sliding", v % c.attn_res_block == 0 ? ", block boundary" : "", worst_name.c_str(), worst, bad, pr.size());
+        const int64_t stored = c.stored_of_visit(v);
+        std::printf("%s visit %2lld (layer %2lld, %s%s): worst seam %s rel %.2e, picks differ %d of %zu\n", ok ? "ok  " : "FAIL", (long long) v, (long long) stored,
+                    lay.layers[(size_t) stored].full ? "full" : "sliding", vs.loop_q_in.empty() ? "" : ", loop msgs", worst_name.c_str(), worst, bad, pr.size());
+    };
+    const C::Mat lp = C::forward(g, c, lay, toks, on_visit);
+    // the log-probabilities: a row a position over the real vocabulary
+    std::vector<int64_t> sh;
+    const C::Mat ref = load_npy(dir + "/logprobs.npy", sh);
+    const int64_t NV = c.n_vocab_real;
+    double md = 0;
+    int top1_same = 0;
+    for (int64_t t = 0; t < T; ++t) {
+        int64_t a = 0, b = 0;
+        for (int64_t v = 0; v < NV; ++v) {
+            md = std::max(md, (double) std::fabs(lp[(size_t) (t * NV + v)] - ref[(size_t) (t * NV + v)]));
+            if (lp[(size_t) (t * NV + v)] > lp[(size_t) (t * NV + a)]) a = v;
+            if (ref[(size_t) (t * NV + v)] > ref[(size_t) (t * NV + b)]) b = v;
+        }
+        top1_same += a == b;
     }
+    const bool ok = sh.size() == 2 && sh[0] == T && sh[1] == NV && md < 5e-3 && top1_same == (int) T;
+    (ok ? g_ok : g_fail)++;
+    std::printf("%s logprobs: max |dlogp| %.3e over %lld x %lld, top-1 the same at %d of %lld positions\n", ok ? "ok  " : "FAIL", md, (long long) T, (long long) NV, top1_same, (long long) T);
     std::printf("%d checks matched, %d failed\n", g_ok, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

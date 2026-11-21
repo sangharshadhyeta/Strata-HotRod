@@ -41,6 +41,19 @@ test oracle and a specification; the engine code is written here, in this engine
 - **M4 engine:** the expert tiers, stand-ins, look-ahead, serve on 8095, speed against Maya's `maya-ik2` (32.4 tok/s on this
   12 GB card, all experts in RAM), batching 2x / 4x; then Inkling-2-Small from the NVMe.
 
+## Status (22 Nov 2026)
+
+- **M0 done:** oracle dumps for a 3-token and a 48-token prompt (578 seams each).
+- **M1 done:** `include/strata/artifact/inkling2.hpp` reads and validates the file (734 tensors, config cross-checks).
+- **M2 done, and the looped forward of M3 in plain C++ (CPU, teacher-forced):** `include/strata/inkling2/ops_cpu.hpp` +
+  `tests/core/inkling2_ops_test.cpp`. All 48 visits of the 48-token oracle match the reference's seams within 9e-7 (relative to each
+  seam's maximum), every expert pick (18,432) is identical, and the log-probabilities differ by at most 7.6e-6 over 48 x 200,058
+  values with the same top-1 at every position. It takes ~2 minutes on one CPU thread: an oracle, not an engine.
+- **Not covered by that oracle:** the full layers' log scaling past 8,192 positions (tau is 1.0 below that), sliding windows longer than
+  48 tokens (the window is 1,024), and the relative-bias extent past 48 positions. A long-prompt oracle is needed before those are claimed.
+- **Next:** (a) a long-context oracle; (b) incremental decode: KV for the 8 full-attention layers' visits and the sliding window, the conv
+  states (3 rows per conv), per-position block states; (c) the CUDA kernels, each checked against `ops_cpu`; (d) the expert tiers.
+
 ## Rules for this port
 
 - The Qwen path, its layer-major prompt walk and its prefill speeds are not touched. Measured before any shared file changes:
