@@ -28,6 +28,22 @@ the rest of `paged_engine.cpp` (3,077 lines), his AMD docs, his panel code. Noth
 | One low-RAM mode that scales | Step 5, with the single scheduler |
 | Live settings, each with a tooltip | Step 3: read-only view first, then editable |
 
+### Measured 21 Nov: the three-windows claim holds for our `--batch`
+
+Qwen UD-Q4_K_XL, 12 GB card, `--max-context 200000`, K/V streaming on (32,768 cells per layer resident), 29 GiB memory scope, same flags both runs:
+
+| | no `--batch` | `--batch 2` |
+|---|---|---|
+| slot sessions | none | 2 x 0.84 GiB of VRAM |
+| expert cache | 1,473 slots (4.27 GiB) | 885 slots (2.57 GiB): 40% fewer |
+| RAM tier | 21.74 GiB | 17.06 GiB (4.7 GiB less) |
+| RAM available to the engine (cgroup) | 24.24 GiB | 19.56 GiB: 4.68 GiB less = two more 2.36 GiB K/V host copies |
+
+So two batch slots cost two more full-size context windows besides the main session (3 in all), in VRAM and in RAM, taken from the experts, as he
+described. What the logs do not show: the main session's VRAM size, and whether it sits idle while the slots decode. Next: read that, then size slot
+sessions by use (the elastic K/V that the single session already has; `--kv-grow` is switched off with `--batch`) and reuse the main session as slot 0.
+Decode speed with `--batch 2` was not measured here (no requests were sent).
+
 ## What we take, and what we keep
 
 His idea is one engine that owns memory and the decode loop, and a small adapter per model. We take that shape. We keep what we measured and built:
