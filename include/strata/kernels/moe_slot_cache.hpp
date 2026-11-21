@@ -25,7 +25,7 @@ public:
         if (mem_) cudaFree(mem_);
         if (cs_) cudaStreamDestroy(cs_);
         if (ev_) cudaEventDestroy(ev_);
-        if (summary_ && hits_ + miss_ > 0) std::fprintf(stderr, "moe slot cache: %ld hits, %ld misses (%.1f%% hit)\n", hits_, miss_, 100.0 * hits_ / (double) (hits_ + miss_));
+        if (summary_ && hits_ + miss_ > 0) std::fprintf(stderr, "moe slot cache: %ld hits, %ld misses (%.1f%% hit), %ld prefetch copies\n", hits_, miss_, 100.0 * hits_ / (double) (hits_ + miss_), prefetched_);
     }
     /// n_slots < 0: automatic (the free VRAM less the margin); 0: off.  Returns whether a cache exists (fewer than one visit's picks = none).
     bool init(long n_slots, size_t gu_bytes, size_t dn_bytes, int n_layers, int n_experts, int max_k, const char* tag = "moe") {
@@ -88,8 +88,32 @@ public:
             uint8_t* base = mem_ + (size_t) slot_of[s] * (gu_ + dn_);
             gu_ptr[s] = base; dn_ptr[s] = base + gu_;
         }
-        if (copied) { cudaEventRecord(ev_, cs_); cudaStreamWaitEvent(wait_on, ev_, 0); }
+        if (copied || unwaited_) { cudaEventRecord(ev_, cs_); cudaStreamWaitEvent(wait_on, ev_, 0); unwaited_ = false; }   // also covers earlier prefetch copies
     }
+
+    /// Look-ahead: start copying the experts `idx[0..n)` of layer `layer` that are not in a slot yet (predicted picks of a visit still to come), on the copy stream, behind the
+    /// copies `place` already waited for; the compute stream waits for them at the next `place`.  Never evicts a slot used by the current visit.  Returns the copies issued.
+    int prefetch(int layer, const int32_t* idx, int n, const uint8_t* gu_src, size_t gu_plane, const uint8_t* dn_src, size_t dn_plane) {
+        int issued = 0;
+        for (int s = 0; s < n; ++s) {
+            const int64_t k = (int64_t) layer * ne_ + idx[s];
+            const int have = map_[(size_t) k];
+            if (have >= 0) { used_[(size_t) have] = clock_; continue; }   // keep it as fresh as this visit's picks
+            int sl = -1;
+            int64_t best = INT64_MAX;
+            for (int i = 0; i < n_; ++i)
+                if (used_[(size_t) i] < best) best = used_[(size_t) i], sl = i;
+            if (sl < 0 || best >= clock_) break;   // every slot belongs to this visit or to a fresher prefetch
+            if (key_[(size_t) sl] >= 0) map_[(size_t) key_[(size_t) sl]] = -1;
+            key_[(size_t) sl] = k; map_[(size_t) k] = sl; used_[(size_t) sl] = clock_;
+            uint8_t* dst = mem_ + (size_t) sl * (gu_ + dn_);
+            cudaMemcpyAsync(dst, gu_src + (size_t) idx[s] * gu_plane, gu_plane, cudaMemcpyHostToDevice, cs_);
+            cudaMemcpyAsync(dst + gu_, dn_src + (size_t) idx[s] * dn_plane, dn_plane, cudaMemcpyHostToDevice, cs_);
+            unwaited_ = true; ++issued; ++prefetched_;
+        }
+        return issued;
+    }
+    long prefetched() const { return prefetched_; }
 
 private:
     int n_ = 0, ne_ = 0, maxk_ = 0;
@@ -100,8 +124,8 @@ private:
     std::vector<int64_t> key_, used_;
     std::vector<int> map_;
     int64_t clock_ = 0;
-    long hits_ = 0, miss_ = 0;
-    bool summary_ = false;
+    long hits_ = 0, miss_ = 0, prefetched_ = 0;
+    bool summary_ = false, unwaited_ = false;
 };
 
 }  // namespace strata::kernels::moe

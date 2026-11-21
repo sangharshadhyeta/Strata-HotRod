@@ -98,6 +98,7 @@ struct Engine::Impl {
 
     Impl(const GgufFile& gg, const Config& cc, const Layout& ll, int max_ctx) : g(gg), c(cc), lay(ll), cap(max_ctx) { init(); }
     ~Impl() {
+        if (pf_total > 0) std::fprintf(stderr, "inkling2 engine: look-ahead: %ld of %ld actual picks were in the predicted set (%.1f%%)\n", pf_hit, pf_total, 100.0 * pf_hit / (double) pf_total);
         for (void* p : allocs) cudaFree(p); for (void* p : pinned) cudaFreeHost(p); }
 
     void* dmalloc(size_t n) { void* p = nullptr; CK(cudaMalloc(&p, n)); allocs.push_back(p); return p; }
@@ -151,6 +152,13 @@ struct Engine::Impl {
     // ---- the VRAM slot cache (class B: the experts are in RAM, hot ones in VRAM): the shared moe::SlotCache (STRATA_MOE_SLOTS, STRATA_MOE_SLOT_MARGIN_MB).
     // Per visit the host reads the picks (one sync), misses are copied on the cache's copy stream, the kernels read slot addresses.
     M::SlotCache scache;
+    // look-ahead (STRATA_MOE_PREFETCH=N: copy the N experts the NEXT visit's router would pick from this visit's router input, while this visit computes; 0 = off)
+    int pf_n = 0;
+    int32_t *d_pidx = nullptr, *h_pidx = nullptr;
+    float *d_pw = nullptr, *rlp = nullptr, *xp = nullptr;
+    int pred_vis = -1;
+    std::vector<int> pred_ids;
+    long pf_pred = 0, pf_hit = 0, pf_total = 0;
     const uint8_t **h_gu_ptr = nullptr, **h_dn_ptr = nullptr;   // pinned address tables
     void init_cache() {
         size_t gu = 0, dn = 0;
@@ -159,6 +167,12 @@ struct Engine::Impl {
         void* hp = nullptr;
         CK(cudaHostAlloc(&hp, 32 * sizeof(void*), cudaHostAllocPortable)); pinned.push_back(hp);
         h_gu_ptr = (const uint8_t**) hp; h_dn_ptr = h_gu_ptr + 16;
+        if (const char* pe = std::getenv("STRATA_MOE_PREFETCH")) pf_n = std::min(std::max(std::atoi(pe), 0), 16);
+        if (pf_n > 0) {
+            d_pidx = (int32_t*) dmalloc(16 * 4); d_pw = fmalloc(16); rlp = fmalloc((size_t) c.n_expert); xp = fmalloc((size_t) c.n_embd);
+            void* hq2 = nullptr; CK(cudaHostAlloc(&hq2, 16 * 4, cudaHostAllocPortable)); pinned.push_back(hq2); h_pidx = (int32_t*) hq2;
+            std::fprintf(stderr, "inkling2 engine: look-ahead prefetch of %d experts a visit\n", pf_n);
+        }
     }
     void place_experts(int l, const LW& w, const int32_t* idx, int K) {
         scache.place(l, idx, K, w.host_gu, w.gu_plane, w.host_dn, w.dn_plane, h_gu_ptr, h_dn_ptr, nullptr);
@@ -330,11 +344,35 @@ struct Engine::Impl {
         int32_t* idxv = d_idx + (size_t) vis * 16;   // this visit's picks stay on the device (the host reads them once a token)
         M::route(rl, w.router_bias, 1, (int) c.n_expert, Kx, c.expert_weight_scale, M::Score::Sigmoid, idxv, d_w, nullptr);
         CK(cudaMemcpyAsync(h_idx + (size_t) vis * 16, idxv, (size_t) Kx * 4, cudaMemcpyDeviceToHost, nullptr));
+        int64_t nl = -1;
+        if (pf_n > 0 && scache.active() && vis + 1 < c.n_visits) {   // the next visit's router on this visit's input (its own norm): the experts to start copying now
+            nl = c.stored_of_visit(vis + 1);
+            const LW& wn = lw[(size_t) nl];
+            if (wn.resident) nl = -1;
+            else {
+                copy(xp, m_in, (size_t) E);
+                rms_w(xp, wn.ffn_norm);
+                ik::matmul_f32(wn.router, xp, rlp, 1, (int) E, (int) c.n_expert, nullptr);
+                M::route(rlp, wn.router_bias, 1, (int) c.n_expert, std::max(pf_n, Kx), c.expert_weight_scale, M::Score::Sigmoid, d_pidx, d_pw, nullptr);
+                CK(cudaMemcpyAsync(h_pidx, d_pidx, (size_t) std::max(pf_n, Kx) * 4, cudaMemcpyDeviceToHost, nullptr));
+            }
+        }
         lap(1);
         // the grouped experts: 4 launches for all of the visit's picks, FP32 activations (no int8 quantization of the input)
         if (scache.active() && !w.resident) {   // class B: the host learns the picks (one sync a visit), misses are copied into VRAM slots, hits cost nothing
             CK(cudaStreamSynchronize(nullptr));
-            place_experts((int) l, w, h_idx + (size_t) vis * 16, Kx);
+            const int32_t* act = h_idx + (size_t) vis * 16;
+            if (pred_vis == vis) {   // how well the last visit's look-ahead named this visit's picks
+                for (int s = 0; s < Kx; ++s) pf_hit += std::find(pred_ids.begin(), pred_ids.end(), act[s]) != pred_ids.end();
+                pf_total += Kx;
+            }
+            place_experts((int) l, w, act, Kx);
+            if (nl >= 0) {   // after this visit's own copies were queued (and waited for): the predicted ones follow on the copy stream, overlapping the compute below
+                const LW& wn = lw[(size_t) nl];
+                const int np = std::max(pf_n, Kx);
+                scache.prefetch((int) nl, h_pidx, np, wn.host_gu, wn.gu_plane, wn.host_dn, wn.dn_plane);
+                pred_ids.assign(h_pidx, h_pidx + np); pred_vis = vis + 1;
+            }
             M::experts_scales(idxv, d_w, w.gs_d, w.ds_d, Kx, d_sg, d_wd, nullptr);
         } else {
             M::experts_prepare(idxv, d_w, w.gu_dev, w.gu_plane, w.dn_dev, w.dn_plane, w.gs_d, w.ds_d, Kx, d_gu_ptr, d_dn_ptr, d_sg, d_wd, nullptr);

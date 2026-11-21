@@ -288,3 +288,24 @@ Not yet done: overlap of the copies with compute (needs the picks before the vis
 
 Qwen check after the change (3 prompts, Strata-edge0 binary, 262144): 18.0 / 18.9 / 21.0 tok/s (mean 19.3, clean main 19.3), 13.6K-token read 339.7 tok/s (clean main 338.1):
 unchanged, as expected: neither library is linked into the `strata` binary. Qwen's own types (IQ) are not decoded by `moe_group` yet.
+
+## L3a result: crude look-ahead prefetch as the control arm (22 Nov)
+
+`STRATA_MOE_PREFETCH=N` (default 0, off): at a visit's router the NEXT visit's router is run on this visit's input (its own norm) and the N best experts not in a slot are copied
+on the copy stream while this visit computes (`SlotCache::prefetch`; never evicts a slot of the current visit). This is the "predict from this layer's input" idea, not our
+learned look-ahead: it is the control the learned look-ahead (`ds4_lalearn`, 89 / 80 / 72% at +1 / +2 / +4 layers on Qwen) and the loop feature must beat.
+
+| arm (48 tokens, cold, 1036 slots) | picks named | hit rate | PCIe copies (misses + prefetch) | tok/s | ms/token |
+|---|---|---|---|---|---|
+| no prefetch | - | 86.2% | 2548 | 22.3 | 43.0 |
+| N = 8 | 75.5% | 94.5% | 1015 + 2557 = 3572 | 21.9 | 43.7 |
+| N = 12 | 87.2% | 96.0% | 731 + 4369 = 5100 | 20.2 | 47.7 |
+
+KL identical (0.0046): placement only. Findings:
+- On a looped model with an 8-byte-wide window the crude predictor is far better than the 46% Maya measured (it also covers passes 2 and 3, which the cache already holds): 75-87%.
+- It still does not help: the hit rate rises, but the PCIe bytes do not fall (wasted prefetches add copies) and the window is short (the next visit's picks are known only one visit
+  ahead; the copy of a few experts takes about as long as the compute it overlaps). Same verdict as Maya's.
+- What would help: a longer reach (+2 / +4 visits, which is what the learned look-ahead is for), fewer wasted copies (confidence, not top-N), and for passes 2-3 protection of the
+  token's pass-1 experts rather than prediction (about 96 experts, 430 MB, fit the cache).
+
+Qwen check (3 prompts): 17.3 / 19.8 / 22.6 tok/s (mean 19.9, clean main 19.3), 13.6K-token read 343.1 tok/s (338.1): unchanged.
