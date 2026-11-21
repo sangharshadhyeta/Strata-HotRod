@@ -11815,7 +11815,7 @@ int main(int argc, char** argv) {
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups) +
                                        (o.batch_cells > 0 ? " batch_cells=" + std::to_string(o.batch_cells) : std::string()) +
-                                       ([] { const char* v = std::getenv("STRATA_COPREFILL"); return v != nullptr && std::atoi(v) != 0; }() && !o.batch_mtp
+                                       ([] { const char* v = std::getenv("STRATA_COPREFILL"); return v == nullptr || std::atoi(v) != 0; }() && !o.batch_mtp
                                                  ? std::string(" coprefill=1") : std::string())).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
@@ -13459,7 +13459,7 @@ int main(int argc, char** argv) {
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
-            // CO-PREFILL (STRATA_COPREFILL, opt-in; docs/CO_PREFILL.md): warm=<slot>:<ids>;<slot>:<ids> - OTHER waiting short prompts of the server, whose prefixes (all but each last
+            // CO-PREFILL (default on, STRATA_COPREFILL=0 turns it off; docs/CO_PREFILL.md): warm=<slot>:<ids>;<slot>:<ids> - OTHER waiting short prompts of the server, whose prefixes (all but each last
             // token) are read into their own batch slots in one layer-major run before this request's read; their own requests then find the slot warm.  Unknown to an older engine
             // (skipped like any unknown key).
             struct WarmJob { int slot = -1; std::vector<int64_t> ids; };
@@ -15391,7 +15391,7 @@ int main(int argc, char** argv) {
                 return std::max(a0, n - mt);
             };
             // CO-PREFILL: the prompts the server sent with this request (warm=) are read into their slots together, so each layer's experts load once for all of them
-            static const bool co_prefill_on = [] { const char* v = std::getenv("STRATA_COPREFILL"); return v != nullptr && std::atoi(v) != 0; }();
+            static const bool co_prefill_on = [] { const char* v = std::getenv("STRATA_COPREFILL"); return v == nullptr || std::atoi(v) != 0; }();
             if (!req_warm.empty())
                 std::fprintf(stderr, "strata batch: co-prefill asked for %zu prompts (on=%d batch=%d batch_mtp=%d draft_keep=%d stages=%zu multi_gpu=%d peer=%d pf_parts=%zu cancelled=%d)\n",
                              req_warm.size(), (int) co_prefill_on, o.batch, (int) batch_mtp, (int) slot_draft_keep, stages.size(), (int) multi_gpu, o.peer_device,
