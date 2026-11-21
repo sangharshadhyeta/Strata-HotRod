@@ -57,7 +57,7 @@ Nothing leaves your PC.</p>
 A fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). Strata keeps Qwen's experts in
 RAM and reads from the SSD when RAM is short; its docs call that path much slower. This fork works on that path: it
 spreads the experts over the card, RAM and the SSD and guesses ahead which ones to read, so the 78 GB IQ3_S runs on 30 GB
-of RAM at 50-70 tokens/s (131K context, short answers; the table below has the long prompts) further teested on their rig by [NoPlaceLikeLocalhost - (scorbo2) Benchmark](https://github.com/scorbo2/ai-playground/tree/master/benchmarking) , and Unsloth's 111 GB UD-Q4_K_XL
+of RAM at 50-70 tokens/s (131K context, short answers; the table below has the long prompts) further tested on their rig by [NoPlaceLikeLocalhost - (scorbo2) Benchmark](https://github.com/scorbo2/ai-playground/tree/master/benchmarking) , and Unsloth's 111 GB UD-Q4_K_XL
 on the same PC at 15-25 tokens/s in short tests on 14 Nov (131K context, three questions, a 29K-token prompt read at 300-420
 tokens/s; the learners were still cold, and it has not been measured as widely as IQ3_S).
 
