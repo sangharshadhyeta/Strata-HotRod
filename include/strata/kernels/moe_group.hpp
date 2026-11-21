@@ -35,6 +35,11 @@ void experts_scales(const int32_t* idx, const float* route_w, const float* gate_
 void experts_gate_up(const uint8_t* const* gu_ptr, int ty, size_t up_off, const float* x, int C, int FF, const float* sg, Act act, float* h, int K, void* stream);
 /// y[s][c] = down_c . h[s] for c < C (h [K][FF]; slot s's down rows at dn_ptr[s]).
 void experts_down(const uint8_t* const* dn_ptr, int ty, const float* h, int C, int FF, float* y, int K, void* stream);
+/// The int8-activation path (~4x fewer ALU ops a weight; the activation is quantized to q8_1 blocks - 36 bytes a 32 values - so the result carries int8 activation noise, as the
+/// engine's other quantized matvecs do): quantize_act turns `rows` rows of n floats (n a multiple of 32) into xq [rows][n / 32][36]; the _q8 kernels take it in place of x / h.
+void quantize_act(const float* x, int n, int rows, void* xq, void* stream);
+void experts_gate_up_q8(const uint8_t* const* gu_ptr, int ty, size_t up_off, const void* xq, int C, int FF, const float* sg, Act act, float* h, int K, void* stream);
+void experts_down_q8(const uint8_t* const* dn_ptr, int ty, const void* hq, int C, int FF, float* y, int K, void* stream);
 /// out[c] = sum_s wd[s] y[s][c].
 void experts_combine(const float* y, const float* wd, int K, int C, float* out, void* stream);
 

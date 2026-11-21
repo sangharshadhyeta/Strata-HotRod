@@ -345,3 +345,20 @@ Spin instead of sleep while the host waits for the router's picks (`cudaDeviceSc
 prefetch N=8 38.0 -> 37.9 (noise-sized, kept on). The per-visit host gap is not wake-up latency. What is left between ~27 ms of kernel time and ~38-40 ms of wall is the host-side work
 between the picks arriving and the expert launches going out, and ~2,000 launches a token; the weight bytes alone (~2.3 GB a token) would need ~8 ms at VRAM speed, so the kernels are
 also well off the bandwidth floor (experts 12.6 ms for 1.85 GB). Qwen check (3 prompts): 17.1 / 18.9 / 23.0 tok/s (mean 19.7), 13.6K read 342.5 tok/s: unchanged.
+
+## L3c: the expert kernels were ALU-bound; int8-activation path (22 Nov)
+
+The exact FP32 expert kernels spend ~12 integer ops per nibble in `e2m1d`; the 165 us a `k_gate_up` was decode, not bytes. `moe::quantize_act` + `moe::experts_gate_up_q8 / experts_down_q8` quantize the
+activation to q8_1 blocks and decode the weights with the byte-permute table lookup + `__dp4a` (the engine's `iq_kernels.cu` lookup, ggml MIT; same NVFP4 word layout; Q8_0 by dp4a directly).
+`STRATA_MOE_INT8` (engine default ON, `=0` the exact FP32 path; the library keeps both). Kernel parity vs the CPU oracle: 8.5e-3 (layer 0 NVFP4) and 1.3e-2 (layer 20 Q8_0) relative, bound 3e-2;
+the FP32 path stays 2e-7.
+
+| 48 tokens, cold, engine alone | ms/token | tok/s | KL vs oracle |
+|---|---|---|---|
+| FP32 experts | 40.7 | 24.6 | 0.0046 |
+| int8 experts | 35.8 | 27.9 | 0.0051 |
+| int8 + look-ahead prefetch 8 | 33.5 | 29.8 | 0.0051 |
+| same, warm cache (floor) | 32.0 | 31.2 | 0.0051 |
+
+Top-1 identical (44 of 48). Maya's engine: ~32 tok/s on this card. The KV cache and conv state stay FP32 (only the expert FFN input and activation are int8; the dense q/k/v/out
+projections already used int8 activations in the first GPU engine). Qwen check (3 prompts): 18.7 / 18.6 / 22.8 tok/s (mean 20.0), 13.6K read 342.0 tok/s: unchanged.

@@ -155,6 +155,8 @@ struct Engine::Impl {
     cudaStream_t st = nullptr;   // every launch of the engine
     M::SlotCache scache;
     // look-ahead (STRATA_MOE_PREFETCH=N: copy the N experts the NEXT visit's router would pick from this visit's router input, while this visit computes; 0 = off)
+    bool int8_act = false;           // STRATA_MOE_INT8
+    void *d_xq8 = nullptr, *d_hq8 = nullptr;   // q8_1-quantized expert input / activation
     int pf_n = 0;
     int32_t *d_pidx = nullptr, *h_pidx = nullptr;
     float *d_pw = nullptr, *rlp = nullptr, *xp = nullptr;
@@ -250,6 +252,8 @@ struct Engine::Impl {
         { void* hp = nullptr; CK(cudaHostAlloc(&hp, (size_t) c.n_visits * 16 * 4, cudaHostAllocPortable)); pinned.push_back(hp); h_idx = (int32_t*) hp; }
         d_gu_ptr = (const uint8_t**) dmalloc(16 * sizeof(void*)); d_dn_ptr = (const uint8_t**) dmalloc(16 * sizeof(void*));
         d_sg = fmalloc(16); d_wd = fmalloc(16); d_hh = fmalloc((size_t) 16 * FF); d_yy = fmalloc((size_t) 16 * E);
+        int8_act = !(std::getenv("STRATA_MOE_INT8") != nullptr && std::atoi(std::getenv("STRATA_MOE_INT8")) == 0);   // default on; STRATA_MOE_INT8=0: the exact FP32 path
+        d_xq8 = dmalloc((size_t) (E / 32) * 36); d_hq8 = dmalloc((size_t) 16 * (FF / 32) * 36);
         xq = dmalloc((size_t) (E / 32) * 36 * 2); hq = dmalloc((size_t) (FF / 32) * 36 * 2); aq = dmalloc((size_t) (H * D / 32) * 36 * 2);
         picks.assign((size_t) c.n_visits, {});
         init_cache();
@@ -382,8 +386,16 @@ struct Engine::Impl {
         } else {
             M::experts_prepare(idxv, d_w, w.gu_dev, w.gu_plane, w.dn_dev, w.dn_plane, w.gs_d, w.ds_d, Kx, d_gu_ptr, d_dn_ptr, d_sg, d_wd, st);
         }
-        M::experts_gate_up(d_gu_ptr, w.etype, w.gate_bytes, x, (int) E, (int) FF, d_sg, M::Act{M::ActKind::Situ, c.situ_beta, c.situ_linear_beta}, d_hh, Kx, st);
-        M::experts_down(d_dn_ptr, w.etype, d_hh, (int) E, (int) FF, d_yy, Kx, st);
+        const M::Act situ{M::ActKind::Situ, c.situ_beta, c.situ_linear_beta};
+        if (int8_act) {   // STRATA_MOE_INT8=1: quantized activations, table-lookup + dp4a decode (~4x fewer ALU ops a weight)
+            M::quantize_act(x, (int) E, 1, d_xq8, st);
+            M::experts_gate_up_q8(d_gu_ptr, w.etype, w.gate_bytes, d_xq8, (int) E, (int) FF, d_sg, situ, d_hh, Kx, st);
+            M::quantize_act(d_hh, (int) FF, Kx, d_hq8, st);
+            M::experts_down_q8(d_dn_ptr, w.etype, d_hq8, (int) E, (int) FF, d_yy, Kx, st);
+        } else {
+            M::experts_gate_up(d_gu_ptr, w.etype, w.gate_bytes, x, (int) E, (int) FF, d_sg, situ, d_hh, Kx, st);
+            M::experts_down(d_dn_ptr, w.etype, d_hh, (int) E, (int) FF, d_yy, Kx, st);
+        }
         M::experts_combine(d_yy, d_wd, Kx, (int) E, moe, st);
         lap(2);
         K::gdn_conv_step(fs[(size_t) vis], moe, w.ffnpost, mm, E, taps, st);

@@ -49,7 +49,7 @@ DevLayer upload(const strata::GgufFile& g, const I::LayerTensors& L, const I::Co
     return d;
 }
 /// The grouped MoE of one token on the GPU.
-C::Mat gpu_moe(const I::Config& c, const DevLayer& d, const C::Mat& logits_row, const C::Mat& x, M::Act act, M::Score score = M::Score::Sigmoid) {
+C::Mat gpu_moe(const I::Config& c, const DevLayer& d, const C::Mat& logits_row, const C::Mat& x, M::Act act, bool i8 = false, M::Score score = M::Score::Sigmoid) {
     const int E = (int) c.n_embd, FF = (int) c.n_ff_exp, K = (int) c.n_expert_used, NE = (int) c.n_expert;
     float *d_l = (float*) dup(logits_row.data(), (size_t) NE * 4), *d_x = (float*) dup(x.data(), (size_t) E * 4), *d_w = nullptr, *d_sg = nullptr, *d_wd = nullptr, *d_h = nullptr, *d_y = nullptr, *d_o = nullptr;
     int32_t* d_i = nullptr;
@@ -58,8 +58,18 @@ C::Mat gpu_moe(const I::Config& c, const DevLayer& d, const C::Mat& logits_row, 
     cudaMalloc(&d_gp, 16 * sizeof(void*)); cudaMalloc(&d_dp, 16 * sizeof(void*));
     M::route(d_l, d.router_bias, 1, NE, K, c.expert_weight_scale, score, d_i, d_w, nullptr);
     M::experts_prepare(d_i, d_w, d.gu, d.gu_plane, d.dn, d.dn_plane, d.gs, d.ds, K, d_gp, d_dp, d_sg, d_wd, nullptr);
-    M::experts_gate_up(d_gp, d.ty, d.up_off, d_x, E, FF, d_sg, act, d_h, K, nullptr);
-    M::experts_down(d_dp, d.ty, d_h, E, FF, d_y, K, nullptr);
+    if (i8) {
+        void *xq = nullptr, *hq = nullptr;
+        cudaMalloc(&xq, (size_t) (E / 32) * 36); cudaMalloc(&hq, (size_t) K * (FF / 32) * 36);
+        M::quantize_act(d_x, E, 1, xq, nullptr);
+        M::experts_gate_up_q8(d_gp, d.ty, d.up_off, xq, E, FF, d_sg, act, d_h, K, nullptr);
+        M::quantize_act(d_h, FF, K, hq, nullptr);
+        M::experts_down_q8(d_dp, d.ty, hq, E, FF, d_y, K, nullptr);
+        cudaDeviceSynchronize(); cudaFree(xq); cudaFree(hq);
+    } else {
+        M::experts_gate_up(d_gp, d.ty, d.up_off, d_x, E, FF, d_sg, act, d_h, K, nullptr);
+        M::experts_down(d_dp, d.ty, d_h, E, FF, d_y, K, nullptr);
+    }
     M::experts_combine(d_y, d_wd, K, E, d_o, nullptr);
     C::Mat out((size_t) E);
     cudaMemcpy(out.data(), d_o, (size_t) E * 4, cudaMemcpyDeviceToHost);
@@ -118,6 +128,20 @@ int main() {
         worst = std::max(worst, rel(gpu_moe(c, d20, lg, x, situ), C::Mat(cpu20.begin() + t * E, cpu20.begin() + (t + 1) * E)));
     }
     report("layer 20 (Q8_0 experts), 2 synthetic tokens: grouped MoE vs the CPU oracle", worst, 2e-4);
+    // the int8-activation path (quantized activations, table lookup + dp4a): the activation noise of q8_1, so a looser bound
+    worst = 0;
+    for (int64_t t : {0, 13, 31, 47}) {
+        if (t >= T) continue;
+        const C::Mat x(vs.moe_in.begin() + t * E, vs.moe_in.begin() + (t + 1) * E), lg(lg0.begin() + t * NE, lg0.begin() + (t + 1) * NE);
+        worst = std::max(worst, rel(gpu_moe(c, d0, lg, x, situ, true), C::Mat(cpu0.begin() + t * E, cpu0.begin() + (t + 1) * E)));
+    }
+    report("layer 0 (NVFP4), int8 activations: grouped MoE vs the CPU oracle", worst, 3e-2);
+    worst = 0;
+    for (int64_t t = 0; t < 2; ++t) {
+        const C::Mat x(xs.begin() + t * E, xs.begin() + (t + 1) * E), lg(lg20.begin() + t * NE, lg20.begin() + (t + 1) * NE);
+        worst = std::max(worst, rel(gpu_moe(c, d20, lg, x, situ, true), C::Mat(cpu20.begin() + t * E, cpu20.begin() + (t + 1) * E)));
+    }
+    report("layer 20 (Q8_0), int8 activations: grouped MoE vs the CPU oracle", worst, 3e-2);
 
     // 2. the activation kinds on one real expert: gate/up by the CPU, the activation by its host formula, the down rows by the CPU; the weights x1 (one pick)
     {
