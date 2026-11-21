@@ -26,6 +26,18 @@ Applied only at a quiet moment: no slot decoding (`!batch_on()`), no prompt loan
 5. **Server:** resize `slot_q`, `slot_busy`, `slot_held`, `slot_used`, `slot_live`, `slot_group` and `self.batch` / `self.slot_cells` on that line; admit to slots only
    when the engine says so. A controller (later) calls `BATCHSET N` when at least N requests overlap for a few seconds and `BATCHSET 0` after a quiet period, with hysteresis.
 
+## Found while preparing the build (21 Nov), and the revised order
+- **Parking a slot's conversation can kill the engine if done carelessly.** A parked snapshot holds the draft head's K/V when `--mtp` is on, and
+  `conversation_snapshot_restore` validates the image against it; a failed validation on the request path is fatal ("ERR restoring parked conversation", the engine
+  exits). A slot has no draft K/V (slot decoding does not use the draft head), so a snapshot saved from a slot with no draft cannot be restored. Saving it with the
+  main session's draft K/V restores, but that state belongs to another conversation: drafts miss until it refills (tokens stay correct, drafts are verified).
+  Parking needs its own test before it is wired into BATCHSET.
+- **The solo penalty of a batch-capable engine has a precise cause:** with `o.batch > 0` the solo decode loop switches off `STRATA_LOOKAHEAD_PROMOTE` and
+  `STRATA_RAM_ADAPT` (generate.cpp, the two `o.batch == 0` conditions) even when no slot is decoding. Gating them on `batch_on()` instead (done 21 Nov) should give a
+  batch-capable engine the solo speed of no `--batch`. What BATCHSET would then save is only the slots' VRAM (about 0.3 GiB for two slots at 2,048 cells).
+- **Order now:** (1) the gate fix and an alternating A/B of solo decode; (2) always-on small slots as the default recommendation, with the stream-count switch from the
+  multi-stream curves; (3) BATCHSET with parking as its own tested step, for small cards where 0.3 GiB matters. `Verifier::release_slots()` is written for it.
+
 ## Risks and open questions
 - `init_slots` / graph capture while serving: untested; each (rows, S) graph is captured at first use ("captured the batch window over slots ..."), so the first windows after a
   re-carve pay a capture.
