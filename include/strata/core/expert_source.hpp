@@ -158,7 +158,8 @@ int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std:
 /// The RAM this process may fill, sized the one way the page-cache warm's auto and `--resident-budget-gib auto` both use:
 /// the smaller of MemAvailable and the engine's memory limit's available, less `reserve` (what the engine allocates later)
 /// and the kernel's high watermarks.  STRATA_PAGECACHE_WARM_HEADROOM_GIB, when set, replaces that sum.  `note` receives
-/// the sizing for a log line.  0 when /proc/meminfo cannot be read.
+/// the sizing for a log line.  0 when neither /proc/meminfo nor the platform's own probe (Windows: GlobalMemoryStatusEx)
+/// can be read.
 uint64_t host_ram_room_bytes(uint64_t reserve, std::string* note = nullptr);
 
 /// Where one routed expert's bytes come from.
