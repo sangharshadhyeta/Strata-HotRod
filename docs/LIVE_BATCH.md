@@ -4,6 +4,14 @@
 No batch by default (the best single-stream path: prefill 335-348 tok/s, decode 22-26). When requests overlap, bring up a few small slots
 (about 2,048 cells each, 0.15 GiB per slot) with VRAM taken from the expert cache; when they end, give it back. Nothing restarts.
 
+## The user decides (rule, 21 Nov)
+The number of slots and their size are the user's settings (`--batch N`, `--batch-context C`, the server's `parallel`), and an explicit value always wins: no hidden cap.
+The default is a computed suggestion from the engine's own measurement; past the measured useful range the engine says so once (log and status page) and keeps the
+setting. The live version (`BATCHSET`) lets the user change both without a restart; the tuner may suggest a value and applies one only when the user turned auto on.
+Measured on one machine (Qwen UD-Q4_K_XL, 12 GB card, 8 slots at 2,048 cells, DIFFERENT questions): total throughput 21.5 tok/s for 1 stream, 26.7 for 2, 24.4 for 3,
+27.2 for 4, 20.8 for 6, 19.2 for 8 - all finished 22% sooner than one after another at 2 and 4 streams, 3% at 6, 0% at 8. With near-identical prompts (shared experts and a
+cached prompt) the total reaches 45 tok/s, so the sweet spot depends on the traffic and the hardware.
+
 ## What the measurements so far say (Qwen UD-Q4_K_XL, 12 GB card; docs/PORTING_STRATAQ.md)
 - Slots as large as `--max-context` cost 40% of the expert cache and 62% of prefill; a cap of 2,048 cells costs about 7% of the cache and, with the single-GPU piece
   fix, no prefill.
