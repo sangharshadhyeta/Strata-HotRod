@@ -111,7 +111,7 @@ int main() {
                 check(cudaMemcpyAsync(dgl[dd], row.data(), kRow * sizeof(float), cudaMemcpyHostToDevice, cs), "gl upload");
                 la::forward(s, dist, dx, dgl[dd], 1, cs);
             }
-        la::post_launch(cs, 1);
+        la::post_launch(cs, 1, nullptr);   // (the mask argument came after this test was written: nullptr = no DS4_MASK levels)
     }
     check(cudaStreamSynchronize(cs), "sync");
     if (!la::counters(0, 1, leader1, picks1, hits1)) {

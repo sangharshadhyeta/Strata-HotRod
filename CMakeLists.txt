@@ -320,6 +320,20 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(inkling2_ops_test PRIVATE include)
   target_link_libraries(inkling2_ops_test PRIVATE strata_artifact)
   add_test(NAME inkling2_ops_test COMMAND inkling2_ops_test)
+  # The DeepSeek branch's tier components (src/dsv41, byte for byte from upstream-dsv41; Project Maya's MIT notice: third_party/project-maya) that the
+  # Inkling engine is built on (docs/INKLING-PORT.md F1): the stand-in budget tuner, the decode timeline and the expert-rule header, each on the
+  # CPU with no GPU and no model, and the RAM-tier ExpertStore test (it needs a GGUF and offsets, so it is built, not a ctest)
+  find_package(Threads REQUIRED)
+  foreach(_t standin_tune timeline experts_rule)
+    add_executable(ds4_${_t}_test tests/dsv41/${_t}_test.cpp)
+    target_include_directories(ds4_${_t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+    target_compile_features(ds4_${_t}_test PRIVATE cxx_std_17)
+    target_link_libraries(ds4_${_t}_test PRIVATE Threads::Threads)
+    add_test(NAME ds4_${_t}_test COMMAND ds4_${_t}_test)
+  endforeach()
+  # tests/dsv41/store_test.cpp (the RAM-tier ExpertStore on real expert files) is copied as it is on the branch and NOT built: it calls
+  # os::ram_avail, which that branch's own ds4_os.hpp does not have (the branch builds no target for it either).  F2 gets a store test on
+  # real Inkling experts instead.
   # how --batch cuts a prompt read into pieces (a layer split with no slot decoding must still reach a BYIELD)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)
@@ -520,6 +534,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(inkling2_router_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(inkling2_router_parity PRIVATE inkling2_kernels strata_kernels CUDA::cudart)
     add_test(NAME inkling2_router_parity COMMAND inkling2_router_parity)
+    # the DeepSeek branch's learned look-ahead (src/dsv41/ds4_lalearn.cu, from the branch byte for byte) on synthetic routers: a GPU, no model (F1)
+    add_executable(ds4_lalearn_test tests/dsv41/lalearn_test.cu src/dsv41/ds4_lalearn.cu)
+    target_include_directories(ds4_lalearn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
+                               ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(ds4_lalearn_test PRIVATE CUDA::cudart)
   endif()
   # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
   # the capacity rule, selected ids bitwise
