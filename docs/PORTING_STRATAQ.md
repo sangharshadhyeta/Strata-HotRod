@@ -9,8 +9,9 @@ the rest of `paged_engine.cpp` (3,077 lines), his AMD docs, his panel code. Noth
 - **No foundation switch.** Upstream's layout and file names stay our foundation. His restructure (`src/common`, `src/models`, `src/base`, the paged
   engine) exists only in his fork; upstream has none of it. Adopting it would break path-based porting of upstream changes and tie us to one person's
   fork (1,951 commits behind upstream, last commit 14 Nov).
-- **Hand-port, copy nothing.** We read his design and write our own version on our tree. No code of his is copied, so his licence notice does not
-  enter our files. We name him in the README/docs for an idea once it ships (held until then).
+- **Hand-port; his code may be used when required (changed 22 Nov, on the owner's instruction).** We read his design and write our own version on our
+  tree; where his code is actually required it may be used, MIT-licensed (David Piepgrass), and then his copyright and licence notice stay in that file's
+  header and in the third-party notices, and he is named in the docs. Nothing of his has been copied so far. We name him for an idea once it ships.
 - **Not merging upstream either.** Upstream changes are hand-ported too; `tools/upstream_triage.py` sorts the backlog (4,729 commits since our base
   on 21 Nov: 2,913 clean, 115 light, 1,318 heavy, 383 docs, by file overlap) and `docs/UPSTREAM_PORTS.md` is the ledger.
 - **No PRs to upstream** (they accept none). Anyone, including qwertie, may send PRs to us.
