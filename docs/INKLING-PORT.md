@@ -49,8 +49,12 @@ test oracle and a specification; the engine code is written here, in this engine
   `tests/core/inkling2_ops_test.cpp`. All 48 visits of the 48-token oracle match the reference's seams within 9e-7 (relative to each
   seam's maximum), every expert pick (18,432) is identical, and the log-probabilities differ by at most 7.6e-6 over 48 x 200,058
   values with the same top-1 at every position. It takes ~2 minutes on one CPU thread: an oracle, not an engine.
-- **Not covered by that oracle:** the full layers' log scaling past 8,192 positions (tau is 1.0 below that), sliding windows longer than
-  48 tokens (the window is 1,024), and the relative-bias extent past 48 positions. A long-prompt oracle is needed before those are claimed.
+- **The 48-token oracle cannot exercise** the full layers' log scaling (tau is 1.0 below 8,192 positions), the 1,024-position window or the
+  relative extent past 48. **Covered 22 Nov by a 92-token oracle with shrunken values** (the reference run with window 32, full extent 48 and
+  log-scaling floor 16; the C++ side applies the same values through `STRATA_INKLING2_WINDOW` / `_EXTENT` / `_FLOOR`): all 48 visits within
+  1.13e-6, all picks identical, max |dlogp| 7.6e-6 over 92 x 200,058, top-1 the same at 92 of 92 positions. That tests the window mask, the
+  extent cutoff and tau up to 1.17 on the same code path the real values use; a run at the real 1,024 / 8,192 stays out of reach of a float64
+  CPU reference, so the real values are covered by this equivalence, not by a direct run.
 - **Next:** (a) a long-context oracle; (b) incremental decode: KV for the 8 full-attention layers' visits and the sliding window, the conv
   states (3 rows per conv), per-position block states; (c) the CUDA kernels, each checked against `ops_cpu`; (d) the expert tiers.
 
