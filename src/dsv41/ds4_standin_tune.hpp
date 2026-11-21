@@ -1,0 +1,572 @@
+// Strata. src/dsv41/ds4_standin_tune.hpp - the DeepSeek engine's stand-in budget tuner (host logic, no CUDA).
+//
+// The rules are the Qwen engine's (src/core/verify.cpp: STRATA_ROUTE_BUDGET_AUTO, STRATA_FRAGILE_BRAKE, the fragile_k learning,
+// the standin-tune.txt file), ported to one token per decode step.  Left out on purpose: the per-size-class learning, the control
+// ring (the noise floor), the explore cuts, the rollback and the DYN budget.
+//
+// The engine asks budget_for_next_token() before each decode token, runs the token at that budget, and reports it with
+// end_token(): its wall seconds, whether stand-ins were taken and, when the token was re-checked, its top-two logit gap, its risk
+// and whether the top token flipped.  A re-check happens when gap < k * risk (k: this header's k()).
+//
+// Two loops run on top of each other:
+//  - The AUTO search keeps ONE base budget b.  An INTERLEAVED test runs two arms over the same stretch of decode, so content drift
+//    cancels: the base arm at req_b and the candidate arm at req_b * s^d (s: the step, 1.25 at the start; d: the direction, +1 up
+//    or -1 down).  Runs of kAutoRun tokens alternate between the arms.  A test ends when both arms have kAutoMin tokens.  The
+//    candidate wins at >= 1.02 times the base's speed (tokens per second); then b moves to it.
+//  - The BRAKE gives each request its own budget req_b, which the arms scale.  It brakes on evidence against measured references
+//    (no fixed thresholds): band re-checks that flip against the control re-checks' noise floor, or a request's flip rate against
+//    the lifetime's.  Clean stretches grow it back.  set_brake_legacy(true) restores the old fixed-threshold rule.
+//  - With the mask learner on (DS4_MASK=learn), every other test is a MASK test: the same interleaved arms, both at req_b, the arms being
+//    the mask's levels for the base (p, g) and for a candidate one step deeper or shallower.  The model decides the step and what a win
+//    keeps (begin / end hooks); this header only schedules it and reports the verdict.  A mask test does not move b.
+// k (the close-call factor) learns from the flips of every 50 re-checks.
+//
+// State that outlives a process is kept in a text file (save / load): lines "budget", "k", "step", "clean", "tests", "lastwin",
+// "alltok", "allfl" (the brake's lifetime counts), "ctrl".
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <string>
+#include <utility>
+
+namespace strata::ds4 {
+
+class StandinTune {
+public:
+    // b0: the start of the base budget (also the ceiling's base while nothing is learned); k0: the start of k (k_pinned: k never
+    // learns or updates); brake_on: the per-request brake (off: every request runs at b).  Call once, before the first request.
+    void configure(float b0, float k0, bool k_pinned, bool brake_on) {
+        b0_ = clamp_b((double) b0);
+        b_ = b0_;
+        k_ = clamp_k((double) k0);
+        k_pinned_ = k_pinned;
+        brake_on_ = brake_on;
+        req_b_ = brake_on_ ? 0.5f * b_ : b_;
+    }
+
+    // A request starts: its budget is half the base budget (the class start of the Qwen engine) when the brake is on, else b.
+    // The finished request's tokens and flips join the lifetime counts (the brake's reference); when the lifetime passes 200000 tokens
+    // both halve, a slow decay.  The request's band counts reset.
+    void begin_request() {
+        all_tok_ += req_tok_all_;
+        all_fl_ += req_fl_all_;
+        req_tok_all_ = req_fl_all_ = 0;
+        if (all_tok_ > 200000) {
+            all_tok_ /= 2;
+            all_fl_ /= 2;
+        }
+        req_b_ = brake_on_ ? 0.5f * b_ : b_;
+        req_rc_ = req_fl_ = req_tok_ = req_wins_ = 0;
+        req_band_n_ = req_band_f_ = 0;
+    }
+
+    // The budget the next decode token runs at.  Chooses its arm (a scheduled run of the running test, or the base arm when no test
+    // can start); the brake's grow check runs every kBrakeWindows tokens of the request.
+    float budget_for_next_token() {
+        if (brake_on_ && ++req_wins_ % kBrakeWindows == 0) grow_check();
+        schedule();
+        return arm_budget();
+    }
+
+    // STRATA_MASK=learn: mask tests alternate with the budget tests.  begin() starts a mask test when it can (false: none testable now,
+    // the budget test runs instead); end() gets the verdict (won: keep the candidate's (p, g)).  Call once, after configure().
+    struct MaskEnd {
+        bool won = false, quality = true;          ///< the speed rule (candidate >= 1.02 x base) and the quality rule
+        double sb = 0.0, sc = 0.0;                 ///< base and candidate tokens per second
+        double pb = 0.0, pc = 0.0;                 ///< base and candidate flips per token
+        long long tok[2] = {0, 0}, rc[2] = {0, 0}; ///< tokens and re-checks per arm (0 base, 1 candidate)
+    };
+    void mask_learn(std::function<bool()> begin, std::function<void(const MaskEnd&)> end) {
+        mask_begin_ = std::move(begin);
+        mask_end_ = std::move(end);
+        mask_ok_ = true;
+    }
+
+    float k() const { return k_; }
+    float b() const { return b_; }           ///< the base budget (the search's b)
+    bool mask_testing() const { return mask_testing_; }   ///< the running test is a mask test
+    int arm() const { return arm_; }                      ///< the arm of the token being run (valid after budget_for_next_token)
+    float req_b() const { return req_b_; }   ///< this request's budget (the base arm's)
+    long long lifetime_tok() const { return all_tok_; }   ///< the brake's lifetime tokens (finished requests)
+    long long lifetime_fl() const { return all_fl_; }     ///< and its flips
+    // The legacy brake (STRATA_FRAGILE_BRAKE_LEGACY=1): the fixed Wilson thresholds of the first port. Default off.
+    void set_brake_legacy(bool on) { brake_legacy_ = on; }
+
+    // After a decode token.  secs: its wall time, a re-run included.  rechecked: stand-ins were taken and the gap test sent it to a
+    // re-run; gap / risk: its top-two logit gap and risk (used when rechecked); flipped: the re-run's top token differs.
+    void end_token(double secs, bool rechecked, float gap, float risk, bool flipped) {
+        const int a = arm_;
+        if (testing_) {   // an arm's time and tokens: the test's own tokens only
+            secs_[a] += secs;
+            ++tok_[a];
+            ++n_[a];
+        }
+        ++req_tok_;
+        ++req_tok_all_;
+        if (rechecked) {
+            ++req_rc_;
+            if (flipped) {
+                ++req_fl_;
+                ++req_fl_all_;
+            }
+            ++rc_[a];
+            if (flipped) ++fl_[a];
+            // the k ring: this re-check's ratio and flip, the last kKWindow re-checks
+            const float ratio = risk > 0.0f && std::isfinite(gap / risk) ? gap / risk : 0.0f;
+            ring_ratio_[ring_pos_] = ratio;
+            ring_flip_[ring_pos_] = flipped;
+            // the brake's boundary band: a re-check at ratio >= 0.5 k; its flips there mean flips leak past k
+            if (ratio >= 0.5f * k_) {
+                ++req_band_n_;
+                if (flipped) ++req_band_f_;
+            }
+            ring_pos_ = (ring_pos_ + 1) % kKRing;
+            if (ring_n_ < kKRing) ++ring_n_;
+            if (++rc_total_ % kKWindow == 0) k_update();
+            brake_check();
+        }
+        const long long need = mask_testing_ ? (long long) kMaskMin : (long long) kAutoMin;   // (a mask test: 4x, see kMaskMin)
+        if (testing_ && n_[0] >= need && n_[1] >= need) test_done();
+    }
+
+    // ---- the noise floor (9 Nov, the Qwen engine's control re-checks): a control re-check runs the exact pass a second time and
+    // compares the two exact top tokens.  A difference is noise (no stand-in is involved); their rate's Wilson upper bound is the floor the
+    // k evidence must clear.  Due on every 2nd re-check until kCtrlMin controls are kept, then every ctrl_every-th
+    // (STRATA_FRAGILE_CTRL_EVERY, default 32; 0 off).
+    void set_ctrl_every(long long n) { ctrl_every_ = n < 0 ? 0 : n; }
+    bool control_due() {
+        if (ctrl_every_ <= 0) return false;
+        const long long every = ctrl_cnt_ < kCtrlMin ? 2 : ctrl_every_;
+        return ++ctrl_tick_ % every == 0;
+    }
+    void note_control(bool differed) {
+        ctrl_ring_[ctrl_pos_] = differed;
+        ctrl_pos_ = (ctrl_pos_ + 1) % kCtrlRing;
+        if (ctrl_cnt_ < kCtrlRing) ++ctrl_cnt_;
+        ++ctrl_req_;
+    }
+    int ctrl_count() const { return ctrl_cnt_; }
+    double ctrl_hi() const {
+        long long f = 0;
+        for (int i = 0; i < ctrl_cnt_; ++i) f += ctrl_ring_[i] ? 1 : 0;
+        double lo = 0.0, hi = 1.0;
+        wilson90(f, ctrl_cnt_, lo, hi);
+        return hi;
+    }
+    long long take_ctrl_req() { const long long v = ctrl_req_; ctrl_req_ = 0; return v; }
+
+    // Writes the state to path (through a temp file, then renamed).  False when the file cannot be written.
+    bool save(const std::string& path) const {
+        const std::string tmp = path + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "w");
+        if (f == nullptr) return false;
+        bool ok = std::fprintf(f, "budget %.9g\n", (double) b_) > 0;
+        ok = ok && std::fprintf(f, "k %.9g\n", (double) k_) > 0;
+        ok = ok && std::fprintf(f, "step %.9g\n", (double) step_) > 0;
+        ok = ok && std::fprintf(f, "clean %.9g\n", b_clean_) > 0;
+        ok = ok && std::fprintf(f, "tests %lld\n", tests_) > 0;
+        ok = ok && std::fprintf(f, "lastwin %d\n", last_win_) > 0;
+        ok = ok && std::fprintf(f, "alltok %lld\n", all_tok_) > 0;
+        ok = ok && std::fprintf(f, "allfl %lld\n", all_fl_) > 0;
+        {   // the control ring, oldest first, as 0/1 characters
+            std::string bits;
+            for (int i = 0; i < ctrl_cnt_; ++i) bits += ctrl_ring_[(ctrl_pos_ - ctrl_cnt_ + i + kCtrlRing) % kCtrlRing] ? '1' : '0';
+            if (!bits.empty()) ok = ok && std::fprintf(f, "ctrl %s\n", bits.c_str()) > 0;
+        }
+        ok = std::fclose(f) == 0 && ok;
+        if (ok && std::rename(tmp.c_str(), path.c_str()) == 0) return true;
+        std::remove(tmp.c_str());
+        return false;
+    }
+
+    // Reads the state from path.  False when the file is missing or has no budget line.  b and clean, step, tests and lastwin are
+    // taken as saved; k is taken unless k is pinned.  Call before the first request.
+    bool load(const std::string& path) {
+        FILE* f = std::fopen(path.c_str(), "r");
+        if (f == nullptr) return false;
+        char line[kCtrlRing + 16];   // the saved 'ctrl ' line is up to kCtrlRing characters long (256 held the first 250 only)
+        double budget = -1.0, k = -1.0, step = -1.0, clean = -1.0, tests = -1.0, lastwin = 2.0, alltok = 0.0, allfl = 0.0;
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            char key[32] = "";
+            double v = 0.0;
+            if (std::strncmp(line, "ctrl ", 5) == 0) {   // the control ring (0/1 characters, oldest first)
+                ctrl_cnt_ = 0;
+                ctrl_pos_ = 0;
+                for (const char* q = line + 5; *q == '0' || *q == '1'; ++q) note_control(*q == '1');
+                ctrl_req_ = 0;
+                continue;
+            }
+            if (std::sscanf(line, "%31s %lf", key, &v) != 2) continue;
+            if (std::strcmp(key, "budget") == 0) budget = v;
+            else if (std::strcmp(key, "k") == 0) k = v;
+            else if (std::strcmp(key, "step") == 0) step = v;
+            else if (std::strcmp(key, "clean") == 0) clean = v;
+            else if (std::strcmp(key, "tests") == 0) tests = v;
+            else if (std::strcmp(key, "lastwin") == 0) lastwin = v;
+            else if (std::strcmp(key, "alltok") == 0) alltok = v;
+            else if (std::strcmp(key, "allfl") == 0) allfl = v;
+        }
+        std::fclose(f);
+        if (budget < 0.0) return false;
+        b_ = clamp_b(budget);
+        req_b_ = brake_on_ ? 0.5f * b_ : b_;
+        if (k > 0.0 && !k_pinned_) k_ = clamp_k(k);
+        if (step > 0.0) step_ = std::min(2.0f, std::max(1.1f, (float) step));
+        if (clean >= 0.0) b_clean_ = clean;
+        if (tests >= 0.0) tests_ = (long long) tests;
+        if (lastwin == -1.0 || lastwin == 0.0 || lastwin == 1.0) last_win_ = (int) lastwin;
+        all_tok_ = alltok > 0.0 ? (long long) alltok : 0;   // (a missing line is 0)
+        all_fl_ = allfl > 0.0 ? (long long) allfl : 0;
+        return true;
+    }
+
+    // One line: b, k, req_b, tests, wins, brakes.
+    std::string stats() const {
+        char buf[256];
+        const double all_rate = all_tok_ > 0 ? (double) all_fl_ / (double) all_tok_ : 0.0;
+        std::snprintf(buf, sizeof buf,
+                      "b %.3f k %.3f req_b %.3f tests %lld wins %lld brakes %lld; noise floor %.3f from %d control re-checks"
+                      "; lifetime flips/token %.4f over %lld tokens",
+                      (double) b_, (double) k_, (double) req_b_, tests_, wins_, brakes_, ctrl_hi(), ctrl_cnt_, all_rate, all_tok_);
+        return buf;
+    }
+
+private:
+    // (kAutoMin counts tokens here: our Qwen engine's 96 were decode windows of several tokens each.  At 96 tokens an arm never reaches
+    // kAutoTokMin or kCleanTok, so the quality gate and the clean ceiling would never act; 400 lets both act as they do there.)
+    // kMaskMin: a mask test's tokens per arm, 4x the budget test's - shorter tests walked the mask's depth back and forth on noise (Qwen, 6 Nov)
+    enum { kAutoRun = 8, kAutoMin = 400, kAutoTokMin = 200, kCleanTok = 400, kMaskMin = 1600 };
+    enum { kBrakeMin = 15, kBrakeWindows = 64, kBrakeTokMin = 100, kBrakeFlips = 3, kKWindow = 50 };
+    // the k evidence (9 Nov port): the ring keeps kKRing re-checks; a threshold needs kEvidenceMinN entries, a raise kKRaiseMinN; the
+    // lowering needs kKRingMin ring entries and kCtrlMin controls and stops at kKFloor
+    enum { kKRing = 200, kEvidenceMinN = 8, kKRaiseMinN = 30, kKRingMin = 50, kCtrlMin = 20, kCtrlRing = 256 };
+    static constexpr float kKFloor = 0.005f;
+    static constexpr double kZ = 1.6448536;   // the Wilson score's z for 90%
+
+    // ---- the search state ----
+    float b0_ = 0.1f;                  ///< the start of b: the ceiling's base while no clean level is learned
+    float b_ = 0.1f;                   ///< the base budget (the search's b)
+    float step_ = 1.25f;               ///< the candidate's step factor s (after a win in the same direction it grows to 2; after a loss it shrinks toward 1.1)
+    int last_win_ = 0;                 ///< the direction of the last win (0: none yet)
+    int first_ = 1;                    ///< the direction the next round tests first
+    int stage_ = 0;                    ///< 0: the round tests first_; 1: the other direction against the same base
+    double b_clean_ = 0.0;             ///< the learned ceiling: the largest candidate of a clean test (0: none yet)
+    long long tests_ = 0, wins_ = 0, brakes_ = 0;   ///< tests finished, candidates that won, brakes (process total)
+
+    // ---- the running test ----
+    bool testing_ = false;             ///< a test is running
+    float cand_b_ = 0.1f;              ///< its candidate's search budget (b * s^d, clamped)
+    int dir_ = 1;                      ///< its direction d
+    long long n_[2] = {0, 0};          ///< its scheduled tokens per arm (0 base, 1 candidate)
+    long long tok_[2] = {0, 0};        ///< its tokens per arm
+    double secs_[2] = {0.0, 0.0};      ///< its wall seconds per arm
+    long long rc_[2] = {0, 0};         ///< its re-checks per arm
+    long long fl_[2] = {0, 0};         ///< its flips per arm
+    long long runs_ = 0;               ///< its runs started
+    int run_left_ = 0;                 ///< tokens left in the current run
+    int run_arm_ = 0;                  ///< the current run's arm
+    int arm_ = 0;                      ///< the arm of the token being run (set by budget_for_next_token)
+    bool mask_testing_ = false;        ///< the running test is a mask test (both arms at req_b; the model's levels differ per arm)
+
+    // ---- the mask learner's hooks (mask_learn) ----
+    bool mask_ok_ = false;             ///< the mask learner is on: the tests alternate
+    bool mask_next_ = false;           ///< the next test is a mask test (set when a budget test ends)
+    std::function<bool()> mask_begin_;
+    std::function<void(const MaskEnd&)> mask_end_;
+
+    // ---- the brake (per request) ----
+    bool brake_on_ = true;
+    float req_b_ = 0.05f;              ///< this request's budget
+    long long req_rc_ = 0, req_fl_ = 0;   ///< this request's re-checks and flips since its last brake
+    long long req_tok_ = 0;            ///< this request's tokens since its last brake
+    long long req_wins_ = 0;           ///< this request's tokens (the grow check every kBrakeWindows)
+    long long req_tok_all_ = 0, req_fl_all_ = 0;   ///< this request's tokens and flips, never reset by a brake (joins the lifetime at begin_request)
+    long long req_band_n_ = 0, req_band_f_ = 0;    ///< this request's boundary band: re-checks at ratio >= 0.5 k, and their flips (reset by a brake)
+    long long all_tok_ = 0, all_fl_ = 0;           ///< the lifetime's tokens and flips (finished requests; saved as "alltok" / "allfl")
+    bool brake_legacy_ = false;        ///< the legacy fixed-threshold brake (set_brake_legacy)
+
+    // ---- k ----
+    float k_ = 4.0f;
+    bool k_pinned_ = false;
+    float ring_ratio_[kKRing] = {};    ///< the last kKRing re-checks: gap / risk
+    bool ring_flip_[kKRing] = {};      ///< and whether each flipped
+    int ring_pos_ = 0, ring_n_ = 0;
+    bool ctrl_ring_[kCtrlRing] = {};   ///< the last control re-checks: did the two exact passes differ
+    int ctrl_pos_ = 0, ctrl_cnt_ = 0;
+    long long ctrl_tick_ = 0, ctrl_every_ = 32, ctrl_req_ = 0;
+    long long rc_total_ = 0;           ///< re-checks in this process (the k update every kKWindow)
+
+    static double clamp_d(double v, double lo, double hi) { return std::min(hi, std::max(lo, v)); }
+    static float clamp_b(double b) { return (float) clamp_d(b, 0.02, 4.0); }
+    static float clamp_k(double k) { return (float) clamp_d(k, 0.005, 50.0); }
+
+    // Wilson score interval at 90% for f flips in n: the flip rate's lower and upper bounds (0 and 1 when n is 0).
+    static void wilson90(long long f, long long n, double& lo, double& hi) {
+        if (n <= 0) {
+            lo = 0.0;
+            hi = 1.0;
+            return;
+        }
+        const double z2 = kZ * kZ, nn = (double) n, p = (double) f / nn;
+        const double centre = p + z2 / (2.0 * nn);
+        const double half = kZ * std::sqrt(p * (1.0 - p) / nn + z2 / (4.0 * nn * nn));
+        const double den = 1.0 + z2 / nn;
+        lo = (centre - half) / den;
+        hi = (centre + half) / den;
+    }
+
+    // The budget of the arm of the token being run: the base arm runs at req_b, the candidate at req_b * s^d (clamped; 0 stays 0).
+    float arm_budget() const {
+        if (arm_ == 0 || req_b_ <= 0.0f || mask_testing_) return req_b_;   // (a mask test runs both arms at req_b)
+        return clamp_b((double) req_b_ * std::pow((double) step_, (double) dir_));
+    }
+
+    // Clears the arms' counts and times and starts the running test.
+    void reset_arms() {
+        n_[0] = n_[1] = tok_[0] = tok_[1] = rc_[0] = rc_[1] = fl_[0] = fl_[1] = 0;
+        secs_[0] = secs_[1] = 0.0;
+        runs_ = 0;
+        run_left_ = 0;
+        testing_ = true;
+    }
+
+    // Starts a budget test of direction d at the base b.
+    void begin_test(int d) {
+        dir_ = d;
+        cand_b_ = clamp_b((double) b_ * std::pow((double) step_, (double) d));
+        reset_arms();
+    }
+
+    // The next direction: a win moves b to the candidate and tests that direction first next round; a loss tests the other direction
+    // against the same base (stage 1); a second loss keeps b and tests the other direction first next round.
+    void next_stage(bool won, int d) {
+        if (won) {
+            b_ = cand_b_;
+            first_ = d;
+            stage_ = 0;
+        } else if (stage_ == 0) {
+            stage_ = 1;
+        } else {
+            first_ = -first_;
+            stage_ = 0;
+        }
+    }
+
+    // Chooses the arm of the next token.  When no test is running, a test starts in a direction that can be tested: a candidate that
+    // clamps to the base is not tested, nor is one above the ceiling (2 * b_clean, or 2 * b0 while none is learned).  Each call tries
+    // both directions at most once; when neither can be tested the token runs the base arm unscheduled.
+    void schedule() {
+        if (!testing_ && mask_next_) {   // STRATA_MASK=learn: after a budget test, the mask's depth is tested when it can be now
+            mask_next_ = false;
+            if (mask_begin_ && mask_begin_()) {
+                mask_testing_ = true;
+                reset_arms();
+            }
+        }
+        for (int tries = 0; !testing_ && tries < 2; ++tries) {
+            const int d = stage_ == 0 ? first_ : -first_;
+            const double cand = clamp_d((double) b_ * std::pow((double) step_, (double) d), 0.02, 4.0);
+            const double ceiling = b_clean_ > 0.0 ? 2.0 * b_clean_ : 2.0 * (double) b0_;
+            if (cand != (double) b_ && !(cand > (double) b_ && cand > ceiling))
+                begin_test(d);
+            else
+                next_stage(false, d);   // clamped to the base, or above the ceiling: a loss without a test
+        }
+        if (!testing_) {
+            arm_ = 0;
+            return;
+        }
+        if (run_left_ == 0) {   // runs of kAutoRun tokens; run r is arm (r % 2) ^ ((r / 2) % 2), so each pair of runs alternates which arm is first
+            run_arm_ = (int) ((runs_ % 2) ^ ((runs_ / 2) % 2));
+            ++runs_;
+            run_left_ = kAutoRun;
+        }
+        --run_left_;
+        arm_ = run_arm_;
+    }
+
+    // The band brake: the request's boundary band (re-checks at ratio >= 0.5 k) has >= kEvidenceMinN entries and the Wilson 90% lower
+    // bound of its flip rate is above the noise floor (ctrl_hi: the control re-checks' upper bound; 1 with no controls, so no brake
+    // without a measured floor).  Flips just below k mean flips are leaking past k.
+    bool band_brake() const {
+        if (req_band_n_ < kEvidenceMinN) return false;
+        double lo = 0.0, hi = 0.0;
+        wilson90(req_band_f_, req_band_n_, lo, hi);
+        return lo > ctrl_hi();
+    }
+
+    // The rate brake: the request has >= kBrakeTokMin tokens and >= kBrakeFlips flips, and the Wilson 90% lower bound of its flips per
+    // token is above the lifetime's flips-per-token upper bound (1 with no history: no brake without history).
+    bool rate_brake() const {
+        if (req_tok_ < kBrakeTokMin || req_fl_ < kBrakeFlips) return false;
+        double lo = 0.0, hi = 0.0, all_lo = 0.0, all_hi = 0.0;
+        wilson90(req_fl_, req_tok_, lo, hi);
+        wilson90(all_fl_, all_tok_, all_lo, all_hi);
+        return lo > all_hi;
+    }
+
+    // The new grow check (every kBrakeWindows tokens of the request; no minimum re-check count): it does not grow while the band brake
+    // holds, nor while the request's flips per token (point rate, with >= kBrakeFlips flips) are above the lifetime's upper bound.
+    // Otherwise the first check sets req_b = b at once, later checks grow it x 1.25 up to b, and from 0 they go to 0.25 b.
+    void grow_check() {
+        if (brake_legacy_) {
+            grow_check_legacy();
+            return;
+        }
+        if (band_brake()) return;
+        double all_lo = 0.0, all_hi = 0.0;
+        wilson90(all_fl_, all_tok_, all_lo, all_hi);
+        if (req_fl_ >= kBrakeFlips && req_tok_ > 0 && (double) req_fl_ / (double) req_tok_ > all_hi) return;
+        if (req_wins_ == kBrakeWindows) {
+            req_b_ = b_;
+            return;
+        }
+        req_b_ = req_b_ <= 0.0f ? 0.25f * b_ : std::min(b_, req_b_ * 1.25f);
+    }
+
+    // The new brake (after each re-check): the request brakes when the band brake or the rate brake holds.  The budget halves (below
+    // 0.01 it is 0) and the request's counts, band included, reset.  Nothing brakes without history or a measured noise floor.
+    void brake_check() {
+        if (brake_legacy_) {
+            brake_check_legacy();
+            return;
+        }
+        if (!brake_on_ || req_b_ <= 0.0f) return;
+        if (!band_brake() && !rate_brake()) return;
+        const float cut = req_b_ * 0.5f;
+        req_b_ = cut < 0.01f ? 0.0f : cut;
+        ++brakes_;
+        req_rc_ = req_fl_ = req_tok_ = 0;
+        req_band_n_ = req_band_f_ = 0;
+    }
+
+    // LEGACY (set_brake_legacy): the fixed-threshold grow check. A grow check every kBrakeWindows tokens of the request: with >= kBrakeMin re-checks and the Wilson 90% upper bounds of its flip
+    // rate per re-check (<= 0.2) and of its flips per token (<= 0.01) the budget grows: x 1.25, never above b; from 0 to 0.25 b.
+    // The first check of a request (token kBrakeWindows) sets req_b = b at once when the bounds hold.
+    void grow_check_legacy() {
+        if (req_rc_ < kBrakeMin) return;
+        double lo = 0.0, hi = 0.0, tok_lo = 0.0, tok_hi = 0.0;
+        wilson90(req_fl_, req_rc_, lo, hi);
+        wilson90(req_fl_, req_tok_, tok_lo, tok_hi);
+        if (hi > 0.2 || tok_hi > 0.01) return;
+        if (req_wins_ == kBrakeWindows) {
+            req_b_ = b_;
+            return;
+        }
+        req_b_ = req_b_ <= 0.0f ? 0.25f * b_ : std::min(b_, req_b_ * 1.25f);
+    }
+
+    // LEGACY (set_brake_legacy): after a re-check the request brakes when (>= kBrakeMin re-checks and the Wilson 90% lower bound of its
+    // flip rate per re-check is above 0.2) or (>= kBrakeFlips flips, >= kBrakeTokMin tokens and the lower bound of flips per token is
+    // above 0.01).  The budget halves (below 0.01 it is 0) and the request's counts reset.
+    void brake_check_legacy() {
+        if (!brake_on_ || req_b_ <= 0.0f) return;
+        double lo = 0.0, hi = 0.0, tok_lo = 0.0, tok_hi = 0.0;
+        wilson90(req_fl_, req_rc_, lo, hi);
+        wilson90(req_fl_, req_tok_, tok_lo, tok_hi);
+        const bool by_recheck = req_rc_ >= kBrakeMin && lo > 0.2;
+        const bool by_token = req_tok_ >= kBrakeTokMin && req_fl_ >= kBrakeFlips && tok_lo > 0.01;
+        if (!by_recheck && !by_token) return;
+        const float cut = req_b_ * 0.5f;
+        req_b_ = cut < 0.01f ? 0.0f : cut;
+        ++brakes_;
+        req_rc_ = req_fl_ = req_tok_ = 0;
+    }
+
+    // Every kKWindow re-checks (9 Nov: the Qwen engine's rule, which replaced "1.25 x the largest flipped ratio"): r* is the LARGEST
+    // flipped ratio t whose entries with ratio >= t (n_t >= kEvidenceMinN) flip with a Wilson 90% lower bound above the noise floor (the
+    // control re-checks' upper bound).  With r*: target 1.25 r*, but a raise needs n_t >= kKRaiseMinN (one flip in a few re-checks once
+    // pushed Qwen's k from 0.02 to 0.107).  Without: k is halved only when the ring has kKRingMin entries and the floor kCtrlMin controls
+    // (no measured noise is no evidence), never below kKFloor; else kept.  Each update moves k at most 0.5x-1.5x.
+    void k_update() {
+        if (k_pinned_) return;
+        const double floor_hi = ctrl_hi();
+        bool found = false;
+        double r_star = 0.0;
+        long long n_star = 0;
+        for (int i = 0; i < ring_n_; ++i) {
+            if (!ring_flip_[i]) continue;
+            const double t = (double) ring_ratio_[i];
+            if (!(t == t)) continue;
+            long long nt = 0, ft = 0;
+            for (int j = 0; j < ring_n_; ++j)
+                if ((double) ring_ratio_[j] >= t) {
+                    ++nt;
+                    if (ring_flip_[j]) ++ft;
+                }
+            if (nt < kEvidenceMinN) continue;
+            double lo = 0.0, hi = 0.0;
+            wilson90(ft, nt, lo, hi);
+            if (lo > floor_hi && (!found || t > r_star)) {
+                found = true;
+                r_star = t;
+                n_star = nt;
+            }
+        }
+        const float old = k_;
+        float target = old;
+        if (found) {
+            target = (float) clamp_d(1.25 * r_star, 0.005, 50.0);
+            if (target > old && n_star < kKRaiseMinN) target = old;
+        } else if (ring_n_ >= kKRingMin && ctrl_cnt_ >= kCtrlMin) {
+            target = old > kKFloor ? std::max(kKFloor, 0.5f * old) : old;
+        }
+        k_ = clamp_k((double) std::min(1.5f * old, std::max(0.5f * old, target)));
+    }
+
+    // The test's end (both arms have kAutoMin tokens): the candidate wins at >= 1.02 times the base's speed, unless its quality is lost.
+    // Quality (Wilson 90% on flips per token, once both arms have kAutoTokMin tokens): lost when the candidate's lower bound is above
+    // the base's upper bound, or its rate is above 1.5 times the base's with >= kBrakeFlips flips.  A candidate with <= 0.5 flips per
+    // 100 tokens over >= kCleanTok tokens raises the learned ceiling b_clean.  The step: a win in the same direction as the last win
+    // grows it (x 1.25, to 2); a loss shrinks it toward 1.1 (square root, at least 1.1).
+    void test_done() {
+        const int d = dir_;
+        const double sb = secs_[0] > 0.0 ? (double) tok_[0] / secs_[0] : 0.0;
+        const double sc = secs_[1] > 0.0 ? (double) tok_[1] / secs_[1] : 0.0;
+        const double pb = tok_[0] > 0 ? (double) fl_[0] / (double) tok_[0] : 0.0;
+        const double pc = tok_[1] > 0 ? (double) fl_[1] / (double) tok_[1] : 0.0;
+        double base_lo = 0.0, base_hi = 0.0, cand_lo = 0.0, cand_hi = 0.0;
+        wilson90(fl_[0], tok_[0], base_lo, base_hi);
+        wilson90(fl_[1], tok_[1], cand_lo, cand_hi);
+        const bool enough = tok_[0] >= kAutoTokMin && tok_[1] >= kAutoTokMin;
+        const bool quality = !(enough && (cand_lo > base_hi || (pc > 1.5 * pb && fl_[1] >= kBrakeFlips)));
+        const bool won = sc >= sb * 1.02 && quality;
+        if (mask_testing_) {   // a mask test decides the mask's (p, g); the budget's state does not move
+            MaskEnd r;
+            r.won = won;
+            r.quality = quality;
+            r.sb = sb;
+            r.sc = sc;
+            r.pb = pb;
+            r.pc = pc;
+            for (int a = 0; a < 2; ++a) {
+                r.tok[a] = tok_[a];
+                r.rc[a] = rc_[a];
+            }
+            mask_testing_ = false;
+            testing_ = false;
+            mask_next_ = false;   // a budget test next
+            if (mask_end_) mask_end_(r);
+            return;
+        }
+        if (tok_[1] >= kCleanTok && 100.0 * (double) fl_[1] <= 0.5 * (double) tok_[1] && (double) cand_b_ > b_clean_)
+            b_clean_ = (double) cand_b_;
+        if (won) {
+            if (d == last_win_) step_ = std::min(step_ * 1.25f, 2.0f);
+            last_win_ = d;
+            ++wins_;
+        } else {
+            step_ = std::max((float) std::sqrt((double) step_), 1.1f);
+        }
+        next_stage(won, d);
+        testing_ = false;
+        ++tests_;
+        mask_next_ = mask_ok_;   // with the mask learner on, the next test is a mask test
+    }
+};
+
+}  // namespace strata::ds4
