@@ -119,6 +119,12 @@ what it has, and keeps the rest resident but pageable with a warning ("only N of
 are the same, only the copies of the pageable part to the GPU go through the CPU. `STRATA_PIN_GUARD=0` turns this off,
 `STRATA_PIN_RESERVE_GIB=N` sets the RAM that must stay free (default: `STRATA_RESIDENT_HEADROOM_GIB`, 4 GiB).
 
+The RAM tier's segments (`STRATA_PIN_SEGS`, on by default) are page-locked in place, which needs no RAM of its own: the pages already hold the experts. Only what the kernel moves to make a
+segment lockable is needed, at most the segment (1 GiB), plus the kernel's own reserve (`vm.min_free_kbytes`). Since 21 Nov that is the reserve those segments are held to (it was the headroom rule's 2 GiB or more):
+on a 31 GB host with the tier sized to leave a few GiB, a start whose available RAM landed just under 2 GiB left the whole tier pageable - the PCIe lane unused, about 100 CPU-served experts per token
+instead of about 35 - while its neighbour pinned all 16.6 GiB; with the computed reserve (1.06 GiB there) four starts in four pinned the whole tier. The memory guard, the floor and the give-back are unchanged.
+`STRATA_PIN_RESERVE_AUTO=0` returns to the headroom rule's reserve; an explicit `STRATA_PIN_RESERVE_GIB` always wins.
+
 **The Windows display driver resets, then the PC blue-screens (0x141, then 0x116 in `nvlddmkm`) during an answer (#961).**
 This is the NVIDIA driver, not Strata: the report shows the same wedge with other CUDA programs on that driver (610.88,
 RTX 4080 SUPER). Try another driver (a Studio one, or an older one) and a lower power limit; if it only happens with

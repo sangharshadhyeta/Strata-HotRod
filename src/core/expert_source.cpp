@@ -4476,7 +4476,26 @@ bool FileExpertSource::pin_cache_complement(
     if (strata::kernels::route_ram_floor_on()) strata::kernels::route_cheap_alloc((size_t) n_layers_ * (size_t) n_expert_);
     refresh_cheap();
     // STRATA_PIN_SEGS: only the pageable RAM tier (no pinned, registered or paced arena); the pages stay where they are
-    if (pin_segs_env && !pin && !pinned_ok && partial_pin == 0 && bytes > 0) pin_segs_build(bytes, pace_reserve);
+    if (pin_segs_env && !pin && !pinned_ok && partial_pin == 0 && bytes > 0) {
+        // STRATA_PIN_RESERVE_AUTO (on by default; =0 returns to the headroom rule's reserve; an explicit STRATA_PIN_RESERVE_GIB wins): the RAM that must be left to page-lock a segment is what registering ONE segment can need - the pages
+        // already hold their experts, so locking takes no RAM of its own, only what the kernel moves to make them lockable, at most the segment (1 GiB) - plus the kernel's own reserve
+        // (vm.min_free_kbytes, read from the system), not the headroom rule's 2 GiB.  Measured 21 Nov (31 GB host, tier sized to leave a few GiB): the pin is a knife-edge at 2 GiB - a start whose
+        // available RAM landed just under it left the whole tier pageable (the PCIe lane dead, CPU-served entries per token 100 against 35 pinned) while its neighbour pinned all 16.6 GiB.
+        uint64_t seg_reserve = pace_reserve;
+        static const bool pin_auto = [] { const char* v = std::getenv("STRATA_PIN_RESERVE_AUTO"); return v == nullptr || v[0] == '\0' || std::atoi(v) != 0; }();
+        if (pin_auto && std::getenv("STRATA_PIN_RESERVE_GIB") == nullptr) {
+            uint64_t min_free = 0;
+            {
+                std::ifstream mf("/proc/sys/vm/min_free_kbytes");
+                unsigned long long kb = 0;
+                if (mf >> kb) min_free = (uint64_t) kb * 1024ull;
+            }
+            seg_reserve = std::min<uint64_t>(pace_reserve, (1ull << 30) + min_free);
+            std::fprintf(stderr, "FileExpertSource: STRATA_PIN_RESERVE_AUTO: the pin's reserve is one segment (1 GiB) plus the kernel's min_free (%.2f GiB) = %.2f GiB, not the headroom rule's %.2f GiB\n",
+                         (double) min_free / 1073741824.0, (double) seg_reserve / 1073741824.0, (double) pace_reserve / 1073741824.0);
+        }
+        pin_segs_build(bytes, seg_reserve);
+    }
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
