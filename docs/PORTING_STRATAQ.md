@@ -42,7 +42,16 @@ Qwen UD-Q4_K_XL, 12 GB card, `--max-context 200000`, K/V streaming on (32,768 ce
 So two batch slots cost two more full-size context windows besides the main session (3 in all), in VRAM and in RAM, taken from the experts, as he
 described. What the logs do not show: the main session's VRAM size, and whether it sits idle while the slots decode. Next: read that, then size slot
 sessions by use (the elastic K/V that the single session already has; `--kv-grow` is switched off with `--batch`) and reuse the main session as slot 0.
-Decode speed with `--batch 2` was not measured here (no requests were sent).
+Decode speed, same day and flags, same questions, 200K, greedy, MTP on (server's own tok/s for the single requests; the pair is wall time):
+
+| | tok/s |
+|---|---|
+| no `--batch`, four questions | 19.1, 25.1, 26.4, 18.7 |
+| `--batch 2`, one request at a time | 10.5, 14.9, 15.8, 8.6 (about 40% slower) |
+| `--batch 2`, two long answers at once | 10 each, 20 in all (900 tokens each in 90 s) |
+
+On this 12 GB card two concurrent answers (20 tok/s in all) are slower than one answer without `--batch` (25 tok/s), and a single request loses about 40%:
+the 40% smaller expert cache costs more than batching gains. One run per leg, so the size is approximate; the direction is large.
 
 ## What we take, and what we keep
 
