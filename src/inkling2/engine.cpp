@@ -183,6 +183,8 @@ struct Engine::Impl {
     }
 
     void init() {
+        // the host waits for the router's picks 48 times a token: spin, do not sleep (before the context exists; an error from an existing one is ignored)
+        if (!std::getenv("STRATA_INKLING2_BLOCKING_SYNC")) { (void) cudaSetDeviceFlags(cudaDeviceScheduleSpin); (void) cudaGetLastError(); }
         CK(cudaStreamCreate(&st));   // an explicit stream: the legacy wrappers (rms norm, conv, elementwise) device-sync after every launch on nullptr (~370 syncs a token)
         const int64_t E = c.n_embd, H = c.n_head, KV = c.n_head_kv, D = c.head_dim, R = c.rel_states, taps = c.conv_taps, FF = c.n_ff_exp, NE = c.n_expert;
         lw.assign((size_t) c.n_stored, LW{});
