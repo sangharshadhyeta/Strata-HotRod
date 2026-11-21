@@ -2748,6 +2748,8 @@ struct PrefillStandin {
     int64_t picks = 0, reads_saved = 0;   // the run's totals: picks replaced; distinct (layer, expert) reads avoided
     int32_t* res = nullptr;               // device: the residency rows, one layer's row uploaded before its stand-ins
     int32_t* pre = nullptr;               // device: the router's own top-10 of the chunk (before the stand-ins)
+    int32_t* needed = nullptr;            // device: STRATA_PREFILL_STANDIN_AGREE's scratch, n_expert int32
+    bool agree = false;                   // STRATA_PREFILL_STANDIN_AGREE=1: an expert is read or replaced for every token alike (standin_agree)
     std::vector<int32_t> pre_h;           // host: `pre` after the layer's sync (the router's picks, the counts' "wanted")
     std::vector<char> before, after;      // host: distinct experts of one layer, the router's picks and the dispatched ones
 
@@ -2789,6 +2791,12 @@ struct PrefillStandin {
             return;
         }
         n_expert = ne;
+        // ON by default since 21 Nov (STRATA_PREFILL_STANDIN_AGREE=0 turns it off): an expert is read or replaced for every token alike.  Measured on Qwen UD-Q4_K_XL, 13.5K-token documents with
+        // four questions each: picks replaced ~1,555,000 -> ~1,700 per prompt with the expert reads saved unchanged (733-796 -> 795-852), prompt time the same, every number in the answers
+        // correct in all three variants (exact prefill, the old stand-ins, agree).  Not run yet with short prompts, --batch or Edge0.
+        const char* ag = std::getenv("STRATA_PREFILL_STANDIN_AGREE");
+        if ((ag == nullptr || std::atoi(ag) != 0) && cudaMalloc((void**) &needed, (size_t) ne * sizeof(int32_t)) == cudaSuccess) agree = true;
+        else (void) cudaGetLastError();
         pre_h.resize((size_t) T * K);
         before.resize((size_t) ne);
         after.resize((size_t) ne);
@@ -2797,6 +2805,7 @@ struct PrefillStandin {
     ~PrefillStandin() {
         if (res != nullptr) cudaFree(res);
         if (pre != nullptr) cudaFree(pre);
+        if (needed != nullptr) cudaFree(needed);
     }
     PrefillStandin(const PrefillStandin&) = delete;
     PrefillStandin& operator=(const PrefillStandin&) = delete;
@@ -2821,8 +2830,8 @@ struct PrefillStandin {
     }
     void report() const {
         if (on)
-            std::fprintf(stderr, "strata prefill: stand-ins: %lld picks replaced, %lld expert reads saved (STRATA_PREFILL_STANDIN)\n",
-                         (long long) picks, (long long) reads_saved);
+            std::fprintf(stderr, "strata prefill: stand-ins: %lld picks replaced, %lld expert reads saved (STRATA_PREFILL_STANDIN%s)\n",
+                         (long long) picks, (long long) reads_saved, agree ? ", agree" : "");
     }
 };
 }  // namespace
@@ -4115,6 +4124,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         (size_t) g.n_expert * sizeof(int32_t), cudaMemcpyHostToDevice, cs);
                         standin_route(m.logits, m.ids, m.w, T, g.n_expert, sa.res + (size_t) l * (size_t) g.n_expert, sa.lo, sa.hi,
                                       sa.margin, sa.edge, sa.pre, cs, sa.budget, sa.budget_tail);
+                        if (sa.agree)
+                            standin_agree(m.logits, m.ids, m.w, T, g.n_expert, sa.res + (size_t) l * (size_t) g.n_expert, sa.pre, sa.needed, cs);
                         sa_now = true;
                     }
                     // the shared expert and its scalar gate

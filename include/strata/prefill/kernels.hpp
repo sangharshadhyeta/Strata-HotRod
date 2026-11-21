@@ -86,6 +86,9 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
 /// (STRATA_ROUTE_BUDGET_TAIL): ranks at or above lo are replaced only when w * max(gap, 0) <= budget_tail, instead of the margin.
 void standin_route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, const int32_t* res, int lo,
                    int hi, float margin, float edge, int32_t* pre, void* stream, float budget = 0.f, float budget_tail = 0.f);
+/// STRATA_PREFILL_STANDIN_AGREE: after standin_route, the router's own pick goes back wherever it was replaced away from a non-resident expert some token still dispatches (that expert is read
+/// anyway: the replacement saved nothing), and the token's weights are the softmax of its chosen logits again.  `needed` is n_expert int32 of scratch.
+void standin_agree(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, const int32_t* res, const int32_t* pre, int32_t* needed, void* stream);
 /// Expert blob (Strata pack layout, Q2_0) -> BF16 matrices: gate/up interleaved [1280, 2560], down [2560, 640].
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)

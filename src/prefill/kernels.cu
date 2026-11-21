@@ -1951,6 +1951,36 @@ __global__ void standin_route_k(const float* __restrict__ logits, int32_t* __res
         for (int r = 0; r < 10; ++r) id[r] = my[r];
     }
 }
+// STRATA_PREFILL_STANDIN_AGREE: an expert is read OR replaced, for every token alike.  A read is saved only when every pick of a non-resident expert in the chunk is replaced; where
+// one token keeps the expert (an exact pick) the expert is read anyway, and replacing its other picks saves nothing and only loses accuracy.  Pass 1 marks the non-resident experts the
+// stand-in pass left in the picks (they will be read); pass 2 puts the router's own pick back wherever it was replaced away from a marked expert, and gives a token whose ten changed its
+// weights again as the softmax of the chosen logits (as standin_route_k does for a swapped token).
+__global__ void standin_agree_mark_k(const int32_t* __restrict__ ids, const int32_t* __restrict__ res, int64_t n, int32_t* __restrict__ needed) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int e = ids[i];
+    if (res[e] < 0) needed[e] = 1;
+}
+__global__ void standin_agree_restore_k(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                        const int32_t* __restrict__ pre, const int32_t* __restrict__ res, const int32_t* __restrict__ needed,
+                                        int n_expert, int64_t T) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    bool changed = false;
+    int my[10];
+    for (int r = 0; r < 10; ++r) {
+        my[r] = ids[t * 10 + r];
+        const int p = pre[t * 10 + r];
+        if (my[r] != p && res[p] < 0 && needed[p]) { my[r] = p; changed = true; }
+    }
+    if (!changed) return;
+    const float* l = logits + (size_t) t * n_expert;
+    float m = -INFINITY;
+    for (int r = 0; r < 10; ++r) m = fmaxf(m, l[my[r]]);
+    float ex[10], sum = 0.0f;
+    for (int r = 0; r < 10; ++r) { ex[r] = expf(l[my[r]] - m); sum += ex[r]; }
+    for (int r = 0; r < 10; ++r) { ids[t * 10 + r] = my[r]; weights[t * 10 + r] = ex[r] / sum; }
+}
 // Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales [2560][10] f16
 template <bool HALF>
 __global__ void blob_dequant_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict__ gu16,
@@ -2635,6 +2665,12 @@ void standin_route(const float* logits, int32_t* ids, float* weights, int64_t T,
     standin_route_k<<<(unsigned) T, 32, 0, (cudaStream_t) stream>>>(logits, ids, weights, res, (int) n_expert, lo, hi, margin,
                                                                    edge, pre, budget, budget_tail);
     check("standin_route");
+}
+void standin_agree(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, const int32_t* res, const int32_t* pre, int32_t* needed, void* stream) {
+    cudaMemsetAsync(needed, 0, (size_t) n_expert * sizeof(int32_t), (cudaStream_t) stream);
+    standin_agree_mark_k<<<blocks_for(T * 10), 256, 0, (cudaStream_t) stream>>>(ids, res, T * 10, needed);
+    standin_agree_restore_k<<<(unsigned) ((T + 127) / 128), 128, 0, (cudaStream_t) stream>>>(logits, ids, weights, pre, res, needed, (int) n_expert, T);
+    check("standin_agree");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     blob_dequant_kernel<false><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);
