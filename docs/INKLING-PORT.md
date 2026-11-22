@@ -379,3 +379,14 @@ projections already used int8 activations in the first GPU engine). Qwen check (
   Plan: two stores (NVFP4 layers, Q8_0 layers: `ExpertStore` slots are uniform), `LayerGeo` for the fused gate_up (gate and up are two offsets of one tensor, stride = the expert plane) and the down tensor, sized VRAM slots, then the
   look-ahead and the loop feature on top.
 Qwen check after this change (3 prompts): 16.7 / 20.6 / 21.5 tok/s (mean 19.6), 13.6K read 334.7 tok/s: unchanged (clean main 19.3 / 338.1; run-to-run spread 333-343).
+
+## Served by HotRod's own server (22 Nov)
+
+`serve/inkling.py` (new): `InklingParser` rewrites Inkling's typed segments (`<|message_model|><|content_thinking|>` / `<|content_text|>` / `<|content_invoke_tool_json|>` ... `<|end_message|>`,
+turn end `<|content_model_end_sampling|>`) into what `OutputParser` reads (`</think>`, the `<tool_call><function=..><parameter=..>` form), so streaming, tool-call events, stop strings
+and usage stay the server's own; `ChatTemplate` detects Inkling's template and converts messages (tool-call arguments as objects, developer -> system) and the thinking kwargs
+(enable_thinking=False -> effort "none"); `end_token_ids` also stops on `<|content_model_end_sampling|>`. The segment grammar and the rewrite-before-the-parser idea are Project Maya's
+(`serve/frontend.py` `InklingRewriter`, MIT, credited in the module and third_party/project-maya/NOTICE.md); the code is written for our parser (no THINK_AGAIN: a reasoning segment after
+the answer began reads as answer text). `serve/test_inkling.py`: reasoning / answer split at every chunk size down to one character, a plain answer, a tool call, messages and kwargs.
+Live on 8095 through `python -m serve.server --engine strata` with `inkling2_serve` as the engine: `content` "The capital of France is Paris.", `reasoning_content` the thinking, finish `stop`;
+200-token answers in 7.6-8.0 s including a ~30-token prompt read (~30 tok/s generation). Context 4096 (the KV is FP32 for every visit; the sliding-window ring is next).

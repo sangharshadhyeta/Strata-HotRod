@@ -24,6 +24,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+from serve.inkling import inkling_kwargs, inkling_messages, is_inkling_template
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -52,6 +53,7 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        self.inkling = is_inkling_template(self.source)   # Inkling 2: typed segments (serve/inkling.py)
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -62,6 +64,8 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+        if self.inkling:
+            messages, kwargs = inkling_messages(messages), inkling_kwargs(kwargs)
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 

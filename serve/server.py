@@ -62,6 +62,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+from serve.inkling import InklingParser  # noqa: E402
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
@@ -3457,7 +3458,7 @@ def end_token_ids(tokenizer) -> set[int]:
     of the first "|", ">", "end", "of", "text" or "im" it wrote, so "Nerazim" came out as "Neraz" (#4576, and a table's first
     "|" in #4137).  Those ids are left out, and the end token the tokenizer names (special_ids "eos") ends the reply instead."""
     ids: set[int] = set()
-    for marker in (IM_END, "<|endoftext|>"):
+    for marker in (IM_END, "<|endoftext|>", "<|content_model_end_sampling|>"):
         got = tokenizer.encode(marker, parse_special=True)
         if len(got) == 1:
             ids.add(int(got[0]))
@@ -4817,6 +4818,8 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        if getattr(self.template, "inkling", False):          # Inkling 2: its typed segments, rewritten ahead of the parser (serve/inkling.py)
+            parser = InklingParser(parser, thinking)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
