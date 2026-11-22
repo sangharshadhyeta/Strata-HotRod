@@ -6,6 +6,7 @@
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/inkling2_kernels.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/inkling2/drafter.hpp"
 #include "strata/kernels/moe_group.hpp"
 #include "strata/kernels/moe_slot_cache.hpp"
 
@@ -158,6 +159,41 @@ struct Engine::Impl {
     // look-ahead (STRATA_MOE_PREFETCH=N: copy the N experts the NEXT visit's router would pick from this visit's router input, while this visit computes; 0 = off)
     float *d_xb = nullptr, *d_rrb = nullptr, *d_moeb = nullptr, *d_wb = nullptr;   // a block's expert inputs, residuals, expert sums, route weights
     int32_t *d_idxb = nullptr, *h_idxb = nullptr;                                    // and its picks (device, pinned host)
+    // ---- speculative decoding (the DSpark drafter): taps, conv-state recording for the rollback of rejected tokens
+    std::unique_ptr<Drafter> drafter;
+    float* d_taps = nullptr;      // [4][kTapLd][E]: the stream at the start of visits 5 / 23 / 41 and the final normed hidden, a row per token of the last forward
+    static constexpr int kTapLd = 16;
+    int tap_vis[3] = {5, 23, 41};
+    float* d_anchor_h = nullptr;
+    bool rec_on = false;
+    int rec_n = 0;
+    std::vector<float*> snap_ks, snap_vs, snap_ps, snap_fs, hist_k, hist_v, hist_p, hist_m;   // per visit: the conv states before the block and the inputs the block gave them
+    void ensure_rec() {
+        if (!snap_ks.empty()) return;
+        const int64_t E = c.n_embd, KVD = c.n_head_kv * c.head_dim, hs = c.conv_taps - 1;
+        for (int64_t v = 0; v < c.n_visits; ++v) {
+            snap_ks.push_back(fmalloc(KVD * hs)); snap_vs.push_back(fmalloc(KVD * hs)); snap_ps.push_back(fmalloc(E * hs)); snap_fs.push_back(fmalloc(E * hs));
+            hist_k.push_back(fmalloc(kB * KVD)); hist_v.push_back(fmalloc(kB * KVD)); hist_p.push_back(fmalloc(kB * E)); hist_m.push_back(fmalloc(kB * E));
+        }
+    }
+    void spec_init() {
+        const char* dp = std::getenv("STRATA_INKLING2_DRAFT");
+        if (!dp || !*dp) return;
+        try {
+            const int64_t E = c.n_embd;
+            drafter.reset(new Drafter(dp, (int) E, cap, st));
+            d_taps = fmalloc((size_t) 4 * kTapLd * E);
+            d_anchor_h = fmalloc(E);
+            int nt = 0;
+            const int* tv = Drafter::tap_visits(nt);
+            for (int i = 0; i < nt && i < 3; ++i) tap_vis[i] = tv[i];
+            drafter->fold((const uint8_t*) d_out, (int) c.n_vocab, (int) c.n_vocab_real);
+            std::fprintf(stderr, "inkling2 engine: DSpark drafter loaded (%.2f GB of VRAM, taps at visits %d / %d / %d + the final hidden)\n", (double) drafter->bytes() / 1e9, tap_vis[0], tap_vis[1], tap_vis[2]);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "inkling2 engine: no drafter (%s)\n", e.what());
+            drafter.reset();
+        }
+    }
     bool grouped_experts = true;   // STRATA_INKLING2_GROUP=1: the block's experts read once per distinct expert (bit-identical; not faster on this card)
     const uint8_t **h_grp_gu = nullptr, **h_grp_dn = nullptr, **d_grp_gu = nullptr, **d_grp_dn = nullptr;
     int *h_grp_cnt = nullptr, *h_grp_slot = nullptr, *d_grp_cnt = nullptr, *d_grp_slot = nullptr;
@@ -337,6 +373,7 @@ struct Engine::Impl {
         d_xq8 = dmalloc((size_t) 8 * (E / 32) * 36); d_hq8 = dmalloc((size_t) 128 * (FF / 32) * 36);
         xq = dmalloc((size_t) (E / 32) * 36 * 2); hq = dmalloc((size_t) (FF / 32) * 36 * 2); aq = dmalloc((size_t) (H * D / 32) * 36 * 2);
         picks.assign((size_t) c.n_visits, {});
+        spec_init();
         init_cache();
     }
 
@@ -635,6 +672,12 @@ struct Engine::Impl {
         mmvq_fn(8, w.k, xs(1), (int) E, (int) (KV * D), bb.K, n);
         mmvq_fn(8, w.v, xs(2), (int) E, (int) (KV * D), bb.V, n);
         const size_t kvd = (size_t) KV * D;
+        if (rec_on) {   // the conv states before this block and the K / V inputs it gives them
+            const size_t hs = (size_t) (taps - 1);
+            cpy(snap_ks[(size_t) vis], ks[(size_t) vis], kvd * hs); cpy(snap_vs[(size_t) vis], vs[(size_t) vis], kvd * hs);
+            cpy(snap_ps[(size_t) vis], ps[(size_t) vis], (size_t) E * hs); cpy(snap_fs[(size_t) vis], fs[(size_t) vis], (size_t) E * hs);
+            cpy(hist_k[(size_t) vis], bb.K, (size_t) n * kvd); cpy(hist_v[(size_t) vis], bb.V, (size_t) n * kvd);
+        }
         if (!L.full) {
             for (int t = 0; t < n; ++t) {
                 K::gdn_conv_step(ks[(size_t) vis], bb.K + t * kvd, w.kconv, bb.KC + t * kvd, KV * D, taps, st);
@@ -653,6 +696,7 @@ struct Engine::Impl {
         ik::attention(bb.Q, bb.R, bb.GATE, bb.SINK, Kc[(size_t) vis], Vc[(size_t) vis], w.relbias, bb.ATT, bb.SCR, pos0, L.full ? 0 : (int) c.window, L.full ? (int) c.rel_extent : (int) c.window, cap,
                       (int) H, (int) KV, (int) D, (int) R, st, n);
         mmvq_fn(8, w.out, bb.ATT, (int) (H * D), (int) E, bb.PROJ, n);
+        if (rec_on) cpy(hist_p[(size_t) vis], bb.PROJ, (size_t) n * E);
         for (int t = 0; t < n; ++t) K::gdn_conv_step(ps[(size_t) vis], bb.PROJ + t * E, w.postconv, bb.A + t * E, E, taps, st);
         if (boundary) { c2d(bb.BLK + (size_t) nb * E, blkp, bb.H, E, E, n); cpy(d_rrb, bb.A, (size_t) n * E); }
         else ik::add(bb.H, bb.A, d_rrb, (int) (n * E), st);
@@ -669,6 +713,7 @@ struct Engine::Impl {
     void step_block_b(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* out) {
         const int64_t E = c.n_embd;
         ensure_batch();
+        if (rec_on) rec_n = n;
         const uint64_t rb = C::row_bytes(kQ8_0, E);
         for (int t = 0; t < n; ++t) ik::dequant_q8_0_row((const uint8_t*) d_embd + (uint64_t) tokens[t] * rb, bb.H + (size_t) t * E, (int) E, st);
         K::rms_norm_weighted(bb.H, d_embd_norm, n, E, c.rms_eps, st);
@@ -689,8 +734,10 @@ struct Engine::Impl {
                     msgs_on = true;
                 }
             }
+            if (drafter) for (int ti = 0; ti < 3; ++ti) if (vv == tap_vis[ti]) cpy(d_taps + (size_t) ti * kTapLd * E, bb.H, (size_t) n * E);
             nb = layer_b(l, vv, nb, msgs_on, pos0, n);
             experts_for_block(vv, l, n);
+            if (rec_on) cpy(hist_m[(size_t) vv], d_moeb, (size_t) n * E);
             const LW& w = lw[(size_t) l];
             for (int t = 0; t < n; ++t) K::gdn_conv_step(fs[(size_t) vv], d_moeb + (size_t) t * E, w.ffnpost, bb.MM + (size_t) t * E, E, c.conv_taps, st);
             ik::add(d_rrb, bb.MM, bb.H, (int) (n * E), st);
@@ -703,6 +750,7 @@ struct Engine::Impl {
         c2d(bb.BLK + (size_t) nb * E, blkp, bb.H, E, E, n);
         ik::attn_res(bb.BLK, nb + 1, d_out_res, 1, bb.HD, (int) E, st, n, blkp, E, E);
         K::rms_norm_weighted(bb.HD, d_out_norm, n, E, c.rms_eps, st);
+        if (drafter) cpy(d_taps + (size_t) 3 * kTapLd * E, bb.HD, (size_t) n * E);
         if (out) {
             mmvq_fn(8, d_out, bb.HD, (int) E, (int) c.n_vocab, bb.LOG, n);
             out->assign((size_t) n, std::vector<float>((size_t) c.n_vocab_real));
@@ -810,6 +858,7 @@ struct Engine::Impl {
                     msgs_on = true;
                 }
             }
+            if (drafter) for (int ti = 0; ti < 3; ++ti) if (vv == tap_vis[ti]) copy(d_taps + (size_t) ti * kTapLd * E, h, (size_t) E);
             nb = layer(l, vv, nb, msgs_on, sink, pos);
             const bool core_visit = vv >= core0 && vv < core0 + c.num_loops * clen;
             if (core_visit && l == c.core_end - 1) {   // a pass ends: its blocks after the first and its final stream become the next pass's bank
@@ -824,6 +873,7 @@ struct Engine::Impl {
         copy(blk + (size_t) nb * E, h, (size_t) E);
         ik::attn_res(blk, nb + 1, d_out_res, 1, hd, (int) E, st);
         rms_w(hd, d_out_norm);
+        if (drafter) copy(d_taps + (size_t) 3 * kTapLd * E, hd, (size_t) E);
         mmvq_f(8, d_out, hd, (int) E, (int) c.n_vocab, logits, xq);
         ik::softcap(logits, (int) c.n_vocab_real, c.final_softcap, st);
         if (out) { out->resize((size_t) c.n_vocab_real); CK(cudaMemcpy(out->data(), logits, (size_t) c.n_vocab_real * 4, cudaMemcpyDeviceToHost)); }
@@ -841,6 +891,41 @@ Engine::~Engine() = default;
 void Engine::step(int64_t token, int pos, std::vector<float>* logits, const SeamSink& sink) { p_->step(token, pos, logits, sink); }
 void Engine::step_block(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* logits) { p_->step_block(tokens, n, pos0, logits); }
 void Engine::reset() { p_->reset(); }
+bool Engine::spec_enabled() const { return p_->drafter != nullptr; }
+void Engine::spec_begin_block() { if (!p_->drafter) return; p_->ensure_batch(); p_->ensure_rec(); p_->rec_on = true; }
+void Engine::spec_end_block(int accepted) {
+    Impl& d = *p_;
+    if (!d.drafter) return;
+    d.rec_on = false;
+    const int64_t E = d.c.n_embd, KVD = d.c.n_head_kv * d.c.head_dim;
+    const int hs = (int) d.c.conv_taps - 1;
+    if (accepted >= d.rec_n && d.rec_n > 0) return;   // every token of the block stays: the states are right
+    for (int64_t v = 0; v < d.c.n_visits; ++v) {
+        ik::conv_restore(d.ks[(size_t) v], d.snap_ks[(size_t) v], d.hist_k[(size_t) v], (int) KVD, accepted, hs, d.st);
+        ik::conv_restore(d.vs[(size_t) v], d.snap_vs[(size_t) v], d.hist_v[(size_t) v], (int) KVD, accepted, hs, d.st);
+        ik::conv_restore(d.ps[(size_t) v], d.snap_ps[(size_t) v], d.hist_p[(size_t) v], (int) E, accepted, hs, d.st);
+        ik::conv_restore(d.fs[(size_t) v], d.snap_fs[(size_t) v], d.hist_m[(size_t) v], (int) E, accepted, hs, d.st);
+    }
+}
+void Engine::spec_commit(int pos0, int m) {
+    Impl& d = *p_;
+    if (!d.drafter || m <= 0) return;
+    d.drafter->write_context(d.d_taps, Impl::kTapLd, 0, m, pos0);
+    d.drafter->set_f_rnn(d.d_taps, Impl::kTapLd, m - 1);
+}
+int Engine::spec_propose(int64_t anchor, int P, int proposals, int* out, float* probs) {
+    Impl& d = *p_;
+    if (!d.drafter) return 0;
+    d.ensure_batch();
+    const int64_t E = d.c.n_embd;
+    ik::dequant_q8_0_row((const uint8_t*) d.d_embd + (uint64_t) anchor * C::row_bytes(kQ8_0, E), d.d_anchor_h, (int) E, d.st);
+    K::rms_norm_weighted(d.d_anchor_h, d.d_embd_norm, 1, E, d.c.rms_eps, d.st);
+    d.drafter->propose((int) anchor, d.d_anchor_h, P, proposals, [&](const float* hidden, int rows, float* logits) {
+        K::quantize_q8_1_rows(hidden, rows, E, d.bb.XQ, d.st);
+        K::iq_mmvq(8, d.d_out, d.bb.XQ, logits, (int) E, (int) d.c.n_vocab, rows, d.st);
+    }, out, probs);
+    return std::min(proposals, 7);
+}
 const std::vector<std::vector<int>>& Engine::last_picks() const { return p_->picks; }
 std::string Engine::profile() const {
     if (!p_->prof || p_->n_steps == 0) return {};

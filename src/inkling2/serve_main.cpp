@@ -5,7 +5,10 @@
 // A conversation that continues the last one reuses its positions (the per-visit conv state is recurrent and cannot rewind: any other prompt starts again from position 0).
 // The prompt is read one token at a time through the decode step (no batched prefill yet: docs/INKLING-PORT.md lists it); sampling is on the host from the step's logits
 // (greedy, or temperature / top-k / top-p / min-p with the repetition, frequency and presence penalties over the last n tokens).
+#include <cuda_runtime.h>
+#include "strata/core/online_tuner.hpp"
 #include "strata/inkling2/engine.hpp"
+#include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +28,8 @@
 #include <vector>
 
 namespace I = strata::inkling2;
+#define CK_SYNC() cudaDeviceSynchronize()
+static const int S_WIN = [] { const char* e = std::getenv("STRATA_INKLING2_SPEC"); const int v = e ? std::atoi(e) : 4; return std::min(8, std::max(2, v)); }();   // --spec: the window's tokens
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -192,7 +197,9 @@ int main(int argc, char** argv) {
                 std::vector<int64_t> tk(ids.begin() + (long) i, ids.begin() + (long) i + n);
                 const bool last = i + (size_t) n == ids.size();
                 std::vector<std::vector<float>> lg;
-                eng.step_block(tk.data(), n, (int) i, last ? &lg : nullptr);
+                if (n == 1) { std::vector<float> l1; eng.step(tk[0], (int) i, last ? &l1 : nullptr); if (last) lg.assign(1, l1); }
+                else eng.step_block(tk.data(), n, (int) i, last ? &lg : nullptr);
+                eng.spec_commit((int) i, n);
                 fed.insert(fed.end(), ids.begin() + (long) i, ids.begin() + (long) i + n);
                 if (last) logits = lg.back();
                 i += (size_t) n;
@@ -207,6 +214,89 @@ int main(int argc, char** argv) {
             const char* reason = "length";
             int n_out = 0;
             std::vector<int> recent(ids.end() - std::min<long>((long) ids.size(), sp.penalty_last_n), ids.end());
+            const bool spec_run = !cancelled && eng.spec_enabled() && sp.temperature <= 0.0f && sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f && std::getenv("STRATA_INKLING2_NO_SPEC") == nullptr;
+            if (spec_run) {
+                // The Qwen engine's rule, with its own code: `--spec S` windows of at most S tokens, the draft layer extends a window by another guess while its probability for the last one is >= spec_min_p
+                // (mtp_draft), spec::DraftPolicy learns the cost and the tokens committed per window size, and the core OnlineTuner moves spec_min_p over the same levels (0.3 .. 0.7).  Greedy: the
+                // longest agreeing prefix is kept and the target's own next token follows it.
+                static strata::spec::DraftPolicy policy(S_WIN);
+                static strata::core::OnlineTuner tuner = [] {
+                    strata::core::OnlineTuner t;
+                    const std::vector<double> lv = {0.3, 0.4, 0.5, 0.6, 0.7};
+                    t.add_knob("spec_min_p", lv, 2, true);
+                    return t;
+                }();
+                static long total_prop = 0, total_acc = 0, total_steps = 0, windows_by_t[9] = {0};
+                static double ms_draft = 0, ms_verify = 0, ms_commit = 0;
+                const auto argmax = [](const std::vector<float>& v) { return (int) (std::max_element(v.begin(), v.end()) - v.begin()); };
+                bool stopped = false, consistent = true;
+                const auto emit = [&](int t) {
+                    ++n_out;
+                    std::printf("T %d\n", t);
+                    std::fflush(stdout);
+                    if (std::find(eos.begin(), eos.end(), t) != eos.end()) { reason = "stop"; stopped = true; }
+                    else if (n_out >= limit) stopped = true;
+                    return !stopped;
+                };
+                int tok = argmax(logits);
+                emit(tok);
+                while (!stopped) {
+                    if (g_cancel) { reason = "cancel"; break; }
+                    const auto tr = Clock::now();
+                    const int P = (int) fed.size();
+                    const double min_p = tuner.value(0);
+                    int d[8];
+                    float pr[8];
+                    const int maxd = std::min({S_WIN - 1, 7, ctx - P - 2, std::max(1, limit - n_out)});
+                    if (maxd < 1) { // no room for a window: a plain step
+                        std::vector<float> l1;
+                        eng.step(tok, P, &l1);
+                        eng.spec_commit(P, 1);
+                        fed.push_back(tok);
+                        tok = argmax(l1);
+                        if (!emit(tok)) break;
+                        continue;
+                    }
+                    const auto t_a = Clock::now();
+                    eng.spec_propose(tok, P, maxd, d, pr);
+                    ms_draft += ms_since(t_a);
+                    int k = 1;                                     // the first guess always; each further one only while the last is sure enough (mtp_draft's rule)
+                    while (k < maxd && pr[k - 1] >= (float) min_p) ++k;
+                    const auto pk = policy.choose(k + 1, 0, 0);    // (no lookup source here: the policy keeps the MTP window and learns its cost)
+                    (void) pk;
+                    int blk[8];
+                    blk[0] = tok;
+                    for (int j = 0; j < k; ++j) blk[j + 1] = d[j];
+                    std::vector<std::vector<float>> lg;
+                    std::vector<int64_t> bt(blk, blk + k + 1);
+                    const auto t_b = Clock::now();
+                    eng.spec_begin_block();
+                    eng.step_block(bt.data(), k + 1, P, &lg);
+                    ms_verify += ms_since(t_b);
+                    int m = 0;
+                    while (m < k && argmax(lg[(size_t) m]) == d[m]) ++m;
+                    const auto t_c = Clock::now();
+                    eng.spec_end_block(m + 1);
+                    eng.spec_commit(P, m + 1);
+                    CK_SYNC();
+                    ms_commit += ms_since(t_c);
+                    fed.push_back(tok);
+                    for (int j = 0; j < m; ++j) fed.push_back(d[j]);
+                    const double round_ms = ms_since(tr);
+                    policy.observe(false, k + 1, m, 0, round_ms);
+                    tuner.window(round_ms, m + 1);
+                    total_prop += k; total_acc += m; ++total_steps; ++windows_by_t[k + 1];
+                    for (int j = 0; j < m && !stopped; ++j) emit(d[j]);
+                    if (stopped) { if (m > 0) consistent = false; break; }
+                    tok = argmax(lg[(size_t) m]);
+                    if (!emit(tok)) break;
+                }
+                if (!consistent) { fed.clear(); eng.reset(); }
+                std::fprintf(stderr, "inkling2 serve: per window: draft %.1f ms, verify %.1f ms, commit %.1f ms\n", ms_draft / std::max(1L, total_steps), ms_verify / std::max(1L, total_steps), ms_commit / std::max(1L, total_steps));
+                std::fprintf(stderr, "inkling2 serve: speculation (S=%d, min_p %.2f): %ld drafts proposed, %ld accepted over %ld windows; window cost ms by size:", S_WIN, tuner.value(0), total_prop, total_acc, total_steps);
+                for (int t = 2; t <= S_WIN; ++t) std::fprintf(stderr, " %d: %.0f", t, policy.cost_ms(t));
+                std::fprintf(stderr, "\n");
+            } else
             if (cancelled) reason = "cancel";
             else {
                 for (int i = 0; i < limit; ++i) {
@@ -219,6 +309,7 @@ int main(int argc, char** argv) {
                     recent.push_back(tok);
                     if (i + 1 == limit) break;
                     eng.step(tok, (int) fed.size(), &logits);
+                    eng.spec_commit((int) fed.size(), 1);
                     fed.push_back(tok);
                 }
             }

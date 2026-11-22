@@ -42,6 +42,14 @@ public:
     void step(int64_t token, int pos, std::vector<float>* logits, const SeamSink& sink = nullptr);
     /// n tokens at positions pos0 .. pos0 + n - 1, visit-major (each visit for all tokens before the next): the same numbers as n step() calls.  logits[t] per token when not null.
     void step_block(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* logits);
+    /// Speculative decoding (STRATA_INKLING2_DRAFT=<mtp.safetensors>): the DSpark drafter.  The forward keeps its taps; spec_commit(pos0, m) writes the drafter's context for the m tokens of the last forward
+    /// (positions pos0 ..) and sets f_rnn from the last; spec_propose drafts up to 7 tokens after `anchor` (at position P); spec_begin_block() before a verification block (step_block) records the conv
+    /// inputs, spec_end_block(accepted) afterwards puts the conv states as after only the first `accepted` tokens of that block.
+    bool spec_enabled() const;
+    void spec_commit(int pos0, int m);
+    int spec_propose(int64_t anchor, int P, int proposals, int* out, float* probs = nullptr);
+    void spec_begin_block();
+    void spec_end_block(int accepted);
     /// Forgets the conversation (conv states and positions); the KV is simply overwritten.
     void reset();
     /// The picks of the last step, per visit: [visit][k] expert ids (for tests and the learners).

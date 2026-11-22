@@ -551,15 +551,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(ds4_lalearn_test PRIVATE CUDA::cudart)
     # the Inkling 2 GPU engine (F2): the whole looped forward on the GPU from the engine's reused kernels (Q8_0 / NVFP4 matvecs, the short conv, RMSNorm) and
     # the new ones, experts read zero-copy from the registered GGUF; its own library, so the Qwen binary is unchanged.  The test runs it against the oracle.
-    add_library(inkling2_engine STATIC src/inkling2/engine.cpp)
+    add_library(inkling2_engine STATIC src/inkling2/engine.cpp src/inkling2/drafter.cu)
     target_include_directories(inkling2_engine PUBLIC include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(inkling2_engine PUBLIC inkling2_kernels strata_moe_group strata_kernels strata_artifact CUDA::cudart)
+    target_link_libraries(inkling2_engine PUBLIC inkling2_kernels strata_moe_group strata_kernels strata_artifact CUDA::cudart CUDA::cublas)
     add_executable(inkling2_gpu_forward_test src/inkling2/gpu_forward_test.cpp)
     target_link_libraries(inkling2_gpu_forward_test PRIVATE inkling2_engine)
     add_test(NAME inkling2_gpu_forward_test COMMAND inkling2_gpu_forward_test)
     # the engine behind serve/server.py's protocol (M4): `inkling2_serve --serve --model <gguf>`
     add_executable(inkling2_serve src/inkling2/serve_main.cpp)
-    target_link_libraries(inkling2_serve PRIVATE inkling2_engine)
+    target_link_libraries(inkling2_serve PRIVATE inkling2_engine strata_spec)
   endif()
   # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
   # the capacity rule, selected ids bitwise

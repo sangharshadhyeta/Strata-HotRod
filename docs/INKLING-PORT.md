@@ -478,3 +478,15 @@ so blocks of 8 and 4 are bit-identical to single steps (0 of 9,602,784 logits di
 or a faster card change that. (`STRATA_INKLING2_GROUP=1` enables the grouped kernels; default off.) Consequence for DSpark: on this card a draft block wins only where acceptance is high (code, edits: Maya's 3090 numbers 162 / 213 vs ~125 tok/s);
 on a card with 3-5x the integer throughput (the roomy-VRAM case this work is for) the same block costs ~2x a token, which is the regime Maya's window numbers come from. The drafter is still worth building, with an adaptive controller that drafts only
 while acceptance stays above break-even.
+
+## DSpark drafter built, exact, and measured (22 Nov)
+`include/strata/inkling2/drafter.hpp` + `src/inkling2/drafter.cu` (Maya's maya-ik2 design, our kernels): loads `mtp.safetensors` (0.81 GB of VRAM with the context caches and the folded Markov head), taps the stream at visits 5 / 23 / 41 + the final hidden,
+keeps the context caches (3 layers), proposes 7 tokens after the anchor (3 dense layers, Markov head, argmax of base + folded bias, each token's softmax probability from an online normaliser in the argmax kernel).
+Engine: taps captured in `step` / `step_block_b`; per-visit recording of the conv inputs and states for a block (`spec_begin_block`) so `spec_end_block(accepted)` restores the sliding conv states to the accepted prefix (`ik::conv_restore`); KV beyond the accepted
+prefix is simply overwritten later. Serve (`STRATA_INKLING2_DRAFT=<mtp.safetensors>`, greedy requests): the Qwen engine's own rule and code - `--spec S` windows (`STRATA_INKLING2_SPEC`, default 4), a window extended while the draft's probability for the
+last guess is >= spec_min_p, `strata::spec::DraftPolicy` observing (window size, accepted, round time) and the core `OnlineTuner` moving spec_min_p over 0.3 .. 0.7; sampled requests and penalties use the plain path.
+Exactness: greedy output with the drafter is token for token the plain output (160 + 160 tokens, same checksum).
+Measured on the 3060 (the drafter costs 899 cache slots instead of 1002): acceptance 28% a draft on a prose continuation (1.7 tokens a window, Maya: 1.8), 64% over prose + code + an edit task through the server (2.8 tokens a window).
+A window costs draft 6.0 ms + verify 84 ms (~3.5 tokens) + commit 0.6 ms against 32 ms for a plain token: through the server 300-token answers run prose 20.9 vs 27.1 tok/s, code 24.5 vs 25.2, edit 19.7 vs 20.3 (plain) - a loss on prose, break-even on code / edits.
+The verification block is the whole cost (the int8 block kernels are ALU-bound, ~18-24 ms a token); the draft and the commit are not. A faster-integer card (the roomy case) or tensor-core (int8 mma) block kernels is what turns it into a win;
+until then it stays opt-in and 8095 runs without it.

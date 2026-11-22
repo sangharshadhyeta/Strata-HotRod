@@ -204,6 +204,16 @@ __global__ void k_deq_q8_0(const unsigned char* row, float* out, int n) {
     out[i] = d * (float) reinterpret_cast<const signed char*>(b + 2)[i % 32];
 }
 
+// a short conv's history after the first j of T inputs: the last `hist` rows of [old (hist rows); x (T rows)]; state is [C][hist] (channel-major)
+__global__ void k_conv_restore(float* state, const float* old, const float* x, int C, int j, int hist) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    for (int i = 0; i < hist; ++i) {
+        const int k = j + i;
+        state[(size_t) c * hist + i] = k < hist ? old[(size_t) c * hist + k] : x[(size_t) (k - hist) * C + c];
+    }
+}
+
 inline int blocks(int n, int t = 256) { return (n + t - 1) / t; }
 
 }  // namespace
@@ -215,6 +225,9 @@ void qkv_prep(float* q, float* k, float* v, float* r, const float* qclip, const 
               bool full, float alpha, float log_floor, int pos0, void* stream) {
     if (D != kT) { std::fprintf(stderr, "ik::qkv_prep: head_dim %d (the kernel runs one thread a dimension: %d)\n", D, kT); std::exit(1); }
     k_qkv_prep<<<dim3(H + KV, T), kT, 0, (cudaStream_t) stream>>>(q, k, v, r, qclip, rclip, H, KV, D, R, qk_clip, rel_clip, eps, full ? 1 : 0, alpha, log_floor, pos0);
+}
+void conv_restore(float* state, const float* old, const float* x, int C, int j, int hist, void* stream) {
+    k_conv_restore<<<blocks(C), 256, 0, (cudaStream_t) stream>>>(state, old, x, C, j, hist);
 }
 void conv_dynamic(float* state, const float* x, const float* f, const float* dyn, float* out, int C, int taps, int heads, void* stream) {
     k_conv_dyn<<<blocks(C), 256, 0, (cudaStream_t) stream>>>(state, x, f, dyn, out, C, taps, heads);

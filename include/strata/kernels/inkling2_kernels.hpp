@@ -20,6 +20,8 @@ void qkv_prep(float* q, float* k, float* v, float* r, const float* qclip, const 
 
 /// A full layer's short conv with dynamic taps, one token: state [C][taps-1] (oldest first, slides), f [C][taps] (the folded static taps),
 /// dyn [heads][taps] (lag 0 = the current token).  out[c] = sum_j f[c][j] x[t - taps + 1 + j] + sum_lag dyn[head(c)][lag] x[t - lag].
+/// A short conv's state (channel-major [C][hist]) after only the first j of the T inputs x [T][C] a block gave it: the last `hist` rows of [old; x] (old = the state before the block).
+void conv_restore(float* state, const float* old, const float* x, int C, int j, int hist, void* stream);
 void conv_dynamic(float* state, const float* x, const float* f, const float* dyn, float* out, int C, int taps, int heads, void* stream);
 
 /// Append one token's k, v ([KV][D] each) at position `pos` of a cache [cap][KV][D].
