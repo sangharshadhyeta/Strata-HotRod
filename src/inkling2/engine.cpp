@@ -8,6 +8,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/inkling2/drafter.hpp"
 #include "strata/kernels/moe_group.hpp"
+#include "strata/kernels/q8_mma.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/moe_slot_cache.hpp"
 
@@ -32,6 +33,7 @@ namespace {
 namespace K = strata::kernels;
 namespace ik = strata::kernels::ik;
 namespace M = strata::kernels::moe;
+namespace M2 = strata::kernels::mma;
 namespace C = strata::inkling2::cpu;
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::fprintf(stderr, "inkling2 engine: %s: %s (%s:%d)\n", #x, cudaGetErrorString(e_), __FILE__, __LINE__); std::exit(1); } } while (0)
@@ -630,9 +632,15 @@ struct Engine::Impl {
         CK(cudaMemcpy2DAsync(dst, dpitch * 4, src, spitch * 4, width * 4, rows, cudaMemcpyDeviceToDevice, st));
     }
     void cpy(float* dst, const float* src, size_t n) { CK(cudaMemcpyAsync(dst, src, n * 4, cudaMemcpyDeviceToDevice, st)); }
+    bool use_mma = std::getenv("STRATA_INKLING2_MMA") != nullptr;   // the block's dense Q8_0 matmuls on the tensor cores (kernels::mma::q8_matmul, parity-tested); not bit-identical to single steps, and not faster on the 3060
+    void q8mv(const void* W, const void* xq, float* y, int n_in, int n_out, int cols) {
+        if (use_mma && cols >= 2 && M2::q8_matmul((const uint8_t*) W, xq, y, n_in, n_out, cols, st)) return;
+        K::iq_mmvq(8, W, xq, y, n_in, n_out, cols, st);
+    }
     void mmvq_fn(int type, const void* W, const float* xin, int n_in, int n_out, float* y, int cols) {
         K::quantize_q8_1_rows(xin, cols, n_in, bb.XQ, st);
-        K::iq_mmvq(type, W, bb.XQ, y, n_in, n_out, cols, st);
+        if (type == 8) q8mv(W, bb.XQ, y, n_in, n_out, cols);
+        else K::iq_mmvq(type, W, bb.XQ, y, n_in, n_out, cols, st);
     }
     void control_b(const LW& w, int module, float* xx, const float* msg, int n) {
         const int64_t E = c.n_embd;
@@ -668,9 +676,9 @@ struct Engine::Impl {
             K::rms_norm_weighted(xs(j), L.full ? nw[j] : w.attn_norm, n, E, c.rms_eps, st);
         }
         K::quantize_q8_1_rows(xs(0), n, E, bb.XQ, st);
-        K::iq_mmvq(8, w.q, bb.XQ, bb.Q, (int) E, (int) (H * D), n, st);
-        K::iq_mmvq(8, w.rel, bb.XQ, bb.R, (int) E, (int) (H * R), n, st);
-        K::iq_mmvq(8, w.gate, bb.XQ, bb.GATE, (int) E, (int) (H * D), n, st);
+        q8mv(w.q, bb.XQ, bb.Q, (int) E, (int) (H * D), n);
+        q8mv(w.rel, bb.XQ, bb.R, (int) E, (int) (H * R), n);
+        q8mv(w.gate, bb.XQ, bb.GATE, (int) E, (int) (H * D), n);
         ik::matmul_f32(w.sink, xs(0), bb.SINK, n, (int) E, (int) H, st);
         mmvq_fn(8, w.k, xs(1), (int) E, (int) (KV * D), bb.K, n);
         mmvq_fn(8, w.v, xs(2), (int) E, (int) (KV * D), bb.V, n);

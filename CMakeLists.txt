@@ -530,7 +530,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # Model-independent MoE kernels (docs/INKLING-PORT.md: "all these ports should help other models too"): the router with a score mode (sigmoid, or DeepSeek's
     # sqrt-softplus) and the grouped experts (run-time shapes, NVFP4 / Q8_0, the activation a parameter).  A library of its own: the Qwen, Edge0 and DeepSeek paths
     # link it behind their own switches; nothing links it into the `strata` binary yet.
-    add_library(strata_moe_group STATIC src/kernels/cuda/moe_group.cu)
+    add_library(strata_moe_group STATIC src/kernels/cuda/moe_group.cu src/kernels/cuda/q8_mma.cu)   # (+ the tensor-core Q8_0 matmul, kernels::mma)
     target_include_directories(strata_moe_group PUBLIC include)
     target_link_libraries(strata_moe_group PUBLIC CUDA::cudart)
     add_library(inkling2_kernels STATIC src/kernels/cuda/inkling2_kernels.cu)   # Inkling's own ops: attention with bias / sink / window, dynamic conv taps, loop gate
@@ -544,6 +544,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(moe_group_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(moe_group_parity PRIVATE strata_moe_group strata_artifact CUDA::cudart)
     add_test(NAME moe_group_parity COMMAND moe_group_parity)
+    add_executable(q8_mma_parity src/kernels/q8_mma_parity.cpp)
+    target_include_directories(q8_mma_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(q8_mma_parity PRIVATE strata_moe_group CUDA::cudart)
+    add_test(NAME q8_mma_parity COMMAND q8_mma_parity)
     # the DeepSeek branch's learned look-ahead (src/dsv41/ds4_lalearn.cu, from the branch byte for byte) on synthetic routers: a GPU, no model (F1)
     add_executable(ds4_lalearn_test tests/dsv41/lalearn_test.cu src/dsv41/ds4_lalearn.cu)
     target_include_directories(ds4_lalearn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41

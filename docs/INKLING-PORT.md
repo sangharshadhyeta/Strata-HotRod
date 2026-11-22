@@ -503,3 +503,13 @@ Speed through the server at temperature 1, 300-token answers: plain prose 27.8, 
 Switches of the drafter (all off or the pipeline's own defaults): `STRATA_INKLING2_DRAFT=<mtp.safetensors>` loads it (unset: no drafter, nothing changes); `STRATA_INKLING2_SPEC=S` the window (default 4); for sampled requests the Qwen pipeline's switches:
 `STRATA_SPEC_PROB=0` exact-match acceptance instead of probabilistic acceptance (default: probabilistic), `STRATA_SPEC_MIN_TEMP=x` drafts only for requests with temperature >= x (default 0 = every sampled request; greedy always drafts);
 `STRATA_INKLING2_NO_SPEC=1` disables speculation for a loaded drafter. Penalty requests always take the plain path.
+
+### The int8 tensor-core item (22 Nov): built, correct, no gain - and what that rules out
+`kernels::mma::q8_matmul` (include/strata/kernels/q8_mma.hpp, src/kernels/cuda/q8_mma.cu, in the strata_moe_group library): Q8_0 weights x up to 8 q8_1 activation rows on `mma.sync m16n8k32 s8`, a block of 8 tokens being exactly one N tile
+(a Q8_0 block = one k32 step; the int8 data sits 2 bytes into a 34-byte block, so the A fragments are two 16-bit loads). `q8_mma_parity` checks it against a CPU reference from the same quantized bytes for the engine's shapes (2304 x 3072 / 1024 / 384,
+3072 x 2304, the 201,024-row head) and 1 .. 8 columns: worst difference ~7e-5 on values ~200 (3e-7 relative). In the block path (`STRATA_INKLING2_MMA=1`, off by default) it gives 49.5 vs 48.3 tok/s at N=8: no speed-up, and the float summation order changes
+so blocks are no longer bit-identical to single steps (top-1 differs at 2 of 48 positions: router near-ties). An NVFP4 / Q8_0 expert version (m16n8k16 per 16-value sub-block, table-lookup A fragments, tokens as N, gate and up sharing the activation fragment)
+ran at 47.0 vs 47.7 tok/s with more drift (top-1 differs at 4 of 48); it was never parity-tested on its own and was removed rather than shipped.
+Measured since: the slot cache misses ~34-36 experts a token in blocks and in single steps alike (90-91% hit), so the extra cost of a block is not PCIe or the cache either. What is ruled out for the block's ~18 ms per extra token on this 3060: the dense Q8_0
+matmuls, the expert arithmetic (dp4a or tensor cores), expert weight re-reads, cache misses. What is not measured: the per-visit timeline of a block (kernel busy was 57% of the wall in the blocks-only nsys run: ~43% of the time the GPU ran nothing - launches, the
+per-visit host sync for the picks and the expert placement, 4n short conv launches, the attention-residual and control kernels that run one block a token). That timeline is the next thing to read before building anything else for DSpark.

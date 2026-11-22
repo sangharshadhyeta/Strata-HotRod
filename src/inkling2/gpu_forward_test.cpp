@@ -69,17 +69,19 @@ int main() {
         if (!only) for (int64_t t = 0; t < T; ++t) eng.step(toks[(size_t) t], (int) t, &single[(size_t) t]);
         else for (int rep = 0; rep < 2; ++rep) { eng.reset(); for (int64_t t0 = 0; t0 < T; t0 += N) { std::vector<std::vector<float>> lg0; eng.step_block(toks.data() + t0, (int) std::min<int64_t>(N, T - t0), (int) t0, &lg0); } }
         eng.reset();
-        double worst = 0; int64_t diff = 0;
+        double worst = 0; int64_t diff = 0, top1_diff = 0;
         const auto tb = std::chrono::steady_clock::now();
         for (int64_t t0 = 0; t0 < T; t0 += N) {
             const int n = (int) std::min<int64_t>(N, T - t0);
             std::vector<std::vector<float>> lg;
             eng.step_block(toks.data() + t0, n, (int) t0, &lg);
-            if (!only) for (int i = 0; i < n; ++i)
+            if (!only) for (int i = 0; i < n; ++i) {
+                top1_diff += std::max_element(lg[(size_t) i].begin(), lg[(size_t) i].end()) - lg[(size_t) i].begin() != std::max_element(single[(size_t) (t0 + i)].begin(), single[(size_t) (t0 + i)].end()) - single[(size_t) (t0 + i)].begin();
                 for (size_t v = 0; v < lg[(size_t) i].size(); ++v) { const double d = std::fabs((double) lg[(size_t) i][v] - (double) single[(size_t) (t0 + i)][v]); worst = std::max(worst, d); diff += d > 0; }
+            }
         }
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();
-        std::printf("BLOCK CHECK N=%d: max |logit difference| %.3g, %lld of %lld logits differ; %.2f tok/s in blocks\n", N, worst, (long long) diff, (long long) (T * c.n_vocab_real), (double) T / s);
+        std::printf("BLOCK CHECK N=%d: max |logit difference| %.3g, %lld of %lld logits differ, top-1 differs at %lld of %lld positions; %.2f tok/s in blocks\n", N, worst, (long long) diff, (long long) (T * c.n_vocab_real), (long long) top1_diff, (long long) T, (double) T / s);
         eng.reset();
     }
     const auto t1 = std::chrono::steady_clock::now();
