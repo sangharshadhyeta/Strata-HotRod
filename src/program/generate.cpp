@@ -10572,7 +10572,7 @@ int main(int argc, char** argv) {
                                      "lower is skipped (+10..20%% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); "
                                      "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
                              tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
-            // STRATA_TAIL_CPU=0 (opt-in; default 1: as before): the tail ranks - from the stand-ins' floor up - are never computed by the CPU nor read over
+            // STRATA_TAIL_CPU=0 (the default when the stand-ins exist and some experts are not resident; STRATA_TAIL_CPU=1 turns it off): the tail ranks - from the stand-ins' floor up - are never computed by the CPU nor read over
             // PCIe.  A tail pick that no resident stand-in replaced is skipped, as STRATA_ROUTE_TAIL_SKIP does (a missed expert that every token of the window
             // routes at or above the floor: neither copied nor computed, its weight dropped), with the rank taken from the floor instead of the fixed 7.
             // Needs the stand-ins (STRATA_ROUTE_RESIDENT): without them there is no floor and nothing changes.
@@ -10580,7 +10580,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: STRATA_RANK_CUTOFF=%d: ranks %d-9 are not computed at all (resident or not): an expert every token of a window routes at rank %d or "
                                      "lower is skipped and its weight dropped (answers differ; the setting trades quality for speed)\n",
                              strata::core::rank_cutoff(), strata::core::rank_cutoff(), strata::core::rank_cutoff());
-            if (const char* tc = std::getenv("STRATA_TAIL_CPU"); tc != nullptr && tc[0] == '0') {
+            const char* tc = std::getenv("STRATA_TAIL_CPU");
+            if (tc != nullptr ? tc[0] == '0' : !all_experts_resident) {
                 const int floor_rank = strata::kernels::route_cfg_floor();
                 if (floor_rank > 0 && floor_rank < 10) {
                     strata::core::set_tail_skip_rank(floor_rank);
@@ -10588,9 +10589,10 @@ int main(int argc, char** argv) {
                         strata::core::set_tail_read_skip(true);   // the read-ahead leaves the tail guesses unread
                         std::fprintf(stderr, "strata serve: STRATA_TAIL_READ=0: the read-ahead does not pull rank %d-9 guesses into RAM\n", floor_rank);
                     }
-                    std::fprintf(stderr, "strata serve: STRATA_TAIL_CPU=0: ranks %d-9 are never computed by the CPU or read over PCIe - a missed expert that every "
-                                         "token of a window routes at rank %d or lower is skipped (the stand-ins' floor; answers differ slightly)\n", floor_rank, floor_rank);
-                } else
+                    std::fprintf(stderr, "strata serve: STRATA_TAIL_CPU=0%s: ranks %d-9 are never computed by the CPU or read over PCIe - a missed expert that every "
+                                         "token of a window routes at rank %d or lower is skipped (the stand-ins' floor; answers differ slightly); STRATA_TAIL_CPU=1 turns it off\n",
+                                 tc == nullptr ? " (default)" : "", floor_rank, floor_rank);
+                } else if (tc != nullptr)
                     std::fprintf(stderr, "strata serve: STRATA_TAIL_CPU=0 has no effect: it needs the stand-ins (STRATA_ROUTE_RESIDENT), whose floor it takes\n");
             }
         }
