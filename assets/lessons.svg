@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520" width="900" role="img" aria-label="Five lessons from solid.cpp and what each became in Strata-HotRod">
+  <defs>
+    <linearGradient id="bgL" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0d1117"/><stop offset="1" stop-color="#11161d"/></linearGradient>
+    <linearGradient id="hot" x1="0" x2="1"><stop offset="0" stop-color="#ffb054"/><stop offset="1" stop-color="#ff7a30"/></linearGradient>
+    <marker id="hd" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#ff7a30"/></marker>
+    <style>
+      text{font-family:-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+      .hd{font-size:12px;font-weight:700;letter-spacing:1.4px}
+      .tt{font-size:15px;font-weight:700;fill:#f0f3f6}
+      .tx{font-size:13px;fill:#aab2bd}
+      .flow{stroke-dasharray:7 8;animation:fl 1s linear infinite}
+      @keyframes fl{to{stroke-dashoffset:-15}}
+      .row{opacity:0;animation:rin .7s ease forwards}
+      @keyframes rin{to{opacity:1}}
+    </style>
+  </defs>
+  <rect width="900" height="520" rx="16" fill="url(#bgL)" stroke="#262c36"/>
+  <text x="34" y="36" class="hd" fill="#5fb4ff">LEARNED IN SOLID.CPP</text>
+  <text x="476" y="36" class="hd" fill="#ff7a30">BUILT INTO STRATA-HOTROD</text>
+
+  <g class="row" style="animation-delay:.05s">
+    <rect x="24" y="52" width="340" height="82" rx="12" fill="#0e1822" stroke="#223a52"/>
+    <text x="42" y="82" class="tt">Stand-ins are the biggest lever</text>
+    <text x="42" y="104" class="tx">but they break the text if pushed too far</text>
+    <path class="flow" d="M372 93 H462" stroke="#ff7a30" stroke-width="2.5" fill="none" marker-end="url(#hd)"/>
+    <rect x="470" y="52" width="406" height="82" rx="12" fill="#1f1510" stroke="#5a3519"/>
+    <text x="488" y="80" class="tt" fill="#ffd9bd">Stand-ins decided by confidence</text>
+    <text x="488" y="101" class="tx">weight × gap ≤ budget · ranks 2–9: 42.2 tok/s,</text>
+    <text x="488" y="120" class="tx">9 of 9 answers read as sound (rank 0 broke them)</text>
+  </g>
+  <g class="row" style="animation-delay:.25s">
+    <rect x="24" y="148" width="340" height="82" rx="12" fill="#0e1822" stroke="#223a52"/>
+    <text x="42" y="178" class="tt">CPU-thread predictor lost</text>
+    <text x="42" y="200" class="tx">late, lossy guesses do not pay</text>
+    <path class="flow" d="M372 189 H462" stroke="#ff7a30" stroke-width="2.5" fill="none" marker-end="url(#hd)"/>
+    <rect x="470" y="148" width="406" height="82" rx="12" fill="#1f1510" stroke="#5a3519"/>
+    <text x="488" y="176" class="tt" fill="#ffd9bd">Learned look-ahead, on the card</text>
+    <text x="488" y="197" class="tx">starts from the model's own router, 1/2/4 layers ahead</text>
+    <text x="488" y="216" class="tx">+8% code · +15% reasoning · +8% prose</text>
+  </g>
+  <g class="row" style="animation-delay:.45s">
+    <rect x="24" y="244" width="340" height="82" rx="12" fill="#0e1822" stroke="#223a52"/>
+    <text x="42" y="274" class="tt">Pinning the hottest experts lost</text>
+    <text x="42" y="296" class="tx">pinned pages cannot be reclaimed</text>
+    <path class="flow" d="M372 285 H462" stroke="#ff7a30" stroke-width="2.5" fill="none" marker-end="url(#hd)"/>
+    <rect x="470" y="244" width="406" height="82" rx="12" fill="#1f1510" stroke="#5a3519"/>
+    <text x="488" y="272" class="tt" fill="#ffd9bd">Pin in segments, give them back</text>
+    <text x="488" y="293" class="tx">the RAM tier is page-locked in segments (STRATA_PIN_SEGS)</text>
+    <text x="488" y="312" class="tx">+9% on the RTX 3060 PC</text>
+  </g>
+  <g class="row" style="animation-delay:.65s">
+    <rect x="24" y="340" width="340" height="82" rx="12" fill="#0e1822" stroke="#223a52"/>
+    <text x="42" y="370" class="tt">The drive sets the speed</text>
+    <text x="42" y="392" class="tx">fix the reads before tuning anything</text>
+    <path class="flow" d="M372 381 H462" stroke="#ff7a30" stroke-width="2.5" fill="none" marker-end="url(#hd)"/>
+    <rect x="470" y="340" width="406" height="82" rx="12" fill="#1f1510" stroke="#5a3519"/>
+    <text x="488" y="368" class="tt" fill="#ffd9bd">Link budgeting, one layer at a time</text>
+    <text x="488" y="389" class="tx">bytes per link per token; each layer's experts read once</text>
+    <text x="488" y="408" class="tx">8,554-token prompt read in 16.9 s · 262K context fits</text>
+  </g>
+  <g class="row" style="animation-delay:.85s">
+    <rect x="24" y="436" width="340" height="68" rx="12" fill="#0e1822" stroke="#223a52"/>
+    <text x="42" y="464" class="tt">Measure in pairs, with a control</text>
+    <text x="42" y="485" class="tx">and retract what turns out to be noise</text>
+    <path class="flow" d="M372 470 H462" stroke="#ff7a30" stroke-width="2.5" fill="none" marker-end="url(#hd)"/>
+    <rect x="470" y="436" width="406" height="68" rx="12" fill="#1f1510" stroke="#5a3519"/>
+    <text x="488" y="464" class="tt" fill="#ffd9bd">The test ledger</text>
+    <text x="488" y="485" class="tx">a decision stays untested until a row holds a measurement</text>
+  </g>
+</svg>

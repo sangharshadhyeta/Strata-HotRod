@@ -1,0 +1,926 @@
+<!doctype html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>HotRod: from solid.cpp to Strata-HotRod</title>
+<meta name="description" content="Running a 100-billion-parameter mixture-of-experts model on one gaming graphics card: what solid.cpp learned, and how each lesson was built into the HotRod engine.">
+<link rel="icon" type="image/jpeg" href="assets/solid-cpp.jpeg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+html{scroll-behavior:smooth;}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto;}*{animation:none!important;transition:none!important;}}
+:root{
+  --bg:#08090b;
+  --bg-2:#0d0f13;
+  --card:#131519;
+  --card-2:#1a1d23;
+  --border:#24272e;
+  --border-soft:#1c1e24;
+  --fg:#edeef1;
+  --muted:#8b8f98;
+  --muted-2:#5c6068;
+  --hot:#4ed6a5;
+  --hot-dim:#2f7a5c;
+  --warm:#5a9bd8;
+  --bad:#f87171;
+  --code-bg:#0e1013;
+  --shine: linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,0) 40%);
+  --font-display:'Bricolage Grotesque', 'Manrope', -apple-system, sans-serif;
+  --font-body:'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono:'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+*{box-sizing:border-box;}
+html{background:var(--bg);}
+body{
+  background:var(--bg);
+  color:var(--fg);
+  font-family:var(--font-body);
+  margin:0;
+  line-height:1.65;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--hot);color:#06110d;}
+p{text-align:justify;text-align-last:left;hyphens:auto;}
+
+.wrap{max-width:960px;margin:0 auto;padding:0 1.25rem 6rem;position:relative;}
+
+/* ---------- ambient background artefacts ---------- */
+.bg-artefacts{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none;}
+.bg-artefacts::before{
+  content:"";position:absolute;inset:0;
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(255,255,255,.05) 1px, transparent 0);
+  background-size:34px 34px;
+  mask-image:radial-gradient(ellipse 70% 55% at 50% 0%, #000 30%, transparent 75%);
+}
+.glow{position:absolute;border-radius:50%;filter:blur(90px);opacity:.20;}
+.glow.g1{width:520px;height:520px;top:-220px;left:50%;transform:translateX(-60%);background:var(--hot);}
+.glow.g2{width:420px;height:420px;top:120px;right:-140px;background:var(--warm);opacity:.14;}
+
+/* ---------- type ---------- */
+h1,h2,h3{font-family:var(--font-display);font-weight:700;text-wrap:balance;letter-spacing:-.01em;}
+p{margin:.8rem 0;color:var(--fg);}
+a{color:var(--hot);text-decoration:none;}
+a:hover{text-decoration:underline;}
+code{font-family:var(--font-mono);background:var(--code-bg);border:1px solid var(--border-soft);padding:.15rem .42rem;border-radius:5px;font-size:.86em;color:#d9e2df;}
+pre{font-family:var(--font-mono);background:var(--code-bg);border:1px solid var(--border);padding:1rem 1.15rem;border-radius:10px;overflow-x:auto;font-size:.86rem;}
+pre code{background:none;border:none;padding:0;}
+ul{padding-left:1.25rem;}
+li{margin:.5rem 0;}
+.eyebrow{
+  display:inline-flex;align-items:center;gap:.4rem;
+  font-family:var(--font-mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--hot);margin-bottom:.9rem;
+}
+.eyebrow::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--hot);box-shadow:0 0 8px var(--hot);}
+
+/* ---------- hero ---------- */
+/* ---------- nav ---------- */
+.topnav{
+  position:sticky;top:0;z-index:20;
+  background:rgba(8,9,11,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  border-bottom:1px solid transparent;
+}
+.topnav.scrolled{border-bottom-color:var(--border-soft);}
+.topnav-inner{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:.85rem 1.25rem;max-width:960px;margin:0 auto;
+}
+.topnav .brand{display:flex;align-items:center;gap:.55rem;font-family:var(--font-display);font-weight:700;font-size:1.02rem;color:var(--fg);}
+.topnav .brand img{width:26px;height:26px;border-radius:7px;display:block;}
+.topnav nav{display:flex;align-items:center;gap:1.4rem;}
+.topnav nav a{color:var(--muted);font-size:.87rem;font-weight:500;}
+.topnav nav a:hover{color:var(--fg);text-decoration:none;}
+.topnav .btn{padding:.45rem .95rem;font-size:.83rem;}
+@media (max-width:640px){.topnav nav a.nav-link{display:none;}}
+
+header.hero{padding:5rem 1rem 3rem;position:relative;display:flex;align-items:flex-start;justify-content:center;gap:2rem;}
+.hero-main{flex:1;min-width:0;text-align:center;order:1;}
+.hero-panel{order:2;}
+@media (max-width:900px){header.hero{flex-direction:column;align-items:stretch;}}
+.logo-badge{
+  width:104px;height:104px;border-radius:26px;margin:0 auto 1.5rem;
+  background:var(--card-2);
+  background-image:var(--shine);
+  border:1px solid var(--border);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.18), 0 0 0 1px rgba(0,0,0,.4), 0 20px 50px -20px rgba(0,0,0,.8);
+  display:flex;align-items:center;justify-content:center;
+  overflow:hidden;
+}
+.logo-badge img{width:100%;height:100%;object-fit:cover;}
+
+.hero-panel{
+  flex:none;width:19rem;text-align:left;
+  background:var(--card);background-image:var(--shine);
+  border:1px solid var(--border);border-radius:14px;padding:1.1rem 1.2rem;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 20px 44px -26px rgba(0,0,0,.9);
+  font-size:.82rem;
+}
+.hero-panel h4{margin:0 0 .15rem;font-size:.8rem;color:var(--fg);font-weight:700;}
+.hero-panel .hp-sub{color:var(--muted-2);font-size:.72rem;margin:0 0 .7rem;}
+.hero-panel .hp-row{display:flex;justify-content:space-between;gap:.6rem;padding:.22rem 0;border-top:1px solid var(--border-soft);}
+.hero-panel .hp-row:first-of-type{border-top:none;}
+.hero-panel .hp-row span:first-child{color:var(--muted);}
+.hero-panel .hp-row span:last-child{color:var(--fg);font-variant-numeric:tabular-nums;text-align:right;}
+.hero-panel .hp-group{margin-top:.7rem;padding-top:.55rem;border-top:1px solid var(--border);}
+.hero-panel .hp-group-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted-2);margin-bottom:.15rem;}
+.hero-panel .hp-note{color:var(--muted-2);font-size:.7rem;margin-top:.7rem;padding-top:.6rem;border-top:1px solid var(--border);line-height:1.5;}
+.hero-panel .hp-note strong{color:var(--muted);}
+@media (max-width:900px){.hero-panel{width:auto;max-width:26rem;margin:2rem auto 0;order:2;}}
+header.hero h1{font-size:3rem;margin:.2rem 0;}
+header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:34rem;margin:.75rem auto 2rem;text-wrap:balance;}
+
+.cta-row{display:flex;gap:.7rem;justify-content:center;flex-wrap:wrap;margin-bottom:1.75rem;}
+.btn{
+  font-family:var(--font-body);font-weight:600;font-size:.92rem;
+  padding:.7rem 1.3rem;border-radius:999px;display:inline-flex;align-items:center;gap:.5rem;
+  border:1px solid var(--border);transition:transform .15s ease, border-color .15s ease;
+}
+.btn:hover{text-decoration:none;transform:translateY(-1px);}
+.btn-shine{
+  background:linear-gradient(180deg,#2a2d33,#0a0b0d);
+  background-image:var(--shine), linear-gradient(180deg,#2a2d33,#0a0b0d);
+  color:#fff;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.22), 0 0 22px -6px rgba(78,214,165,.35), 0 12px 26px -14px rgba(0,0,0,.9);
+  border-color:#2e3138;
+}
+.btn-shine:hover{border-color:var(--hot);box-shadow:inset 0 1px 0 rgba(255,255,255,.28), 0 0 26px -4px rgba(78,214,165,.55);}
+.btn-ghost{background:var(--card);color:var(--muted);}
+.btn-ghost:hover{color:var(--fg);border-color:var(--muted-2);}
+
+.badges{display:flex;gap:.5rem;justify-content:center;flex-wrap:wrap;}
+.hero-zero{
+  margin:2.5rem auto 0;max-width:44rem;text-align:left;
+  background:var(--card);background-image:var(--shine);
+  border:1px solid var(--border);border-radius:16px;padding:1.4rem 1.5rem;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 20px 50px -30px rgba(0,0,0,.8);
+}
+.hero-zero-head{display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap;margin-bottom:.85rem;}
+.hero-zero-tag{
+  font-family:var(--font-mono);font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--hot);border:1px solid var(--hot-dim);border-radius:999px;padding:.2rem .6rem;
+}
+.hero-zero-sub{color:var(--muted);font-size:.86rem;}
+.hero-zero-cmd{margin:0 0 .85rem;padding:.7rem .9rem;font-size:.82rem;background:var(--card-2);border-radius:10px;border:1px solid var(--border);overflow-x:auto;}
+.hero-zero-cmd code{white-space:nowrap;}
+.hero-zero-flow{margin:0 0 1.1rem;font-size:.85rem;line-height:1.6;color:var(--muted);}
+.hero-zero-flow strong{color:var(--fg);font-weight:600;}
+.hero-zero-grid{display:grid;grid-template-columns:1fr 1fr;gap:.9rem;margin-bottom:1rem;}
+.hero-zero-grid > div{
+  display:flex;flex-direction:column;gap:.18rem;
+  background:var(--card-2);border:1px solid var(--border);border-radius:12px;padding:.8rem .9rem;
+}
+.hz-model{font-weight:600;font-size:.88rem;}
+.hz-note{color:var(--muted);font-size:.74rem;}
+.hz-num{font-family:var(--font-display);font-size:1.6rem;font-weight:700;color:var(--hot);line-height:1.1;font-variant-numeric:tabular-nums;margin-top:.15rem;}
+.hz-num small{font-size:.8rem;color:var(--muted);font-weight:600;}
+.hero-zero-foot{margin:0;font-size:.8rem;line-height:1.6;color:var(--muted);}
+@media (max-width:560px){.hero-zero-grid{grid-template-columns:1fr;}}
+.pill{font-family:var(--font-mono);font-size:.72rem;color:var(--muted);border:1px solid var(--border-soft);background:var(--bg-2);padding:.28rem .65rem;border-radius:999px;}
+
+/* ---------- sections ---------- */
+section{margin:5rem 0;scroll-margin-top:5.5rem;}
+h2{font-size:1.65rem;margin:0 0 .5rem;}
+.section-lede{color:var(--muted);max-width:42rem;font-size:1rem;margin:0 0 1.75rem;}
+
+/* ---------- cards ---------- */
+.card{
+  background:var(--card);
+  background-image:var(--shine);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:1.4rem 1.5rem;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 16px 40px -28px rgba(0,0,0,.9);
+  transition:border-color .18s ease, transform .18s ease, box-shadow .18s ease;
+}
+.card-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
+.card-grid .card{cursor:default;}
+.card-grid .card:hover{border-color:var(--hot-dim);transform:translateY(-2px);box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 20px 44px -26px rgba(0,0,0,.95), 0 0 0 1px rgba(78,214,165,.08);}
+.card-grid .card h3{font-size:1.02rem;margin:0 0 .4rem;color:var(--fg);}
+.card-grid .card p{color:var(--muted);font-size:.9rem;margin:0;}
+.card-grid .card code{font-size:.8rem;}
+
+/* ---------- stat cards ---------- */
+.stat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1.5rem;}
+.stat-card{
+  background:var(--card);background-image:var(--shine);
+  border:1px solid var(--border);border-radius:14px;padding:1.25rem 1.35rem;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06);
+  transition:border-color .18s ease, transform .18s ease;
+}
+.stat-card:hover{border-color:var(--hot-dim);transform:translateY(-2px);}
+.stat-card .num{font-family:var(--font-display);font-size:2.1rem;font-weight:700;color:var(--hot);line-height:1;font-variant-numeric:tabular-nums;}
+.stat-card .num small{font-size:1.1rem;color:var(--muted);font-weight:600;}
+.stat-card .label{color:var(--muted);font-size:.82rem;margin-top:.5rem;}
+
+.tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--bg-2);-webkit-overflow-scrolling:touch;}
+table{width:100%;min-width:640px;border-collapse:collapse;font-size:.88rem;table-layout:fixed;}
+@media (max-width:640px){table{font-size:.82rem;}th,td{padding:.65rem .7rem;}}
+th,td{text-align:left;padding:.75rem .85rem;border-bottom:1px solid var(--border-soft);vertical-align:top;overflow-wrap:break-word;}
+tr:last-child td{border-bottom:none;}
+th{color:var(--muted);font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;background:var(--bg-2);}
+td.num{font-variant-numeric:tabular-nums;font-weight:600;font-family:var(--font-mono);font-size:.85rem;}
+.tag{display:inline-block;padding:.14rem .55rem;border-radius:999px;font-size:.68rem;font-weight:700;letter-spacing:.02em;white-space:nowrap;font-family:var(--font-mono);}
+.tag-solid{background:rgba(78,214,165,.14);color:var(--hot);border:1px solid rgba(78,214,165,.3);}
+.delta-pos{color:var(--hot);font-weight:700;}
+.delta-neg{color:var(--bad);font-weight:700;}
+.note{color:var(--muted-2);font-size:.8rem;}
+
+.callout{
+  background:var(--bg-2);border:1px solid var(--border);border-left:3px solid var(--hot);
+  border-radius:10px;padding:1.1rem 1.3rem;margin:1.5rem 0;font-size:.94rem;color:var(--fg);
+}
+.callout p{color:inherit;}
+
+/* ---------- brain artefact (decorative, echoes the real live view) ---------- */
+.brain-artefact{
+  display:grid;grid-template-columns:repeat(24,1fr);gap:3px;
+  padding:1.1rem;background:var(--bg-2);border:1px solid var(--border);border-radius:12px;margin:1.5rem 0 0;
+}
+.brain-artefact i{display:block;aspect-ratio:1;border-radius:2px;background:#262a30;}
+.brain-legend{display:flex;gap:1.25rem;flex-wrap:wrap;color:var(--muted);font-size:.78rem;margin-top:.85rem;align-items:center;}
+.brain-legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:.4rem;vertical-align:middle;}
+
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.85rem;}
+.grid a.card{display:flex;flex-direction:column;color:var(--fg);}
+.grid a.card:hover{border-color:var(--hot);text-decoration:none;transform:translateY(-2px);}
+.grid a.card .k{font-weight:700;color:var(--hot);font-size:.95rem;}
+.grid a.card .d{color:var(--muted);font-size:.83rem;margin-top:.3rem;}
+.grid a.card img{width:100%;height:220px;object-fit:cover;object-position:center;border-radius:8px;margin-bottom:.6rem;display:block;}
+
+footer{margin-top:4rem;padding-top:1.75rem;border-top:1px solid var(--border);color:var(--muted-2);font-size:.85rem;display:flex;justify-content:space-between;flex-wrap:wrap;gap:.5rem;}
+footer a{color:var(--muted);text-decoration:underline;}
+
+@media (max-width:640px){
+  .card-grid,.stat-row,.grid{grid-template-columns:1fr;}
+  header.hero h1{font-size:2.3rem;}
+  .brain-artefact{grid-template-columns:repeat(14,1fr);}
+}
+
+:root{--fire:#ff7a30;--ember:#ffb054;--ice:#5fb4ff;}
+html{scroll-padding-top:5rem}
+p,.cap{text-align:justify;text-align-last:left;hyphens:auto;-webkit-hyphens:auto}
+.glow.g1{animation:drift1 18s ease-in-out infinite alternate;background:var(--fire);opacity:.17}
+.glow.g2{animation:drift2 22s ease-in-out infinite alternate;background:var(--ice);opacity:.13}
+@keyframes drift1{to{transform:translateX(-40%) translateY(40px)}}
+@keyframes drift2{to{transform:translateX(-50px) translateY(60px)}}
+.topnav nav{display:flex;align-items:center;gap:1.1rem}
+.topnav nav a.nav-link{white-space:nowrap;font-size:.86rem}
+.topnav .brand{white-space:nowrap;margin-right:1rem}
+.topnav .brand img{width:26px;height:26px;border-radius:7px;object-fit:cover}
+.logo-badge img{object-fit:cover;width:100%;height:100%;border-radius:inherit}
+.logo-badge{box-shadow:0 0 60px rgba(255,122,48,.28),inset 0 1px 0 rgba(255,255,255,.08)}
+header.hero{display:block}
+.hero-main{max-width:46rem;margin:0 auto;text-align:center}
+.hero-main h1{font-size:clamp(2.6rem,7vw,4.2rem);line-height:1.02;margin:.2rem 0 .6rem}
+.hero-main h1 em{font-style:normal;background:linear-gradient(90deg,var(--ice),var(--fire));-webkit-background-clip:text;background-clip:text;color:transparent}
+.tagline{text-align:center;text-align-last:center}
+.slogan{font:italic 500 1.25rem/1.4 var(--font-display);color:var(--ember);text-align:center;text-align-last:center;margin:.1rem auto 1.1rem;text-wrap:balance}
+.h-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:2.2rem 0 .4rem;text-align:left}
+.h-stats .stat-card .num{white-space:nowrap}
+@media (max-width:820px){.h-stats{grid-template-columns:1fr 1fr}}
+.acc-fire{color:var(--fire)}
+.eyebrow.fire{color:var(--fire)}.eyebrow.fire::before{background:var(--fire);box-shadow:0 0 8px var(--fire)}
+.part{margin:6rem 0 0;padding:1.4rem 0 0;border-top:1px solid var(--border)}
+.part h2{font-size:clamp(1.8rem,4vw,2.4rem)}
+.diagram{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.diagram svg{display:block;width:100%;min-width:560px;height:auto}
+svg text{font-family:var(--font-body)}
+.t-title{font-size:20px;font-weight:700;fill:#edeef1}
+.t-lab{font-size:16px;fill:#cfd2d9}
+.t-sm{font-size:14px;fill:#9aa0ab}
+.t-b{font-weight:700}
+.card.flat{padding:1.1rem 1.25rem}
+.cap{font-size:.86rem;color:var(--muted);margin:.7rem .2rem 0}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+@media (max-width:820px){.two{grid-template-columns:1fr}}
+
+/* animated bars */
+.bars{display:grid;gap:.85rem}
+.row{display:grid;grid-template-columns:minmax(130px,230px) 1fr 74px;gap:.8rem;align-items:center;font-size:.92rem}
+.row .l{color:#d0d3da}
+.row .t{height:16px;border-radius:8px;background:#1a1d23;overflow:hidden}
+.row .t i{display:block;height:100%;width:0;border-radius:8px;background:linear-gradient(90deg,var(--fire),var(--ember));transition:width 1.3s cubic-bezier(.2,.8,.2,1)}
+.row .t i.ice{background:linear-gradient(90deg,#3d86c9,var(--ice))}
+.row .t i.ok{background:linear-gradient(90deg,#2c9c78,var(--hot))}
+.row .t i.bad{background:repeating-linear-gradient(135deg,#a24444,#a24444 6px,#7b2f2f 6px,#7b2f2f 12px)}
+.row .v{font:500 .92rem var(--font-mono);text-align:right}
+@media (max-width:560px){.row{grid-template-columns:1fr 64px}.row .t{grid-column:1/-1;order:3}}
+.no-js .row .t i{width:var(--w)}
+
+/* lessons flow */
+.flowrows{display:grid;gap:.9rem}
+.fr{display:grid;grid-template-columns:1fr 56px 1.35fr;align-items:stretch}
+.fr .a,.fr .b{border-radius:14px;padding:1.05rem 1.2rem;border:1px solid var(--border)}
+.fr .a{background:linear-gradient(135deg,#0e1822,var(--card));border-color:#223345}
+.fr .b{background:linear-gradient(135deg,#231710,var(--card));border-color:#4a2c18}
+.fr h4{margin:0 0 .35rem;font:500 .7rem var(--font-mono);letter-spacing:.09em;text-transform:uppercase}
+.fr .a h4{color:var(--ice)}.fr .b h4{color:var(--fire)}
+.fr p{margin:0;font-size:.93rem;line-height:1.55;text-align:left;text-align-last:left;hyphens:manual}
+.fr .arr{display:flex;align-items:center;justify-content:center}
+.fr .arr svg{width:42px;overflow:visible}
+.fr .arr path.run{stroke-dasharray:6 8;animation:dash 1.1s linear infinite}
+@keyframes dash{to{stroke-dashoffset:-14}}
+.chip{display:inline-block;font:500 .74rem var(--font-mono);padding:.15rem .6rem;border-radius:99px;margin:.55rem .4rem 0 0;background:#1d1812;border:1px solid #4a2c18;color:var(--ember)}
+.chip.bad{background:#1f1212;border-color:#4a2222;color:var(--bad)}
+@media (max-width:820px){.fr{grid-template-columns:1fr}.fr .arr{height:34px;transform:rotate(90deg)}}
+.reveal{opacity:0;transform:translateY(16px);transition:opacity .7s ease,transform .7s ease}
+.reveal.in{opacity:1;transform:none}
+.no-js .reveal{opacity:1;transform:none}
+
+/* timeline */
+.tl-band{transform-box:fill-box;transform-origin:left center;transform:scaleX(0);transition:transform 1.6s cubic-bezier(.2,.8,.2,1)}
+.in .tl-band{transform:scaleX(1)}
+.in .tl-band.b2{transition-delay:.9s}
+.tl-dot{opacity:0;transition:opacity .5s ease}
+.in .tl-dot{opacity:1}
+.tl-cards{display:grid;grid-template-columns:repeat(6,1fr);gap:.7rem;margin-top:1rem}
+.tl-cards .c{background:var(--card-2);border:1px solid var(--border);border-radius:12px;padding:.8rem .85rem;font-size:.84rem;line-height:1.45;color:#cfd2d9}
+.tl-cards .c b{display:block;font:700 .95rem var(--font-display);margin-bottom:.15rem}
+.tl-cards .c.s{border-top:2px solid var(--ice)}.tl-cards .c.h{border-top:2px solid var(--fire)}
+@media (max-width:900px){.tl-cards{grid-template-columns:1fr 1fr}}
+@media (max-width:520px){.tl-cards{grid-template-columns:1fr}}
+
+/* token flow */
+.node-box{transition:filter .4s ease,stroke-width .4s ease}
+.node-box.lit{filter:drop-shadow(0 0 10px currentColor);stroke-width:3}
+#tokDot{filter:drop-shadow(0 0 8px #ffb054)}
+.tok-cap{min-height:3.2em;font-size:.95rem;color:#e9e4da;text-align:center;text-align-last:center;margin:.7rem 0 0}
+.tok-cap b{color:var(--ember)}
+
+/* method loop */
+.loop{display:grid;grid-template-columns:repeat(5,1fr);gap:.7rem}
+.loop .s{background:var(--card-2);border:1px solid var(--border);border-radius:12px;padding:.9rem 1rem;font-size:.86rem;line-height:1.5;color:#cfd2d9;position:relative;animation:glowstep 10s ease-in-out infinite}
+.loop .s b{display:block;font:700 .95rem var(--font-display);margin-bottom:.2rem;color:var(--ember)}
+.loop .s:nth-child(1){animation-delay:0s}.loop .s:nth-child(2){animation-delay:2s}.loop .s:nth-child(3){animation-delay:4s}.loop .s:nth-child(4){animation-delay:6s}.loop .s:nth-child(5){animation-delay:8s}
+@keyframes glowstep{0%,18%,100%{border-color:var(--border);box-shadow:none}6%,12%{border-color:var(--fire);box-shadow:0 0 22px -6px rgba(255,122,48,.55)}}
+@media (max-width:900px){.loop{grid-template-columns:1fr 1fr}}
+@media (max-width:520px){.loop{grid-template-columns:1fr}}
+
+/* install */
+.steps{counter-reset:s;display:grid;grid-template-columns:minmax(0,1fr);gap:.9rem}
+.step{min-width:0;position:relative;padding:1.1rem 1.3rem 1.1rem 4rem;background:var(--card);background-image:var(--shine);border:1px solid var(--border);border-radius:14px}
+.step::before{counter-increment:s;content:counter(s);position:absolute;left:1.1rem;top:1.05rem;width:2rem;height:2rem;border-radius:50%;display:flex;align-items:center;justify-content:center;font:700 .95rem var(--font-display);color:#1a0b00;background:linear-gradient(135deg,var(--ember),var(--fire))}
+.step h3{margin:0 0 .35rem;font-size:1.05rem}
+.step p{margin:.3rem 0}
+.step pre{margin:.6rem 0 .2rem;max-width:100%;overflow-x:auto}
+.warnbox{background:#1d160c;border:1px solid #4a3414;border-left:3px solid var(--ember);border-radius:10px;padding:1rem 1.2rem;font-size:.9rem;margin:1.2rem 0}
+.warnbox p{margin:.2rem 0}
+
+/* credit / repo */
+.chain{display:flex;flex-direction:column;gap:.4rem}
+.node{border:1px solid var(--border);border-radius:12px;padding:.65rem .9rem;background:var(--card-2);font-size:.9rem}
+.node small{display:block;color:var(--muted);font-size:.78rem}
+.node.up{border-color:#223345;background:#0e1822}.node.me{border-color:#4a2c18;background:#231710}
+.dn{align-self:center;color:var(--muted-2);font-size:.85rem;line-height:1}
+.tree{font:.86rem/1.9 var(--font-mono);color:#cfd2d9;overflow-x:auto;white-space:pre}
+.tree em{font-style:normal;color:var(--muted)}
+.lim{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.4rem}
+.lim span{font-size:.84rem;border:1px solid var(--border);border-radius:99px;padding:.35rem .8rem;color:#c9ccd3;background:var(--card)}
+footer.site{margin:5rem 0 0;padding:1.6rem 0 4rem;border-top:1px solid var(--border-soft);color:var(--muted);font-size:.82rem}
+.topnav nav a.nav-link.active{color:var(--fg)}
+@media (prefers-reduced-motion:reduce){.row .t i{transition:none}.reveal{opacity:1;transform:none}.tl-band{transform:none}.tl-dot{opacity:1}}
+
+.chap{margin:5.5rem 0}
+.learned,.built{border-radius:16px;padding:1.4rem 1.5rem;border:1px solid var(--border)}
+.learned{background:linear-gradient(135deg,#0d1620,var(--card));border-color:#223345}
+.built{background:linear-gradient(135deg,#1f1510,var(--card));border-color:#4a2c18}
+.learned>h4,.built>h4{margin:0 0 .8rem;font:500 .72rem var(--font-mono);letter-spacing:.09em;text-transform:uppercase}
+.learned>h4{color:var(--ice)}.built>h4{color:var(--fire)}
+.learned p,.built p{margin:.5rem 0}
+.bridge{display:flex;flex-direction:column;align-items:center;gap:.1rem;margin:.55rem 0;color:var(--fire);font:500 .72rem var(--font-mono);letter-spacing:.09em;text-transform:uppercase}
+.bridge svg{width:22px;height:40px;overflow:visible}
+.bridge path.run{stroke-dasharray:6 7;animation:dashv 1s linear infinite}
+@keyframes dashv{to{stroke-dashoffset:-13}}
+.mini{background:var(--bg-2);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem;font-size:.9rem;line-height:1.55}
+.mini b{display:block;color:var(--ember);font:700 .95rem var(--font-display);margin-bottom:.15rem}
+.learned .tablewrap,.built .tablewrap{margin:.9rem 0 .4rem}
+
+/* ---- compact sizing ---- */
+html{font-size:14.5px}
+.wrap{max-width:880px}
+body{line-height:1.6}
+section{margin:4rem 0}
+h2{font-size:1.4rem}
+.section-lede{font-size:.92rem;margin-bottom:1.2rem}
+header.hero{padding:3.2rem 1rem 1.6rem}
+.logo-badge{width:min(250px,62vw);height:min(250px,62vw);border-radius:22px;margin:0 auto 1.2rem}
+.hero-main h1{font-size:clamp(2.1rem,6vw,2.9rem)}
+.slogan{font-size:1.02rem}
+.tagline{font-size:.98rem;margin-bottom:1.3rem}
+.h-stats{gap:9px;margin-top:1.6rem}
+.stat-card{padding:.85rem 1rem}
+.stat-card .num{font-size:1.5rem}
+.stat-card .label{font-size:.78rem}
+.diagram svg{max-width:500px;margin:0 auto;min-width:420px}
+.t-title{font-size:16px}.t-lab{font-size:13.5px}.t-sm{font-size:12px}
+.card.flat{padding:.95rem 1.1rem}
+.cap{font-size:.78rem}
+table{font-size:.8rem}
+th,td{padding:.55rem .7rem}
+.row{font-size:.84rem;gap:.6rem}
+.row .t{height:11px;border-radius:6px}.row .t i{border-radius:6px}
+.row .v{font-size:.82rem}
+.bars{gap:.6rem}
+.chip{font-size:.7rem}
+.step{padding:.9rem 1.1rem .9rem 3.4rem}
+.step::before{width:1.7rem;height:1.7rem;font-size:.82rem;left:.9rem;top:.9rem}
+.step h3{font-size:.98rem}
+.learned,.built{padding:1.1rem 1.25rem;font-size:.9rem}
+.learned p,.built p{font-size:.9rem}
+.loop .s{font-size:.8rem;padding:.7rem .8rem}
+.chap{margin:4.2rem 0}
+.mini{font-size:.84rem}
+.tl-cards .c{font-size:.78rem;padding:.65rem .75rem}
+.topnav-inner{padding:.65rem 1rem}
+.tok-cap{font-size:.86rem}
+#tokSvg{max-width:440px}
+
+/* ---- expert placement grid ---- */
+.placement{padding:1rem 1.1rem}
+.pl-head{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;font-size:.8rem;color:var(--muted);margin-bottom:.7rem}
+.pl-head b{color:var(--fg);font-weight:600}
+.pl-head #plStats{font:500 .76rem var(--font-mono);color:var(--ember)}
+.pgrid{display:grid;grid-template-columns:repeat(24,1fr);gap:3px;padding:.75rem;background:var(--bg-2);border:1px solid var(--border);border-radius:10px}
+.pgrid i{display:block;aspect-ratio:1;border-radius:2px;background:#232a33;transition:background .6s ease,box-shadow .6s ease,transform .35s ease}
+.pgrid i.c{background:#232a33}
+.pgrid i.w{background:#c98a3a}
+.pgrid i.h{background:#ff7a30;box-shadow:0 0 7px rgba(255,122,48,.65)}
+.pgrid i.req{transform:scale(1.28);z-index:2;outline:1.5px solid #fff}
+.pgrid i.sub{background:#facc15!important;box-shadow:0 0 10px #facc15!important;transform:scale(1.28)}
+.pgrid i.ssd{background:#5fb4ff!important;box-shadow:0 0 9px #5fb4ff!important}
+.pl-legend{display:flex;flex-wrap:wrap;gap:.35rem 1.1rem;margin-top:.7rem;font-size:.74rem;color:var(--muted)}
+.pl-legend .dot{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:.4rem;vertical-align:middle}
+.pl-legend .dot.h{background:#ff7a30}.pl-legend .dot.w{background:#c98a3a}.pl-legend .dot.c{background:#3a4650}.pl-legend .dot.s{background:#facc15}
+.pl-legend b{color:#d0d3da;font-weight:600}
+@media (max-width:640px){.pgrid{grid-template-columns:repeat(16,1fr)}}
+
+/* ---- print copy ---- */
+.print-only{display:none}
+@page{size:A4;margin:14mm 13mm}
+@media print{
+  :root{--bg:#fff;--bg-2:#f4f6f8;--card:#fff;--card-2:#f4f6f8;--border:#d4d8de;--border-soft:#e4e7eb;--fg:#14181d;--muted:#555d68;--muted-2:#7a828d;--code-bg:#f1f3f5;--shine:none}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  :root{color-scheme:light}
+  #tokSvg{background:#0d1117;border-radius:10px;padding:6px;max-width:440px}
+  #tlcard .t-lab,#tlcard .t-sm{fill:#14181d}
+  .tl-cards .c,.tl-cards .c b{color:#14181d}
+  .tok-cap{color:#14181d}
+  .row .t i.bad{opacity:.9}
+  html,body{background:#fff!important;color:#14181d}
+  html{font-size:12.5px}
+  .bg-artefacts,.topnav,.cta-row,.badges,.glow{display:none!important}
+  .print-only{display:block}
+  .printhead{border:1px solid #cfd4db;border-radius:10px;padding:.55rem .9rem;margin:0 0 1rem;background:#f6f8fa;font-size:.85rem;color:#14181d}
+  .printhead b{color:#c2410c}
+  .printhead a,.printlinks a{color:#0b5cad;text-decoration:underline;word-break:break-all}
+  .printlinks{margin-top:2rem;padding-top:.8rem;border-top:1px solid #cfd4db;font-size:.85rem}
+  .printlinks li{margin:.25rem 0}
+  a{color:#0b5cad}
+  p,.cap,.section-lede{color:#14181d}
+  .section-lede,.cap{color:#444c56}
+  .logo-badge{box-shadow:none;border:1px solid #cfd4db;width:104px;height:104px;margin-bottom:.5rem}
+  .hero-main h1 em{background:none;-webkit-background-clip:initial;color:#c2410c}
+  .slogan{color:#b45309}
+  header.hero{padding:.5rem 0 .6rem}
+  .h-stats{margin-top:.4rem;margin-bottom:0}
+  .hero-main h1{font-size:2.3rem}
+  .tagline{margin-bottom:.4rem}
+  .pgrid{padding:.4rem;gap:2px}
+  .placement{padding:.6rem .8rem}
+  .stat-card,.card,.card.flat,.tablewrap,.mini,.step,.warnbox,.node,.tl-cards .c,.loop .s{background:#fff!important;border-color:#cfd4db!important;box-shadow:none!important}
+  .stat-card .num{color:#c2410c}
+  .learned{background:#f3f8fd!important;border-color:#b9d3ee!important}
+  .built{background:#fff7f1!important;border-color:#f0c9ac!important}
+  .learned>h4{color:#1d6fb8}.built>h4{color:#c2410c}
+  .chip{background:#fff3e8;border-color:#f0c9ac;color:#9a4a0c}
+  .chip.bad{background:#fdeeee;border-color:#efb9b9;color:#b42323}
+  .row .l,.tok-cap{color:#14181d}
+  .row .t{background:#e7eaee}
+  .row .v,.pl-head b{color:#14181d}
+  .pl-head #plStats{color:#b45309}
+  .pgrid{background:#f4f6f8;border-color:#d4d8de}
+  .pgrid i.c{background:#c9d0d8}
+  .pl-legend,.pl-legend b{color:#3c444e}
+  th{background:#eef1f4;color:#4a525c}
+  td,th{border-color:#e1e5e9}
+  code{background:#f1f3f5;border-color:#dde1e6;color:#6b2d0a}
+  pre{background:#f6f8fa;border-color:#d4d8de}
+  .tree{color:#14181d}.tree em{color:#59616c}
+  .lim span,.pill{background:#fff;border-color:#cfd4db;color:#2b323a}
+  .eyebrow,.eyebrow.fire{color:#c2410c}
+  .eyebrow::before,.eyebrow.fire::before{background:#c2410c;box-shadow:none}
+  .delta-pos{color:#15803d}.delta-neg{color:#b42323}
+  .tag{border-color:#cfd4db}
+  .mini b,.loop .s b{color:#b45309}
+  .node.up{background:#eef5fb!important;border-color:#b9d3ee!important}.node.me{background:#fff4ec!important;border-color:#f0c9ac!important}
+  /* diagrams keep their dark artwork; give them a frame */
+  .diagram{border-radius:10px}
+  .diagram svg{max-width:420px}
+  section,.chap{margin:1.4rem 0}
+  .chap{break-before:page}
+  .eyebrow,.section-lede{break-after:avoid;page-break-after:avoid}
+  .card,.learned,.built,.tablewrap,.stat-card,.step,.tl-cards .c,.loop .s,.mini,table,tr,svg{break-inside:avoid;page-break-inside:avoid}
+  h2,h3{break-after:avoid}
+  .bridge svg path.run,.fr .arr path.run{animation:none}
+  .reveal{opacity:1!important;transform:none!important}
+  .row .t i{transition:none}
+  .loop .s{animation:none}
+  footer.site{margin-top:1rem;padding-bottom:0}
+}
+</style>
+</head>
+<body>
+
+<div class="bg-artefacts"><div class="glow g1"></div><div class="glow g2"></div></div>
+<div class="topnav" id="topnav"><div class="topnav-inner">
+  <a class="brand" href="#"><img src="assets/hotrod.gif" alt=""> HotRod</a>
+  <nav>
+    <a class="nav-link" href="#idea">Idea</a>
+    <a class="nav-link" href="#path">Path</a>
+    <a class="nav-link" href="#standins">Stand-ins</a>
+    <a class="nav-link" href="#lookahead">Look-ahead</a>
+    <a class="nav-link" href="#memory">Memory</a>
+    <a class="nav-link" href="#method">Method</a>
+    <a class="nav-link" href="#token">How it works</a>
+    <a class="nav-link" href="#results">Results</a>
+    <a class="nav-link" href="#install">Install</a>
+    <a class="btn btn-shine" href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/legacy-solid">Repository</a>
+  </nav>
+</div></div>
+
+<div class="wrap">
+<div class="print-only printhead"><b>Legacy copy (18 Nov 2026):</b> <a href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/legacy-solid">https://github.com/sangharshadhyeta/Strata-HotRod/tree/legacy-solid</a></div>
+<header class="hero"><div class="hero-main">
+  <div class="logo-badge"><img src="assets/hotrod.gif" alt="HotRod logo"></div>
+  <div class="eyebrow fire" style="justify-content:center">Technical write-up · November 2026</div>
+  <h1><em>HotRod</em></h1>
+  <p class="slogan">A system which rewires the model around the way you use it.</p>
+  <div class="tagline">A 100-billion-parameter AI model on one gaming graphics card and an ordinary PC. Built in two steps: <strong>solid.cpp</strong> found what works, <strong>Strata-HotRod</strong> built it into an engine.</div>
+  <div class="cta-row">
+    <a class="btn btn-shine" href="#standins">The four lessons</a>
+    <a class="btn btn-ghost" href="#install">Install HotRod</a>
+  </div>
+  <div class="badges">
+    <span class="pill">MIT licensed</span><span class="pill">built on Strata by Niko1221</span><span class="pill">lessons from llama.cpp work</span>
+  </div>
+  <p style="color:var(--muted);font-size:.9rem;margin:1.4rem auto 0;max-width:34rem;text-align:center;text-align-last:center">Sumit Sodhi · Assistant Administrative Officer, IS-II Wing, O/o the C&amp;AG of India</p>
+</div></header>
+
+<div class="h-stats" id="hstats">
+  <div class="stat-card"><div class="num"><span data-count="78">78</span><small> GB</small></div><div class="label">model on a PC with 30 GB RAM and a 12 GB card</div></div>
+  <div class="stat-card"><div class="num">17<small> → </small>50–70</div><div class="label">tokens per second: stock Strata (10 Oct) to HotRod (24 Oct)</div></div>
+  <div class="stat-card"><div class="num"><span data-count="111">111</span><small> GB</small></div><div class="label">larger version of the model, 15–22 tokens per second</div></div>
+  <div class="stat-card"><div class="num"><span data-count="341">341</span><small> GB</small></div><div class="label">DeepSeek-V4.1-Flash on the same PC, 5 to 8 tokens per second</div></div>
+</div>
+<p class="cap" style="text-align:center;text-align-last:center">All figures are the author's own measurements on one PC (RTX 3060 12 GB, i5-12400F, 30–31 GB RAM, NVMe) and have not been independently reproduced.</p>
+
+<section id="idea">
+  <div class="eyebrow fire">The idea</div>
+  <h2>A model far bigger than the card, placed by use</h2>
+  <p class="section-lede">A mixture-of-experts model uses only a small slice of itself for each word. So the busiest experts sit on the card, the next busiest in RAM and the rest on the drive, and the placement keeps changing as the conversation does. Watch one layer's experts being requested.</p>
+  <div class="card flat placement" id="placeCard">
+    <div class="pl-head"><b>One layer's experts</b><span id="plStats">&nbsp;</span></div>
+    <div class="pgrid" id="pgrid" aria-hidden="true"></div>
+    <div class="pl-legend">
+      <span><i class="dot h"></i><b>hot</b> · on the card · 12 GB · 254 GB/s</span>
+      <span><i class="dot w"></i><b>warm</b> · in RAM · 30 GB · 24.5 GB/s over PCIe</span>
+      <span><i class="dot c"></i><b>cold</b> · on the SSD · up to 111 GB · 3.55 GB/s</span>
+      <span><i class="dot s"></i><b>stand-in</b> · a hot expert doing a missing one's work</span>
+    </div>
+    <p class="cap" id="plCap" style="min-height:2.6em">Each request is served from the card, from a stand-in, from RAM or from the SSD, and an expert that was read moves up a tier.</p>
+  </div>
+</section>
+
+<section id="path">
+  <div class="eyebrow fire">The path</div>
+  <h2>Two projects, one line of work</h2>
+  <p class="section-lede">solid.cpp was the learning ground. On 10 October the decision was recorded: stop experimenting and port the wins that survived measurement into Strata, one step at a time.</p>
+  <div class="card flat reveal" id="tlcard">
+  <div class="lim" style="margin:0 0 .4rem"><span style="border-color:#2f6aa3"><b style="color:#5fb4ff">●</b> solid.cpp · 13 Aug – 3 Oct</span><span style="border-color:#a24d1a"><b style="color:#ff7a30">●</b> Strata-HotRod · 10 Oct – 15 Nov</span></div>
+  <div class="diagram">
+  <svg viewBox="0 0 640 120" role="img" aria-label="Timeline from 13 August to 15 November 2026">
+    <rect class="tl-band" x="40" y="48" width="291" height="28" rx="14" fill="#173a5c"/>
+    <rect class="tl-band b2" x="371" y="48" width="205" height="28" rx="14" fill="#7a3510"/>
+    <g class="tl-dot">
+      <circle cx="40" cy="62" r="6" fill="#5fb4ff"/><circle cx="331" cy="62" r="6" fill="#5fb4ff"/>
+      <circle cx="371" cy="62" r="6" fill="#ff7a30"/><circle cx="450" cy="62" r="6" fill="#ff7a30"/>
+      <circle cx="490" cy="62" r="6" fill="#ff7a30"/><circle cx="576" cy="62" r="6" fill="#ff7a30"/>
+      <text x="40" y="30" text-anchor="start" class="t-lab t-b">13 Aug</text>
+      <text x="371" y="30" text-anchor="middle" class="t-lab t-b">10 Oct</text>
+      <text x="490" y="30" text-anchor="middle" class="t-lab t-b">31 Oct</text>
+      <text x="331" y="104" text-anchor="middle" class="t-lab t-b">3 Oct</text>
+      <text x="450" y="104" text-anchor="middle" class="t-lab t-b">24 Oct</text>
+      <text x="576" y="104" text-anchor="end" class="t-lab t-b">15 Nov</text>
+    </g>
+  </svg></div>
+  <div class="tl-cards">
+    <div class="c s"><b>13 Aug</b>solid.cpp starts: an expert cache on the card</div>
+    <div class="c s"><b>3 Oct</b>solid.cpp's last work. GLM-5.3 (93 GB) runs on 42 GB</div>
+    <div class="c h"><b>10 Oct · decision</b>Port solid's wins into Strata, one measured step at a time</div>
+    <div class="c h"><b>24 Oct</b>78 GB model at 50–70 tokens/s</div>
+    <div class="c h"><b>31 Oct</b>DeepSeek port measured on the same PC</div>
+    <div class="c h"><b>15 Nov</b>111 GB model at 15–22; DeepSeek at 7–8</div>
+  </div></div>
+</section>
+<section class="chap" id="standins"><div class="eyebrow fire">Chapter 1</div><h2>Don't wait for the expert: serve a stand-in</h2><p class="section-lede">When the model asks for an expert that is not on the card, the engine can wait for it or run a similar one that is already there. This is the lever that mattered most.</p><div class="learned reveal"><h4>solid.cpp · what it found</h4><p>On a model that does not fit, a stand-in was the largest single gain. Qwen3.8-Flash-Next (87 GB) on the 12 GB card, same binary, tokens per second:</p>
+  <div class="bars"><div class="row"><span class="l">Expert cache off</span><span class="t"><i class="bad" data-w="5" style="--w:5%"></i></span><span class="v">3.7</span></div><div class="row"><span class="l">Cache on, no stand-ins</span><span class="t"><i class="ice" data-w="11.5" style="--w:11.5%"></i></span><span class="v">8.3</span></div><div class="row"><span class="l">Cache on + stand-ins</span><span class="t"><i class="" data-w="17.7" style="--w:17.7%"></i></span><span class="v">12.85</span></div><div class="row"><span class="l">A model that fits (Gemma-4 26B)</span><span class="t"><i class="ok" data-w="100" style="--w:100%"></i></span><span class="v">72–78</span></div></div>
+  <p style="margin-top:1rem">Pushed too far, stand-ins wreck the text: at the most aggressive setting the model produced <em>"a question to how a steps explaining on the how quicksort"</em> at a respectable-looking 11.95 tok/s. So speed alone could never be the test. Three of solid.cpp's own safety checks were also wrong, and each correction changed how HotRod measures:</p><div class="tablewrap"><table style="min-width:560px"><colgroup><col style="width:20%"><col style="width:48%"><col style="width:32%"></colgroup><thead><tr><th>Check</th><th>What it measured</th><th>Verdict</th></tr></thead><tbody><tr><td>Reproducibility</td><td>Identical greedy answers across 5 repeats. The cache changes between requests, so wording drifts.</td><td>Fired 9 times, always at 2-of-5: sampling noise. <span class="delta-neg">Removed</span></td></tr><tr><td>Fidelity score</td><td>Similarity to a stand-in-free reference. A stand-in differs by design.</td><td>Rated a correct answer at zero. <span class="delta-neg">Demoted</span> to a report</td></tr><tr><td>Degeneracy</td><td>Repeated 4-grams, one word dominating.</td><td>Caught the only real memory bug. <span class="delta-pos">Kept</span></td></tr></tbody></table></div>
+  <p class="cap">A setting that passed every short test later returned an empty answer when served with reasoning on. Quick tests may only shortlist; the decision is taken in the setup that is actually served.</p></div><div class="bridge"><svg viewBox="0 0 24 44" aria-hidden="true"><path class="run" d="M12 2V30" fill="none" stroke="#ff7a30" stroke-width="2.5" stroke-linecap="round"/><path d="M5 25l7 9 7-9" fill="none" stroke="#ff7a30" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>became</span></div><div class="built reveal"><h4>Strata-HotRod · what was built</h4><p><b>Stand-ins by confidence, not by rank.</b> A missing expert is replaced only when <code>router weight × logit gap ≤ budget</code>: a heavy pick needs a stand-in within about a logit, a light one can take one much further away. The budget tunes itself by alternating runs of the same text, each request brakes itself if re-checks show flips, and the few fragile tokens are re-run exactly.</p>
+  <p>The line was measured, then the answers were read. Short answers, warm, tokens per second on the 3060 PC:</p><div class="tablewrap"><table style="min-width:520px"><colgroup><col style="width:28%"><col style="width:16%"><col style="width:56%"></colgroup><thead><tr><th>Stand-ins from rank</th><th>tokens/s</th><th>Answers, read by a person</th></tr></thead><tbody><tr><td>off</td><td class="num">22.9</td><td>the control</td></tr><tr><td>8–9</td><td class="num">28.3</td><td>sound</td></tr><tr><td>6–9</td><td class="num">25.8</td><td>sound</td></tr><tr><td>4–9</td><td class="num">37.1</td><td>sound</td></tr><tr><td><strong>2–9 · chosen</strong></td><td class="num"><span class="delta-pos">42.2</span></td><td><span class="delta-pos">9 of 9 sound</span></td></tr><tr><td>1–9</td><td class="num">—</td><td><span class="delta-neg">failed</span> on code and reasoning (code 1 of 3)</td></tr><tr><td>0–9</td><td class="num">64.5</td><td><span class="delta-neg">broke</span>: restates the task, then stops</td></tr></tbody></table></div></div></section><section class="chap" id="lookahead"><div class="eyebrow fire">Chapter 2</div><h2>Guess ahead, but only if the guess arrives on time</h2><p class="section-lede">Knowing which experts the next layer will want lets the engine start the reads early. solid.cpp tried it twice and learned which kind of guess pays.</p><div class="learned reveal"><h4>solid.cpp · what it found</h4><p>solid.cpp trained a small predictor (a "pre-router") on its own traffic and tried three ways of using its guesses. Tokens per second:</p><div class="tablewrap"><table style="min-width:560px"><colgroup><col style="width:52%"><col style="width:24%"><col style="width:24%"></colgroup><thead><tr><th>What the guess was used for</th><th>Gemma-4 26B</th><th>Qwen3.8-Flash-Next</th></tr></thead><tbody><tr><td>Trained, but not used</td><td class="num">—</td><td class="num">9.44</td></tr><tr><td>Fetch experts before they are asked for (admission)</td><td class="num">56.59 <span class="delta-neg">hurts</span></td><td class="num">9.45 <span class="note">adds nothing</span></td></tr><tr><td>Protect likely experts from eviction</td><td class="num"><span class="delta-pos">71.41</span></td><td class="num">9.86</td></tr><tr><td>Eviction + prefer wanted experts as stand-ins</td><td class="num">52.81 <span class="delta-neg">hurts</span></td><td class="num"><span class="delta-pos">10.69</span></td></tr></tbody></table></div>
+  <div class="two" style="margin-top:1rem">
+    <div class="mini"><b>Router look-ahead</b>Runs as a graph node while the current layer computes. Lead time: exactly one layer. Arrives every time.</div>
+    <div class="mini"><b>Trained pre-router</b>Queued on a worker, one deep, and drops rather than falls behind. Arrives whenever, or never.</div>
+  </div>
+  <p style="margin-top:1rem">The guess that can be late helped keep the right experts; it did not help fetch new ones. A related trick, biasing the router toward experts already on the card, lifted the hit rate from 0.847 to 0.917 (+3.9% speed). A predictor trained live on a CPU thread, in the earlier experiments, lost outright.</p></div><div class="bridge"><svg viewBox="0 0 24 44" aria-hidden="true"><path class="run" d="M12 2V30" fill="none" stroke="#ff7a30" stroke-width="2.5" stroke-linecap="round"/><path d="M5 25l7 9 7-9" fill="none" stroke="#ff7a30" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>became</span></div><div class="built reveal"><h4>Strata-HotRod · what was built</h4><p><b>A learned look-ahead that runs on the card.</b> It starts from the model's own router and learns a small correction, one, two and four layers ahead, so the guess is never worse than the router's. It runs on the graphics card while the current layer computes, so it arrives on time, and the reads it starts use two I/O threads, next layer first: only about 3,000 of 25,000 experts read ahead were being used, and eight threads' wasted reads had queued in front of the real ones.</p>
+  <span class="chip">+8% code</span><span class="chip">+15% reasoning</span><span class="chip">+8% prose</span><span class="chip">drive wait 3.8–4.7 s → 2.8–3.0 s</span>
+  <p style="margin-top:.9rem">On DeepSeek, where a missing expert is computed on the CPU, the same guesses feed a <b>VRAM ring</b>: spare card slots filled one or two layers ahead, used only if the copy has landed.</p></div></section><section class="chap" id="memory"><div class="eyebrow fire">Chapter 3</div><h2>Make everything fit, and keep the reads cheap</h2><p class="section-lede">The drive, not the arithmetic, sets the speed. solid.cpp found that its worst slowdowns were its own bugs and its own memory budget.</p><div class="learned reveal"><h4>solid.cpp · what it found</h4><p><b>Two bugs had been blamed on the hardware.</b> The page first said the PC was the limit. The loader was page-locking memory-mapped experts on a model larger than RAM, turning 18.4 GiB into copies that could not be evicted, and every page fault read 4 MiB for a 0.88 MiB expert slice. Fixing both took the same model on the same card from <b>2.81 to 12.85 tokens/s</b>.</p>
+  <div class="bars"><div class="row"><span class="l">Before the two fixes</span><span class="t"><i class="bad" data-w="21.9" style="--w:21.9%"></i></span><span class="v">2.81</span></div><div class="row"><span class="l">After</span><span class="t"><i class="" data-w="100" style="--w:100%"></i></span><span class="v">12.85</span></div></div>
+  <p style="margin-top:1.1rem"><b>Settings chosen at a short context do not hold at a long one.</b></p><div class="tablewrap"><table style="min-width:520px"><colgroup><col style="width:52%"><col style="width:24%"><col style="width:24%"></colgroup><thead><tr><th>Qwen3.8-Flash-Next at 64K</th><th>f16 K/V cache</th><th>q8_0 K/V cache</th></tr></thead><tbody><tr><td>VRAM left after model, context and buffers</td><td class="num">1,405 MiB</td><td class="num">2,393 MiB</td></tr><tr><td>Can the 1,819 MiB draft layer load?</td><td class="num">no</td><td class="num">yes, 1,117 MiB spare</td></tr><tr><td>Decode speed</td><td class="num">8.36 tok/s</td><td class="num"><span class="delta-pos">9.17 tok/s</span></td></tr></tbody></table></div>
+  <p style="margin-top:1rem"><b>Every spare gigabyte buys speed.</b> Lowering the memory reserve one step at a time kept moving more layers onto the card:</p><div class="tablewrap"><table style="min-width:560px"><colgroup><col style="width:34%"><col style="width:26%"><col style="width:16%"><col style="width:24%"></colgroup><thead><tr><th>Memory reserve (--fit-target)</th><th>Layers still on the CPU</th><th>tokens/s</th><th>Card memory used</th></tr></thead><tbody><tr><td>1024 (default)</td><td class="num">27</td><td class="num">47.32</td><td class="num">8,951 MiB</td></tr><tr><td>640</td><td class="num">24</td><td class="num">50.37</td><td class="num">10,307 MiB</td></tr><tr><td>448</td><td class="num">23</td><td class="num">51.61</td><td class="num">10,741 MiB</td></tr><tr><td>320</td><td class="num">22</td><td class="num"><span class="delta-pos">52.85</span></td><td class="num">11,237 MiB</td></tr></tbody></table></div>
+  <p class="cap">Its furthest reach: GLM-5.3-Flash (a 93 GB quantisation, 320B parameters) ran on 42 GB of combined memory, well below the roughly 102 GB its publisher gives as a practical minimum, at 1.18 tokens/s, with a 38.7% cache hit rate. Slow, but it loaded and answered correctly.</p></div><div class="bridge"><svg viewBox="0 0 24 44" aria-hidden="true"><path class="run" d="M12 2V30" fill="none" stroke="#ff7a30" stroke-width="2.5" stroke-linecap="round"/><path d="M5 25l7 9 7-9" fill="none" stroke="#ff7a30" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>became</span></div><div class="built reveal"><h4>Strata-HotRod · what was built</h4><p><b>Pin in segments, give them back.</b> Pinning the hottest experts in memory had lost in solid.cpp, because pinned pages cannot be reclaimed and starve everything else. HotRod page-locks its RAM tier in segments (<code>STRATA_PIN_SEGS</code>) and releases them when memory is needed. A different mechanism on a different engine: <span class="chip" style="margin:0">+9% on the 3060 PC</span></p>
+  <p><b>Link budgeting.</b> The three links (SSD→RAM, RAM→card, SSD→card) are budgeted like capacities, and every step reports the bytes moved per link per token. A change that raises the hit rate but pushes more bytes over a saturated link does not count as a win.</p>
+  <p><b>Long prompts, one layer at a time.</b> The prompt passes one layer at a time, so each layer's experts are read from the SSD once rather than once per piece of the prompt, with direct reads that bypass the page cache.</p>
+  <span class="chip">8,554-token prompt read in 16.9 s</span><span class="chip">262K context fits</span><span class="chip">45K-token conversation back in 0.4 s</span>
+  <p style="margin-top:.9rem">From 64K tokens the attention's K/V streams from RAM while 32K tokens stay on the card, and a long conversation's state is saved to the SSD and reloaded instead of being read again.</p></div></section><section class="chap" id="method"><div class="eyebrow fire">Chapter 4</div><h2>Measure it like evidence</h2><p class="section-lede">Most of what solid.cpp contributed is not a feature but a way of working, and its mistakes taught it as much as its wins.</p><div class="learned reveal"><h4>solid.cpp · what it found</h4><p>Each fix below was its own before/after on the same hardware, with the same prompt and settings except the thing measured:</p><div class="bars"><div class="row"><span class="l">Frozen expert-cache bug fixed</span><span class="t"><i class="" data-w="100" style="--w:100%"></i></span><span class="v">+65%</span></div><div class="row"><span class="l">Cache fed by prediction, not history</span><span class="t"><i class="" data-w="63" style="--w:63%"></i></span><span class="v">+41%</span></div><div class="row"><span class="l">Overlapped prefill uploads</span><span class="t"><i class="" data-w="55.4" style="--w:55.4%"></i></span><span class="v">+36.0%</span></div><div class="row"><span class="l">Expert cache vs naive CPU offload</span><span class="t"><i class="" data-w="48.2" style="--w:48.2%"></i></span><span class="v">+31.3%</span></div><div class="row"><span class="l">MTP speculative decoding</span><span class="t"><i class="" data-w="43.2" style="--w:43.2%"></i></span><span class="v">+28.1%</span></div><div class="row"><span class="l">Empirical placement search</span><span class="t"><i class="" data-w="33.2" style="--w:33.2%"></i></span><span class="v">+21.6%</span></div><div class="row"><span class="l">Prefetch double-buffer</span><span class="t"><i class="" data-w="19.5" style="--w:19.5%"></i></span><span class="v">+12.7%</span></div><div class="row"><span class="l">Real placement optimum</span><span class="t"><i class="" data-w="15.4" style="--w:15.4%"></i></span><span class="v">+10.0%</span></div></div>
+  <p style="margin-top:1.1rem"><b>Defaults were chosen by paired runs</b>, three rounds each, with a control alongside (Gemma-4):</p><div class="tablewrap"><table style="min-width:520px"><colgroup><col style="width:58%"><col style="width:18%"><col style="width:24%"></colgroup><thead><tr><th>Default</th><th>Evidence</th><th>Rounds won</th></tr></thead><tbody><tr><td>Neuron subsetting off unless calibrated on</td><td class="num">+50%</td><td class="num">24 of 24</td></tr><tr><td>Draft depth 4 (acceptance 0.61 against 0.40)</td><td class="num">+22%</td><td class="num">22 of 24</td></tr><tr><td>Draft confidence gate p_min 0.5</td><td class="num">+13%</td><td class="num">19 of 24</td></tr><tr><td>Probabilistic draft acceptance on (off is −9%)</td><td class="num">+9%</td><td class="num">20 of 24</td></tr></tbody></table></div>
+  <p style="margin-top:1rem"><b>Wrong decisions came from the order of the tests.</b> The draft was eliminated before it was configured; a prefill number (42.3 against 48.5 tok/s) switched prefetch off for every decode stage; the acceptance mode was chosen 2,000 lines after the depth it decides. Eight faults were found along the way, among them an illegal memory access with lazily committed K/V, an out-of-memory in CUDA graph capture, and a skipped calibration stage that cached the launch value as if it were a measurement. A "+21% to +50%" gain from three single runs was retracted as noise.</p></div><div class="bridge"><svg viewBox="0 0 24 44" aria-hidden="true"><path class="run" d="M12 2V30" fill="none" stroke="#ff7a30" stroke-width="2.5" stroke-linecap="round"/><path d="M5 25l7 9 7-9" fill="none" stroke="#ff7a30" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>became</span></div><div class="built reveal"><h4>Strata-HotRod · what was built</h4><p><b>The test ledger.</b> Every decision in <code>SPEC.md</code> stays untested until a row in the ledger holds a measurement on the target PC, and a decision whose test fails is reopened, whoever made it. Comparisons use alternated A/B pairs with a control, and every answer is read by a person.</p>
+  <div class="loop" style="margin-top:1.1rem">
+    <div class="s"><b>1 · Hypothesis</b>One idea, one switch, one expected effect, a named test.</div>
+    <div class="s"><b>2 · Paired A/B</b>Same prompts, alternated runs, an identical-config control.</div>
+    <div class="s"><b>3 · Read the answers</b>Speed bought with broken text does not count.</div>
+    <div class="s"><b>4 · Ledger</b>A row with the measurement, the PC and the date.</div>
+    <div class="s"><b>5 · Keep or retract</b>A failed test reopens the decision. Noise is retracted in writing.</div>
+  </div>
+  <p style="margin-top:1rem">Several October commits come from systematic code review: hangs on error paths, an image-job deadlock, a batch-state bug in the CUDA decode path, a read past a tensor's storage.</p></div></section>
+<section id="token">
+  <div class="eyebrow fire">How it works</div>
+  <h2>One token, one expert at a time</h2>
+  <p class="section-lede">Watch an expert request go through the engine. Each loop shows one of the four possible outcomes.</p>
+  <div class="card flat"><div class="diagram">
+  <svg id="tokSvg" viewBox="0 0 640 560" role="img" aria-label="Flowchart of how a requested expert is served">
+    <defs><marker id="ah2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#7d838e"/></marker></defs>
+    <rect x="80" y="8" width="260" height="52" rx="26" fill="#181b22" stroke="#3a3f4a" stroke-width="1.5"/>
+    <text x="210" y="31" text-anchor="middle" class="t-lab t-b">The router picks experts</text>
+    <text x="210" y="50" text-anchor="middle" class="t-sm">for the next word</text>
+    <path d="M210 84 L335 130 L210 176 L85 130 Z" fill="#12141a" stroke="#ffb054" stroke-width="2"/>
+    <text x="210" y="136" text-anchor="middle" class="t-lab t-b">On the card?</text>
+    <path d="M210 204 L340 252 L210 300 L80 252 Z" fill="#12141a" stroke="#ffb054" stroke-width="2"/>
+    <text x="210" y="248" text-anchor="middle" class="t-lab t-b">Stand-in OK?</text>
+    <text x="210" y="268" text-anchor="middle" class="t-sm">weight × gap ≤ budget</text>
+    <path d="M210 328 L335 374 L210 420 L85 374 Z" fill="#12141a" stroke="#ffb054" stroke-width="2"/>
+    <text x="210" y="380" text-anchor="middle" class="t-lab t-b">In the RAM tier?</text>
+    <g fill="none" stroke="#7d838e" stroke-width="2" marker-end="url(#ah2)">
+      <path d="M210 60 V82"/><path d="M210 176 V202"/><path d="M210 300 V326"/><path d="M210 420 V452"/>
+      <path d="M335 130 H402"/><path d="M340 252 H402"/><path d="M335 374 H402"/>
+    </g>
+    <g class="t-sm t-b" style="fill:#aeb3bd"><text x="358" y="120">yes</text><text x="361" y="242">yes</text><text x="358" y="364">yes</text>
+      <text x="222" y="194">no</text><text x="222" y="318">no</text><text x="222" y="442">no</text></g>
+    <rect id="bx_card" class="node-box" x="404" y="106" width="226" height="48" rx="12" fill="#231710" stroke="#ff7a30" stroke-width="2" style="color:#ff7a30"/>
+    <text x="517" y="136" text-anchor="middle" class="t-lab t-b" style="fill:#ffd9bd">Compute on the card</text>
+    <rect id="bx_stand" class="node-box" x="404" y="228" width="226" height="48" rx="12" fill="#231710" stroke="#ff7a30" stroke-width="2" style="color:#ff7a30"/>
+    <text x="517" y="258" text-anchor="middle" class="t-lab t-b" style="fill:#ffd9bd">Use the closest on card</text>
+    <rect id="bx_ram" class="node-box" x="404" y="350" width="226" height="48" rx="12" fill="#1f190f" stroke="#ffb054" stroke-width="2" style="color:#ffb054"/>
+    <text x="517" y="380" text-anchor="middle" class="t-lab t-b" style="fill:#ffe3b8">Read it from RAM</text>
+    <rect id="bx_ssd" class="node-box" x="80" y="454" width="260" height="56" rx="12" fill="#0e1822" stroke="#5fb4ff" stroke-width="2" style="color:#5fb4ff"/>
+    <text x="210" y="478" text-anchor="middle" class="t-lab t-b" style="fill:#bfe0ff">Read it from the SSD</text>
+    <text x="210" y="498" text-anchor="middle" class="t-sm">direct, bypassing the page cache</text>
+    <rect x="404" y="440" width="226" height="86" rx="12" fill="#18160f" stroke="#ffb054" stroke-width="1.5" stroke-dasharray="6 5"/>
+    <text x="517" y="466" text-anchor="middle" class="t-lab t-b" style="fill:#ffe3b8">Learned look-ahead</text>
+    <text x="517" y="488" text-anchor="middle" class="t-sm">guesses the next 1–4 layers</text>
+    <text x="517" y="507" text-anchor="middle" class="t-sm">and starts these reads early</text>
+    <g fill="none" stroke="#ffb054" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ah2)"><path d="M404 482 H344"/><path d="M517 440 V402"/></g>
+    <!-- invisible routes the token follows -->
+    <path id="rt_card" d="M210 60 V130 H404" fill="none" stroke="none"/>
+    <path id="rt_stand" d="M210 60 V252 H404" fill="none" stroke="none"/>
+    <path id="rt_ram" d="M210 60 V374 H404" fill="none" stroke="none"/>
+    <path id="rt_ssd" d="M210 60 V454" fill="none" stroke="none"/>
+    <circle id="tokDot" r="6" cx="210" cy="34" fill="#ffb054" opacity="0"/>
+  </svg></div>
+  <p class="tok-cap" id="tokCap" aria-live="polite">The engine answers each request in the cheapest way that keeps the text right.</p>
+  <p class="cap" style="text-align:center;text-align-last:center">Close call? The token is run again exactly, without stand-ins.</p></div>
+</section>
+
+<section id="results">
+  <div class="eyebrow fire">Results</div>
+  <h2>What the work bought</h2>
+  <p class="section-lede">Qwen3.8-Flash-Next, IQ3_S (78 GB), tokens per second as the work progressed on the same PC. Prompts and context length differ between stages, so read it as a progression, not a controlled comparison.</p>
+  <div class="card flat"><div class="bars"><div class="row"><span class="l">Stock Strata · 10 Oct</span><span class="t"><i class="bad" data-w="24" style="--w:24%"></i></span><span class="v">17.2</span></div><div class="row"><span class="l">+ I/O prefetch on · 10 Oct</span><span class="t"><i class="ice" data-w="38" style="--w:38%"></i></span><span class="v">27.2</span></div><div class="row"><span class="l">+ stand-ins, draft head · 11 Oct</span><span class="t"><i class="" data-w="62" style="--w:62%"></i></span><span class="v">44.6</span></div><div class="row"><span class="l">Merged version · 11 Oct</span><span class="t"><i class="" data-w="81" style="--w:81%"></i></span><span class="v">58.4</span></div><div class="row"><span class="l">Final · 24 Oct, 131K context</span><span class="t"><i class="ok" data-w="100" style="--w:100%"></i></span><span class="v">50–70</span></div></div></div>
+  <div class="two" style="margin-top:1rem">
+    <div class="card flat"><h3 style="font-family:var(--font-display);font-size:1.05rem;margin:0 0 .8rem">By kind of answer, 24 Oct</h3><div class="bars"><div class="row"><span class="l">Code</span><span class="t"><i class="" data-w="76" style="--w:76%"></i></span><span class="v">52–55</span></div><div class="row"><span class="l">Reasoning</span><span class="t"><i class="" data-w="97" style="--w:97%"></i></span><span class="v">66–71</span></div><div class="row"><span class="l">Story</span><span class="t"><i class="" data-w="73" style="--w:73%"></i></span><span class="v">50–53</span></div></div>
+      <p class="cap">An 8,554-token prompt is read in 16.9 s and answered at 52–54 tokens/s (262K context).</p></div>
+    <div class="card flat"><h3 style="font-family:var(--font-display);font-size:1.05rem;margin:0 0 .8rem">Models run on the same PC</h3><div class="bars"><div class="row"><span class="l">Qwen 78 GB</span><span class="t"><i class="ok" data-w="100" style="--w:100%"></i></span><span class="v">50–70</span></div><div class="row"><span class="l">Qwen 111 GB</span><span class="t"><i class="ice" data-w="32" style="--w:32%"></i></span><span class="v">15–22</span></div><div class="row"><span class="l">DeepSeek 341 GB</span><span class="t"><i class="ice" data-w="11" style="--w:11%"></i></span><span class="v">5–8</span></div></div>
+      <p class="cap">DeepSeek: about 5 on 31 Oct, 7–8 over a whole answer per the 15 Nov README. The 111 GB and DeepSeek results rest on fewer runs.</p></div>
+  </div>
+
+</section>
+
+<section id="install">
+  <div class="eyebrow fire">Install HotRod</div>
+  <h2>Installing Strata-HotRod</h2>
+  <p class="section-lede">HotRod is Strata plus the changes in this repository, so the engine is built from Strata with HotRod's files laid over it. This is the Qwen3.8-Flash-Next build; the DeepSeek port has its own notes in <code>hotrod-deepseek/</code>.</p>
+
+  <div class="tablewrap" style="margin-bottom:1.2rem"><table>
+    <colgroup><col style="width:28%"><col style="width:72%"></colgroup>
+    <thead><tr><th>You need</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr><td>Graphics card</td><td>NVIDIA, with a recent driver and the <strong>CUDA 13</strong> toolkit (neither is installed for you)</td></tr>
+      <tr><td>Compiler</td><td>gcc-toolset-13 (Rocky Linux 9; other distributions are untested)</td></tr>
+      <tr><td>Python</td><td>3.10 or newer with venv. Rocky/Alma/RHEL 9 ship 3.9, which is too old: install <code>python3.12</code> first</td></tr>
+      <tr><td>Disk</td><td>NVMe with about <strong>137 GB free</strong> for IQ3_S on a PC whose RAM cannot hold the experts (84 GB download, a 50 GB copy of the experts, room for the draft layer). Setup refuses to start below this</td></tr>
+      <tr><td>Memory</td><td>Measured on 30 GB. Setup says it wants 64 GB for IQ3_S; naming the model is the consent</td></tr>
+    </tbody></table></div>
+
+  <div class="steps">
+    <div class="step"><h3>Install the prerequisites</h3>
+<pre><code>sudo dnf install -y git gcc-toolset-13 python3.12 python3.12-pip</code></pre></div>
+    <div class="step"><h3>Get Strata-HotRod</h3>
+      <p>This page is a legacy copy of the 18 Nov 2026 write-up, which installed HotRod as a patch over Strata commit <b>477ac13c</b>. That route is superseded: <code>main</code> of Strata-HotRod is the complete engine.</p>
+<pre><code>git clone https://github.com/sangharshadhyeta/Strata-HotRod.git
+cd Strata-HotRod</code></pre></div>
+    <div class="step"><h3>Build and set up</h3>
+      <p><code>--build</code> compiles HotRod's engine; without it setup downloads upstream's, which lacks these changes. It also downloads the learned look-ahead's trained state (5.4 MB, SHA-256 checked) into <code>data/</code>.</p>
+<pre><code>scl enable gcc-toolset-13 -- ./setup.sh --model IQ3_S --context 131072 --build --yes --no-start</code></pre>
+      <p>For 262K context set <code>--max-context 262144</code> in the config's <code>args</code>. <code>--models-dir /path/on/nvme</code> puts the model files elsewhere.</p></div>
+    <div class="step"><h3>Run it, inside a memory limit</h3>
+      <p>Cap the server at 94% of RAM: two uncapped runs once froze the test PC. On your own PC, add <code>--host 0.0.0.0 --api-key YOUR_KEY</code> only if you need access from other machines.</p>
+<pre><code>systemd-run --scope -p MemoryMax=$(awk '/MemTotal/ {printf "%dK", $2 * 0.94}' /proc/meminfo) -p MemorySwapMax=0 \
+  .venv/bin/python serve/server.py --engine strata --config strata-iq3_s.json --port 8095</code></pre></div>
+    <div class="step"><h3>Open it</h3>
+      <p>When it prints <code>ready: http://127.0.0.1:8095/v1</code>, open <code>http://127.0.0.1:8095</code>. The first hour is the engine fitting itself to your PC (VRAM reserve, RAM tier, which experts sit where), so it starts slower and speeds up.</p></div>
+  </div>
+
+  <div class="warnbox"><p><strong>What was and was not tested.</strong> On a fresh clone of Strata at 477ac13c the patch applies, all 55 changed Python files compile, every source file listed in <code>CMakeLists.txt</code> exists (the few absent paths are generated, fetched at build, or guarded by an existence test), the headers the changed C++/CUDA files include resolve, and all 43 setup tests that need no graphics card pass. The original install notes (<code>hotrod-qwen/PRODUCT-README.md</code>) were tested on 13 Nov on an RTX 3060, Rocky Linux 9, CUDA 13.3 up to setup's disk check. The 84 GB model download, the compile and the first start from a patched clone were <strong>not</strong> run.</p></div>
+</section>
+
+<section id="credit">
+  <div class="eyebrow fire">Credit</div>
+  <h2>What is whose</h2>
+  <p class="section-lede">This work stands on other people's open-source projects, and the history makes the split plain. Every project, paper, model, dataset and contributor is listed in <a href="https://github.com/sangharshadhyeta/Strata-HotRod/blob/legacy-solid/CITATIONS.md">CITATIONS.md</a>: 29 papers, the prior-art projects, the models and 30 named Strata contributors.</p>
+  <div class="two">
+    <div class="card flat"><div class="chain">
+      <div class="node up"><b>llama.cpp</b><small>ggml-org and contributors · MIT</small></div>
+      <div class="dn">▼ forked</div>
+      <div class="node me"><b>solid.cpp</b><small>the author · about 540 commits · 13 Aug – 3 Oct</small></div>
+      <div class="dn" style="margin-top:.4rem">lessons carried forward</div>
+      <div class="node up"><b>Strata</b><small>Niko1221 and contributors · MIT · about 3,600 commits</small></div>
+      <div class="dn">▼ modified</div>
+      <div class="node me"><b>Strata-HotRod</b><small>the author · about 630 commits (Qwen), about 120 (DeepSeek)</small></div>
+      <div class="dn">▼ ported with</div>
+      <div class="node up"><b>Project Maya</b><small>mw00 and contributors · MIT · the DeepSeek engine (maya-ds4)</small></div>
+    </div></div>
+    <div class="card flat"><h3 style="font-family:var(--font-display);font-size:1.05rem;margin:0 0 .8rem">Commits in the Strata-HotRod history</h3>
+      <div class="bars">
+        <div class="row" style="grid-template-columns:1fr"><span class="l">Niko1221 · upstream Strata</span></div>
+        <div class="row" style="grid-template-columns:1fr 64px"><span class="t"><i class="ice" data-w="100" style="--w:100%"></i></span><span class="v">≈3,600</span></div>
+        <div class="row" style="grid-template-columns:1fr"><span class="l">The author · HotRod</span></div>
+        <div class="row" style="grid-template-columns:1fr 64px"><span class="t"><i data-w="17.5" style="--w:17.5%"></i></span><span class="v">≈630</span></div>
+      </div>
+      <p class="cap">The author's part is the stand-in, look-ahead and prompt-reading work above, the tools for simulation, predictor experiments and link benchmarks, fixes from code review, and the specification and measurement notes. It was done with <b>Claude Code</b>, an AI coding assistant, directed by the author, who set the decisions and read the results.</p></div>
+  </div>
+</section>
+
+<section id="repo">
+  <div class="eyebrow fire">Limits and repository</div>
+  <h2>What this does not show, and where to look</h2>
+  <div class="lim">
+    <span>One PC, one card, one drive</span><span>AMD, Intel and Apple not tested here</span><span>Speeds are for short answers</span><span>Answers read by a person, not a standard accuracy test</span><span>Not independently reproduced</span><span>Changed files only, not a buildable copy</span>
+  </div>
+  <div class="card flat" style="margin-top:1.2rem"><div class="tree">index.html            <em>this page</em>
+README.md · UPSTREAM.md   <em>guide, and what is whose</em>
+<b>solid-cpp/</b>            <em>the learning ground: notes, ROADMAP, LEARNINGS, changed sources</em>
+<b>hotrod-qwen/</b>          <em>SPEC.md (spec + test ledger) · docs · tools · benchmarks · sources</em>
+<b>hotrod-deepseek/</b>      <em>the DeepSeek port: docs and sources</em>
+LICENSE              <em>MIT, upstream credit kept</em></div></div>
+  <p class="cap">Start with <code>hotrod-qwen/SPEC.md</code>, then <code>hotrod-qwen/docs/HOTROD-DETAILS.md</code> (every change with its measurement) and <code>hotrod-qwen/docs/solid-page-vs-strata.md</code> (the two projects compared line by line).</p>
+</section>
+<div class="print-only printlinks"><b>Links</b><ul>
+<li>Live write-up (animated page): <a href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/legacy-solid">https://github.com/sangharshadhyeta/Strata-HotRod/tree/legacy-solid</a></li>
+<li>Repository: <a href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/legacy-solid">https://github.com/sangharshadhyeta/Strata-HotRod/tree/legacy-solid</a></li>
+<li>All citations and credits: <a href="https://github.com/sangharshadhyeta/Strata-HotRod/blob/legacy-solid/CITATIONS.md">https://github.com/sangharshadhyeta/Strata-HotRod/blob/legacy-solid/CITATIONS.md</a></li>
+<li>Specification and test ledger: <a href="https://github.com/sangharshadhyeta/Strata-HotRod/blob/main/SPEC.md">https://github.com/sangharshadhyeta/Strata-HotRod/blob/main/SPEC.md</a></li>
+<li>Strata, by Niko1221 and contributors: <a href="https://github.com/Niko1221/Strata">https://github.com/Niko1221/Strata</a></li>
+<li>llama.cpp: <a href="https://github.com/ggml-org/llama.cpp">https://github.com/ggml-org/llama.cpp</a></li>
+<li>Project Maya: <a href="https://github.com/mw00/project-maya">https://github.com/mw00/project-maya</a></li>
+</ul></div>
+<footer class="site">Strata is MIT-licensed, © Niko1221 and the Strata contributors; llama.cpp is MIT-licensed. Both licences are kept in this repository. Figures are the author's own measurements as recorded in the notes.</footer>
+</div>
+
+<script>
+(function(){
+  var reduce = (window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) || /[?&]print/.test(location.search);
+  document.documentElement.classList.remove('no-js');
+
+  /* nav: shadow + active link */
+  var nav = document.getElementById('topnav');
+  function onScroll(){ if(nav) nav.classList.toggle('scrolled', window.scrollY > 8); }
+  onScroll(); addEventListener('scroll', onScroll, {passive:true});
+  var links = [].slice.call(document.querySelectorAll('.nav-link'));
+  var secs = links.map(function(a){return document.querySelector(a.getAttribute('href'));}).filter(Boolean);
+  if ('IntersectionObserver' in window) {
+    var spy = new IntersectionObserver(function(es){
+      es.forEach(function(e){ if(e.isIntersecting){ links.forEach(function(a){ a.classList.toggle('active', a.getAttribute('href') === '#' + e.target.id); }); } });
+    }, {rootMargin:'-45% 0px -50% 0px'});
+    secs.forEach(function(s){ spy.observe(s); });
+  }
+
+  /* reveal + bars + counters */
+  function runBars(root){ [].forEach.call(root.querySelectorAll('i[data-w]'), function(el,i){ setTimeout(function(){ el.style.width = el.getAttribute('data-w') + '%'; }, reduce ? 0 : i*110); }); }
+  function countUp(el){
+    var to = parseFloat(el.getAttribute('data-count')), dec = (el.getAttribute('data-count').split('.')[1]||'').length;
+    if (reduce) { el.textContent = to.toFixed(dec); return; }
+    var t0 = null, dur = 1400;
+    function step(t){ if(!t0) t0 = t; var p = Math.min(1,(t-t0)/dur); p = 1-Math.pow(1-p,3); el.textContent = (to*p).toFixed(dec); if(p<1) requestAnimationFrame(step); }
+    el.textContent = (0).toFixed(dec); requestAnimationFrame(step);
+  }
+  var seen = function(el){ el.classList.add('in'); runBars(el); [].forEach.call(el.querySelectorAll('[data-count]'), countUp); if (el.matches('[data-count]')) countUp(el); };
+  var targets = [].slice.call(document.querySelectorAll('.reveal, .card, .stat-card, #hstats, #tlcard, .tablewrap'));
+  if ('IntersectionObserver' in window && !reduce) {
+    var io = new IntersectionObserver(function(es){ es.forEach(function(e){ if(e.isIntersecting){ seen(e.target); io.unobserve(e.target); } }); }, {threshold:.18});
+    targets.forEach(function(t){ io.observe(t); });
+    [].forEach.call(document.querySelectorAll('.bars'), function(b){ if(!b.closest('.card')) io.observe(b); });
+  } else { targets.forEach(seen); [].forEach.call(document.querySelectorAll('.bars'), runBars); }
+
+
+  /* expert placement grid */
+  var grid = document.getElementById('pgrid');
+  if (grid) {
+    var cols = window.innerWidth < 640 ? 16 : 24, N = cols * 6, cells = [], st = [], i;
+    for (i = 0; i < N; i++) { var c = document.createElement('i'); grid.appendChild(c); cells.push(c); var r0 = Math.random(); st.push(r0 < .13 ? 2 : (r0 < .42 ? 1 : 0)); }
+    function paint(i){ cells[i].className = ['c','w','h'][st[i]]; }
+    for (i = 0; i < N; i++) paint(i);
+    var stats = document.getElementById('plStats'), pcap = document.getElementById('plCap');
+    var tot = 0, onCard = 0, stand = 0, ram = 0, ssd = 0;
+    function pick(t){ var idx = []; for (var k = 0; k < N; k++) if (st[k] === t) idx.push(k); return idx.length ? idx[Math.floor(Math.random()*idx.length)] : -1; }
+    function show(){ stats.textContent = 'served without waiting ' + (tot ? Math.round(100*(onCard+stand)/tot) : 0) + '%  ·  RAM reads ' + ram + '  ·  SSD reads ' + ssd; }
+    function demote(from, keep){ var d = pick(from); if (d >= 0 && keep.indexOf(d) < 0) { st[d] = from - 1; paint(d); } }
+    function stepPlace(){
+      var req = [], k = 0;
+      while (req.length < 3 && k++ < 30) {
+        var r = Math.random(), t = r < .55 ? 2 : (r < .8 ? 1 : 0), x = pick(t);
+        if (x >= 0 && req.indexOf(x) < 0) req.push(x);
+      }
+      req.forEach(function(x, n){
+        setTimeout(function(){
+          var tier = st[x], msg = ''; tot++;
+          cells[x].classList.add('req');
+          if (tier === 2) { onCard++; msg = 'Expert on the card: computed at once.'; }
+          else if (tier === 1) { ram++; st[x] = 2; msg = 'Expert in RAM: read over PCIe and promoted onto the card.'; demote(2, req); }
+          else if (Math.random() < .4) {
+            stand++; var h = pick(2); if (h >= 0) { cells[h].classList.add('sub'); setTimeout(function(){ paint(h); }, 800); }
+            msg = 'Expert on the SSD, but a close one is on the card: a stand-in answers with no waiting.';
+          } else { ssd++; cells[x].classList.add('ssd'); st[x] = 1; msg = 'Expert on the SSD: read from the drive and moved up to RAM.'; demote(1, req); }
+          setTimeout(function(){ cells[x].classList.remove('req'); cells[x].classList.remove('ssd'); paint(x); }, 700);
+          pcap.textContent = msg; show();
+        }, n * 260);
+      });
+    }
+    show();
+    if (!reduce && 'IntersectionObserver' in window) {
+      var timer = null, gio = new IntersectionObserver(function(es){ es.forEach(function(e){
+        if (e.isIntersecting && !timer) timer = setInterval(stepPlace, 1500);
+        else if (!e.isIntersecting && timer) { clearInterval(timer); timer = null; }
+      }); }, {threshold:.25});
+      gio.observe(document.getElementById('placeCard'));
+    }
+  }
+
+  /* SMIL packets */
+  if (reduce) { [].forEach.call(document.querySelectorAll('svg'), function(s){ if (s.pauseAnimations) s.pauseAnimations(); }); }
+
+  /* token flow */
+  var dot = document.getElementById('tokDot'), cap = document.getElementById('tokCap');
+  if (dot && !reduce && 'IntersectionObserver' in window) {
+    var routes = [
+      {p:'rt_card',  box:'bx_card',  t:'<b>On the card:</b> the expert is already there, computed exactly.'},
+      {p:'rt_stand', box:'bx_stand', t:'<b>Stand-in:</b> not on the card, but a close one is, and weight × gap is within the budget.'},
+      {p:'rt_ram',   box:'bx_ram',   t:'<b>From RAM:</b> too different to swap, so it is read from the RAM tier.'},
+      {p:'rt_ssd',   box:'bx_ssd',   t:'<b>From the SSD:</b> the last resort, read directly. The look-ahead tries to make this rare.'}
+    ];
+    var idx = 0, running = false;
+    function lightOff(){ routes.forEach(function(r){ document.getElementById(r.box).classList.remove('lit'); }); }
+    function go(){
+      var r = routes[idx % routes.length], path = document.getElementById(r.p), len = path.getTotalLength();
+      lightOff(); dot.setAttribute('opacity','1'); cap.innerHTML = '';
+      var t0 = null, dur = 700 + len*4.2;
+      function step(t){
+        if(!t0) t0 = t; var p = Math.min(1,(t-t0)/dur), e = p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2;
+        var pt = path.getPointAtLength(len*e); dot.setAttribute('cx', pt.x); dot.setAttribute('cy', pt.y);
+        if (p < 1) requestAnimationFrame(step);
+        else { document.getElementById(r.box).classList.add('lit'); cap.innerHTML = r.t; idx++; setTimeout(function(){ dot.setAttribute('opacity','0'); setTimeout(go, 350); }, 2300); }
+      }
+      requestAnimationFrame(step);
+    }
+    var tio = new IntersectionObserver(function(es){ es.forEach(function(e){ if(e.isIntersecting && !running){ running = true; go(); } }); }, {threshold:.35});
+    tio.observe(document.getElementById('tokSvg'));
+  } else if (cap) { cap.innerHTML = 'On the card, as a stand-in, from RAM, or from the SSD: the engine takes the cheapest route that keeps the text right.'; }
+})();
+</script>
+
+</body>
+</html>
