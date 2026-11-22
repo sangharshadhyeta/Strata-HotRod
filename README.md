@@ -1,12 +1,14 @@
 <p align="center"><i> Coming Soon: <s>A system which rewires the model around the way you use it.</s></i></p>
 
-Watch this first: [NoPlaceLikeLocalhost](https://youtu.be/WSJL4SOIZDg?si=qPTa3jeK4YtDLCPy) - This repo is for the hosters who like to get under the hood, tinker, tune and make things their own. Who believe in building, not just buying; in ingenuity over expensive hardware; and in pushing what they've got to do what others thought it couldn't.
+Watch this first: [NoPlaceLikeLocalhost](https://youtu.be/WSJL4SOIZDg?si=qPTa3jeK4YtDLCPy)
+
+<p align="center"><img src="docs/media/hotrod-hero.gif" width="380" alt="Strata Hot Rod: the Strata hexagon in fire and ice"></p>
+
+This repo is for the hosters who like to get under the hood, tinker, tune and make things their own. Who believe in building, not just buying; in ingenuity over expensive hardware; and in pushing what they've got to do what others thought it couldn't.
 
 And in the spirit of open source, sharing what they build, learning from each other, and making the whole community better along the way.
 
 Take the machine you have. Make it your own. Share what you learn. See what it'll do.
-
-<p align="center"><img src="docs/media/hotrod-hero.gif" width="380" alt="Strata Hot Rod: the Strata hexagon in fire and ice"></p>
 
 <h1 align="center">Strata-HotRod</h1>
 
@@ -93,16 +95,44 @@ with less RAM it reads the rest from the SSD, much slower.
 
 <div align="justify">
 
-Measured on the machine below; a token is about ¾ of a word. Every answer in these runs was read and checked.
+Measured on one PC: RTX 3060 12 GB, i5-12400F, 30 GB RAM, NVMe (the full list is below). A token is about ¾ of a word. Every answer
+in these runs was read and checked.
 
 </div>
 
+<table>
+<tr>
+<td valign="top" width="50%">
+
 <table width="100%">
-<tr><th align="left">Answer</th><th align="right">tokens/s (24 Oct, 131K context)</th></tr>
-<tr><td align="left">Code (a Python function, 500-650 tokens)</td><td align="right">52 - 55</td></tr>
-<tr><td align="left">Reasoning (a two-train problem, ~1,000 tokens)</td><td align="right">66 - 71</td></tr>
-<tr><td align="left">Story (a paragraph, 100-150 tokens)</td><td align="right">50 - 53</td></tr>
+<tr><th align="left">Qwen3.8-Flash-Next IQ3_S<br>131K context, 24 Oct</th><th align="right">tokens/s</th></tr>
+<tr><td align="left">Code (a Python function, 500-650 tokens)</td><td align="right">52 – 55</td></tr>
+<tr><td align="left">Reasoning (a two-train problem, ~1,000 tokens)</td><td align="right">66 – 71</td></tr>
+<tr><td align="left">Story (a paragraph, 100-150 tokens)</td><td align="right">50 – 53</td></tr>
 </table>
+
+</td>
+<td valign="top" width="50%">
+
+<table width="100%">
+<tr><th align="left">Stage, same PC</th><th align="right">tokens/s</th></tr>
+<tr><td align="left">Stock Strata, 10 Oct (32K)</td><td align="right">17.2</td></tr>
+<tr><td align="left">I/O prefetch on (test T1)</td><td align="right">27.2</td></tr>
+<tr><td align="left">Stand-ins from rank 2 + draft head</td><td align="right">44.6</td></tr>
+<tr><td align="left">Merged version (SPEC 20 step 9o)</td><td align="right">58.4</td></tr>
+<tr><td align="left">Final, 24 Oct</td><td align="right">50 – 70</td></tr>
+</table>
+
+</td>
+</tr>
+</table>
+
+<div align="justify">
+
+The 111 GB UD-Q4_K_XL ran at 15–22 tokens/s (14 Nov, learners still cold). DeepSeek-V4.1-Flash (341 GB) ran at about 5
+tokens/s on 31 Oct, and 7.5–8 over a whole answer on 13 Nov. These rest on fewer runs than the 78 GB result.
+
+</div>
 
 <table width="100%">
 <tr><th align="left">Long prompts (262K context, 20 Oct)</th><th align="right">Read in</th><th align="right">Answer written at</th></tr>
