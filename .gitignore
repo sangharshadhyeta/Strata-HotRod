@@ -73,3 +73,7 @@ data/expert-predictor/
 data/standin-tune-*.txt
 data/predictor-*.bin
 data/predictor-*.txt
+
+# local config backups made before editing a serve config
+*.json.bak
+*.json.bak-*
