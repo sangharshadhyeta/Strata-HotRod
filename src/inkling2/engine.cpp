@@ -8,6 +8,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/inkling2/drafter.hpp"
 #include "strata/kernels/moe_group.hpp"
+#include "strata/kernels/sampler.hpp"
 #include "strata/kernels/moe_slot_cache.hpp"
 
 #include <cuda_runtime.h>
@@ -604,7 +605,8 @@ struct Engine::Impl {
     // n single steps.  What stays per token are the short convs (a sliding state) - launches, not kernels over n rows.  Numerics are the single step's.
     static constexpr int kB = 8;
     struct BatchBufs {
-        float *H, *PRE, *BLK, *MS, *MSG, *INS, *XS, *Q, *R, *GATE, *SINK, *K, *V, *KC, *VC, *DYNK, *DYNV, *ATT, *PROJ, *A, *MIN, *RL, *SCR, *CAT, *G64, *FGT, *GNN, *TMP, *MM, *HD, *LOG;
+        float *H, *PRE, *BLK, *MS, *MSG, *INS, *XS, *Q, *R, *GATE, *SINK, *K, *V, *KC, *VC, *DYNK, *DYNV, *ATT, *PROJ, *A, *MIN, *RL, *SCR, *CAT, *G64, *FGT, *GNN, *TMP, *MM, *HD, *LOG, *LOGC;
+        int *DTOK = nullptr, *OUT = nullptr;
         void* XQ = nullptr;
         bool ready = false;
     } bb;
@@ -620,6 +622,7 @@ struct Engine::Impl {
         bb.SCR = fmalloc((size_t) kB * H * cap);
         bb.CAT = fmalloc(kB * 2 * E); bb.G64 = fmalloc((size_t) kB * c.gate_rank); bb.FGT = fmalloc(kB * E); bb.GNN = fmalloc(kB * E); bb.TMP = fmalloc(kB * E);
         bb.MM = fmalloc(kB * E); bb.HD = fmalloc(kB * E); bb.LOG = fmalloc((size_t) kB * c.n_vocab);
+        bb.LOGC = fmalloc((size_t) kB * c.n_vocab_real); bb.DTOK = (int*) dmalloc(16 * 4); bb.OUT = (int*) dmalloc(16 * 4);
         bb.XQ = dmalloc((size_t) kB * (std::max<int64_t>(E, H * D) / 32) * 36 + 4096);
         bb.ready = true;
     }
@@ -892,6 +895,17 @@ void Engine::step(int64_t token, int pos, std::vector<float>* logits, const Seam
 void Engine::step_block(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* logits) { p_->step_block(tokens, n, pos0, logits); }
 void Engine::reset() { p_->reset(); }
 bool Engine::spec_enabled() const { return p_->drafter != nullptr; }
+bool Engine::spec_sample_block(const int32_t* dtok, int n_tokens, const kernels::SamplerParams& p, int* out) {
+    Impl& d = *p_;
+    if (!d.drafter || n_tokens < 1 || n_tokens > Impl::kB) return false;
+    // the block's softcapped logits [n][n_vocab] (padded rows of the head) -> [n][n_vocab_real], the sampler's layout
+    d.c2d(d.bb.LOGC, (size_t) d.c.n_vocab_real, d.bb.LOG, (size_t) d.c.n_vocab, (size_t) d.c.n_vocab_real, n_tokens);
+    if (n_tokens > 1) CK(cudaMemcpyAsync(d.bb.DTOK, dtok, (size_t) (n_tokens - 1) * 4, cudaMemcpyHostToDevice, d.st));
+    if (!strata::kernels::sample_tokens_spec(d.bb.LOGC, n_tokens, (int) d.c.n_vocab_real, nullptr, 0, p, d.bb.DTOK, nullptr, 0, d.bb.OUT, d.st)) return false;
+    CK(cudaMemcpyAsync(out, d.bb.OUT, (size_t) n_tokens * 4, cudaMemcpyDeviceToHost, d.st));
+    CK(cudaStreamSynchronize(d.st));
+    return true;
+}
 void Engine::spec_begin_block() { if (!p_->drafter) return; p_->ensure_batch(); p_->ensure_rec(); p_->rec_on = true; }
 void Engine::spec_end_block(int accepted) {
     Impl& d = *p_;

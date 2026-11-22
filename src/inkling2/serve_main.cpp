@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include "strata/core/online_tuner.hpp"
 #include "strata/inkling2/engine.hpp"
+#include "strata/kernels/sampler.hpp"
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
@@ -214,7 +215,7 @@ int main(int argc, char** argv) {
             const char* reason = "length";
             int n_out = 0;
             std::vector<int> recent(ids.end() - std::min<long>((long) ids.size(), sp.penalty_last_n), ids.end());
-            const bool spec_run = !cancelled && eng.spec_enabled() && sp.temperature <= 0.0f && sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f && std::getenv("STRATA_INKLING2_NO_SPEC") == nullptr;
+            const bool spec_run = !cancelled && eng.spec_enabled() && sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f && std::getenv("STRATA_INKLING2_NO_SPEC") == nullptr;
             if (spec_run) {
                 // The Qwen engine's rule, with its own code: `--spec S` windows of at most S tokens, the draft layer extends a window by another guess while its probability for the last one is >= spec_min_p
                 // (mtp_draft), spec::DraftPolicy learns the cost and the tokens committed per window size, and the core OnlineTuner moves spec_min_p over the same levels (0.3 .. 0.7).  Greedy: the
@@ -238,7 +239,13 @@ int main(int argc, char** argv) {
                     else if (n_out >= limit) stopped = true;
                     return !stopped;
                 };
-                int tok = argmax(logits);
+                // sampled requests: the pipeline's probabilistic acceptance (core/spec_prob.hpp via kernels::sample_tokens_spec); the drafter is deterministic, so its drafts are point masses
+                const bool sampled = sp.temperature > 0.0f;
+                const std::vector<int> no_recent;
+                strata::kernels::SamplerParams spp;
+                spp.top_k = sp.top_k; spp.top_p = sp.top_p; spp.min_p = sp.min_p; spp.temperature = sp.temperature;
+                spp.seed = sp.has_seed ? sp.seed : (unsigned long long) std::random_device{}();
+                int tok = sampled ? sample(logits, sp, no_recent, rng) : argmax(logits);
                 emit(tok);
                 while (!stopped) {
                     if (g_cancel) { reason = "cancel"; break; }
@@ -253,7 +260,7 @@ int main(int argc, char** argv) {
                         eng.step(tok, P, &l1);
                         eng.spec_commit(P, 1);
                         fed.push_back(tok);
-                        tok = argmax(l1);
+                        tok = sampled ? sample(l1, sp, no_recent, rng) : argmax(l1);
                         if (!emit(tok)) break;
                         continue;
                     }
@@ -273,8 +280,14 @@ int main(int argc, char** argv) {
                     eng.spec_begin_block();
                     eng.step_block(bt.data(), k + 1, P, &lg);
                     ms_verify += ms_since(t_b);
-                    int m = 0;
-                    while (m < k && argmax(lg[(size_t) m]) == d[m]) ++m;
+                    int m = 0, newtok = -1;
+                    if (!sampled) { while (m < k && argmax(lg[(size_t) m]) == d[m]) ++m; newtok = argmax(lg[(size_t) m]); }
+                    else {
+                        spp.counter = (unsigned long long) P;   // the window's first position, as the pipeline keys its Philox draws
+                        int outv[8];
+                        if (eng.spec_sample_block((const int32_t*) d, k + 1, spp, outv)) { while (m < k && d[m] == outv[m]) ++m; newtok = outv[m]; }
+                        else { while (m < k) { const int t = sample(lg[(size_t) m], sp, no_recent, rng); if (t != d[m]) { newtok = t; break; } ++m; } if (newtok < 0) newtok = sample(lg[(size_t) k], sp, no_recent, rng); }
+                    }
                     const auto t_c = Clock::now();
                     eng.spec_end_block(m + 1);
                     eng.spec_commit(P, m + 1);
@@ -288,7 +301,7 @@ int main(int argc, char** argv) {
                     total_prop += k; total_acc += m; ++total_steps; ++windows_by_t[k + 1];
                     for (int j = 0; j < m && !stopped; ++j) emit(d[j]);
                     if (stopped) { if (m > 0) consistent = false; break; }
-                    tok = argmax(lg[(size_t) m]);
+                    tok = newtok;
                     if (!emit(tok)) break;
                 }
                 if (!consistent) { fed.clear(); eng.reset(); }

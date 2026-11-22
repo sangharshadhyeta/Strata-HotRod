@@ -490,3 +490,12 @@ Measured on the 3060 (the drafter costs 899 cache slots instead of 1002): accept
 A window costs draft 6.0 ms + verify 84 ms (~3.5 tokens) + commit 0.6 ms against 32 ms for a plain token: through the server 300-token answers run prose 20.9 vs 27.1 tok/s, code 24.5 vs 25.2, edit 19.7 vs 20.3 (plain) - a loss on prose, break-even on code / edits.
 The verification block is the whole cost (the int8 block kernels are ALU-bound, ~18-24 ms a token); the draft and the commit are not. A faster-integer card (the roomy case) or tensor-core (int8 mma) block kernels is what turns it into a win;
 until then it stays opt-in and 8095 runs without it.
+
+### DSpark at temperature 1: the pipeline's probabilistic acceptance (22 Nov)
+Sampled requests use the Qwen pipeline's own rule and kernel: `Engine::spec_sample_block` -> `kernels::sample_tokens_spec` (core/spec_prob.hpp: accept draft d with min(1, p(d) / q(d)), a reject draws the residual; the drafter has no q list, so its drafts are point masses:
+accept with p(d), residual = p without d; Philox counters keyed by the window's first position), on the block's logits compacted to the real vocabulary; the serve loop is the pipeline's `while (a < k && window[a+1] == out[a]) ++a`, out[a] the next token.
+If the split sampler cannot run, exact match against the host sampler is the fallback. Penalties still use the plain path.
+Distribution check (16-token prompt, 4 tokens, temperature 1, top_k 64, 200 seeds a run): spec vs plain total-variation distance of tokens 2 / 3 / 4: 0.215 / 0.330 / 0.470; plain vs plain (other seeds, the noise floor) 0.155 / 0.260 / 0.455; spec vs the second plain 0.150 / 0.310 / 0.450 -
+indistinguishable at this sample size (the test has little power on high-entropy tokens; a larger N would tighten it).
+Speed through the server at temperature 1, 300-token answers: plain prose 27.8, code 26.1, edit 20.5 tok/s; with the drafter 20.0 / 19.6 / 16.7 (window cost 67 / 90 / 122 ms for 2 / 3 / 4 tokens against 32 ms a plain token; acceptance ~22% a draft in the distribution test,
+44% over these three tasks). Sampling lowers acceptance and the verification block costs the same, so the loss is larger than greedy's (prose -28%, code -25%, edit -19%). On this 3060 the drafter stays opt-in.

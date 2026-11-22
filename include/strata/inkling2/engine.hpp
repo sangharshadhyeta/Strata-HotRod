@@ -16,6 +16,7 @@
 #include <vector>
 
 namespace strata {
+namespace kernels { struct SamplerParams; }
 namespace inkling2 {
 
 /// Where an expert's three matrices are (device-addressable pointers) and its scales (NVFP4: the per-expert F32 scale, else 1).
@@ -48,6 +49,10 @@ public:
     bool spec_enabled() const;
     void spec_commit(int pos0, int m);
     int spec_propose(int64_t anchor, int P, int proposals, int* out, float* probs = nullptr);
+    /// A sampled request's verification block (the last forward was a step_block that returned logits): the Qwen pipeline's probabilistic acceptance (kernels::sample_tokens_spec, core/spec_prob.hpp):
+    /// drafts dtok[0 .. n_tokens - 2] are point masses (the drafter has no q list), row t judges draft t; out[t] = the draft when kept, the residual sample when not, a plain sample on the last row.
+    /// The caller's loop is the pipeline's: while (a < n - 1 && window[a + 1] == out[a]) ++a; out[a] is the next token.  False: the split sampler cannot run (use exact match).
+    bool spec_sample_block(const int32_t* dtok, int n_tokens, const kernels::SamplerParams& p, int* out);
     void spec_begin_block();
     void spec_end_block(int accepted);
     /// Forgets the conversation (conv states and positions); the KV is simply overwritten.
