@@ -31,17 +31,18 @@ void experts_prepare(const int32_t* idx, const float* route_w, const uint8_t* gu
                      const float* down_scale, int K, const uint8_t** gu_ptr, const uint8_t** dn_ptr, float* sg, float* wd, void* stream);
 /// The same without the addresses, for a tier that places experts itself (a VRAM slot cache: the host writes gu_ptr / dn_ptr): only the scales and combine weights.
 void experts_scales(const int32_t* idx, const float* route_w, const float* gate_up_scale, const float* down_scale, int K, float* sg, float* wd, void* stream);
+/// kper: slots per input row (a block of tokens: slot s reads row s / kper of x / xq; K = n_tokens * kper slots; 0 = every slot reads row 0).  experts_combine: ntok rows of K slots each.
 /// h[s][r] = act(gate_r . x, up_r . x) for r < FF: slot s's plane holds the gate rows, then (at up_off bytes) the up rows; `ty` the ggml type (40 NVFP4, 8 Q8_0); x [C] float.
-void experts_gate_up(const uint8_t* const* gu_ptr, int ty, size_t up_off, const float* x, int C, int FF, const float* sg, Act act, float* h, int K, void* stream);
+void experts_gate_up(const uint8_t* const* gu_ptr, int ty, size_t up_off, const float* x, int C, int FF, const float* sg, Act act, float* h, int K, void* stream, int kper = 0);
 /// y[s][c] = down_c . h[s] for c < C (h [K][FF]; slot s's down rows at dn_ptr[s]).
 void experts_down(const uint8_t* const* dn_ptr, int ty, const float* h, int C, int FF, float* y, int K, void* stream);
 /// The int8-activation path (~4x fewer ALU ops a weight; the activation is quantized to q8_1 blocks - 36 bytes a 32 values - so the result carries int8 activation noise, as the
 /// engine's other quantized matvecs do): quantize_act turns `rows` rows of n floats (n a multiple of 32) into xq [rows][n / 32][36]; the _q8 kernels take it in place of x / h.
 void quantize_act(const float* x, int n, int rows, void* xq, void* stream);
-void experts_gate_up_q8(const uint8_t* const* gu_ptr, int ty, size_t up_off, const void* xq, int C, int FF, const float* sg, Act act, float* h, int K, void* stream);
+void experts_gate_up_q8(const uint8_t* const* gu_ptr, int ty, size_t up_off, const void* xq, int C, int FF, const float* sg, Act act, float* h, int K, void* stream, int kper = 0);
 void experts_down_q8(const uint8_t* const* dn_ptr, int ty, const void* hq, int C, int FF, float* y, int K, void* stream);
 /// out[c] = sum_s wd[s] y[s][c].
-void experts_combine(const float* y, const float* wd, int K, int C, float* out, void* stream);
+void experts_combine(const float* y, const float* wd, int K, int C, float* out, void* stream, int ntok = 1);
 
 /// Whether the weight type has a decode here.
 bool type_supported(int ggml_type);

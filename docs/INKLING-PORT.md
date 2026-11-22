@@ -445,3 +445,10 @@ Build order: (1) multi-token forward through the 48 visits (token-major conv sta
 `Engine::step_block(tokens, n, pos0, logits)`: n tokens through the 48 visits, each visit for all tokens before the next, with per-token stream / prelude / block list / message bank / pass counters (the engine's working
 pointers are bound to token t's while its visit runs). `STRATA_INKLING2_BLOCK_CHECK=N` in gpu_forward_test: logits of blocks of 8 and of 5 against single steps over the 48-token oracle prompt: 0 of 9,602,784 differ
 (bit-identical); 31-32 tok/s. No speed change yet: the experts of a visit are still run per token. Next: share them (the union of the block's picks, each expert read once) and add the multi-row attention, then the drafter.
+
+### DSpark step 1b: the block's experts shared (22 Nov)
+`layer()` can stop after routing (`defer_experts`); `step_block` then places the picks of all n tokens together (an expert picked twice is fetched once; `SlotCache::place` now takes up to 128 entries) and runs 4 launches
+for all n*K slots (`kper` = slots per input row in the gate-up kernels, `ntok` rows in the combine), then each token's FFN tail; the pass-end message bank is built after the tails. `STRATA_INKLING2_NO_SHARE=1` runs the blocks unshared.
+Blocks of 8 and 4 against single steps: 0 of 9,602,784 logits differ (bit-identical). Speed: 31.9 tok/s shared vs 31.2 unshared vs ~31 single, on a warm 48-token prompt. Little gained: the visit's attention side, convs,
+residuals and norms (about 15 ms of a token) still run one token at a time, and the experts were already cheap on a warm cache. The block's speed-up needs the dense / attention path batched (multi-row matvec, multi-row attention);
+that is the next piece, and it is also what verification of a draft block needs.

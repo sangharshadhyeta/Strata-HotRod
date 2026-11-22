@@ -156,6 +156,9 @@ struct Engine::Impl {
     cudaStream_t st = nullptr;   // every launch of the engine
     M::SlotCache scache;
     // look-ahead (STRATA_MOE_PREFETCH=N: copy the N experts the NEXT visit's router would pick from this visit's router input, while this visit computes; 0 = off)
+    float *d_xb = nullptr, *d_rrb = nullptr, *d_moeb = nullptr, *d_wb = nullptr;   // a block's expert inputs, residuals, expert sums, route weights
+    int32_t *d_idxb = nullptr, *h_idxb = nullptr;                                    // and its picks (device, pinned host)
+    bool defer_experts = false;   // layer() stops after routing: the block step runs the experts for all tokens
     bool int8_act = false;           // STRATA_MOE_INT8
     void *d_xq8 = nullptr, *d_hq8 = nullptr;   // q8_1-quantized expert input / activation
     int pf_n = 0;
@@ -225,8 +228,8 @@ struct Engine::Impl {
         for (const LW& w : lw) if (!w.resident) { gu = std::max<size_t>(gu, w.gu_plane); dn = std::max<size_t>(dn, w.dn_plane); }
         // everything the engine needs is allocated BEFORE the cache, so the free figure below is what this process really has left (the Qwen engine's order); the look-ahead's buffers too
         void* hp = nullptr;
-        CK(cudaHostAlloc(&hp, 32 * sizeof(void*), cudaHostAllocPortable)); pinned.push_back(hp);
-        h_gu_ptr = (const uint8_t**) hp; h_dn_ptr = h_gu_ptr + 16;
+        CK(cudaHostAlloc(&hp, 256 * sizeof(void*), cudaHostAllocPortable)); pinned.push_back(hp);
+        h_gu_ptr = (const uint8_t**) hp; h_dn_ptr = h_gu_ptr + 128;
         if (const char* pe = std::getenv("STRATA_MOE_PREFETCH")) pf_n = std::min(std::max(std::atoi(pe), 0), 16);
         if (pf_n > 0) {
             d_pidx = (int32_t*) dmalloc(16 * 4); d_pw = fmalloc(16); rlp = fmalloc((size_t) c.n_expert); xp = fmalloc((size_t) c.n_embd);
@@ -320,10 +323,12 @@ struct Engine::Impl {
         cat = fmalloc(2 * E); g64 = fmalloc(c.gate_rank); fgt = fmalloc(E); gnn = fmalloc(E); logits = fmalloc((size_t) c.n_vocab); hd = fmalloc(E);
         d_idx = (int32_t*) dmalloc((size_t) c.n_visits * 16 * 4); d_w = fmalloc(16);   // every visit's picks stay on the device; the host reads them once a token
         { void* hp = nullptr; CK(cudaHostAlloc(&hp, (size_t) c.n_visits * 16 * 4, cudaHostAllocPortable)); pinned.push_back(hp); h_idx = (int32_t*) hp; }
-        d_gu_ptr = (const uint8_t**) dmalloc(16 * sizeof(void*)); d_dn_ptr = (const uint8_t**) dmalloc(16 * sizeof(void*));
-        d_sg = fmalloc(16); d_wd = fmalloc(16); d_hh = fmalloc((size_t) 16 * FF); d_yy = fmalloc((size_t) 16 * E);
+        d_gu_ptr = (const uint8_t**) dmalloc(128 * sizeof(void*)); d_dn_ptr = (const uint8_t**) dmalloc(128 * sizeof(void*));
+        d_sg = fmalloc(128); d_wd = fmalloc(128); d_hh = fmalloc((size_t) 128 * FF); d_yy = fmalloc((size_t) 128 * E);
+        d_xb = fmalloc((size_t) 8 * E); d_rrb = fmalloc((size_t) 8 * E); d_moeb = fmalloc((size_t) 8 * E); d_idxb = (int32_t*) dmalloc(128 * 4); d_wb = fmalloc(128);
+        { void* hb = nullptr; CK(cudaHostAlloc(&hb, 128 * 4, cudaHostAllocPortable)); pinned.push_back(hb); h_idxb = (int32_t*) hb; }
         int8_act = !(std::getenv("STRATA_MOE_INT8") != nullptr && std::atoi(std::getenv("STRATA_MOE_INT8")) == 0);   // default on; STRATA_MOE_INT8=0: the exact FP32 path
-        d_xq8 = dmalloc((size_t) (E / 32) * 36); d_hq8 = dmalloc((size_t) 16 * (FF / 32) * 36);
+        d_xq8 = dmalloc((size_t) 8 * (E / 32) * 36); d_hq8 = dmalloc((size_t) 128 * (FF / 32) * 36);
         xq = dmalloc((size_t) (E / 32) * 36 * 2); hq = dmalloc((size_t) (FF / 32) * 36 * 2); aq = dmalloc((size_t) (H * D / 32) * 36 * 2);
         picks.assign((size_t) c.n_visits, {});
         init_cache();
@@ -424,7 +429,7 @@ struct Engine::Impl {
         M::route(rl, w.router_bias, 1, (int) c.n_expert, Kx, c.expert_weight_scale, M::Score::Sigmoid, idxv, d_w, st);
         CK(cudaMemcpyAsync(h_idx + (size_t) vis * 16, idxv, (size_t) Kx * 4, cudaMemcpyDeviceToHost, st));
         int64_t nl = -1;
-        if (pf_n > 0 && scache.active() && vis + 1 < c.n_visits) {   // the next visit's router on this visit's input (its own norm): the experts to start copying now
+        if (pf_n > 0 && scache.active() && vis + 1 < c.n_visits && !defer_experts) {   // the next visit's router on this visit's input (its own norm): the experts to start copying now
             nl = c.stored_of_visit(vis + 1);
             const LW& wn = lw[(size_t) nl];
             if (wn.resident) nl = -1;
@@ -436,6 +441,7 @@ struct Engine::Impl {
                 CK(cudaMemcpyAsync(h_pidx, d_pidx, (size_t) std::max(pf_n, Kx) * 4, cudaMemcpyDeviceToHost, st));
             }
         }
+        if (defer_experts) return nbl;   // (block step: the experts of all tokens come next)
         lap(1);
         // the grouped experts: 4 launches for all of the visit's picks, FP32 activations (no int8 quantization of the input)
         if (scache.active() && !w.resident) {   // class B: the host learns the picks (one sync a visit), misses are copied into VRAM slots, hits cost nothing
@@ -490,6 +496,38 @@ struct Engine::Impl {
         }
     }
     void bind(TokState& t) { h = t.h; pre_h = t.pre_h; blk = t.blk; ms = t.ms; msgs = t.msgs; }
+    /// The experts of one visit for the whole block: the picks of all n tokens placed together (an expert picked twice is fetched once), 4 launches for every token's slots, then each token's FFN tail.
+    void experts_block_pass(int vv, int64_t l, int n) {
+        const int64_t E = c.n_embd, FF = c.n_ff_exp, taps = c.conv_taps;
+        const int Kx = (int) c.n_expert_used, NK = n * Kx;
+        const LW& w = lw[(size_t) l];
+        CK(cudaMemcpyAsync(h_idxb, d_idxb, (size_t) NK * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        if (scache.active() && !w.resident) {
+            scache.place((int) l, h_idxb, NK, w.host_gu, w.gu_plane, w.host_dn, w.dn_plane, h_gu_ptr, h_dn_ptr, st);
+        } else {
+            for (int i = 0; i < NK; ++i) { h_gu_ptr[i] = w.gu_dev + (uint64_t) h_idxb[i] * w.gu_plane; h_dn_ptr[i] = w.dn_dev + (uint64_t) h_idxb[i] * w.dn_plane; }
+        }
+        CK(cudaMemcpyAsync(d_gu_ptr, h_gu_ptr, (size_t) NK * sizeof(void*), cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_dn_ptr, h_dn_ptr, (size_t) NK * sizeof(void*), cudaMemcpyHostToDevice, st));
+        M::experts_scales(d_idxb, d_wb, w.gs_d, w.ds_d, NK, d_sg, d_wd, st);
+        const M::Act situ{M::ActKind::Situ, c.situ_beta, c.situ_linear_beta};
+        if (int8_act) {
+            M::quantize_act(d_xb, (int) E, n, d_xq8, st);
+            M::experts_gate_up_q8(d_gu_ptr, w.etype, w.gate_bytes, d_xq8, (int) E, (int) FF, d_sg, situ, d_hh, NK, st, Kx);
+            M::quantize_act(d_hh, (int) FF, NK, d_hq8, st);
+            M::experts_down_q8(d_dn_ptr, w.etype, d_hq8, (int) E, (int) FF, d_yy, NK, st);
+        } else {
+            M::experts_gate_up(d_gu_ptr, w.etype, w.gate_bytes, d_xb, (int) E, (int) FF, d_sg, situ, d_hh, NK, st, Kx);
+            M::experts_down(d_dn_ptr, w.etype, d_hh, (int) E, (int) FF, d_yy, NK, st);
+        }
+        M::experts_combine(d_yy, d_wd, Kx, (int) E, d_moeb, st, n);
+        for (int t = 0; t < n; ++t) {
+            bind(tok_states[(size_t) t]);
+            K::gdn_conv_step(fs[(size_t) vv], d_moeb + (size_t) t * E, w.ffnpost, mm, E, taps, st);
+            ik::add(d_rrb + (size_t) t * E, mm, h, (int) E, st);
+        }
+    }
     void step_block(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* out) {
         const int64_t E = c.n_embd;
         if (pos0 + n > cap) { std::fprintf(stderr, "inkling2 engine: positions %d..%d beyond the %d the caches hold\n", pos0, pos0 + n - 1, cap); std::exit(1); }
@@ -503,6 +541,7 @@ struct Engine::Impl {
             ik::dequant_q8_0_row((const uint8_t*) d_embd + (uint64_t) tokens[t] * rb, h, (int) E, st);
             rms_w(h, d_embd_norm);
         }
+        const bool share = n > 1 && std::getenv("STRATA_INKLING2_NO_SHARE") == nullptr;   // the block's experts run once a visit, each expert fetched once
         const int64_t core0 = c.core_start, clen = c.core_len();
         for (int vv = 0; vv < c.n_visits; ++vv) {
             const int64_t l = c.stored_of_visit(vv);
@@ -522,14 +561,25 @@ struct Engine::Impl {
                         msgs_on = true;
                     }
                 }
+                defer_experts = share;
                 ts.nb = layer(l, vv, ts.nb, msgs_on, SeamSink{}, pos0 + t);
-                const bool core_visit = vv >= core0 && vv < core0 + c.num_loops * clen;
-                if (core_visit && l == c.core_end - 1) {
+                defer_experts = false;
+                if (share) {   // this token's expert input, residual and picks, kept for the block's shared expert pass
+                    const int Kx = (int) c.n_expert_used;
+                    copy(d_xb + (size_t) t * E, x, (size_t) E); copy(d_rrb + (size_t) t * E, rr, (size_t) E);
+                    CK(cudaMemcpyAsync(d_idxb + t * Kx, d_idx + (size_t) vv * 16, (size_t) Kx * 4, cudaMemcpyDeviceToDevice, st));
+                    CK(cudaMemcpyAsync(d_wb + t * Kx, d_w, (size_t) Kx * 4, cudaMemcpyDeviceToDevice, st));
+                }
+            }
+            if (share) experts_block_pass(vv, l, n);
+            if (vv >= core0 && vv < core0 + c.num_loops * clen && l == c.core_end - 1)   // a pass ends: the bank for the next one
+                for (int t = 0; t < n; ++t) {
+                    TokState& ts = tok_states[(size_t) t];
+                    bind(ts);
                     ts.nms = 0;
                     for (int b = ts.pre_nb + 1; b < ts.nb; ++b) copy(ms + (size_t) ts.nms++ * E, blk + (size_t) b * E, (size_t) E);
                     copy(ms + (size_t) ts.nms++ * E, h, (size_t) E);
                 }
-            }
         }
         if (out) out->assign((size_t) n, std::vector<float>());
         for (int t = 0; t < n; ++t) {

@@ -63,8 +63,8 @@ public:
                cudaStream_t wait_on) {
         ++clock_;
         bool copied = false;
-        int slot_of[16];
-        for (int s = 0; s < K && s < 16; ++s) {
+        int slot_of[128];
+        for (int s = 0; s < K && s < 128; ++s) {
             const int64_t k = (int64_t) layer * ne_ + idx[s];
             int sl = map_[(size_t) k];
             if (sl >= 0) ++hits_;
@@ -83,7 +83,7 @@ public:
             used_[(size_t) sl] = clock_;   // set now: a pick made earlier in this visit is never the victim
             slot_of[s] = sl;
         }
-        for (int s = 0; s < K && s < 16; ++s) {
+        for (int s = 0; s < K && s < 128; ++s) {
             uint8_t* base = mem_ + (size_t) slot_of[s] * (gu_ + dn_);
             gu_ptr[s] = base; dn_ptr[s] = base + gu_;
         }

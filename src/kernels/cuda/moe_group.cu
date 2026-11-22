@@ -158,20 +158,21 @@ __global__ void k_prepare(const int32_t* idx, const float* rw, const uint8_t* gu
 }
 
 __global__ void k_scales(const int32_t* idx, const float* rw, const float* gs, const float* ds, int K, float* sg, float* wd) {
-    const int s = threadIdx.x;
-    if (s >= K) return;
-    const int e = idx[s];
-    sg[s] = gs ? gs[e] : 1.0f;
-    wd[s] = rw[s] * (ds ? ds[e] : 1.0f);
+    for (int s = threadIdx.x; s < K; s += blockDim.x) {
+        const int e = idx[s];
+        sg[s] = gs ? gs[e] : 1.0f;
+        wd[s] = rw[s] * (ds ? ds[e] : 1.0f);
+    }
 }
 
 constexpr int kEW = 8, kER = 2;   // warps a block, rows a warp
 
 // grid (ceil(FF / (kEW kER)), K), kEW * 32 threads, C floats of shared memory.
-__global__ void k_gate_up(const uint8_t* const* gu_ptr, int ty, size_t up_off, const float* x, int C, int FF, const float* sg, int kind, float p0, float p1, float* h) {
+__global__ void k_gate_up(const uint8_t* const* gu_ptr, int ty, size_t up_off, const float* x, int C, int FF, const float* sg, int kind, float p0, float p1, float* h, int kper) {
     extern __shared__ float xs[];
     const int s = blockIdx.y;
-    for (int i = threadIdx.x; i < C; i += blockDim.x) xs[i] = x[i];
+    const float* xr = x + (size_t) (kper > 0 ? s / kper : 0) * C;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) xs[i] = xr[i];
     __syncthreads();
     const int warp = threadIdx.x >> 5;
     const uint8_t* plane = gu_ptr[s];
@@ -202,11 +203,11 @@ __global__ void k_down(const uint8_t* const* dn_ptr, int ty, const float* h, int
     }
 }
 __global__ void k_combine(const float* y, const float* wd, int K, int C, float* out) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (c >= C) return;
     float a = 0.0f;
-    for (int s = 0; s < K; ++s) a += wd[s] * y[(size_t) s * C + c];
-    out[c] = a;
+    for (int s = 0; s < K; ++s) a += wd[t * K + s] * y[((size_t) t * K + s) * C + c];
+    out[(size_t) t * C + c] = a;
 }
 
 
@@ -282,11 +283,12 @@ __global__ void k_quant(const float* x, int nblk, uint8_t* xq) {
     if (lane == 0) { *reinterpret_cast<__half*>(b) = __float2half(d); *reinterpret_cast<__half*>(b + 2) = __float2half(0.0f); }
 }
 
-__global__ void k_gate_up_q8(const uint8_t* const* gu_ptr, int ty, size_t up_off, const uint8_t* xq, int C, int FF, const float* sg, int kind, float p0, float p1, float* h) {
+__global__ void k_gate_up_q8(const uint8_t* const* gu_ptr, int ty, size_t up_off, const uint8_t* xq, int C, int FF, const float* sg, int kind, float p0, float p1, float* h, int kper) {
     extern __shared__ __align__(16) uint8_t xs8[];
     const int s = blockIdx.y;
     const int xb = (C >> 5) * 36;
-    for (int i = threadIdx.x; i < xb / 4; i += blockDim.x) reinterpret_cast<int*>(xs8)[i] = reinterpret_cast<const int*>(xq)[i];
+    const uint8_t* xqr = xq + (size_t) (kper > 0 ? s / kper : 0) * xb;
+    for (int i = threadIdx.x; i < xb / 4; i += blockDim.x) reinterpret_cast<int*>(xs8)[i] = reinterpret_cast<const int*>(xqr)[i];
     __syncthreads();
     const int warp = threadIdx.x >> 5;
     const uint8_t* plane = gu_ptr[s];
@@ -334,11 +336,11 @@ void experts_prepare(const int32_t* idx, const float* route_w, const uint8_t* gu
     k_prepare<<<1, 32, 0, (cudaStream_t) stream>>>(idx, route_w, gu_base, gu_plane, dn_base, dn_plane, gate_up_scale, down_scale, K, gu_ptr, dn_ptr, sg, wd);
 }
 void experts_scales(const int32_t* idx, const float* route_w, const float* gate_up_scale, const float* down_scale, int K, float* sg, float* wd, void* stream) {
-    k_scales<<<1, 32, 0, (cudaStream_t) stream>>>(idx, route_w, gate_up_scale, down_scale, K, sg, wd);
+    k_scales<<<1, 128, 0, (cudaStream_t) stream>>>(idx, route_w, gate_up_scale, down_scale, K, sg, wd);
 }
-void experts_gate_up(const uint8_t* const* gu_ptr, int ty, size_t up_off, const float* x, int C, int FF, const float* sg, Act act, float* h, int K, void* stream) {
+void experts_gate_up(const uint8_t* const* gu_ptr, int ty, size_t up_off, const float* x, int C, int FF, const float* sg, Act act, float* h, int K, void* stream, int kper) {
     if (!type_supported(ty)) { std::fprintf(stderr, "moe::experts_gate_up: ggml type %d has no decode here\n", ty); std::exit(1); }
-    k_gate_up<<<dim3((FF + kEW * kER - 1) / (kEW * kER), K), kEW * 32, (size_t) C * 4, (cudaStream_t) stream>>>(gu_ptr, ty, up_off, x, C, FF, sg, (int) act.kind, act.p0, act.p1, h);
+    k_gate_up<<<dim3((FF + kEW * kER - 1) / (kEW * kER), K), kEW * 32, (size_t) C * 4, (cudaStream_t) stream>>>(gu_ptr, ty, up_off, x, C, FF, sg, (int) act.kind, act.p0, act.p1, h, kper);
 }
 void experts_down(const uint8_t* const* dn_ptr, int ty, const float* h, int C, int FF, float* y, int K, void* stream) {
     if (!type_supported(ty)) { std::fprintf(stderr, "moe::experts_down: ggml type %d has no decode here\n", ty); std::exit(1); }
@@ -348,16 +350,16 @@ void quantize_act(const float* x, int n, int rows, void* xq, void* stream) {
     const int nblk = rows * (n / 32);
     k_quant<<<(nblk * 32 + 255) / 256, 256, 0, (cudaStream_t) stream>>>(x, nblk, (uint8_t*) xq);
 }
-void experts_gate_up_q8(const uint8_t* const* gu_ptr, int ty, size_t up_off, const void* xq, int C, int FF, const float* sg, Act act, float* h, int K, void* stream) {
+void experts_gate_up_q8(const uint8_t* const* gu_ptr, int ty, size_t up_off, const void* xq, int C, int FF, const float* sg, Act act, float* h, int K, void* stream, int kper) {
     if (!type_supported(ty)) { std::fprintf(stderr, "moe::experts_gate_up_q8: ggml type %d has no decode here\n", ty); std::exit(1); }
-    k_gate_up_q8<<<dim3((FF + kEW * kER - 1) / (kEW * kER), K), kEW * 32, (size_t) (C / 32) * 36, (cudaStream_t) stream>>>(gu_ptr, ty, up_off, (const uint8_t*) xq, C, FF, sg, (int) act.kind, act.p0, act.p1, h);
+    k_gate_up_q8<<<dim3((FF + kEW * kER - 1) / (kEW * kER), K), kEW * 32, (size_t) (C / 32) * 36, (cudaStream_t) stream>>>(gu_ptr, ty, up_off, (const uint8_t*) xq, C, FF, sg, (int) act.kind, act.p0, act.p1, h, kper);
 }
 void experts_down_q8(const uint8_t* const* dn_ptr, int ty, const void* hq, int C, int FF, float* y, int K, void* stream) {
     if (!type_supported(ty)) { std::fprintf(stderr, "moe::experts_down_q8: ggml type %d has no decode here\n", ty); std::exit(1); }
     k_down_q8<<<dim3((C + kEW * kER - 1) / (kEW * kER), K), kEW * 32, (size_t) (FF / 32) * 36, (cudaStream_t) stream>>>(dn_ptr, ty, (const uint8_t*) hq, C, FF, y);
 }
-void experts_combine(const float* y, const float* wd, int K, int C, float* out, void* stream) {
-    k_combine<<<(C + 255) / 256, 256, 0, (cudaStream_t) stream>>>(y, wd, K, C, out);
+void experts_combine(const float* y, const float* wd, int K, int C, float* out, void* stream, int ntok) {
+    k_combine<<<dim3((C + 255) / 256, ntok), 256, 0, (cudaStream_t) stream>>>(y, wd, K, C, out);
 }
 
 }  // namespace strata::kernels::moe
