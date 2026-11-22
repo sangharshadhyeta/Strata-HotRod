@@ -286,9 +286,10 @@ $PY tools/dsv41/pack_gguf.py --model $C --shards $P-0000{1,2,3,4,5}-of-00006.ggu
 
 Its config is the full model's with `--pack .../ds41c`, `"model_name": "deepseek-v4.1-flash-coder"` and, in `env`, the switches our
 Coder runs with: `DS4_RING=32`, `DS4_RING_PIN=1`, `STRATA_STANDIN=1`, `DS4_LEND=1`, `DS4_LEND_RING=1`, `DS4_RING_STICKY=1`,
-`DS4_MASK=learn`, `DS4_STANDIN_LEARN=1`, `DS4_STANDIN_BALANCE=1`, `STRATA_LA_EXACT_W=4`, `STRATA_LA_LEARN=1`. Nothing is learned
-yet when a Coder pack is new (no trained look-ahead is published for it; the full model's is for 384 experts), so its first
-hours are slower than the table above, which is a pack that learned from a day of use.
+`DS4_MASK=learn`, `DS4_STANDIN_LEARN=1`, `DS4_STANDIN_BALANCE=1`, `STRATA_LA_EXACT_W=4`. The learned look-ahead is on by default
+(`STRATA_LA_LEARN=0` turns it off): a pack's `hotrod-predictor.bin` is loaded when it is there, and otherwise the look-ahead learns from
+scratch. Nothing is learned yet when a Coder pack is new (no trained look-ahead is published for it; the full model's is for 384
+experts), so its first hours are slower than the table above, which is a pack that learned from a day of use.
 The installer: `setup.py --model Starw1-2.00bpw-MXFP8` (full) or `--model Coder-2.00bpw-MXFP8` (Coder) downloads the pinned files
 (size and SHA-256 checked), makes the pack and the config. **The Coder entry in the installer was added on 14 Nov and has not been run
 end to end**: a script checked that every file has its size, SHA-256 and download address and that the planner gives numbers for it,

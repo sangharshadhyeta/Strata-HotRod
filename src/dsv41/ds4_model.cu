@@ -3770,7 +3770,7 @@ struct Model::Impl {
             CK(cudaStreamSynchronize(d.st));
         }
         lend_init();   // (DS4_LEND: the arena's fill thread and its streams; the first fill is asked for once the warm-up is done)
-        la_init();   // (STRATA_LA_LEARN: the learner, on the trunk's GPU; off unless the env var or the saved file says on)
+        la_init();   // (STRATA_LA_LEARN: the learner, on the trunk's GPU; on unless STRATA_LA_LEARN=0)
         standin_init();
         mask_init();   // (DS4_MASK: after the placement, which says which experts are on the card; the profile is loaded by now)
         if (par || chunk > 0)   // (the windows' threads; the prompt path's, whatever mode the windows take)
@@ -3793,14 +3793,14 @@ struct Model::Impl {
     }
 
 
-    // STRATA_LA_LEARN (ds4_lalearn.cuh): the learned look-ahead.  Unset: on only when the pack's saved file exists; "0": off; any other
-    // value: on.  Its state lives on the trunk's GPU (all trunk layers on one device).  A saved file that does not fit this model is
-    // refused, and the learner starts new.
+    // STRATA_LA_LEARN (ds4_lalearn.cuh): the learned look-ahead.  Unset: on (the pack's saved file is loaded when it exists, else the
+    // learner learns from scratch); "0": off; any other value: on.  Its state lives on the trunk's GPU (all trunk layers on one device).
+    // A saved file that does not fit this model is refused, and the learner starts new.
     void la_init() {
         const char* env = std::getenv("STRATA_LA_LEARN");
         la_path = o.pack + "/hotrod-predictor.bin";
         const bool saved = std::ifstream(la_path).good();
-        if (!(env != nullptr ? std::strcmp(env, "0") != 0 : saved)) {
+        if (env != nullptr && std::strcmp(env, "0") == 0) {
             std::fprintf(stderr, "ds4: look-ahead learner: off\n");
             return;
         }
