@@ -1,11 +1,13 @@
 # Project Maya (maya-ds4), DeepSeek-V4.1 engine
 
-The files under `src/dsv41/`, `include/strata/dsv41/`, `tests/dsv41/` and `tools/dsv41/` come from
+On the `upstream-dsv41` branch the files under `src/dsv41/`, `include/strata/dsv41/`, `tests/dsv41/` and `tools/dsv41/` come from
 https://github.com/mw00/project-maya (release v1.1.17, commit 8d9a9b5d), its DeepSeek engine `src/ds4`, `tests/ds4_*`,
 `tools/ds4` and the kernel sources it builds on (`exl3`, `sampler`). Project Maya is itself built on Strata.
 
 Copyright (c) 2026 Peasant Smith (mw00) and the Project Maya contributors, including needmorevram.
 MIT License, the full text is in `LICENSE` beside this file. The notice stays with every copy.
+
+(This branch carried the tier components of `src/dsv41` for the Inkling engine until 22 Nov 2026; both are removed from it and kept under the tag `inkling-engine`.)
 
 Changes made while porting into Strata are listed in the git history of the `src/dsv41` directory
 (the first commit of each file is the unmodified upstream copy).

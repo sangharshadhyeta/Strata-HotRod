@@ -310,30 +310,6 @@ if(STRATA_BUILD_TESTS)
   add_executable(model_family_test tests/core/model_family_test.cpp)
   target_link_libraries(model_family_test PRIVATE strata_artifact)
   add_test(NAME model_family_test COMMAND model_family_test)
-  # the inkling2 GGUF (Inkling 2, docs/INKLING-PORT.md M1): the configuration from metadata and its refusals (synthetic), and every
-  # tensor of a real file when STRATA_INKLING2_GGUF names one
-  add_executable(inkling2_gguf_test tests/core/inkling2_gguf_test.cpp)
-  target_link_libraries(inkling2_gguf_test PRIVATE strata_artifact)
-  add_test(NAME inkling2_gguf_test COMMAND inkling2_gguf_test)
-  # Inkling 2's CPU ops against the float64 reference's seams (M2a; needs STRATA_INKLING2_GGUF / _ORACLE / _TOKENS, else skipped)
-  add_executable(inkling2_ops_test tests/core/inkling2_ops_test.cpp)
-  target_include_directories(inkling2_ops_test PRIVATE include)
-  target_link_libraries(inkling2_ops_test PRIVATE strata_artifact)
-  add_test(NAME inkling2_ops_test COMMAND inkling2_ops_test)
-  # The DeepSeek branch's tier components (src/dsv41, byte for byte from upstream-dsv41; Project Maya's MIT notice: third_party/project-maya) that the
-  # Inkling engine is built on (docs/INKLING-PORT.md F1): the stand-in budget tuner, the decode timeline and the expert-rule header, each on the
-  # CPU with no GPU and no model, and the RAM-tier ExpertStore test (it needs a GGUF and offsets, so it is built, not a ctest)
-  find_package(Threads REQUIRED)
-  foreach(_t standin_tune timeline experts_rule)
-    add_executable(ds4_${_t}_test tests/dsv41/${_t}_test.cpp)
-    target_include_directories(ds4_${_t}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
-    target_compile_features(ds4_${_t}_test PRIVATE cxx_std_17)
-    target_link_libraries(ds4_${_t}_test PRIVATE Threads::Threads)
-    add_test(NAME ds4_${_t}_test COMMAND ds4_${_t}_test)
-  endforeach()
-  # tests/dsv41/store_test.cpp (the RAM-tier ExpertStore on real expert files) is copied as it is on the branch and NOT built: it calls
-  # os::ram_avail, which that branch's own ds4_os.hpp does not have (the branch builds no target for it either).  F2 gets a store test on
-  # real Inkling experts instead.
   # how --batch cuts a prompt read into pieces (a layer split with no slot decoding must still reach a BYIELD)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)
@@ -457,7 +433,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/elementwise.cu
                           src/kernels/cuda/bf16_gemv.cu
                           src/kernels/cuda/native_mmvq.cu
-                          src/kernels/cuda/q8_mma.cu
                           src/kernels/cuda/native_bf16.cu
                           src/kernels/cuda/native_gr_norm.cu
                           src/kernels/cuda/native_moe.cu
@@ -513,62 +488,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
-  endif()
-  # Inkling 2 REUSE check (docs/INKLING-PORT.md): the engine's GDN short-conv kernel (gdn_conv_step) runs Inkling's static short convs as it
-  # is, against the CPU oracle and the reference's seams (GPU + STRATA_INKLING2_GGUF / _ORACLE / _TOKENS; skipped without them)
-  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
-    add_executable(inkling2_conv_parity src/kernels/inkling2_conv_parity.cpp)
-    target_include_directories(inkling2_conv_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(inkling2_conv_parity PRIVATE strata_kernels CUDA::cudart)
-    add_test(NAME inkling2_conv_parity COMMAND inkling2_conv_parity)
-    # the engine's NVFP4 expert kernel (iq_mmvq type 40, Edge0's) on Inkling's NVFP4 experts, with the per-expert scales and the SITU activation
-    add_executable(inkling2_nvfp4_parity src/kernels/inkling2_nvfp4_parity.cpp)
-    target_include_directories(inkling2_nvfp4_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(inkling2_nvfp4_parity PRIVATE strata_kernels CUDA::cudart)
-    add_test(NAME inkling2_nvfp4_parity COMMAND inkling2_nvfp4_parity)
-    # Inkling 2's own kernels, in a small library so the Qwen binary is unchanged: the router, hand-ported from the DeepSeek branch's route_kernel
-    # (sigmoid in place of sqrt-softplus), against the reference's picks (docs/INKLING-PORT.md, "Code used from the DeepSeek branch")
-    # Model-independent MoE kernels (docs/INKLING-PORT.md: "all these ports should help other models too"): the router with a score mode (sigmoid, or DeepSeek's
-    # sqrt-softplus) and the grouped experts (run-time shapes, NVFP4 / Q8_0, the activation a parameter).  A library of its own: the Qwen, Edge0 and DeepSeek paths
-    # link it behind their own switches; nothing links it into the `strata` binary yet.
-    add_library(strata_moe_group STATIC src/kernels/cuda/moe_group.cu)   # (the tensor-core Q8_0 matmul, kernels::mma, is in strata_kernels)
-    target_include_directories(strata_moe_group PUBLIC include)
-    target_link_libraries(strata_moe_group PUBLIC CUDA::cudart)
-    add_library(inkling2_kernels STATIC src/kernels/cuda/inkling2_kernels.cu)   # Inkling's own ops: attention with bias / sink / window, dynamic conv taps, loop gate
-    target_include_directories(inkling2_kernels PUBLIC include)
-    target_link_libraries(inkling2_kernels PUBLIC CUDA::cudart)
-    add_executable(inkling2_router_parity src/kernels/inkling2_router_parity.cpp)
-    target_include_directories(inkling2_router_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(inkling2_router_parity PRIVATE strata_moe_group strata_kernels CUDA::cudart)
-    add_test(NAME inkling2_router_parity COMMAND inkling2_router_parity)
-    add_executable(moe_group_parity src/kernels/moe_group_parity.cpp)
-    target_include_directories(moe_group_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(moe_group_parity PRIVATE strata_moe_group strata_artifact CUDA::cudart)
-    add_test(NAME moe_group_parity COMMAND moe_group_parity)
-    add_executable(q8_mma_parity src/kernels/q8_mma_parity.cpp)
-    target_include_directories(q8_mma_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(q8_mma_parity PRIVATE strata_moe_group strata_kernels CUDA::cudart)
-    # the same kernel against Qwen's own Q8_0 matvec (native_mmvq), on Qwen's real shapes, 2 - 8 columns: agreement and speed
-    add_executable(q8_mma_vs_native src/kernels/q8_mma_vs_native.cpp)
-    target_include_directories(q8_mma_vs_native PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(q8_mma_vs_native PRIVATE strata_kernels CUDA::cudart)
-    add_test(NAME q8_mma_parity COMMAND q8_mma_parity)
-    # the DeepSeek branch's learned look-ahead (src/dsv41/ds4_lalearn.cu, from the branch byte for byte) on synthetic routers: a GPU, no model (F1)
-    add_executable(ds4_lalearn_test tests/dsv41/lalearn_test.cu src/dsv41/ds4_lalearn.cu)
-    target_include_directories(ds4_lalearn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
-                               ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(ds4_lalearn_test PRIVATE CUDA::cudart)
-    # the Inkling 2 GPU engine (F2): the whole looped forward on the GPU from the engine's reused kernels (Q8_0 / NVFP4 matvecs, the short conv, RMSNorm) and
-    # the new ones, experts read zero-copy from the registered GGUF; its own library, so the Qwen binary is unchanged.  The test runs it against the oracle.
-    add_library(inkling2_engine STATIC src/inkling2/engine.cpp src/inkling2/drafter.cu src/dsv41/ds4_lalearn.cu)   # (+ the learned look-ahead, the Qwen design as src/dsv41 carries it)
-    target_include_directories(inkling2_engine PUBLIC include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
-    target_link_libraries(inkling2_engine PUBLIC inkling2_kernels strata_moe_group strata_kernels strata_artifact CUDA::cudart CUDA::cublas)
-    add_executable(inkling2_gpu_forward_test src/inkling2/gpu_forward_test.cpp)
-    target_link_libraries(inkling2_gpu_forward_test PRIVATE inkling2_engine)
-    add_test(NAME inkling2_gpu_forward_test COMMAND inkling2_gpu_forward_test)
-    # the engine behind serve/server.py's protocol (M4): `inkling2_serve --serve --model <gguf>`
-    add_executable(inkling2_serve src/inkling2/serve_main.cpp)
-    target_link_libraries(inkling2_serve PRIVATE inkling2_engine strata_spec)
   endif()
   # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
   # the capacity rule, selected ids bitwise

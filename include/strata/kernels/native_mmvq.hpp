@@ -135,9 +135,6 @@ bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
-/// STRATA_Q8_MMA=1 (opt-in): a raw (not STRATA_Q8_PACKED) Q8_0 matvec of 2 - 8 columns, n_out a multiple of 16, runs on the tensor cores (kernels::mma::q8_matmul).  Not bitwise equal to the
-/// one-column kernel (the float summation order differs) - the property native_mmvq otherwise keeps for every column count - so it is off by default.  mode: 0 off, 1 on, -1 back to the environment.
-void native_q8_mma_set(int mode);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
