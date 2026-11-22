@@ -530,3 +530,18 @@ Not integrated into the `strata` binary, and no speed measured for Qwen: on Inkl
 `kernels::mma::q8_matmul` is now behind `native_mmvq` (ggml type 8, raw Q8_0, 2-8 columns; `native_q8_mma_set`), and `q8_mma_vs_native` times both on Qwen's 11 real Q8_0 shapes (synthetic weights, RTX 3060, 200 calls each). They agree (max rel diff <= 7e-7).
 Speed: the tensor-core kernel LOSES on 9 of 11 shapes (0.09x - 0.82x of Qwen's matvec; e.g. 2560x10240 8 cols 0.75x, the 248320-row head 0.63x, 10240x320 0.14x), and wins only where n_in is small: 320x10240 2.0-4.2x, 640x2560 1.2-2.9x (2-8 columns).
 Likely why (not tested): it has no split-K, so a large n_in with few output rows leaves most SMs idle, and Qwen's matvec already streams the weights near bandwidth. Not a default; the small-n_in wins are 7-20 us a call, too small to matter before a split-K variant exists.
+
+### Multi-visit look-ahead, crude predictor (22 Nov) - `STRATA_MOE_DEPTH=1..4` (with `STRATA_MOE_PREFETCH=N`), no gain beyond depth 1
+Is the learned look-ahead (ds4_lalearn, the loop feature) in the Inkling engine? No: only this crude predictor (each next visit's router on this visit's input) is wired in; ds4_lalearn is ported into src/dsv41 but not connected to the engine.
+Depth D runs the routers of visits +1..+D on the current input and copies the picks nearest-first on the copy stream. 48 tokens, warm-start profile, engine alone (`STRATA_INKLING2_BENCH`), N = 4 unless noted:
+| arm | picks named at +1 / +2 / +3 / +4 | misses | prefetch copies | tok/s |
+|---|---|---|---|---|
+| none | - | 4911 | 0 | 32.2 (32.1 re-run) |
+| depth 1 | 75.7% | 2021 | 5052 | 33.1 (+3%) |
+| depth 2 | 75.7 / 68.9% | 2096 | 7097 | 30.4 |
+| depth 3 | 75.7 / 68.9 / 60.5% | 2168 | 9530 | 27.6 |
+| depth 4 | .. / 55.6% | 2224 | 11413 | 25.7 |
+| N = 8, depth 2 | same | 2094 | 7090 | 30.4 |
+Deeper reach does not remove more misses (2021 -> 2224: the extra predictions are less accurate and evict useful slots) and adds copies: at depth 2 about 7100 + 2100 copies x 4.5 MB in 48 tokens x 32 ms = ~21 GB/s, the PCIe ceiling measured before. So the link is already full: a
+look-ahead can only win by cutting TOTAL copies (misses + prefetch), not by starting them earlier. Depth 1 trades 4911 misses for 2021 + 5052 copies (more bytes, hidden) for +3%. What would pay: higher precision (a learned, confidence-gated predictor - 3 of 4 depth-1
+prefetches are still wasted or already resident), and protecting the token's pass-1 experts for passes 2-3 instead of predicting them. Default unchanged (prefetch off, depth 1).

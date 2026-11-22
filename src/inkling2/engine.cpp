@@ -104,7 +104,7 @@ struct Engine::Impl {
     ~Impl() {
         if (ht_n > 0) std::fprintf(stderr, "inkling2 engine: host time a visit (%ld visits): wait for the picks %.0f us, placement + uploads + launch %.0f us\n", ht_n, ht_sync / (double) ht_n * 1e6, (ht_place + ht_up) / (double) ht_n * 1e6);
         prof_save();
-        if (pf_total > 0) std::fprintf(stderr, "inkling2 engine: look-ahead: %ld of %ld actual picks were in the predicted set (%.1f%%)\n", pf_hit, pf_total, 100.0 * pf_hit / (double) pf_total);
+        for (int d = 1; d <= 4; ++d) if (pf_tot_d[d] > 0) std::fprintf(stderr, "inkling2 engine: look-ahead +%d visit(s): %ld of %ld actual picks were in the predicted set (%.1f%%)\n", d, pf_hit_d[d], pf_tot_d[d], 100.0 * pf_hit_d[d] / (double) pf_tot_d[d]);
         if (st) cudaStreamDestroy(st);
         for (void* p : allocs) cudaFree(p); for (void* p : pinned) cudaFreeHost(p); }
 
@@ -210,8 +210,9 @@ struct Engine::Impl {
     int pf_n = 0;
     int32_t *d_pidx = nullptr, *h_pidx = nullptr;
     float *d_pw = nullptr, *rlp = nullptr, *xp = nullptr;
-    int pred_vis = -1;
-    std::vector<int> pred_ids;
+    int pf_depth = 1;                                   // STRATA_MOE_DEPTH: how many visits ahead the look-ahead reaches (each from THIS visit's input)
+    std::vector<std::vector<int>> pred_tab;             // [target visit * 5 + depth] -> the experts predicted for it
+    long pf_hit_d[5] = {0, 0, 0, 0, 0}, pf_tot_d[5] = {0, 0, 0, 0, 0};
     long pf_pred = 0, pf_hit = 0, pf_total = 0;
     const uint8_t **h_gu_ptr = nullptr, **h_dn_ptr = nullptr;   // pinned address tables
     // ---- the usage profile: how often each (stored layer, expert) was picked, kept across runs (STRATA_MOE_PROFILE or the constructor's path).  Counts are added as tokens run and saved
@@ -278,9 +279,11 @@ struct Engine::Impl {
         h_gu_ptr = (const uint8_t**) hp; h_dn_ptr = h_gu_ptr + 128;
         if (const char* pe = std::getenv("STRATA_MOE_PREFETCH")) pf_n = std::min(std::max(std::atoi(pe), 0), 16);
         if (pf_n > 0) {
+            if (const char* pd = std::getenv("STRATA_MOE_DEPTH")) pf_depth = std::min(std::max(std::atoi(pd), 1), 4);
             d_pidx = (int32_t*) dmalloc(16 * 4); d_pw = fmalloc(16); rlp = fmalloc((size_t) c.n_expert); xp = fmalloc((size_t) c.n_embd);
-            void* hq2 = nullptr; CK(cudaHostAlloc(&hq2, 16 * 4, cudaHostAllocPortable)); pinned.push_back(hq2); h_pidx = (int32_t*) hq2;
-            std::fprintf(stderr, "inkling2 engine: look-ahead prefetch of %d experts a visit\n", pf_n);
+            void* hq2 = nullptr; CK(cudaHostAlloc(&hq2, 16 * 4 * 4, cudaHostAllocPortable)); pinned.push_back(hq2); h_pidx = (int32_t*) hq2;
+            pred_tab.assign((size_t) c.n_visits * 5, {});
+            std::fprintf(stderr, "inkling2 engine: look-ahead prefetch of %d experts a visit, %d visit(s) ahead\n", pf_n, pf_depth);
         }
         // one token before the sizing: the runtime allocates lazily (kernel modules, local memory), which the free figure must already count
         step(0, 0, nullptr, SeamSink{});
@@ -478,17 +481,18 @@ struct Engine::Impl {
         int32_t* idxv = d_idx + (size_t) vis * 16;   // this visit's picks stay on the device (the host reads them once a token)
         M::route(rl, w.router_bias, 1, (int) c.n_expert, Kx, c.expert_weight_scale, M::Score::Sigmoid, idxv, d_w, st);
         CK(cudaMemcpyAsync(h_idx + (size_t) vis * 16, idxv, (size_t) Kx * 4, cudaMemcpyDeviceToHost, st));
-        int64_t nl = -1;
-        if (pf_n > 0 && scache.active() && vis + 1 < c.n_visits && !defer_experts) {   // the next visit's router on this visit's input (its own norm): the experts to start copying now
-            nl = c.stored_of_visit(vis + 1);
-            const LW& wn = lw[(size_t) nl];
-            if (wn.resident) nl = -1;
-            else {
+        int64_t nls[4] = {-1, -1, -1, -1};
+        if (pf_n > 0 && scache.active() && !defer_experts) {   // the router of each of the next visits on THIS visit's input (its own norm): the experts to start copying now
+            for (int d = 1; d <= pf_depth && vis + d < c.n_visits; ++d) {
+                int64_t nl = c.stored_of_visit(vis + d);
+                const LW& wn = lw[(size_t) nl];
+                if (wn.resident) continue;
+                nls[d - 1] = nl;
                 copy(xp, m_in, (size_t) E);
                 rms_w(xp, wn.ffn_norm);
                 ik::matmul_f32(wn.router, xp, rlp, 1, (int) E, (int) c.n_expert, st);
                 M::route(rlp, wn.router_bias, 1, (int) c.n_expert, std::max(pf_n, Kx), c.expert_weight_scale, M::Score::Sigmoid, d_pidx, d_pw, st);
-                CK(cudaMemcpyAsync(h_pidx, d_pidx, (size_t) std::max(pf_n, Kx) * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(h_pidx + (size_t) (d - 1) * 16, d_pidx, (size_t) std::max(pf_n, Kx) * 4, cudaMemcpyDeviceToHost, st));
             }
         }
         if (defer_experts) return nbl;   // (block step: the experts of all tokens come next)
@@ -499,16 +503,20 @@ struct Engine::Impl {
             CK(cudaStreamSynchronize(st));
             const double t1_ = ht_on ? now_s() : 0.0;
             const int32_t* act = h_idx + (size_t) vis * 16;
-            if (pred_vis == vis) {   // how well the last visit's look-ahead named this visit's picks
-                for (int s = 0; s < Kx; ++s) pf_hit += std::find(pred_ids.begin(), pred_ids.end(), act[s]) != pred_ids.end();
-                pf_total += Kx;
+            if (!pred_tab.empty()) for (int d = 1; d <= 4; ++d) {   // how well each earlier visit's look-ahead named this visit's picks
+                std::vector<int>& pt = pred_tab[(size_t) vis * 5 + d];
+                if (pt.empty()) continue;
+                for (int s = 0; s < Kx; ++s) pf_hit_d[d] += std::find(pt.begin(), pt.end(), act[s]) != pt.end();
+                pf_tot_d[d] += Kx;
+                pt.clear();
             }
             place_experts((int) l, w, act, Kx);
-            if (nl >= 0) {   // after this visit's own copies were queued (and waited for): the predicted ones follow on the copy stream, overlapping the compute below
-                const LW& wn = lw[(size_t) nl];
+            for (int d = 1; d <= pf_depth; ++d) if (nls[d - 1] >= 0) {   // after this visit's own copies were queued (and waited for): the predicted ones follow on the copy stream, nearest visit first, overlapping the compute below
+                const LW& wn = lw[(size_t) nls[d - 1]];
                 const int np = std::max(pf_n, Kx);
-                scache.prefetch((int) nl, h_pidx, np, wn.host_gu, wn.gu_plane, wn.host_dn, wn.dn_plane);
-                pred_ids.assign(h_pidx, h_pidx + np); pred_vis = vis + 1;
+                const int32_t* hp_ = h_pidx + (size_t) (d - 1) * 16;
+                scache.prefetch((int) nls[d - 1], hp_, np, wn.host_gu, wn.gu_plane, wn.host_dn, wn.dn_plane);
+                pred_tab[(size_t) (vis + d) * 5 + d].assign(hp_, hp_ + np);
             }
             M::experts_scales(idxv, d_w, w.gs_d, w.ds_d, Kx, d_sg, d_wd, st);
             if (ht_on) { const double t3_ = now_s(); ht_sync += t1_ - t0_; ht_place += t3_ - t1_; ++ht_n; }
