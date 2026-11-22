@@ -100,9 +100,7 @@ in these runs was read and checked.
 
 </div>
 
-<table width="100%">
-<tr>
-<td valign="top" width="50%">
+<div align="center">
 
 <table width="100%">
 <tr><th align="left">Qwen3.8-Flash-Next IQ3_S<br>131K context, 24 Oct</th><th align="right">tokens/s</th></tr>
@@ -110,9 +108,6 @@ in these runs was read and checked.
 <tr><td align="left">Reasoning (a two-train problem, ~1,000 tokens)</td><td align="right">66 – 71</td></tr>
 <tr><td align="left">Story (a paragraph, 100-150 tokens)</td><td align="right">50 – 53</td></tr>
 </table>
-
-</td>
-<td valign="top" width="50%">
 
 <table width="100%">
 <tr><th align="left">Stage, same PC</th><th align="right">tokens/s</th></tr>
@@ -123,9 +118,7 @@ in these runs was read and checked.
 <tr><td align="left">Final, 24 Oct</td><td align="right">50 – 70</td></tr>
 </table>
 
-</td>
-</tr>
-</table>
+</div>
 
 <div align="justify">
 
@@ -134,12 +127,16 @@ tokens/s on 31 Oct, and 7.5–8 over a whole answer on 13 Nov. These rest on few
 
 </div>
 
+<div align="center">
+
 <table width="100%">
 <tr><th align="left">Long prompts (262K context, 20 Oct)</th><th align="right">Read in</th><th align="right">Answer written at</th></tr>
 <tr><td align="left">8,554 tokens</td><td align="right">16.9 s</td><td align="right">52 - 54 tokens/s</td></tr>
 <tr><td align="left">45,398 tokens</td><td align="right">67 - 68 s</td><td align="right">38 - 41 tokens/s</td></tr>
 <tr><td align="left">The same 45K conversation, next turn</td><td align="right">0.4 - 0.5 s</td><td align="right">34 - 45 tokens/s</td></tr>
 </table>
+
+</div>
 
 <div align="justify">
 
@@ -273,12 +270,16 @@ and kept across restarts.
 </tr>
 </table>
 
+<div align="center">
+
 <table width="100%">
 <tr><th align="left">Needed experts guessed (live, 24 Oct)</th><th align="center">Plain router</th><th align="center">Learned look-ahead</th></tr>
 <tr><td align="left">1 layer ahead</td><td align="center">77-79%</td><td align="center"><b>85-88%</b></td></tr>
 <tr><td align="left">2 layers ahead</td><td align="center">66-69%</td><td align="center"><b>76-79%</b></td></tr>
 <tr><td align="left">4 layers ahead</td><td align="center">55-58%</td><td align="center"><b>66-71%</b></td></tr>
 </table>
+
+</div>
 
 <div align="justify">
 
