@@ -101,14 +101,14 @@ in these runs was read and checked.
 </div>
 
 <table width="100%">
-<tr><th align="left" width="70%">Qwen3.8-Flash-Next IQ3_S<br>131K context, 24 Oct</th><th align="right" width="30%">tokens/s</th></tr>
+<tr><th align="left" width="980">Qwen3.8-Flash-Next IQ3_S<br>131K context, 24 Oct</th><th align="right" width="420">tokens/s</th></tr>
 <tr><td align="left">Code (a Python function, 500-650 tokens)</td><td align="right">52 – 55</td></tr>
 <tr><td align="left">Reasoning (a two-train problem, ~1,000 tokens)</td><td align="right">66 – 71</td></tr>
 <tr><td align="left">Story (a paragraph, 100-150 tokens)</td><td align="right">50 – 53</td></tr>
 </table>
 
 <table width="100%">
-<tr><th align="left" width="70%">Stage, same PC</th><th align="right" width="30%">tokens/s</th></tr>
+<tr><th align="left" width="980">Stage, same PC</th><th align="right" width="420">tokens/s</th></tr>
 <tr><td align="left">Stock Strata, 10 Oct (32K)</td><td align="right">17.2</td></tr>
 <tr><td align="left">I/O prefetch on (test T1)</td><td align="right">27.2</td></tr>
 <tr><td align="left">Stand-ins from rank 2 + draft head</td><td align="right">44.6</td></tr>
@@ -124,7 +124,7 @@ tokens/s on 31 Oct, and 7.5–8 over a whole answer on 13 Nov. These rest on few
 </div>
 
 <table width="100%">
-<tr><th align="left" width="52%">Long prompts (262K context, 20 Oct)</th><th align="right" width="24%">Read in</th><th align="right" width="24%">Answer written at</th></tr>
+<tr><th align="left" width="730">Long prompts (262K context, 20 Oct)</th><th align="right" width="335">Read in</th><th align="right" width="335">Answer written at</th></tr>
 <tr><td align="left">8,554 tokens</td><td align="right">16.9 s</td><td align="right">52 - 54 tokens/s</td></tr>
 <tr><td align="left">45,398 tokens</td><td align="right">67 - 68 s</td><td align="right">38 - 41 tokens/s</td></tr>
 <tr><td align="left">The same 45K conversation, next turn</td><td align="right">0.4 - 0.5 s</td><td align="right">34 - 45 tokens/s</td></tr>
@@ -141,7 +141,7 @@ already read. A 262K context costs about 8% against 131K, because more of the at
 <summary><b>The machine</b></summary>
 
 <table width="100%">
-<tr><th align="left" width="70%"></th><th align="left" width="30%"></th></tr>
+<tr><th align="left" width="980"></th><th align="left" width="420"></th></tr>
 <tr><td align="left"><b>Graphics card</b></td><td align="left">NVIDIA GeForce RTX 3060, 12 GB (driver 610.57, CUDA 13.3)</td></tr>
 <tr><td align="left"><b>Processor, RAM</b></td><td align="left">Intel Core i5-12400F (6 cores, 12 threads), 30 GB</td></tr>
 <tr><td align="left"><b>Disk</b></td><td align="left">500 GB NVMe (WD Blue SN5000) on a PCIe 3.0 link; the model files live on it</td></tr>
@@ -263,7 +263,7 @@ and kept across restarts.
 </table>
 
 <table width="100%">
-<tr><th align="left" width="52%">Needed experts guessed (live, 24 Oct)</th><th align="center" width="24%">Plain router</th><th align="center" width="24%">Learned look-ahead</th></tr>
+<tr><th align="left" width="730">Needed experts guessed (live, 24 Oct)</th><th align="center" width="335">Plain router</th><th align="center" width="335">Learned look-ahead</th></tr>
 <tr><td align="left">1 layer ahead</td><td align="center">77-79%</td><td align="center"><b>85-88%</b></td></tr>
 <tr><td align="left">2 layers ahead</td><td align="center">66-69%</td><td align="center"><b>76-79%</b></td></tr>
 <tr><td align="left">4 layers ahead</td><td align="center">55-58%</td><td align="center"><b>66-71%</b></td></tr>
