@@ -460,3 +460,13 @@ a token count (`attn_res`, `attention`, `kv_append`, `control_cat`; defaults kee
 Speed on the warm 48-token prompt, including copying all n logit rows to the host: 49.0 tok/s (N=8), 46.5 (N=4), against 31.9 for the per-token block path and ~31 for single steps. `STRATA_INKLING2_NO_BATCH=1` selects the per-token path.
 Used by `inkling2_serve` for the prompt (blocks of 8, logits only for the last token): a 1,432-token prompt + 60 generated in 44.8 s through the server (~34 tok/s of prompt on a cold cache with a large expert working set, against ~27 before).
 Attention scratch is [8][H][cap]: it grows with the context (to be bounded when the KV ring lands).
+
+### DSpark: what the drafter needs, and why it does not pay yet (22 Nov)
+Read from Maya's ik2_draft.cu / docs/INKLING2.md for Mini: the drafter is 3 layers (width 2304, 24 heads / 8 KV heads of 128, MLP 9216, layers 0 and 2 windowed at 1024, layer 1 global), taps = the stream at the start of visits 5, 23, 41 and the final normed
+hidden (4 taps, softmax(fuse_weight) rows mix them per layer), a context K/V cache per layer built from the taps (k_proj_ctx / v_proj_ctx, per-head norm, NeoX RoPE theta 1e6), an 8-row block (anchor embedding + 7 mask_embed rows), the target's
+head for the base logits, and a Markov head (GRU-like cell on [state; markov_w1[prev]; hidden; f_rnn]) whose folded bias (head . hidden_out) is added before the argmax. Verification also needs the conv states rolled back to the accepted prefix
+(old 3-row history + recorded inputs, per visit): an extra 10 MB of recorded inputs, nothing hard.
+The economics decide the order. Our block forward costs ~32 + 18 (N - 1) ms (N=4: 86 ms, N=8: 163 ms; one plain token 32 ms), so a verified draft token costs 18 ms and a correct one saves 32 ms: break-even acceptance ~56% a draft position, which prose will
+not reach (Maya's own prose numbers on a 3090: 131 vs 127 tok/s; code 162 vs 126; edits 213 vs 124). The marginal 18 ms is the expert kernels (`k_gate_up_q8` + `k_down_q8` = 39% of kernel time; each token's slots read their expert's weights again from VRAM
+although several tokens picked the same expert) and the dense q8 matvecs (27%). Maya's window of 5 costs 2x a token because an expert's blocks are read once for all the tokens that picked it. So: (1) expert-grouped multi-token kernels
+(each distinct expert read once, applied to every token that picked it) to bring the marginal cost per extra token to a few ms; (2) then the drafter; (3) the verify / rollback loop. (1) is useful by itself (prompt reading).
