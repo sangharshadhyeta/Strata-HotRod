@@ -1029,6 +1029,7 @@ struct PinnedUpload {
 };
 
 struct Prefill::Impl {
+    int64_t peer_missing_bytes = 0;   // set_peer's first failing allocation: how far it was past the free memory (see peer_missing_mib)
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -2121,6 +2122,8 @@ bool Prefill::bind_stage_helper(int64_t T) {
     return true;
 }
 
+int64_t Prefill::peer_missing_mib() const { return impl_->peer_missing_bytes >> 20; }
+
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
@@ -2167,12 +2170,21 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
             ok = cudaEventCreateWithFlags(&pp->ev_grp[i], cudaEventDisableTiming) == cudaSuccess;
     }
     size_t asked = 0;   // what the peer's prompt buffers have asked for so far (for the failure message: how much room they need)
+    m.peer_missing_bytes = 0;
     auto take = [&](size_t bytes) -> void* {
         void* p = nullptr;
         if (ok) asked += bytes;
-        if (!ok || cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
-        pp->owned.push_back(p);
-        return p;
+        if (ok && cudaMalloc(&p, bytes) == cudaSuccess) {
+            pp->owned.push_back(p);
+            return p;
+        }
+        if (ok) {   // the first allocation that failed: how far past the free memory it was (the retry raises the peer's reserve by that and more)
+            (void) cudaGetLastError();
+            size_t f = 0, t = 0;
+            if (cudaMemGetInfo(&f, &t) == cudaSuccess) m.peer_missing_bytes = (int64_t) (bytes > f ? bytes - f : bytes);
+        }
+        ok = false;
+        return nullptr;
     };
     pp->mixed = (float*) take((size_t) m.T_max * N * 4);
     {

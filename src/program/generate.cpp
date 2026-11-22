@@ -38,6 +38,7 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
+#include "strata/core/peer_retry.hpp"
 #include "strata/core/online_tuner.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
@@ -7262,14 +7263,17 @@ int main(int argc, char** argv) {
 
     // ---- Multi-GPU: the second GPU's expert tier, filled with the ranked pairs the primary does not hold
     strata::core::PeerExperts peer;
+    // the peer's expert cache with a given reserve (the retry below reopens it with a larger one)
+    auto open_peer = [&](int reserve_mib) {
+        return peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, reserve_mib, o.peer_slots, err);
+    };
     if (o.peer_device >= 1) {
         if (profile.empty() || srcp == nullptr || o.expert_cache <= 0) {
             std::fprintf(stderr, "strata generate: --peer-device needs --expert-profile and the expert cache\n");
             return 1;
         }
         const auto tp0 = Clock::now();
-        if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
-                       err)) {
+        if (!open_peer(o.peer_reserve_mib)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -9344,8 +9348,47 @@ int main(int argc, char** argv) {
         }
         if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
-            if (!sp.set_peer(&peer, rows, err)) {
-                std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
+            bool peer_ok = sp.set_peer(&peer, rows, err);
+            std::string peer_err = err;   // the last failure's text (err is cleared along the retries)
+            // EXPERIMENTAL (STRATA_PEER_RESERVE_RETRY=0 turns it off; written without a second GPU to run it on, community issue #2): the peer's prompt
+            // buffers did not fit in the reserve it kept free.  Say how short the first failing allocation was, close the peer cache, reopen it
+            // with a larger reserve (peer_retry.hpp) and try the buffers again, up to three times.  This runs only where the result is already the
+            // degraded one (every prompt row on the primary); if a reopen fails, the reserve that worked first is put back.
+            const char* retry_env = std::getenv("STRATA_PEER_RESERVE_RETRY");
+            const bool retry_on = retry_env == nullptr || std::atoi(retry_env) != 0;
+            int peer_reserve = o.peer_reserve_mib;
+            const int first_reserve = peer_reserve;
+            for (int attempt = 1; !peer_ok && retry_on && attempt <= strata::core::kPeerRetryMaxAttempts && peer.valid() &&
+                                  err.find("the peer's buffers do not fit") != std::string::npos; ++attempt) {
+                const int64_t missing = sp.peer_missing_mib();
+                const int next = strata::core::next_peer_reserve_mib(peer_reserve, missing, attempt);
+                if (next <= peer_reserve) break;   // at the cap
+                std::fprintf(stderr, "strata serve: peer reserve retry %d: the first buffer that failed was %lld MiB short; reopening the peer cache "
+                                     "with --peer-reserve-mib %d (was %d)\n", attempt, (long long) missing, next, peer_reserve);
+                peer.close();
+                std::string oerr;
+                if (!open_peer(next)) {
+                    oerr = err;
+                    std::fprintf(stderr, "strata serve: peer reserve retry: %s; back to %d MiB\n", oerr.c_str(), first_reserve);
+                    err.clear();
+                    if (!open_peer(first_reserve)) {
+                        std::fprintf(stderr, "strata serve: peer reserve retry: the peer cache could not be reopened (%s): the peer tier is off\n",
+                                     err.c_str());
+                        err.clear();
+                        drive.d.peer = nullptr;
+                    }
+                    break;
+                }
+                peer_reserve = next;
+                err.clear();
+                peer_ok = sp.set_peer(&peer, rows, err);
+                peer_err = err;
+            }
+            if (peer_ok && peer_reserve != first_reserve)
+                std::fprintf(stderr, "strata serve: the peer's prompt rows are on with --peer-reserve-mib %d (set that to skip the retry; %lld experts "
+                                     "on the peer now)\n", peer_reserve, (long long) peer.resident());
+            if (!peer_ok) {
+                std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", peer_err.c_str());
                 err.clear();
             }
         }
