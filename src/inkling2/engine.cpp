@@ -102,6 +102,7 @@ struct Engine::Impl {
 
     Impl(const GgufFile& gg, const Config& cc, const Layout& ll, int max_ctx, const std::string& prof) : g(gg), c(cc), lay(ll), cap(max_ctx), prof_path(prof) { init(); }
     ~Impl() {
+        if (ht_n > 0) std::fprintf(stderr, "inkling2 engine: host time a visit (%ld visits): wait for the picks %.0f us, placement + uploads + launch %.0f us\n", ht_n, ht_sync / (double) ht_n * 1e6, (ht_place + ht_up) / (double) ht_n * 1e6);
         prof_save();
         if (pf_total > 0) std::fprintf(stderr, "inkling2 engine: look-ahead: %ld of %ld actual picks were in the predicted set (%.1f%%)\n", pf_hit, pf_total, 100.0 * pf_hit / (double) pf_total);
         if (st) cudaStreamDestroy(st);
@@ -200,6 +201,9 @@ struct Engine::Impl {
     bool grouped_experts = true;   // STRATA_INKLING2_GROUP=1: the block's experts read once per distinct expert (bit-identical; not faster on this card)
     const uint8_t **h_grp_gu = nullptr, **h_grp_dn = nullptr, **d_grp_gu = nullptr, **d_grp_dn = nullptr;
     int *h_grp_cnt = nullptr, *h_grp_slot = nullptr, *d_grp_cnt = nullptr, *d_grp_slot = nullptr;
+    double ht_sync = 0, ht_place = 0, ht_up = 0; long ht_n = 0;   // STRATA_INKLING2_HOSTTIME: host seconds in the per-visit picks wait / placement / uploads
+    bool ht_on = std::getenv("STRATA_INKLING2_HOSTTIME") != nullptr;
+    static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     bool defer_experts = false;   // layer() stops after routing: the block step runs the experts for all tokens
     bool int8_act = false;           // STRATA_MOE_INT8
     void *d_xq8 = nullptr, *d_hq8 = nullptr;   // q8_1-quantized expert input / activation
@@ -491,7 +495,9 @@ struct Engine::Impl {
         lap(1);
         // the grouped experts: 4 launches for all of the visit's picks, FP32 activations (no int8 quantization of the input)
         if (scache.active() && !w.resident) {   // class B: the host learns the picks (one sync a visit), misses are copied into VRAM slots, hits cost nothing
+            const double t0_ = ht_on ? now_s() : 0.0;
             CK(cudaStreamSynchronize(st));
+            const double t1_ = ht_on ? now_s() : 0.0;
             const int32_t* act = h_idx + (size_t) vis * 16;
             if (pred_vis == vis) {   // how well the last visit's look-ahead named this visit's picks
                 for (int s = 0; s < Kx; ++s) pf_hit += std::find(pred_ids.begin(), pred_ids.end(), act[s]) != pred_ids.end();
@@ -505,6 +511,7 @@ struct Engine::Impl {
                 pred_ids.assign(h_pidx, h_pidx + np); pred_vis = vis + 1;
             }
             M::experts_scales(idxv, d_w, w.gs_d, w.ds_d, Kx, d_sg, d_wd, st);
+            if (ht_on) { const double t3_ = now_s(); ht_sync += t1_ - t0_; ht_place += t3_ - t1_; ++ht_n; }
         } else {
             M::experts_prepare(idxv, d_w, w.gu_dev, w.gu_plane, w.dn_dev, w.dn_plane, w.gs_d, w.ds_d, Kx, d_gu_ptr, d_dn_ptr, d_sg, d_wd, st);
         }
@@ -547,16 +554,20 @@ struct Engine::Impl {
         const int64_t E = c.n_embd, FF = c.n_ff_exp;
         const int Kx = (int) c.n_expert_used, NK = n * Kx;
         const LW& w = lw[(size_t) l];
+        const double t0_ = ht_on ? now_s() : 0.0;
         CK(cudaMemcpyAsync(h_idxb, d_idxb, (size_t) NK * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        const double t1_ = ht_on ? now_s() : 0.0;
         if (scache.active() && !w.resident) {
             scache.place((int) l, h_idxb, NK, w.host_gu, w.gu_plane, w.host_dn, w.dn_plane, h_gu_ptr, h_dn_ptr, st);
         } else {
             for (int i = 0; i < NK; ++i) { h_gu_ptr[i] = w.gu_dev + (uint64_t) h_idxb[i] * w.gu_plane; h_dn_ptr[i] = w.dn_dev + (uint64_t) h_idxb[i] * w.dn_plane; }
         }
+        const double t2_ = ht_on ? now_s() : 0.0;
         CK(cudaMemcpyAsync(d_gu_ptr, h_gu_ptr, (size_t) NK * sizeof(void*), cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_dn_ptr, h_dn_ptr, (size_t) NK * sizeof(void*), cudaMemcpyHostToDevice, st));
         M::experts_scales(d_idxb, d_wb, w.gs_d, w.ds_d, NK, d_sg, d_wd, st);
+        if (ht_on) { const double t3_ = now_s(); ht_sync += t1_ - t0_; ht_place += t2_ - t1_; ht_up += t3_ - t2_; ++ht_n; }
         const M::Act situ{M::ActKind::Situ, c.situ_beta, c.situ_linear_beta};
         if (int8_act) {
             M::quantize_act(d_xb, (int) E, n, d_xq8, st);

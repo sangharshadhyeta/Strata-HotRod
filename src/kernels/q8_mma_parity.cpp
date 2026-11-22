@@ -13,7 +13,7 @@
 #include <random>
 #include <vector>
 
-int main() {
+int main(int argc, char** argv) {
     int devs = 0;
     if (cudaGetDeviceCount(&devs) != cudaSuccess || devs == 0) { std::printf("(skipped: no CUDA device)\n"); return 0; }
     namespace M = strata::kernels::moe;
@@ -21,7 +21,12 @@ int main() {
     std::normal_distribution<float> nd(0.0f, 1.0f);
     struct Shape { int n_in, n_out; };
     int fails = 0;
-    for (const Shape sh : {Shape{2304, 3072}, Shape{2304, 1024}, Shape{3072, 2304}, Shape{2304, 384}, Shape{2304, 201024}}) {
+    std::vector<Shape> shapes = {Shape{2304, 3072}, Shape{2304, 1024}, Shape{3072, 2304}, Shape{2304, 384}, Shape{2304, 201024}};   // the Inkling engine's
+    if (argc > 1) {   // shapes n_in:n_out on the command line replace them (e.g. another model's Q8_0 tensors)
+        shapes.clear();
+        for (int i = 1; i < argc; ++i) { int a = 0, b = 0; if (std::sscanf(argv[i], "%d:%d", &a, &b) == 2) shapes.push_back(Shape{a, b}); }
+    }
+    for (const Shape sh : shapes) {
         const int nb = sh.n_in / 32;
         std::vector<uint8_t> W((size_t) sh.n_out * nb * 34);
         for (size_t r = 0; r < (size_t) sh.n_out * nb; ++r) {
@@ -30,8 +35,9 @@ int main() {
             for (int j = 0; j < 32; ++j) W[r * 34 + 2 + j] = (uint8_t) (int8_t) std::max(-127, std::min(127, (int) std::lround(nd(rng) * 40.0f)));
         }
         uint8_t* dW = nullptr; float *dx = nullptr, *dy = nullptr; void* dq = nullptr;
-        cudaMalloc((void**) &dW, W.size()); cudaMemcpy(dW, W.data(), W.size(), cudaMemcpyHostToDevice);
-        cudaMalloc(&dx, (size_t) 8 * sh.n_in * 4); cudaMalloc(&dq, (size_t) 8 * nb * 36); cudaMalloc(&dy, (size_t) 8 * sh.n_out * 4);
+        bool alloc_ok = cudaMalloc((void**) &dW, W.size()) == cudaSuccess && cudaMemcpy(dW, W.data(), W.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+        alloc_ok = alloc_ok && cudaMalloc(&dx, (size_t) 8 * sh.n_in * 4) == cudaSuccess && cudaMalloc(&dq, (size_t) 8 * nb * 36) == cudaSuccess && cudaMalloc(&dy, (size_t) 8 * sh.n_out * 4) == cudaSuccess;
+        if (!alloc_ok) { std::printf("FAIL: %d x %d: a device allocation failed (GPU memory in use?), not tested\n", sh.n_in, sh.n_out); ++fails; (void) cudaGetLastError(); continue; }
         for (int cols = 1; cols <= 8; ++cols) {
             std::vector<float> x((size_t) cols * sh.n_in);
             for (float& v : x) v = nd(rng) * 2.0f;
@@ -58,7 +64,7 @@ int main() {
                     worst = std::max(worst, std::fabs(ref - (double) y[(size_t) c * sh.n_out + r]));
                 }
             }
-            const bool ok = worst <= 1e-5 * std::max(mx, 1e-9);
+            const bool ok = mx > 0 && worst <= 1e-5 * mx && cudaGetLastError() == cudaSuccess;   // an all-zero reference means nothing was computed
             if (!ok) ++fails;
             if (!ok || cols == 8 || cols == 1) std::printf("%s %6d x %-6d cols %d: max |diff| %.2e (max |ref| %.2e)\n", ok ? "ok  " : "FAIL", sh.n_in, sh.n_out, cols, worst, mx);
         }
