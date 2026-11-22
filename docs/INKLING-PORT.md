@@ -401,3 +401,12 @@ exist (L2), the learned look-ahead exists (prefetch), decode is in CUDA graphs (
 The headroom is the half of each token the GPU spends waiting on the miss path (CPU lane + fetch). Candidates from the Inkling twists, to be built as new code and measured one at a time on the
 3-prompt check: copy-engine DMA for the predicted experts ahead of the layer (Inkling's copy stream) instead of an SM-based fetch in the graph; the loop-style protection of an expert across a token.
 The learner (`la_b_*`, ~1% of the window on its own stream) is not on the critical path in the window measured.
+
+### Qwen: where the decode window goes, read from the engine's own stage timer and serve log (22 Nov)
+
+`strata decode stages (ms/window)` (verify.cpp `stage_report`, in every serve log; a window is one verify pass, several rows): cpu-wait 12-21, router 10-13, vram-experts 7.5-8.5, gdn 7-8, pcie-experts 0.4-9, hc-read / attn / ffn-read 3-4 each,
+plan-wait 1.3, the rest small. The start-up line "PCIe share: the CPU pool takes 120 us per missed expert (26.1 GB/s of expert bytes), the link 24.7 GB/s -> pcie_frac 0.35" shows the split of the misses
+between the CPU lane and PCIe is already set from the two measured rates (the CPU is faster per expert, takes 65%): the cpu-wait is the miss volume of the window x that cost, both lanes bandwidth-bound (~26 + ~25 GB/s).
+So Qwen's decode on this card sits at the memory-bandwidth point of its miss path; what moves it is fewer missed bytes per window (hit rate, fewer bytes an expert, stand-ins / mask - all present), not a faster lane.
+The router stage (10-13 ms) is already one fused post-routing launch (`native_route_post`, SPEC-router-fuse step 2); what is left in it are one-warp-per-token serial kernels (`route_post_k` 47 us, `route_pred_sel_k` 38 us)
+carrying the stand-in / route-resident logic that must stay bit-exact: at most ~3 ms a window, at the cost of rewriting those rules. Not started.
