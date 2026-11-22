@@ -52,7 +52,7 @@
       "name": "Can it run a model bigger than the RAM?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Yes. The 78 GB IQ3_S of Qwen3.8-Flash-Next runs on a 30 GB PC. A separate DeepSeek-V4.1-Flash branch (341 GB of files) runs at about 5 tokens/s on the same PC, limited by the NVMe at about 2.8 GB/s."
+        "text": "Yes. The 78 GB IQ3_S of Qwen3.8-Flash-Next runs on a 30 GB PC. A separate DeepSeek-V4.1-Flash branch (341 GB of files) runs at 7.5-8 tokens/s over a whole answer on the same PC, limited by the NVMe at about 2.8 GB/s."
       }
     }
   ]
@@ -96,6 +96,11 @@ details{background:var(--card);border:1px solid var(--border);border-radius:10px
 summary{cursor:pointer;font-weight:600}
 .links a{display:inline-block;margin:.3rem .6rem .3rem 0}
 footer{color:var(--muted);font-size:.9rem;margin-top:3rem}
+.bars{margin:.8rem 0}.bars .row{display:grid;grid-template-columns:minmax(9rem,17rem) 1fr 4.4rem;gap:.7rem;align-items:center;margin:.4rem 0;font-size:.92rem}
+.bars .l{color:var(--muted)}.bars .t{background:#0e1013;border:1px solid var(--border);border-radius:999px;height:.8rem;overflow:hidden}
+.bars .t i{display:block;height:100%;background:var(--ice)}.bars .t i.f{background:var(--fire)}.bars .v{text-align:right}
+.fig{display:block;margin:1rem auto;max-width:100%;height:auto;border-radius:10px}
+@media (max-width:640px){.bars .row{grid-template-columns:1fr 4.4rem}.bars .row .t{grid-column:1/3}}
 </style>
 </head>
 <body>
@@ -103,6 +108,7 @@ footer{color:var(--muted);font-size:.9rem;margin-top:3rem}
 <a class="brand" href="#top">Strata-HotRod</a>
 <a href="#faq">FAQ</a>
 <a href="#speed">Speed</a>
+<a href="#lessons">How it got fast</a>
 <a href="#big-models">Big models</a>
 <a href="#run-it">Run it</a>
 <a href="#not-tested">Not tested</a>
@@ -147,7 +153,7 @@ the rest of the experts from the SSD, which its docs call much slower. Strata-Ho
 <p>No. Everything runs on your PC and nothing leaves it. Setup downloads the model once from Hugging Face.</p>
 
 <h2>Can it run a model bigger than the RAM?</h2>
-<p>Yes. The 78 GB IQ3_S runs on a 30 GB PC. A separate DeepSeek-V4.1-Flash branch (341 GB of files) runs at about 5 tokens/s on
+<p>Yes. The 78 GB IQ3_S runs on a 30 GB PC. A separate DeepSeek-V4.1-Flash branch (341 GB of files) runs at 7.5-8 tokens/s over a whole answer on
 the same PC, limited by the NVMe at about 2.8 GB/s.</p>
 
 <h2 id="speed">How fast is it?</h2>
@@ -178,13 +184,58 @@ already read.</p>
 </table>
 </details>
 
+<h2 id="lessons">How it got fast: five lessons</h2>
+<p>Strata-HotRod grew out of <b>solid.cpp</b> (August to October 2026), a fork of llama.cpp used to find out what really works for a
+mixture-of-experts model that does not fit the card. What survived measurement was ported into Strata one concept at a time.</p>
+<img class="fig" src="assets/lessons.svg" width="760" alt="Five lessons from solid.cpp and what each became in Strata-HotRod">
+<table>
+<tr><th>Learned in solid.cpp</th><th>Built into Strata-HotRod</th></tr>
+<tr><td><b>Stand-ins are the biggest lever, but they break the text if pushed too far.</b> On a 87 GB model on a 12 GB card: cache off 3.7 tokens/s, cache on 8.3, cache plus stand-ins 12.85</td><td>Stand-ins decided by confidence (router weight x logit gap &le; budget): from rank 2, 42.2 tokens/s, 9 of 9 answers read as sound (rank 0 broke them)</td></tr>
+<tr><td><b>A CPU-thread predictor lost:</b> late, lossy guesses do not pay</td><td>A learned look-ahead on the card, starting from the model's own router, 1, 2 and 4 layers ahead: +8% code, +15% reasoning, +8% prose</td></tr>
+<tr><td><b>Pinning the hottest experts lost,</b> because pinned pages cannot be reclaimed</td><td>The RAM tier is page-locked in segments and handed back: +9% on the RTX 3060 PC</td></tr>
+<tr><td><b>The drive sets the speed:</b> fix the reads before tuning anything</td><td>Link budgeting, one layer at a time: an 8,554-token prompt read in 16.9 s, 262K context fits</td></tr>
+<tr><td><b>Measure in pairs, with a control,</b> and retract what turns out to be noise</td><td>A test ledger: a decision stays untested until a row holds a measurement</td></tr>
+</table>
+
+<h3>What the work bought</h3>
+<p class="cap">Qwen3.8-Flash-Next IQ3_S (78 GB), tokens per second as the work progressed on the same PC. Prompts and context length differ between stages: a progression, not a controlled comparison.</p>
+<div class="bars">
+<div class="row"><span class="l">Stock Strata, 10 Oct</span><span class="t"><i style="width:24%"></i></span><span class="v">17.2</span></div>
+<div class="row"><span class="l">+ I/O prefetch, 10 Oct</span><span class="t"><i style="width:38%"></i></span><span class="v">27.2</span></div>
+<div class="row"><span class="l">+ stand-ins, draft head, 11 Oct</span><span class="t"><i style="width:62%"></i></span><span class="v">44.6</span></div>
+<div class="row"><span class="l">Merged version, 11 Oct</span><span class="t"><i style="width:81%"></i></span><span class="v">58.4</span></div>
+<div class="row"><span class="l">Final, 24 Oct (131K context)</span><span class="t"><i class="f" style="width:100%"></i></span><span class="v">50-70</span></div>
+</div>
+
+<h3>The look-ahead's guesses</h3>
+<table>
+<tr><th>Needed experts guessed (live, 24 Oct)</th><th class="r">Plain router</th><th class="r">Learned look-ahead</th></tr>
+<tr><td>1 layer ahead</td><td class="r">77 - 79%</td><td class="r"><b>85 - 88%</b></td></tr>
+<tr><td>2 layers ahead</td><td class="r">66 - 69%</td><td class="r"><b>76 - 79%</b></td></tr>
+<tr><td>4 layers ahead</td><td class="r">55 - 58%</td><td class="r"><b>66 - 71%</b></td></tr>
+</table>
+<p class="cap">Each guess is the router's own score plus a small correction learned live from the real routing; it falls back to the plain router if it ever does worse.</p>
+
+<h3>How a token is served</h3>
+<img class="fig" src="assets/token-flow.svg" width="760" alt="How a requested expert is served: on the card, stand-in, RAM or SSD">
+
+<h3>Answer quality</h3>
+<p>With stand-ins on, 47 of 50 maths and 30 of 30 coding questions were correct, against 48 of 50 and 30 of 30 with nothing replaced; a
+test this small cannot show a difference of one or two answers. <b>MMLU-Pro (30 Oct): 87.1%</b>, 183 of 210 questions, thinking on, 32K
+context, temperature 0. Every answer in these runs was read.</p>
+<p class="cap">The full story, with the checks that were wrong and the settings that wrecked the text, is the
+<a href="https://sangharshadhyeta.github.io/solid/">illustrated write-up of solid.cpp and HotRod</a>
+(<a href="https://github.com/sangharshadhyeta/solid.cpp">solid.cpp on GitHub</a>,
+<a href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/legacy-solid">the legacy branch</a>).</p>
+
 <h2 id="big-models">How do I run a very large AI model on small local hardware?</h2>
 <p>If the model is a mixture-of-experts (MoE) model, you do not need to fit all of it in GPU memory or even in RAM.
 Only a few experts are used for each token, so the rest can wait on the SSD. Strata-HotRod keeps the hot experts on the
 GPU, the warm ones in RAM and the cold ones on the NVMe drive, and a learned look-ahead loads the next experts before they are needed.</p>
 <ul>
 <li><b>Qwen3.8-Flash-Next</b>, 125B parameters, 78 GB of model files, on an RTX 3060 12 GB with 30 GB of RAM: 50-70 tokens/s.</li>
-<li><b>DeepSeek V4.1</b>, 341 GB of files, on the same PC: 5.2-5.4 tokens/s (separate branch, <code>upstream-dsv41</code>).</li>
+<li><b>Qwen3.8-Flash-Next UD-Q4_K_XL</b>, the 111 GB version, on the same PC: 15-22 tokens/s (14 Nov, with the learners still cold).</li>
+<li><b>DeepSeek V4.1</b>, 341 GB of files, on the same PC: 7.5-8 tokens/s over a whole answer, the best answers near 10 (separate branch, <code>upstream-dsv41</code>).</li>
 </ul>
 <p>Longer guides: <a href="run-125b-model-on-12gb-gpu/">run a 125B model on a 12 GB GPU with 30 GB of RAM</a> and
 <a href="run-moe-models-from-ssd/">run a mixture-of-experts model from an SSD</a>.</p>
@@ -219,6 +270,7 @@ the DeepSeek install are in the GitHub README.</p>
 <p class="links">
 <a href="https://github.com/sangharshadhyeta/Strata-HotRod">Strata-HotRod on GitHub</a> (Qwen3.8-Flash-Next)
 &middot; <a href="https://github.com/sangharshadhyeta/Strata-HotRod/tree/upstream-dsv41">DeepSeek branch</a>
+&middot; <a href="https://sangharshadhyeta.github.io/solid/">solid.cpp write-up</a>
 &middot; <a href="https://dev.to/sumit_sodhi/a-125b-model-at-50-toks-on-a-12-gb-gaming-card-what-i-changed-in-strata-2cig">Write-up on dev.to</a>
 &middot; <a href="https://medium.com/@sumitssodhi/a-125b-model-at-50-tok-s-on-a-12-gb-gaming-card-what-i-changed-in-strata-8fc22ca838a4">Write-up on Medium</a>
 </p>

@@ -5,17 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="msvalidate.01" content="28F77845BA2217F8FD32376C38F992AC" />
 <title>Run a mixture-of-experts model from an SSD on a consumer GPU | Strata-HotRod</title>
-<meta name="description" content="Stream mixture-of-experts models from an NVMe SSD: Qwen3.8-Flash-Next (78 GB) at 50-70 tokens/s and DeepSeek-V4.1-Flash (341 GB) at 5.2-5.4 tokens/s on one RTX 3060 12 GB with 30 GB of RAM.">
+<meta name="description" content="Stream mixture-of-experts models from an NVMe SSD: Qwen3.8-Flash-Next (78 GB) at 50-70 tokens/s and DeepSeek-V4.1-Flash (341 GB) at 7.5-8 tokens/s on one RTX 3060 12 GB with 30 GB of RAM.">
 <link rel="canonical" href="https://sangharshadhyeta.github.io/Strata-HotRod/run-moe-models-from-ssd/">
 <meta property="og:title" content="Run a mixture-of-experts model from an SSD on a consumer GPU | Strata-HotRod">
-<meta property="og:description" content="Stream mixture-of-experts models from an NVMe SSD: Qwen3.8-Flash-Next (78 GB) at 50-70 tokens/s and DeepSeek-V4.1-Flash (341 GB) at 5.2-5.4 tokens/s on one RTX 3060 12 GB with 30 GB of RAM.">
+<meta property="og:description" content="Stream mixture-of-experts models from an NVMe SSD: Qwen3.8-Flash-Next (78 GB) at 50-70 tokens/s and DeepSeek-V4.1-Flash (341 GB) at 7.5-8 tokens/s on one RTX 3060 12 GB with 30 GB of RAM.">
 <meta property="og:type" content="article">
 <meta property="og:url" content="https://sangharshadhyeta.github.io/Strata-HotRod/run-moe-models-from-ssd/">
 <meta property="og:image" content="https://sangharshadhyeta.github.io/Strata-HotRod/Neon%20Fire%20and%20Ice%20Hot%20Rod%20Logo.png">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#0b0d10">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%A5%3C/text%3E%3C/svg%3E">
-<script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Can a mixture-of-experts model run from an SSD?","acceptedAnswer":{"@type":"Answer","text":"Yes. Strata-HotRod keeps the hot experts on the GPU, warm ones in RAM and cold ones on the NVMe drive. Qwen3.8-Flash-Next (78 GB) ran at 50-70 tokens/s and DeepSeek-V4.1-Flash (341 GB of files) at 5.2-5.4 tokens/s on one RTX 3060 12 GB with 30 GB of RAM."}},{"@type":"Question","name":"What limits speed when streaming from an SSD?","acceptedAnswer":{"@type":"Answer","text":"The drive. On the test PC the NVMe reads at about 2.8 GB/s, which is what limits the DeepSeek model. A learned look-ahead that starts reads early reduces the wait."}},{"@type":"Question","name":"Does it work for dense models?","acceptedAnswer":{"@type":"Answer","text":"No. It relies on a mixture-of-experts model using only a few experts per token."}}]}</script>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Can a mixture-of-experts model run from an SSD?","acceptedAnswer":{"@type":"Answer","text":"Yes. Strata-HotRod keeps the hot experts on the GPU, warm ones in RAM and cold ones on the NVMe drive. Qwen3.8-Flash-Next (78 GB) ran at 50-70 tokens/s and DeepSeek-V4.1-Flash (341 GB of files) at 7.5-8 tokens/s on one RTX 3060 12 GB with 30 GB of RAM."}},{"@type":"Question","name":"What limits speed when streaming from an SSD?","acceptedAnswer":{"@type":"Answer","text":"The drive. On the test PC the NVMe reads at about 2.8 GB/s, which is what limits the DeepSeek model. A learned look-ahead that starts reads early reduces the wait."}},{"@type":"Question","name":"Does it work for dense models?","acceptedAnswer":{"@type":"Answer","text":"No. It relies on a mixture-of-experts model using only a few experts per token."}}]}</script>
 <style>
 :root{--bg:#0b0d10;--card:#14181d;--border:#262c34;--text:#e8ebef;--muted:#9aa4af;--fire:#ff6a2b;--ice:#4dabf7;}
 html{scroll-behavior:smooth}
@@ -71,7 +71,7 @@ footer{color:var(--muted);font-size:.9rem;margin-top:3rem}
 <table>
 <tr><th>Model</th><th class="r">Files</th><th class="r">tokens/s</th></tr>
 <tr><td>Qwen3.8-Flash-Next (IQ3_S)</td><td class="r">78 GB</td><td class="r">50-70</td></tr>
-<tr><td>DeepSeek-V4.1-Flash (separate branch)</td><td class="r">341 GB</td><td class="r">5.2-5.4</td></tr>
+<tr><td>DeepSeek-V4.1-Flash (separate branch)</td><td class="r">341 GB</td><td class="r">7.5-8</td></tr>
 </table>
 <p class="cap">Same PC for both. The DeepSeek files are 138.6 GB of backbone plus a 202.8 GB Engram table (plus an 8 GB draft model). There the limit is the drive: this NVMe reads at about 2.8 GB/s.</p>
 <h2>What makes SSD streaming usable</h2>
