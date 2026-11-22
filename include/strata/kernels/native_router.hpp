@@ -67,9 +67,12 @@ struct RouteCfg {
     float wmax;   ///< HOBBIT-style weight floor (STRATA_ROUTE_WMAX): a missed pick is replaced only when the router's own weight on it is below this (0 = off, the rank floor alone decides)
     float budget; ///< STRATA_ROUTE_BUDGET=<b>: ranks below `lo` take the budget test w * gap <= b instead of the margin / edge (0 = off)
     float budget_tail; ///< STRATA_ROUTE_BUDGET_TAIL=<b>: ranks at or above `lo` take a resident stand-in only when w * max(gap, 0) <= b (0 = off: any, as the margin says)
+    int32_t ne;        ///< routed experts per layer (default 512; route_cfg_set_experts, at most 512): the stand-in stage's logits row stride, its loop bound and its pair-table stride
 };
 void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, int maxrank = 0, float want_lo = 1.f, float repl_gap = 0.f, float wmax = 0.f, float budget = 0.f, float budget_tail = 0.f);   ///< before graph capture
 void route_cfg_set_floor(int lo);                                ///< between windows
+int route_cfg_floor();                                           ///< the stand-in floor (the first rank a stand-in may replace) set by route_cfg_init; -1 when the stand-ins are off
+void route_cfg_set_experts(int n_expert);                        ///< the model's routed experts per layer (1..512), once after route_cfg_init and before graph capture; 512 until then
 /// hotrod-edge0 (latent packs): the device table of group labels [n_layers][512] and the stand-in rule (mode 0: counted only, 1: a stand-in
 /// must be of the missing expert's group).  Before graph capture.  route_group_stats: [0] stand-ins taken, [1] in another group (labels set).
 void route_group_set(const int32_t* labels_dev, int mode, float bonus = 0.0f);   ///< mode 2: a same-group resident candidate gets `bonus` logits (soft preference)

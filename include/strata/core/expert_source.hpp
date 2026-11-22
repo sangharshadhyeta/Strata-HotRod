@@ -198,6 +198,11 @@ public:
     /// asynchronous host-to-device copy can DMA it directly (no staging copy on the CPU).
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
 
+    /// True when every expert is held in VRAM or RAM, so no read from the files is ever needed and the file tier's read-ahead (the guesses
+    /// queued for the I/O threads, the look-ahead's warm dispatch) has nothing to do.  Only the file-backed source can say yes (set when its RAM
+    /// tier is sized, before the first decode); the answer never changes afterwards.
+    virtual bool all_in_ram() const { return false; }
+
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
@@ -700,6 +705,13 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
+/// STRATA_RANK_CUTOFF=R (opt-in; 0 = off, 1..9): ranks R..9 are not computed at all - an expert (resident or not) that every token of the window routes at
+/// rank >= R is neither copied nor computed and its weight is dropped (no renormalisation), as a tail skip does for a missed one.  Changes the output.
+int rank_cutoff();
+void set_rank_cutoff(int r);
+/// STRATA_TAIL_CPU=0 in effect (set by the serve start-up when the stand-ins' floor exists): the tail ranks are never computed by the CPU, so the read-ahead leaves them unread.
+bool tail_cpu_off();
+void set_tail_cpu_off(bool on);
 /// STRATA_ROUTER_TRACE (measurement only): the window's token ids, written as their own record before the window's layer-0 record
 /// (tools/predictor/trace_reader.py pairs them in order and checks the row count).  The verifier calls it as it launches a window;
 /// a no-op when the trace is off.
@@ -863,7 +875,7 @@ public:
     /// True when the RAM tier holds EVERY expert the GPU cache does not (set when the complement is sized): no expert is file-resident, so no read
     /// from the files can ever be needed and the file tier's read-ahead has nothing to do (HotRod, 21 Nov; the scheduler's storage profile).  A big-RAM
     /// PC is in this state; a PC whose RAM is smaller than the experts is not.  Today it is reported (log, INFO); the scheduler acts on it.
-    bool all_in_ram() const { return all_in_ram_; }
+    bool all_in_ram() const override { return all_in_ram_; }
     bool all_in_ram_ = false;   ///< see all_in_ram() (set when the complement is sized; one writer, read after the start)
     /// STRATA_CONV_FILL: promotes the candidates, in order, on ONE background thread (the look-ahead promotion, promote_read,
     /// with the same free-place rule; a full queue waits 2 ms and retries the same candidate, 2000 times at most).  A new call

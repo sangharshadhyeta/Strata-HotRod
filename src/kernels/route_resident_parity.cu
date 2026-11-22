@@ -30,7 +30,7 @@ void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
 }
 
-constexpr int kExperts = 512;
+int kExperts = 512;   // the run's expert count (run_for sets it; at most 512, RouteCfg::ne)
 constexpr int kTop = 10;
 constexpr int kMaxTok = 8;
 // The weights are a softmax ratio (ten expf calls, a sum, one division).  The kernel is bit-identical to the
@@ -45,10 +45,10 @@ constexpr int kWeightUlp = 8;
 // against the ids as they are at that rank (a swap changes the set).
 __global__ void route_resident_ref_k(const float* __restrict__ logits, int32_t* __restrict__ ids,
                                      float* __restrict__ weights, const int32_t* __restrict__ res, int n_tok,
-                                     float margin, int lo, int hi, unsigned long long* __restrict__ stats) {
+                                     float margin, int lo, int hi, unsigned long long* __restrict__ stats, int ne) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tok) return;
-    const float* l = logits + (size_t) t * kExperts;
+    const float* l = logits + (size_t) t * ne;
     int32_t* id = ids + (size_t) t * kTop;
     int32_t my[kTop];
     for (int r = 0; r < kTop; ++r) my[r] = id[r];
@@ -60,7 +60,7 @@ __global__ void route_resident_ref_k(const float* __restrict__ logits, int32_t* 
         ++tail;
         float bv = -INFINITY;
         int bi = -1;
-        for (int f = 0; f < kExperts; ++f) {
+        for (int f = 0; f < ne; ++f) {
             if (res[f] < 0) continue;
             bool used = false;
             for (int q = 0; q < kTop; ++q) used |= my[q] == f;
@@ -103,7 +103,9 @@ void top10(const float* l, int32_t* out) {
 }
 }  // namespace
 
-int main() {
+static int run_for(int ne) {
+    kExperts = ne;
+    std::printf("== %d experts per layer\n", ne);
     const float margins[] = {-0.5f, 0.0f, 0.05f, 0.25f, 0.5f, 1.0f, 1.5f};
     const int n_margins = (int) (sizeof(margins) / sizeof(margins[0]));
     const int cases = 240;
@@ -170,7 +172,7 @@ int main() {
         ck(cudaMemcpy(d_w_ref, sentinel.data(), sentinel.size() * 4, cudaMemcpyHostToDevice), "up w ref");
         ck(cudaMemset(d_stats, 0, 4 * sizeof(unsigned long long)), "zero stats");
         route_resident_ref_k<<<(n_tok + 63) / 64, 64, 0, stream>>>(d_logits, d_ids_ref, d_w_ref, d_res, n_tok,
-                                                                   margin, lo, hi, d_stats);
+                                                                   margin, lo, hi, d_stats, kExperts);
         ck(cudaStreamSynchronize(stream), "sync ref");
         unsigned long long st_ref[4] = {0, 0, 0, 0};
         ck(cudaMemcpy(st_ref, d_stats, sizeof(st_ref), cudaMemcpyDeviceToHost), "down stats ref");
@@ -182,6 +184,7 @@ int main() {
         // our kernel takes its floor from the shared config (host-mapped, read at every launch): the same window as the reference's, no edge
         // rank, no CCE bias, no rank gate, no weight floor - every option of ours off, which is what upstream's reference computes
         strata::kernels::route_cfg_init(lo, hi, margin, -1.0f);
+        strata::kernels::route_cfg_set_experts(kExperts);   // the stand-in stage's expert count (512 unless set)
         strata::kernels::native_route_resident(d_logits, d_ids_par, d_w_par, d_res, n_tok, d_stats, (void*) stream);
         ck(cudaStreamSynchronize(stream), "sync par");
         unsigned long long st_par[4] = {0, 0, 0, 0};
@@ -242,16 +245,24 @@ int main() {
         if (st_par[1]) { ++swapped_cases; swaps_total += st_par[1]; }
     }
 
-    std::printf("route_resident_parity: %d cases, %d with swaps (%llu swaps), %d mismatches, weights within %d ulp\n",
-                cases, swapped_cases, swaps_total, bad, worst_ulp);
+    std::printf("route_resident_parity[%d experts]: %d cases, %d with swaps (%llu swaps), %d mismatches, weights within %d ulp\n",
+                ne, cases, swapped_cases, swaps_total, bad, worst_ulp);
     if (stats_bad) std::printf("  (%d of them in the counters)\n", stats_bad);
     if (swapped_cases == 0) {
         std::printf("route_resident_parity: no case swapped anything - the test proved nothing\n");
         ++bad;
     }
-    std::printf(bad ? "route_resident_parity: %d FAILURES\n" : "route_resident_parity OK\n", bad);
+    if (bad) std::printf("route_resident_parity[%d experts]: %d FAILURES\n", ne, bad); else std::printf("route_resident_parity[%d experts] OK\n", ne);
     cudaFree(d_logits); cudaFree(d_w_ref); cudaFree(d_w_par);
     cudaFree(d_ids_ref); cudaFree(d_ids_par); cudaFree(d_res); cudaFree(d_stats);
     cudaStreamDestroy(stream);
+    return bad ? 1 : 0;
+}
+
+// 512 first (the Flash-Next shape, which must stay bit-exact), then the smaller counts a pruned model can have (130 = REAP25).
+int main() {
+    int bad = 0;
+    for (const int ne : {512, 384, 257, 130, 96}) bad += run_for(ne);
+    std::printf(bad ? "route_resident_parity: %d FAILING RUNS\n" : "route_resident_parity OK (every expert count)\n", bad);
     return bad ? 1 : 0;
 }

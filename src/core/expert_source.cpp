@@ -1993,6 +1993,7 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
 }
 
 void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n) {
+    if (all_in_ram_) return;   // every expert is in VRAM or RAM: nothing to read from the files
     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return;
     if (io_fill_ && io_pf_ && direct_.empty()) {   // hand the layer's uncached blobs to the workers and go on: the kernels
         for (int64_t i = 0; i < n; ++i) {          // that reach one before it lands wait on its pages, the rest compute
@@ -2909,6 +2910,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 }
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n, const int* pos) {
+    if (all_in_ram_) return;   // every expert is in VRAM or RAM: nothing to warm from the files
     if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
     uint32_t stamp;
     {
@@ -5834,6 +5836,25 @@ int tail_skip_rank() {
     return r;
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+namespace {
+std::atomic<int> g_rank_cutoff{-1};   // -1: not resolved yet
+}  // namespace
+int rank_cutoff() {
+    int r = g_rank_cutoff.load(std::memory_order_relaxed);
+    if (r < 0) {
+        const char* v = std::getenv("STRATA_RANK_CUTOFF");
+        r = v != nullptr ? std::atoi(v) : 0;
+        r = r > 0 && r < 10 ? r : 0;
+        g_rank_cutoff.store(r, std::memory_order_relaxed);
+    }
+    return r;
+}
+void set_rank_cutoff(int r) { g_rank_cutoff.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+namespace {
+std::atomic<bool> g_tail_cpu_off{false};
+}  // namespace
+bool tail_cpu_off() { return g_tail_cpu_off.load(std::memory_order_relaxed); }
+void set_tail_cpu_off(bool on) { g_tail_cpu_off.store(on, std::memory_order_relaxed); }
 
 namespace {
 // STRATA_ROUTER_TRACE=<file> (measurement only, off by default): one record per call of expert_pool_dispatch_multi, i.e. for every MoE layer of every
@@ -6057,7 +6078,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.pred_fed;
         }
     }
-    if (d.gpu_pred != nullptr && d.gpu_pred_warm && d.host_res != nullptr && n_tok <= 8 && d.src != nullptr) {
+    if (d.gpu_pred != nullptr && d.gpu_pred_warm && d.host_res != nullptr && n_tok <= 8 && d.src != nullptr && !d.src->all_in_ram()) {   // (all in VRAM/RAM: no guess to queue)
         // SPEC-adaptive-la change 3: the host time of this dispatch (steady clock), its guesses considered and queued
         const auto ra_t0 = std::chrono::steady_clock::now();
         long long ra_cons = 0, ra_queued = 0;
@@ -6111,6 +6132,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     const int32_t e = d.gpu_pred[(((size_t) target * kRoutePredDists + (size_t) route_pred_slot(dist)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
                     if (gate_fs != nullptr && !gate_fs->ra_admit(di * 10 + (int) r, (double) (gate_busy + (size_t) nw) / gate_workers)) continue;
+                    // STRATA_TAIL_CPU=0 / STRATA_RANK_CUTOFF=R: a guess at a rank the plan never computes is not read ahead (it would be skipped after the read)
+                    if (tail_read && ((r >= tail_lo && tail_cpu_off()) || (rank_cutoff() > 0 && r >= rank_cutoff()))) {
+                        la_tail_read_open_skips.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
                     if (tail_read && r >= tail_lo) {
                         if (tail_mode == 2) {   // the open rule: a resident stand-in serves this rank in this window, so it is not read
                             la_tail_read_open_skips.fetch_add(1, std::memory_order_relaxed);
@@ -6239,9 +6265,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
         // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
         const int tail_rank = tail_skip_rank();
+        // STRATA_RANK_CUTOFF=R (opt-in): ranks R..9 are not computed at all - the same skip, but also for an expert that is resident
+        const int cut_rank = rank_cutoff();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
+        if ((tail_rank > 0 || cut_rank > 0) && d.peer == nullptr && d.remote_count == 0) {
             int minr[kMaxWindowEntries];
             for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
@@ -6251,10 +6279,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
-                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                if (e < 0 || e >= d.n_expert) continue;
+                const bool resident = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
+                const bool cut = cut_rank > 0 && minr[q] >= cut_rank;                          // STRATA_RANK_CUTOFF: skipped even when resident
+                const bool tail = tail_rank > 0 && minr[q] >= tail_rank && !resident;          // STRATA_ROUTE_TAIL_SKIP: a missed expert only
+                if (!cut && !tail) continue;
                 skip_d[q] = true;
-                --nmiss;
+                if (!resident) --nmiss;
                 ++d.tail_experts;
             }
         }

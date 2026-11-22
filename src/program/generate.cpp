@@ -10572,6 +10572,24 @@ int main(int argc, char** argv) {
                                      "lower is skipped (+10..20%% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); "
                                      "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
                              tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
+            // STRATA_TAIL_CPU=0 (opt-in; default 1: as before): the tail ranks - from the stand-ins' floor up - are never computed by the CPU nor read over
+            // PCIe.  A tail pick that no resident stand-in replaced is skipped, as STRATA_ROUTE_TAIL_SKIP does (a missed expert that every token of the window
+            // routes at or above the floor: neither copied nor computed, its weight dropped), with the rank taken from the floor instead of the fixed 7.
+            // Needs the stand-ins (STRATA_ROUTE_RESIDENT): without them there is no floor and nothing changes.
+            if (strata::core::rank_cutoff() > 0)
+                std::fprintf(stderr, "strata serve: STRATA_RANK_CUTOFF=%d: ranks %d-9 are not computed at all (resident or not): an expert every token of a window routes at rank %d or "
+                                     "lower is skipped and its weight dropped (answers differ; the setting trades quality for speed)\n",
+                             strata::core::rank_cutoff(), strata::core::rank_cutoff(), strata::core::rank_cutoff());
+            if (const char* tc = std::getenv("STRATA_TAIL_CPU"); tc != nullptr && tc[0] == '0') {
+                const int floor_rank = strata::kernels::route_cfg_floor();
+                if (floor_rank > 0 && floor_rank < 10) {
+                    strata::core::set_tail_skip_rank(floor_rank);
+                    strata::core::set_tail_cpu_off(true);   // the read-ahead leaves the ranks from the floor up unread
+                    std::fprintf(stderr, "strata serve: STRATA_TAIL_CPU=0: ranks %d-9 are never computed by the CPU or read over PCIe - a missed expert that every "
+                                         "token of a window routes at rank %d or lower is skipped (the stand-ins' floor; answers differ slightly)\n", floor_rank, floor_rank);
+                } else
+                    std::fprintf(stderr, "strata serve: STRATA_TAIL_CPU=0 has no effect: it needs the stand-ins (STRATA_ROUTE_RESIDENT), whose floor it takes\n");
+            }
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
@@ -17694,6 +17712,14 @@ int main(int argc, char** argv) {
                 for (int b = 16; b < 22; ++b) repl += det[b] - prev_det[b];
                 for (int b = 29; b < 33; ++b) poor += det[b] - prev_det[b];   // the gap buckets [27 + 0..5]: 2..5 = the stand-in is >= 1 logit below the pick
                 const unsigned long long rows = det[11] - prev_det[11];
+                // the router's own picks that were NOT resident, by rank, before any stand-in ([r], r = 0..9): the ranks below the stand-in floor stay
+                // exact (the CPU or PCIe computes them), the ranks at and above it are the ones a stand-in takes
+                if (rows > 0) {
+                    char by[256];
+                    int o = 0;
+                    for (int r = 0; r < 10; ++r) o += std::snprintf(by + o, sizeof by - (size_t) o, " r%d %llu", r, det[r] - prev_det[r]);
+                    std::fprintf(stderr, "strata serve: non-resident router picks by rank (before stand-ins), %llu layer-rows:%s\n", rows, by);
+                }
                 for (int b = 0; b < 48; ++b) prev_det[b] = det[b];
                 if (rows > 0)
                     std::fprintf(stderr, "strata serve: stand-ins: %llu replaced picks in %llu layer-rows = %.4f per layer-row (%.2f per generated token over %lld layers); "

@@ -403,9 +403,9 @@ __device__ __forceinline__ bool fragile_held(const uint32_t* fctrl, int row) {
     return row < 32 ? ((b >> row) & 1u) != 0u : b == 0xFFFFFFFFu;
 }
 // SPEC-substitute-fit stage 2: the fitted slot of pair (e, s) in this layer's LUT, or -1 (no table, or no fit).
-__device__ __forceinline__ int sub_slot(const SubfitRoute& sub, int e, int s) {
-    if (sub.lut == nullptr || e < 0 || e >= 512 || s < 0 || s >= 512) return -1;
-    int slot = (int) sub.lut[e * 512 + s];                              // the ladder: the pair,
+__device__ __forceinline__ int sub_slot(const SubfitRoute& sub, int e, int s, int ne = 512) {
+    if (sub.lut == nullptr || e < 0 || e >= ne || s < 0 || s >= ne) return -1;
+    int slot = (int) sub.lut[e * ne + s];                              // the ladder: the pair,
     if (slot < 0 && sub.elut != nullptr) slot = (int) sub.elut[e];      // else the (layer, expert) group,
     if (slot < 0 && sub.llut != nullptr) slot = (int) sub.llut[0];      // else the layer's group
     return slot;
@@ -437,13 +437,14 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
     const float wmax = ((const volatile RouteCfg*) cfg)->wmax;
     const float budget = ((const volatile RouteCfg*) cfg)->budget;
     const float budget_tail = ((const volatile RouteCfg*) cfg)->budget_tail;
-    const float* l = logits + (size_t) t * 512;
+    const int ne = ((const volatile RouteCfg*) cfg)->ne;   // routed experts per layer (512 unless the model has fewer)
+    const float* l = logits + (size_t) t * ne;
     int32_t* id = ids + (size_t) t * 10;
     // SPEC-recheck-gated (C): the early margin, the router's top-1 minus top-2 raw logit over all 512 experts, before any stand-in, min'd into
     // margin_out[row] by the routers of layers 0-3 (the host sets the array to a large value before each window; predicated, uniform per warp)
     if (margin_out != nullptr && layer < 4) {
         float m1 = -INFINITY, m2 = -INFINITY;
-        for (int f = lane; f < 512; f += 32) {
+        for (int f = lane; f < ne; f += 32) {
             const float v = l[f];
             if (v > m1) { m2 = m1; m1 = v; }
             else if (v > m2) m2 = v;
@@ -492,7 +493,7 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
             for (int r = 0; r < 10; ++r) {
                 int best = -1;
                 float bs = -INFINITY;
-                for (int f = 0; f < 512; ++f) {
+                for (int f = 0; f < ne; ++f) {
                     bool used = false;
                     for (int q = 0; q < r; ++q) used |= pick[q] == f;
                     const float s = l[f] + (res[f] >= 0 ? bias : 0.f);
@@ -561,10 +562,10 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
         if (lane == 0) ++tail;
         float bv = -INFINITY;
         int bi = -1;
-        const int32_t* glab = (g_grp_labels != nullptr && layer >= 0) ? g_grp_labels + (size_t) layer * 512 : nullptr;
+        const int32_t* glab = (g_grp_labels != nullptr && layer >= 0) ? g_grp_labels + (size_t) layer * ne : nullptr;
         const bool gonly = glab != nullptr && g_grp_mode == 1;
         const float gbonus = (glab != nullptr && g_grp_mode == 2) ? g_grp_bonus : 0.0f;
-        for (int f = lane; f < 512; f += 32) {
+        for (int f = lane; f < ne; f += 32) {
             if (!have(f)) continue;
             if (gonly && glab[f] != glab[e]) continue;   // latent packs: a stand-in of the missing expert's group only
             bool used = false;
@@ -586,7 +587,7 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
         // picks); a stand-in further down than `maxrank` is refused and the exact expert is fetched instead
         if (bi >= 0 && maxrank > 0) {
             int place = 0;
-            for (int f = lane; f < 512; f += 32) place += l[f] > bv;
+            for (int f = lane; f < ne; f += 32) place += l[f] > bv;
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1) place += __shfl_xor_sync(0xffffffffu, place, off);
             if (place >= maxrank) bi = -1;
@@ -610,16 +611,16 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
         const bool flip_win = sub.mode == strata::core::subfit_rule::kModeFlip && sub.gate != nullptr && sub.gate[4] != 0;
         // (not the slot the learner samples y_e from in this window: gate[0] == 2 at gate[1] = layer, gate[2] = rank - it must stay exact)
         const bool learn_slot = sub.gate != nullptr && sub.gate[0] == 2 && sub.gate[1] == layer && sub.gate[2] == r;
-        if (flip_win && !learn_slot && !take && bi >= 0 && sub_slot(sub, pair_orig[r], bi) >= 0) take = true;
+        if (flip_win && !learn_slot && !take && bi >= 0 && sub_slot(sub, pair_orig[r], bi, ne) >= 0) take = true;
         // SPEC-recheck-gated step F: a move that would take the row's accumulated shift past its cap stays the router's pick (refused).
         // cap_row and shift_acc are the same in every lane (warp-reduced values; shift_acc starts at the row's shift and follows each move).
         // SPEC-substitute-fit stage 2 (steps 4-5): a fitted pair (its LUT entry) is taken corrected by subfit_rule::decide: dynamic past the
         // cap (refused otherwise), all on every move.  No table (sub.lut == nullptr): the old cap test, as before.
         bool corr = false;
         float corr_add = 0.f;
-        const int fslot = (bi >= 0 && take) ? sub_slot(sub, pair_orig[r], bi) : -1;
+        const int fslot = (bi >= 0 && take) ? sub_slot(sub, pair_orig[r], bi, ne) : -1;
         if (bi >= 0 && take && (cap_row < INFINITY || fslot >= 0)) {
-            const float pf_c = pair_pe != nullptr ? pair_pe[(size_t) orig[r] * 512 + bi] : 1.0f;
+            const float pf_c = pair_pe != nullptr ? pair_pe[(size_t) orig[r] * ne + bi] : 1.0f;
             const float resid = (fslot >= 0 && sub.resid != nullptr) ? sub.resid[fslot] : 1.0f;
             const strata::core::subfit_rule::Move mv = strata::core::subfit_rule::decide(
                 shift_acc, cap_row, cap_row < INFINITY, weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf_c, fslot >= 0, resid, sub.mode, flip_win);
@@ -643,7 +644,7 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
                 // what was replaced and by what (per replacement): the weight of the replaced pick, the substitute's place in
                 // the router's own ranking of all 512 experts, and the score gap to it
                 int gr = 0;
-                for (int f = lane; f < 512; f += 32) gr += l[f] > bv;
+                for (int f = lane; f < ne; f += 32) gr += l[f] > bv;
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1) gr += __shfl_xor_sync(0xffffffffu, gr, off);
                 if (lane == 0) {
@@ -663,7 +664,7 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
             // STRATA_FRAGILE_RECHECK: how far this row's picks moved (any rule): the replaced pick's router weight times its score gap to
             // the stand-in (the quantity the budget test uses), summed over the layers and the picks of the row (read by the host)
             // STRATA_STANDIN_BALANCE (pair_pe, opt-in): a ready pair's risk is scaled by its relative error (clip 0.25-4; 1 until ready)
-            const float pf = pair_pe != nullptr ? pair_pe[(size_t) orig[r] * 512 + bi] : 1.0f;
+            const float pf = pair_pe != nullptr ? pair_pe[(size_t) orig[r] * ne + bi] : 1.0f;
             const float add_shift = corr ? corr_add : weights[(size_t) t * 10 + r] * fmaxf(gap, 0.f) * pf;   // a corrected move adds plain x resid
             if (lane == 0 && row_shift != nullptr) atomicAdd(row_shift + t, add_shift);
             shift_acc += add_shift;   // (the cap's running shift, every lane)
@@ -721,7 +722,7 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
             // STRATA_STANDIN_LEARN: a stand-in's weight is scaled by its pair's learned correction (1 until the pair is ready)
             if (pair_c != nullptr)
                 for (int r = 0; r < 10; ++r)
-                    if (sub_s[r] >= 0) weights[(size_t) t * 10 + r] *= pair_c[(size_t) orig[r] * 512 + sub_s[r]];
+                    if (sub_s[r] >= 0) weights[(size_t) t * 10 + r] *= pair_c[(size_t) orig[r] * ne + sub_s[r]];
         }
         for (int r = 0; r < 10; ++r) id[r] = my[r];
         if (stats) {
@@ -762,6 +763,7 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
     if (g_cfg_host == nullptr) {
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
+        g_cfg_host->ne = 512;   // (cudaHostAlloc does not clear it) the Flash-Next default; route_cfg_set_experts moves it
     }
     g_cfg_host->lo = lo;
     g_cfg_host->hi = hi;
@@ -786,6 +788,14 @@ void route_group_stats(unsigned long long out[2]) {
     out[0] = out[1] = 0;
     if (cudaMemcpyFromSymbol(out, g_grp_stats, 2 * sizeof(unsigned long long)) != cudaSuccess) (void) cudaGetLastError();
 }
+// The model's routed experts per layer (1..512): the stand-in stage then reads the logits rows at this stride and scans this many experts.
+// Once, after route_cfg_init and before graph capture (the value is read at every launch from host-mapped memory, like the floor).
+void route_cfg_set_experts(int n_expert) {
+    if (g_cfg_host == nullptr || n_expert < 1 || n_expert > 512) return;
+    g_cfg_host->ne = n_expert;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+int route_cfg_floor() { return g_cfg_host == nullptr ? -1 : g_cfg_host->lo; }
 void route_cfg_set_floor(int lo) {
     if (g_cfg_host == nullptr) return;
     g_cfg_host->lo = lo;

@@ -2089,9 +2089,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (route_resident_cfg().margin > 0.0f) {
         // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
         // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
-        strata::kernels::route_cfg_init(route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().margin,
+        strata::kernels::route_cfg_init(route_resident_cfg().lo,
+                                        // STRATA_RANK_CUTOFF=R: ranks R..9 are not computed at all, so no stand-in either - the stand-in range ends at rank R-1
+                                        // (the read-ahead leaves those ranks unread: expert_source.cpp's warm loop; the plan skips them: the tail skip block)
+                                        strata::core::rank_cutoff() > 0 && !(std::getenv("STRATA_RANK_CUTOFF_CLIP") != nullptr && std::atoi(std::getenv("STRATA_RANK_CUTOFF_CLIP")) == 0)
+                                            ? std::min<int>(route_resident_cfg().hi, strata::core::rank_cutoff() - 1) : route_resident_cfg().hi,
+                                        route_resident_cfg().margin,
                                         route_resident_cfg().edge, route_resident_cfg().bias, route_resident_cfg().maxrank, route_resident_cfg().want_lo, route_resident_cfg().repl_gap, route_resident_cfg().wmax,
                                         route_resident_cfg().budget, route_resident_cfg().budget_tail);
+        strata::kernels::route_cfg_set_experts((int) g.n_expert);   // the stand-in stage reads the logits rows at this stride (512 for Flash-Next; REAP25: 130)
     }
     if (route_resident_cfg().margin > 0.0f)
         std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, edge %g, router bias ln(1+beta) %g, stand-in within the router's first %d places, decode windows %s)\n",
@@ -3814,7 +3820,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const strata::kernels::SubfitRoute sub_r = subfit_route_(l, (int) tb);   // SPEC-substitute-fit stage 2 (all null: off)
         const bool own_mask_on = NE == 512 && K == 10 && !route_resident_cfg().win_exact && strata::kernels::route_mask_layer(l, g.n_expert) != nullptr;
         const bool own_res_on = route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr;
-        const bool post_own = router_post_on() && (own_mask_on || own_res_on);
+        const bool post_own = router_post_on() && NE == 512 && (own_mask_on || own_res_on);   // (NE != 512: the separate calls below)
         float* const lab_dev = post_own && la_learn_win ? strata::kernels::la_learn_label_dev(l, n) : nullptr;
         // STRATA_LA_LEARN: this layer's router logits are the label of this window's batch (copied here; the batch runs after the window)
         if (la_learn_win && lab_dev == nullptr) {
@@ -3875,7 +3881,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 } catch (const std::exception& e) { err = "verify mask: " + std::string(e.what()); return false; }
             }
         }
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+        if (route_resident_cfg().margin > 0.0f && NE <= 512 && K == 10 && hits_.d_res != nullptr) {   // any expert count up to 512 (RouteCfg::ne)
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
