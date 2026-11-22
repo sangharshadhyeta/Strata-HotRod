@@ -20,7 +20,7 @@ router weight on picks that were changed (swapped).  The stand-in rule (router w
 hit for the same swapped weight (bias is not better).  Making the pre-router's top-K ready for the token: exact hit (no swaps) at lead 1, K=4: 42.0 (router reuse) ->
 43.5 (pre-router); K=8: 65.5 -> 69.9; lead 2, K=4: 35.8 -> 39.0.
 
-## Online learning (pred_online_edge0.py: prequential, mini-batches of 16, every learner starts exactly at the real router; mean of layers 8/16/24/32/40)
+## Online learning (pred_online.py <trace> edge0: prequential, mini-batches of 16, every learner starts exactly at the real router; mean of layers 8/16/24/32/40)
 True rank 0-1 experts inside the predicted top 4 (%), first 2000 tokens | before the topic shift | after the shift:
 | | lead 1 | lead 2 |
 |---|---|---|

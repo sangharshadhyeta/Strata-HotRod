@@ -27,6 +27,8 @@ torch.set_num_threads(10)
 torch.manual_seed(0)
 H, NL, E = 2560, 48, 512
 TRACE = sys.argv[1] if len(sys.argv) > 1 else "/mnt/nvme/strata-data/traces/trace1.bin"
+MODEL = sys.argv[2] if len(sys.argv) > 2 else "qwen"   # "qwen", or "edge0" (Edge0-145B: its own routers, and the wider low-rank arms)
+assert MODEL in ("qwen", "edge0"), MODEL
 SERVER_LOG = "/root/.claude/jobs/743230e4/tmp/trace_server.log"
 t0 = time.time()
 log = lambda *a: print(f"[{time.time()-t0:5.0f}s]", *a, flush=True)
@@ -64,7 +66,7 @@ for s in complete:
                 IDS[layer][tok + t] = np.frombuffer(buf[p:p + k * 2], dtype=np.int16)[:10]
             p += k * 2
     tok += steps[s][0][1]
-W = torch.from_numpy(np.load("/mnt/nvme/strata-data/traces/routers_f32.npy"))
+W = torch.from_numpy(np.load("/mnt/nvme/strata-data/traces/routers_f32.npy" if MODEL == "qwen" else "/mnt/nvme/strata-data/traces/routers_edge0_f32.npy"))
 f32 = lambda u: torch.from_numpy((u.astype(np.uint32) << 16).view(np.float32))
 log("loaded", N, "tokens from", TRACE, "layers", need)
 
@@ -124,11 +126,13 @@ D_LIST = (2, 1)
 LOS = (2, 3, 4, 6)
 FLOORS = [f"lo{lo}" for lo in LOS]
 NRM = ["p1", "p2", "p4", "mr4"]
-CHEAP = [("lowrank-8", "lowrank", 8), ("lowrank-32", "lowrank", 32), ("bias", "bias", 0), ("scale+bias", "scale", 0)]
+WIDE = [("lowrank-64", "lowrank", 64), ("lowrank-128", "lowrank", 128)] if MODEL == "edge0" else []   # Edge0 also tries the wider corrections
+CHEAP = [("lowrank-8", "lowrank", 8), ("lowrank-32", "lowrank", 32)] + WIDE + [("bias", "bias", 0), ("scale+bias", "scale", 0)]
 GRID_LIST = [("online-R", "full", [3e-5, 1e-4, 3e-4], 0),
              ("lowrank-8", "lowrank", [1e-4, 1e-3, 1e-2], 8),
-             ("lowrank-32", "lowrank", [1e-4, 1e-3, 1e-2], 32),
-             ("bias", "bias", [1e-3, 1e-2, 1e-1], 0),
+             ("lowrank-32", "lowrank", [1e-4, 1e-3, 1e-2], 32)] + \
+            [(n, k, [1e-4, 1e-3, 1e-2], r) for n, k, r in WIDE] + \
+            [("bias", "bias", [1e-3, 1e-2, 1e-1], 0),
              ("scale+bias", "scale", [1e-4, 1e-3, 1e-2], 0)]
 GRID = [(n, k, lrs, r, "list") for n, k, lrs, r in GRID_LIST] + \
        [(n + "/mse", k, lrs, r, "mse") for n, k, lrs, r in GRID_LIST if k != "full"]
