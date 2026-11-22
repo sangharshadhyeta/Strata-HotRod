@@ -434,3 +434,9 @@ and already use the table-lookup + dp4a decode of the int8 path, so that twist h
 - Warm start (Maya's IK2_WARM idea; our file, `STRATA_MOE_PROFILE`): the engine counts picks per (layer, expert), saves them as it runs, and the next start fills the free VRAM slots with the most picked before the first token. 48-token cold pass 31.3 -> 33.6 tok/s, KL unchanged.
 - Host sampling: the top-k is one heap pass over the logits instead of a partial sort of 200K.
 - Still open from her list: batched prompt path + scan-resistant eviction, FP8/FP16 KV with fused attention, CPU lane, device-side sampling candidates, DSpark drafter (needs mtp.safetensors, not on disk).
+
+## DSpark drafter: checkpoint and plan (22 Nov)
+`/home/models/inkling-2-mini/mtp.safetensors` (0.64 GB, sha256 7c3b6513..., matches Maya's docs/INKLING2.md; from thinkingmachines/Inkling-2-Mini): 54 BF16 tensors, 318M params: 3 drafter layers (87M each, width 2304),
+`markov_head` (56M), `fuse_weight` [4,4], `mask_embed`, `norm`. (Maya's header comment describes the Small drafter, 5 layers / 8 taps; Mini's is 3 layers / fuse_weight 4x4, so the tap layers differ: read from the checkpoint, not copied.)
+Build order: (1) multi-token forward through the 48 visits (token-major conv state, causal attention over cache + block, experts of the block's union read once) - also gives batched prompt reading;
+(2) the drafter (taps, 3 layers, Markov head) from the checkpoint, checked against Maya's float reference; (3) verify the block, accept the longest matching prefix, serve. Not started in code.
