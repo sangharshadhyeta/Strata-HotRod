@@ -420,3 +420,12 @@ carrying the stand-in / route-resident logic that must stay bit-exact: at most ~
   fixed point on this card. For another card the same rule finds its own value; the cache always takes (free - reserve), so it scales with the card (a 24 GB card gets ~3x the slots).
   Not changed in code. Suggestion for the Qwen server config: drop the explicit `--vram-reserve-mib 768` so the engine decides (floor 700).
 - Inkling's engine sizes its cache the same way (free - reserve after a warm-up token); its reserve (700 default, `STRATA_VRAM_RESERVE_MIB`) is not yet learned from the end-of-start free as Qwen's is: to do.
+
+### Qwen reserve left to the engine, and the Edge0 profile (22 Nov)
+
+Reserve (`--vram-reserve-mib` dropped, STRATA_LEARN_PROFILE=0, 3 prompts, interleaved): fixed 768 ended at 282 / 284 MiB free (the engine's own line is 512; it calls that LOW), 1119 slots, 20.1 / 19.0 tok/s.
+Flag dropped: start 1 used the 700 default (1136 slots), ended at 220 MiB free and learned 1024 for the next start (`vram-reserve.json`, key "NVIDIA GeForce RTX 3060 11909MiB ctx262144 kv32768/int8 b0 draft");
+starts 2-4 ran at 1024 (1051 slots, 542 MiB free after start): 19.1 / 19.7 / 18.7 tok/s, hit rates 91-93% as before. No speed difference within the ~0.5 tok/s spread; the engine's own choice costs 68 slots and
+leaves the headroom it asks for. Recommendation: drop the explicit flag from the Qwen config. (Earlier logs showed 524-528 MiB free at 768; today's starts end lower, so the fixed value is not safe by itself.)
+Edge0 decode profile (graph nodes traced): 34% of decode-side kernel time is `wait_flag_ge_kernel` (the host flags, as on Qwen); the NVFP4 grouped expert kernels (`native_gu_multi_kernel<40>`, `native_down_multi_kernel<40>`) are 6.6%
+and already use the table-lookup + dp4a decode of the int8 path, so that twist has no gap to close on Edge0; the next largest are Edge0's `latent_u_p4_k` (5.3%) and the `mmvq` family (~13%).
