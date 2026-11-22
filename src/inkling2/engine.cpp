@@ -11,6 +11,8 @@
 #include "strata/kernels/q8_mma.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/moe_slot_cache.hpp"
+#include "ds4_lalearn.cuh"   // src/dsv41: the learned look-ahead
+namespace la = strata::ds4::la;
 
 #include <cuda_runtime.h>
 
@@ -102,6 +104,7 @@ struct Engine::Impl {
 
     Impl(const GgufFile& gg, const Config& cc, const Layout& ll, int max_ctx, const std::string& prof) : g(gg), c(cc), lay(ll), cap(max_ctx), prof_path(prof) { init(); }
     ~Impl() {
+        if (la_on) { std::string m2; if (!la_file.empty()) std::fprintf(stderr, "inkling2 engine: learner file %s: %s\n", la_file.c_str(), strata::ds4::la::save(la_file.c_str(), m2) ? "saved" : m2.c_str()); std::fprintf(stderr, "%s", strata::ds4::la::report().c_str()); strata::ds4::la::release(); }
         if (ht_n > 0) std::fprintf(stderr, "inkling2 engine: host time a visit (%ld visits): wait for the picks %.0f us, placement + uploads + launch %.0f us\n", ht_n, ht_sync / (double) ht_n * 1e6, (ht_place + ht_up) / (double) ht_n * 1e6);
         prof_save();
         for (int d = 1; d <= 4; ++d) if (pf_tot_d[d] > 0) std::fprintf(stderr, "inkling2 engine: look-ahead +%d visit(s): %ld of %ld actual picks were in the predicted set (%.1f%%)\n", d, pf_hit_d[d], pf_tot_d[d], 100.0 * pf_hit_d[d] / (double) pf_tot_d[d]);
@@ -210,6 +213,9 @@ struct Engine::Impl {
     int pf_n = 0;
     int32_t *d_pidx = nullptr, *h_pidx = nullptr;
     float *d_pw = nullptr, *rlp = nullptr, *xp = nullptr;
+    bool la_on = false, la_run = false;                 // STRATA_LA_LEARN=1 (needs the prefetch on): the learned look-ahead; la_run once the warm-up token is behind us
+    float *d_gl = nullptr, *d_keya = nullptr, *d_zbias = nullptr;   // [3][1024] the guesses per reach, this visit's real key, a zero bias
+    std::string la_file; long la_windows = 0;
     int pf_depth = 1;                                   // STRATA_MOE_DEPTH: how many visits ahead the look-ahead reaches (each from THIS visit's input)
     std::vector<std::vector<int>> pred_tab;             // [target visit * 5 + depth] -> the experts predicted for it
     long pf_hit_d[5] = {0, 0, 0, 0, 0}, pf_tot_d[5] = {0, 0, 0, 0, 0};
@@ -283,12 +289,29 @@ struct Engine::Impl {
             d_pidx = (int32_t*) dmalloc(16 * 4); d_pw = fmalloc(16); rlp = fmalloc((size_t) c.n_expert); xp = fmalloc((size_t) c.n_embd);
             void* hq2 = nullptr; CK(cudaHostAlloc(&hq2, 16 * 4 * 4, cudaHostAllocPortable)); pinned.push_back(hq2); h_pidx = (int32_t*) hq2;
             pred_tab.assign((size_t) c.n_visits * 5, {});
+            if (const char* lv = std::getenv("STRATA_LA_LEARN")) la_on = lv[0] == '1';
+            if (la_on) {
+                pf_depth = std::getenv("STRATA_MOE_DEPTH") ? pf_depth : 2;   // the Qwen engine publishes the reaches 1 and 2
+                d_gl = fmalloc(3 * 1024); d_keya = fmalloc(1024); d_zbias = fzero((size_t) c.n_expert);
+                unsigned long long* tz = (unsigned long long*) dmalloc(512 * 8); CK(cudaMemset(tz, 0, 512 * 8));
+                unsigned long long* to = (unsigned long long*) dmalloc(512 * 8); CK(cudaMemset(to, 1, 512 * 8));
+                std::vector<const unsigned long long*> tabs((size_t) c.n_visits);
+                for (int vv = 0; vv < (int) c.n_visits; ++vv) tabs[(size_t) vv] = lw[(size_t) c.stored_of_visit(vv)].resident ? to : tz;   // no expert is pinned in VRAM (the cache is dynamic); a resident layer's are all there
+                std::string lm;
+                if (!strata::ds4::la::alloc((int) c.n_visits, (int) c.n_embd, (int) c.n_expert, (int) c.n_expert_used, (int) c.n_expert_used, 1.0f, lm) || !strata::ds4::la::set_resident_tables(tabs.data(), (int) c.n_visits)) {
+                    std::fprintf(stderr, "inkling2 engine: learned look-ahead off: %s\n", lm.c_str()); la_on = false;
+                } else {
+                    std::fprintf(stderr, "inkling2 engine: learned look-ahead on (%s), published reaches 1..%d\n", lm.c_str(), pf_depth);
+                    if (const char* lf = std::getenv("STRATA_LA_LEARN_FILE")) { la_file = lf; std::string m2; if (access(lf, R_OK) == 0) std::fprintf(stderr, "inkling2 engine: learner file %s: %s\n", lf, strata::ds4::la::load(lf, m2) ? "loaded" : m2.c_str()); }
+                }
+            }
             std::fprintf(stderr, "inkling2 engine: look-ahead prefetch of %d experts a visit, %d visit(s) ahead\n", pf_n, pf_depth);
         }
         // one token before the sizing: the runtime allocates lazily (kernel modules, local memory), which the free figure must already count
         step(0, 0, nullptr, SeamSink{});
         reset();
         CK(cudaDeviceSynchronize());
+        la_run = la_on;
         // the reserve: STRATA_VRAM_RESERVE_MIB, the Qwen engine's --vram-reserve-mib default (700 MiB) - the driver and what a longer prompt's buffers will take
         const char* rv = std::getenv("STRATA_VRAM_RESERVE_MIB");
         const size_t reserve = (size_t) (rv ? std::atoll(rv) : 700) << 20;
@@ -482,16 +505,29 @@ struct Engine::Impl {
         M::route(rl, w.router_bias, 1, (int) c.n_expert, Kx, c.expert_weight_scale, M::Score::Sigmoid, idxv, d_w, st);
         CK(cudaMemcpyAsync(h_idx + (size_t) vis * 16, idxv, (size_t) Kx * 4, cudaMemcpyDeviceToHost, st));
         int64_t nls[4] = {-1, -1, -1, -1};
-        if (pf_n > 0 && scache.active() && !defer_experts) {   // the router of each of the next visits on THIS visit's input (its own norm): the experts to start copying now
-            for (int d = 1; d <= pf_depth && vis + d < c.n_visits; ++d) {
-                int64_t nl = c.stored_of_visit(vis + d);
+        if (pf_n > 0 && scache.active() && !defer_experts) {
+            if (la_run) {   // the learner's label: this visit's real selection key (what it trains its guesses against)
+                M::route_key(rl, w.router_bias, (int) c.n_expert, M::Score::Sigmoid, d_keya, st);
+                la::label((int) vis, d_keya, 1, st);
+            }
+            // each reach: the target visit's router on THIS visit's input (its own norm) = the plain guess; the learner (STRATA_LA_LEARN) adds its leader's correction
+            // (distances 1, 2 and 4; 4 is trained and reported only); the picks of the published reaches are what the copy stream starts on
+            const int nd = la_run ? la::kNd : pf_depth;
+            for (int i = 0; i < nd; ++i) {
+                const int d = la_run ? la::kDist[i] : i + 1;
+                if (vis + d >= c.n_visits) continue;
+                const int64_t nl = c.stored_of_visit(vis + d);
                 const LW& wn = lw[(size_t) nl];
-                if (wn.resident) continue;
-                nls[d - 1] = nl;
+                if (wn.resident && !la_run) continue;
+                float* gl = d_gl + (size_t) i * 1024;
                 copy(xp, m_in, (size_t) E);
                 rms_w(xp, wn.ffn_norm);
-                ik::matmul_f32(wn.router, xp, rlp, 1, (int) E, (int) c.n_expert, st);
-                M::route(rlp, wn.router_bias, 1, (int) c.n_expert, std::max(pf_n, Kx), c.expert_weight_scale, M::Score::Sigmoid, d_pidx, d_pw, st);
+                ik::matmul_f32(wn.router, xp, gl, 1, (int) E, (int) c.n_expert, st);
+                M::route_key(gl, wn.router_bias, (int) c.n_expert, M::Score::Sigmoid, gl, st);
+                if (la_run) la::forward((int) vis, d, x, gl, 1, st);
+                if (d > pf_depth || wn.resident) continue;
+                nls[d - 1] = nl;
+                M::route(gl, d_zbias, 1, (int) c.n_expert, std::max(pf_n, Kx), c.expert_weight_scale, M::Score::Sigmoid, d_pidx, d_pw, st);
                 CK(cudaMemcpyAsync(h_pidx + (size_t) (d - 1) * 16, d_pidx, (size_t) std::max(pf_n, Kx) * 4, cudaMemcpyDeviceToHost, st));
             }
         }
@@ -873,6 +909,7 @@ struct Engine::Impl {
         rms_w(h, d_embd_norm);
         int nb = 0, pre_nb = 0, nms = 0;
         const int64_t core0 = c.core_start, clen = c.core_len();
+        if (la_run) strata::ds4::la::pre_launch(st);   // the previous token's training batch must be done before this window uses the learner
         for (int vv = 0; vv < c.n_visits; ++vv) {
             const int64_t l = c.stored_of_visit(vv);
             bool msgs_on = false;
@@ -907,6 +944,10 @@ struct Engine::Impl {
         mmvq_f(8, d_out, hd, (int) E, (int) c.n_vocab, logits, xq);
         ik::softcap(logits, (int) c.n_vocab_real, c.final_softcap, st);
         if (out) { out->resize((size_t) c.n_vocab_real); CK(cudaMemcpy(out->data(), logits, (size_t) c.n_vocab_real * 4, cudaMemcpyDeviceToHost)); }
+        if (la_run) {   // after the window's last launch: the batch on the learner's side stream (rank, score, gradients, AdamW, the leader's decision)
+            strata::ds4::la::post_launch(st, 1, nullptr);
+            if (!la_file.empty() && ++la_windows % 512 == 0) { std::string m2; strata::ds4::la::save(la_file.c_str(), m2); }
+        }
         CK(cudaDeviceSynchronize());   // the one sync of a token (no host round trip inside a visit any more)
         for (int vv = 0; vv < c.n_visits; ++vv) picks[(size_t) vv].assign(h_idx + (size_t) vv * 16, h_idx + (size_t) vv * 16 + c.n_expert_used);
         prof_count_token();

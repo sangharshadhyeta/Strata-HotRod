@@ -19,6 +19,9 @@ enum class Score { Sigmoid = 0, SqrtSoftplus = 1 };
 /// One block a token.  Experts are PICKED by score + bias (the selection bias never enters the weights), the k best, the lowest index winning a tie; the weights are the picked
 /// scores' share of their sum times `route_scale`.  logits [T][n]; n <= 1024, k <= 16.  idx [T][k] (best first), w [T][k].  A non-finite input still yields k valid, distinct ids.
 void route(const float* logits, const float* bias, int T, int n, int k, float route_scale, Score score, int32_t* idx, float* w, void* stream);
+/// The router's selection key of one row, score(logit) + bias, as a plain array (out may be logits: in place).  The look-ahead's guesses and labels live in this space,
+/// so ranking them (route with a zero bias: the score is monotone) is the router's own ranking.
+void route_key(const float* logits, const float* bias, int n, Score score, float* out, void* stream);
 
 enum class ActKind { Silu = 0, ClampedSilu = 1, Situ = 2 };
 /// Silu: silu(g) u.   ClampedSilu(p0 = limit): g = min(g, lim), u = clamp(u, -lim, lim), then silu(g) u (DeepSeek).

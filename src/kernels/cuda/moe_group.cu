@@ -453,6 +453,15 @@ void route(const float* logits, const float* bias, int T, int n, int k, float ro
     }
     k_route<<<T, n <= 128 ? 128 : 512, 0, (cudaStream_t) stream>>>(logits, bias, n, k, route_scale, (int) score, idx, w);
 }
+__global__ void k_route_key(const float* logits, const float* bias, int n, int score, float* out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float l = logits[i];
+    out[i] = (score == 0 ? sigmoidf_(l) : sqrtf(l > 20.0f ? l : log1pf(expf(l)))) + bias[i];
+}
+void route_key(const float* logits, const float* bias, int n, Score score, float* out, void* stream) {
+    k_route_key<<<(n + 127) / 128, 128, 0, (cudaStream_t) stream>>>(logits, bias, n, (int) score, out);
+}
 void experts_prepare(const int32_t* idx, const float* route_w, const uint8_t* gu_base, size_t gu_plane, const uint8_t* dn_base, size_t dn_plane, const float* gate_up_scale,
                      const float* down_scale, int K, const uint8_t** gu_ptr, const uint8_t** dn_ptr, float* sg, float* wd, void* stream) {
     k_prepare<<<1, 32, 0, (cudaStream_t) stream>>>(idx, route_w, gu_base, gu_plane, dn_base, dn_plane, gate_up_scale, down_scale, K, gu_ptr, dn_ptr, sg, wd);

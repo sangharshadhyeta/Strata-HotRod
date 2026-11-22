@@ -545,3 +545,17 @@ Depth D runs the routers of visits +1..+D on the current input and copies the pi
 Deeper reach does not remove more misses (2021 -> 2224: the extra predictions are less accurate and evict useful slots) and adds copies: at depth 2 about 7100 + 2100 copies x 4.5 MB in 48 tokens x 32 ms = ~21 GB/s, the PCIe ceiling measured before. So the link is already full: a
 look-ahead can only win by cutting TOTAL copies (misses + prefetch), not by starting them earlier. Depth 1 trades 4911 misses for 2021 + 5052 copies (more bytes, hidden) for +3%. What would pay: higher precision (a learned, confidence-gated predictor - 3 of 4 depth-1
 prefetches are still wasted or already resident), and protecting the token's pass-1 experts for passes 2-3 instead of predicting them. Default unchanged (prefetch off, depth 1).
+
+### The learned look-ahead in the Inkling engine, the Qwen design as src/dsv41 carries it (22 Nov) - `STRATA_LA_LEARN=1` (needs `STRATA_MOE_PREFETCH`), opt-in
+Wired exactly as Qwen drives it: per decode token (`step`) `pre_launch`; at each of the 48 visits the real selection key (score(logit) + bias) is the label, and for the reaches 1, 2, 4 the target visit's router on this visit's normed input is the plain guess, `la::forward` replaces it with the
+leader's logits (plain or a rank 4 / 8 / 16 correction), reaches 1 and 2 are published to the copy stream (4 trained and reported only); `post_launch` after the head trains one batch on a side stream. The learner is indexed by VISIT (48), so a pass-2 / pass-3 source learns its own
+corrections (the loop). 151 MiB of VRAM (taken from the slot cache); state saved to / loaded from `STRATA_LA_LEARN_FILE` (every 512 windows and at exit). `moe::route_key` is the new shared kernel (the router's key as an array; ranking it with a zero bias is the router's own ranking).
+Trained on 2400 decode tokens of the model's own temperature-1 text (97 s), then run on the held-out 48 oracle tokens (engine alone, N = 4, depth 2):
+| | learner's own score (non-resident true picks named) | picks named at +1 / +2 | misses | prefetch copies | tok/s |
+|---|---|---|---|---|---|
+| crude, depth 2 (above) | - | 75.7 / 68.9% | 2096 | 7097 | 30.4 |
+| learned, trained file | leader vs plain: d=1 93.7 vs 92.2%, d=2 88.0 vs 86.4%, d=4 80.0 vs 73.2% | 78.2 / 71.3% | 2020 | 7109 | 28.2 |
+| crude, depth 1 | - | 75.7% | 2021 | 5052 | 33.1 |
+So the learner works (it beats the plain router at every reach, most at +4, resets 0-2 per 2400 windows, the main stream never found a batch pending) but on this model the plain predictor is already 92% on what the learner scores, so the gain is +1.5 / +1.6 / +6.8 points and +2.4 picks named: the
+misses and the copies do not move. It also costs speed: 3 reaches a visit (copy, norm, router, key, forward = ~25 unfused launches a visit) plus the side-stream batch took 33.1 -> 28.2 tok/s; Qwen hides this in its window graph. Not a default. What it shows: prediction quality is not what limits
+this engine (the link is full, see the depth table); the lever left is fewer total copies - confidence-gated prefetch and keeping the token's pass-1 experts for passes 2-3.
