@@ -111,8 +111,19 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 // STRATA_DECODE_STAGE_TIMERS=1: the decode window's stage boundaries (Verifier::stage_mark); the ids index stage_ms_
 inline bool g_stage_timers() { static const bool on = [] { const char* v = std::getenv("STRATA_DECODE_STAGE_TIMERS"); return v != nullptr && v[0] == '1'; }(); return on; }
-// STRATA_PCIE_EARLY=1 (opt-in): the PCIe share's fetch kernel runs on its own stream beside the VRAM groups (Verifier::pf_cs_)
-inline bool pcie_early_env() { static const bool on = [] { const char* v = std::getenv("STRATA_PCIE_EARLY"); return v != nullptr && v[0] == '1'; }(); return on; }
+// STRATA_PCIE_EARLY (on by default on CUDA; =0 off): the PCIe share's fetch kernel runs on its own stream beside the VRAM groups (Verifier::pf_cs_).
+// Measured on an RTX 3060 (Qwen UD-Q4_K_XL): about 7% off the decode window.  Not measured on AMD (HIP): there it stays opt-in (=1).
+inline bool pcie_early_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PCIE_EARLY");
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+        return v != nullptr && v[0] == '1';
+#else
+        return v == nullptr || v[0] != '0';
+#endif
+    }();
+    return on;
+}
 enum StageId : int { kStOther = 0, kStHc, kStAttn, kStGdn, kStFfn, kStRouter, kStDoor, kStShared,
                      kStPlan, kStVram, kStPcieWait, kStPcieExp, kStCpuWait, kStRows, kStHcWrite };
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
@@ -2521,7 +2532,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             if (ev_pf_join_) { cudaEventDestroy(ev_pf_join_); ev_pf_join_ = nullptr; }
             std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the side stream could not be made, the PCIe fetch stays on the window's stream\n");
         } else {
-            std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the PCIe share's fetch overlaps the VRAM experts (own stream, pcie mode 2)\n");
+            std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the PCIe share's fetch overlaps the VRAM experts (own stream, pcie mode 2; STRATA_PCIE_EARLY=0 turns it off)\n");
         }
     }
 #if !defined(STRATA_USE_HIP)
