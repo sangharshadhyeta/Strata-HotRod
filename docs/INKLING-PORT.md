@@ -410,3 +410,13 @@ between the CPU lane and PCIe is already set from the two measured rates (the CP
 So Qwen's decode on this card sits at the memory-bandwidth point of its miss path; what moves it is fewer missed bytes per window (hit rate, fewer bytes an expert, stand-ins / mask - all present), not a faster lane.
 The router stage (10-13 ms) is already one fused post-routing launch (`native_route_post`, SPEC-router-fuse step 2); what is left in it are one-warp-per-token serial kernels (`route_post_k` 47 us, `route_pred_sel_k` 38 us)
 carrying the stand-in / route-resident logic that must stay bit-exact: at most ~3 ms a window, at the cost of rewriting those rules. Not started.
+
+### Qwen A/B legs, 22 Nov (3 prompts, decode tok/s, interleaved; measured, not argued)
+
+- **Learner (`STRATA_LA_LEARN`): on 19.7 (base 19.8 / 19.6), off 18.4 (18.6 / 18.1).** The learner is worth ~7% of decode here; it stays on.
+- **Reserve:** `--vram-reserve-mib 320` refuses to start ("verify: the device arena (96 MiB) does not fit"); 600 and 500 start (1163 and 1189 slots against 1119 at 768) but are below the engine's own safe line
+  (the log's "N MiB of VRAM free with everything loaded" is 524-528 for nearly every start at 768, the line is 512). The engine already learns its reserve both ways (generate.cpp, end of start: below the line raises it, 256 MiB above lowers it; `vram-reserve.json`),
+  but only when `--vram-reserve-mib` is NOT given: the 8095 config passes 768, which turns the learning off. Left to itself at the default 700 the start would end near 458 MiB free, below the line, and learn 768 for the next: 768 is the
+  fixed point on this card. For another card the same rule finds its own value; the cache always takes (free - reserve), so it scales with the card (a 24 GB card gets ~3x the slots).
+  Not changed in code. Suggestion for the Qwen server config: drop the explicit `--vram-reserve-mib 768` so the engine decides (floor 700).
+- Inkling's engine sizes its cache the same way (free - reserve after a warm-up token); its reserve (700 default, `STRATA_VRAM_RESERVE_MIB`) is not yet learned from the end-of-start free as Qwen's is: to do.
