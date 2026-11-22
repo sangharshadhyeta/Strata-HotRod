@@ -38,6 +38,7 @@ Nothing leaves your PC.</p>
   <a href="#what-you-see">The app</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#install">Install</a> ·
+  <a href="#where-this-came-from">Where from</a> ·
   <a href="#credits-and-license">Credits</a>
 </p>
 
@@ -68,14 +69,6 @@ tokens/s; the learners were still cold, and it has not been measured as widely a
 > (`strata-dsv41`), its own install steps and its own README, for the full model (IQ2_XXS, 7.5-8 tokens/s over a whole answer on this PC, peaking near 10) and
 > the **Coder** (a half-expert coding version, about 9 tokens/s). Everything on this page, `setup.py` included, is for Qwen3.8-Flash-Next.
 > The two branches are kept apart on purpose.
-
-> ### 🧬 Looking for Edge0 (145B latent MoE)? It is on another branch.
-> **Go to the [`hotrod-edge0` branch](https://github.com/sangharshadhyeta/Strata-HotRod/tree/hotrod-edge0)**: this fork's engine now runs
-> [Edge0-145B](https://huggingface.co/Edge0/Edge0-145B-NVFP4) (NVFP4, latent experts, 8 groups per layer) with all of this page's tiers
-> (RAM tier, expert cache, stand-ins on by default, speculative decoding). Early support, measured once on this PC (RTX 3060 12 GB, SSD
-> mode, 15 Nov, a few short questions read by hand): 16-18 tokens/s with the stand-ins, 7 without. Prompts are read in small windows, so
-> they are slow (30-40 tokens/s); the chunked prompt path and the other tiers' latent versions are not ported yet. Everything on this page,
-> `setup.py` included, is for Qwen3.8-Flash-Next; Edge0's own engine and models are by [Edge0](https://github.com/Edge0-AI/Edge0).
 
 ## Can Qwen3.8-Flash-Next run on an RTX 3060 12 GB with low RAM?
 
@@ -262,6 +255,15 @@ and kept across restarts.
 Every change and its measurement: [docs/HOTROD-DETAILS.md](docs/HOTROD-DETAILS.md) · the predictor study:
 [docs/PREDICTOR-EXPERIMENTS.md](docs/PREDICTOR-EXPERIMENTS.md) · the full log of ideas tried: [docs/perf-ideas.md](docs/perf-ideas.md) ·
 earlier experiments from a separate fork: [docs/EARLIER-EXPERIMENTS.md](docs/EARLIER-EXPERIMENTS.md).
+
+**New on main (22 Nov):** the engine tunes itself (an online tuner; calibration that runs by default and trains the learners on
+your PC; a final check that keeps the chosen set only if it beats the defaults by more than 3%), the learned residency profile is
+on for every model, the pin-segment reserve is computed, prompt stand-ins treat every token alike, co-prefill is on by default
+and the batch windows accept drafts probabilistically. Fixes: a read-ahead copy race, a stale pin after a failed read, STOP before
+QUIT, prompt-cache metadata, NaN kept a NaN in the bf16 conversions, the shared-expert combine's rounding, a GGUF header bounds
+check, the PLE shard identity, the peer tier's reserve. From the commit log; each is not benchmarked on its own, and Qwen's decode
+speed did not move with them (22 Nov, three prompts at 262K on UD-Q4_K_XL: 19.9 tokens/s against 19.3 on the 18 Nov build; a
+13.6K-token read 343 against 338 tokens/s).
 
 **New on main (9 Nov):** the flip re-check is opt-in (`STRATA_FRAGILE_RECHECK=1`; off: 42-44 vs 31-34 tokens/s on this
 PC at 262K, answers correct in both); the shift cap is opt-in (`STRATA_SHIFT_CAP=1`); the stand-in learner learns from the
@@ -562,6 +564,32 @@ Every option: [docs/DETAILS.md](docs/DETAILS.md) (upstream's reference; it cover
 </div>
 </details>
 
+## Where this came from
+
+<div align="justify">
+
+This fork began as **[solid.cpp](https://github.com/sangharshadhyeta/solid.cpp)** (August to October 2026), a llama.cpp fork used
+to find out what really works for a mixture-of-experts model that does not fit the card; the lessons that survived measurement
+were ported into Strata one concept at a time. A copy of that work is kept on the
+**[`legacy-solid` branch](https://github.com/sangharshadhyeta/Strata-HotRod/tree/legacy-solid)**: the illustrated write-up
+([`index.html`](https://github.com/sangharshadhyeta/Strata-HotRod/blob/legacy-solid/index.html)), the formal Technical Note
+([`print/technical-note.html`](https://github.com/sangharshadhyeta/Strata-HotRod/blob/legacy-solid/print/technical-note.html), with the references), solid.cpp's changed
+sources and notes, **[CITATIONS.md](https://github.com/sangharshadhyeta/Strata-HotRod/blob/legacy-solid/CITATIONS.md)** (every project, paper, model and person
+credited) and **[UPSTREAM.md](https://github.com/sangharshadhyeta/Strata-HotRod/blob/legacy-solid/UPSTREAM.md)** (exactly what is whose).
+
+</div>
+
+<p align="center"><img src="docs/media/lessons.svg" width="760" alt="Five lessons from solid.cpp and what each became in Strata-HotRod"></p>
+
+<p align="center"><img src="docs/media/token-flow.svg" width="760" alt="How a requested expert is served: on the card, stand-in, RAM or SSD"></p>
+
+<div align="justify">
+
+**What this is not.** One PC, one card, one drive; AMD, Intel and Apple paths were not tested here. Figures are the author's own
+measurements and have not been independently reproduced.
+
+</div>
+
 ## Credits and license
 
 <div align="justify">
@@ -570,6 +598,11 @@ The model is Qwen3.8-Flash-Next by the Qwen team, compressed by ISTA-DASLab. Str
 this fork keeps its [MIT License](LICENSE) and copyright notice. The engine uses parts of
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp), and the picture encoder uses llama.cpp's `mtmd`. A few parts and
 every model have their own licenses: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#license). Security: [SECURITY.md](SECURITY.md).
+
+The DeepSeek engine comes from **[Project Maya](https://github.com/mw00/project-maya)** by Peasant Smith (mw00) and its
+contributors (MIT; its notice is kept in [`third_party/project-maya`](third_party/project-maya) on the DeepSeek branch).
+The author's part, about 540 commits in solid.cpp and about 630 (Qwen) and
+120 (DeepSeek) on top of Strata, was done with Claude Code as an AI coding assistant.
 
 </div>
 
