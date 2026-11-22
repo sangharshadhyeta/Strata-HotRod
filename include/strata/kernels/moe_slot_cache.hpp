@@ -3,7 +3,7 @@
 // Nothing here knows a model: the caller says how many layers and experts there are, how many bytes an expert's two planes take, and where an expert's bytes are on the
 // host (a base pointer + plane size per layer and plane).  Per layer visit the host reads the router's picks, `place` copies the missing experts into least-recently-used
 // slots on a copy stream (a hit costs nothing) and hands back the slot addresses for moe::experts_gate_up / experts_down; the compute stream waits on an event.
-// Switches (read by `from_env`, shared by every engine that uses it): STRATA_MOE_SLOTS=N (0 = off), STRATA_MOE_SLOT_MARGIN_MB (VRAM left free when N is automatic; 1500).
+// Switches (read by `from_env`, shared by every engine that uses it): STRATA_MOE_SLOTS=N (0 = off), the reserve is the caller's (the Inkling engine: STRATA_VRAM_RESERVE_MIB, Qwen's --vram-reserve-mib default 700).
 #pragma once
 
 #include <cuda_runtime.h>
@@ -27,15 +27,14 @@ public:
         if (ev_) cudaEventDestroy(ev_);
         if (summary_ && hits_ + miss_ > 0) std::fprintf(stderr, "moe slot cache: %ld hits, %ld misses (%.1f%% hit), %ld prefetch copies\n", hits_, miss_, 100.0 * hits_ / (double) (hits_ + miss_), prefetched_);
     }
-    /// n_slots < 0: automatic (the free VRAM less the margin); 0: off.  Returns whether a cache exists (fewer than one visit's picks = none).
-    bool init(long n_slots, size_t gu_bytes, size_t dn_bytes, int n_layers, int n_experts, int max_k, const char* tag = "moe") {
+    /// n_slots < 0: automatic ((the free VRAM - reserve_bytes) / the slot's bytes, read after every other allocation, as the Qwen engine sizes its expert cache); 0: off.  Returns whether a cache exists (fewer than one visit's picks = none).
+    bool init(long n_slots, size_t gu_bytes, size_t dn_bytes, int n_layers, int n_experts, int max_k, size_t reserve_bytes, const char* tag = "moe") {
         gu_ = gu_bytes; dn_ = dn_bytes; ne_ = n_experts; maxk_ = max_k;
         if (n_slots == 0 || gu_ + dn_ == 0) return false;
         if (n_slots < 0) {
             size_t freeb = 0, totalb = 0;
             if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) return false;
-            const char* m = std::getenv("STRATA_MOE_SLOT_MARGIN_MB");
-            const size_t margin = (size_t) (m ? std::atoll(m) : 1500) << 20;
+            const size_t margin = reserve_bytes;   // what the caller knows will be allocated after the cache, plus its safety reserve (the Qwen engine's rule: free - reserve)
             n_slots = (long) ((freeb > margin ? freeb - margin : 0) / (gu_ + dn_));
         }
         n_slots = std::min<long>(n_slots, (long) n_layers * n_experts);

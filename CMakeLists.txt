@@ -557,6 +557,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(inkling2_gpu_forward_test src/inkling2/gpu_forward_test.cpp)
     target_link_libraries(inkling2_gpu_forward_test PRIVATE inkling2_engine)
     add_test(NAME inkling2_gpu_forward_test COMMAND inkling2_gpu_forward_test)
+    # the engine behind serve/server.py's protocol (M4): `inkling2_serve --serve --model <gguf>`
+    add_executable(inkling2_serve src/inkling2/serve_main.cpp)
+    target_link_libraries(inkling2_serve PRIVATE inkling2_engine)
   endif()
   # #512: the top-k's active-block bound (Turing's dispatch, forced on any card by STRATA_TOPK_ACTIVE_ANY) against
   # the capacity rule, selected ids bitwise

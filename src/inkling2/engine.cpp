@@ -167,7 +167,7 @@ struct Engine::Impl {
     void init_cache() {
         size_t gu = 0, dn = 0;
         for (const LW& w : lw) if (!w.resident) { gu = std::max<size_t>(gu, w.gu_plane); dn = std::max<size_t>(dn, w.dn_plane); }
-        if (!scache.init(M::SlotCache::slots_from_env(), gu, dn, (int) c.n_stored, (int) c.n_expert, (int) c.n_expert_used, "inkling2 engine")) return;
+        // everything the engine needs is allocated BEFORE the cache, so the free figure below is what this process really has left (the Qwen engine's order); the look-ahead's buffers too
         void* hp = nullptr;
         CK(cudaHostAlloc(&hp, 32 * sizeof(void*), cudaHostAllocPortable)); pinned.push_back(hp);
         h_gu_ptr = (const uint8_t**) hp; h_dn_ptr = h_gu_ptr + 16;
@@ -177,6 +177,14 @@ struct Engine::Impl {
             void* hq2 = nullptr; CK(cudaHostAlloc(&hq2, 16 * 4, cudaHostAllocPortable)); pinned.push_back(hq2); h_pidx = (int32_t*) hq2;
             std::fprintf(stderr, "inkling2 engine: look-ahead prefetch of %d experts a visit\n", pf_n);
         }
+        // one token before the sizing: the runtime allocates lazily (kernel modules, local memory), which the free figure must already count
+        step(0, 0, nullptr, SeamSink{});
+        reset();
+        CK(cudaDeviceSynchronize());
+        // the reserve: STRATA_VRAM_RESERVE_MIB, the Qwen engine's --vram-reserve-mib default (700 MiB) - the driver and what a longer prompt's buffers will take
+        const char* rv = std::getenv("STRATA_VRAM_RESERVE_MIB");
+        const size_t reserve = (size_t) (rv ? std::atoll(rv) : 700) << 20;
+        scache.init(M::SlotCache::slots_from_env(), gu, dn, (int) c.n_stored, (int) c.n_expert, (int) c.n_expert_used, reserve, "inkling2 engine");
     }
     void place_experts(int l, const LW& w, const int32_t* idx, int K) {
         scache.place(l, idx, K, w.host_gu, w.gu_plane, w.host_dn, w.dn_plane, h_gu_ptr, h_dn_ptr, st);
@@ -193,7 +201,10 @@ struct Engine::Impl {
         if (const char* vl = std::getenv("STRATA_INKLING2_VRAM_LAYERS")) vram_layers = std::atoi(vl);
         prof = std::getenv("STRATA_INKLING2_PROFILE") != nullptr;
         const float dsc = (float) (1.0 / std::sqrt((double) (2 * taps + 1)));
-        d_embd = q8(*lay.token_embd, "token_embd");
+        // the token-embedding table stays in pinned host memory: a token reads one 2.4 KB row over PCIe (Maya does the same), so its 0.49 GB goes to the expert cache
+        // (STRATA_INKLING2_EMBD_VRAM=1 keeps it in VRAM)
+        if (lay.token_embd->type != kQ8_0) throw std::runtime_error(std::string("token_embd: expected Q8_0, got ") + lay.token_embd->type_name());
+        d_embd = std::getenv("STRATA_INKLING2_EMBD_VRAM") ? q8(*lay.token_embd, "token_embd") : (void*) load_pinned(*lay.token_embd);
         d_out = q8(*lay.output, "output");
         d_embd_norm = up(C::vec(g, *lay.token_embd_norm));
         d_out_norm = up(C::vec(g, *lay.output_norm));

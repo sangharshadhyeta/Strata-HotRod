@@ -362,3 +362,20 @@ the FP32 path stays 2e-7.
 
 Top-1 identical (44 of 48). Maya's engine: ~32 tok/s on this card. The KV cache and conv state stay FP32 (only the expert FFN input and activation are int8; the dense q/k/v/out
 projections already used int8 activations in the first GPU engine). Qwen check (3 prompts): 18.7 / 18.6 / 22.8 tok/s (mean 20.0), 13.6K read 342.0 tok/s: unchanged.
+
+## L4: the VRAM sizing follows the Qwen engine's rule; embedding on the host; first serve (22 Nov)
+
+- **VRAM cache sizing (not a guess any more):** slots = (free VRAM - reserve) / slot bytes, read after every other engine allocation and after one warm-up token (the runtime allocates lazily), reserve =
+  `STRATA_VRAM_RESERVE_MIB` (default 700, the Qwen engine's `--vram-reserve-mib` default). Qwen additionally adds the prompt path's buffers, the draft head and the pipeline windows to the reserve and learns a per-machine
+  reserve (`vram-reserve.json`); those two terms are not in the Inkling engine yet (no prompt path / draft head here).
+- **Embedding table on the host** (pinned, zero-copy row read; `STRATA_INKLING2_EMBD_VRAM=1` keeps it in VRAM): +0.49 GB for the cache. Cache 846 -> 1193 experts (39%) at the serve context of 4096; cold 31.3 tok/s, warm 33.1 tok/s with
+  prefetch 8 (engine alone, 48 tokens; Maya ~32), 29.7 / 32.2 without prefetch. KL 0.0051.
+- **Served end to end** through the Python server's protocol: `inkling2_serve --serve` (INFO / READY, GEN, PP, T, DONE, STOP, QUIT; conversation continuation reuses positions). Greedy answer "The capital of France is Paris."
+  (reasoning channel and answer both right); ~28 tok/s generation through the server, prompt read ~27 tok/s (one token at a time: no batched prefill yet). Maya's v1.1.72 server carries the Inkling reply parser
+  (`serve/frontend.py`: content_thinking / content_text, stop on `<|content_model_end_sampling|>`); ours does not yet, so for now it is the front of our engine on 8095 (port the parser into our `serve/`).
+- **Known departures from our design, to be replaced (owner, 22 Nov: "use our design")**: (1) the host tier is a pinned `cudaHostAlloc` + `pread` copy, not `ds4::ExpertStore` (src/dsv41/ds4_store.hpp: unbuffered reads that
+  leave the page cache alone, a policy-owned arena, `LayerGeo` per-matrix offsets and strides, pinned chunks, guesses read ahead); (2) the VRAM tier is my `moe::SlotCache` (LRU), not the engine's `core::ExpertCache` / the DeepSeek
+  branch's VRAM tier, and its slots are sized for the Q8_0 layers (8.4 MB) although 20 of 24 layers are NVFP4 (4.5 MB): about half the cache is wasted; (3) no stand-ins, no learned look-ahead, no adaptive swaps yet.
+  Plan: two stores (NVFP4 layers, Q8_0 layers: `ExpertStore` slots are uniform), `LayerGeo` for the fused gate_up (gate and up are two offsets of one tensor, stride = the expert plane) and the down tensor, sized VRAM slots, then the
+  look-ahead and the loop feature on top.
+Qwen check after this change (3 prompts): 16.7 / 20.6 / 21.5 tok/s (mean 19.6), 13.6K read 334.7 tok/s: unchanged (clean main 19.3 / 338.1; run-to-run spread 333-343).
