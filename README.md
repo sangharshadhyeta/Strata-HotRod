@@ -21,7 +21,7 @@ view so you can watch the cache work instead of taking it on faith.
 > ported, one concept at a time, into [Strata-HotRod](https://github.com/sangharshadhyeta/Strata-HotRod) (branch `main`), which is
 > the engine to use. This branch keeps solid.cpp's changed sources and notes, and the 18 Nov 2026 write-up, for the record. The
 > project's own repository is [sangharshadhyeta/solid.cpp](https://github.com/sangharshadhyeta/solid.cpp), with its
-> [docs page](https://sangharshadhyeta.github.io/solid.cpp/).
+> [illustrated write-up](https://sangharshadhyeta.github.io/solid/).
 
 ## What it taught, and where each lesson went
 
