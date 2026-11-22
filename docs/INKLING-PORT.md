@@ -429,3 +429,8 @@ starts 2-4 ran at 1024 (1051 slots, 542 MiB free after start): 19.1 / 19.7 / 18.
 leaves the headroom it asks for. Recommendation: drop the explicit flag from the Qwen config. (Earlier logs showed 524-528 MiB free at 768; today's starts end lower, so the fixed value is not safe by itself.)
 Edge0 decode profile (graph nodes traced): 34% of decode-side kernel time is `wait_flag_ge_kernel` (the host flags, as on Qwen); the NVFP4 grouped expert kernels (`native_gu_multi_kernel<40>`, `native_down_multi_kernel<40>`) are 6.6%
 and already use the table-lookup + dp4a decode of the int8 path, so that twist has no gap to close on Edge0; the next largest are Edge0's `latent_u_p4_k` (5.3%) and the `mmvq` family (~13%).
+
+## Maya's items ported (22 Nov)
+- Warm start (Maya's IK2_WARM idea; our file, `STRATA_MOE_PROFILE`): the engine counts picks per (layer, expert), saves them as it runs, and the next start fills the free VRAM slots with the most picked before the first token. 48-token cold pass 31.3 -> 33.6 tok/s, KL unchanged.
+- Host sampling: the top-k is one heap pass over the logits instead of a partial sort of 200K.
+- Still open from her list: batched prompt path + scan-resistant eviction, FP8/FP16 KV with fused attention, CPU lane, device-side sampling candidates, DSpark drafter (needs mtp.safetensors, not on disk).

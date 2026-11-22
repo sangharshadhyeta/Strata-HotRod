@@ -114,6 +114,24 @@ public:
     }
     long prefetched() const { return prefetched_; }
 
+    /// Start-up warm fill: puts expert (layer, e) into a free slot now.  `rank` orders the later eviction: a larger rank is evicted later (the most popular expert gets the
+    /// largest), and `finish_warm` makes every later use newer than every warm entry.  False when no slot is free or the expert is already here.
+    bool warm_insert(int layer, int e, int rank, const uint8_t* gu_src, size_t gu_len, const uint8_t* dn_src, size_t dn_len) {
+        const int64_t k = (int64_t) layer * ne_ + e;
+        if (n_ == 0 || map_[(size_t) k] >= 0) return false;
+        int sl = -1;
+        for (int i = 0; i < n_; ++i) if (key_[(size_t) i] < 0) { sl = i; break; }
+        if (sl < 0) return false;
+        key_[(size_t) sl] = k; map_[(size_t) k] = sl; used_[(size_t) sl] = rank + 1;
+        uint8_t* dst = mem_ + (size_t) sl * (gu_ + dn_);
+        cudaMemcpyAsync(dst, gu_src, gu_len, cudaMemcpyHostToDevice, cs_);
+        cudaMemcpyAsync(dst + gu_, dn_src, dn_len, cudaMemcpyHostToDevice, cs_);
+        warmed_ = std::max<long>(warmed_, rank + 1);
+        return true;
+    }
+    void finish_warm() { cudaStreamSynchronize(cs_); clock_ = std::max<int64_t>(clock_, (int64_t) warmed_ + 1); }
+    int free_slots() const { int n = 0; for (int i = 0; i < n_; ++i) n += key_[(size_t) i] < 0; return n; }
+
 private:
     int n_ = 0, ne_ = 0, maxk_ = 0;
     size_t gu_ = 0, dn_ = 0;
@@ -123,7 +141,7 @@ private:
     std::vector<int64_t> key_, used_;
     std::vector<int> map_;
     int64_t clock_ = 0;
-    long hits_ = 0, miss_ = 0, prefetched_ = 0;
+    long hits_ = 0, miss_ = 0, prefetched_ = 0, warmed_ = 0;
     bool summary_ = false, unwaited_ = false;
 };
 

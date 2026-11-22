@@ -32,7 +32,8 @@ using SeamSink = std::function<void(int visit, const char* name, const float* de
 class Engine {
 public:
     /// Uploads the dense weights and registers the experts.  max_ctx: positions of the per-visit KV caches.
-    Engine(const GgufFile& g, const Config& c, const Layout& lay, int max_ctx);
+    /// profile: a file of per-(layer, expert) pick counts (written by this engine as it runs, read at the next start to pre-fill the VRAM cache); empty = STRATA_MOE_PROFILE or none.
+    Engine(const GgufFile& g, const Config& c, const Layout& lay, int max_ctx, const std::string& profile = std::string());
     ~Engine();
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;

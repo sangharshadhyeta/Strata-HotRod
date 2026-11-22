@@ -96,8 +96,9 @@ struct Engine::Impl {
         tp = n;
     }
 
-    Impl(const GgufFile& gg, const Config& cc, const Layout& ll, int max_ctx) : g(gg), c(cc), lay(ll), cap(max_ctx) { init(); }
+    Impl(const GgufFile& gg, const Config& cc, const Layout& ll, int max_ctx, const std::string& prof) : g(gg), c(cc), lay(ll), cap(max_ctx), prof_path(prof) { init(); }
     ~Impl() {
+        prof_save();
         if (pf_total > 0) std::fprintf(stderr, "inkling2 engine: look-ahead: %ld of %ld actual picks were in the predicted set (%.1f%%)\n", pf_hit, pf_total, 100.0 * pf_hit / (double) pf_total);
         if (st) cudaStreamDestroy(st);
         for (void* p : allocs) cudaFree(p); for (void* p : pinned) cudaFreeHost(p); }
@@ -164,6 +165,61 @@ struct Engine::Impl {
     std::vector<int> pred_ids;
     long pf_pred = 0, pf_hit = 0, pf_total = 0;
     const uint8_t **h_gu_ptr = nullptr, **h_dn_ptr = nullptr;   // pinned address tables
+    // ---- the usage profile: how often each (stored layer, expert) was picked, kept across runs (STRATA_MOE_PROFILE or the constructor's path).  Counts are added as tokens run and saved
+    // now and then and at the end; the next start fills the VRAM cache with the most picked experts before the first token (a cold cache cost the first tokens ~8%).
+    std::string prof_path;
+    std::vector<uint32_t> prof_counts;   // [n_stored][n_expert]
+    long prof_dirty = 0;
+    void prof_load() {
+        prof_counts.assign((size_t) c.n_stored * c.n_expert, 0);
+        if (prof_path.empty()) return;
+        FILE* f = std::fopen(prof_path.c_str(), "rb");
+        if (!f) return;
+        uint32_t hdr[3] = {0, 0, 0};
+        if (std::fread(hdr, 4, 3, f) == 3 && hdr[0] == 0x31504b49u && hdr[1] == (uint32_t) c.n_stored && hdr[2] == (uint32_t) c.n_expert)
+            if (std::fread(prof_counts.data(), 4, prof_counts.size(), f) != prof_counts.size()) std::fill(prof_counts.begin(), prof_counts.end(), 0u);
+        std::fclose(f);
+    }
+    void prof_save() {
+        if (prof_path.empty() || prof_dirty == 0) return;
+        uint32_t mx = 0;
+        for (uint32_t v : prof_counts) mx = std::max(mx, v);
+        if (mx > (1u << 30)) for (uint32_t& v : prof_counts) v >>= 1;   // never overflow: keep the ratios
+        const std::string tmp = prof_path + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) return;
+        const uint32_t hdr[3] = {0x31504b49u, (uint32_t) c.n_stored, (uint32_t) c.n_expert};
+        std::fwrite(hdr, 4, 3, f);
+        std::fwrite(prof_counts.data(), 4, prof_counts.size(), f);
+        std::fclose(f);
+        std::rename(tmp.c_str(), prof_path.c_str());
+        prof_dirty = 0;
+    }
+    void prof_count_token() {
+        if (prof_counts.empty() || prof_path.empty()) return;
+        for (int vv = 0; vv < c.n_visits; ++vv) {
+            const int64_t l = c.stored_of_visit(vv);
+            for (int e : picks[(size_t) vv]) ++prof_counts[(size_t) l * c.n_expert + (size_t) e];
+        }
+        if ((prof_dirty += 1) >= 512) prof_save();
+    }
+    void warm_cache() {
+        if (!scache.active() || prof_counts.empty()) return;
+        std::vector<std::pair<uint32_t, int>> order;   // (count, layer * n_expert + e) for the experts ever picked, most picked last
+        for (size_t i = 0; i < prof_counts.size(); ++i) if (prof_counts[i] > 0) order.push_back({prof_counts[i], (int) i});
+        if (order.empty()) return;
+        std::sort(order.begin(), order.end());
+        const size_t keep = std::min<size_t>(order.size(), (size_t) scache.free_slots());
+        long n = 0;
+        for (size_t r = order.size() - keep; r < order.size(); ++r) {
+            const int l = order[r].second / (int) c.n_expert, e = order[r].second % (int) c.n_expert;
+            const LW& w = lw[(size_t) l];
+            if (w.resident) continue;
+            if (scache.warm_insert(l, e, (int) (r - (order.size() - keep)), w.host_gu + (size_t) e * w.gu_plane, w.gu_plane, w.host_dn + (size_t) e * w.dn_plane, w.dn_plane)) ++n;
+        }
+        scache.finish_warm();
+        std::fprintf(stderr, "inkling2 engine: cache warm-started with %ld of the most picked experts (profile %s)\n", n, prof_path.c_str());
+    }
     void init_cache() {
         size_t gu = 0, dn = 0;
         for (const LW& w : lw) if (!w.resident) { gu = std::max<size_t>(gu, w.gu_plane); dn = std::max<size_t>(dn, w.dn_plane); }
@@ -184,7 +240,10 @@ struct Engine::Impl {
         // the reserve: STRATA_VRAM_RESERVE_MIB, the Qwen engine's --vram-reserve-mib default (700 MiB) - the driver and what a longer prompt's buffers will take
         const char* rv = std::getenv("STRATA_VRAM_RESERVE_MIB");
         const size_t reserve = (size_t) (rv ? std::atoll(rv) : 700) << 20;
+        if (prof_path.empty()) if (const char* pe = std::getenv("STRATA_MOE_PROFILE")) prof_path = pe;
+        prof_load();
         scache.init(M::SlotCache::slots_from_env(), gu, dn, (int) c.n_stored, (int) c.n_expert, (int) c.n_expert_used, reserve, "inkling2 engine");
+        warm_cache();
     }
     void place_experts(int l, const LW& w, const int32_t* idx, int K) {
         scache.place(l, idx, K, w.host_gu, w.gu_plane, w.host_dn, w.dn_plane, h_gu_ptr, h_dn_ptr, st);
@@ -460,13 +519,14 @@ struct Engine::Impl {
         if (out) { out->resize((size_t) c.n_vocab_real); CK(cudaMemcpy(out->data(), logits, (size_t) c.n_vocab_real * 4, cudaMemcpyDeviceToHost)); }
         CK(cudaDeviceSynchronize());   // the one sync of a token (no host round trip inside a visit any more)
         for (int vv = 0; vv < c.n_visits; ++vv) picks[(size_t) vv].assign(h_idx + (size_t) vv * 16, h_idx + (size_t) vv * 16 + c.n_expert_used);
+        prof_count_token();
         if (prof) { const auto n = std::chrono::steady_clock::now(); ph[4] += std::chrono::duration<double>(n - tp).count(); tp = n; }
         ++n_steps;
         pos_cur = pos;
     }
 };
 
-Engine::Engine(const GgufFile& g, const Config& c, const Layout& lay, int max_ctx) : p_(new Impl(g, c, lay, max_ctx)) {}
+Engine::Engine(const GgufFile& g, const Config& c, const Layout& lay, int max_ctx, const std::string& profile) : p_(new Impl(g, c, lay, max_ctx, profile)) {}
 Engine::~Engine() = default;
 void Engine::step(int64_t token, int pos, std::vector<float>* logits, const SeamSink& sink) { p_->step(token, pos, logits, sink); }
 void Engine::reset() { p_->reset(); }

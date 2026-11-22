@@ -75,10 +75,17 @@ int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int>& re
     }
     if (s.temperature <= 0.0f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
     const int k = std::min(std::max(s.top_k, 1), std::min(64, V));
-    std::vector<int> idx((size_t) V);
-    for (int i = 0; i < V; ++i) idx[(size_t) i] = i;
-    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return lg[(size_t) a] > lg[(size_t) b]; });
-    idx.resize((size_t) k);
+    // the k best by one pass and a small min-heap: after the first k it is one compare a logit (a partial_sort over 200K candidates took ~1.5 ms a token)
+    std::vector<std::pair<float, int>> heap;
+    heap.reserve((size_t) k);
+    const auto worse = [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; };   // min-heap on the value
+    for (int i = 0; i < V; ++i) {
+        if ((int) heap.size() < k) { heap.push_back({lg[(size_t) i], i}); if ((int) heap.size() == k) std::make_heap(heap.begin(), heap.end(), worse); }
+        else if (lg[(size_t) i] > heap.front().first) { std::pop_heap(heap.begin(), heap.end(), worse); heap.back() = {lg[(size_t) i], i}; std::push_heap(heap.begin(), heap.end(), worse); }
+    }
+    std::sort(heap.begin(), heap.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+    std::vector<int> idx((size_t) k);
+    for (int i = 0; i < k; ++i) idx[(size_t) i] = heap[(size_t) i].second;
     std::vector<double> p((size_t) k);
     const double mx = lg[(size_t) idx[0]];
     double z = 0;
