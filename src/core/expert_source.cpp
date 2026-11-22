@@ -4918,6 +4918,7 @@ static constexpr size_t kPromoQueueMax = 32;
 static std::atomic<uint64_t> pf_dem_total{0}, pf_dem_qual{0};                               // demand file-tier misses; those whose miss score was >= 1 when they missed
 static std::atomic<uint64_t> pf_w_calls{0}, pf_w_free{0}, pf_w_low{0}, pf_w_novictim{0}, pf_w_yes{0};   // promote_wanted: calls, a free place, score < 1, no victim, a victim
 static std::atomic<uint64_t> pf_released{0}, pf_published{0};                              // places given up for starved layers, promotions published
+static std::atomic<uint64_t> pf_rk_read[3], pf_rk_skip[3];   // STRATA_PCIE_STATS: the plan's missed experts by best rank (0-2, 3-6, 7-9): read / skipped
 static std::atomic<uint64_t> pf_jb_us[4], pf_jb_n[4];   // the CPU lane's `jobs` phase (c2 -> c3) per layer call, bucketed by that call's file-tier misses (0, 1, 2, 3+)
 static constexpr uint32_t kPromoGrace = 300;   // STRATA_PROMO_NETGAIN: windows a promotion may stay unused before its place can be taken back
 static bool pf_funnel_on() { static const bool on = [] { const char* v = std::getenv("STRATA_PCIE_STATS"); return v != nullptr && v[0] == '1'; }(); return on; }
@@ -5851,10 +5852,10 @@ int rank_cutoff() {
 }
 void set_rank_cutoff(int r) { g_rank_cutoff.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 namespace {
-std::atomic<bool> g_tail_cpu_off{false};
+std::atomic<bool> g_tail_read_skip{false};
 }  // namespace
-bool tail_cpu_off() { return g_tail_cpu_off.load(std::memory_order_relaxed); }
-void set_tail_cpu_off(bool on) { g_tail_cpu_off.store(on, std::memory_order_relaxed); }
+bool tail_read_skip() { return g_tail_read_skip.load(std::memory_order_relaxed); }
+void set_tail_read_skip(bool on) { g_tail_read_skip.store(on, std::memory_order_relaxed); }
 
 namespace {
 // STRATA_ROUTER_TRACE=<file> (measurement only, off by default): one record per call of expert_pool_dispatch_multi, i.e. for every MoE layer of every
@@ -6132,8 +6133,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     const int32_t e = d.gpu_pred[(((size_t) target * kRoutePredDists + (size_t) route_pred_slot(dist)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
                     if (gate_fs != nullptr && !gate_fs->ra_admit(di * 10 + (int) r, (double) (gate_busy + (size_t) nw) / gate_workers)) continue;
-                    // STRATA_TAIL_CPU=0 / STRATA_RANK_CUTOFF=R: a guess at a rank the plan never computes is not read ahead (it would be skipped after the read)
-                    if (tail_read && ((r >= tail_lo && tail_cpu_off()) || (rank_cutoff() > 0 && r >= rank_cutoff()))) {
+                    // STRATA_RANK_CUTOFF=R: a guess at a rank that is never used at all is not read ahead.  (STRATA_TAIL_CPU=0 does not skip: a tail expert in RAM can be
+                    // swapped into the GPU cache, it is only never computed by the CPU.)
+                    if (tail_read && ((rank_cutoff() > 0 && r >= rank_cutoff()) || (r >= tail_lo && tail_read_skip()))) {
                         la_tail_read_open_skips.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
@@ -6283,6 +6285,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const bool resident = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
                 const bool cut = cut_rank > 0 && minr[q] >= cut_rank;                          // STRATA_RANK_CUTOFF: skipped even when resident
                 const bool tail = tail_rank > 0 && minr[q] >= tail_rank && !resident;          // STRATA_ROUTE_TAIL_SKIP: a missed expert only
+                if (!resident && pf_funnel_on()) (cut || tail ? pf_rk_skip : pf_rk_read)[minr[q] < 3 ? 0 : minr[q] < 7 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
                 if (!cut && !tail) continue;
                 skip_d[q] = true;
                 if (!resident) --nmiss;
@@ -6426,6 +6429,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     }
                     std::fprintf(stderr, "strata jobs phase per layer call, by its file-tier misses:%s\n", b);
                 }
+                if (st_print)
+                    std::fprintf(stderr, "strata plan misses by best rank in the window (read / skipped): rank 0-2 %llu / %llu, rank 3-6 %llu / %llu, rank 7-9 %llu / %llu\n",
+                                 (unsigned long long) pf_rk_read[0].load(), (unsigned long long) pf_rk_skip[0].load(), (unsigned long long) pf_rk_read[1].load(),
+                                 (unsigned long long) pf_rk_skip[1].load(), (unsigned long long) pf_rk_read[2].load(), (unsigned long long) pf_rk_skip[2].load());
                 if (st_print && ng_ffs != nullptr)
                     std::fprintf(stderr, "strata read-ahead gate (STRATA_PROMO_GUESS_MIN): %llu decode guesses not read\n", (unsigned long long) pf_guess_skipped.load());
                 if (st_print && ng_ffs != nullptr) {

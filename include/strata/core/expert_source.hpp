@@ -709,9 +709,9 @@ void set_tail_skip_rank(int r);
 /// rank >= R is neither copied nor computed and its weight is dropped (no renormalisation), as a tail skip does for a missed one.  Changes the output.
 int rank_cutoff();
 void set_rank_cutoff(int r);
-/// STRATA_TAIL_CPU=0 in effect (set by the serve start-up when the stand-ins' floor exists): the tail ranks are never computed by the CPU, so the read-ahead leaves them unread.
-bool tail_cpu_off();
-void set_tail_cpu_off(bool on);
+/// STRATA_TAIL_READ=0 with STRATA_TAIL_CPU=0 (set by the serve start-up): the read-ahead leaves the guesses at the stand-ins' floor and above unread.
+bool tail_read_skip();
+void set_tail_read_skip(bool on);
 /// STRATA_ROUTER_TRACE (measurement only): the window's token ids, written as their own record before the window's layer-0 record
 /// (tools/predictor/trace_reader.py pairs them in order and checks the row count).  The verifier calls it as it launches a window;
 /// a no-op when the trace is off.

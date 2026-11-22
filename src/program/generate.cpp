@@ -10584,7 +10584,10 @@ int main(int argc, char** argv) {
                 const int floor_rank = strata::kernels::route_cfg_floor();
                 if (floor_rank > 0 && floor_rank < 10) {
                     strata::core::set_tail_skip_rank(floor_rank);
-                    strata::core::set_tail_cpu_off(true);   // the read-ahead leaves the ranks from the floor up unread
+                    if (const char* tr = std::getenv("STRATA_TAIL_READ"); tr != nullptr && tr[0] == '0') {
+                        strata::core::set_tail_read_skip(true);   // the read-ahead leaves the tail guesses unread
+                        std::fprintf(stderr, "strata serve: STRATA_TAIL_READ=0: the read-ahead does not pull rank %d-9 guesses into RAM\n", floor_rank);
+                    }
                     std::fprintf(stderr, "strata serve: STRATA_TAIL_CPU=0: ranks %d-9 are never computed by the CPU or read over PCIe - a missed expert that every "
                                          "token of a window routes at rank %d or lower is skipped (the stand-ins' floor; answers differ slightly)\n", floor_rank, floor_rank);
                 } else
