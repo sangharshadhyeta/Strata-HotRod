@@ -525,3 +525,8 @@ transfer: predict further ahead than the crude one-visit prefetch (+5%), i.e. th
 Qwen shapes for the tensor-core Q8_0 matmul: `q8_mma_parity` takes n_in:n_out arguments; all 11 distinct Q8_0 matrices of the Qwen3.8 UD-Q4_K_XL files (10240:320, 320:10240, 2560:640, 640:2560, 6144:2560, 2560:10240, 2560:6144, 2560:512, 2560:12288, 2560:248320, 2560:2560)
 match the CPU reference (worst 2.4e-4 on values ~370, 1..8 columns). (The test first passed two of them vacuously while the Inkling server held the GPU: an allocation failure gave an all-zero reference. It now fails on any CUDA error or a zero reference.)
 Not integrated into the `strata` binary, and no speed measured for Qwen: on Inkling the dense tensor-core path gave no gain.
+
+### Tensor-core Q8_0 against Qwen's own matvec (22 Nov) - `STRATA_Q8_MMA=1`, opt-in, off
+`kernels::mma::q8_matmul` is now behind `native_mmvq` (ggml type 8, raw Q8_0, 2-8 columns; `native_q8_mma_set`), and `q8_mma_vs_native` times both on Qwen's 11 real Q8_0 shapes (synthetic weights, RTX 3060, 200 calls each). They agree (max rel diff <= 7e-7).
+Speed: the tensor-core kernel LOSES on 9 of 11 shapes (0.09x - 0.82x of Qwen's matvec; e.g. 2560x10240 8 cols 0.75x, the 248320-row head 0.63x, 10240x320 0.14x), and wins only where n_in is small: 320x10240 2.0-4.2x, 640x2560 1.2-2.9x (2-8 columns).
+Likely why (not tested): it has no split-K, so a large n_in with few output rows leaves most SMs idle, and Qwen's matvec already streams the weights near bandwidth. Not a default; the small-n_in wins are 7-20 us a call, too small to matter before a split-K variant exists.

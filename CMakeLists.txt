@@ -457,6 +457,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/elementwise.cu
                           src/kernels/cuda/bf16_gemv.cu
                           src/kernels/cuda/native_mmvq.cu
+                          src/kernels/cuda/q8_mma.cu
                           src/kernels/cuda/native_bf16.cu
                           src/kernels/cuda/native_gr_norm.cu
                           src/kernels/cuda/native_moe.cu
@@ -530,7 +531,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # Model-independent MoE kernels (docs/INKLING-PORT.md: "all these ports should help other models too"): the router with a score mode (sigmoid, or DeepSeek's
     # sqrt-softplus) and the grouped experts (run-time shapes, NVFP4 / Q8_0, the activation a parameter).  A library of its own: the Qwen, Edge0 and DeepSeek paths
     # link it behind their own switches; nothing links it into the `strata` binary yet.
-    add_library(strata_moe_group STATIC src/kernels/cuda/moe_group.cu src/kernels/cuda/q8_mma.cu)   # (+ the tensor-core Q8_0 matmul, kernels::mma)
+    add_library(strata_moe_group STATIC src/kernels/cuda/moe_group.cu)   # (the tensor-core Q8_0 matmul, kernels::mma, is in strata_kernels)
     target_include_directories(strata_moe_group PUBLIC include)
     target_link_libraries(strata_moe_group PUBLIC CUDA::cudart)
     add_library(inkling2_kernels STATIC src/kernels/cuda/inkling2_kernels.cu)   # Inkling's own ops: attention with bias / sink / window, dynamic conv taps, loop gate
@@ -546,7 +547,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME moe_group_parity COMMAND moe_group_parity)
     add_executable(q8_mma_parity src/kernels/q8_mma_parity.cpp)
     target_include_directories(q8_mma_parity PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(q8_mma_parity PRIVATE strata_moe_group CUDA::cudart)
+    target_link_libraries(q8_mma_parity PRIVATE strata_moe_group strata_kernels CUDA::cudart)
+    # the same kernel against Qwen's own Q8_0 matvec (native_mmvq), on Qwen's real shapes, 2 - 8 columns: agreement and speed
+    add_executable(q8_mma_vs_native src/kernels/q8_mma_vs_native.cpp)
+    target_include_directories(q8_mma_vs_native PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(q8_mma_vs_native PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME q8_mma_parity COMMAND q8_mma_parity)
     # the DeepSeek branch's learned look-ahead (src/dsv41/ds4_lalearn.cu, from the branch byte for byte) on synthetic routers: a GPU, no model (F1)
     add_executable(ds4_lalearn_test tests/dsv41/lalearn_test.cu src/dsv41/ds4_lalearn.cu)

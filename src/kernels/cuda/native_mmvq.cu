@@ -23,6 +23,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include "strata/kernels/q8_mma.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
@@ -2766,9 +2767,17 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
     return true;
 }
 
+static int g_q8_mma = -1;   // STRATA_Q8_MMA: -1 = read the environment on first use
+void native_q8_mma_set(int mode) { g_q8_mma = mode; }
+static bool q8_mma_on() {
+    if (g_q8_mma < 0) { const char* v = std::getenv("STRATA_Q8_MMA"); g_q8_mma = (v != nullptr && v[0] == '1') ? 1 : 0; }
+    return g_q8_mma == 1;
+}
+
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
+    if (ncols >= 2 && q8_mma_on() && strata::kernels::mma::q8_matmul(static_cast<const uint8_t*>(weights), x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_MMA=1
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
