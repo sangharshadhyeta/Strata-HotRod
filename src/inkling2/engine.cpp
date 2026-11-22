@@ -289,7 +289,8 @@ struct Engine::Impl {
             d_pidx = (int32_t*) dmalloc(16 * 4); d_pw = fmalloc(16); rlp = fmalloc((size_t) c.n_expert); xp = fmalloc((size_t) c.n_embd);
             void* hq2 = nullptr; CK(cudaHostAlloc(&hq2, 16 * 4 * 4, cudaHostAllocPortable)); pinned.push_back(hq2); h_pidx = (int32_t*) hq2;
             pred_tab.assign((size_t) c.n_visits * 5, {});
-            if (const char* lv = std::getenv("STRATA_LA_LEARN")) la_on = lv[0] == '1';
+            la_on = true;   // the learned look-ahead feeds the prefetch: on with it (it learns from scratch, or loads STRATA_LA_LEARN_FILE); STRATA_LA_LEARN=0 turns it off
+            if (const char* lv = std::getenv("STRATA_LA_LEARN")) la_on = lv[0] != '0';
             if (la_on) {
                 pf_depth = std::getenv("STRATA_MOE_DEPTH") ? pf_depth : 2;   // the Qwen engine publishes the reaches 1 and 2
                 d_gl = fmalloc(3 * 1024); d_keya = fmalloc(1024); d_zbias = fzero((size_t) c.n_expert);

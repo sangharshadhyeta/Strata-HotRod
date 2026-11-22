@@ -118,12 +118,13 @@ inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv(
 struct RouteResidentCfg;
 RouteResidentCfg& route_resident_cfg();
 // STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned correction (native_router.cu la_learn_*); STRATA_LA_LEARN_TIMING=1 times its training
-// STRATA_LA_LEARN unset = auto: on only when a learned predictor (data/predictor-*.bin) is already on disk (the serve start says so
-// through la_learn_set_saved, before the verifier allocates); =1 on (learns from the plain router when nothing is saved); =0 off.
+// STRATA_LA_LEARN unset = auto: on.  A learned predictor already on disk (data/predictor-*.bin; the serve start says so through
+// la_learn_set_saved, before the verifier allocates) is loaded; without one the learner starts from the plain router and learns from scratch.
+// =1 on, the same; =0 off.
 static int g_la_saved = 0;
 static bool la_learn_env_on() {
     static const int mode = [] { const char* e = std::getenv("STRATA_LA_LEARN"); return e == nullptr ? 2 : (e[0] == '0' ? 0 : 1); }();
-    return mode == 1 || (mode == 2 && g_la_saved != 0);
+    return mode != 0;   // auto (2) and =1: on; =0: off (g_la_saved only decides whether a file is loaded)
 }
 static bool la_learn_timing_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN_TIMING"); return e != nullptr && e[0] == '1'; }();
