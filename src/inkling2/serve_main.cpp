@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include "strata/core/online_tuner.hpp"
 #include "strata/inkling2/engine.hpp"
+#include "strata/core/spec_prob.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/spec/draft_policy.hpp"
 
@@ -215,7 +216,7 @@ int main(int argc, char** argv) {
             const char* reason = "length";
             int n_out = 0;
             std::vector<int> recent(ids.end() - std::min<long>((long) ids.size(), sp.penalty_last_n), ids.end());
-            const bool spec_run = !cancelled && eng.spec_enabled() && sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f && std::getenv("STRATA_INKLING2_NO_SPEC") == nullptr;
+            const bool spec_run = !cancelled && eng.spec_enabled() && (sp.temperature <= 0.0f || sp.temperature >= strata::core::spec_min_temp()) && sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f && std::getenv("STRATA_INKLING2_NO_SPEC") == nullptr;
             if (spec_run) {
                 // The Qwen engine's rule, with its own code: `--spec S` windows of at most S tokens, the draft layer extends a window by another guess while its probability for the last one is >= spec_min_p
                 // (mtp_draft), spec::DraftPolicy learns the cost and the tokens committed per window size, and the core OnlineTuner moves spec_min_p over the same levels (0.3 .. 0.7).  Greedy: the
@@ -285,7 +286,8 @@ int main(int argc, char** argv) {
                     else {
                         spp.counter = (unsigned long long) P;   // the window's first position, as the pipeline keys its Philox draws
                         int outv[8];
-                        if (eng.spec_sample_block((const int32_t*) d, k + 1, spp, outv)) { while (m < k && d[m] == outv[m]) ++m; newtok = outv[m]; }
+                        static const bool prob_on = [] { const char* e = std::getenv("STRATA_SPEC_PROB"); return !(e && e[0] == '0'); }();   // the pipeline's switch: 0 = exact match under sampling
+                        if (prob_on && eng.spec_sample_block((const int32_t*) d, k + 1, spp, outv)) { while (m < k && d[m] == outv[m]) ++m; newtok = outv[m]; }
                         else { while (m < k) { const int t = sample(lg[(size_t) m], sp, no_recent, rng); if (t != d[m]) { newtok = t; break; } ++m; } if (newtok < 0) newtok = sample(lg[(size_t) k], sp, no_recent, rng); }
                     }
                     const auto t_c = Clock::now();

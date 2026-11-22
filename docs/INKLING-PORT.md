@@ -499,3 +499,7 @@ Distribution check (16-token prompt, 4 tokens, temperature 1, top_k 64, 200 seed
 indistinguishable at this sample size (the test has little power on high-entropy tokens; a larger N would tighten it).
 Speed through the server at temperature 1, 300-token answers: plain prose 27.8, code 26.1, edit 20.5 tok/s; with the drafter 20.0 / 19.6 / 16.7 (window cost 67 / 90 / 122 ms for 2 / 3 / 4 tokens against 32 ms a plain token; acceptance ~22% a draft in the distribution test,
 44% over these three tasks). Sampling lowers acceptance and the verification block costs the same, so the loss is larger than greedy's (prose -28%, code -25%, edit -19%). On this 3060 the drafter stays opt-in.
+
+Switches of the drafter (all off or the pipeline's own defaults): `STRATA_INKLING2_DRAFT=<mtp.safetensors>` loads it (unset: no drafter, nothing changes); `STRATA_INKLING2_SPEC=S` the window (default 4); for sampled requests the Qwen pipeline's switches:
+`STRATA_SPEC_PROB=0` exact-match acceptance instead of probabilistic acceptance (default: probabilistic), `STRATA_SPEC_MIN_TEMP=x` drafts only for requests with temperature >= x (default 0 = every sampled request; greedy always drafts);
+`STRATA_INKLING2_NO_SPEC=1` disables speculation for a loaded drafter. Penalty requests always take the plain path.
