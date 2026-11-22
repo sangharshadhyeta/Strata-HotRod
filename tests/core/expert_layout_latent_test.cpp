@@ -1,8 +1,8 @@
-// tests/core/expert_layout_latent_test.cpp - Edge0's latent A-only packs (native_experts.txt v6), without a model or a GPU.
+// tests/core/expert_layout_latent_test.cpp - the latent A-only packs (native_experts.txt v6), without a model or a GPU.
 //
 // A latent pack's experts are not n_embd wide: the A stage runs at the latent width (1792 for the 145B, 1280 for the 120B) with
 // 640 inside, and the header says so ("expert_embd 1792, expert_ff 640").  This checks, on the CPU-only layout reader:
-//   1. NVFP4 at 1792/640 makes exactly the blob size Edge0's own pack records (1,935,376 B), so the layout code needs no new
+//   1. NVFP4 at 1792/640 makes exactly the blob size the original pack records (1,935,376 B), so the layout code needs no new
 //      format arithmetic;
 //   2. a v6 pack parses: widths, per-layer formats, offsets, totals; the layout says it is latent;
 //   3. every refusal: v6 without its widths, widths in another version's header, v5 (Hadamard-folded experts: no kernels
@@ -49,7 +49,7 @@ bool load(const fs::path& dir, int64_t n_layers, int64_t n_expert, std::string& 
     return strata::kernels::cpu::expert_layout_load(dir.string(), n_layers, n_expert, err);
 }
 
-// the five-column form (no GGUF offsets: NVFP4 and latent packs carry none) with the header Edge0's packer writes
+// the five-column form (no GGUF offsets: NVFP4 and latent packs carry none) with the header the original packer writes
 std::string manifest(int version, const std::string& widths, int64_t blob, int n_layers = 2, int n_expert = 512) {
     std::string s = "# strata native experts v" + std::to_string(version) + ": latent A-only" + widths + "\n";
     for (int l = 0; l < n_layers; ++l)
@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
     std::printf("expert_layout_latent_test\n");
     NativeFmt f;
     std::string err;
-    // `expert_layout_latent_test PACK_DIR`: a real Edge0 folder (native_experts.txt and experts.bin beside it), read-only: the
+    // `expert_layout_latent_test PACK_DIR`: a real latent-model folder (native_experts.txt and experts.bin beside it), read-only: the
     // header parses as latent, and the layers' totals are exactly the size of experts.bin
     if (argc == 2) {
         const fs::path dir = argv[1];

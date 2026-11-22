@@ -1,4 +1,4 @@
-// src/core/latent_tab.cpp - the session-level latent MoE tables (branch hotrod-edge0).  The shape (one upload before the cache is sized, the
+// src/core/latent_tab.cpp - the session-level latent MoE tables (latent-experts branch).  The shape (one upload before the cache is sized, the
 // device pair shared through latent_share.hpp) follows Edge0's LatentTab in edge0-strata (MIT, a fork of Strata); the sizing is ours: every
 // number is read off the pack (see the header).
 #include "strata/core/latent_tab.hpp"

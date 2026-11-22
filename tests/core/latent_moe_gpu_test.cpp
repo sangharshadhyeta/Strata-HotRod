@@ -1,7 +1,7 @@
-// tests/core/latent_moe_gpu_test.cpp - one layer of Edge0's latent MoE (D -> A -> U -> combine) on the GPU against a CPU
-// reference that shares no kernel with it.  Branch hotrod-edge0, step 2.
+// tests/core/latent_moe_gpu_test.cpp - one layer of the latent MoE (D -> A -> U -> combine) on the GPU against a CPU
+// reference that shares no kernel with it.  Branch latent-experts branch, step 2.
 //
-//   latent_moe_gpu_test <Edge0 NVFP4 folder> [layer=0] [T=4]
+//   latent_moe_gpu_test <latent NVFP4 folder> [layer=0] [T=4]
 //
 // The folder is read only.  Real weights of the chosen layer (D/U from latent_dense_q8.bin, the experts from experts.bin, the
 // group labels from labels.bin), T tokens of deterministic pseudo-random hidden states, K=10 distinct experts per token.

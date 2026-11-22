@@ -107,7 +107,7 @@ __global__ void latent_u_k(const uint8_t* __restrict__ u_q8, const uint8_t* __re
     if (lane == 0) o[h] = facc;
 }
 
-// hotrod-edge0: packed Q4_0 U.  The per-entry kernel's Q4 dot builds every dp4a word from byte loads (a Q4_0 block is 18 B: only 2-byte
+// latent-experts branch: packed Q4_0 U.  The per-entry kernel's Q4 dot builds every dp4a word from byte loads (a Q4_0 block is 18 B: only 2-byte
 // aligned), ~60 instructions per 8 values; nsys on the 145B: 385 us a layer-window, instruction-bound (a by-group variant that read each
 // row once was SLOWER, 518 us, which is how that was found out).  The device copy of U is repacked ONCE at upload into
 // [nb x 16 B nibbles][nb x f16 scales] per row (the same bytes per row), so a lane loads a block's 16 nibble bytes as one int4 and
@@ -201,7 +201,7 @@ __global__ void latent_u_p4_k(const uint8_t* __restrict__ u, const uint8_t* __re
     }
 }
 
-// hotrod-edge0 (prompt path): the D matrix [rows, cols] (Q4_0 18-byte or Q8_0 34-byte blocks, raw layout) to f16, for one GEMM over a chunk.
+// latent-experts branch (prompt path): the D matrix [rows, cols] (Q4_0 18-byte or Q8_0 34-byte blocks, raw layout) to f16, for one GEMM over a chunk.
 __global__ void latent_dequant_f16_k(const uint8_t* __restrict__ src, int64_t n_blocks, int fmt, uint16_t* __restrict__ dst) {
     const int64_t b = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;

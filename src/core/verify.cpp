@@ -57,8 +57,8 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/pdl.hpp"
 #include "strata/kernels/ple.hpp"
-#include "strata/core/latent_share.hpp"   // hotrod-edge0: the session's latent D/U tables
-#include "strata/kernels/latent.hpp"      // hotrod-edge0: latent_plan_rows, latent_u_grouped
+#include "strata/core/latent_share.hpp"   // latent-experts branch: the session's latent D/U tables
+#include "strata/kernels/latent.hpp"      // latent-experts branch: latent_plan_rows, latent_u_grouped
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -2172,7 +2172,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
-    // ---- latent MoE (Edge0, branch hotrod-edge0): a pack whose experts run in a latent space.  Everything comes from the pack's layout and the
+    // ---- latent MoE (latent-experts branch): a pack whose experts run in a latent space.  Everything comes from the pack's layout and the
     // session-level LatentTab (core/latent_tab.hpp), which the engine loads before the expert cache is sized; no constant of a model or a card.
     {
         const auto& lay0 = strata::kernels::cpu::expert_layout();
@@ -3594,7 +3594,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 16, grp);
         if (!stage_mark(cs, is_qsa_layer(g, l) ? kStAttn : kStGdn, err)) return false;
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
-        if (latent_) {   // hotrod-edge0: the D stage for this group's rows, before the router and the doorbell
+        if (latent_) {   // latent-experts branch: the D stage for this group's rows, before the router and the doorbell
             // not ported yet: these fail loudly instead of running wrong
             if (G != 1 || lb_ != 0 || device_plan_ || ar_on() || remote_opt_ != nullptr || m_bal_ != nullptr) {
                 err = "verify: a latent pack runs in single-group windows on one GPU without the device plan, the all-resident plan, helper GPUs or the PCIe balance (not ported yet)";
@@ -4045,7 +4045,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         bool hits_in_combine = false;
         if (latent_) {
-            // hotrod-edge0: the experts at the latent width.  D ran in `pre` (xlq = the q8_1 rows of xl, row token*G + group).  Here: the GPU's
+            // latent-experts branch: the experts at the latent width.  D ran in `pre` (xlq = the q8_1 rows of xl, row token*G + group).  Here: the GPU's
             // share (the VRAM groups, the PCIe groups) as A, the CPU pool's A rows merged in, then U for every route into `parts_out`, which
             // the combine reads as it reads any expert rows - so none of the old hit-add or CPU-row paths below applies.
             wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
@@ -4743,7 +4743,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
-    if (h_xlseq_ != nullptr) {   // hotrod-edge0: the D stage's doorbell restarts with the window, and the CPU pool finds this verifier's D rows
+    if (h_xlseq_ != nullptr) {   // latent-experts branch: the D stage's doorbell restarts with the window, and the CPU pool finds this verifier's D rows
         *(volatile uint32_t*) h_xlseq_ = 0;
         strata::core::latent_xl_current() = (const uint8_t*) h_latxl_;
         strata::core::latent_xlseq_current() = h_xlseq_;
@@ -7209,7 +7209,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
-    if (h_xlseq_ != nullptr) {   // hotrod-edge0: the D stage's doorbell restarts with the window, and the CPU pool finds this verifier's D rows
+    if (h_xlseq_ != nullptr) {   // latent-experts branch: the D stage's doorbell restarts with the window, and the CPU pool finds this verifier's D rows
         *(volatile uint32_t*) h_xlseq_ = 0;
         strata::core::latent_xl_current() = (const uint8_t*) h_latxl_;
         strata::core::latent_xlseq_current() = h_xlseq_;

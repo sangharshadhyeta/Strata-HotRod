@@ -2,7 +2,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/foresight_swap.hpp"
-#include "strata/core/latent_share.hpp"   // hotrod-edge0: the D rows and the group labels the CPU pool reads
+#include "strata/core/latent_share.hpp"   // latent-experts branch: the D rows and the group labels the CPU pool reads
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -6197,7 +6197,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
-    // hotrod-edge0 (Edge0's latent MoE): the CPU pool runs the experts' A part at the latent width.  Its input is the D stage's row for
+    // latent-experts branch (latent MoE): the CPU pool runs the experts' A part at the latent width.  Its input is the D stage's row for
     // (token, the expert's group) - published to host memory by the GPU, with a doorbell - not the hidden state; its output rows are
     // `Hout` (the latent width) floats; the GPU does U afterwards.  Everything is read off the pack (the layout, the session's LatentTab).
     const bool latent = native && lay.latent;

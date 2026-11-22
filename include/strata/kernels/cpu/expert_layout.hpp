@@ -29,7 +29,7 @@ struct ExpertLayout {
     /// and up in shard 3 (native_experts.txt v4, the `gate,up,down` shard column).
     std::vector<std::string> gguf_file;
     int version = 0;                      ///< native_experts.txt's header version (0 = none given)
-    /// v6 (Edge0 latent MoE, branch hotrod-edge0): the A pack's expert rows are `expert_embd` wide (the latent width ELL,
+    /// v6 (latent MoE, latent-experts branch): the A pack's expert rows are `expert_embd` wide (the latent width ELL,
     /// 1792 for the 145B), not the model's n_embd, and their hidden width is `expert_ff` (640).  0 = the model's own
     /// (every other pack).  `latent` is true when the pack says its experts are not n_embd wide: such a pack also needs the
     /// per-layer D/U projections and the expert group labels, which the layer table does not carry.

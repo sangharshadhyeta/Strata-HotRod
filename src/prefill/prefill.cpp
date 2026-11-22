@@ -20,7 +20,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
-#include "strata/core/latent_share.hpp"   // hotrod-edge0: a latent pack's D / U / labels
+#include "strata/core/latent_share.hpp"   // latent-experts branch: a latent pack's D / U / labels
 #include "strata/kernels/latent.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -1130,7 +1130,7 @@ struct Prefill::Impl {
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
-    // hotrod-edge0: a latent pack's prompt path (D over the chunk -> the experts at the latent width -> U into the rows the combine reads)
+    // latent-experts branch: a latent pack's prompt path (D over the chunk -> the experts at the latent width -> U into the rows the combine reads)
     float *lat_xl32 = nullptr, *lat_yl = nullptr;
     uint16_t *lat_xl16 = nullptr, *lat_dqd = nullptr;
     uint16_t *lat_yl16 = nullptr, *lat_yg16 = nullptr;   // the latent rows as f16 (expert order), and regrouped by group: the per-group U GEMMs' input
@@ -1426,7 +1426,7 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
     if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
-    if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent) {   // hotrod-edge0: the latent prompt path's chunk buffers
+    if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent) {   // latent-experts branch: the latent prompt path's chunk buffers
         const size_t G = (size_t) core::latent_shared_info().groups, EL = (size_t) ly.expert_embd;
         a.take<float>(T * G * EL, ok); a.take<uint16_t>(T * G * EL, ok); a.take<float>(T * K * EL, ok);
         a.take<uint16_t>(T * K * EL, ok); a.take<uint16_t>(T * K * EL, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
@@ -1691,7 +1691,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
-        if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent) {   // hotrod-edge0 (same takes as moe_set_bytes)
+        if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent) {   // latent-experts branch (same takes as moe_set_bytes)
             const size_t G = (size_t) core::latent_shared_info().groups, EL = (size_t) ly.expert_embd;
             m.lat_xl32 = c.take<float>(T * G * EL, ok); m.lat_xl16 = c.take<uint16_t>(T * G * EL, ok); m.lat_yl = c.take<float>(T * K * EL, ok);
             m.lat_yl16 = c.take<uint16_t>(T * K * EL, ok); m.lat_yg16 = c.take<uint16_t>(T * K * EL, ok);
@@ -1712,7 +1712,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (base == nullptr) ok = false;
     }
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
-    if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent)   // hotrod-edge0: one layer's D as f16 [G * latent, N]
+    if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent)   // latent-experts branch: one layer's D as f16 [G * latent, N]
         m.lat_dqd = o.take<uint16_t>((size_t) core::latent_shared_info().groups * (size_t) ly.expert_embd * N, ok);
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -2498,7 +2498,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
-    if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent)   // hotrod-edge0 (as init)
+    if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent)   // latent-experts branch (as init)
         o.take<uint16_t>((size_t) core::latent_shared_info().groups * (size_t) ly.expert_embd * N, ok);
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -2805,7 +2805,7 @@ struct PrefillStandin {
         n_expert = ne;
         // ON by default since 21 Nov (STRATA_PREFILL_STANDIN_AGREE=0 turns it off): an expert is read or replaced for every token alike.  Measured on Qwen UD-Q4_K_XL, 13.5K-token documents with
         // four questions each: picks replaced ~1,555,000 -> ~1,700 per prompt with the expert reads saved unchanged (733-796 -> 795-852), prompt time the same, every number in the answers
-        // correct in all three variants (exact prefill, the old stand-ins, agree).  Not run yet with short prompts, --batch or Edge0.
+        // correct in all three variants (exact prefill, the old stand-ins, agree).  Not run yet with short prompts, --batch or the latent model.
         const char* ag = std::getenv("STRATA_PREFILL_STANDIN_AGREE");
         if ((ag == nullptr || std::atoi(ag) != 0) && cudaMalloc((void**) &needed, (size_t) ne * sizeof(int32_t)) == cudaSuccess) agree = true;
         else (void) cudaGetLastError();
@@ -4165,7 +4165,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // keep MMQ; without the variable nothing here runs.  A native pack's layer takes the native kernels
                     // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: IQ1_M).
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
-                    // hotrod-edge0: a latent pack's layer - D (hidden -> one latent vector per group), the experts at the latent width, U (per route)
+                    // latent-experts branch: a latent pack's layer - D (hidden -> one latent vector per group), the experts at the latent width, U (per route)
                     const bool latent = lay.latent;
                     const core::LatentShared& lsh = core::latent_shared_info();
                     const int LG = latent ? (int) lsh.groups : 0;

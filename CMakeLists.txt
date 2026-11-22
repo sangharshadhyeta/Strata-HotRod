@@ -620,7 +620,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/subfit_samples.cpp src/core/subfit_learn.cpp src/core/subfit_shadow.cpp
     src/core/risk_concentration.cpp)
-  # Edge0's latent MoE (branch hotrod-edge0): the D/U + experts file loaders and the layer module (D -> A -> U -> combine)
+  # the latent MoE (latent-experts branch): the D/U + experts file loaders and the layer module (D -> A -> U -> combine)
   target_sources(strata_engine PRIVATE src/core/latent_dense.cpp src/core/latent_tab.cpp src/latent/latent_moe.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
@@ -711,7 +711,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(expert_layout_test PRIVATE strata_engine)
     add_test(NAME expert_layout_test COMMAND expert_layout_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
     set_tests_properties(expert_layout_test PROPERTIES TIMEOUT 60)
-    # Edge0's latent layer on the GPU against a CPU reference, on a real downloaded Edge0 folder (run by hand: the folder is
+    # the latent layer on the GPU against a CPU reference, on a real downloaded latent-model folder (run by hand: the folder is
     # 100 GB, so no add_test): latent_moe_gpu_test <folder> [layer] [tokens]
     if(STRATA_ENABLE_CUDA)
       add_executable(latent_moe_gpu_test tests/core/latent_moe_gpu_test.cpp)
@@ -2052,7 +2052,7 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME expert_multi_test COMMAND expert_multi_test)
   set_tests_properties(expert_multi_test PROPERTIES SKIP_RETURN_CODE 77)   # no AVX-512: skipped
 
-  # Edge0's latent A-only packs (native_experts.txt v6): CPU-only, no model and no GPU (branch hotrod-edge0)
+  # the latent A-only packs (native_experts.txt v6): CPU-only, no model and no GPU (latent-experts branch)
   if(STRATA_NATIVE_EXPERTS)
     add_executable(expert_layout_latent_test tests/core/expert_layout_latent_test.cpp)
     target_link_libraries(expert_layout_latent_test PRIVATE strata_kernels_cpu)

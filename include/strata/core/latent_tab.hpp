@@ -1,6 +1,6 @@
-// include/strata/core/latent_tab.hpp - the session-level latent MoE tables (branch hotrod-edge0).
+// include/strata/core/latent_tab.hpp - the session-level latent MoE tables (latent-experts branch).
 //
-// An Edge0 latent pack's experts run in a latent space: every layer has D projections (hidden -> latent, one per expert group), U
+// A latent pack's experts run in a latent space: every layer has D projections (hidden -> latent, one per expert group), U
 // projections (latent -> hidden) and a group label per expert.  This loads them ONCE for the session, to the GPU, before the expert cache is
 // sized (so the cache's "what is free" already excludes them), and publishes the device pointers through latent_share.hpp for the verify and
 // prompt paths to pull inside their own init.

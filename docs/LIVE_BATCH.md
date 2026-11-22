@@ -12,7 +12,7 @@ Measured on one machine (Qwen UD-Q4_K_XL, 12 GB card, 8 slots at 2,048 cells, DI
 27.2 for 4, 20.8 for 6, 19.2 for 8 - all finished 22% sooner than one after another at 2 and 4 streams, 3% at 6, 0% at 8. With near-identical prompts (shared experts and a
 cached prompt) the total reaches 45 tok/s, so the sweet spot depends on the traffic and the hardware.
 
-## What the measurements so far say (Qwen UD-Q4_K_XL, 12 GB card; docs/PORTING_STRATAQ.md)
+## What the measurements so far say (Qwen UD-Q4_K_XL, 12 GB card)
 - Slots as large as `--max-context` cost 40% of the expert cache and 62% of prefill; a cap of 2,048 cells costs about 7% of the cache and, with the single-GPU piece
   fix, no prefill.
 - Two streams in batch mode total about 19 tok/s against 22-25 for one stream alone (one token per stream per window against MTP's 2.4). The break-even is expected at

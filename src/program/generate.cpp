@@ -149,7 +149,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <vector>
 
 namespace {
-// the session-level latent MoE tables (hotrod-edge0): loaded once, before the expert cache is sized; empty for a non-latent pack
+// the session-level latent MoE tables (latent-experts branch): loaded once, before the expert cache is sized; empty for a non-latent pack
 strata::core::LatentTab g_lat_tab;
 // STRATA_CONV_PRELOAD: the conversation's routing counts travel with its session file, as `<path>.conv` beside it: written after a
 // SAVE, read after a RESTORE.  Layout (host byte order): "CNV1", i64 n_parts, then per part i64 conv_tokens, i64 size and size
@@ -1673,7 +1673,7 @@ static std::string chunk_learn_key() {
     return name + "/" + std::to_string((long long) (pr.totalGlobalMem >> 20)) + "MiB/" + std::to_string(ram_gib) + "GiB";
 }
 static bool chunk_learn_eligible(const Options& o) {
-    // a latent pack: on by default (measured on Edge0-145B); any other model: opt-in until it has been measured there (STRATA_PREFILL_CHUNK_LEARN=1)
+    // a latent pack: on by default (measured on the 145B latent model); any other model: opt-in until it has been measured there (STRATA_PREFILL_CHUNK_LEARN=1)
     const char* v = std::getenv("STRATA_PREFILL_CHUNK_LEARN");
     const bool want = v != nullptr ? std::atoi(v) != 0 : strata::kernels::cpu::expert_layout().latent;
     return o.serve && o.prefill_auto && !o.pack.empty() && want;
@@ -3336,7 +3336,7 @@ int main(int argc, char** argv) {
     // The residency profile learns by default (serve mode; HotRod, 21 Nov; STRATA_LEARN_PROFILE=0 turns it off): the engine saves what its adaptive
     // tier learned as profile-learned.bin beside the shipped profile (every 10 minutes and at QUIT), and the next start fills the GPU cache and the RAM
     // tier from it when it exists and is for the same layers x experts.  Qwen UD-Q4_K_XL on a 12 GB RTX 3060 at 262K, cold start: the first questions
-    // 16.1 -> 16.1 / 19.7 -> 22.3 / 22.9 -> 24.6 tok/s on the second start (one draw, inside the +-1.5 tok/s run-to-run noise); on Edge0-145B 14.6 -> 20.0.
+    // 16.1 -> 16.1 / 19.7 -> 22.3 / 22.9 -> 24.6 tok/s on the second start (one draw, inside the +-1.5 tok/s run-to-run noise); on the 145B latent model 14.6 -> 20.0.
     // An --expert-profile-save of its own wins.
     if (o.serve && !o.expert_profile.empty() && o.expert_profile_save.empty() &&
         [] { const char* v = std::getenv("STRATA_LEARN_PROFILE"); return v == nullptr || std::atoi(v) != 0; }()) {
@@ -3814,7 +3814,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        // Edge0's latent MoE (native_experts.txt v6, branch hotrod-edge0): the experts' rows are `expert_embd` wide, not n_embd wide, and a
+        // the latent MoE (native_experts.txt v6, latent-experts branch): the experts' rows are `expert_embd` wide, not n_embd wide, and a
         // layer also needs its D/U projections and the expert group labels, which the session-level LatentTab loads before the expert
         // cache is sized (below).  Decode (verify windows) and the chunked prompt path (prefill.cpp: D over the chunk by one GEMM, the experts
         // on the fp16 branch at the latent width, U per row) both run them.  The chunked path has no MMQ / fused kernels, no CPU share and no
@@ -3831,7 +3831,7 @@ int main(int argc, char** argv) {
             } else {
                 setenv("STRATA_PREFILL_CPU_SHARE", "0", 0);   // the CPU share computes at the model's width: not for a latent pack
                 // Prompt and decode never run together in serve, so the prompt path borrows the expert cache down to the engine's floor of 128
-                // slots (the auto rule held back 15%): a bigger chunk, fewer per-chunk costs.  Measured 15 Nov, Edge0-145B on the RTX 3060 12 GB, a
+                // slots (the auto rule held back 15%): a bigger chunk, fewer per-chunk costs.  Measured 15 Nov, the 145B latent model on the RTX 3060 12 GB, a
                 // 13.5K-token prompt: chunk 1280-1536 -> 1536 with 981 slots lent, read 255-263 -> 291 tok/s.  STRATA_PREFILL_LEND_PCT overrides.
                 setenv("STRATA_PREFILL_LEND_PCT", "100", 0);
                 // The expert products on the fp16 path (dequant + GEMM) by default.  The latent MMQ path (STRATA_PREFILL_NVFP4=w4a8) works and reads
@@ -3849,7 +3849,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: latent experts: stand-ins on by default (ranks 3-9, edge 1; STRATA_ROUTE_RESIDENT=0 turns them off)\n");
             }
             // The learned look-ahead ON by default too (STRATA_LA_LEARN=0 turns it off; its state is saved beside the pack and kept).  Measured
-            // 15 Nov on Edge0-145B, cold start, no pre-trained state, about 15 minutes of use: its guesses of the experts needed 1 / 2 / 4
+            // 15 Nov on the 145B latent model, cold start, no pre-trained state, about 15 minutes of use: its guesses of the experts needed 1 / 2 / 4
             // layers ahead hit 90.7 / 84.5 / 78.6% against the plain router's 85.2 / 76.5 / 70.0%.  Decode speed was the same as with it off
             // (two rounds of three questions each, within noise): the accuracy is the gain so far, not speed.
             if (std::getenv("STRATA_LA_LEARN") == nullptr) {
@@ -3858,7 +3858,7 @@ int main(int argc, char** argv) {
             }
             // The residency profile learns too (serve mode): the engine saves what its adaptive tier learned as profile-learned.bin beside the
             // shipped profile (every 10 minutes and at QUIT), and the next start fills the GPU cache and RAM tier from it when it exists and
-            // has the shipped one's size.  Measured 15 Nov, Edge0-145B, cold start, alternating, two pairs: decode of the first questions
+            // has the shipped one's size.  Measured 15 Nov, the 145B latent model, cold start, alternating, two pairs: decode of the first questions
             // 14.6 / 15.0 -> 20.0 / 21.9 tok/s (short answer), 16.3 / 16.2 -> 18.2 / 19.6 (code), 22.9 / 23.0 -> 25.1 / 25.3 (long); equal by the
             // fourth question (26.4 / 27.4 vs 26.1 / 26.7).  The answers read correct.  STRATA_LATENT_LEARN_PROFILE=0 turns it off.
             if (o.serve && !o.expert_profile.empty() && o.expert_profile_save.empty() &&
@@ -4205,7 +4205,7 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
-    // hotrod-edge0: with K/V streaming on, the draft head must attend only to cells that are resident.  Measured 15 Nov on Edge0-145B (one-shot,
+    // latent-experts branch: with K/V streaming on, the draft head must attend only to cells that are resident.  Measured 15 Nov on the 145B latent model (one-shot,
     // 120 tokens, --max-context 32768 --kv-resident 8192, repeatable): the default 32768-cell draft window gave windows of 1-2 tokens (T1:19 T2:17,
     // 1.85 tokens per round, 13.2-13.5 tok/s); a draft window of 8192 or 4096 gave 2.5-2.6 tokens per round and 15.5-15.9 tok/s (full-resident
     // K/V: 2.63 per round, 17.9-18.1 tok/s).  --mtp-window overrides.
@@ -6569,7 +6569,7 @@ int main(int argc, char** argv) {
                      (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
         return mib + 64;   // a margin for the allocator
     };
-    // Edge0's latent MoE (hotrod-edge0): the session-level D/U tables and the group labels go to the GPU HERE, before the cache is sized from
+    // the latent MoE (latent-experts branch): the session-level D/U tables and the group labels go to the GPU HERE, before the cache is sized from
     // what is free, so the cache leaves room for them.  Every size is read off the pack (core/latent_tab.hpp); a non-latent pack skips this.
     if (strata::kernels::cpu::expert_layout().latent) {
         const auto& lay_l = strata::kernels::cpu::expert_layout();
@@ -8862,7 +8862,7 @@ int main(int argc, char** argv) {
                          ev, v.why.c_str());
         return false;
     };
-    // hotrod-edge0: a latent pack has no batched prompt path yet; serve reads every prompt in verify windows (read_windows)
+    // latent-experts branch: a latent pack has no batched prompt path yet; serve reads every prompt in verify windows (read_windows)
     const bool latent_serve = strata::kernels::cpu::expert_layout().latent && o.prefill_chunk <= 0;   // windows only: STRATA_LATENT_PREFILL=0
     if (o.serve) {
         if (o.spec < 2 || (o.prefill_chunk <= 0 && !latent_serve) ||
@@ -18470,7 +18470,7 @@ int main(int argc, char** argv) {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
-    // hotrod-edge0: a latent pack has no chunked prompt path yet, so the prompt's first n_prompt - 1 tokens are fed through verify
+    // latent-experts branch: a latent pack has no chunked prompt path yet, so the prompt's first n_prompt - 1 tokens are fed through verify
     // windows (all accepted, outputs dropped) before the first real window; the last prompt token then starts the loop as usual.
     const bool latent_feed = native_pack && strata::kernels::cpu::expert_layout().latent && o.prefill_chunk <= 0 &&
                              pos_start == 0 && n_prompt > 1;

@@ -366,7 +366,7 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 // picked when its logit is within `margin` of the replaced one; the weights are then the softmax of the selected
 // logits (the router's renormalisation).  Tokens without a swap keep the router's exact bits.
 // stats (device, 4 x uint64): [0] tail entries seen, [1] swaps, [2] non-resident entries before, [3] after.
-// hotrod-edge0: a latent pack's expert groups.  g_grp_labels is the device table [n_layers][512] of group labels (null: not a latent pack).
+// latent-experts branch: a latent pack's expert groups.  g_grp_labels is the device table [n_layers][512] of group labels (null: not a latent pack).
 // g_grp_mode 0: stand-ins as before, only counted; 1: a stand-in must carry the missing expert's group label (an expert of another group would
 // be fed a different latent vector, so it is a worse match).  g_grp_stats: [0] stand-ins taken, [1] of them in another group than the pick.
 __device__ const int32_t* g_grp_labels = nullptr;

@@ -73,7 +73,7 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias = 0.f, 
 void route_cfg_set_floor(int lo);                                ///< between windows
 int route_cfg_floor();                                           ///< the stand-in floor (the first rank a stand-in may replace) set by route_cfg_init; -1 when the stand-ins are off
 void route_cfg_set_experts(int n_expert);                        ///< the model's routed experts per layer (1..512), once after route_cfg_init and before graph capture; 512 until then
-/// hotrod-edge0 (latent packs): the device table of group labels [n_layers][512] and the stand-in rule (mode 0: counted only, 1: a stand-in
+/// latent-experts branch (latent packs): the device table of group labels [n_layers][512] and the stand-in rule (mode 0: counted only, 1: a stand-in
 /// must be of the missing expert's group).  Before graph capture.  route_group_stats: [0] stand-ins taken, [1] in another group (labels set).
 void route_group_set(const int32_t* labels_dev, int mode, float bonus = 0.0f);   ///< mode 2: a same-group resident candidate gets `bonus` logits (soft preference)
 void route_group_stats(unsigned long long out[2]);

@@ -22,7 +22,7 @@ void latent_plan_rows(int32_t* tok, const int32_t* dst, const int32_t* counts, c
 /// U[group] slice (Q8_0 or Q4_0 rows [G*H, ELL], fmt 8 or 4); the H-wide result lands at out[r*H .. r*H+H].
 void latent_u_grouped(const uint8_t* u_q8, const uint8_t* yl_q8, const int32_t* ids, const int32_t* labels_dev,
                       int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt = 8, int G = 0, bool packed = false);
-/// hotrod-edge0: packed = the device U was repacked by latent_u_repack_q4 (Q4_0 only, G = the group count, latent_u_pack_q4_ok(ELL)): the
+/// latent-experts branch: packed = the device U was repacked by latent_u_repack_q4 (Q4_0 only, G = the group count, latent_u_pack_q4_ok(ELL)): the
 /// instruction-bound per-entry kernel is replaced by one that loads a block's nibbles as one int4.  Same integer dot; only the float add order differs.
 bool latent_u_pack_q4_ok(int ELL);
 /// The D matrix [rows, cols] in its raw Q4_0 (fmt 4) or Q8_0 (fmt 8) blocks to f16 (the prompt path's GEMM over a chunk); cols % 32 == 0.

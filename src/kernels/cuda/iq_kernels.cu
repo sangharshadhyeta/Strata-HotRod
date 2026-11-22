@@ -2516,7 +2516,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
     }
 }
 
-// hotrod-edge0: NVFP4 -> f16 with one thread per 16-value sub-block.  The generic path above runs one 32-thread block per 256 values and decodes the
+// latent-experts branch: NVFP4 -> f16 with one thread per 16-value sub-block.  The generic path above runs one 32-thread block per 256 values and decodes the
 // sub-block's scale again for every value; nsys-timed on a 13.5K-token prompt, expert dequant was 29% of the prompt path.  Here a thread decodes its
 // scale once, reads the sub-block's 8 code bytes as two 4-byte words (a block is 36 bytes: 4-byte aligned), and writes its 16 values as two 16-byte
 // stores.  The scale (the tail: s_gate / s_up / s_down) is folded in before the one f16 rounding (the generic path rounds twice).

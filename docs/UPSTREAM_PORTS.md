@@ -2,7 +2,7 @@
 
 One line per upstream commit (or group) and per idea from another fork: what was done and why. `tools/upstream_triage.py` reads this file and
 leaves out any commit whose full or 9-character hash appears here. Verdicts: ported, adapted, skipped. Always give the reason and the test result.
-Skipped items are recorded so they are not weighed again. Nothing is copied from other forks; ideas are written by hand (docs/PORTING_STRATAQ.md).
+Skipped items are recorded so they are not weighed again. Nothing is copied from other forks; ideas are written by hand.
 
 Upstream = Niko1221/Strata (`origin`). Our base: 477ac13cb (16 Oct 2026). First triage 21 Nov: 4,729 commits after the base.
 

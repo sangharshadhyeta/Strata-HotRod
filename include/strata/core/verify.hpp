@@ -838,7 +838,7 @@ private:
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
-    // latent MoE (Edge0, branch hotrod-edge0): every pointer stays null for an ordinary pack.  The experts of a latent pack run in a latent
+    // latent MoE (latent-experts branch): every pointer stays null for an ordinary pack.  The experts of a latent pack run in a latent
     // space: D (hidden -> one latent vector per group) before them, U (latent -> hidden, per group) after.  The D/U pair, the group labels
     // and the sizes come from the session-level LatentTab (core/latent_share.hpp); nothing here is sized by a constant.
     bool latent_ = false;
