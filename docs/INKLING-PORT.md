@@ -390,3 +390,14 @@ and usage stay the server's own; `ChatTemplate` detects Inkling's template and c
 the answer began reads as answer text). `serve/test_inkling.py`: reasoning / answer split at every chunk size down to one character, a plain answer, a tool call, messages and kwargs.
 Live on 8095 through `python -m serve.server --engine strata` with `inkling2_serve` as the engine: `content` "The capital of France is Paris.", `reasoning_content` the thinking, finish `stop`;
 200-token answers in 7.6-8.0 s including a ~30-token prompt read (~30 tok/s generation). Context 4096 (the KV is FP32 for every visit; the sliding-window ring is next).
+
+## Qwen decode profile and what the Inkling steps map to (22 Nov, nsys with CUDA-graph nodes traced: `--cuda-graph-trace=node`; without it the graph's kernels are invisible)
+
+Qwen3.8 UD-Q4_K_XL, default config, 3 x 300-token answers (16-19 tok/s under nsys). Per steady decode window (300 ms): the main stream is busy 27%; three fetch streams
+(`fetch_blobs_kernel`, then `native_gu_kernel` / `native_down_kernel` on the fetched experts, with `wait_flag_ge_stamped_kernel` spins between: verify.cpp, the PCIe-balance flags) 13-17% each;
+some kernel runs 72% of the window, and without the wait kernels 46%. Kernel time over the whole decode: wait_flag 43%, fetch_blobs 15%, the compute kernels ~10%.
+Nothing of the Inkling compute work applies to those numbers: its grouped `native_gu/down/mmvq_multi` kernels are already dp4a / q8_1 (L1, the int8 path), the cache and the in-graph device-side fetch
+exist (L2), the learned look-ahead exists (prefetch), decode is in CUDA graphs (no per-launch syncs), the embedding row is already host-side (`native_head.hpp`), the cache is sized free - reserve.
+The headroom is the half of each token the GPU spends waiting on the miss path (CPU lane + fetch). Candidates from the Inkling twists, to be built as new code and measured one at a time on the
+3-prompt check: copy-engine DMA for the predicted experts ahead of the layer (Inkling's copy stream) instead of an SM-based fetch in the graph; the loop-style protection of an expert across a token.
+The learner (`la_b_*`, ~1% of the window on its own stream) is not on the critical path in the window measured.
