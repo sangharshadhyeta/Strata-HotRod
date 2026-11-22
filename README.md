@@ -1,14 +1,14 @@
 <p align="center"><i> Coming Soon: <s>A system which rewires the model around the way you use it.</s></i></p>
 
-Watch this first: [NoPlaceLikeLocalhost](https://youtu.be/WSJL4SOIZDg?si=qPTa3jeK4YtDLCPy)
+<p align="center">Watch this first: <a href="https://youtu.be/WSJL4SOIZDg?si=qPTa3jeK4YtDLCPy">NoPlaceLikeLocalhost</a></p>
 
 <p align="center"><img src="docs/media/hotrod-hero.gif" width="380" alt="Strata Hot Rod: the Strata hexagon in fire and ice"></p>
 
-This repo is for the hosters who like to get under the hood, tinker, tune and make things their own. Who believe in building, not just buying; in ingenuity over expensive hardware; and in pushing what they've got to do what others thought it couldn't.
+<p align="center">This repo is for the hosters who like to get under the hood, tinker, tune and make things their own. Who believe in building, not just buying; in ingenuity over expensive hardware; and in pushing what they've got to do what others thought it couldn't.</p>
 
-And in the spirit of open source, sharing what they build, learning from each other, and making the whole community better along the way.
+<p align="center">And in the spirit of open source, sharing what they build, learning from each other, and making the whole community better along the way.</p>
 
-Take the machine you have. Make it your own. Share what you learn. See what it'll do.
+<p align="center">Take the machine you have. Make it your own. Share what you learn. See what it'll do.</p>
 
 <h1 align="center">Strata-HotRod</h1>
 
@@ -46,7 +46,7 @@ Nothing leaves your PC.</p>
 
 ---
 
-<table>
+<table width="100%">
 <tr>
 <td align="center" width="25%"><h2>🧊 78 - 111 GB</h2>of model on a <b>30 GB</b> PC (IQ3_S and UD-Q4_K_XL)</td>
 <td align="center" width="25%"><h2>🔥 50-70 / 15-25</h2>tokens/s on one RTX 3060: IQ3_S (131K context, short answers)</td>
@@ -100,7 +100,7 @@ in these runs was read and checked.
 
 </div>
 
-<table>
+<table width="100%">
 <tr>
 <td valign="top" width="50%">
 
@@ -201,7 +201,7 @@ about the ones that do not.
 
 </div>
 
-<table>
+<table width="100%">
 <tr>
 <td width="50%" valign="top">
 
