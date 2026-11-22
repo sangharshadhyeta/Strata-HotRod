@@ -477,6 +477,79 @@ struct Engine::Impl {
         return nbl;
     }
 
+    // ---- a block of tokens (speculative verification, batched prompt reads): visit-major, so each visit's work for all n tokens sits together.  Each token has its own stream, prelude copy,
+    // block list, message bank and pass counters; the engine's working pointers are pointed at token t's while its visit runs, so the numerics are those of n sequential steps.
+    struct TokState { float *h, *pre_h, *blk, *ms, *msgs; int nb = 0, pre_nb = 0, nms = 0; };
+    std::vector<TokState> tok_states;
+    void ensure_tok_states(int n) {
+        const int64_t E = c.n_embd;
+        while ((int) tok_states.size() < n) {
+            TokState t;
+            t.h = fmalloc(E); t.pre_h = fmalloc(E); t.blk = fmalloc((size_t) kMaxBlk * E); t.ms = fmalloc((size_t) kMaxBlk * E); t.msgs = fmalloc(4 * E);
+            tok_states.push_back(t);
+        }
+    }
+    void bind(TokState& t) { h = t.h; pre_h = t.pre_h; blk = t.blk; ms = t.ms; msgs = t.msgs; }
+    void step_block(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* out) {
+        const int64_t E = c.n_embd;
+        if (pos0 + n > cap) { std::fprintf(stderr, "inkling2 engine: positions %d..%d beyond the %d the caches hold\n", pos0, pos0 + n - 1, cap); std::exit(1); }
+        ensure_tok_states(n);
+        float *sh = h, *spre = pre_h, *sblk = blk, *sms = ms, *smsgs = msgs;   // the single-token step's own buffers, restored at the end
+        const uint64_t rb = C::row_bytes(kQ8_0, E);
+        for (int t = 0; t < n; ++t) {
+            TokState& ts = tok_states[(size_t) t];
+            ts.nb = ts.pre_nb = ts.nms = 0;
+            bind(ts);
+            ik::dequant_q8_0_row((const uint8_t*) d_embd + (uint64_t) tokens[t] * rb, h, (int) E, st);
+            rms_w(h, d_embd_norm);
+        }
+        const int64_t core0 = c.core_start, clen = c.core_len();
+        for (int vv = 0; vv < c.n_visits; ++vv) {
+            const int64_t l = c.stored_of_visit(vv);
+            for (int t = 0; t < n; ++t) {
+                TokState& ts = tok_states[(size_t) t];
+                bind(ts);
+                bool msgs_on = false;
+                if (vv == core0) { copy(pre_h, h, (size_t) E); ts.pre_nb = ts.nb; }
+                if (vv >= core0 && vv < core0 + c.num_loops * clen) {
+                    const int64_t p = (vv - core0) / clen, i = l - core0;
+                    if (i == 0 && p > 0) { copy(h, pre_h, (size_t) E); ts.nb = ts.pre_nb; }
+                    if (p > 0) {
+                        ik::attn_res(ms, ts.nms, d_loop_rq + (size_t) 2 * i * E, 2, tmp, (int) E, st);
+                        copy(msgs + 0 * E, tmp, (size_t) E); copy(msgs + 3 * E, tmp + E, (size_t) E);
+                        ik::attn_res(ms, ts.nms, d_loop_kq + (size_t) 2 * i * E, 2, tmp, (int) E, st);
+                        copy(msgs + 1 * E, tmp, (size_t) E); copy(msgs + 2 * E, tmp + E, (size_t) E);
+                        msgs_on = true;
+                    }
+                }
+                ts.nb = layer(l, vv, ts.nb, msgs_on, SeamSink{}, pos0 + t);
+                const bool core_visit = vv >= core0 && vv < core0 + c.num_loops * clen;
+                if (core_visit && l == c.core_end - 1) {
+                    ts.nms = 0;
+                    for (int b = ts.pre_nb + 1; b < ts.nb; ++b) copy(ms + (size_t) ts.nms++ * E, blk + (size_t) b * E, (size_t) E);
+                    copy(ms + (size_t) ts.nms++ * E, h, (size_t) E);
+                }
+            }
+        }
+        if (out) out->assign((size_t) n, std::vector<float>());
+        for (int t = 0; t < n; ++t) {
+            TokState& ts = tok_states[(size_t) t];
+            bind(ts);
+            copy(blk + (size_t) ts.nb * E, h, (size_t) E);
+            ik::attn_res(blk, ts.nb + 1, d_out_res, 1, hd, (int) E, st);
+            rms_w(hd, d_out_norm);
+            if (out) {
+                mmvq_f(8, d_out, hd, (int) E, (int) c.n_vocab, logits, xq);
+                ik::softcap(logits, (int) c.n_vocab_real, c.final_softcap, st);
+                (*out)[(size_t) t].resize((size_t) c.n_vocab_real);
+                CK(cudaMemcpy((*out)[(size_t) t].data(), logits, (size_t) c.n_vocab_real * 4, cudaMemcpyDeviceToHost));
+            }
+        }
+        CK(cudaDeviceSynchronize());
+        h = sh; pre_h = spre; blk = sblk; ms = sms; msgs = smsgs;
+        pos_cur = pos0 + n - 1;
+    }
+
     void step(int64_t token, int pos, std::vector<float>* out, const SeamSink& sink) {
         const int64_t E = c.n_embd;
         if (pos >= cap) { std::fprintf(stderr, "inkling2 engine: position %d beyond the %d the caches hold\n", pos, cap); std::exit(1); }
@@ -529,6 +602,7 @@ struct Engine::Impl {
 Engine::Engine(const GgufFile& g, const Config& c, const Layout& lay, int max_ctx, const std::string& profile) : p_(new Impl(g, c, lay, max_ctx, profile)) {}
 Engine::~Engine() = default;
 void Engine::step(int64_t token, int pos, std::vector<float>* logits, const SeamSink& sink) { p_->step(token, pos, logits, sink); }
+void Engine::step_block(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* logits) { p_->step_block(tokens, n, pos0, logits); }
 void Engine::reset() { p_->reset(); }
 const std::vector<std::vector<int>>& Engine::last_picks() const { return p_->picks; }
 std::string Engine::profile() const {

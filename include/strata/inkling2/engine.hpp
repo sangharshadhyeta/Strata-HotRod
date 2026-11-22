@@ -40,6 +40,8 @@ public:
 
     /// One token at position `pos` (0, 1, 2 ... in order): all visits; fills `logits` (the real vocabulary, softcapped) when not null.
     void step(int64_t token, int pos, std::vector<float>* logits, const SeamSink& sink = nullptr);
+    /// n tokens at positions pos0 .. pos0 + n - 1, visit-major (each visit for all tokens before the next): the same numbers as n step() calls.  logits[t] per token when not null.
+    void step_block(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* logits);
     /// Forgets the conversation (conv states and positions); the KV is simply overwritten.
     void reset();
     /// The picks of the last step, per visit: [visit][k] expert ids (for tests and the learners).

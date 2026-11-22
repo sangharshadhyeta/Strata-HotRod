@@ -440,3 +440,8 @@ and already use the table-lookup + dp4a decode of the int8 path, so that twist h
 `markov_head` (56M), `fuse_weight` [4,4], `mask_embed`, `norm`. (Maya's header comment describes the Small drafter, 5 layers / 8 taps; Mini's is 3 layers / fuse_weight 4x4, so the tap layers differ: read from the checkpoint, not copied.)
 Build order: (1) multi-token forward through the 48 visits (token-major conv state, causal attention over cache + block, experts of the block's union read once) - also gives batched prompt reading;
 (2) the drafter (taps, 3 layers, Markov head) from the checkpoint, checked against Maya's float reference; (3) verify the block, accept the longest matching prefix, serve. Not started in code.
+
+### DSpark step 1a: block forward, visit-major (22 Nov)
+`Engine::step_block(tokens, n, pos0, logits)`: n tokens through the 48 visits, each visit for all tokens before the next, with per-token stream / prelude / block list / message bank / pass counters (the engine's working
+pointers are bound to token t's while its visit runs). `STRATA_INKLING2_BLOCK_CHECK=N` in gpu_forward_test: logits of blocks of 8 and of 5 against single steps over the 48-token oracle prompt: 0 of 9,602,784 differ
+(bit-identical); 31-32 tok/s. No speed change yet: the experts of a visit are still run per token. Next: share them (the union of the block's picks, each expert read once) and add the multi-row attention, then the drafter.
