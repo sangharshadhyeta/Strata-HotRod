@@ -158,6 +158,9 @@ struct Engine::Impl {
     // look-ahead (STRATA_MOE_PREFETCH=N: copy the N experts the NEXT visit's router would pick from this visit's router input, while this visit computes; 0 = off)
     float *d_xb = nullptr, *d_rrb = nullptr, *d_moeb = nullptr, *d_wb = nullptr;   // a block's expert inputs, residuals, expert sums, route weights
     int32_t *d_idxb = nullptr, *h_idxb = nullptr;                                    // and its picks (device, pinned host)
+    bool grouped_experts = true;   // STRATA_INKLING2_GROUP=1: the block's experts read once per distinct expert (bit-identical; not faster on this card)
+    const uint8_t **h_grp_gu = nullptr, **h_grp_dn = nullptr, **d_grp_gu = nullptr, **d_grp_dn = nullptr;
+    int *h_grp_cnt = nullptr, *h_grp_slot = nullptr, *d_grp_cnt = nullptr, *d_grp_slot = nullptr;
     bool defer_experts = false;   // layer() stops after routing: the block step runs the experts for all tokens
     bool int8_act = false;           // STRATA_MOE_INT8
     void *d_xq8 = nullptr, *d_hq8 = nullptr;   // q8_1-quantized expert input / activation
@@ -325,6 +328,9 @@ struct Engine::Impl {
         { void* hp = nullptr; CK(cudaHostAlloc(&hp, (size_t) c.n_visits * 16 * 4, cudaHostAllocPortable)); pinned.push_back(hp); h_idx = (int32_t*) hp; }
         d_gu_ptr = (const uint8_t**) dmalloc(128 * sizeof(void*)); d_dn_ptr = (const uint8_t**) dmalloc(128 * sizeof(void*));
         d_sg = fmalloc(128); d_wd = fmalloc(128); d_hh = fmalloc((size_t) 128 * FF); d_yy = fmalloc((size_t) 128 * E);
+        grouped_experts = std::getenv("STRATA_INKLING2_GROUP") != nullptr;
+        { void* a = nullptr; CK(cudaHostAlloc(&a, 128 * 2 * sizeof(void*) + 128 * 4 + 128 * 8 * 4, cudaHostAllocPortable)); pinned.push_back(a); h_grp_gu = (const uint8_t**) a; h_grp_dn = h_grp_gu + 128; h_grp_cnt = (int*) (h_grp_dn + 128); h_grp_slot = h_grp_cnt + 128; }
+        d_grp_gu = (const uint8_t**) dmalloc(128 * sizeof(void*)); d_grp_dn = (const uint8_t**) dmalloc(128 * sizeof(void*)); d_grp_cnt = (int*) dmalloc(128 * 4); d_grp_slot = (int*) dmalloc(128 * 8 * 4);
         d_xb = fmalloc((size_t) 8 * E); d_rrb = fmalloc((size_t) 8 * E); d_moeb = fmalloc((size_t) 8 * E); d_idxb = (int32_t*) dmalloc(128 * 4); d_wb = fmalloc(128);
         { void* hb = nullptr; CK(cudaHostAlloc(&hb, 128 * 4, cudaHostAllocPortable)); pinned.push_back(hb); h_idxb = (int32_t*) hb; }
         int8_act = !(std::getenv("STRATA_MOE_INT8") != nullptr && std::atoi(std::getenv("STRATA_MOE_INT8")) == 0);   // default on; STRATA_MOE_INT8=0: the exact FP32 path
@@ -514,9 +520,32 @@ struct Engine::Impl {
         const M::Act situ{M::ActKind::Situ, c.situ_beta, c.situ_linear_beta};
         if (int8_act) {
             M::quantize_act(d_xb, (int) E, n, d_xq8, st);
+            if (grouped_experts) {   // each distinct expert read once for all the tokens that picked it
+                int ng = 0, maxc = 0;
+                int gcnt[128], gslot[128 * 8];
+                const uint8_t *ggu[128], *gdn[128];
+                int gexp[128];
+                for (int i = 0; i < NK; ++i) {
+                    int g = 0;
+                    while (g < ng && gexp[g] != h_idxb[i]) ++g;
+                    if (g == ng) { gexp[ng] = h_idxb[i]; gcnt[ng] = 0; ggu[ng] = h_gu_ptr[i]; gdn[ng] = h_dn_ptr[i]; ++ng; }
+                    gslot[g * 8 + gcnt[g]++] = i;
+                    maxc = std::max(maxc, gcnt[g]);
+                }
+                std::memcpy(h_grp_gu, ggu, (size_t) ng * sizeof(void*)); std::memcpy(h_grp_dn, gdn, (size_t) ng * sizeof(void*));
+                std::memcpy(h_grp_cnt, gcnt, (size_t) ng * 4); std::memcpy(h_grp_slot, gslot, (size_t) ng * 8 * 4);
+                CK(cudaMemcpyAsync(d_grp_gu, h_grp_gu, (size_t) ng * sizeof(void*), cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(d_grp_dn, h_grp_dn, (size_t) ng * sizeof(void*), cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(d_grp_cnt, h_grp_cnt, (size_t) ng * 4, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(d_grp_slot, h_grp_slot, (size_t) ng * 8 * 4, cudaMemcpyHostToDevice, st));
+                M::experts_gate_up_q8_grouped(d_grp_gu, w.etype, w.gate_bytes, d_xq8, (int) E, (int) FF, d_sg, situ, d_hh, d_grp_cnt, d_grp_slot, ng, Kx, maxc, st);
+                M::quantize_act(d_hh, (int) FF, NK, d_hq8, st);
+                M::experts_down_q8_grouped(d_grp_dn, w.etype, d_hq8, (int) E, (int) FF, d_yy, d_grp_cnt, d_grp_slot, ng, maxc, st);
+            } else {
             M::experts_gate_up_q8(d_gu_ptr, w.etype, w.gate_bytes, d_xq8, (int) E, (int) FF, d_sg, situ, d_hh, NK, st, Kx);
             M::quantize_act(d_hh, (int) FF, NK, d_hq8, st);
             M::experts_down_q8(d_dn_ptr, w.etype, d_hq8, (int) E, (int) FF, d_yy, NK, st);
+            }
         } else {
             M::experts_gate_up(d_gu_ptr, w.etype, w.gate_bytes, d_xb, (int) E, (int) FF, d_sg, situ, d_hh, NK, st, Kx);
             M::experts_down(d_dn_ptr, w.etype, d_hh, (int) E, (int) FF, d_yy, NK, st);

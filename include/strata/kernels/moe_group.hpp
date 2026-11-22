@@ -41,6 +41,11 @@ void experts_down(const uint8_t* const* dn_ptr, int ty, const float* h, int C, i
 void quantize_act(const float* x, int n, int rows, void* xq, void* stream);
 void experts_gate_up_q8(const uint8_t* const* gu_ptr, int ty, size_t up_off, const void* xq, int C, int FF, const float* sg, Act act, float* h, int K, void* stream, int kper = 0);
 void experts_down_q8(const uint8_t* const* dn_ptr, int ty, const void* hq, int C, int FF, float* y, int K, void* stream);
+/// Expert-grouped (a token block): n_groups DISTINCT experts; group g's gate+up plane is gu_ptr[g] (down plane dn_ptr[g]), cnt[g] <= max_cnt (<= 8) slots slot[g * 8 + j] picked it; a slot's input row is
+/// slot / kper of xq (gate-up) and its own row of hq (down); outputs go to the slot's rows of h / y, so everything downstream (combine) is unchanged.  Each expert's weights are read once for all its tokens.
+void experts_gate_up_q8_grouped(const uint8_t* const* gu_ptr, int ty, size_t up_off, const void* xq, int C, int FF, const float* sg, Act act, float* h, const int* cnt, const int* slot,
+                                int n_groups, int kper, int max_cnt, void* stream);
+void experts_down_q8_grouped(const uint8_t* const* dn_ptr, int ty, const void* hq, int C, int FF, float* y, const int* cnt, const int* slot, int n_groups, int max_cnt, void* stream);
 /// out[c] = sum_s wd[s] y[s][c].
 void experts_combine(const float* y, const float* wd, int K, int C, float* out, void* stream, int ntok = 1);
 

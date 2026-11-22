@@ -64,8 +64,10 @@ int main() {
     if (const char* bs = std::getenv("STRATA_INKLING2_BLOCK_CHECK")) {   // blocks of N tokens against single steps: the logits must be identical
         const int N = std::max(1, std::atoi(bs));
         std::vector<std::vector<float>> single((size_t) T);
+        const bool only = std::getenv("STRATA_INKLING2_BLOCK_ONLY") != nullptr;   // blocks only (for profiling): run them twice, nothing to compare
         eng.reset();
-        for (int64_t t = 0; t < T; ++t) eng.step(toks[(size_t) t], (int) t, &single[(size_t) t]);
+        if (!only) for (int64_t t = 0; t < T; ++t) eng.step(toks[(size_t) t], (int) t, &single[(size_t) t]);
+        else for (int rep = 0; rep < 2; ++rep) { eng.reset(); for (int64_t t0 = 0; t0 < T; t0 += N) { std::vector<std::vector<float>> lg0; eng.step_block(toks.data() + t0, (int) std::min<int64_t>(N, T - t0), (int) t0, &lg0); } }
         eng.reset();
         double worst = 0; int64_t diff = 0;
         const auto tb = std::chrono::steady_clock::now();
@@ -73,7 +75,7 @@ int main() {
             const int n = (int) std::min<int64_t>(N, T - t0);
             std::vector<std::vector<float>> lg;
             eng.step_block(toks.data() + t0, n, (int) t0, &lg);
-            for (int i = 0; i < n; ++i)
+            if (!only) for (int i = 0; i < n; ++i)
                 for (size_t v = 0; v < lg[(size_t) i].size(); ++v) { const double d = std::fabs((double) lg[(size_t) i][v] - (double) single[(size_t) (t0 + i)][v]); worst = std::max(worst, d); diff += d > 0; }
         }
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count();

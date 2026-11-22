@@ -470,3 +470,11 @@ The economics decide the order. Our block forward costs ~32 + 18 (N - 1) ms (N=4
 not reach (Maya's own prose numbers on a 3090: 131 vs 127 tok/s; code 162 vs 126; edits 213 vs 124). The marginal 18 ms is the expert kernels (`k_gate_up_q8` + `k_down_q8` = 39% of kernel time; each token's slots read their expert's weights again from VRAM
 although several tokens picked the same expert) and the dense q8 matvecs (27%). Maya's window of 5 costs 2x a token because an expert's blocks are read once for all the tokens that picked it. So: (1) expert-grouped multi-token kernels
 (each distinct expert read once, applied to every token that picked it) to bring the marginal cost per extra token to a few ms; (2) then the drafter; (3) the verify / rollback loop. (1) is useful by itself (prompt reading).
+
+### DSpark step 1: expert-grouped kernels, and why the block is compute-bound here (22 Nov)
+`moe::experts_gate_up_q8_grouped / experts_down_q8_grouped`: one launch over the distinct experts of a block, an expert's rows decoded once and dotted with the input of every token that picked it (up to 8); per-token arithmetic in the same order,
+so blocks of 8 and 4 are bit-identical to single steps (0 of 9,602,784 logits differ). Speed: N=8 50.2 vs 49.2 tok/s ungrouped, N=4 44.4 vs 46.2: no gain. Blocks-only nsys: `k_gate_up_q8g` ~650 us a visit for 8 tokens against ~165 us for one token, `k_down_q8g`
+~340 us; the dense `mmvq` (27% of kernel time) and `k_matmul` (13%) also scale with the token count. The int8 dot products are ALU-bound on a 3060, so a block of n costs about 32 + 18 (n - 1) ms however the weights are read; only tensor-core (int8 mma) kernels
+or a faster card change that. (`STRATA_INKLING2_GROUP=1` enables the grouped kernels; default off.) Consequence for DSpark: on this card a draft block wins only where acceptance is high (code, edits: Maya's 3090 numbers 162 / 213 vs ~125 tok/s);
+on a card with 3-5x the integer throughput (the roomy-VRAM case this work is for) the same block costs ~2x a token, which is the regime Maya's window numbers come from. The drafter is still worth building, with an adaptive controller that drafts only
+while acceptance stays above break-even.

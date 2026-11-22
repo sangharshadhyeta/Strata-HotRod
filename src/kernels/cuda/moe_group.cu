@@ -319,6 +319,128 @@ __global__ void k_down_q8(const uint8_t* const* dn_ptr, int ty, const uint8_t* h
     }
 }
 
+
+// ---- expert-grouped int8 kernels: one launch over the DISTINCT experts of a token block; an expert's rows are decoded once and dotted with the input of every token that picked it (up to kMaxTok).
+// The per-token arithmetic (lane split, summation order) is that of dot_*_q8 above, so a token's result is the same as when it runs alone.
+constexpr int kMaxTok = 8;
+
+__device__ __forceinline__ void dot_nvfp4_q8_multi(const uint8_t* row, const uint8_t* xs8, int xbytes, int n, int cnt, float* out) {
+    const int lane = threadIdx.x & 31, w = lane & 7, is = w >> 1, i8 = (is & 1) * 4 + (w & 1);
+    const int nb = n >> 6;
+    float acc[kMaxTok];
+#pragma unroll
+    for (int j = 0; j < kMaxTok; ++j) acc[j] = 0.0f;
+#pragma unroll 2
+    for (int b0 = 0; b0 < nb; b0 += 4) {
+        const int b = b0 + (lane >> 3);
+        if (b < nb) {
+            const uint8_t* blk = row + (size_t) b * 36;
+            const int2 v = tbl16(*reinterpret_cast<const uint32_t*>(blk + 4 + 4 * w));
+            const float d = ue4m3_half(blk[is]);
+#pragma unroll
+            for (int j = 0; j < kMaxTok; ++j) {
+                if (j < cnt) {
+                    const uint8_t* xb = xs8 + (size_t) j * xbytes + (size_t) (b * 2 + (is >> 1)) * 36;
+                    const int* xi = reinterpret_cast<const int*>(xb + 4);
+                    int sm = __dp4a(v.x, xi[i8], 0);
+                    sm = __dp4a(v.y, xi[i8 + 2], sm);
+                    acc[j] += d * __half2float(*reinterpret_cast<const __half*>(xb)) * (float) sm;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kMaxTok; ++j) {
+        float a = acc[j];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        out[j] = a;
+    }
+}
+__device__ __forceinline__ void dot_q8_0_q8_multi(const uint8_t* row, const uint8_t* xs8, int xbytes, int n, int cnt, float* out) {
+    const int lane = threadIdx.x & 31, w = lane & 7;
+    const int nb = n >> 5;
+    float acc[kMaxTok];
+#pragma unroll
+    for (int j = 0; j < kMaxTok; ++j) acc[j] = 0.0f;
+#pragma unroll 2
+    for (int b0 = 0; b0 < nb; b0 += 4) {
+        const int b = b0 + (lane >> 3);
+        if (b < nb) {
+            const uint8_t* blk = row + (size_t) b * 34;
+            const uint32_t wq = (uint32_t) *reinterpret_cast<const uint16_t*>(blk + 2 + 4 * w) | ((uint32_t) *reinterpret_cast<const uint16_t*>(blk + 4 + 4 * w) << 16);
+            const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+#pragma unroll
+            for (int j = 0; j < kMaxTok; ++j) {
+                if (j < cnt) {
+                    const uint8_t* xb = xs8 + (size_t) j * xbytes + (size_t) b * 36;
+                    const int sm = __dp4a((int) wq, reinterpret_cast<const int*>(xb + 4)[w], 0);
+                    acc[j] += d * __half2float(*reinterpret_cast<const __half*>(xb)) * (float) sm;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kMaxTok; ++j) {
+        float a = acc[j];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        out[j] = a;
+    }
+}
+__device__ __forceinline__ void dot_row_q8_multi(int ty, const uint8_t* row, const uint8_t* xs8, int xbytes, int n, int cnt, float* out) {
+    if (ty == 40) dot_nvfp4_q8_multi(row, xs8, xbytes, n, cnt, out); else dot_q8_0_q8_multi(row, xs8, xbytes, n, cnt, out);
+}
+
+// grid (ceil(FF / (kEW kER)), n_groups); group g: expert plane gu_ptr[g], cnt[g] slots slot[g * kMaxTok + j]; the slot's token = slot / kper; the input rows of xq are per token.
+__global__ void k_gate_up_q8g(const uint8_t* const* gu_ptr, int ty, size_t up_off, const uint8_t* xq, int C, int FF, const float* sg, int kind, float p0, float p1, float* h,
+                              const int* cnt_a, const int* slot_a, int kper) {
+    extern __shared__ __align__(16) uint8_t xs8[];
+    const int g = blockIdx.y, cnt = cnt_a[g];
+    const int xb = (C >> 5) * 36;
+    for (int j = 0; j < cnt; ++j) {
+        const uint8_t* src = xq + (size_t) (slot_a[g * kMaxTok + j] / kper) * xb;
+        for (int i = threadIdx.x; i < xb / 4; i += blockDim.x) reinterpret_cast<int*>(xs8 + (size_t) j * xb)[i] = reinterpret_cast<const int*>(src)[i];
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5;
+    const uint8_t* plane = gu_ptr[g];
+    const size_t rb = row_bytes_dev(ty, C);
+    for (int j = 0; j < kER; ++j) {
+        const int r = (blockIdx.x * kEW + warp) * kER + j;
+        if (r >= FF) break;
+        float gv[kMaxTok], uv[kMaxTok];
+        dot_row_q8_multi(ty, plane + (size_t) r * rb, xs8, xb, C, cnt, gv);
+        dot_row_q8_multi(ty, plane + up_off + (size_t) r * rb, xs8, xb, C, cnt, uv);
+        if ((threadIdx.x & 31) == 0)
+            for (int q = 0; q < cnt; ++q) {
+                const int slot = slot_a[g * kMaxTok + q];
+                const float scale = sg[slot];
+                h[(size_t) slot * FF + r] = activate(gv[q] * scale, uv[q] * scale, kind, p0, p1);
+            }
+    }
+}
+// grid (ceil(C / (kEW kER)), n_groups); the inputs are the slot's own rows of hq.
+__global__ void k_down_q8g(const uint8_t* const* dn_ptr, int ty, const uint8_t* hq, int C, int FF, float* y, const int* cnt_a, const int* slot_a) {
+    extern __shared__ __align__(16) uint8_t xs8[];
+    const int g = blockIdx.y, cnt = cnt_a[g];
+    const int xb = (FF >> 5) * 36;
+    for (int j = 0; j < cnt; ++j) {
+        const uint8_t* src = hq + (size_t) slot_a[g * kMaxTok + j] * xb;
+        for (int i = threadIdx.x; i < xb / 4; i += blockDim.x) reinterpret_cast<int*>(xs8 + (size_t) j * xb)[i] = reinterpret_cast<const int*>(src)[i];
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5;
+    const uint8_t* w = dn_ptr[g];
+    const size_t rb = row_bytes_dev(ty, FF);
+    for (int j = 0; j < kER; ++j) {
+        const int r = (blockIdx.x * kEW + warp) * kER + j;
+        if (r >= C) break;
+        float v[kMaxTok];
+        dot_row_q8_multi(ty, w + (size_t) r * rb, xs8, xb, FF, cnt, v);
+        if ((threadIdx.x & 31) == 0)
+            for (int q = 0; q < cnt; ++q) y[(size_t) slot_a[g * kMaxTok + q] * C + r] = v[q];
+    }
+}
+
 }  // namespace
 
 bool type_supported(int ty) { return ty == 40 || ty == 8; }
@@ -357,6 +479,15 @@ void experts_gate_up_q8(const uint8_t* const* gu_ptr, int ty, size_t up_off, con
 void experts_down_q8(const uint8_t* const* dn_ptr, int ty, const void* hq, int C, int FF, float* y, int K, void* stream) {
     if (!type_supported(ty)) { std::fprintf(stderr, "moe::experts_down_q8: ggml type %d has no decode here\n", ty); std::exit(1); }
     k_down_q8<<<dim3((C + kEW * kER - 1) / (kEW * kER), K), kEW * 32, (size_t) (FF / 32) * 36, (cudaStream_t) stream>>>(dn_ptr, ty, (const uint8_t*) hq, C, FF, y);
+}
+void experts_gate_up_q8_grouped(const uint8_t* const* gu_ptr, int ty, size_t up_off, const void* xq, int C, int FF, const float* sg, Act act, float* h, const int* cnt, const int* slot,
+                                int n_groups, int kper, int max_cnt, void* stream) {
+    if (!type_supported(ty)) { std::fprintf(stderr, "moe::experts_gate_up_q8_grouped: ggml type %d has no decode here\n", ty); std::exit(1); }
+    k_gate_up_q8g<<<dim3((FF + kEW * kER - 1) / (kEW * kER), n_groups), kEW * 32, (size_t) max_cnt * (C / 32) * 36, (cudaStream_t) stream>>>(gu_ptr, ty, up_off, (const uint8_t*) xq, C, FF, sg, (int) act.kind, act.p0, act.p1, h, cnt, slot, kper);
+}
+void experts_down_q8_grouped(const uint8_t* const* dn_ptr, int ty, const void* hq, int C, int FF, float* y, const int* cnt, const int* slot, int n_groups, int max_cnt, void* stream) {
+    if (!type_supported(ty)) { std::fprintf(stderr, "moe::experts_down_q8_grouped: ggml type %d has no decode here\n", ty); std::exit(1); }
+    k_down_q8g<<<dim3((C + kEW * kER - 1) / (kEW * kER), n_groups), kEW * 32, (size_t) max_cnt * (FF / 32) * 36, (cudaStream_t) stream>>>(dn_ptr, ty, (const uint8_t*) hq, C, FF, y, cnt, slot);
 }
 void experts_combine(const float* y, const float* wd, int K, int C, float* out, void* stream, int ntok) {
     k_combine<<<dim3((C + 255) / 256, ntok), 256, 0, (cudaStream_t) stream>>>(y, wd, K, C, out);
