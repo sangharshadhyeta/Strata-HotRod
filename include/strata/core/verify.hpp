@@ -758,6 +758,10 @@ private:
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     cudaEvent_t ev_q8_ = nullptr;   // STRATA_VERIFY_QDEDUP with the forked shared stream: cs's q8_1 of the MoE input, waited on by sh_cs_
+    // STRATA_PCIE_EARLY (pcie mode 2, the missed experts fetched by a copy kernel): the fetch runs on pf_cs_, forked from cs once the
+    // layer's plan is on the device and joined back before the PCIe groups, so it overlaps the VRAM groups instead of following them
+    cudaStream_t pf_cs_ = nullptr;
+    cudaEvent_t ev_pf_fork_ = nullptr, ev_pf_join_ = nullptr;
     // STRATA_LOOKAHEAD_GPU_STREAM (CUDA): the look-ahead node on its own stream, forked from cs after the layer's MoE input
     // (mixed_) is complete and before the router; cs waits on ev_la_read_done_ before it next writes mixed_ (pre of the next
     // layer, grp 0) and joins ev_la_done_ at the window's end.  nullptr: the node stays on cs

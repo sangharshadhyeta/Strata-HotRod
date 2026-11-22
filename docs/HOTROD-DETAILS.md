@@ -190,6 +190,8 @@ The opt-in switches for the top two ranks stay in the engine for testing: `STRAT
 | `STRATA_LA_LEARN`, `STRATA_LA_TAIL_READ=2` | the learned look-ahead, need-only read-ahead |
 | `STRATA_PIN_SEGS` | the pageable RAM tier page-locked in 1 GiB segments (no extra RAM; a give-back unlocks a segment first). With `STRATA_PCIE_BALANCE`: 39.7 vs 36.5 tok/s (+9%), 38.2 pinned alone, no copy failures (RTX 3060 PC) |
 | `STRATA_PCIE_BALANCE` | each verify layer's PCIe count from measured CPU and GPU costs (one GPU, native pack, no batch slots) |
+| `STRATA_PCIE_EARLY=1` (opt-in) | the PCIe share's fetch kernel runs on its own stream beside the layer's VRAM experts instead of after them (PCIe mode 2, the default copy-kernel path). Measured on an RTX 3060 PC, Qwen UD-Q4_K_XL, stage timers on: `pcie-experts` 19.9 -> 1.8 ms per window, `vram-experts` 10.2 -> 27.7 ms (the two now overlap), `cpu-wait` 34.6 -> 28.6 ms; about 7% off the window, 1-4% more tok/s, 99th-percentile token gap about 13% lower |
+| `STRATA_PCIE_STATS=1` (opt-in) | every 20000 layer calls, one line: distinct misses, how many the PCIe share asked for, how many could fly (only a page-locked RAM-tier blob can; a file-tier blob stays a CPU miss). 22% of the asks were refused in the same run |
 
 | Opt-in, measured and left off | Why |
 | --- | --- |

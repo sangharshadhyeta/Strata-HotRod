@@ -111,6 +111,8 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 // STRATA_DECODE_STAGE_TIMERS=1: the decode window's stage boundaries (Verifier::stage_mark); the ids index stage_ms_
 inline bool g_stage_timers() { static const bool on = [] { const char* v = std::getenv("STRATA_DECODE_STAGE_TIMERS"); return v != nullptr && v[0] == '1'; }(); return on; }
+// STRATA_PCIE_EARLY=1 (opt-in): the PCIe share's fetch kernel runs on its own stream beside the VRAM groups (Verifier::pf_cs_)
+inline bool pcie_early_env() { static const bool on = [] { const char* v = std::getenv("STRATA_PCIE_EARLY"); return v != nullptr && v[0] == '1'; }(); return on; }
 enum StageId : int { kStOther = 0, kStHc, kStAttn, kStGdn, kStFfn, kStRouter, kStDoor, kStShared,
                      kStPlan, kStVram, kStPcieWait, kStPcieExp, kStCpuWait, kStRows, kStHcWrite };
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
@@ -1158,6 +1160,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (pf_cs_) cudaStreamSynchronize(pf_cs_);
     if (la_cs_) cudaStreamSynchronize(la_cs_);
     stage_report();   // STRATA_DECODE_STAGE_TIMERS: the cumulative per-window averages, if any window was timed
     for (auto& kv : stage_chains_)
@@ -1178,6 +1181,9 @@ Verifier::~Verifier() {
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (pf_cs_) cudaStreamDestroy(pf_cs_);
+    if (ev_pf_fork_) cudaEventDestroy(ev_pf_fork_);
+    if (ev_pf_join_) cudaEventDestroy(ev_pf_join_);
     if (la_cs_) cudaStreamDestroy(la_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
@@ -2505,6 +2511,18 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
         return false;
+    }
+    if (pcie_early_env()) {   // optional: on any failure it stays off (pf_cs_ nullptr) and the fetch stays on cs
+        if (make_decode_stream(&pf_cs_) != cudaSuccess || cudaEventCreateWithFlags(&ev_pf_fork_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_pf_join_, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            if (pf_cs_) { cudaStreamDestroy(pf_cs_); pf_cs_ = nullptr; }
+            if (ev_pf_fork_) { cudaEventDestroy(ev_pf_fork_); ev_pf_fork_ = nullptr; }
+            if (ev_pf_join_) { cudaEventDestroy(ev_pf_join_); ev_pf_join_ = nullptr; }
+            std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the side stream could not be made, the PCIe fetch stays on the window's stream\n");
+        } else {
+            std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the PCIe share's fetch overlaps the VRAM experts (own stream, pcie mode 2)\n");
+        }
     }
 #if !defined(STRATA_USE_HIP)
     // the look-ahead node's own stream (record_window, STRATA_LOOKAHEAD_GPU_STREAM), made like sh_cs_.  Optional: on any
@@ -4072,6 +4090,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (!stage_mark(cs, kStPlan, err)) return false;   // plan-wait: the GPU plan's flag and its copy
             stamp(l, 19, grp);
+            // STRATA_PCIE_EARLY: the PCIe share's fetch starts on pf_cs_ as soon as the plan is on the device and the host has published the
+            // share (flag B), while cs runs the VRAM groups; the join below makes the PCIe groups wait for it.  cs keeps its own (stamped)
+            // wait on flag B, so the balance's timestamps mean what they did.  The staging region is this group's, reused only by the same
+            // group of the next layer, whose fork comes after this layer's PCIe groups on cs.
+            const bool pf_early = pf_cs_ != nullptr && sink_.pcie_mode == 2 && !device_plan_ && !prof_on_;
+            if (pf_early) {
+                cudaEventRecord(ev_pf_fork_, cs);
+                cudaStreamWaitEvent(pf_cs_, ev_pf_fork_, 0);
+                wait_flag_ge(m_flagB_, ring, pf_cs_);
+                const int64_t per_e = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage_e = staging_ + (size_t) (grp * per_e) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage_e, (int64_t) lay.blob_bytes(l), (int) per_e, pf_cs_);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage_e, (int64_t) lay.blob_bytes(l), pf_cs_);
+                cudaEventRecord(ev_pf_join_, pf_cs_);
+            }
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
             if (!stage_mark(cs, kStVram, err)) return false;   // vram-experts: the resident groups
@@ -4080,7 +4113,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
             if (!stage_mark(cs, kStPcieWait, err)) return false;   // pcie-wait: the PCIe share's flag
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+            if (pf_early) {
+                cudaStreamWaitEvent(cs, ev_pf_join_, 0);           // STRATA_PCIE_EARLY: the fetch ran beside the VRAM groups
+            } else if (sink_.pcie_mode == 2) {                     // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);

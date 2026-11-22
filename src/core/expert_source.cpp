@@ -6275,6 +6275,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
+        {   // STRATA_PCIE_STATS=1 (opt-in): how many distinct misses the PCIe share asked for and how many could fly (a blob flies only
+            // when its RAM-tier bytes are page-locked: a file-tier or unpinned blob stays a CPU miss); one line per 20000 layer calls
+            static const bool st_on = [] { const char* v = std::getenv("STRATA_PCIE_STATS"); return v != nullptr && v[0] == '1'; }();
+            if (st_on) {
+                static std::atomic<uint64_t> st_calls{0}, st_miss{0}, st_want{0}, st_got{0};
+                st_miss.fetch_add((uint64_t) std::max(0, nmiss), std::memory_order_relaxed);
+                st_want.fetch_add((uint64_t) std::max(0, std::min(m, nmiss)), std::memory_order_relaxed);
+                st_got.fetch_add((uint64_t) fetches, std::memory_order_relaxed);
+                if (st_calls.fetch_add(1, std::memory_order_relaxed) % 20000 == 19999)
+                    std::fprintf(stderr, "strata pcie share: %llu distinct misses, the share asked for %llu, %llu could fly (pinned RAM-tier blobs), %llu stayed on the CPU for lack of a pinned blob\n",
+                                 (unsigned long long) st_miss.load(), (unsigned long long) st_want.load(), (unsigned long long) st_got.load(),
+                                 (unsigned long long) (st_want.load() - std::min(st_want.load(), st_got.load())));
+            }
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
