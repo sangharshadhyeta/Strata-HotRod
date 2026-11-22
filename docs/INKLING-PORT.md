@@ -452,3 +452,11 @@ for all n*K slots (`kper` = slots per input row in the gate-up kernels, `ntok` r
 Blocks of 8 and 4 against single steps: 0 of 9,602,784 logits differ (bit-identical). Speed: 31.9 tok/s shared vs 31.2 unshared vs ~31 single, on a warm 48-token prompt. Little gained: the visit's attention side, convs,
 residuals and norms (about 15 ms of a token) still run one token at a time, and the experts were already cheap on a warm cache. The block's speed-up needs the dense / attention path batched (multi-row matvec, multi-row attention);
 that is the next piece, and it is also what verification of a draft block needs.
+
+### DSpark step 1c: the batched dense / attention path (22 Nov)
+`layer_b` / `step_block_b`: a block of n <= 8 tokens through each visit as contiguous [n][..] buffers (inputs, norms and loop messages j-major; block lists and message banks [n][kMaxBlk][E]); matmuls, norms, q/k/v/gate
+projections, qkv_prep, the router, the attention (grid H x T, token t at pos0 + t), the attention residual (grid nq x T) and the loop control run over n rows; the short convs stay one launch a token (a sliding state). The kernels gained
+a token count (`attn_res`, `attention`, `kv_append`, `control_cat`; defaults keep the single-token behaviour). Blocks of 8 and 4 against single steps: 0 of 9,602,784 logits differ (bit-identical).
+Speed on the warm 48-token prompt, including copying all n logit rows to the host: 49.0 tok/s (N=8), 46.5 (N=4), against 31.9 for the per-token block path and ~31 for single steps. `STRATA_INKLING2_NO_BATCH=1` selects the per-token path.
+Used by `inkling2_serve` for the prompt (blocks of 8, logits only for the last token): a 1,432-token prompt + 60 generated in 44.8 s through the server (~34 tok/s of prompt on a cold cache with a large expert working set, against ~27 before).
+Attention scratch is [8][H][cap]: it grows with the context (to be bounded when the KV ring lands).

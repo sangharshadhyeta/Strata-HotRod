@@ -95,9 +95,10 @@ __global__ void k_conv_dyn(float* state, const float* x, const float* f, const f
 
 // grid H, kT threads.
 __global__ void k_attn(const float* q, const float* r, const float* gate, const float* sink, const float* Kc, const float* Vc, const float* rel_bias, float* out,
-                       float* scratch, int pos, int window, int extent, int cap, int H, int KV, int D, int R) {
+                       float* scratch, int pos0, int window, int extent, int cap, int H, int KV, int D, int R) {
     __shared__ float sm[32];
-    const int h = blockIdx.x, kvh = h / (H / KV);
+    const int h = blockIdx.x, kvh = h / (H / KV), tk = blockIdx.y, pos = pos0 + tk;
+    q += (size_t) tk * H * D; r += (size_t) tk * H * R; gate += (size_t) tk * H * D; sink += (size_t) tk * H; out += (size_t) tk * H * D; scratch += (size_t) tk * H * cap;
     const int s0 = window > 0 ? max(0, pos - window + 1) : 0;
     const int n = pos - s0 + 1;
     float* lg = scratch + (size_t) h * cap;
@@ -132,10 +133,11 @@ __global__ void k_attn(const float* q, const float* r, const float* gate, const 
 }
 
 // grid nq, 256 threads: states [n][C] (n <= 16).
-__global__ void k_attn_res(const float* states, int n, const float* q, float* out, int C) {
+__global__ void k_attn_res(const float* states, int n, const float* q, float* out, int C, size_t st_tok, size_t out_tok, size_t out_q) {
     __shared__ float sm[32];
     __shared__ float rs[16], p[16];
     const int k = blockIdx.x;
+    states += (size_t) blockIdx.y * st_tok;
     const float* qq = q + (size_t) k * C;
     for (int i = 0; i < n; ++i) {
         const float* s = states + (size_t) i * C;
@@ -158,12 +160,13 @@ __global__ void k_attn_res(const float* states, int n, const float* q, float* ou
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
         float acc = 0.0f;
         for (int i = 0; i < n; ++i) acc += p[i] * states[(size_t) i * C + c] * rs[i];
-        out[(size_t) k * C + c] = acc;
+        out[(size_t) blockIdx.y * out_tok + (size_t) k * out_q + c] = acc;
     }
 }
 
 __global__ void k_control_cat(const float* x, const float* msg, float* cat, int C) {
     __shared__ float sm[32];
+    x += (size_t) blockIdx.x * C; msg += (size_t) blockIdx.x * C; cat += (size_t) blockIdx.x * 2 * C;
     float sx = 0.0f, sg = 0.0f;
     for (int c = threadIdx.x; c < C; c += blockDim.x) { sx += x[c] * x[c]; sg += msg[c] * msg[c]; }
     sx = block_sum(sx, sm);
@@ -216,19 +219,19 @@ void qkv_prep(float* q, float* k, float* v, float* r, const float* qclip, const 
 void conv_dynamic(float* state, const float* x, const float* f, const float* dyn, float* out, int C, int taps, int heads, void* stream) {
     k_conv_dyn<<<blocks(C), 256, 0, (cudaStream_t) stream>>>(state, x, f, dyn, out, C, taps, heads);
 }
-void kv_append(float* Kc, float* Vc, const float* k, const float* v, int pos, int KV, int D, void* stream) {
-    cudaMemcpyAsync(Kc + (size_t) pos * KV * D, k, (size_t) KV * D * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
-    cudaMemcpyAsync(Vc + (size_t) pos * KV * D, v, (size_t) KV * D * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
+void kv_append(float* Kc, float* Vc, const float* k, const float* v, int pos, int KV, int D, void* stream, int T) {
+    cudaMemcpyAsync(Kc + (size_t) pos * KV * D, k, (size_t) T * KV * D * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
+    cudaMemcpyAsync(Vc + (size_t) pos * KV * D, v, (size_t) T * KV * D * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) stream);
 }
 void attention(const float* q, const float* r, const float* gate, const float* sink, const float* Kc, const float* Vc, const float* rel_bias, float* out, float* scratch, int pos,
-               int window, int extent, int cap, int H, int KV, int D, int R, void* stream) {
-    k_attn<<<H, kT, 0, (cudaStream_t) stream>>>(q, r, gate, sink, Kc, Vc, rel_bias, out, scratch, pos, window, extent, cap, H, KV, D, R);
+               int window, int extent, int cap, int H, int KV, int D, int R, void* stream, int T) {
+    k_attn<<<dim3(H, T), kT, 0, (cudaStream_t) stream>>>(q, r, gate, sink, Kc, Vc, rel_bias, out, scratch, pos, window, extent, cap, H, KV, D, R);
 }
-void attn_res(const float* states, int n, const float* q, int nq, float* out, int C, void* stream) {
+void attn_res(const float* states, int n, const float* q, int nq, float* out, int C, void* stream, int T, size_t st_tok, size_t out_tok, size_t out_q) {
     if (n > 16) { std::fprintf(stderr, "ik::attn_res: %d states (at most 16)\n", n); std::exit(1); }
-    k_attn_res<<<nq, 256, 0, (cudaStream_t) stream>>>(states, n, q, out, C);
+    k_attn_res<<<dim3(nq, T), 256, 0, (cudaStream_t) stream>>>(states, n, q, out, C, st_tok, out_tok ? out_tok : (size_t) nq * C, out_q ? out_q : (size_t) C);
 }
-void control_cat(const float* x, const float* msg, float* cat, int C, void* stream) { k_control_cat<<<1, 256, 0, (cudaStream_t) stream>>>(x, msg, cat, C); }
+void control_cat(const float* x, const float* msg, float* cat, int C, void* stream, int T) { k_control_cat<<<T, 256, 0, (cudaStream_t) stream>>>(x, msg, cat, C); }
 void control_mix(const float* x, const float* msg, const float* forget, const float* gain, float* y, int C, void* stream) {
     k_control_mix<<<blocks(C), 256, 0, (cudaStream_t) stream>>>(x, msg, forget, gain, y, C);
 }

@@ -497,8 +497,8 @@ struct Engine::Impl {
     }
     void bind(TokState& t) { h = t.h; pre_h = t.pre_h; blk = t.blk; ms = t.ms; msgs = t.msgs; }
     /// The experts of one visit for the whole block: the picks of all n tokens placed together (an expert picked twice is fetched once), 4 launches for every token's slots, then each token's FFN tail.
-    void experts_block_pass(int vv, int64_t l, int n) {
-        const int64_t E = c.n_embd, FF = c.n_ff_exp, taps = c.conv_taps;
+    void experts_for_block(int vv, int64_t l, int n) {
+        const int64_t E = c.n_embd, FF = c.n_ff_exp;
         const int Kx = (int) c.n_expert_used, NK = n * Kx;
         const LW& w = lw[(size_t) l];
         CK(cudaMemcpyAsync(h_idxb, d_idxb, (size_t) NK * 4, cudaMemcpyDeviceToHost, st));
@@ -522,14 +522,172 @@ struct Engine::Impl {
             M::experts_down(d_dn_ptr, w.etype, d_hh, (int) E, (int) FF, d_yy, NK, st);
         }
         M::experts_combine(d_yy, d_wd, Kx, (int) E, d_moeb, st, n);
+    }
+    void experts_block_pass(int vv, int64_t l, int n) {
+        experts_for_block(vv, l, n);
+        const int64_t E = c.n_embd, taps = c.conv_taps;
+        const LW& w = lw[(size_t) l];
         for (int t = 0; t < n; ++t) {
             bind(tok_states[(size_t) t]);
             K::gdn_conv_step(fs[(size_t) vv], d_moeb + (size_t) t * E, w.ffnpost, mm, E, taps, st);
             ik::add(d_rrb + (size_t) t * E, mm, h, (int) E, st);
         }
     }
+
+    // ---- the batched block: the dense and attention path for all n tokens at once (contiguous [n][..] buffers; the inputs, norms, loop messages are j-major arrays), so a block of n costs far less than
+    // n single steps.  What stays per token are the short convs (a sliding state) - launches, not kernels over n rows.  Numerics are the single step's.
+    static constexpr int kB = 8;
+    struct BatchBufs {
+        float *H, *PRE, *BLK, *MS, *MSG, *INS, *XS, *Q, *R, *GATE, *SINK, *K, *V, *KC, *VC, *DYNK, *DYNV, *ATT, *PROJ, *A, *MIN, *RL, *SCR, *CAT, *G64, *FGT, *GNN, *TMP, *MM, *HD, *LOG;
+        void* XQ = nullptr;
+        bool ready = false;
+    } bb;
+    void ensure_batch() {
+        if (bb.ready) return;
+        const int64_t E = c.n_embd, H = c.n_head, KV = c.n_head_kv, D = c.head_dim, R = c.rel_states, taps = c.conv_taps;
+        bb.H = fmalloc(kB * E); bb.PRE = fmalloc(kB * E); bb.BLK = fmalloc((size_t) kB * kMaxBlk * E); bb.MS = fmalloc((size_t) kB * kMaxBlk * E); bb.MSG = fmalloc(4 * kB * E);
+        bb.INS = fmalloc(3 * kB * E); bb.XS = fmalloc(3 * kB * E);
+        bb.Q = fmalloc(kB * H * D); bb.R = fmalloc(kB * H * R); bb.GATE = fmalloc(kB * H * D); bb.SINK = fmalloc(kB * H);
+        bb.K = fmalloc(kB * KV * D); bb.V = fmalloc(kB * KV * D); bb.KC = fmalloc(kB * KV * D); bb.VC = fmalloc(kB * KV * D);
+        bb.DYNK = fmalloc(kB * KV * taps); bb.DYNV = fmalloc(kB * KV * taps);
+        bb.ATT = fmalloc(kB * H * D); bb.PROJ = fmalloc(kB * E); bb.A = fmalloc(kB * E); bb.MIN = fmalloc(kB * E); bb.RL = fmalloc((size_t) kB * c.n_expert);
+        bb.SCR = fmalloc((size_t) kB * H * cap);
+        bb.CAT = fmalloc(kB * 2 * E); bb.G64 = fmalloc((size_t) kB * c.gate_rank); bb.FGT = fmalloc(kB * E); bb.GNN = fmalloc(kB * E); bb.TMP = fmalloc(kB * E);
+        bb.MM = fmalloc(kB * E); bb.HD = fmalloc(kB * E); bb.LOG = fmalloc((size_t) kB * c.n_vocab);
+        bb.XQ = dmalloc((size_t) kB * (std::max<int64_t>(E, H * D) / 32) * 36 + 4096);
+        bb.ready = true;
+    }
+    void c2d(float* dst, size_t dpitch, const float* src, size_t spitch, size_t width, int rows) {
+        CK(cudaMemcpy2DAsync(dst, dpitch * 4, src, spitch * 4, width * 4, rows, cudaMemcpyDeviceToDevice, st));
+    }
+    void cpy(float* dst, const float* src, size_t n) { CK(cudaMemcpyAsync(dst, src, n * 4, cudaMemcpyDeviceToDevice, st)); }
+    void mmvq_fn(int type, const void* W, const float* xin, int n_in, int n_out, float* y, int cols) {
+        K::quantize_q8_1_rows(xin, cols, n_in, bb.XQ, st);
+        K::iq_mmvq(type, W, bb.XQ, y, n_in, n_out, cols, st);
+    }
+    void control_b(const LW& w, int module, float* xx, const float* msg, int n) {
+        const int64_t E = c.n_embd;
+        ik::control_cat(xx, msg, bb.CAT, (int) E, st, n);
+        ik::matmul_f32(w.ld[module], bb.CAT, bb.G64, n, (int) (2 * E), (int) c.gate_rank, st);
+        ik::matmul_f32(w.lf[module], bb.G64, bb.FGT, n, (int) c.gate_rank, (int) E, st);
+        ik::matmul_f32(w.lg[module], bb.G64, bb.GNN, n, (int) c.gate_rank, (int) E, st);
+        ik::control_mix(xx, msg, bb.FGT, bb.GNN, bb.TMP, (int) (n * E), st);
+        cpy(xx, bb.TMP, (size_t) n * E);
+    }
+    /// One layer visit for n tokens (positions pos0 ..): up to the router (the picks into d_idxb / d_wb, the expert input in d_xb, the residual in d_rrb); returns nbl.
+    int layer_b(int64_t l, int vis, int nb, bool msgs_on, int pos0, int n) {
+        const int64_t E = c.n_embd, H = c.n_head, KV = c.n_head_kv, D = c.head_dim, R = c.rel_states, taps = c.conv_taps;
+        const LayerTensors& L = lay.layers[(size_t) l];
+        const LW& w = lw[(size_t) l];
+        const bool boundary = l % c.attn_res_block == 0;
+        const size_t blkp = (size_t) kMaxBlk * E;
+        float* INS = bb.INS; float* XS = bb.XS; float* MSG = bb.MSG;
+        auto ins = [&](int j) { return INS + (size_t) j * kB * E; };
+        auto xs = [&](int j) { return XS + (size_t) j * kB * E; };
+        auto msg = [&](int j) { return MSG + (size_t) j * kB * E; };
+        if (l == 0) { for (int j = 0; j < 3; ++j) cpy(ins(j), bb.H, (size_t) n * E); }
+        else {
+            c2d(bb.BLK + (size_t) nb * E, blkp, bb.H, E, E, n);
+            const int nq = L.full ? 3 : 1;
+            ik::attn_res(bb.BLK, nb + 1, w.res_q, nq, INS, (int) E, st, n, blkp, E, (size_t) kB * E);
+            if (nq == 1) { cpy(ins(1), ins(0), (size_t) n * E); cpy(ins(2), ins(0), (size_t) n * E); }
+        }
+        if (msgs_on) for (int j = 0; j < 3; ++j) control_b(w, j, ins(j), msg(j), n);
+        const float* nw[3] = {w.qn, w.kn, w.vn};
+        for (int j = 0; j < 3; ++j) {
+            cpy(xs(j), ins(!L.full && !msgs_on ? 0 : j), (size_t) n * E);
+            K::rms_norm_weighted(xs(j), L.full ? nw[j] : w.attn_norm, n, E, c.rms_eps, st);
+        }
+        K::quantize_q8_1_rows(xs(0), n, E, bb.XQ, st);
+        K::iq_mmvq(8, w.q, bb.XQ, bb.Q, (int) E, (int) (H * D), n, st);
+        K::iq_mmvq(8, w.rel, bb.XQ, bb.R, (int) E, (int) (H * R), n, st);
+        K::iq_mmvq(8, w.gate, bb.XQ, bb.GATE, (int) E, (int) (H * D), n, st);
+        ik::matmul_f32(w.sink, xs(0), bb.SINK, n, (int) E, (int) H, st);
+        mmvq_fn(8, w.k, xs(1), (int) E, (int) (KV * D), bb.K, n);
+        mmvq_fn(8, w.v, xs(2), (int) E, (int) (KV * D), bb.V, n);
+        const size_t kvd = (size_t) KV * D;
+        if (!L.full) {
+            for (int t = 0; t < n; ++t) {
+                K::gdn_conv_step(ks[(size_t) vis], bb.K + t * kvd, w.kconv, bb.KC + t * kvd, KV * D, taps, st);
+                K::gdn_conv_step(vs[(size_t) vis], bb.V + t * kvd, w.vconv, bb.VC + t * kvd, KV * D, taps, st);
+            }
+        } else {
+            ik::matmul_f32(w.kproj, xs(1), bb.DYNK, n, (int) E, (int) (KV * taps), st);
+            ik::matmul_f32(w.vproj, xs(2), bb.DYNV, n, (int) E, (int) (KV * taps), st);
+            for (int t = 0; t < n; ++t) {
+                ik::conv_dynamic(ks[(size_t) vis], bb.K + t * kvd, w.kconv, bb.DYNK + (size_t) t * KV * taps, bb.KC + t * kvd, (int) (KV * D), (int) taps, (int) KV, st);
+                ik::conv_dynamic(vs[(size_t) vis], bb.V + t * kvd, w.vconv, bb.DYNV + (size_t) t * KV * taps, bb.VC + t * kvd, (int) (KV * D), (int) taps, (int) KV, st);
+            }
+        }
+        ik::qkv_prep(bb.Q, bb.KC, bb.VC, bb.R, w.qclip, w.rclip, n, (int) H, (int) KV, (int) D, (int) R, c.qk_clip, c.rel_clip, c.rms_eps, L.full, c.log_scale_alpha, (float) c.log_scale_floor, pos0, st);
+        ik::kv_append(Kc[(size_t) vis], Vc[(size_t) vis], bb.KC, bb.VC, pos0, (int) KV, (int) D, st, n);
+        ik::attention(bb.Q, bb.R, bb.GATE, bb.SINK, Kc[(size_t) vis], Vc[(size_t) vis], w.relbias, bb.ATT, bb.SCR, pos0, L.full ? 0 : (int) c.window, L.full ? (int) c.rel_extent : (int) c.window, cap,
+                      (int) H, (int) KV, (int) D, (int) R, st, n);
+        mmvq_fn(8, w.out, bb.ATT, (int) (H * D), (int) E, bb.PROJ, n);
+        for (int t = 0; t < n; ++t) K::gdn_conv_step(ps[(size_t) vis], bb.PROJ + t * E, w.postconv, bb.A + t * E, E, taps, st);
+        if (boundary) { c2d(bb.BLK + (size_t) nb * E, blkp, bb.H, E, E, n); cpy(d_rrb, bb.A, (size_t) n * E); }
+        else ik::add(bb.H, bb.A, d_rrb, (int) (n * E), st);
+        const int nbl = nb + (boundary ? 1 : 0);
+        c2d(bb.BLK + (size_t) nbl * E, blkp, d_rrb, E, E, n);
+        ik::attn_res(bb.BLK, nbl + 1, w.ffn_res_q, 1, bb.MIN, (int) E, st, n, blkp, E, E);
+        if (msgs_on) control_b(w, 3, bb.MIN, msg(3), n);
+        cpy(d_xb, bb.MIN, (size_t) n * E);
+        K::rms_norm_weighted(d_xb, w.ffn_norm, n, E, c.rms_eps, st);
+        ik::matmul_f32(w.router, d_xb, bb.RL, n, (int) E, (int) c.n_expert, st);
+        M::route(bb.RL, w.router_bias, n, (int) c.n_expert, (int) c.n_expert_used, c.expert_weight_scale, M::Score::Sigmoid, d_idxb, d_wb, st);
+        return nbl;
+    }
+    void step_block_b(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* out) {
+        const int64_t E = c.n_embd;
+        ensure_batch();
+        const uint64_t rb = C::row_bytes(kQ8_0, E);
+        for (int t = 0; t < n; ++t) ik::dequant_q8_0_row((const uint8_t*) d_embd + (uint64_t) tokens[t] * rb, bb.H + (size_t) t * E, (int) E, st);
+        K::rms_norm_weighted(bb.H, d_embd_norm, n, E, c.rms_eps, st);
+        int nb = 0, pre_nb = 0, nms = 0;
+        const int64_t core0 = c.core_start, clen = c.core_len();
+        const size_t blkp = (size_t) kMaxBlk * E;
+        for (int vv = 0; vv < c.n_visits; ++vv) {
+            const int64_t l = c.stored_of_visit(vv);
+            bool msgs_on = false;
+            const bool in_core = vv >= core0 && vv < core0 + c.num_loops * clen;
+            if (vv == core0) { cpy(bb.PRE, bb.H, (size_t) n * E); pre_nb = nb; }
+            if (in_core) {
+                const int64_t p = (vv - core0) / clen, i = l - core0;
+                if (i == 0 && p > 0) { cpy(bb.H, bb.PRE, (size_t) n * E); nb = pre_nb; }
+                if (p > 0) {
+                    ik::attn_res(bb.MS, nms, d_loop_rq + (size_t) 2 * i * E, 2, bb.MSG, (int) E, st, n, blkp, E, (size_t) 3 * kB * E);                 // msg 0 and msg 3
+                    ik::attn_res(bb.MS, nms, d_loop_kq + (size_t) 2 * i * E, 2, bb.MSG + (size_t) kB * E, (int) E, st, n, blkp, E, (size_t) kB * E);   // msg 1 and msg 2
+                    msgs_on = true;
+                }
+            }
+            nb = layer_b(l, vv, nb, msgs_on, pos0, n);
+            experts_for_block(vv, l, n);
+            const LW& w = lw[(size_t) l];
+            for (int t = 0; t < n; ++t) K::gdn_conv_step(fs[(size_t) vv], d_moeb + (size_t) t * E, w.ffnpost, bb.MM + (size_t) t * E, E, c.conv_taps, st);
+            ik::add(d_rrb, bb.MM, bb.H, (int) (n * E), st);
+            if (in_core && l == c.core_end - 1) {
+                nms = 0;
+                for (int b = pre_nb + 1; b < nb; ++b) c2d(bb.MS + (size_t) nms++ * E, blkp, bb.BLK + (size_t) b * E, blkp, E, n);
+                c2d(bb.MS + (size_t) nms++ * E, blkp, bb.H, E, E, n);
+            }
+        }
+        c2d(bb.BLK + (size_t) nb * E, blkp, bb.H, E, E, n);
+        ik::attn_res(bb.BLK, nb + 1, d_out_res, 1, bb.HD, (int) E, st, n, blkp, E, E);
+        K::rms_norm_weighted(bb.HD, d_out_norm, n, E, c.rms_eps, st);
+        if (out) {
+            mmvq_fn(8, d_out, bb.HD, (int) E, (int) c.n_vocab, bb.LOG, n);
+            out->assign((size_t) n, std::vector<float>((size_t) c.n_vocab_real));
+            for (int t = 0; t < n; ++t) {
+                ik::softcap(bb.LOG + (size_t) t * c.n_vocab, (int) c.n_vocab_real, c.final_softcap, st);
+                CK(cudaMemcpyAsync((*out)[(size_t) t].data(), bb.LOG + (size_t) t * c.n_vocab, (size_t) c.n_vocab_real * 4, cudaMemcpyDeviceToHost, st));
+            }
+        }
+        CK(cudaStreamSynchronize(st));
+        pos_cur = pos0 + n - 1;
+    }
     void step_block(const int64_t* tokens, int n, int pos0, std::vector<std::vector<float>>* out) {
         const int64_t E = c.n_embd;
+        if (n > 1 && n <= kB && std::getenv("STRATA_INKLING2_NO_BATCH") == nullptr) { step_block_b(tokens, n, pos0, out); return; }
         if (pos0 + n > cap) { std::fprintf(stderr, "inkling2 engine: positions %d..%d beyond the %d the caches hold\n", pos0, pos0 + n - 1, cap); std::exit(1); }
         ensure_tok_states(n);
         float *sh = h, *spre = pre_h, *sblk = blk, *sms = ms, *smsgs = msgs;   // the single-token step's own buffers, restored at the end

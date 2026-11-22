@@ -23,21 +23,22 @@ void qkv_prep(float* q, float* k, float* v, float* r, const float* qclip, const 
 void conv_dynamic(float* state, const float* x, const float* f, const float* dyn, float* out, int C, int taps, int heads, void* stream);
 
 /// Append one token's k, v ([KV][D] each) at position `pos` of a cache [cap][KV][D].
-void kv_append(float* Kc, float* Vc, const float* k, const float* v, int pos, int KV, int D, void* stream);
+void kv_append(float* Kc, float* Vc, const float* k, const float* v, int pos, int KV, int D, void* stream, int T = 1);   // T tokens at pos .. pos + T - 1
 
 /// One token's attention over the cache (positions 0 .. pos, the current already appended): logits q.k / sqrt(D) + bias(dist) with
 /// bias = r[h] . rel_bias[dist] for dist < extent (else 0), the window (0 = none) limiting the positions, a sink logit per head in the softmax
 /// (value zero), the output times sigmoid(gate).  scratch: [H][cap] floats.  out [H][D].
 void attention(const float* q, const float* r, const float* gate, const float* sink, const float* Kc, const float* Vc, const float* rel_bias, float* out,
-               float* scratch, int pos, int window, int extent, int cap, int H, int KV, int D, int R, void* stream);
+               float* scratch, int pos, int window, int extent, int cap, int H, int KV, int D, int R, void* stream, int T = 1);   // T tokens at pos .. pos + T - 1: q / r / gate / sink / out packed per token, scratch [T][H][cap]
 
 /// The attention residual for one token: states [n][C] (the blocks and the stream), nq queries q [nq][C]; per query: softmax over the n states of
 /// (q . rms(s)) / sqrt(C) (weightless RMS, eps 1e-6), out[k] = sum_n p_n rms(s_n).  out [nq][C].
-void attn_res(const float* states, int n, const float* q, int nq, float* out, int C, void* stream);
+/// T tokens (grid y): token t reads states + t * st_tok and writes out[t * out_tok + k * out_q + c] (0 = packed [nq][C] per token).
+void attn_res(const float* states, int n, const float* q, int nq, float* out, int C, void* stream, int T = 1, size_t st_tok = 0, size_t out_tok = 0, size_t out_q = 0);
 
 /// The loop control gate of a core layer, one token: cat = [rms(x); rms(msg)] (weightless, eps 1e-6) -> [2C];  then, after the caller has run
 /// cat @ down^T -> g (rank) and g @ forget^T, g @ gain^T (matmul_f32), mix:  y = (1 - tanh(forget)) x + tanh(gain) msg.
-void control_cat(const float* x, const float* msg, float* cat, int C, void* stream);
+void control_cat(const float* x, const float* msg, float* cat, int C, void* stream, int T = 1);   // T rows
 void control_mix(const float* x, const float* msg, const float* forget, const float* gain, float* y, int C, void* stream);
 
 /// SITU: h = tanh(g s / beta) beta sigmoid(g s) tanh(u s / gamma) gamma, s = the expert's gate/up scale; n values.

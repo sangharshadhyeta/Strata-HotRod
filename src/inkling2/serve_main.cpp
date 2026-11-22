@@ -186,13 +186,19 @@ int main(int argc, char** argv) {
             const auto t0 = Clock::now();
             std::vector<float> logits;
             bool cancelled = false;
-            for (size_t i = start; i < ids.size(); ++i) {
+            for (size_t i = start; i < ids.size();) {   // the prompt in blocks of 8 (visit-major, bit-identical to single steps); logits only for the last token
                 if (g_cancel) { cancelled = true; break; }
-                eng.step(ids[i], (int) i, i + 1 == ids.size() ? &logits : nullptr);
-                fed.push_back(ids[i]);
-                if ((i + 1 - start) % 16 == 0 || i + 1 == ids.size()) {
+                const int n = (int) std::min<size_t>(8, ids.size() - i);
+                std::vector<int64_t> tk(ids.begin() + (long) i, ids.begin() + (long) i + n);
+                const bool last = i + (size_t) n == ids.size();
+                std::vector<std::vector<float>> lg;
+                eng.step_block(tk.data(), n, (int) i, last ? &lg : nullptr);
+                fed.insert(fed.end(), ids.begin() + (long) i, ids.begin() + (long) i + n);
+                if (last) logits = lg.back();
+                i += (size_t) n;
+                if ((i - start) % 16 == 0 || last) {
                     const double ms = ms_since(t0);
-                    std::printf("PP %zu %zu %.0f %.1f\n", i + 1, ids.size(), ms, (double) (i + 1 - start) / (ms / 1e3));
+                    std::printf("PP %zu %zu %.0f %.1f\n", i, ids.size(), ms, (double) (i - start) / (ms / 1e3));
                     std::fflush(stdout);
                 }
             }
