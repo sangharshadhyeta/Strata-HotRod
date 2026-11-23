@@ -10587,7 +10587,19 @@ int main(int argc, char** argv) {
             const char* tc = std::getenv("STRATA_TAIL_CPU");
             if (tc != nullptr ? tc[0] == '0' : !all_experts_resident) {
                 const int floor_rank = strata::kernels::route_cfg_floor();
-                if (floor_rank > 0 && floor_rank < 10) {
+                const bool tw_env = std::getenv("STRATA_TAIL_WEIGHT") != nullptr;   // the user named a value (0 = the weight rule off: the rank rule stays)
+                if (floor_rank > 0 && floor_rank < 10 && tc == nullptr && !tw_env) strata::core::set_tail_weight(0.02f);   // the default: tau 0.02
+                if (floor_rank > 0 && floor_rank < 10 && tc == nullptr && strata::core::tail_weight() > 0.0f) {
+                    // The user chose the weight rule (STRATA_TAIL_WEIGHT=<tau>, e.g. 0.02, 0.05 or 0.10) and left STRATA_TAIL_CPU alone: the weight rule replaces the rank rule below.  A
+                    // missed expert that no stand-in took is skipped only when every pick of the window weighs under tau; heavier ones are computed.  Measured 23 Nov (48 checkable
+                    // problems, exact 26: 0.02 gave 28, 0.05 gave 27, 0.10 gave 26, all at the speed of the rank rule or a little above): no setting could be told from the exact run,
+                    // so 0.02, the mildest, is the default and the user edits it.  STRATA_TAIL_WEIGHT=0 or STRATA_TAIL_CPU=0 asks for the rank rule, STRATA_TAIL_CPU=1 for neither.
+                    strata::core::set_tail_skip_rank(0);
+                    if (const char* tr = std::getenv("STRATA_TAIL_READ"); tr != nullptr && tr[0] == '0') strata::core::set_tail_read_skip(true);
+                    std::fprintf(stderr, "strata serve: STRATA_TAIL_WEIGHT=%.3f replaces the rank rule: a missed expert that no stand-in took is skipped only when every token of a window "
+                                         "routes it at rank 2 or lower with a router weight below %.3f (its weight dropped, answers differ slightly); STRATA_TAIL_CPU=0 uses the rank rule "
+                                         "(ranks %d-9) instead, STRATA_TAIL_CPU=1 neither\n", (double) strata::core::tail_weight(), (double) strata::core::tail_weight(), floor_rank);
+                } else if (floor_rank > 0 && floor_rank < 10) {
                     strata::core::set_tail_skip_rank(floor_rank);
                     if (const char* tr = std::getenv("STRATA_TAIL_READ"); tr != nullptr && tr[0] == '0') {
                         strata::core::set_tail_read_skip(true);   // the read-ahead leaves the tail guesses unread
