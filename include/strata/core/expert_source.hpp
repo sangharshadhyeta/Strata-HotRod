@@ -721,6 +721,13 @@ void set_tail_weight(float tau);
 /// are always computed); 2 when there are no stand-ins to take it from.  Set by the serve start-up.
 int tail_weight_from();
 void set_tail_weight_from(int rank);
+/// STRATA_LAYER_SENS=<file> (opt-in): a measured sensitivity per layer (one number per layer, larger = the layer's output suffers more from a dropped expert; '#' lines
+/// ignored).  The weight rule's threshold then scales per layer, tau_l = tau * m_l, with m_l proportional to 1 / sensitivity_l (clamped to 0.25..4, mean 1): the budget
+/// of skipped weight is spent where a skip costs least (the idea of RCO-GSQ, arXiv 2604.18556, applied to the tail skip instead of the bit allocation).  Returns false and
+/// says why in `err` when the file is unreadable or has fewer numbers than layers.
+bool layer_sens_load(const char* path, int n_layers, std::string& err);
+/// The multiplier of STRATA_TAIL_WEIGHT for `layer` (1 when no sensitivity file was loaded).
+float tail_weight_layer_mult(int64_t layer);
 /// The verifier's host-mapped router weights of the window slice about to be served ([n_tok * k], indexed like the ids); null when not set.  Thread-local: set just before the
 /// pool call and cleared after it.
 void expert_dispatch_set_weights(const float* w);

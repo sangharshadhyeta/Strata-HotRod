@@ -5875,6 +5875,38 @@ namespace {
 std::atomic<int> g_tail_weight_from{2};
 }  // namespace
 int tail_weight_from() { return g_tail_weight_from.load(std::memory_order_relaxed); }
+namespace {
+std::vector<float> g_layer_mult;   // empty: no sensitivity file; written once at start-up, read by the dispatch
+}  // namespace
+bool layer_sens_load(const char* path, int n_layers, std::string& err) {
+    std::ifstream in(path);
+    if (!in) { err = std::string("cannot read ") + path; return false; }
+    std::vector<float> v;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line[0] == '#') continue;
+        std::istringstream ls(line);
+        float x;
+        while (ls >> x) v.push_back(x);
+    }
+    if ((int) v.size() < n_layers) { err = "the file has " + std::to_string(v.size()) + " numbers for " + std::to_string(n_layers) + " layers"; return false; }
+    v.resize((size_t) n_layers);
+    double mean = 0.0;
+    for (float x : v) mean += std::max(x, 1e-6f);
+    mean /= n_layers;
+    std::vector<float> m((size_t) n_layers);
+    double msum = 0.0;
+    for (int l = 0; l < n_layers; ++l) {
+        m[(size_t) l] = std::min(4.0f, std::max(0.25f, (float) (mean / std::max(v[(size_t) l], 1e-6f))));
+        msum += m[(size_t) l];
+    }
+    for (float& x : m) x = (float) (x * n_layers / msum);   // mean 1 after the clamp, so the average threshold stays tau
+    g_layer_mult = std::move(m);
+    return true;
+}
+float tail_weight_layer_mult(int64_t layer) {
+    return layer >= 0 && (size_t) layer < g_layer_mult.size() ? g_layer_mult[(size_t) layer] : 1.0f;
+}
 void set_tail_weight_from(int rank) { g_tail_weight_from.store(rank >= 1 && rank < 10 ? rank : 2, std::memory_order_relaxed); }
 void expert_dispatch_set_weights(const float* w) { t_route_w = w; }
 
@@ -6291,7 +6323,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // STRATA_RANK_CUTOFF=R (opt-in): ranks R..9 are not computed at all - the same skip, but also for an expert that is resident
         const int cut_rank = rank_cutoff();
         // STRATA_TAIL_WEIGHT=tau (opt-in): the weight rule, see tail_weight(); needs the verifier's router weights for this slice
-        const float tail_w = tail_weight();
+        const float tail_w = tail_weight() * tail_weight_layer_mult(d.layers);   // STRATA_LAYER_SENS: tau_l = tau * m_l (1 without the file)
         const int tail_w_from = tail_weight_from();   // the stand-ins' floor: the ranks below it are always computed
         const float* rw = t_route_w;
         const bool wt_on = tail_w > 0.0f && rw != nullptr;

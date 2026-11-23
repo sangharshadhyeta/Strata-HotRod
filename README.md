@@ -683,6 +683,20 @@ supporting evidence and not a proof of the rule used here.
   for it to prune anything here (mean 9.99 of 10 experts).
 - **C3PO** ([2504.07964](https://arxiv.org/abs/2504.07964)): re-mixes the routing weights of a pretrained MoE per sample at
   test time and reports accuracy gains, so a model's routing choices are not fixed points.
+- **HOBBIT** ([2411.01433](https://arxiv.org/abs/2411.01433)): mixed-precision expert offloading. It scores each expert by
+  its gate weight, keeps the important ones exact, loads the medium ones at lower precision and skips only the least
+  important, with thresholds on the cumulative gate weight. That is the same idea as `STRATA_TAIL_WEIGHT` (skip by router
+  weight, not by rank); HOBBIT swaps in low-precision copies where this fork skips or substitutes a resident expert. The
+  authors report that skipping about 10% of the experts costs more than 1% perplexity; the threshold here is a setting
+  for that reason, and the default has not been shown to be free of cost.
+- **Cache-conditional experts** ([2412.00099](https://arxiv.org/abs/2412.00099)): biases a pretrained MoE's routing toward
+  experts that are already in the cache, with no training, and reports more than half of the cache misses removed for a small
+  perplexity cost (0.1 to 3%). It is the closest published relative of the stand-ins, which also trade a missed expert for
+  one that is resident; they bias the router, the stand-ins replace the expert after routing.
+- **RCO-GSQ** ([2604.18556](https://arxiv.org/abs/2604.18556)): allocates quantization precision across layers by measured
+  sensitivity under a fixed budget. `STRATA_LAYER_SENS` borrows the allocation idea for the weight rule's skip threshold,
+  per layer instead of per bit width; the sensitivities come from this model's own router capture, and the effect on answers
+  has not been shown yet.
 
 </div>
 </details>

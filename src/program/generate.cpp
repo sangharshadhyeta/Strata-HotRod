@@ -10584,6 +10584,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: STRATA_TAIL_WEIGHT=%.3f: a missed expert that every token of a window routes at the stand-ins' floor rank or lower with a router weight below %.3f is "
                                      "skipped (its weight dropped, no renormalisation; answers differ; the stand-ins come first; use with STRATA_TAIL_CPU=1 STRATA_ROUTE_TAIL_SKIP=0 to test it alone)\n",
                              (double) strata::core::tail_weight(), (double) strata::core::tail_weight());
+            if (const char* ls = std::getenv("STRATA_LAYER_SENS"); ls != nullptr && ls[0] != '\0') {
+                std::string lerr;
+                if (strata::core::layer_sens_load(ls, (int) g.n_layers, lerr))
+                    std::fprintf(stderr, "strata serve: STRATA_LAYER_SENS=%s: the weight rule's threshold scales per layer (tau * 1/sensitivity, mean 1, clamped 0.25..4)\n", ls);
+                else
+                    std::fprintf(stderr, "strata serve: STRATA_LAYER_SENS=%s ignored: %s\n", ls, lerr.c_str());
+            }
             // the weight rule skips from the stand-ins' floor (STRATA_ROUTE_RESIDENT_RANKS), not from a fixed rank: the ranks below it - the edge rank included - are always computed
             if (const int fr = strata::kernels::route_cfg_floor(); fr > 0 && fr < 10) strata::core::set_tail_weight_from(fr);
             const char* tc = std::getenv("STRATA_TAIL_CPU");
