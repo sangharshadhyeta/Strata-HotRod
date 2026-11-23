@@ -5876,7 +5876,13 @@ std::atomic<int> g_tail_weight_from{2};
 }  // namespace
 int tail_weight_from() { return g_tail_weight_from.load(std::memory_order_relaxed); }
 namespace {
-std::vector<float> g_layer_mult;   // empty: no sensitivity file; written once at start-up, read by the dispatch
+constexpr int kLayerMultCap = 256;
+std::atomic<float> g_layer_mult[kLayerMultCap];   // the per-layer threshold multipliers; 1 = none.  Elementwise atomics so a reload while the dispatch reads is race-free
+std::atomic<bool> g_layer_mult_init{false};
+void layer_mult_init() {
+    bool e = false;
+    if (g_layer_mult_init.compare_exchange_strong(e, true)) for (auto& x : g_layer_mult) x.store(1.0f, std::memory_order_relaxed);
+}
 }  // namespace
 bool layer_sens_load(const char* path, int n_layers, std::string& err) {
     std::ifstream in(path);
@@ -5901,11 +5907,13 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err) {
         msum += m[(size_t) l];
     }
     for (float& x : m) x = (float) (x * n_layers / msum);   // mean 1 after the clamp, so the average threshold stays tau
-    g_layer_mult = std::move(m);
+    layer_mult_init();
+    for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) g_layer_mult[l].store(m[(size_t) l], std::memory_order_relaxed);
     return true;
 }
 float tail_weight_layer_mult(int64_t layer) {
-    return layer >= 0 && (size_t) layer < g_layer_mult.size() ? g_layer_mult[(size_t) layer] : 1.0f;
+    if (!g_layer_mult_init.load(std::memory_order_relaxed)) return 1.0f;
+    return layer >= 0 && layer < kLayerMultCap ? g_layer_mult[layer].load(std::memory_order_relaxed) : 1.0f;
 }
 void set_tail_weight_from(int rank) { g_tail_weight_from.store(rank >= 1 && rank < 10 ? rank : 2, std::memory_order_relaxed); }
 void expert_dispatch_set_weights(const float* w) { t_route_w = w; }

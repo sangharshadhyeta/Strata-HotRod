@@ -726,6 +726,7 @@ void set_tail_weight_from(int rank);
 /// of skipped weight is spent where a skip costs least (the idea of RCO-GSQ, arXiv 2604.18556, applied to the tail skip instead of the bit allocation).  Returns false and
 /// says why in `err` when the file is unreadable or has fewer numbers than layers.
 bool layer_sens_load(const char* path, int n_layers, std::string& err);
+// Safe to call again while decoding: the table is atomic per layer, so a table refreshed on disk (tools/layer_table.py) takes effect at the next window.
 /// The multiplier of STRATA_TAIL_WEIGHT for `layer` (1 when no sensitivity file was loaded).
 float tail_weight_layer_mult(int64_t layer);
 /// The verifier's host-mapped router weights of the window slice about to be served ([n_tok * k], indexed like the ids); null when not set.  Thread-local: set just before the

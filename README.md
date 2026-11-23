@@ -693,10 +693,12 @@ supporting evidence and not a proof of the rule used here.
   experts that are already in the cache, with no training, and reports more than half of the cache misses removed for a small
   perplexity cost (0.1 to 3%). It is the closest published relative of the stand-ins, which also trade a missed expert for
   one that is resident; they bias the router, the stand-ins replace the expert after routing.
-- **RCO-GSQ** ([2604.18556](https://arxiv.org/abs/2604.18556)): allocates quantization precision across layers by measured
-  sensitivity under a fixed budget. `STRATA_LAYER_SENS` borrows the allocation idea for the weight rule's skip threshold,
-  per layer instead of per bit width; the sensitivities come from this model's own router capture, and the effect on answers
-  has not been shown yet.
+- **GSQ** ([2604.18556](https://arxiv.org/abs/2604.18556)) and **RCO** ([2605.00649](https://arxiv.org/abs/2605.00649)): two papers from
+  the same group. GSQ is a post-training scalar quantizer that learns, per weight, which grid point to take (Gumbel-Softmax
+  relaxation) against a block-output reconstruction loss on calibration text. RCO allocates a fixed budget (bits per layer or
+  expert, or experts kept) by optimising the allocation against the model's own calibration loss, with the weights themselves
+  left untouched. `STRATA_LAYER_SENS` borrows only RCO's idea of spending a fixed budget unevenly across layers, using a
+  measured per-layer error map instead of RCO's gradient-based search; the effect on answers has not been shown yet.
 
 </div>
 </details>

@@ -1626,6 +1626,9 @@ static std::string lm_map_path(const Options& o) {
 }
 /// The stand-in tuning of this model (STRATA_ROUTE_BUDGET_AUTO / STRATA_FRAGILE_RECHECK: budget, k, step, counts), beside the expert
 /// profile like the reserve files.  It is keyed to the model fingerprint inside (Verifier::route_tune_open).
+static std::string g_layer_sens_path;   // the per-layer threshold table in force (STRATA_LAYER_SENS or <pack>/layer-sens.txt); empty = none
+static std::filesystem::file_time_type g_layer_sens_mtime{};
+static int g_layer_sens_layers = 0;
 static std::string standin_tune_path(const Options& o) {
     const std::string& p = !o.expert_profile.empty() ? o.expert_profile : o.expert_profile_save;
     if (p.empty()) return "";
@@ -10584,8 +10587,20 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: STRATA_TAIL_WEIGHT=%.3f: a missed expert that every token of a window routes at the stand-ins' floor rank or lower with a router weight below %.3f is "
                                      "skipped (its weight dropped, no renormalisation; answers differ; the stand-ins come first; use with STRATA_TAIL_CPU=1 STRATA_ROUTE_TAIL_SKIP=0 to test it alone)\n",
                              (double) strata::core::tail_weight(), (double) strata::core::tail_weight());
-            if (const char* ls = std::getenv("STRATA_LAYER_SENS"); ls != nullptr && ls[0] != '\0') {
+            // the per-layer table: STRATA_LAYER_SENS=<file>, else <pack>/layer-sens.txt beside the expert profile when it exists (made and refreshed by tools/layer_table.py from real
+            // traffic; absent = every layer at the flat threshold, the shipped default)
+            std::string ls_path = std::getenv("STRATA_LAYER_SENS") != nullptr ? std::getenv("STRATA_LAYER_SENS") : "";
+            if (ls_path.empty()) {
+                const std::string& pp = !o.expert_profile.empty() ? o.expert_profile : o.expert_profile_save;
+                if (!pp.empty()) {
+                    ls_path = (std::filesystem::path(pp).parent_path() / "layer-sens.txt").string();   // may not exist yet: watched for, loaded when it appears
+                }
+            }
+            g_layer_sens_path = ls_path;
+            g_layer_sens_layers = (int) g.n_layers;
+            if (const char* ls = ls_path.c_str(); !ls_path.empty() && (std::getenv("STRATA_LAYER_SENS") != nullptr || std::filesystem::exists(ls_path))) {
                 std::string lerr;
+                {   std::error_code mec; g_layer_sens_mtime = std::filesystem::last_write_time(ls, mec); }
                 if (strata::core::layer_sens_load(ls, (int) g.n_layers, lerr))
                     std::fprintf(stderr, "strata serve: STRATA_LAYER_SENS=%s: the weight rule's threshold scales per layer (tau * 1/sensitivity, mean 1, clamped 0.25..4)\n", ls);
                 else
@@ -15574,6 +15589,16 @@ int main(int argc, char** argv) {
             }
             {   // tail_weight= / tail_skip=: the audit's switches (docs/HOTROD-DETAILS.md).  A request that names one overrides it for this request; the next request
                 // without it gets the value that was in force before back.  Never touched while no request uses the keys.
+                if (!g_layer_sens_path.empty() && g_layer_sens_layers > 0) {   // a table refreshed on disk takes effect at the next request
+                    std::error_code mec;
+                    const auto mt = std::filesystem::last_write_time(g_layer_sens_path, mec);
+                    if (!mec && mt != g_layer_sens_mtime) {
+                        std::string lerr;
+                        g_layer_sens_mtime = mt;
+                        std::fprintf(stderr, "strata serve: layer table %s %s\n", g_layer_sens_path.c_str(),
+                                     strata::core::layer_sens_load(g_layer_sens_path.c_str(), g_layer_sens_layers, lerr) ? "reloaded" : ("not reloaded: " + lerr).c_str());
+                    }
+                }
                 static bool tw_over = false, ts_over = false;
                 static float tw_saved = 0.0f;
                 static int ts_saved = 0;
