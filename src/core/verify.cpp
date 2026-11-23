@@ -5950,7 +5950,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
         static uint32_t pushed_gen = 0;   // stop asking: the multipliers are copied to the kernel's configuration only when they changed
         if (sub_on && strata::core::layer_mult_generation() != pushed_gen) {
             pushed_gen = strata::core::layer_mult_generation();
-            for (int l = 0; l < 128; ++l) strata::kernels::route_cfg_set_layer_budget_mult(l, std::max(0.05f, strata::core::layer_mult_shape(l)));
+            for (int l = 0; l < 128; ++l) strata::kernels::route_cfg_set_layer_budget_mult(l, std::max(0.05f, strata::core::layer_budget_shape(l)));
         }
     }
     // STRATA_FRAGILE_CTRL_EVERY: this window's fragile control flag, decided and written before the window runs (the kernels read it at launch)

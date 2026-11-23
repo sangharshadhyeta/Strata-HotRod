@@ -698,7 +698,7 @@ supporting evidence and not a proof of the rule used here.
   relaxation) against a block-output reconstruction loss on calibration text. RCO allocates a fixed budget (bits per layer or
   expert, or experts kept) by optimising the allocation against the model's own calibration loss, with the weights themselves
   left untouched. `STRATA_LAYER_SENS` borrows only RCO's idea of spending a fixed budget unevenly across layers, using a
-  measured per-layer error map instead of RCO's gradient-based search; the effect on answers has not been shown yet.
+  measured per-layer error map instead of RCO's gradient-based search, and the engine's per-layer learning (`STRATA_LAYER_LEARN`) now measures that error itself from the work it does anyway, so each layer settles on its own skip threshold (0.078-0.169 on Qwen; the cost of a skip rises 3-5 times from the middle layers to the last twelve). GSQ's idea of choosing the rounding against block-output reconstruction on calibration text, and RCO's of spending a fixed budget unevenly, are what the data-aware low-rank copies (`STRATA_LOWRANK`, 4-bit factors fitted against the layer's own activations) borrow; the copies are opt-in and not shown to beat skipping in the engine. Details and the measured coherence: [docs/HOTROD-DETAILS.md](docs/HOTROD-DETAILS.md#what-the-per-layer-learning-settled-on-qwen38-flash-next-iq3_s-23-nov-2026).
 
 </div>
 </details>

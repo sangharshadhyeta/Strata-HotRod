@@ -40,6 +40,7 @@
 #include <memory>
 #include <new>
 #include <mutex>
+#include <unordered_map>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -5909,7 +5910,6 @@ std::atomic<uint32_t> g_live_win{0};
 std::atomic<bool> g_live_settled{false};   // the thresholds have stopped moving: the histogram is fed 1 window in 16 and re-solved every 1024 windows instead of every 64
 std::atomic<uint32_t> g_live_calm{0};          // consecutive re-solves that moved no layer's threshold by more than 3%
 std::string g_live_path;
-std::atomic<uint64_t> g_dbg_plan{0}, g_dbg_wt{0}, g_dbg_live{0}, g_dbg_note{0}, g_dbg_rank{0}, g_dbg_badw{0};   // why the histogram stays empty (debug)
 int g_live_layers = 0;
 int live_bin(double w) {
     const double pos = std::log(w / kBinLo) / std::log(kBinSpan) * kBins;
@@ -5929,13 +5929,226 @@ double hist_below(int l, double t) {
 void layer_live_set(bool on) { layer_mult_init(); g_live_on.store(on, std::memory_order_relaxed); }
 void layer_live_set_share(float share) { g_live_share.store(share > 0.0f && share < 1.0f ? share : 0.0f, std::memory_order_relaxed); }
 bool layer_live_on() { return g_live_on.load(std::memory_order_relaxed); }
+
+// ---- low-rank copies (opt-in STRATA_LOWRANK=1): a skipped missed expert whose copy is in <dir>/lowrank.bin (tools/lowrank_fit.py) is computed from the copy instead of being zero ----
+// The copy of one expert is three W ~ B A pairs (4-bit, groups of 32, fp16 scales), dequantized to float once, on first use.  The file is only ever appended to; it is looked at again every
+// 4096 calls while copies are being added and every 1<<20 once nothing new has appeared in a while (the sidecar has settled).
+struct LowrankCopy { int rank = 0; std::vector<float> bg, ag, bu, au, bd, ad; };
+std::mutex g_lr_mu;
+std::unordered_map<uint32_t, LowrankCopy> g_lr;
+uint64_t g_lr_off = 8;            // how far into lowrank.bin has been read
+std::atomic<uint32_t> g_lr_calls{0};
+std::atomic<uint32_t> g_lr_next_check{0};
+std::atomic<uint64_t> g_lr_served{0};
+std::atomic<int> g_lr_on{-1};     // -1 unknown, 0 off, 1 on
+uint32_t g_lr_quiet = 0;          // checks in a row that found nothing new
+
+float lr_half(uint16_t h) {
+    const uint32_t sg = (h >> 15) & 1u, ex = (h >> 10) & 31u, mt = h & 1023u;
+    float v;
+    if (ex == 0) v = std::ldexp((float) mt, -24);
+    else if (ex == 31) v = mt ? std::nanf("") : INFINITY;
+    else v = std::ldexp((float) (mt + 1024u), (int) ex - 25);
+    return sg ? -v : v;
+}
+// rows x cols matrix stored as fp16 scales [rows][ng] then nibbles [rows][ng*group/2]; returns the bytes consumed
+size_t lr_matrix(const uint8_t* p, int rows, int cols, int group, std::vector<float>& out) {
+    const int ng = (cols + group - 1) / group;
+    const uint8_t* sc = p;
+    const uint8_t* nb = p + (size_t) rows * ng * 2;
+    out.assign((size_t) rows * cols, 0.0f);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) {
+            const int g = c / group;
+            uint16_t h; std::memcpy(&h, sc + ((size_t) r * ng + g) * 2, 2);
+            const uint8_t b = nb[(size_t) r * ng * group / 2 + c / 2];
+            const int q = (c & 1) ? (b >> 4) : (b & 15);
+            out[(size_t) r * cols + c] = (float) (q - 8) * lr_half(h);
+        }
+    return (size_t) rows * ng * 2 + (size_t) rows * ng * group / 2;
+}
+void lr_reload_locked(const std::string& path) {
+    std::error_code ec;
+    const uint64_t sz = std::filesystem::file_size(path, ec);
+    if (ec || sz <= g_lr_off) return;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return;
+    char mg[8];
+    if (std::fread(mg, 1, 8, f) != 8 || std::memcmp(mg, "LRC1", 4) != 0) { std::fclose(f); return; }
+    size_t added = 0;
+    std::fseek(f, (long) g_lr_off, SEEK_SET);
+    for (;;) {
+        uint16_t h[4];
+        if (std::fread(h, 2, 4, f) != 4) break;
+        const int layer = h[0], expert = h[1], rank = h[2], group = h[3];
+        if (rank <= 0 || rank > 1024 || group <= 0 || group > 256) break;
+        const int ng_r = (rank + group - 1) / group, ng_i = (2560 + group - 1) / group, ng_h = (640 + group - 1) / group;
+        const size_t bytes = (size_t) 640 * (ng_r * 2 + ng_r * group / 2) * 2 + (size_t) rank * (ng_i * 2 + ng_i * group / 2) * 2 +
+                             (size_t) 2560 * (ng_r * 2 + ng_r * group / 2) + (size_t) rank * (ng_h * 2 + ng_h * group / 2);
+        std::vector<uint8_t> buf(bytes);
+        if (std::fread(buf.data(), 1, bytes, f) != bytes) break;   // a record cut short at the end: read when it is complete
+        LowrankCopy lc; lc.rank = rank;
+        size_t o = 0;
+        o += lr_matrix(buf.data() + o, 640, rank, group, lc.bg);
+        o += lr_matrix(buf.data() + o, rank, 2560, group, lc.ag);
+        o += lr_matrix(buf.data() + o, 640, rank, group, lc.bu);
+        o += lr_matrix(buf.data() + o, rank, 2560, group, lc.au);
+        o += lr_matrix(buf.data() + o, 2560, rank, group, lc.bd);
+        o += lr_matrix(buf.data() + o, rank, 640, group, lc.ad);
+        g_lr[(uint32_t) layer << 16 | (uint32_t) expert] = std::move(lc);
+        g_lr_off += 8 + bytes;
+        ++added;
+    }
+    std::fclose(f);
+    g_lr_quiet = added ? 0 : g_lr_quiet + 1;
+    if (added) std::fprintf(stderr, "strata serve: low-rank copies: %zu loaded from %s (%zu in all)\n", added, path.c_str(), g_lr.size());
+}
+void lr_matvec(const float* M, int rows, int cols, const float* x, float* y) {
+    for (int r = 0; r < rows; ++r) {
+        const float* m = M + (size_t) r * cols;
+        float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        int c = 0;
+        for (; c + 4 <= cols; c += 4) { a0 += m[c] * x[c]; a1 += m[c + 1] * x[c + 1]; a2 += m[c + 2] * x[c + 2]; a3 += m[c + 3] * x[c + 3]; }
+        for (; c < cols; ++c) a0 += m[c] * x[c];
+        y[r] = (a0 + a1) + (a2 + a3);
+    }
+}
+
+
+// ---- per-layer learning (opt-in STRATA_LAYER_LEARN=full|sample; =1 is full, the default mode) ----
+// Two strategies, one state, one settle rule, one saved file.  SAMPLE (=sample): skipping runs from the start; while a layer has not settled, 1 skipped expert in a few windows is ALSO computed
+// exactly and compared with what was used (zero or the copy): every 6th window until the layer's first 64 samples (once, ever), every 16th after.  FULL (the default mode when on): see below - slow at first, no sampling.
+// A layer that has not settled is run EXACT: the weight rule skips nothing there (the stand-ins run as always).  Every missed pick the CPU computes anyway is a measurement for free: its router weight w and the size
+// of its output |e| are what dropping it would cost (w^2 |e|^2), and where the layer has low-rank copies the copy's error is computed beside it.  When the layer's estimate of that cost is stable (standard error
+// of the mean within 10%, at least 64 picks) the layer SETTLES: skipping turns on for it, with its own threshold, and nothing is measured there any more.  The layers settle one by one, so the engine speeds up
+// layer by layer.  A settled layer wakes (runs exact again, learns again) only if its live threshold has moved more than 10% from the value it settled at.  The state is saved in <dir>/layer-shadow.bin.
+struct LearnLayer { uint32_t n = 0; double mean = 0, m2 = 0; double sk = 0, us = 0, wsk = 0, wus = 0; bool settled = false, fast_done = false; float mult_at_settle = 1.0f; };
+std::atomic<uint32_t> g_sh_tick[kLayerMultCap];
+std::mutex g_sh_mu;
+LearnLayer g_sh[kLayerMultCap];
+std::atomic<int> g_sh_on{-1};
+bool g_sh_loaded = false;
+float g_sh_w[512];                  // the router weight of the missed candidate of this window (set where the skip would be decided)
+uint32_t g_sh_cand[512];            // the window stamp it was set in
+uint32_t g_sh_stamp = 0;
+bool g_sh_rec = false;              // this window's candidates are to be recorded after the CPU's run
+std::string shadow_path() { return (std::filesystem::path(g_live_path).parent_path() / "layer-shadow.bin").string(); }
+// callers hold g_sh_mu
+void shadow_save_locked() {
+    if (g_live_path.empty()) return;
+    const std::string p = shadow_path(), tmp = p + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return;
+    const uint32_t mg = 0x33484c53u, nl = (uint32_t) kLayerMultCap;   // "SLH3"
+    std::fwrite(&mg, 4, 1, f); std::fwrite(&nl, 4, 1, f);
+    for (int l = 0; l < kLayerMultCap; ++l) {
+        const LearnLayer& L = g_sh[l];
+        const uint8_t fl[2] = {(uint8_t) L.settled, (uint8_t) L.fast_done};
+        std::fwrite(fl, 1, 2, f); std::fwrite(&L.n, 4, 1, f);
+        std::fwrite(&L.sk, 8, 1, f); std::fwrite(&L.us, 8, 1, f); std::fwrite(&L.wsk, 8, 1, f); std::fwrite(&L.wus, 8, 1, f); std::fwrite(&L.mult_at_settle, 4, 1, f);
+    }
+    std::fclose(f);
+    std::error_code ec;
+    std::filesystem::rename(tmp, p, ec);
+}
+void shadow_load_locked() {
+    g_sh_loaded = true;
+    if (g_live_path.empty()) return;
+    FILE* f = std::fopen(shadow_path().c_str(), "rb");
+    if (f == nullptr) return;
+    uint32_t mg = 0, nl = 0;
+    if (std::fread(&mg, 4, 1, f) != 1 || std::fread(&nl, 4, 1, f) != 1 || mg != 0x33484c53u || nl != (uint32_t) kLayerMultCap) { std::fclose(f); return; }
+    int settled = 0;
+    for (int l = 0; l < kLayerMultCap; ++l) {
+        LearnLayer L; uint8_t fl[2] = {0, 0};
+        if (std::fread(fl, 1, 2, f) != 2 || std::fread(&L.n, 4, 1, f) != 1 || std::fread(&L.sk, 8, 1, f) != 1 || std::fread(&L.us, 8, 1, f) != 1 ||
+            std::fread(&L.wsk, 8, 1, f) != 1 || std::fread(&L.wus, 8, 1, f) != 1 || std::fread(&L.mult_at_settle, 4, 1, f) != 1) break;
+        L.settled = fl[0] != 0; L.fast_done = fl[1] != 0;
+        settled += L.settled ? 1 : 0;
+        g_sh[l] = L;
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "strata serve: layer learn: state loaded from %s (%d layers settled: they skip from the start)\n", shadow_path().c_str(), settled);
+}
+int learn_mode() {   // 0 off, 1 sample, 2 full (the default mode)
+    static const int m = [] {
+        const char* e = std::getenv("STRATA_LAYER_LEARN");
+        if (e == nullptr || e[0] == '\0' || e[0] == '0') return 0;
+        return std::strcmp(e, "sample") == 0 ? 1 : 2;   // =1 or =full: FULL (the default mode); =sample: the sampling strategy
+    }();
+    return m;
+}
+// still learning?  loads the saved state on first use; a settled layer wakes when its live threshold moved more than 10% from the one it settled at (the fast rate never returns)
+bool learn_tick(int64_t layer) {
+    if (layer < 0 || layer >= kLayerMultCap) return false;
+    std::lock_guard<std::mutex> lk(g_sh_mu);
+    if (!g_sh_loaded) shadow_load_locked();
+    LearnLayer& L = g_sh[layer];
+    if (!L.settled) return true;
+    const float m = g_layer_mult[layer].load(std::memory_order_relaxed);
+    if (std::fabs(m - L.mult_at_settle) <= 0.10f * std::max(L.mult_at_settle, 1e-3f)) return false;
+    const float was = L.mult_at_settle;
+    const bool fd = L.fast_done;
+    L = LearnLayer();
+    L.fast_done = fd;
+    std::fprintf(stderr, "strata serve: layer learn: layer %lld woke (its threshold moved from x%.2f to x%.2f): learning again until it settles\n", (long long) layer, (double) was, (double) m);
+    shadow_save_locked();
+    return true;
+}
+bool learn_active(int64_t layer) { return learn_mode() == 2 && learn_tick(layer); }   // FULL: a layer still learning runs exact
+// one measurement: sk = |exact|^2, us = |used - exact|^2, w = the pick's router weight
+void learn_add(int64_t layer, double sk, double us, float w) {
+    std::lock_guard<std::mutex> lk(g_sh_mu);
+    LearnLayer& L = g_sh[layer];
+    if (L.settled) return;
+    const double xv = (double) w * w * sk;                            // the layer's cost of dropping this pick
+    ++L.n;
+    const double dlt = xv - L.mean;
+    L.mean += dlt / (double) L.n;
+    L.m2 += dlt * (xv - L.mean);
+    L.sk += sk; L.us += us; L.wsk += xv; L.wus += (double) w * w * us;
+    if (L.n >= 64 && !L.fast_done) { L.fast_done = true; shadow_save_locked(); }
+    if (L.n < 64) return;
+    const double se = std::sqrt(L.m2 / (double) (L.n - 1) / (double) L.n);   // standard error of the mean
+    if (se <= 0.10 * L.mean || L.n >= 4096) {
+        L.settled = true;
+        L.mult_at_settle = g_layer_mult[layer].load(std::memory_order_relaxed);
+        std::fprintf(stderr, "strata serve: layer learn (%s): layer %lld settled after %u picks%s: weighted skip error %.4g (+-%.1f%%), used/skip error ratio %.3f\n",
+                     learn_mode() == 2 ? "full" : "sample", (long long) layer, L.n, L.n >= 4096 ? " (capped)" : "", std::sqrt(L.mean), 100.0 * se / std::max(L.mean, 1e-30), L.sk > 0 ? L.us / L.sk : 1.0);
+        shadow_save_locked();
+        g_mult_gen.fetch_add(1, std::memory_order_relaxed);   // the stand-in budgets follow the measured cost: they are pushed again
+    }
+}
+// FULL: one missed pick the CPU computed exactly anyway: row = its output (Hout floats), x = the layer's input activation, w = its router weight
+void learn_note(int64_t layer, int expert, const float* x, const float* row, int64_t n, float w) {
+    double sk = 0;
+    for (int64_t i = 0; i < n; ++i) sk += (double) row[i] * row[i];
+    double us = sk;                                                  // dropping it: the whole output is the error
+    static thread_local std::vector<float> cp;
+    cp.assign((size_t) n, 0.0f);
+    if (lowrank_apply(layer, expert, x, cp.data(), n)) {             // a copy of this expert exists: its error beside it
+        us = 0;
+        for (int64_t i = 0; i < n; ++i) { const double d = (double) cp[(size_t) i] - row[i]; us += d * d; }
+    }
+    learn_add(layer, sk, us, w);
+}
+// SAMPLE: does this layer take an exact sample in this window?  every 6th window (staggered by layer) until its first 64 samples - once, ever - then every 16th; none once settled
+bool sample_want(int64_t layer) {
+    if (learn_mode() != 1 || layer < 0 || layer >= kLayerMultCap) return false;
+    const uint32_t tick = g_sh_tick[layer].fetch_add(1, std::memory_order_relaxed);
+    if (!learn_tick(layer)) return false;
+    bool fd;
+    { std::lock_guard<std::mutex> lk(g_sh_mu); fd = g_sh[layer].fast_done; }
+    return !fd ? ((tick + (uint32_t) layer * 5u) % 6u) == 0 : ((tick + (uint32_t) layer) & 15u) == 0;
+}
+
+bool skipcnt_on() { static const bool on = [] { const char* e = std::getenv("STRATA_LOWRANK"); return e != nullptr && e[0] == '1'; }(); return on; }   // only the copy sidecar reads the per-expert skip counts
 void layer_skip_note(int64_t layer, int expert) {
-    if (layer < 0 || layer >= kLayerMultCap || expert < 0 || expert >= 512) return;
+    if (!skipcnt_on() || layer < 0 || layer >= kLayerMultCap || expert < 0 || expert >= 512) return;
     g_skipcnt[layer][expert].fetch_add(1, std::memory_order_relaxed);
 }
 void layer_live_note(int64_t layer, float w) {
-    g_dbg_note.fetch_add(1, std::memory_order_relaxed);
-    if (layer < 0 || layer >= kLayerMultCap || !(w > 0.0f)) { g_dbg_badw.fetch_add(1, std::memory_order_relaxed); return; }
+    if (layer < 0 || layer >= kLayerMultCap || !(w > 0.0f)) return;
     const int b = live_bin((double) w);
     g_lhist[layer][b].fetch_add(1, std::memory_order_relaxed);
     g_lwsum[layer][b].fetch_add((uint64_t) ((double) w * 1e6), std::memory_order_relaxed);
@@ -5955,7 +6168,7 @@ bool layer_live_save() {
     std::fclose(f);
     std::error_code ec;
     std::filesystem::rename(tmp, g_live_path, ec);
-    {   // the skip counts: <dir>/layer-skips.bin, "LSK1", layers, 512, u32 [layers][512]
+    if (skipcnt_on()) {   // the skip counts: <dir>/layer-skips.bin, "LSK1", layers, 512, u32 [layers][512]
         const std::string sp = (std::filesystem::path(g_live_path).parent_path() / "layer-skips.bin").string(), stmp = sp + ".tmp";
         if (FILE* g = std::fopen(stmp.c_str(), "wb")) {
             const uint32_t m2 = 0x314b534cu, nl2 = (uint32_t) g_live_layers, ne2 = 512;
@@ -5999,7 +6212,7 @@ void layer_live_refresh(int n_layers, double tau) {
     const uint32_t win = g_live_win.fetch_add(1, std::memory_order_relaxed);
     if ((win & (g_live_settled.load(std::memory_order_relaxed) ? 1023u : 63u)) != 0) return;
     if (win > 0 && (win & 4095u) == 0)   // forget slowly: halve the counts every 4096 windows
-        for (int l = 0; l < n_layers; ++l) for (int e = 0; e < 512; ++e) g_skipcnt[l][e].store(g_skipcnt[l][e].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
+        if (skipcnt_on()) for (int l = 0; l < n_layers; ++l) for (int e = 0; e < 512; ++e) g_skipcnt[l][e].store(g_skipcnt[l][e].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
     if (win > 0 && (win & 4095u) == 0)
         for (int l = 0; l < n_layers; ++l) for (int b = 0; b < kBins; ++b) {
             g_lhist[l][b].store(g_lhist[l][b].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
@@ -6026,7 +6239,7 @@ void layer_live_refresh(int n_layers, double tau) {
     }
     if (const float sh = g_live_share.load(std::memory_order_relaxed); sh > 0.0f) target = (double) sh * total;   // system-driven: skip this share of the missed picks, whatever the flat threshold would skip
     if (total < 2000.0 || target < 20.0) {              // too few weights seen yet: every layer keeps the configured threshold
-        if (win == 0 || win == 64 || win == 256 || win == 1024) std::fprintf(stderr, "strata serve: layer live: collecting (window %u, %.0f missed-expert weights seen, %.0f below %.4f, %d layers; plan blocks %llu, weight rule on %llu, live on %llu, notes %llu (bad %llu), rank rule on %llu)\n", win, total, target, tau, n_layers, (unsigned long long) g_dbg_plan.load(), (unsigned long long) g_dbg_wt.load(), (unsigned long long) g_dbg_live.load(), (unsigned long long) g_dbg_note.load(), (unsigned long long) g_dbg_badw.load(), (unsigned long long) g_dbg_rank.load());
+        if (win == 0 || win == 64 || win == 256 || win == 1024) std::fprintf(stderr, "strata serve: layer live: collecting (window %u, %.0f missed-expert weights seen, %.0f below %.4f, %d layers)\n", win, total, target, tau, n_layers);
         return;
     }
     std::vector<double> shape((size_t) n_layers, 1.0);
@@ -6116,6 +6329,53 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err) {
 void layer_earn_set(bool on) { g_earn.store(on, std::memory_order_relaxed); }
 bool layer_earned() { return !g_earn.load(std::memory_order_relaxed) || g_earned.load(std::memory_order_relaxed); }
 // The multipliers' shape alone, mean 1 over the layers: what the per-layer stand-in budget uses (its overall level is the user's budget, not the skip threshold's).
+
+/// A skipped missed expert's output from its low-rank copy (row = Hout floats, the raw expert output the router weight is applied to later); false when there is no copy (the row stays zero).
+bool lowrank_apply(int64_t layer, int expert, const float* x, float* row, int64_t hout) {
+    if (g_lr_on.load(std::memory_order_relaxed) < 0) {
+        const char* e = std::getenv("STRATA_LOWRANK");
+        g_lr_on.store(e != nullptr && e[0] == '1' && !g_live_path.empty() ? 1 : 0, std::memory_order_relaxed);
+    }
+    if (g_lr_on.load(std::memory_order_relaxed) != 1 || hout != 2560) return false;
+    const uint32_t calls = g_lr_calls.fetch_add(1, std::memory_order_relaxed);
+    const LowrankCopy* lc = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_lr_mu);
+        if (calls >= g_lr_next_check.load(std::memory_order_relaxed)) {   // looks at the file again: often while copies are arriving, rarely once it has been quiet
+            lr_reload_locked((std::filesystem::path(g_live_path).parent_path() / "lowrank.bin").string());
+            g_lr_next_check.store(calls + (g_lr_quiet >= 3 ? (1u << 20) : 4096u), std::memory_order_relaxed);
+        }
+        const auto it = g_lr.find((uint32_t) layer << 16 | (uint32_t) expert);
+        if (it != g_lr.end()) lc = &it->second;
+    }
+    if (lc == nullptr) return false;
+    const int r = lc->rank;
+    static thread_local std::vector<float> t, g, u, h, t2;
+    t.resize((size_t) r); g.resize(640); u.resize(640); h.resize(640); t2.resize((size_t) r);
+    lr_matvec(lc->ag.data(), r, 2560, x, t.data());
+    lr_matvec(lc->bg.data(), 640, r, t.data(), g.data());
+    lr_matvec(lc->au.data(), r, 2560, x, t.data());
+    lr_matvec(lc->bu.data(), 640, r, t.data(), u.data());
+    for (int i = 0; i < 640; ++i) h[(size_t) i] = g[(size_t) i] / (1.0f + std::exp(-g[(size_t) i])) * u[(size_t) i];
+    lr_matvec(lc->ad.data(), r, 640, h.data(), t2.data());
+    lr_matvec(lc->bd.data(), 2560, r, t2.data(), row);
+    if ((g_lr_served.fetch_add(1, std::memory_order_relaxed) & 4095u) == 0)
+        std::fprintf(stderr, "strata serve: low-rank copies: %llu skipped picks served by a copy so far\n", (unsigned long long) g_lr_served.load(std::memory_order_relaxed));
+    return true;
+}
+/// The per-layer stand-in budget multiplier (mean 1 over the layers that have it): from the MEASURED cost of dropping a pick in each settled layer (the learning's weighted skip error) - a layer where a
+/// drop is expensive gets a tighter budget, a cheap one a looser one (x0.25..x2).  A layer that has not settled, or learning off: the weight shape (layer_mult_shape).
+float layer_budget_shape(int64_t layer) {
+    if (learn_mode() == 0 || layer < 0 || layer >= kLayerMultCap) return layer_mult_shape(layer);
+    std::lock_guard<std::mutex> lk(g_sh_mu);
+    if (!g_sh[layer].settled || g_sh[layer].mean <= 0.0) return layer_mult_shape(layer);
+    double sum = 0; int cnt = 0;
+    for (int l = 0; l < kLayerMultCap; ++l)
+        if (g_sh[l].settled && g_sh[l].mean > 0.0) { sum += 1.0 / std::sqrt(g_sh[l].mean); ++cnt; }
+    if (cnt == 0) return layer_mult_shape(layer);
+    const double m = (1.0 / std::sqrt(g_sh[layer].mean)) / (sum / cnt);   // mean 1 over the settled layers
+    return (float) std::min(2.0, std::max(0.25, m));
+}
 uint32_t layer_mult_generation() { return g_mult_gen.load(std::memory_order_relaxed); }
 float layer_mult_shape(int64_t layer) {
     const int n = g_mult_layers.load(std::memory_order_relaxed);
@@ -6656,10 +6916,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const float* rw = t_route_w;
         const bool wt_on = tail_w > 0.0f && rw != nullptr;
         const bool live_note = wt_on && n_tok <= 8 && g_live_on.load(std::memory_order_relaxed) && (!g_live_settled.load(std::memory_order_relaxed) || (g_live_win.load(std::memory_order_relaxed) & 15u) == 0);
-        g_dbg_plan.fetch_add(1, std::memory_order_relaxed);
-        if (wt_on) g_dbg_wt.fetch_add(1, std::memory_order_relaxed);
-        if (live_note) g_dbg_live.fetch_add(1, std::memory_order_relaxed);
-        if (tail_rank > 0) g_dbg_rank.fetch_add(1, std::memory_order_relaxed);
+        const bool learning = wt_on && learn_active(d.layers);   // STRATA_LAYER_LEARN: this layer has not settled: no weight-rule skips here, the picks are measured
+        if (learning && n_tok <= 8) { ++g_sh_stamp; g_sh_rec = true; }
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
         if ((tail_rank > 0 || cut_rank > 0 || wt_on) && d.peer == nullptr && d.remote_count == 0) {
@@ -6681,11 +6939,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (live_note && !resident && minr[q] >= tail_w_from) layer_live_note(d.layers, maxw[q]);   // the live thresholds' histogram: the weight of a missed expert the rule looks at
                 const bool cut = cut_rank > 0 && minr[q] >= cut_rank;                          // STRATA_RANK_CUTOFF: skipped even when resident
                 const bool tail = tail_rank > 0 && minr[q] >= tail_rank && !resident;          // STRATA_ROUTE_TAIL_SKIP: a missed expert only
-                const bool wtail = wt_on && !resident && minr[q] >= tail_w_from && maxw[q] < tail_w;   // STRATA_TAIL_WEIGHT: a missed expert whose every pick weighs less than tau
+                if (learning && n_tok <= 8 && !resident && minr[q] >= tail_w_from) { g_sh_cand[(size_t) e & 511] = g_sh_stamp; g_sh_w[(size_t) e & 511] = maxw[q]; }
+                const bool wtail = wt_on && !learning && !resident && minr[q] >= tail_w_from && maxw[q] < tail_w;   // STRATA_TAIL_WEIGHT: a missed expert whose every pick weighs less than tau
                 if (!resident && pf_funnel_on()) (cut || tail || wtail ? pf_rk_skip : pf_rk_read)[minr[q] < 3 ? 0 : minr[q] < 7 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
                 if (!cut && !tail && !wtail) continue;
                 skip_d[q] = true;
-                if (!resident) { --nmiss; if (live_note) layer_skip_note(d.layers, (int) e); }   // which missed experts get skipped: what a copy of the real expert would serve
+                if (!resident) { --nmiss; if (live_note) layer_skip_note(d.layers, (int) e); if (learn_mode() == 1) g_sh_w[(size_t) e & 511] = maxw[q]; }   // which missed experts get skipped: what a copy of the real expert would serve
                 ++d.tail_experts;
             }
         }
@@ -6995,8 +7254,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
-            if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero
-                std::memset(row, 0, (size_t) Hout * sizeof(float));
+            if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero - or its low-rank copy's output (STRATA_LOWRANK=1, native only)
+                if (!(native && !latent && lowrank_apply(d.layers, (int) e, x_f + (size_t) t * H, row, Hout)))
+                    std::memset(row, 0, (size_t) Hout * sizeof(float));
                 ++d.tail_skipped;
                 continue;
             }
@@ -7055,6 +7315,37 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - cr0).count();
             if (bb > 0.0) d.fs->ring_cost_sample(d.layers, us / (double) njobs / (bb / 1e6));
         }
+    }
+    if (native && !latent && sample_want(d.layers)) {   // STRATA_LAYER_LEARN=sample: one skipped expert of this window, also computed exactly (a separate pool call; the window's own work is untouched)
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            if (kind[i] != -2) continue;
+            const int64_t e = ids[i], t = i / k;
+            d.src->prefetch(d.layers, &e, 1);
+            const uint8_t* b = d.src->blob(d.layers, e);
+            if (b == nullptr) break;
+            static thread_local std::vector<float> sh_exact;
+            sh_exact.assign((size_t) Hout, 0.0f);
+            static thread_local std::vector<uint8_t> sh_act;
+            sh_act.assign(kNativeActBytes, 0);
+            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, sh_act.data());
+            ExpertJobMulti sj;
+            sj.blob = b; sj.nt = 1; sj.act[0] = nullptr; sj.nact[0] = sh_act.data(); sj.out[0] = sh_exact.data();
+            d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], &sj, 1);
+            const float* used = out + (size_t) i * Hout;
+            double sk = 0, us = 0;
+            for (int64_t j = 0; j < Hout; ++j) { const double ex = sh_exact[(size_t) j], dd = (double) used[j] - ex; sk += ex * ex; us += dd * dd; }
+            learn_add(d.layers, sk, us, g_sh_w[(size_t) e & 511]);
+            break;
+        }
+    }
+    if (g_sh_rec) {   // STRATA_LAYER_LEARN: the missed picks the CPU just computed, as measurements (a layer that is still learning skipped nothing)
+        g_sh_rec = false;
+        if (native && !latent)
+            for (int64_t i = 0; i < n_tok * k; ++i) {
+                const int64_t e = ids[i];
+                if (kind[i] == -1 && e >= 0 && e < d.n_expert && g_sh_cand[(size_t) e & 511] == g_sh_stamp)
+                    learn_note(d.layers, (int) e, x_f + (size_t) (i / k) * H, out + (size_t) i * Hout, Hout, g_sh_w[(size_t) e & 511]);
+            }
     }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
