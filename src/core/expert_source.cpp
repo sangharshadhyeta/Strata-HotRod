@@ -5902,6 +5902,7 @@ constexpr double kBinLo = 1e-4, kBinSpan = 5000.0;   // bins: log-spaced from 1e
 std::atomic<uint32_t> g_lhist[kLayerMultCap][kBins];
 std::atomic<uint64_t> g_lwsum[kLayerMultCap][kBins];   // sum of the weights x 1e6
 std::atomic<float> g_lshape[kLayerMultCap];            // from a table (0 = none)
+std::atomic<uint32_t> g_skipcnt[kLayerMultCap][512];     // per (layer, expert): how often the weight rule skipped it (the picks a low-rank copy would serve); fed like the histogram, saved beside it
 std::atomic<bool> g_live_on{false};
 std::atomic<float> g_live_share{0.0f};   // > 0: the share of the missed picks to skip (system-driven); 0: the flat threshold's own skip count
 std::atomic<uint32_t> g_live_win{0};
@@ -5928,6 +5929,10 @@ double hist_below(int l, double t) {
 void layer_live_set(bool on) { layer_mult_init(); g_live_on.store(on, std::memory_order_relaxed); }
 void layer_live_set_share(float share) { g_live_share.store(share > 0.0f && share < 1.0f ? share : 0.0f, std::memory_order_relaxed); }
 bool layer_live_on() { return g_live_on.load(std::memory_order_relaxed); }
+void layer_skip_note(int64_t layer, int expert) {
+    if (layer < 0 || layer >= kLayerMultCap || expert < 0 || expert >= 512) return;
+    g_skipcnt[layer][expert].fetch_add(1, std::memory_order_relaxed);
+}
 void layer_live_note(int64_t layer, float w) {
     g_dbg_note.fetch_add(1, std::memory_order_relaxed);
     if (layer < 0 || layer >= kLayerMultCap || !(w > 0.0f)) { g_dbg_badw.fetch_add(1, std::memory_order_relaxed); return; }
@@ -5950,6 +5955,21 @@ bool layer_live_save() {
     std::fclose(f);
     std::error_code ec;
     std::filesystem::rename(tmp, g_live_path, ec);
+    {   // the skip counts: <dir>/layer-skips.bin, "LSK1", layers, 512, u32 [layers][512]
+        const std::string sp = (std::filesystem::path(g_live_path).parent_path() / "layer-skips.bin").string(), stmp = sp + ".tmp";
+        if (FILE* g = std::fopen(stmp.c_str(), "wb")) {
+            const uint32_t m2 = 0x314b534cu, nl2 = (uint32_t) g_live_layers, ne2 = 512;
+            std::fwrite(&m2, 4, 1, g); std::fwrite(&nl2, 4, 1, g); std::fwrite(&ne2, 4, 1, g);
+            std::vector<uint32_t> row(512);
+            for (int l = 0; l < g_live_layers; ++l) {
+                for (int e = 0; e < 512; ++e) row[(size_t) e] = g_skipcnt[l][e].load(std::memory_order_relaxed);
+                std::fwrite(row.data(), 4, 512, g);
+            }
+            std::fclose(g);
+            std::error_code ec2;
+            std::filesystem::rename(stmp, sp, ec2);
+        }
+    }
     return !ec;
 }
 // `path`: where the histogram lives between runs; loaded now when it matches the model, saved periodically and at exit.
@@ -5979,6 +5999,8 @@ void layer_live_refresh(int n_layers, double tau) {
     const uint32_t win = g_live_win.fetch_add(1, std::memory_order_relaxed);
     if ((win & (g_live_settled.load(std::memory_order_relaxed) ? 1023u : 63u)) != 0) return;
     if (win > 0 && (win & 4095u) == 0)   // forget slowly: halve the counts every 4096 windows
+        for (int l = 0; l < n_layers; ++l) for (int e = 0; e < 512; ++e) g_skipcnt[l][e].store(g_skipcnt[l][e].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
+    if (win > 0 && (win & 4095u) == 0)
         for (int l = 0; l < n_layers; ++l) for (int b = 0; b < kBins; ++b) {
             g_lhist[l][b].store(g_lhist[l][b].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
             g_lwsum[l][b].store(g_lwsum[l][b].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
@@ -6663,7 +6685,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (!resident && pf_funnel_on()) (cut || tail || wtail ? pf_rk_skip : pf_rk_read)[minr[q] < 3 ? 0 : minr[q] < 7 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
                 if (!cut && !tail && !wtail) continue;
                 skip_d[q] = true;
-                if (!resident) --nmiss;
+                if (!resident) { --nmiss; if (live_note) layer_skip_note(d.layers, (int) e); }   // which missed experts get skipped: what a copy of the real expert would serve
                 ++d.tail_experts;
             }
         }
