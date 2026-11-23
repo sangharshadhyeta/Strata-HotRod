@@ -6147,7 +6147,7 @@ std::atomic<uint64_t> g_ls[kLayerMultCap][4];
 std::atomic<uint32_t> g_ls_calls{0};
 bool ls_stats_on() { static const bool on = [] { const char* e = std::getenv("STRATA_LAYER_STATS"); return e != nullptr && e[0] == '1'; }(); return on; }
 bool slot_share_on() { static const bool on = [] { const char* e = std::getenv("STRATA_SLOT_SHARE"); return e != nullptr && e[0] == '1'; }(); return on; }
-bool cross_swap_on() { static const bool on = [] { const char* e = std::getenv("STRATA_CROSS_SWAP"); return e != nullptr && e[0] == '1'; }(); return on; }
+bool cross_swap_on() { static const bool on = [] { const char* e = std::getenv("STRATA_CROSS_SWAP"); return e == nullptr || e[0] != '0'; }(); return on; }   // on by default (24 Nov); =0 turns it off
 bool ls_on() { return ls_stats_on() || slot_share_on() || cross_swap_on(); }
 void ls_note(int64_t layer, int32_t kind) {
     if (layer < 0 || layer >= kLayerMultCap) return;
