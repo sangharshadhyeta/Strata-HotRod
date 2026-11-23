@@ -10581,9 +10581,11 @@ int main(int argc, char** argv) {
                                      "lower is skipped and its weight dropped (answers differ; the setting trades quality for speed)\n",
                              strata::core::rank_cutoff(), strata::core::rank_cutoff(), strata::core::rank_cutoff());
             if (strata::core::tail_weight() > 0.0f)
-                std::fprintf(stderr, "strata serve: STRATA_TAIL_WEIGHT=%.3f: a missed expert that every token of a window routes at rank 2 or lower with a router weight below %.3f is "
+                std::fprintf(stderr, "strata serve: STRATA_TAIL_WEIGHT=%.3f: a missed expert that every token of a window routes at the stand-ins' floor rank or lower with a router weight below %.3f is "
                                      "skipped (its weight dropped, no renormalisation; answers differ; the stand-ins come first; use with STRATA_TAIL_CPU=1 STRATA_ROUTE_TAIL_SKIP=0 to test it alone)\n",
                              (double) strata::core::tail_weight(), (double) strata::core::tail_weight());
+            // the weight rule skips from the stand-ins' floor (STRATA_ROUTE_RESIDENT_RANKS), not from a fixed rank: the ranks below it - the edge rank included - are always computed
+            if (const int fr = strata::kernels::route_cfg_floor(); fr > 0 && fr < 10) strata::core::set_tail_weight_from(fr);
             const char* tc = std::getenv("STRATA_TAIL_CPU");
             if (tc != nullptr ? tc[0] == '0' : !all_experts_resident) {
                 const int floor_rank = strata::kernels::route_cfg_floor();
@@ -10597,8 +10599,8 @@ int main(int argc, char** argv) {
                     strata::core::set_tail_skip_rank(0);
                     if (const char* tr = std::getenv("STRATA_TAIL_READ"); tr != nullptr && tr[0] == '0') strata::core::set_tail_read_skip(true);
                     std::fprintf(stderr, "strata serve: STRATA_TAIL_WEIGHT=%.3f replaces the rank rule: a missed expert that no stand-in took is skipped only when every token of a window "
-                                         "routes it at rank 2 or lower with a router weight below %.3f (its weight dropped, answers differ slightly); STRATA_TAIL_CPU=0 uses the rank rule "
-                                         "(ranks %d-9) instead, STRATA_TAIL_CPU=1 neither\n", (double) strata::core::tail_weight(), (double) strata::core::tail_weight(), floor_rank);
+                                         "routes it at rank %d or lower (the stand-ins' floor) with a router weight below %.3f (its weight dropped, answers differ slightly); STRATA_TAIL_CPU=0 uses the rank rule "
+                                         "(ranks %d-9) instead, STRATA_TAIL_CPU=1 neither\n", (double) strata::core::tail_weight(), floor_rank, (double) strata::core::tail_weight(), floor_rank);
                 } else if (floor_rank > 0 && floor_rank < 10) {
                     strata::core::set_tail_skip_rank(floor_rank);
                     if (const char* tr = std::getenv("STRATA_TAIL_READ"); tr != nullptr && tr[0] == '0') {

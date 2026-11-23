@@ -712,11 +712,15 @@ void set_rank_cutoff(int r);
 /// STRATA_TAIL_READ=0 with STRATA_TAIL_CPU=0 (set by the serve start-up): the read-ahead leaves the guesses at the stand-ins' floor and above unread.
 bool tail_read_skip();
 void set_tail_read_skip(bool on);
-/// STRATA_TAIL_WEIGHT=tau (opt-in; 0 = off): a missed expert (no stand-in took its place) that EVERY token of the window routes at rank >= 2 with a router weight below tau
+/// STRATA_TAIL_WEIGHT=tau (opt-in; 0 = off): a missed expert (no stand-in took its place) that EVERY token of the window routes at rank >= tail_weight_from() (the stand-ins' floor) with a router weight below tau
 /// is neither copied nor computed and its weight is dropped (no renormalisation).  The weight, not the rank, says how much the pick matters (offline, 23 Nov: the router
 /// weight is within about 0.01 of the true contribution as a ranking, and dropping the smallest weights costs about half the error of dropping the highest ranks).
 float tail_weight();
 void set_tail_weight(float tau);
+/// The first rank the weight rule may skip: taken from the stand-in setting (STRATA_ROUTE_RESIDENT_RANKS's floor, 3 in the shipped config, so ranks 0-2 - the edge rank 2 included -
+/// are always computed); 2 when there are no stand-ins to take it from.  Set by the serve start-up.
+int tail_weight_from();
+void set_tail_weight_from(int rank);
 /// The verifier's host-mapped router weights of the window slice about to be served ([n_tok * k], indexed like the ids); null when not set.  Thread-local: set just before the
 /// pool call and cleared after it.
 void expert_dispatch_set_weights(const float* w);

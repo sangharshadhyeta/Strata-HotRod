@@ -5871,6 +5871,11 @@ float tail_weight() {
     return t;
 }
 void set_tail_weight(float tau) { g_tail_weight.store(tau > 0.0f && tau < 1.0f ? tau : 0.0f, std::memory_order_relaxed); }
+namespace {
+std::atomic<int> g_tail_weight_from{2};
+}  // namespace
+int tail_weight_from() { return g_tail_weight_from.load(std::memory_order_relaxed); }
+void set_tail_weight_from(int rank) { g_tail_weight_from.store(rank >= 1 && rank < 10 ? rank : 2, std::memory_order_relaxed); }
 void expert_dispatch_set_weights(const float* w) { t_route_w = w; }
 
 namespace {
@@ -6287,6 +6292,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int cut_rank = rank_cutoff();
         // STRATA_TAIL_WEIGHT=tau (opt-in): the weight rule, see tail_weight(); needs the verifier's router weights for this slice
         const float tail_w = tail_weight();
+        const int tail_w_from = tail_weight_from();   // the stand-ins' floor: the ranks below it are always computed
         const float* rw = t_route_w;
         const bool wt_on = tail_w > 0.0f && rw != nullptr;
         bool skip_d[kMaxWindowEntries];
@@ -6309,7 +6315,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const bool resident = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
                 const bool cut = cut_rank > 0 && minr[q] >= cut_rank;                          // STRATA_RANK_CUTOFF: skipped even when resident
                 const bool tail = tail_rank > 0 && minr[q] >= tail_rank && !resident;          // STRATA_ROUTE_TAIL_SKIP: a missed expert only
-                const bool wtail = wt_on && !resident && minr[q] >= 2 && maxw[q] < tail_w;   // STRATA_TAIL_WEIGHT: a missed expert whose every pick weighs less than tau
+                const bool wtail = wt_on && !resident && minr[q] >= tail_w_from && maxw[q] < tail_w;   // STRATA_TAIL_WEIGHT: a missed expert whose every pick weighs less than tau
                 if (!resident && pf_funnel_on()) (cut || tail || wtail ? pf_rk_skip : pf_rk_read)[minr[q] < 3 ? 0 : minr[q] < 7 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
                 if (!cut && !tail && !wtail) continue;
                 skip_d[q] = true;
