@@ -5877,6 +5877,7 @@ std::atomic<int> g_tail_weight_from{2};
 int tail_weight_from() { return g_tail_weight_from.load(std::memory_order_relaxed); }
 namespace {
 constexpr int kLayerMultCap = 256;
+std::atomic<bool> g_earn{false}, g_earned{false};   // earn mode: no layer skips (multiplier 0) until the first complete table has been loaded
 std::atomic<float> g_layer_mult[kLayerMultCap];   // the per-layer threshold multipliers; 1 = none.  Elementwise atomics so a reload while the dispatch reads is race-free
 std::atomic<bool> g_layer_mult_init{false};
 void layer_mult_init() {
@@ -5885,66 +5886,82 @@ void layer_mult_init() {
 }
 }  // namespace
 namespace {
-// STRATA_LAYER_LIVE=1 (opt-in): the router's own confidence as a running per-layer signal.  Per window and layer: the weight the rule WOULD drop at the reference threshold,
-// per token, sum of w over the picks at or above the stand-ins' floor whose weight is under kMassRefTau; its running average is mass_l.  The sensitivity estimate of a layer is
-// s_l = mass_l * c_l; c_l = 1 until a measured table (tools/layer_table.py: two numbers a layer, the measured sensitivity and the same statistic on the capture it measured)
-// calibrates it: c_l = measured_l / statistic_l, so the exact map corrects the live statistic where the router misjudges a layer (the last layer) without replacing it.
-constexpr float kMassRefTau = 0.02f;
-std::atomic<float> g_lmass[kLayerMultCap];        // the running statistic
-std::atomic<uint32_t> g_lmass_n[kLayerMultCap];   // windows behind it
-std::atomic<float> g_lcalib[kLayerMultCap];       // c_l (0 = uncalibrated)
-std::atomic<float> g_ltable[kLayerMultCap];       // the table's measured sensitivity (0 = none)
+// STRATA_LAYER_LIVE=1 (opt-in): the per-layer thresholds keep the skip count of the flat threshold.  The table (tools/layer_table.py) gives the SHAPE (tau_l ~ 1/sensitivity_l); a
+// running histogram of the router weights every layer really sees (ranks at or above the stand-ins' floor, log-spaced bins) gives the SCALE: every 64 windows the engine solves for the
+// c with  sum_l skipped_l(c * shape_l) = sum_l skipped_l(tau)  (tau = STRATA_TAIL_WEIGHT, the flat default), so the allocation spends the same number of skipped experts - the same
+// speed - where they cost the least.  Offline on the real weights this lowered the block-output error proxy to 0.44 of the flat rule's at the same skip count.  No table: the shape is
+// flat and c = tau, i.e. nothing changes.  The router's weight alone cannot give the shape (it does not say how big a layer's expert outputs are against its block output).
+constexpr int kBins = 48;
+constexpr double kBinLo = 1e-4, kBinSpan = 5000.0;   // bins: log-spaced from 1e-4 to 0.5
+std::atomic<uint32_t> g_lhist[kLayerMultCap][kBins];
+std::atomic<float> g_lshape[kLayerMultCap];           // ~ 1/sensitivity from the table, clamped 0.25..4 (0 = no table)
 std::atomic<bool> g_live_on{false};
 std::atomic<uint32_t> g_live_win{0};
+// skipped picks (counts) below threshold t in layer l: whole bins plus a log-interpolated part of the bin t falls in
+double hist_below(int l, double t) {
+    if (t <= kBinLo) return 0.0;
+    const double pos = std::log(t / kBinLo) / std::log(kBinSpan) * kBins;
+    double c = 0.0;
+    const int full = (int) std::min<double>(pos, (double) kBins);
+    for (int b = 0; b < full; ++b) c += (double) g_lhist[l][b].load(std::memory_order_relaxed);
+    if (full < kBins) c += (pos - full) * (double) g_lhist[l][full].load(std::memory_order_relaxed);
+    return c;
+}
 }  // namespace
 void layer_live_set(bool on) { layer_mult_init(); g_live_on.store(on, std::memory_order_relaxed); }
 bool layer_live_on() { return g_live_on.load(std::memory_order_relaxed); }
+static std::atomic<uint64_t> g_live_calls{0}, g_live_null{0};
 void layer_live_update(int64_t layer, const float* rw, int64_t n_tok, int64_t k, int from) {
+    g_live_calls.fetch_add(1, std::memory_order_relaxed);
+    if (rw == nullptr) g_live_null.fetch_add(1, std::memory_order_relaxed);
     if (!g_live_on.load(std::memory_order_relaxed) || rw == nullptr || layer < 0 || layer >= kLayerMultCap || k < 1) return;
-    double m = 0.0;
     for (int64_t t = 0; t < n_tok; ++t)
-        for (int64_t r = from; r < k; ++r) { const float w = rw[(size_t) (t * k + r)]; if (w < kMassRefTau) m += w; }
-    m /= (double) std::max<int64_t>(n_tok, 1);
-    const uint32_t n = g_lmass_n[layer].load(std::memory_order_relaxed);
-    const float a = n < 100 ? 1.0f / (float) (n + 1) : 0.01f;   // a plain mean at first, then a running average over ~100 windows
-    g_lmass[layer].store((1.0f - a) * g_lmass[layer].load(std::memory_order_relaxed) + a * (float) m, std::memory_order_relaxed);
-    g_lmass_n[layer].store(n + 1, std::memory_order_relaxed);
-}
-// Recompute the per-layer multipliers from the live statistic (every 64 windows, at layer 0): layers with fewer than 50 windows keep the table's value or the mean.
-void layer_live_refresh(int n_layers) {
-    if (!g_live_on.load(std::memory_order_relaxed) || n_layers < 1 || n_layers > kLayerMultCap) return;
-    if ((g_live_win.fetch_add(1, std::memory_order_relaxed) & 63u) != 0) return;
-    std::vector<double> sv((size_t) n_layers, -1.0);
-    double mean = 0.0; int cnt = 0;
-    for (int l = 0; l < n_layers; ++l) {
-        double v = -1.0;
-        if (g_lmass_n[l].load(std::memory_order_relaxed) >= 50) {
-            const float c = g_lcalib[l].load(std::memory_order_relaxed);
-            v = (double) g_lmass[l].load(std::memory_order_relaxed) * (c > 0.0f ? (double) c : 1.0);
-        } else if (g_ltable[l].load(std::memory_order_relaxed) > 0.0f) {
-            v = (double) g_ltable[l].load(std::memory_order_relaxed);
+        for (int64_t r = from; r < k; ++r) {
+            const float w = rw[(size_t) (t * k + r)];
+            if (!(w > 0.0f)) continue;
+            const double pos = std::log((double) w / kBinLo) / std::log(kBinSpan) * kBins;
+            const int b = pos < 0.0 ? 0 : (pos >= kBins ? kBins - 1 : (int) pos);
+            g_lhist[layer][b].fetch_add(1, std::memory_order_relaxed);
         }
-        sv[(size_t) l] = v;
-        if (v > 0.0) { mean += v; ++cnt; }
+}
+// Every 64 windows, at layer 0: the scale c that keeps the flat rule's skip count, then the multipliers c * shape_l / tau.
+void layer_live_refresh(int n_layers, double tau) {
+    if (!g_live_on.load(std::memory_order_relaxed) || n_layers < 1 || n_layers > kLayerMultCap || tau <= 0.0) return;
+    const uint32_t win = g_live_win.fetch_add(1, std::memory_order_relaxed);
+    if ((win & 63u) != 0) return;
+    if ((win & 4095u) == 0 && win > 0)   // forget slowly: halve the counts every 4096 windows
+        for (int l = 0; l < n_layers; ++l) for (int b = 0; b < kBins; ++b) g_lhist[l][b].store(g_lhist[l][b].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
+    double target = 0.0, total = 0.0;
+    for (int l = 0; l < n_layers; ++l) { target += hist_below(l, tau); for (int b = 0; b < kBins; ++b) total += (double) g_lhist[l][b].load(std::memory_order_relaxed); }
+    if (total < 2000.0 || target < 20.0) {              // too few weights seen yet: the table (or the flat default) stays in force
+        if (win == 0 || win == 256 || win == 2048) std::fprintf(stderr, "strata serve: layer live: waiting (window %u, %.0f picks seen, %.0f below the flat threshold %.4f; %llu updates, %llu without weights, %d layers)\n", win, total, target, tau, (unsigned long long) g_live_calls.load(), (unsigned long long) g_live_null.load(), n_layers);
+        return;
     }
-    if (cnt < n_layers / 2) return;   // not enough yet: the table (or the flat default) stays in force
-    mean /= cnt;
-    std::vector<double> m((size_t) n_layers);
-    double msum = 0.0;
-    for (int l = 0; l < n_layers; ++l) {
-        const double v = sv[(size_t) l] > 0.0 ? sv[(size_t) l] : mean;
-        m[(size_t) l] = std::min(4.0, std::max(0.25, mean / std::max(v, 1e-9)));
-        msum += m[(size_t) l];
+    std::vector<double> shape((size_t) n_layers, 1.0);
+    bool any = false;
+    for (int l = 0; l < n_layers; ++l) { const float sh = g_lshape[l].load(std::memory_order_relaxed); if (sh > 0.0f) { shape[(size_t) l] = sh; any = true; } }
+    if (!any) {                                         // no table: flat
+        if (win == 0 || win == 256) std::fprintf(stderr, "strata serve: layer live: no table loaded, the thresholds stay flat\n");
+        return;
     }
-    float lo = 1e9f, hi = 0.0f;
+    double lo = 1e-4, hi = 0.5;
+    for (int it = 0; it < 40; ++it) {
+        const double c = std::sqrt(lo * hi);
+        double f = 0.0;
+        for (int l = 0; l < n_layers; ++l) f += hist_below(l, c * shape[(size_t) l]);
+        (f < target ? lo : hi) = c;
+    }
+    const double c = std::sqrt(lo * hi);
+    float mn = 1e9f, mx = 0.0f;
     for (int l = 0; l < n_layers; ++l) {
-        const float x = (float) (m[(size_t) l] * n_layers / msum);
-        g_layer_mult[l].store(x, std::memory_order_relaxed);
-        lo = std::min(lo, x); hi = std::max(hi, x);
+        const float m = (float) (c * shape[(size_t) l] / tau);
+        g_layer_mult[l].store(m, std::memory_order_relaxed);
+        mn = std::min(mn, m); mx = std::max(mx, m);
     }
     static std::atomic<uint32_t> g_refreshes{0};
     if (const uint32_t r = g_refreshes.fetch_add(1, std::memory_order_relaxed); r == 0 || (r % 64) == 0)
-        std::fprintf(stderr, "strata serve: layer live: thresholds x%.2f..x%.2f of tau from %d layers' running statistic (%u windows)\n", (double) lo, (double) hi, cnt, g_live_win.load(std::memory_order_relaxed));
+        std::fprintf(stderr, "strata serve: layer live: the same skip count as the flat rule (%.0f picks seen), thresholds x%.2f..x%.2f of tau (%.4f..%.4f) after %u windows\n",
+                     total, (double) mn, (double) mx, (double) mn * tau, (double) mx * tau, win);
 }
 bool layer_sens_load(const char* path, int n_layers, std::string& err) {
     std::ifstream in(path);
@@ -5974,12 +5991,15 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err) {
     layer_mult_init();
     for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) {
         g_layer_mult[l].store(m[(size_t) l], std::memory_order_relaxed);
-        g_ltable[l].store(v[(size_t) l], std::memory_order_relaxed);
-        g_lcalib[l].store(!stat.empty() && stat[(size_t) l] > 1e-9f ? v[(size_t) l] / stat[(size_t) l] : 0.0f, std::memory_order_relaxed);
+        g_lshape[l].store((float) std::min(4.0, std::max(0.25, mean / std::max((double) v[(size_t) l], 1e-6))), std::memory_order_relaxed);
     }
+    g_earned.store(true, std::memory_order_relaxed);   // a complete table: the layers have earned their thresholds
     return true;
 }
+void layer_earn_set(bool on) { g_earn.store(on, std::memory_order_relaxed); }
+bool layer_earned() { return !g_earn.load(std::memory_order_relaxed) || g_earned.load(std::memory_order_relaxed); }
 float tail_weight_layer_mult(int64_t layer) {
+    if (g_earn.load(std::memory_order_relaxed) && !g_earned.load(std::memory_order_relaxed)) return 0.0f;   // not earned yet: exact
     if (!g_layer_mult_init.load(std::memory_order_relaxed)) return 1.0f;
     return layer >= 0 && layer < kLayerMultCap ? g_layer_mult[layer].load(std::memory_order_relaxed) : 1.0f;
 }
@@ -6284,7 +6304,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     if (router_trace_on() && x_f != nullptr && ids != nullptr && k >= 1 && k <= 16) router_trace_write(d.layers, x_f, ids, n_tok, k);
     if (g_live_on.load(std::memory_order_relaxed) && n_tok <= 8 && k == 10) {   // STRATA_LAYER_LIVE: the router's confidence, per layer, as a running statistic
-        if (d.layers == 0) layer_live_refresh((int) std::max<int64_t>(d.n_layers, 1));
+        if (d.layers == 0) layer_live_refresh((int) std::max<int64_t>(d.n_layers, 1), (double) tail_weight());
         layer_live_update(d.layers, t_route_w, n_tok, k, tail_weight_from());
     }
     if (n_tok <= 8 && x_f != nullptr && ids != nullptr && k >= 1 && k <= 16) layer_capture_write(d.layers, x_f, ids, n_tok, k);   // the live capture: a few decode windows, bounded

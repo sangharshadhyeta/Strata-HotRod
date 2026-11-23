@@ -152,7 +152,7 @@ def measure(args, layers):
         res[l] = float(((C * d[:, :, None]).sum(1).norm(dim=1) / nf).mean())
         # the engine's running statistic on these same rows (expert_source.cpp, kMassRefTau): the weight the rule would drop at 0.02, summed over ranks >= from-rank, per token
         ww = w[:, args.from_rank:]
-        stat[l] = float((ww * (ww < 0.02)).sum(1).mean())
+        stat[l] = float((ww * (ww < 0.02)).sum(1).mean())   # kept in the printout only
         print("layer %2d: error at 10%% dropped by weight %.4f, live statistic %.5f (%d rows)" % (l, res[l], stat[l], N), flush=True)
     return res, stat
 
@@ -186,7 +186,7 @@ def main(argv=None):
         merged = [m if (new[l] is not None or l in meas) else None for l, m in enumerate(merged)]
         merged_stat = [m if (new[l] is not None or l in meas) else None for l, m in enumerate(merged_stat)]
     tmp = a.out + ".tmp"
-    open(tmp, "w").write(format_table(merged, runs + 1, "last part %s, %d layers measured, %.0f s" % (a.part, len(res), time.time() - t0), merged_stat))
+    open(tmp, "w").write(format_table(merged, runs + 1, "last part %s, %d layers measured, %.0f s" % (a.part, len(res), time.time() - t0)))
     os.replace(tmp, a.out)   # the engine sees the whole new file or the old one
     print("wrote %s (%d layers measured of %d)" % (a.out, len(res), a.layers))
 

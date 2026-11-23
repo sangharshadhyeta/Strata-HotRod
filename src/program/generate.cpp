@@ -10619,8 +10619,8 @@ int main(int argc, char** argv) {
             }
             if (const char* ll = std::getenv("STRATA_LAYER_LIVE"); ll != nullptr && ll[0] == '1') {
                 strata::core::layer_live_set(true);
-                std::fprintf(stderr, "strata serve: STRATA_LAYER_LIVE=1: the weight rule's threshold scales per layer from the router's own confidence, kept running from every window%s\n",
-                             g_layer_sens_path.empty() ? "" : " (calibrated by the layer table when it has two numbers a layer)");
+                std::fprintf(stderr, "strata serve: STRATA_LAYER_LIVE=1: the weight rule's per-layer thresholds keep the flat rule's skip count: the table gives the shape, the router weights seen every window give the scale%s\n",
+                             g_layer_sens_path.empty() ? " (no table path: flat)" : "");
             }
             // the weight rule skips from the stand-ins' floor (STRATA_ROUTE_RESIDENT_RANKS), not from a fixed rank: the ranks below it - the edge rank included - are always computed
             if (const int fr = strata::kernels::route_cfg_floor(); fr > 0 && fr < 10) strata::core::set_tail_weight_from(fr);
@@ -10629,6 +10629,10 @@ int main(int argc, char** argv) {
                 const int floor_rank = strata::kernels::route_cfg_floor();
                 const bool tw_env = std::getenv("STRATA_TAIL_WEIGHT") != nullptr;   // the user named a value (0 = the weight rule off: the rank rule stays)
                 if (floor_rank > 0 && floor_rank < 10 && tc == nullptr && !tw_env) strata::core::set_tail_weight(0.02f);   // the default: tau 0.02
+                    if (const char* ea = std::getenv("STRATA_LAYER_EARN"); floor_rank > 0 && floor_rank < 10 && tc == nullptr && !tw_env && !g_layer_sens_path.empty() && !(ea != nullptr && ea[0] == '0')) {
+                        strata::core::layer_earn_set(true);   // start exact; the first table earns the skipping
+                        std::fprintf(stderr, "strata serve: layer earn mode: every layer starts at threshold 0 (exact); the first table (%s) switches the thresholds on (STRATA_LAYER_EARN=0: flat %.3f from the first request)\n", g_layer_sens_path.c_str(), (double) strata::core::tail_weight());
+                    }
                 if (floor_rank > 0 && floor_rank < 10 && tc == nullptr && strata::core::tail_weight() > 0.0f) {
                     // The user chose the weight rule (STRATA_TAIL_WEIGHT=<tau>, e.g. 0.02, 0.05 or 0.10) and left STRATA_TAIL_CPU alone: the weight rule replaces the rank rule below.  A
                     // missed expert that no stand-in took is skipped only when every pick of the window weighs under tau; heavier ones are computed.  Measured 23 Nov (48 checkable
