@@ -5877,6 +5877,7 @@ std::atomic<int> g_tail_weight_from{2};
 int tail_weight_from() { return g_tail_weight_from.load(std::memory_order_relaxed); }
 namespace {
 constexpr int kLayerMultCap = 256;
+std::atomic<int> g_mult_layers{0};   // how many layers the multiplier table covers (set by the table loader and by the live refresh)
 std::atomic<bool> g_earn{false}, g_earned{false};   // earn mode: no layer skips (multiplier 0) until the first complete table has been loaded
 std::atomic<float> g_layer_mult[kLayerMultCap];   // the per-layer threshold multipliers; 1 = none.  Elementwise atomics so a reload while the dispatch reads is race-free
 std::atomic<bool> g_layer_mult_init{false};
@@ -5901,6 +5902,7 @@ std::atomic<uint32_t> g_lhist[kLayerMultCap][kBins];
 std::atomic<uint64_t> g_lwsum[kLayerMultCap][kBins];   // sum of the weights x 1e6
 std::atomic<float> g_lshape[kLayerMultCap];            // from a table (0 = none)
 std::atomic<bool> g_live_on{false};
+std::atomic<float> g_live_share{0.0f};   // > 0: the share of the missed picks to skip (system-driven); 0: the flat threshold's own skip count
 std::atomic<uint32_t> g_live_win{0};
 std::string g_live_path;
 std::atomic<uint64_t> g_dbg_plan{0}, g_dbg_wt{0}, g_dbg_live{0}, g_dbg_note{0}, g_dbg_rank{0}, g_dbg_badw{0};   // why the histogram stays empty (debug)
@@ -5921,6 +5923,7 @@ double hist_below(int l, double t) {
 }
 }  // namespace
 void layer_live_set(bool on) { layer_mult_init(); g_live_on.store(on, std::memory_order_relaxed); }
+void layer_live_set_share(float share) { g_live_share.store(share > 0.0f && share < 1.0f ? share : 0.0f, std::memory_order_relaxed); }
 bool layer_live_on() { return g_live_on.load(std::memory_order_relaxed); }
 void layer_live_note(int64_t layer, float w) {
     g_dbg_note.fetch_add(1, std::memory_order_relaxed);
@@ -5996,6 +5999,7 @@ void layer_live_refresh(int n_layers, double tau) {
             m10[(size_t) l] = c > 0.0 ? ws / c : 0.0;
         }
     }
+    if (const float sh = g_live_share.load(std::memory_order_relaxed); sh > 0.0f) target = (double) sh * total;   // system-driven: skip this share of the missed picks, whatever the flat threshold would skip
     if (total < 2000.0 || target < 20.0) {              // too few weights seen yet: every layer keeps the configured threshold
         if (win == 0 || win == 64 || win == 256 || win == 1024) std::fprintf(stderr, "strata serve: layer live: collecting (window %u, %.0f missed-expert weights seen, %.0f below %.4f, %d layers; plan blocks %llu, weight rule on %llu, live on %llu, notes %llu (bad %llu), rank rule on %llu)\n", win, total, target, tau, n_layers, (unsigned long long) g_dbg_plan.load(), (unsigned long long) g_dbg_wt.load(), (unsigned long long) g_dbg_live.load(), (unsigned long long) g_dbg_note.load(), (unsigned long long) g_dbg_badw.load(), (unsigned long long) g_dbg_rank.load());
         return;
@@ -6019,6 +6023,7 @@ void layer_live_refresh(int n_layers, double tau) {
     }
     const double c = std::sqrt(lo * hi);
     float mn = 1e9f, mx = 0.0f;
+    g_mult_layers.store(n_layers, std::memory_order_relaxed);
     for (int l = 0; l < n_layers; ++l) {
         const float m = (float) (c * shape[(size_t) l] / tau);
         g_layer_mult[l].store(m, std::memory_order_relaxed);
@@ -6056,6 +6061,7 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err) {
     }
     for (float& x : m) x = (float) (x * n_layers / msum);   // mean 1 after the clamp, so the average threshold stays tau
     layer_mult_init();
+    g_mult_layers.store(n_layers, std::memory_order_relaxed);
     for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) {
         g_layer_mult[l].store(m[(size_t) l], std::memory_order_relaxed);
         g_lshape[l].store((float) std::min(4.0, std::max(0.25, mean / std::max((double) v[(size_t) l], 1e-6))), std::memory_order_relaxed);
@@ -6065,6 +6071,15 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err) {
 }
 void layer_earn_set(bool on) { g_earn.store(on, std::memory_order_relaxed); }
 bool layer_earned() { return !g_earn.load(std::memory_order_relaxed) || g_earned.load(std::memory_order_relaxed); }
+// The multipliers' shape alone, mean 1 over the layers: what the per-layer stand-in budget uses (its overall level is the user's budget, not the skip threshold's).
+float layer_mult_shape(int64_t layer) {
+    const int n = g_mult_layers.load(std::memory_order_relaxed);
+    if (n < 1 || n > kLayerMultCap) return 1.0f;
+    double sum = 0.0;
+    for (int l = 0; l < n; ++l) sum += (double) tail_weight_layer_mult(l);
+    const double mean = sum / n;
+    return mean > 1e-9 ? (float) ((double) tail_weight_layer_mult(layer) / mean) : 1.0f;
+}
 float tail_weight_layer_mult(int64_t layer) {
     if (g_earn.load(std::memory_order_relaxed) && !g_earned.load(std::memory_order_relaxed)) return 0.0f;   // not earned yet: exact
     if (!g_layer_mult_init.load(std::memory_order_relaxed)) return 1.0f;

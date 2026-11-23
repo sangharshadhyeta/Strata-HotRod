@@ -5948,7 +5948,7 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
         // little takes looser stand-ins, a sensitive layer refuses more.  Cheap: up to 128 stores to host-mapped memory per window.
         static const bool sub_on = [] { const char* e = std::getenv("STRATA_LAYER_SUB"); return e != nullptr && e[0] == '1'; }();
         if (sub_on)
-            for (int l = 0; l < 128; ++l) strata::kernels::route_cfg_set_layer_budget_mult(l, std::max(0.05f, strata::core::tail_weight_layer_mult(l)));
+            for (int l = 0; l < 128; ++l) strata::kernels::route_cfg_set_layer_budget_mult(l, std::max(0.05f, strata::core::layer_mult_shape(l)));
     }
     // STRATA_FRAGILE_CTRL_EVERY: this window's fragile control flag, decided and written before the window runs (the kernels read it at launch)
     const bool fctl = route_fragile_ctrl_next(c, decode && auto_ok);

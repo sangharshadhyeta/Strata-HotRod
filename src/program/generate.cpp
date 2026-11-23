@@ -10624,6 +10624,7 @@ int main(int argc, char** argv) {
             };
             if (const char* ll = std::getenv("STRATA_LAYER_LIVE"); ll != nullptr && ll[0] == '1') {
                 live_start();
+                if (const char* sh = std::getenv("STRATA_LAYER_SHARE"); sh != nullptr && std::atof(sh) > 0.0) strata::core::layer_live_set_share((float) std::atof(sh));
                 std::fprintf(stderr, "strata serve: STRATA_LAYER_LIVE=1: the weight rule's per-layer thresholds keep the flat rule's skip count: the table gives the shape, the router weights seen every window give the scale%s\n",
                              g_layer_sens_path.empty() ? " (no table path: flat)" : "");
             }
@@ -10639,6 +10640,21 @@ int main(int argc, char** argv) {
                         strata::core::layer_earn_set(true);   // start exact; the first table earns the skipping
                         std::fprintf(stderr, "strata serve: layer earn mode: every layer starts at threshold 0 (exact); the first table (%s) switches the thresholds on (opt-in STRATA_LAYER_EARN=1; the default starts flat at %.3f)\n", g_layer_sens_path.c_str(), (double) strata::core::tail_weight());
                     }
+                if (floor_rank > 0 && floor_rank < 10 && tc == nullptr && !tw_env) {
+                    // SYSTEM-DRIVEN (the default): the engine decides which missed tail picks to skip.  It skips STRATA_LAYER_SHARE (default 0.5) of them, the lowest-weight ones, and spreads
+                    // them over the layers by what the router's own weights say each layer can spare; the 0.02 setting plays no part.  STRATA_LAYER_LIVE=0 turns it off, and then
+                    // STRATA_TAIL_WEIGHT (0.02) is a plain threshold on every layer.
+                    const char* lv = std::getenv("STRATA_LAYER_LIVE");
+                    if (lv == nullptr || lv[0] != '0') {
+                        const char* sh = std::getenv("STRATA_LAYER_SHARE");
+                        const float share = sh != nullptr && std::atof(sh) > 0.0 ? (float) std::atof(sh) : 0.5f;
+                        strata::core::layer_live_set_share(share);
+                        live_start();
+                        std::fprintf(stderr, "strata serve: layer live (system-driven, the default): the engine skips the %.0f%% lowest-weight missed tail picks, spread over the layers by the router's own weights "
+                                             "(STRATA_LAYER_SHARE=<0..1> changes the share; STRATA_LAYER_LIVE=0 gives the flat STRATA_TAIL_WEIGHT=%.3f instead)%s\n",
+                                     100.0 * share, (double) strata::core::tail_weight(), g_layer_sens_path.empty() ? "; no profile directory: not kept across restarts" : "; kept across restarts in layer-live.bin");
+                    }
+                }
                 if (floor_rank > 0 && floor_rank < 10 && tc == nullptr && strata::core::tail_weight() > 0.0f) {
                     // The user chose the weight rule (STRATA_TAIL_WEIGHT=<tau>, e.g. 0.02, 0.05 or 0.10) and left STRATA_TAIL_CPU alone: the weight rule replaces the rank rule below.  A
                     // missed expert that no stand-in took is skipped only when every pick of the window weighs under tau; heavier ones are computed.  (The 23 Nov measurements of this rule were of the rank behaviour: the routing weights were not yet copied to the host, so every weight read 0; fixed 24 Nov, see docs/HOTROD-DETAILS.md.)
