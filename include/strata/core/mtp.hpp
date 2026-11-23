@@ -281,6 +281,14 @@ private:
     float rr_margin_ = 0.0f;
     int rr_lo_ = 6, rr_hi_ = 9;
     float* probs_ = nullptr;
+    // M1 (STRATA_MTP_SOFT=k, opt-in): a chain step j >= 1 takes as its token input the mixture of the k most likely tokens of the previous step's head (their
+    // embeddings weighted by their softmax over those k at STRATA_MTP_SOFT_TEMP) instead of the one drafted token; the drafts themselves are unchanged and the verifier
+    // still checks every one, so the output is exact - only the draft's acceptance can change.
+    int soft_k_ = 0;
+    float soft_inv_t_ = 1.0f;
+    bool soft_rec_ = false;   ///< record_front: this step's embedding is the soft mixture
+    int32_t* soft_ids_ = nullptr;
+    float *soft_w_ = nullptr, *soft_g_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' and row_top_prob_split's partials and counters
     uint8_t* top_scratch_ = nullptr;
     // device
