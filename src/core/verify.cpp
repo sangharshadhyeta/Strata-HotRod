@@ -5947,8 +5947,11 @@ void Verifier::route_budget_window(bool decode, bool auto_ok) {
     {   // STRATA_LAYER_SUB=1 (opt-in): the stand-in budgets scale per layer with the same multipliers as the skip thresholds (the live ones, or a table's): a layer where dropping costs
         // little takes looser stand-ins, a sensitive layer refuses more.  Cheap: up to 128 stores to host-mapped memory per window.
         static const bool sub_on = [] { const char* e = std::getenv("STRATA_LAYER_SUB"); return e != nullptr && e[0] == '1'; }();
-        if (sub_on)
+        static uint32_t pushed_gen = 0;   // stop asking: the multipliers are copied to the kernel's configuration only when they changed
+        if (sub_on && strata::core::layer_mult_generation() != pushed_gen) {
+            pushed_gen = strata::core::layer_mult_generation();
             for (int l = 0; l < 128; ++l) strata::kernels::route_cfg_set_layer_budget_mult(l, std::max(0.05f, strata::core::layer_mult_shape(l)));
+        }
     }
     // STRATA_FRAGILE_CTRL_EVERY: this window's fragile control flag, decided and written before the window runs (the kernels read it at launch)
     const bool fctl = route_fragile_ctrl_next(c, decode && auto_ok);

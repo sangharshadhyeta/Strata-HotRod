@@ -729,6 +729,7 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err);
 // Safe to call again while decoding: the table is atomic per layer, so a table refreshed on disk (tools/layer_table.py) takes effect at the next window.
 /// The multiplier of STRATA_TAIL_WEIGHT for `layer` (1 when no sensitivity file was loaded).
 float tail_weight_layer_mult(int64_t layer);
+uint32_t layer_mult_generation();   ///< moves when the multiplier table really changes; callers that copy it elsewhere ask again only then
 float layer_mult_shape(int64_t layer);   ///< the same multipliers divided by their mean: the shape only (the per-layer stand-in budget, STRATA_LAYER_SUB)
 /// The live per-layer thresholds (default with the default weight rule; STRATA_LAYER_LIVE=0 off): every layer starts at the configured threshold; a running histogram of the router weights
 /// of the missed experts gives each layer's shape and the scale that keeps the flat rule's skip count; the histogram survives a restart (layer_live_persist).

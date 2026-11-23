@@ -5877,6 +5877,7 @@ std::atomic<int> g_tail_weight_from{2};
 int tail_weight_from() { return g_tail_weight_from.load(std::memory_order_relaxed); }
 namespace {
 constexpr int kLayerMultCap = 256;
+std::atomic<uint32_t> g_mult_gen{1};   // bumped whenever the multiplier table really changes: whoever pushes it somewhere (the stand-in budgets) asks only when this moved
 std::atomic<int> g_mult_layers{0};   // how many layers the multiplier table covers (set by the table loader and by the live refresh)
 std::atomic<bool> g_earn{false}, g_earned{false};   // earn mode: no layer skips (multiplier 0) until the first complete table has been loaded
 std::atomic<float> g_layer_mult[kLayerMultCap];   // the per-layer threshold multipliers; 1 = none.  Elementwise atomics so a reload while the dispatch reads is race-free
@@ -6028,21 +6029,26 @@ void layer_live_refresh(int n_layers, double tau) {
     g_mult_layers.store(n_layers, std::memory_order_relaxed);
     static std::atomic<bool> g_first{true};
     const bool first = g_first.exchange(false, std::memory_order_relaxed);
+    float nv[kLayerMultCap];
     for (int l = 0; l < n_layers; ++l) {
         const float target_m = (float) (c * shape[(size_t) l] / tau);
         const float old = g_layer_mult[l].load(std::memory_order_relaxed);
-        const float m = first ? target_m : 0.7f * old + 0.3f * target_m;   // smoothed: one noisy window cannot move a threshold much
-        delta = std::max(delta, std::fabs(m - old) / std::max(old, 1e-3f));
-        g_layer_mult[l].store(m, std::memory_order_relaxed);
-        mn = std::min(mn, m); mx = std::max(mx, m);
+        nv[l] = first ? target_m : 0.7f * old + 0.3f * target_m;   // smoothed: one noisy window cannot move a threshold much
+        delta = std::max(delta, std::fabs(nv[l] - old) / std::max(old, 1e-3f));
+        mn = std::min(mn, nv[l]); mx = std::max(mx, nv[l]);
+    }
+    const bool was = g_live_settled.load(std::memory_order_relaxed);
+    // settled and still: keep the thresholds exactly as they are (nothing is stored, the generation does not move, whoever copied them elsewhere has nothing to ask again)
+    if (!(was && delta <= 0.03f)) {
+        for (int l = 0; l < n_layers; ++l) g_layer_mult[l].store(nv[l], std::memory_order_relaxed);
+        g_mult_gen.fetch_add(1, std::memory_order_relaxed);
     }
     {   // settle: no layer moved more than 3% over 6 re-solves in a row -> stop feeding and re-solving at the full rate; a move of more than 10% wakes it again
-        const bool was = g_live_settled.load(std::memory_order_relaxed);
         if (!first && delta < 0.03f) g_live_calm.fetch_add(1, std::memory_order_relaxed); else if (delta > 0.10f || first) g_live_calm.store(0, std::memory_order_relaxed);
         const bool now = g_live_calm.load(std::memory_order_relaxed) >= 6 && !(was && delta > 0.10f);
         if (was && delta > 0.10f) g_live_calm.store(0, std::memory_order_relaxed);
         g_live_settled.store(now, std::memory_order_relaxed);
-        if (now != was) std::fprintf(stderr, "strata serve: layer live: thresholds %s (window %u, largest move %.1f%%)\n", now ? "settled: the histogram is now sampled 1 window in 16 and re-solved every 1024" : "moving again", win, 100.0 * (double) delta);
+        if (now != was) std::fprintf(stderr, "strata serve: layer live: thresholds %s (window %u, largest move %.1f%%)\n", now ? "settled: the histogram is now sampled 1 window in 16, re-solved every 1024, and nothing is rewritten while it stays within 3%" : "moving again", win, 100.0 * (double) delta);
     }
     static std::atomic<uint32_t> g_refreshes{0};
     if (const uint32_t r = g_refreshes.fetch_add(1, std::memory_order_relaxed); r == 0 || (r % 64) == 0)
@@ -6082,11 +6088,13 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err) {
         g_lshape[l].store((float) std::min(4.0, std::max(0.25, mean / std::max((double) v[(size_t) l], 1e-6))), std::memory_order_relaxed);
     }
     g_earned.store(true, std::memory_order_relaxed);   // a complete table: the layers have earned their thresholds
+    g_mult_gen.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 void layer_earn_set(bool on) { g_earn.store(on, std::memory_order_relaxed); }
 bool layer_earned() { return !g_earn.load(std::memory_order_relaxed) || g_earned.load(std::memory_order_relaxed); }
 // The multipliers' shape alone, mean 1 over the layers: what the per-layer stand-in budget uses (its overall level is the user's budget, not the skip threshold's).
+uint32_t layer_mult_generation() { return g_mult_gen.load(std::memory_order_relaxed); }
 float layer_mult_shape(int64_t layer) {
     const int n = g_mult_layers.load(std::memory_order_relaxed);
     if (n < 1 || n > kLayerMultCap) return 1.0f;
