@@ -10580,6 +10580,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: STRATA_RANK_CUTOFF=%d: ranks %d-9 are not computed at all (resident or not): an expert every token of a window routes at rank %d or "
                                      "lower is skipped and its weight dropped (answers differ; the setting trades quality for speed)\n",
                              strata::core::rank_cutoff(), strata::core::rank_cutoff(), strata::core::rank_cutoff());
+            if (strata::core::tail_weight() > 0.0f)
+                std::fprintf(stderr, "strata serve: STRATA_TAIL_WEIGHT=%.3f: a missed expert that every token of a window routes at rank 2 or lower with a router weight below %.3f is "
+                                     "skipped (its weight dropped, no renormalisation; answers differ; the stand-ins come first; use with STRATA_TAIL_CPU=1 STRATA_ROUTE_TAIL_SKIP=0 to test it alone)\n",
+                             (double) strata::core::tail_weight(), (double) strata::core::tail_weight());
             const char* tc = std::getenv("STRATA_TAIL_CPU");
             if (tc != nullptr ? tc[0] == '0' : !all_experts_resident) {
                 const int floor_rank = strata::kernels::route_cfg_floor();

@@ -712,6 +712,14 @@ void set_rank_cutoff(int r);
 /// STRATA_TAIL_READ=0 with STRATA_TAIL_CPU=0 (set by the serve start-up): the read-ahead leaves the guesses at the stand-ins' floor and above unread.
 bool tail_read_skip();
 void set_tail_read_skip(bool on);
+/// STRATA_TAIL_WEIGHT=tau (opt-in; 0 = off): a missed expert (no stand-in took its place) that EVERY token of the window routes at rank >= 2 with a router weight below tau
+/// is neither copied nor computed and its weight is dropped (no renormalisation).  The weight, not the rank, says how much the pick matters (offline, 23 Nov: the router
+/// weight is within about 0.01 of the true contribution as a ranking, and dropping the smallest weights costs about half the error of dropping the highest ranks).
+float tail_weight();
+void set_tail_weight(float tau);
+/// The verifier's host-mapped router weights of the window slice about to be served ([n_tok * k], indexed like the ids); null when not set.  Thread-local: set just before the
+/// pool call and cleared after it.
+void expert_dispatch_set_weights(const float* w);
 /// STRATA_ROUTER_TRACE (measurement only): the window's token ids, written as their own record before the window's layer-0 record
 /// (tools/predictor/trace_reader.py pairs them in order and checks the row count).  The verifier calls it as it launches a window;
 /// a no-op when the trace is off.

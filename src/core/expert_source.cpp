@@ -5856,6 +5856,22 @@ std::atomic<bool> g_tail_read_skip{false};
 }  // namespace
 bool tail_read_skip() { return g_tail_read_skip.load(std::memory_order_relaxed); }
 void set_tail_read_skip(bool on) { g_tail_read_skip.store(on, std::memory_order_relaxed); }
+namespace {
+std::atomic<float> g_tail_weight{-1.0f};   // -1: not resolved yet
+thread_local const float* t_route_w = nullptr;
+}  // namespace
+float tail_weight() {
+    float t = g_tail_weight.load(std::memory_order_relaxed);
+    if (t < 0.0f) {
+        const char* v = std::getenv("STRATA_TAIL_WEIGHT");
+        t = v != nullptr ? (float) std::atof(v) : 0.0f;
+        t = t > 0.0f && t < 1.0f ? t : 0.0f;
+        g_tail_weight.store(t, std::memory_order_relaxed);
+    }
+    return t;
+}
+void set_tail_weight(float tau) { g_tail_weight.store(tau > 0.0f && tau < 1.0f ? tau : 0.0f, std::memory_order_relaxed); }
+void expert_dispatch_set_weights(const float* w) { t_route_w = w; }
 
 namespace {
 // STRATA_ROUTER_TRACE=<file> (measurement only, off by default): one record per call of expert_pool_dispatch_multi, i.e. for every MoE layer of every
@@ -6269,15 +6285,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int tail_rank = tail_skip_rank();
         // STRATA_RANK_CUTOFF=R (opt-in): ranks R..9 are not computed at all - the same skip, but also for an expert that is resident
         const int cut_rank = rank_cutoff();
+        // STRATA_TAIL_WEIGHT=tau (opt-in): the weight rule, see tail_weight(); needs the verifier's router weights for this slice
+        const float tail_w = tail_weight();
+        const float* rw = t_route_w;
+        const bool wt_on = tail_w > 0.0f && rw != nullptr;
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if ((tail_rank > 0 || cut_rank > 0) && d.peer == nullptr && d.remote_count == 0) {
+        if ((tail_rank > 0 || cut_rank > 0 || wt_on) && d.peer == nullptr && d.remote_count == 0) {
             int minr[kMaxWindowEntries];
-            for (int q = 0; q < nd; ++q) minr[q] = 99;
+            float maxw[kMaxWindowEntries];
+            for (int q = 0; q < nd; ++q) { minr[q] = 99; maxw[q] = 0.0f; }
             for (int64_t i = 0; i < n; ++i) {
                 int q = 0;
                 while (q < nd && distinct[q] != first_of[i]) ++q;
-                if (q < nd) minr[q] = std::min(minr[q], (int) (i % k));
+                if (q < nd) {
+                    minr[q] = std::min(minr[q], (int) (i % k));
+                    if (wt_on) maxw[q] = std::max(maxw[q], rw[i]);
+                }
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
@@ -6285,8 +6309,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const bool resident = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
                 const bool cut = cut_rank > 0 && minr[q] >= cut_rank;                          // STRATA_RANK_CUTOFF: skipped even when resident
                 const bool tail = tail_rank > 0 && minr[q] >= tail_rank && !resident;          // STRATA_ROUTE_TAIL_SKIP: a missed expert only
-                if (!resident && pf_funnel_on()) (cut || tail ? pf_rk_skip : pf_rk_read)[minr[q] < 3 ? 0 : minr[q] < 7 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
-                if (!cut && !tail) continue;
+                const bool wtail = wt_on && !resident && minr[q] >= 2 && maxw[q] < tail_w;   // STRATA_TAIL_WEIGHT: a missed expert whose every pick weighs less than tau
+                if (!resident && pf_funnel_on()) (cut || tail || wtail ? pf_rk_skip : pf_rk_read)[minr[q] < 3 ? 0 : minr[q] < 7 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+                if (!cut && !tail && !wtail) continue;
                 skip_d[q] = true;
                 if (!resident) --nmiss;
                 ++d.tail_experts;
