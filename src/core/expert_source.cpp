@@ -6145,13 +6145,16 @@ bool sample_want(int64_t layer) {
 // ---- STRATA_LAYER_STATS=1 (opt-in diagnostic): per depth band, how the routed picks were served: VRAM hit / PCIe or another GPU / CPU exact / skipped.  Off: one branch per pick. ----
 std::atomic<uint64_t> g_ls[kLayerMultCap][4];
 std::atomic<uint32_t> g_ls_calls{0};
-bool ls_on() { static const bool on = [] { const char* e = std::getenv("STRATA_LAYER_STATS"); return e != nullptr && e[0] == '1'; }(); return on; }
+bool ls_stats_on() { static const bool on = [] { const char* e = std::getenv("STRATA_LAYER_STATS"); return e != nullptr && e[0] == '1'; }(); return on; }
+bool slot_share_on() { static const bool on = [] { const char* e = std::getenv("STRATA_SLOT_SHARE"); return e != nullptr && e[0] == '1'; }(); return on; }
+bool cross_swap_on() { static const bool on = [] { const char* e = std::getenv("STRATA_CROSS_SWAP"); return e != nullptr && e[0] == '1'; }(); return on; }
+bool ls_on() { return ls_stats_on() || slot_share_on() || cross_swap_on(); }
 void ls_note(int64_t layer, int32_t kind) {
     if (layer < 0 || layer >= kLayerMultCap) return;
     g_ls[layer][kind == -2 ? 3 : kind == -1 ? 2 : kind == 0 ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
 }
 void ls_report(size_t n_layers) {   // every 1024 windows, from the last layer: six depth bands
-    if ((g_ls_calls.fetch_add(1, std::memory_order_relaxed) & 1023u) != 1023u) return;
+    if (!ls_stats_on() || (g_ls_calls.fetch_add(1, std::memory_order_relaxed) & 1023u) != 1023u) return;
     std::fprintf(stderr, "strata serve: layer stats (picks per depth band: VRAM hit / PCIe / CPU exact / skipped, and the share each is of the band's picks):\n");
     const size_t bands = 6, per = (n_layers + bands - 1) / bands;
     for (size_t b = 0; b < bands; ++b) {
@@ -6163,6 +6166,62 @@ void ls_report(size_t n_layers) {   // every 1024 windows, from the last layer: 
         std::fprintf(stderr, "  layers %2zu-%2zu: %9llu %8llu %8llu %8llu   (%4.1f%% / %4.1f%% / %4.1f%% / %4.1f%%)\n", lo, hi - 1, (unsigned long long) v[0], (unsigned long long) v[1],
                      (unsigned long long) v[2], (unsigned long long) v[3], 100.0 * v[0] / t, 100.0 * v[1] / t, 100.0 * v[2] / t, 100.0 * v[3] / t);
     }
+}
+
+// ---- STRATA_SLOT_SHARE=1 (opt-in): the VRAM slots follow the layers' non-skippable misses, as RATIOS.  A pick that is served from VRAM, or skipped (a low-weight miss the weight rule drops for free), does not
+// need a slot; a pick the CPU computes or PCIe fetches does.  Per layer: nsm_l = (PCIe + CPU exact picks) / all its picks - a share of its own picks, no absolute count - and the layer's factor is
+// nsm_l over the mean of nsm over the layers (clamped 0.5..2).  The swap ranks experts by their decayed usage across all layers; each round's newly drained usage of layer l is scaled by its factor,
+// so the layers that miss more of what cannot be skipped earn a larger share of the slots, and no layer is given a fixed number.  Until a layer has enough picks its factor is 1.
+float g_slot_f[kLayerMultCap];                 // the layers' factors in use
+double g_slot_nsm_settle[kLayerMultCap];       // the non-skippable-miss shares the factors settled on
+float g_slot_prev[kLayerMultCap];
+bool g_slot_settled = false, g_slot_loaded = false;
+int g_slot_calm = 0;
+std::mutex g_slot_mu;
+std::atomic<uint32_t> g_slot_rounds{0};
+std::string slot_path() { return (std::filesystem::path(g_live_path).parent_path() / "slot-share.bin").string(); }
+// shares nsm_l (-1: too few picks yet) and the factors from them, from the cumulative per-layer counters
+void slot_share_compute(int n_layers, float* f, double* nsm) {
+    double sum = 0; int cnt = 0;
+    for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) {
+        double v[4];
+        for (int k = 0; k < 4; ++k) v[k] = (double) g_ls[l][k].load(std::memory_order_relaxed);
+        const double t = v[0] + v[1] + v[2] + v[3];
+        nsm[l] = t >= 4000.0 ? (v[1] + v[2]) / t : -1.0;
+        if (nsm[l] >= 0) { sum += nsm[l]; ++cnt; }
+    }
+    const double mean = cnt > 0 ? sum / cnt : 0.0;
+    for (int l = 0; l < n_layers && l < kLayerMultCap; ++l)
+        f[l] = (nsm[l] < 0 || mean <= 0.0) ? 1.0f : (float) std::min(2.0, std::max(0.5, nsm[l] / mean));
+}
+void slot_save_locked() {   // "SSH1", layers, settled, factors, shares
+    if (g_live_path.empty()) return;
+    const std::string p = slot_path(), tmp = p + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return;
+    const uint32_t mg = 0x31485353u, nl = (uint32_t) kLayerMultCap;
+    const uint8_t st = g_slot_settled ? 1 : 0;
+    std::fwrite(&mg, 4, 1, f); std::fwrite(&nl, 4, 1, f); std::fwrite(&st, 1, 1, f);
+    std::fwrite(g_slot_f, sizeof(float), kLayerMultCap, f); std::fwrite(g_slot_nsm_settle, sizeof(double), kLayerMultCap, f);
+    std::fclose(f);
+    std::error_code ec;
+    std::filesystem::rename(tmp, p, ec);
+}
+void slot_load_locked() {
+    g_slot_loaded = true;
+    for (int l = 0; l < kLayerMultCap; ++l) { g_slot_f[l] = 1.0f; g_slot_prev[l] = 1.0f; g_slot_nsm_settle[l] = -1.0; }
+    if (g_live_path.empty()) return;
+    FILE* f = std::fopen(slot_path().c_str(), "rb");
+    if (f == nullptr) return;
+    uint32_t mg = 0, nl = 0; uint8_t st = 0;
+    float ff[kLayerMultCap]; double nn[kLayerMultCap];
+    const bool ok = std::fread(&mg, 4, 1, f) == 1 && std::fread(&nl, 4, 1, f) == 1 && std::fread(&st, 1, 1, f) == 1 && mg == 0x31485353u && nl == (uint32_t) kLayerMultCap &&
+                    std::fread(ff, sizeof(float), kLayerMultCap, f) == (size_t) kLayerMultCap && std::fread(nn, sizeof(double), kLayerMultCap, f) == (size_t) kLayerMultCap;
+    std::fclose(f);
+    if (!ok) return;
+    for (int l = 0; l < kLayerMultCap; ++l) { g_slot_f[l] = ff[l]; g_slot_prev[l] = ff[l]; g_slot_nsm_settle[l] = nn[l]; }
+    g_slot_settled = st != 0;
+    std::fprintf(stderr, "strata serve: slot share: state loaded from %s (%s)\n", slot_path().c_str(), g_slot_settled ? "settled: the shares are applied, nothing is recomputed" : "still learning");
 }
 
 bool skipcnt_on() { static const bool on = [] { const char* e = std::getenv("STRATA_LOWRANK"); return e != nullptr && e[0] == '1'; }(); return on; }   // only the copy sidecar reads the per-expert skip counts
@@ -6398,6 +6457,63 @@ float layer_budget_shape(int64_t layer) {
     if (cnt == 0) return layer_mult_shape(layer);
     const double m = (1.0 / std::sqrt(g_sh[layer].mean)) / (sum / cnt);   // mean 1 over the settled layers
     return (float) std::min(2.0, std::max(0.25, m));
+}
+
+/// The swap's round drained `after - before` of newly wanted usage: scale each layer's share of it by its slot-share factor (ratios of non-skippable misses).  LEARNING: the factors are recomputed from the
+/// per-layer counters every round; when no factor has moved more than 3% over 6 checks (one per 64 rounds) the shares SETTLE and are saved: nothing is recomputed any more, the settled factors are just applied.
+/// A settled share wakes only if a layer's miss share has moved more than 10% from the one it settled on (checked every 4096 rounds).
+void slot_share_apply(float* usage, const float* before, int n_layers, int n_expert) {
+    if (!slot_share_on()) return;
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    if (!g_slot_loaded) slot_load_locked();
+    const uint32_t r = g_slot_rounds.fetch_add(1, std::memory_order_relaxed);
+    if (g_slot_settled) {
+        if ((r & 4095u) == 4095u) {
+            float f[kLayerMultCap]; double nsm[kLayerMultCap];
+            slot_share_compute(n_layers, f, nsm);
+            double mv = 0.0;
+            for (int l = 0; l < n_layers && l < kLayerMultCap; ++l)
+                if (nsm[l] >= 0 && g_slot_nsm_settle[l] > 0) mv = std::max(mv, std::fabs(nsm[l] - g_slot_nsm_settle[l]) / g_slot_nsm_settle[l]);
+            if (mv > 0.10) {
+                g_slot_settled = false; g_slot_calm = 0;
+                std::fprintf(stderr, "strata serve: slot share: woke (a layer's miss share moved %.0f%%): learning again\n", 100.0 * mv);
+                slot_save_locked();
+            }
+        }
+    } else {
+        double nsm[kLayerMultCap];
+        slot_share_compute(n_layers, g_slot_f, nsm);
+        if ((r % 64u) == 63u) {
+            double mv = 0.0; int have = 0;
+            for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) { mv = std::max(mv, (double) std::fabs(g_slot_f[l] - g_slot_prev[l]) / std::max(1e-3f, g_slot_prev[l])); have += nsm[l] >= 0 ? 1 : 0; g_slot_prev[l] = g_slot_f[l]; }
+            g_slot_calm = (have == n_layers && mv < 0.03) ? g_slot_calm + 1 : 0;
+            if (g_slot_calm >= 6) {
+                g_slot_settled = true;
+                for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) g_slot_nsm_settle[l] = nsm[l];
+                float lo = 1e9f, hi = 0.0f;
+                for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) { lo = std::min(lo, g_slot_f[l]); hi = std::max(hi, g_slot_f[l]); }
+                std::fprintf(stderr, "strata serve: slot share: settled at round %u: layers' factors x%.2f..x%.2f of the mean (non-skippable misses as a share of each layer's picks); nothing is recomputed now\n", r + 1, (double) lo, (double) hi);
+                slot_save_locked();
+            }
+        }
+    }
+    for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) {
+        const float f = g_slot_f[l];
+        if (f == 1.0f) continue;
+        float* u = usage + (size_t) l * (size_t) n_expert;
+        const float* b = before + (size_t) l * (size_t) n_expert;
+        for (int e = 0; e < n_expert; ++e) u[e] = b[e] + (u[e] - b[e]) * f;
+    }
+    if (r == 63) {
+        float lo = 1e9f, hi = 0.0f;
+        for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) { lo = std::min(lo, g_slot_f[l]); hi = std::max(hi, g_slot_f[l]); }
+        std::fprintf(stderr, "strata serve: slot share: learning, round 64: layers' factors x%.2f..x%.2f of the mean\n", (double) lo, (double) hi);
+    }
+}
+/// The layers' factors now (ratios: each layer's share of non-skippable misses over the mean, 0.5..2; 1 until a layer has enough picks), from the live per-layer counters.
+void slot_share_factors(int n_layers, float* f) {
+    double nsm[kLayerMultCap];
+    slot_share_compute(n_layers, f, nsm);
 }
 uint32_t layer_mult_generation() { return g_mult_gen.load(std::memory_order_relaxed); }
 float layer_mult_shape(int64_t layer) {

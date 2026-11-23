@@ -522,6 +522,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
     for (size_t i = 0; i < host_res.size(); ++i) busy[i] = host_res[i] >= 0 ? 1 : 0;
     for (const Swap& s : swaps) busy[(size_t) s.layer * (size_t) n_expert + (size_t) s.in] = 1;
     for (const Swap& s : swaps) {
+        if (s.out_layer >= 0 && s.out_layer != s.layer) { kept.push_back(s); continue; }   // cross-layer: no RAM exchange (its places are per layer)
         if (src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
         // `out`'s RAM place: `in`'s own when the copy holds `in`; an `in` read from the files gives up the coldest RAM
         // place of its layer instead (the victim, evicted from RAM), and the exchange goes on as for an `in` from RAM.
@@ -11040,9 +11041,40 @@ int main(int argc, char** argv) {
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         int64_t adapt_layer_limit = -1;   // >= 0: the round looks at the layers below it only (the prefill swap: the layers the read has passed)
+        // STRATA_CROSS_SWAP=1: the round's measured costs - the window time between rounds and the copy time per swapped expert (CUDA events) - set how many cross-layer swaps it may add
+        static const bool cross_on = strata::core::cross_swap_on();
+        double cross_win_ms = 0, cross_copy_ms = 0;
+        int cross_prev_n = 0, cross_idle = 0;
+        uint32_t cross_tick = 0, cross_logs = 0;
+        int64_t cross_total = 0;
+        auto cross_t_last = Clock::now();
+        cudaEvent_t cross_ev0 = nullptr, cross_ev1 = nullptr;
+        if (cross_on) { cudaEventCreate(&cross_ev0); cudaEventCreate(&cross_ev1); }
+        // what the unmasked router wanted (13.20), drained into the usage; STRATA_SLOT_SHARE=1 scales each layer's newly drained part by its share of non-skippable misses (ratios)
+        auto drain_want = [&]() {
+            if (!strata::core::slot_share_on()) { strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size()); return; }
+            static thread_local std::vector<float> before;
+            before = drive.d.usage;
+            strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size());
+            if (drive.d.usage.size() == (size_t) (g.n_layers * g.n_expert)) strata::core::slot_share_apply(drive.d.usage.data(), before.data(), (int) g.n_layers, (int) g.n_expert);
+        };
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
-            strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size());   // what the unmasked router wanted (13.20)
+            drain_want();
+            if (cross_on) {
+                const auto tn = Clock::now();
+                const double wms = std::chrono::duration<double, std::milli>(tn - cross_t_last).count();
+                cross_t_last = tn;
+                if (wms < 2000.0) cross_win_ms = cross_win_ms == 0 ? wms : 0.9 * cross_win_ms + 0.1 * wms;
+                if (cross_prev_n > 0) {   // the previous round's copies have landed (pending is empty): their time per expert
+                    float ms = 0;
+                    if (cudaEventElapsedTime(&ms, cross_ev0, cross_ev1) == cudaSuccess && ms > 0) {
+                        const double per = (double) ms / (double) cross_prev_n;
+                        cross_copy_ms = cross_copy_ms == 0 ? per : 0.9 * cross_copy_ms + 0.1 * per;
+                    }
+                    cross_prev_n = 0;
+                }
+            }
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             ++swap_round;
             // STRATA_RESIDENCY_FILE=<path> (the server sets it for the Monitor's residency view): at most every 2 s, one JSON snapshot of which experts
@@ -11076,7 +11108,8 @@ int main(int argc, char** argv) {
                 std::error_code ec;
                 std::filesystem::rename(tmp, res_file, ec);
             }
-            struct Swap { float gain; int32_t layer, in, out; };
+            struct Swap { float gain; int32_t layer, in, out; int32_t out_layer = -1; };
+            [[maybe_unused]] auto ol = [](const Swap& s) -> int32_t { return s.out_layer >= 0 ? s.out_layer : s.layer; };   // the layer the victim belongs to
             std::vector<Swap> swaps;
             // The experts a prompt's loan has taken out of VRAM are marked missing (host_res < 0) until the refill puts them back into the SAME slots: they must never be swap CANDIDATES (the
             // expert would sit in two slots once the refill ran).  Decode rounds are kept out of a loan by their callers (in_prompt_read); the round itself now holds the same line.
@@ -11118,10 +11151,79 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            // STRATA_CROSS_SWAP=1: slots move BETWEEN layers, toward the layers that miss more of what cannot be skipped.  Only where the protocol is the simple one (no overlap, one GPU, no helpers, no loan
+            // in progress); the victim is evicted from its layer's table first and the copy lands before the new expert is marked resident, exactly as a same-layer swap.  The budget is computed: the
+            // copies may take 10% of a window's time (a ratio) at the measured time per expert, less what the same-layer swaps already use.  Values are the usage scaled by each layer's factor (ratios
+            // of non-skippable misses over the mean); a layer's count stays between half and twice the mean; a slot only takes an expert whose blob fits it.
+            if (cross_on) {   // once: why a round cannot do cross-layer swaps, if it cannot
+                static bool said = false;
+                if (!said && (aov || multi_gpu || peer.valid() || remote_opt || adapt_fence || adapt_layer_limit >= 0 || !lent_mask.empty())) {
+                    said = true;
+                    std::fprintf(stderr, "strata serve: cross-layer swaps wait: overlap %d, multi-GPU %d, peer %d, remote %d, fence %d, layer limit %d, loan %d (the rounds without these do them)\n",
+                                 (int) aov, (int) multi_gpu, (int) peer.valid(), (int) (remote_opt != nullptr), (int) (bool) adapt_fence, (int) adapt_layer_limit, (int) !lent_mask.empty());
+                }
+            }
+            if (cross_on && !aov && !multi_gpu && !peer.valid() && !remote_opt && !adapt_fence && adapt_layer_limit < 0 && lent_mask.empty()) {
+                int budget = cross_copy_ms > 0 && cross_win_ms > 0 ? (int) (0.10 * cross_win_ms / cross_copy_ms) - (int) swaps.size() : 4;   // the first rounds probe with 4
+                if (cross_idle >= 8 && (++cross_tick % 16) != 0) budget = 0;   // nothing moved for 8 rounds: look at every 16th only
+                if (budget > 0) {
+                    const int64_t NL = g.n_layers, NE = g.n_expert;
+                    std::vector<float> fac((size_t) NL, 1.0f);
+                    strata::core::slot_share_factors((int) NL, fac.data());
+                    std::vector<char> used((size_t) (NL * NE), 0);
+                    for (const Swap& s : swaps) { used[(size_t) (s.layer * NE + s.in)] = 1; used[(size_t) (ol(s) * NE + s.out)] = 1; }
+                    std::vector<int> cnt((size_t) NL, 0);
+                    int64_t tot = 0;
+                    for (int64_t l = 0; l < NL; ++l)
+                        for (int64_t e = 0; e < NE; ++e)
+                            if (host_res[(size_t) (l * NE + e)] >= 0) { ++cnt[(size_t) l]; ++tot; }
+                    const int mean_cnt = (int) (tot / NL);
+                    struct CV { float v; int32_t layer, e; };
+                    std::vector<CV> cc, vv;
+                    for (int64_t l = 0; l < NL; ++l) {
+                        const float* u = drive.d.usage.data() + l * NE;
+                        const int32_t* r = host_res.data() + l * NE;
+                        for (int32_t e = 0; e < (int32_t) NE; ++e) {
+                            const size_t ix = (size_t) (l * NE + e);
+                            if (used[ix]) continue;
+                            if (r[e] < 0) {
+                                if (u[e] >= 2.0f && !helper_holds(l, e) && !(!lent_mask.empty() && lent_mask[ix])) cc.push_back({u[e] * fac[(size_t) l], (int32_t) l, e});
+                            } else if (swap_grace == 0 || swap_round - swapped_at[ix] > swap_grace) vv.push_back({u[e] * fac[(size_t) l], (int32_t) l, e});
+                        }
+                    }
+                    std::sort(cc.begin(), cc.end(), [](const CV& a, const CV& b) { return a.v > b.v; });
+                    std::sort(vv.begin(), vv.end(), [](const CV& a, const CV& b) { return a.v < b.v; });
+                    const int floor_cnt = std::max(1, mean_cnt / 2), ceil_cnt = mean_cnt * 2;
+                    int added = 0;
+                    for (const CV& c : cc) {
+                        if (added >= budget) break;
+                        if (cnt[(size_t) c.layer] >= ceil_cnt) continue;
+                        for (CV& v : vv) {
+                            if (v.layer < 0 || v.layer == c.layer) continue;
+                            if (c.v - v.v < o.adapt_min_gain) break;   // the victims only get hotter down the list
+                            if (cnt[(size_t) v.layer] <= floor_cnt) continue;
+                            const int32_t slot = host_res[(size_t) (v.layer * NE + v.e)];
+                            if (slot < 0 || xcache.slot_capacity(slot) < (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(c.layer)) continue;
+                            Swap sw{c.v - v.v, c.layer, c.e, v.e};
+                            sw.out_layer = v.layer;
+                            swaps.push_back(sw);
+                            --cnt[(size_t) v.layer]; ++cnt[(size_t) c.layer];
+                            v.layer = -1;
+                            ++added;
+                            break;
+                        }
+                    }
+                    cross_idle = added > 0 ? 0 : cross_idle + 1;
+                    cross_total += added;
+                    if (added > 0 && (cross_logs++ % 128) == 0)
+                        std::fprintf(stderr, "strata serve: cross-layer swaps: %d this round, %lld in all (budget %d: %.3f ms to copy an expert, %.1f ms a window, 10%% of it for the copies)\n",
+                                     added, (long long) cross_total, budget, cross_copy_ms, cross_win_ms);
+                }
+            }
             if (swap2_max > 0) {   // SWAP2: after the demand swaps, into cold slots only
                 strata::kernels::route_repl_drain(usage2.data(), usage2.size());
                 std::vector<char> taken((size_t) (g.n_layers * g.n_expert), 0);
-                for (const Swap& s : swaps) { taken[(size_t) (s.layer * g.n_expert + s.in)] = 1; taken[(size_t) (s.layer * g.n_expert + s.out)] = 1; }
+                for (const Swap& s : swaps) { taken[(size_t) (s.layer * g.n_expert + s.in)] = 1; taken[(size_t) (ol(s) * g.n_expert + s.out)] = 1; }
                 std::vector<Swap> extra;
                 std::vector<std::pair<float, int32_t>> c2, v2;
                 for (int64_t l = 0; l < (adapt_layer_limit >= 0 ? std::min<int64_t>(adapt_layer_limit, g.n_layers) : g.n_layers); ++l) {
@@ -11272,7 +11374,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> fenced_slots;
             if (adapt_fence && !swaps.empty()) {
                 for (const Swap& s : swaps) {
-                    const size_t out = (size_t) s.layer * g.n_expert + s.out;
+                    const size_t out = (size_t) ol(s) * g.n_expert + s.out;
                     fenced_slots.push_back(host_res[out]);
                     host_res[out] = strata::core::kNotResident;
                 }
@@ -11285,6 +11387,7 @@ int main(int argc, char** argv) {
             std::vector<void*> cp_dst;
             std::vector<const void*> cp_src;
             std::vector<size_t> cp_bytes;
+            if (cross_on && !swaps.empty()) cudaEventRecord(cross_ev0, adapt_stream);
             for (size_t si = 0; si < swaps.size(); ++si) {
                 const Swap& s = swaps[si];
                 if (aov && (si == 0 || swaps[si - 1].layer != s.layer)) {
@@ -11294,7 +11397,7 @@ int main(int argc, char** argv) {
                     if (slow_us > 0)
                         cudaLaunchHostFunc(adapt_stream, [](void* p) { std::this_thread::sleep_for(std::chrono::microseconds(*(int*) p)); }, &slow_arg);
                 }
-                const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
+                const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) ol(s) * g.n_expert + s.out;
                 const int32_t slot = fenced_slots.empty() ? host_res[out] : fenced_slots[si];
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
                 const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
@@ -11306,7 +11409,7 @@ int main(int argc, char** argv) {
                     cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
                     main_live = true;
                     host_res[out] = strata::core::kNotResident;
-                    srcp->prefetch(s.layer, s.out);
+                    srcp->prefetch(ol(s), s.out);
                     pending.emplace_back((int32_t) in, slot);
                     continue;
                 }
@@ -11321,7 +11424,7 @@ int main(int argc, char** argv) {
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
-                srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
+                srcp->prefetch(ol(s), s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
                 if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
                     (agate.hland != nullptr
@@ -11337,7 +11440,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (drive.d.evict_sync && !swaps.empty()) {   // the evicted ones are misses now (see the pre-launch hook)
-                for (const Swap& s : swaps) drive.d.res_dirty_idx.push_back((int32_t) (s.layer * g.n_expert + s.out));
+                for (const Swap& s : swaps) drive.d.res_dirty_idx.push_back((int32_t) (ol(s) * g.n_expert + s.out));
                 drive.d.res_dirty = true;
             }
             if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),
@@ -11347,6 +11450,7 @@ int main(int argc, char** argv) {
                 return false;
             }
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (cross_on && !swaps.empty()) { cudaEventRecord(cross_ev1, adapt_stream); cross_prev_n = (int) swaps.size(); }
             // #2188: hand the copies and their landing signals to the GPU now.  WDDM batches a stream's work until a
             // driver call flushes it, and the verify window only spins on the pinned int (Linux submits at once: no-op)
             if (aov && agate.hland != nullptr && !swaps.empty()) (void) cudaStreamQuery(adapt_stream);
@@ -11648,7 +11752,7 @@ int main(int argc, char** argv) {
                     a_last = a_win;
                     ++a_rounds;
                     a_t0 = Clock::now();
-                    strata::kernels::route_want_drain(drive.d.usage.data(), drive.d.usage.size());   // 13.20
+                    drain_want();   // 13.20
                     a_usage = drive.d.usage;
                     a_res = host_res;
                     // #477: the routing counted, as adapt() counts it (--expert-profile-save; else `heat` is empty)
@@ -18767,7 +18871,8 @@ int main(int argc, char** argv) {
                 return true;   // the previous swaps are still in flight
             }
             if (trace_adapt) std::fprintf(stderr, "strata: ADAPT round=%lld considering\n", (long long) adapt_rounds);
-            struct Swap { float gain; int32_t layer, in, out; };
+            struct Swap { float gain; int32_t layer, in, out; int32_t out_layer = -1; };
+            [[maybe_unused]] auto ol = [](const Swap& s) -> int32_t { return s.out_layer >= 0 ? s.out_layer : s.layer; };   // the layer the victim belongs to
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
             for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -18811,7 +18916,7 @@ int main(int argc, char** argv) {
             std::vector<const void*> cp_src;
             std::vector<size_t> cp_bytes;
             for (const Swap& s : swaps) {
-                const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
+                const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) ol(s) * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
                 const size_t blob_n = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
@@ -18829,11 +18934,11 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
-                srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
+                srcp->prefetch(ol(s), s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (drive.d.evict_sync && !swaps.empty()) {   // the evicted ones are misses now (see the pre-launch hook)
-                for (const Swap& s : swaps) drive.d.res_dirty_idx.push_back((int32_t) (s.layer * g.n_expert + s.out));
+                for (const Swap& s : swaps) drive.d.res_dirty_idx.push_back((int32_t) (ol(s) * g.n_expert + s.out));
                 drive.d.res_dirty = true;
             }
             if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),

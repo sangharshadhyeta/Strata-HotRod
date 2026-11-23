@@ -98,6 +98,8 @@ public:
     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
     /// Byte offset of each slot in the arena (null for uniform slots).
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
+    /// The data bytes a slot can hold (its stride minus the guard; the uniform blob size for a uniform arena): a cross-layer swap only fits an expert whose blob is this small.
+    int64_t slot_capacity(int32_t slot) const { return off_.empty() ? blob_ : (int64_t) (off_[(size_t) slot + 1] - off_[(size_t) slot]) - (int64_t) guard_; }
     void close();
 
     bool valid() const { return base_ != nullptr; }
