@@ -435,8 +435,9 @@ __device__ __forceinline__ void route_resident_warp(const float* __restrict__ lo
     const float want_lo = ((const volatile RouteCfg*) cfg)->want_lo;
     const float repl_gap = ((const volatile RouteCfg*) cfg)->repl_gap;
     const float wmax = ((const volatile RouteCfg*) cfg)->wmax;
-    const float budget = ((const volatile RouteCfg*) cfg)->budget;
-    const float budget_tail = ((const volatile RouteCfg*) cfg)->budget_tail;
+    const float bm = (layer >= 0 && layer < 256) ? ((const volatile RouteCfg*) cfg)->bmult[layer] : 1.0f;   // STRATA_LAYER_SUB: this layer's share of the budgets (1 when off)
+    const float budget = ((const volatile RouteCfg*) cfg)->budget * bm;
+    const float budget_tail = ((const volatile RouteCfg*) cfg)->budget_tail * bm;
     const int ne = ((const volatile RouteCfg*) cfg)->ne;   // routed experts per layer (512 unless the model has fewer)
     const float* l = logits + (size_t) t * ne;
     int32_t* id = ids + (size_t) t * 10;
@@ -764,6 +765,7 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
         if (cudaHostAlloc((void**) &g_cfg_host, sizeof(RouteCfg), cudaHostAllocMapped) != cudaSuccess) { g_cfg_host = nullptr; return; }
         if (cudaHostGetDevicePointer((void**) &g_cfg_dev, g_cfg_host, 0) != cudaSuccess) { g_cfg_dev = nullptr; return; }
         g_cfg_host->ne = 512;   // (cudaHostAlloc does not clear it) the Flash-Next default; route_cfg_set_experts moves it
+        for (int i = 0; i < 256; ++i) g_cfg_host->bmult[i] = 1.0f;
     }
     g_cfg_host->lo = lo;
     g_cfg_host->hi = hi;
@@ -777,6 +779,10 @@ void route_cfg_init(int lo, int hi, float margin, float edge, float bias, int ma
     g_cfg_host->budget = budget;
     g_cfg_host->budget_tail = budget_tail;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+void route_cfg_set_layer_budget_mult(int layer, float m) {
+    if (g_cfg_host == nullptr || layer < 0 || layer >= 256 || !(m > 0.0f)) return;
+    g_cfg_host->bmult[layer] = m;
 }
 void route_group_set(const int32_t* labels_dev, int mode, float bonus) {
     if (cudaMemcpyToSymbol(g_grp_labels, &labels_dev, sizeof labels_dev) != cudaSuccess ||

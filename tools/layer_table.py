@@ -157,12 +157,23 @@ def measure(args, layers):
     return res, stat
 
 
+def detect_layers(gguf_glob):
+    """The number of MoE layers of the model: the layers that have a router (blk.N.ffn_gate_inp.weight) in its GGUF files."""
+    from gguf import GGUFReader
+    n = 0
+    for p in sorted(glob.glob(gguf_glob)):
+        for t in GGUFReader(p, "r").tensors:
+            if t.name.startswith("blk.") and t.name.endswith(".ffn_gate_inp.weight"):
+                n += 1
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--trace", required=True, nargs="+", help="a STRATA_ROUTER_TRACE capture, or the live capture's segment files (<pack>/layer-capture/cap-*.bin)")
     ap.add_argument("--gguf", required=True, help="glob of the model's GGUF files")
     ap.add_argument("--out", required=True, help="the table (<pack>/layer-sens.txt); blended into when it exists")
-    ap.add_argument("--layers", type=int, default=48)
+    ap.add_argument("--layers", type=int, default=0, help="MoE layers of the model (0: counted from the GGUF)")
     ap.add_argument("--rows", type=int, default=600, help="decode rows per layer from the trace")
     ap.add_argument("--alpha", type=float, default=0.3, help="weight of this run's measurement when blending into an existing table")
     ap.add_argument("--part", default="0/1", help="k/n: measure only layers l with l %% n == k (a short job per run)")
@@ -170,6 +181,10 @@ def main(argv=None):
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--min-rows", type=int, default=50, help="a layer with fewer rows in the capture is skipped this run")
     a = ap.parse_args(argv)
+    if a.layers <= 0:
+        a.layers = detect_layers(a.gguf)
+        if a.layers <= 0:
+            sys.exit("no MoE layers found in " + a.gguf)
     k, n = (int(v) for v in a.part.split("/"))
     layers = [l for l in range(a.layers) if l % n == k]
     t0 = time.time()

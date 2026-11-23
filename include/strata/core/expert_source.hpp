@@ -729,14 +729,14 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err);
 // Safe to call again while decoding: the table is atomic per layer, so a table refreshed on disk (tools/layer_table.py) takes effect at the next window.
 /// The multiplier of STRATA_TAIL_WEIGHT for `layer` (1 when no sensitivity file was loaded).
 float tail_weight_layer_mult(int64_t layer);
-/// STRATA_LAYER_LIVE=1 (opt-in): the per-layer thresholds keep the flat rule's skip count: the table gives the shape (tau_l ~ 1/sensitivity_l), a running histogram of the router
-/// weights every layer sees gives the scale, solved every 64 windows so the same number of experts is skipped (the same speed) where skipping costs the least.  No table: flat.
-/// Earn mode (default when the weight rule is the default and the pack has a place for the table; STRATA_LAYER_EARN=0 turns it off): every layer starts at threshold 0 - exact - and
-/// the first complete table (tools/layer_table.py, from the live capture) is what switches the thresholds on.  Without it nothing is skipped.
+/// The live per-layer thresholds (default with the default weight rule; STRATA_LAYER_LIVE=0 off): every layer starts at the configured threshold; a running histogram of the router weights
+/// of the missed experts gives each layer's shape and the scale that keeps the flat rule's skip count; the histogram survives a restart (layer_live_persist).
+/// Earn mode (opt-in STRATA_LAYER_EARN=1): every layer starts at threshold 0 - exact - until the first complete table has been loaded.
 void layer_earn_set(bool on);
 bool layer_earned();
 void layer_live_set(bool on);
 bool layer_live_on();
+void layer_live_persist(const std::string& path, int n_layers);
 /// The verifier's host-mapped router weights of the window slice about to be served ([n_tok * k], indexed like the ids); null when not set.  Thread-local: set just before the
 /// pool call and cleared after it.
 void expert_dispatch_set_weights(const float* w);

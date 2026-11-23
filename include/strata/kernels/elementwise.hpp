@@ -123,7 +123,7 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
                             float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
                             void* stream);
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
-                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream);
+                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream, const float* weights = nullptr, float* weights_out = nullptr);
 /// SYCL: publishes launched or recorded while `on` store the payload with plain stores instead of uncached ones, for
 /// a caller that reads the payload only after the publishing kernel has ended (the stepped verify window).
 void doorbell_plain_payload(bool on);
@@ -135,7 +135,7 @@ void doorbell_plain_payload(bool on);
 /// finalizer - a plain sum missed a reordering, [3,7] -> [7,3], of the expert ids) in a per-ring slot modulo 4:
 /// seq[1 + 2 (r % 4)] is the tag, seq[2 + 2 (r % 4)] the checksum (a split verify publishes two rings before the host
 /// reads the first). The sequence word therefore needs 9 words of mapped host memory.  The two publish shapes
-/// differ (doorbell_publish / doorbell_publish_value publish the routing weights, doorbell_publish_res does not),
+/// differ (doorbell_publish / doorbell_publish_value publish the routing weights, doorbell_publish_res publishes them only when given `weights_out`),
 /// so the wait accepts either.  CUDA/HIP: always true (their ordering holds), so callers may skip the wait there.
 bool doorbell_payload_ready(const uint32_t* h_seq, const float* h_x, int64_t n, const int32_t* h_ids,
                             const float* h_weights, int64_t k, uint32_t want);

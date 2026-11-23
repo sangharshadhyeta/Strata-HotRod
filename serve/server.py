@@ -4129,6 +4129,22 @@ class Service:
         finally:
             self.fifo.release()
 
+    def start_layer_maint(self):
+        """The per-layer threshold table keeps itself fresh: while the server is idle a low-priority job turns the engine's live capture into the table the engine reloads
+        (serve/layer_maint.py; STRATA_LAYER_MAINT=0 turns it off)."""
+        spawn = getattr(self.engine, "spawn", None)
+        if not spawn:
+            return
+        try:
+            from serve import layer_maint
+            tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+            lm = layer_maint.from_engine_args(spawn[1], spawn[4], tools, lambda: bool(self.status.get("busy") or self.status.get("queued")), lambda: self.last_request_at,
+                                              log=lambda m: print(m, flush=True))
+            if lm is not None:
+                lm.start()
+        except Exception as e:                      # never worth a failed start
+            print(f"[strata] layer table refresh not started: {e}", flush=True)
+
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
@@ -8027,6 +8043,7 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    svc.start_layer_maint()
     svc.start_vision_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "

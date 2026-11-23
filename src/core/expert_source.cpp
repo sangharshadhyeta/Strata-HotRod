@@ -5886,18 +5886,30 @@ void layer_mult_init() {
 }
 }  // namespace
 namespace {
-// STRATA_LAYER_LIVE=1 (opt-in): the per-layer thresholds keep the skip count of the flat threshold.  The table (tools/layer_table.py) gives the SHAPE (tau_l ~ 1/sensitivity_l); a
-// running histogram of the router weights every layer really sees (ranks at or above the stand-ins' floor, log-spaced bins) gives the SCALE: every 64 windows the engine solves for the
-// c with  sum_l skipped_l(c * shape_l) = sum_l skipped_l(tau)  (tau = STRATA_TAIL_WEIGHT, the flat default), so the allocation spends the same number of skipped experts - the same
-// speed - where they cost the least.  Offline on the real weights this lowered the block-output error proxy to 0.44 of the flat rule's at the same skip count.  No table: the shape is
-// flat and c = tau, i.e. nothing changes.  The router's weight alone cannot give the shape (it does not say how big a layer's expert outputs are against its block output).
+// The live per-layer thresholds (the default with the default weight rule; STRATA_LAYER_LIVE=0 turns it off).  Every layer starts at the configured threshold tau
+// (STRATA_TAIL_WEIGHT, 0.02).  The engine keeps, per layer, a log-binned histogram of the router weights of the missed experts the weight rule looks at (count and weight sum
+// per bin) and every 64 windows re-solves the thresholds from it:
+//   shape_l  = how cheap skipping is in layer l.  Router only: m10_l, the mean weight of the layer's weakest 10% of those picks - a layer whose weakest picks carry
+//              more weight loses more from skipping them - and shape_l ~ 1/m10_l (clamped 0.25..4); a table (tools/layer_table.py) replaces it when one is loaded.
+//   scale c  = solved so that sum_l skipped_l(c * shape_l) = sum_l skipped_l(tau): the same number of experts is skipped as with the flat threshold, so the speed is the same.
+// tau_l = c * shape_l.  Offline on the real router weights this allocation had 0.52 of the flat rule's block-output error proxy at the same skip count (0.44 with the exact map).
+// The histogram is saved beside the profile (layer-live.bin) every ~1000 windows and at exit and loaded at start, so the thresholds survive a restart.  Cost: one histogram
+// count per missed expert and window, and ~100,000 operations every 64 windows.
 constexpr int kBins = 48;
 constexpr double kBinLo = 1e-4, kBinSpan = 5000.0;   // bins: log-spaced from 1e-4 to 0.5
 std::atomic<uint32_t> g_lhist[kLayerMultCap][kBins];
-std::atomic<float> g_lshape[kLayerMultCap];           // ~ 1/sensitivity from the table, clamped 0.25..4 (0 = no table)
+std::atomic<uint64_t> g_lwsum[kLayerMultCap][kBins];   // sum of the weights x 1e6
+std::atomic<float> g_lshape[kLayerMultCap];            // from a table (0 = none)
 std::atomic<bool> g_live_on{false};
 std::atomic<uint32_t> g_live_win{0};
-// skipped picks (counts) below threshold t in layer l: whole bins plus a log-interpolated part of the bin t falls in
+std::string g_live_path;
+std::atomic<uint64_t> g_dbg_plan{0}, g_dbg_wt{0}, g_dbg_live{0}, g_dbg_note{0}, g_dbg_rank{0}, g_dbg_badw{0};   // why the histogram stays empty (debug)
+int g_live_layers = 0;
+int live_bin(double w) {
+    const double pos = std::log(w / kBinLo) / std::log(kBinSpan) * kBins;
+    return pos < 0.0 ? 0 : (pos >= kBins ? kBins - 1 : (int) pos);
+}
+// count of the picks of layer l below threshold t: whole bins plus a log-interpolated part of the bin t falls in
 double hist_below(int l, double t) {
     if (t <= kBinLo) return 0.0;
     const double pos = std::log(t / kBinLo) / std::log(kBinSpan) * kBins;
@@ -5910,39 +5922,93 @@ double hist_below(int l, double t) {
 }  // namespace
 void layer_live_set(bool on) { layer_mult_init(); g_live_on.store(on, std::memory_order_relaxed); }
 bool layer_live_on() { return g_live_on.load(std::memory_order_relaxed); }
-static std::atomic<uint64_t> g_live_calls{0}, g_live_null{0};
-void layer_live_update(int64_t layer, const float* rw, int64_t n_tok, int64_t k, int from) {
-    g_live_calls.fetch_add(1, std::memory_order_relaxed);
-    if (rw == nullptr) g_live_null.fetch_add(1, std::memory_order_relaxed);
-    if (!g_live_on.load(std::memory_order_relaxed) || rw == nullptr || layer < 0 || layer >= kLayerMultCap || k < 1) return;
-    for (int64_t t = 0; t < n_tok; ++t)
-        for (int64_t r = from; r < k; ++r) {
-            const float w = rw[(size_t) (t * k + r)];
-            if (!(w > 0.0f)) continue;
-            const double pos = std::log((double) w / kBinLo) / std::log(kBinSpan) * kBins;
-            const int b = pos < 0.0 ? 0 : (pos >= kBins ? kBins - 1 : (int) pos);
-            g_lhist[layer][b].fetch_add(1, std::memory_order_relaxed);
-        }
+void layer_live_note(int64_t layer, float w) {
+    g_dbg_note.fetch_add(1, std::memory_order_relaxed);
+    if (layer < 0 || layer >= kLayerMultCap || !(w > 0.0f)) { g_dbg_badw.fetch_add(1, std::memory_order_relaxed); return; }
+    const int b = live_bin((double) w);
+    g_lhist[layer][b].fetch_add(1, std::memory_order_relaxed);
+    g_lwsum[layer][b].fetch_add((uint64_t) ((double) w * 1e6), std::memory_order_relaxed);
 }
-// Every 64 windows, at layer 0: the scale c that keeps the flat rule's skip count, then the multipliers c * shape_l / tau.
+bool layer_live_save() {
+    if (g_live_path.empty() || g_live_layers < 1) return false;
+    const std::string tmp = g_live_path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return false;
+    const uint32_t magic = 0x31484c4cu, nl = (uint32_t) g_live_layers, nb = (uint32_t) kBins;   // "LLH1"
+    std::fwrite(&magic, 4, 1, f); std::fwrite(&nl, 4, 1, f); std::fwrite(&nb, 4, 1, f);
+    std::vector<uint32_t> cnt((size_t) kBins); std::vector<uint64_t> ws((size_t) kBins);
+    for (int l = 0; l < g_live_layers; ++l) {
+        for (int b = 0; b < kBins; ++b) { cnt[(size_t) b] = g_lhist[l][b].load(std::memory_order_relaxed); ws[(size_t) b] = g_lwsum[l][b].load(std::memory_order_relaxed); }
+        std::fwrite(cnt.data(), 4, (size_t) kBins, f); std::fwrite(ws.data(), 8, (size_t) kBins, f);
+    }
+    std::fclose(f);
+    std::error_code ec;
+    std::filesystem::rename(tmp, g_live_path, ec);
+    return !ec;
+}
+// `path`: where the histogram lives between runs; loaded now when it matches the model, saved periodically and at exit.
+void layer_live_persist(const std::string& path, int n_layers) {
+    g_live_path = path;
+    g_live_layers = std::min(n_layers, kLayerMultCap);
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f != nullptr) {
+        uint32_t magic = 0, nl = 0, nb = 0;
+        bool ok = std::fread(&magic, 4, 1, f) == 1 && std::fread(&nl, 4, 1, f) == 1 && std::fread(&nb, 4, 1, f) == 1 && magic == 0x31484c4cu && (int) nl == g_live_layers && (int) nb == kBins;
+        if (ok) {
+            std::vector<uint32_t> cnt((size_t) kBins); std::vector<uint64_t> ws((size_t) kBins);
+            for (int l = 0; l < g_live_layers && ok; ++l) {
+                ok = std::fread(cnt.data(), 4, (size_t) kBins, f) == (size_t) kBins && std::fread(ws.data(), 8, (size_t) kBins, f) == (size_t) kBins;
+                if (ok) for (int b = 0; b < kBins; ++b) { g_lhist[l][b].store(cnt[(size_t) b], std::memory_order_relaxed); g_lwsum[l][b].store(ws[(size_t) b], std::memory_order_relaxed); }
+            }
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "strata serve: layer live: %s %s\n", path.c_str(), ok ? "loaded: the thresholds start from where the last run left off" : "does not match this model, starting fresh");
+    }
+    static bool registered = false;
+    if (!registered) { registered = true; std::atexit([] { layer_live_save(); }); }
+}
+// Every 64 windows, at layer 0: the shape, the scale c that keeps the flat rule's skip count, then the multipliers c * shape_l / tau.
 void layer_live_refresh(int n_layers, double tau) {
     if (!g_live_on.load(std::memory_order_relaxed) || n_layers < 1 || n_layers > kLayerMultCap || tau <= 0.0) return;
     const uint32_t win = g_live_win.fetch_add(1, std::memory_order_relaxed);
     if ((win & 63u) != 0) return;
-    if ((win & 4095u) == 0 && win > 0)   // forget slowly: halve the counts every 4096 windows
-        for (int l = 0; l < n_layers; ++l) for (int b = 0; b < kBins; ++b) g_lhist[l][b].store(g_lhist[l][b].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
+    if (win > 0 && (win & 4095u) == 0)   // forget slowly: halve the counts every 4096 windows
+        for (int l = 0; l < n_layers; ++l) for (int b = 0; b < kBins; ++b) {
+            g_lhist[l][b].store(g_lhist[l][b].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
+            g_lwsum[l][b].store(g_lwsum[l][b].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
+        }
     double target = 0.0, total = 0.0;
-    for (int l = 0; l < n_layers; ++l) { target += hist_below(l, tau); for (int b = 0; b < kBins; ++b) total += (double) g_lhist[l][b].load(std::memory_order_relaxed); }
-    if (total < 2000.0 || target < 20.0) {              // too few weights seen yet: the table (or the flat default) stays in force
-        if (win == 0 || win == 256 || win == 2048) std::fprintf(stderr, "strata serve: layer live: waiting (window %u, %.0f picks seen, %.0f below the flat threshold %.4f; %llu updates, %llu without weights, %d layers)\n", win, total, target, tau, (unsigned long long) g_live_calls.load(), (unsigned long long) g_live_null.load(), n_layers);
+    std::vector<double> n_l((size_t) n_layers, 0.0), m10((size_t) n_layers, 0.0);
+    for (int l = 0; l < n_layers; ++l) {
+        target += hist_below(l, tau);
+        double n = 0.0;
+        for (int b = 0; b < kBins; ++b) n += (double) g_lhist[l][b].load(std::memory_order_relaxed);
+        n_l[(size_t) l] = n; total += n;
+        if (n >= 100.0) {   // the mean weight of the weakest 10% of this layer's picks
+            const double want = 0.10 * n;
+            double c = 0.0, ws = 0.0;
+            for (int b = 0; b < kBins && c < want; ++b) {
+                const double cb = (double) g_lhist[l][b].load(std::memory_order_relaxed), wb = (double) g_lwsum[l][b].load(std::memory_order_relaxed) * 1e-6;
+                if (cb <= 0.0) continue;
+                const double take = std::min(cb, want - c);
+                c += take; ws += wb * (take / cb);
+            }
+            m10[(size_t) l] = c > 0.0 ? ws / c : 0.0;
+        }
+    }
+    if (total < 2000.0 || target < 20.0) {              // too few weights seen yet: every layer keeps the configured threshold
+        if (win == 0 || win == 64 || win == 256 || win == 1024) std::fprintf(stderr, "strata serve: layer live: collecting (window %u, %.0f missed-expert weights seen, %.0f below %.4f, %d layers; plan blocks %llu, weight rule on %llu, live on %llu, notes %llu (bad %llu), rank rule on %llu)\n", win, total, target, tau, n_layers, (unsigned long long) g_dbg_plan.load(), (unsigned long long) g_dbg_wt.load(), (unsigned long long) g_dbg_live.load(), (unsigned long long) g_dbg_note.load(), (unsigned long long) g_dbg_badw.load(), (unsigned long long) g_dbg_rank.load());
         return;
     }
     std::vector<double> shape((size_t) n_layers, 1.0);
-    bool any = false;
-    for (int l = 0; l < n_layers; ++l) { const float sh = g_lshape[l].load(std::memory_order_relaxed); if (sh > 0.0f) { shape[(size_t) l] = sh; any = true; } }
-    if (!any) {                                         // no table: flat
-        if (win == 0 || win == 256) std::fprintf(stderr, "strata serve: layer live: no table loaded, the thresholds stay flat\n");
-        return;
+    double msum = 0.0; int mcnt = 0;
+    for (int l = 0; l < n_layers; ++l) if (m10[(size_t) l] > 0.0) { msum += m10[(size_t) l]; ++mcnt; }
+    const double mmean = mcnt > 0 ? msum / mcnt : 0.0;
+    bool from_table = false;
+    for (int l = 0; l < n_layers; ++l) {
+        const float tsh = g_lshape[l].load(std::memory_order_relaxed);
+        if (tsh > 0.0f) { shape[(size_t) l] = tsh; from_table = true; }
+        else if (m10[(size_t) l] > 0.0 && mmean > 0.0) shape[(size_t) l] = std::min(4.0, std::max(0.25, mmean / m10[(size_t) l]));
     }
     double lo = 1e-4, hi = 0.5;
     for (int it = 0; it < 40; ++it) {
@@ -5960,8 +6026,9 @@ void layer_live_refresh(int n_layers, double tau) {
     }
     static std::atomic<uint32_t> g_refreshes{0};
     if (const uint32_t r = g_refreshes.fetch_add(1, std::memory_order_relaxed); r == 0 || (r % 64) == 0)
-        std::fprintf(stderr, "strata serve: layer live: the same skip count as the flat rule (%.0f picks seen), thresholds x%.2f..x%.2f of tau (%.4f..%.4f) after %u windows\n",
-                     total, (double) mn, (double) mx, (double) mn * tau, (double) mx * tau, win);
+        std::fprintf(stderr, "strata serve: layer live: thresholds %.4f..%.4f (x%.2f..x%.2f of tau %.4f) from %s, the same skip count as the flat rule (%.0f weights seen, window %u)\n",
+                     mn * tau, mx * tau, (double) mn, (double) mx, tau, from_table ? "the table's shape" : "the router's own weights", total, win);
+    if ((win & 1023u) == 0 && win > 0) layer_live_save();
 }
 bool layer_sens_load(const char* path, int n_layers, std::string& err) {
     std::ifstream in(path);
@@ -6303,10 +6370,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (router_trace_on() && x_f != nullptr && ids != nullptr && k >= 1 && k <= 16) router_trace_write(d.layers, x_f, ids, n_tok, k);
-    if (g_live_on.load(std::memory_order_relaxed) && n_tok <= 8 && k == 10) {   // STRATA_LAYER_LIVE: the router's confidence, per layer, as a running statistic
-        if (d.layers == 0) layer_live_refresh((int) std::max<int64_t>(d.n_layers, 1), (double) tail_weight());
-        layer_live_update(d.layers, t_route_w, n_tok, k, tail_weight_from());
-    }
+    if (d.layers == 0 && n_tok <= 8 && g_live_on.load(std::memory_order_relaxed)) layer_live_refresh((int) std::max<int64_t>(d.n_layers, 1), (double) tail_weight());   // the live per-layer thresholds
     if (n_tok <= 8 && x_f != nullptr && ids != nullptr && k >= 1 && k <= 16) layer_capture_write(d.layers, x_f, ids, n_tok, k);   // the live capture: a few decode windows, bounded
     if (d.src != nullptr) d.src->route_layer(d.layers);   // before the look-ahead below queues this layer's guesses
     if (d.fs != nullptr) d.fs->at_layer.store(d.layers, std::memory_order_release);   // STRATA_RING's refill guard
@@ -6531,6 +6595,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int tail_w_from = tail_weight_from();   // the stand-ins' floor: the ranks below it are always computed
         const float* rw = t_route_w;
         const bool wt_on = tail_w > 0.0f && rw != nullptr;
+        const bool live_note = wt_on && n_tok <= 8 && g_live_on.load(std::memory_order_relaxed);
+        g_dbg_plan.fetch_add(1, std::memory_order_relaxed);
+        if (wt_on) g_dbg_wt.fetch_add(1, std::memory_order_relaxed);
+        if (live_note) g_dbg_live.fetch_add(1, std::memory_order_relaxed);
+        if (tail_rank > 0) g_dbg_rank.fetch_add(1, std::memory_order_relaxed);
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
         if ((tail_rank > 0 || cut_rank > 0 || wt_on) && d.peer == nullptr && d.remote_count == 0) {
@@ -6549,6 +6618,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int32_t e = ids[distinct[q]];
                 if (e < 0 || e >= d.n_expert) continue;
                 const bool resident = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
+                if (live_note && !resident && minr[q] >= tail_w_from) layer_live_note(d.layers, maxw[q]);   // the live thresholds' histogram: the weight of a missed expert the rule looks at
                 const bool cut = cut_rank > 0 && minr[q] >= cut_rank;                          // STRATA_RANK_CUTOFF: skipped even when resident
                 const bool tail = tail_rank > 0 && minr[q] >= tail_rank && !resident;          // STRATA_ROUTE_TAIL_SKIP: a missed expert only
                 const bool wtail = wt_on && !resident && minr[q] >= tail_w_from && maxw[q] < tail_w;   // STRATA_TAIL_WEIGHT: a missed expert whose every pick weighs less than tau

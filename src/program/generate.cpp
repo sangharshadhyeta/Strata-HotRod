@@ -10597,14 +10597,14 @@ int main(int argc, char** argv) {
                 }
             }
             g_layer_sens_path = ls_path;
-            {   // the live capture feeding that table (STRATA_LAYER_CAPTURE=0 turns it off; STRATA_LAYER_CAPTURE_EVERY=<n> windows per sample, default 25): small bounded segments
+            {   // the live capture feeding that table (opt-in STRATA_LAYER_CAPTURE=1: for the table tool; STRATA_LAYER_CAPTURE_EVERY=<n> windows per sample, default 25): small bounded segments
                 // beside the table, consumed by the server's idle refresh job (serve/layer_maint.py)
                 const char* lc = std::getenv("STRATA_LAYER_CAPTURE");
-                if (!g_layer_sens_path.empty() && !(lc != nullptr && lc[0] == '0')) {
+                if (!g_layer_sens_path.empty() && lc != nullptr && lc[0] == '1') {
                     const char* ev = std::getenv("STRATA_LAYER_CAPTURE_EVERY");
                     const std::string cdir = (std::filesystem::path(g_layer_sens_path).parent_path() / "layer-capture").string();
                     strata::core::layer_capture_configure(cdir, ev != nullptr && std::atoi(ev) > 0 ? (uint32_t) std::atoi(ev) : 25u);
-                    std::fprintf(stderr, "strata serve: layer capture on: 1 decode window in %s sampled into %s (at most 8 segments of 4 MB wait there; STRATA_LAYER_CAPTURE=0 turns it off)\n",
+                    std::fprintf(stderr, "strata serve: layer capture on: 1 decode window in %s sampled into %s (at most 8 segments of 4 MB wait there)\n",
                                  ev != nullptr ? ev : "25", cdir.c_str());
                 }
             }
@@ -10617,8 +10617,13 @@ int main(int argc, char** argv) {
                 else
                     std::fprintf(stderr, "strata serve: STRATA_LAYER_SENS=%s ignored: %s\n", ls, lerr.c_str());
             }
-            if (const char* ll = std::getenv("STRATA_LAYER_LIVE"); ll != nullptr && ll[0] == '1') {
+            auto live_start = [&] {
                 strata::core::layer_live_set(true);
+                if (!g_layer_sens_path.empty())
+                    strata::core::layer_live_persist((std::filesystem::path(g_layer_sens_path).parent_path() / "layer-live.bin").string(), (int) g.n_layers);
+            };
+            if (const char* ll = std::getenv("STRATA_LAYER_LIVE"); ll != nullptr && ll[0] == '1') {
+                live_start();
                 std::fprintf(stderr, "strata serve: STRATA_LAYER_LIVE=1: the weight rule's per-layer thresholds keep the flat rule's skip count: the table gives the shape, the router weights seen every window give the scale%s\n",
                              g_layer_sens_path.empty() ? " (no table path: flat)" : "");
             }
@@ -10629,14 +10634,14 @@ int main(int argc, char** argv) {
                 const int floor_rank = strata::kernels::route_cfg_floor();
                 const bool tw_env = std::getenv("STRATA_TAIL_WEIGHT") != nullptr;   // the user named a value (0 = the weight rule off: the rank rule stays)
                 if (floor_rank > 0 && floor_rank < 10 && tc == nullptr && !tw_env) strata::core::set_tail_weight(0.02f);   // the default: tau 0.02
-                    if (const char* ea = std::getenv("STRATA_LAYER_EARN"); floor_rank > 0 && floor_rank < 10 && tc == nullptr && !tw_env && !g_layer_sens_path.empty() && !(ea != nullptr && ea[0] == '0')) {
+
+                    if (const char* ea = std::getenv("STRATA_LAYER_EARN"); floor_rank > 0 && floor_rank < 10 && tc == nullptr && !tw_env && !g_layer_sens_path.empty() && ea != nullptr && ea[0] == '1') {
                         strata::core::layer_earn_set(true);   // start exact; the first table earns the skipping
-                        std::fprintf(stderr, "strata serve: layer earn mode: every layer starts at threshold 0 (exact); the first table (%s) switches the thresholds on (STRATA_LAYER_EARN=0: flat %.3f from the first request)\n", g_layer_sens_path.c_str(), (double) strata::core::tail_weight());
+                        std::fprintf(stderr, "strata serve: layer earn mode: every layer starts at threshold 0 (exact); the first table (%s) switches the thresholds on (opt-in STRATA_LAYER_EARN=1; the default starts flat at %.3f)\n", g_layer_sens_path.c_str(), (double) strata::core::tail_weight());
                     }
                 if (floor_rank > 0 && floor_rank < 10 && tc == nullptr && strata::core::tail_weight() > 0.0f) {
                     // The user chose the weight rule (STRATA_TAIL_WEIGHT=<tau>, e.g. 0.02, 0.05 or 0.10) and left STRATA_TAIL_CPU alone: the weight rule replaces the rank rule below.  A
-                    // missed expert that no stand-in took is skipped only when every pick of the window weighs under tau; heavier ones are computed.  Measured 23 Nov (48 checkable
-                    // problems, exact 26: 0.02 gave 28, 0.05 gave 27, 0.10 gave 26, all at the speed of the rank rule or a little above): no setting could be told from the exact run,
+                    // missed expert that no stand-in took is skipped only when every pick of the window weighs under tau; heavier ones are computed.  (The 23 Nov measurements of this rule were of the rank behaviour: the routing weights were not yet copied to the host, so every weight read 0; fixed 24 Nov, see docs/HOTROD-DETAILS.md.)
                     // so 0.02, the mildest, is the default and the user edits it.  STRATA_TAIL_WEIGHT=0 or STRATA_TAIL_CPU=0 asks for the rank rule, STRATA_TAIL_CPU=1 for neither.
                     strata::core::set_tail_skip_rank(0);
                     if (const char* tr = std::getenv("STRATA_TAIL_READ"); tr != nullptr && tr[0] == '0') strata::core::set_tail_read_skip(true);
