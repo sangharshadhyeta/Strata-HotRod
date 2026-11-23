@@ -4142,6 +4142,11 @@ class Service:
                                               log=lambda m: print(m, flush=True))
             if lm is not None:
                 lm.start()
+            from serve import lowrank_maint   # opt-in (STRATA_LOWRANK=1): fits low-rank copies of the most-skipped experts in idle time and stops when settled
+            lr = lowrank_maint.from_engine_args(spawn[1], spawn[4], tools, lambda: bool(self.status.get("busy") or self.status.get("queued")), lambda: self.last_request_at,
+                                                log=lambda m: print(m, flush=True))
+            if lr is not None:
+                lr.start()
         except Exception as e:                      # never worth a failed start
             print(f"[strata] layer table refresh not started: {e}", flush=True)
 
