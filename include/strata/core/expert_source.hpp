@@ -729,6 +729,10 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err);
 // Safe to call again while decoding: the table is atomic per layer, so a table refreshed on disk (tools/layer_table.py) takes effect at the next window.
 /// The multiplier of STRATA_TAIL_WEIGHT for `layer` (1 when no sensitivity file was loaded).
 float tail_weight_layer_mult(int64_t layer);
+/// STRATA_LAYER_LIVE=1 (opt-in): the router's tail-weight statistic per layer, kept running from the weights every window, scales the same multipliers; a table made by
+/// tools/layer_table.py (two numbers a layer) calibrates it.  The thresholds start flat and move as the statistic accumulates.
+void layer_live_set(bool on);
+bool layer_live_on();
 /// The verifier's host-mapped router weights of the window slice about to be served ([n_tok * k], indexed like the ids); null when not set.  Thread-local: set just before the
 /// pool call and cleared after it.
 void expert_dispatch_set_weights(const float* w);
@@ -736,6 +740,9 @@ void expert_dispatch_set_weights(const float* w);
 /// (tools/predictor/trace_reader.py pairs them in order and checks the row count).  The verifier calls it as it launches a window;
 /// a no-op when the trace is off.
 void router_trace_tokens(const int32_t* tokens, int64_t n_tok);
+/// The live layer capture (see expert_source.cpp): `dir` holds the small segment files tools/layer_table.py consumes; every `every`-th decode window is written.  Not configured: off.
+void layer_capture_configure(const std::string& dir, uint32_t every);
+void layer_capture_write(int64_t layer, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k);
 /// STRATA_ROUTER_TRACE_PREFILL=1 (with STRATA_ROUTER_TRACE): the prompt's routing in the same file (format RTR2, see expert_source.cpp).
 /// router_trace_prefill_on() is false otherwise and the other calls are no-ops.  router_trace_request starts a request (its prefill records carry its number).
 /// router_trace_prefill writes one MoE layer's sampled prompt tokens: pos and tok (n_tok each), x_bf16 (n_tok x 2560 bf16, the router input), ids (n_tok x k).

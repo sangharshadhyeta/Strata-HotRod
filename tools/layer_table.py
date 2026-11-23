@@ -18,13 +18,21 @@ import argparse, glob, os, sys, time
 
 
 def parse_table(text):
-    """The numbers of a table file, in order ('#' lines ignored)."""
-    out = []
+    """The sensitivity of every layer of a table file, in order ('#' lines ignored).  A line is 'sensitivity' or 'sensitivity statistic'."""
+    return parse_pairs(text)[0]
+
+
+def parse_pairs(text):
+    """(sensitivities, statistics) of a table file; the statistics are [] for a table of one number a layer."""
+    sens, stat = [], []
     for ln in text.splitlines():
-        if ln.startswith("#"):
+        if ln.startswith("#") or not ln.strip():
             continue
-        out.extend(float(x) for x in ln.split())
-    return out
+        v = [float(x) for x in ln.split()]
+        sens.append(v[0])
+        if len(v) > 1:
+            stat.append(v[1])
+    return sens, (stat if len(stat) == len(sens) else [])
 
 
 def parse_measured(text):
@@ -50,14 +58,17 @@ def merge_table(old, new, alpha, measured_old=None):
     return out
 
 
-def format_table(vals, runs, note):
+def format_table(vals, runs, note, stats=None):
     head = ["# per-layer sensitivity for STRATA_TAIL_WEIGHT (tools/layer_table.py)",
             "# block-output error with 10% of the picks dropped by smallest weight; larger = the layer suffers more, so the engine skips less of it",
             "# runs blended into this table: %d   %s" % (runs, note),
             "# measured layers: " + " ".join(str(l) for l, v in enumerate(vals) if v is not None)]
     present = [v for v in vals if v is not None]
     fill = sum(present) / len(present) if present else 1.0
-    return "\n".join(head + ["%.5f" % (v if v is not None else fill) for v in vals]) + "\n"
+    if stats is None:
+        return "\n".join(head + ["%.5f" % (v if v is not None else fill) for v in vals]) + "\n"
+    sfill = sum(x for x in stats if x is not None) / max(1, sum(1 for x in stats if x is not None))
+    return "\n".join(head + ["%.5f %.6f" % (v if v is not None else fill, (stats[l] if stats[l] is not None else sfill)) for l, v in enumerate(vals)]) + "\n"
 
 
 def parse_runs(text):
@@ -94,20 +105,22 @@ def measure(args, layers):
 
     X = {l: [] for l in layers}
     IDS = {l: [] for l in layers}
-    for rec in trace_reader.iter_records(args.trace, want_x=True):
-        if rec["kind"] != "decode" or rec["layer"] not in X:
-            continue
-        l = rec["layer"]
-        for i in range(rec["n_tok"]):
-            if len(X[l]) < args.rows:
-                X[l].append(rec["x"][i].copy())
-                IDS[l].append(rec["ids"][i].astype(np.int64))
+    for tp in args.trace:
+        for rec in trace_reader.iter_records(tp, want_x=True):
+            if rec["kind"] != "decode" or rec["layer"] not in X:
+                continue
+            l = rec["layer"]
+            for i in range(rec["n_tok"]):
+                if len(X[l]) < args.rows:
+                    X[l].append(rec["x"][i].copy())
+                    IDS[l].append(rec["ids"][i].astype(np.int64))
         if all(len(X[k]) >= args.rows for k in X):
             break
     silu = lambda z: z / (1 + torch.exp(-z))
     res = {}
+    stat = {}
     for l in layers:
-        if len(X[l]) < 50:
+        if len(X[l]) < args.min_rows:
             print("layer %d: only %d rows in the trace, skipped" % (l, len(X[l])), flush=True)
             continue
         W = deq("blk.%d.ffn_gate_inp.weight" % l).reshape(-1, 2560)
@@ -137,13 +150,16 @@ def measure(args, layers):
         d[np.argsort(key, kind="stable")[:n_drop]] = True
         d = torch.from_numpy(d.reshape(N, ids.shape[1]))
         res[l] = float(((C * d[:, :, None]).sum(1).norm(dim=1) / nf).mean())
-        print("layer %2d: error at 10%% dropped by weight %.4f (%d rows)" % (l, res[l], N), flush=True)
-    return res
+        # the engine's running statistic on these same rows (expert_source.cpp, kMassRefTau): the weight the rule would drop at 0.02, summed over ranks >= from-rank, per token
+        ww = w[:, args.from_rank:]
+        stat[l] = float((ww * (ww < 0.02)).sum(1).mean())
+        print("layer %2d: error at 10%% dropped by weight %.4f, live statistic %.5f (%d rows)" % (l, res[l], stat[l], N), flush=True)
+    return res, stat
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--trace", required=True, help="a STRATA_ROUTER_TRACE capture")
+    ap.add_argument("--trace", required=True, nargs="+", help="a STRATA_ROUTER_TRACE capture, or the live capture's segment files (<pack>/layer-capture/cap-*.bin)")
     ap.add_argument("--gguf", required=True, help="glob of the model's GGUF files")
     ap.add_argument("--out", required=True, help="the table (<pack>/layer-sens.txt); blended into when it exists")
     ap.add_argument("--layers", type=int, default=48)
@@ -152,21 +168,25 @@ def main(argv=None):
     ap.add_argument("--part", default="0/1", help="k/n: measure only layers l with l %% n == k (a short job per run)")
     ap.add_argument("--from-rank", type=int, default=3, help="ranks below this are never dropped (the stand-ins' floor)")
     ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--min-rows", type=int, default=50, help="a layer with fewer rows in the capture is skipped this run")
     a = ap.parse_args(argv)
     k, n = (int(v) for v in a.part.split("/"))
     layers = [l for l in range(a.layers) if l % n == k]
     t0 = time.time()
-    res = measure(a, layers)
-    old, runs, meas = None, 0, None
+    res, stat = measure(a, layers)
+    old, old_stat, runs, meas = None, [], 0, None
     if os.path.exists(a.out):
         text = open(a.out).read()
-        old, runs, meas = parse_table(text), parse_runs(text), parse_measured(text)
+        (old, old_stat), runs, meas = parse_pairs(text), parse_runs(text), parse_measured(text)
     new = [res.get(l) for l in range(a.layers)]
+    new_stat = [stat.get(l) for l in range(a.layers)]
     merged = merge_table(old, new, a.alpha, meas)
+    merged_stat = merge_table(old_stat or None, new_stat, a.alpha, meas)
     if meas is not None and old is not None and len(old) == len(new):   # layers measured in earlier runs stay marked as measured
         merged = [m if (new[l] is not None or l in meas) else None for l, m in enumerate(merged)]
+        merged_stat = [m if (new[l] is not None or l in meas) else None for l, m in enumerate(merged_stat)]
     tmp = a.out + ".tmp"
-    open(tmp, "w").write(format_table(merged, runs + 1, "last part %s, %d layers measured, %.0f s" % (a.part, len(res), time.time() - t0)))
+    open(tmp, "w").write(format_table(merged, runs + 1, "last part %s, %d layers measured, %.0f s" % (a.part, len(res), time.time() - t0), merged_stat))
     os.replace(tmp, a.out)   # the engine sees the whole new file or the old one
     print("wrote %s (%d layers measured of %d)" % (a.out, len(res), a.layers))
 

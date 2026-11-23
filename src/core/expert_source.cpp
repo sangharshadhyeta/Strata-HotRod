@@ -5884,6 +5884,68 @@ void layer_mult_init() {
     if (g_layer_mult_init.compare_exchange_strong(e, true)) for (auto& x : g_layer_mult) x.store(1.0f, std::memory_order_relaxed);
 }
 }  // namespace
+namespace {
+// STRATA_LAYER_LIVE=1 (opt-in): the router's own confidence as a running per-layer signal.  Per window and layer: the weight the rule WOULD drop at the reference threshold,
+// per token, sum of w over the picks at or above the stand-ins' floor whose weight is under kMassRefTau; its running average is mass_l.  The sensitivity estimate of a layer is
+// s_l = mass_l * c_l; c_l = 1 until a measured table (tools/layer_table.py: two numbers a layer, the measured sensitivity and the same statistic on the capture it measured)
+// calibrates it: c_l = measured_l / statistic_l, so the exact map corrects the live statistic where the router misjudges a layer (the last layer) without replacing it.
+constexpr float kMassRefTau = 0.02f;
+std::atomic<float> g_lmass[kLayerMultCap];        // the running statistic
+std::atomic<uint32_t> g_lmass_n[kLayerMultCap];   // windows behind it
+std::atomic<float> g_lcalib[kLayerMultCap];       // c_l (0 = uncalibrated)
+std::atomic<float> g_ltable[kLayerMultCap];       // the table's measured sensitivity (0 = none)
+std::atomic<bool> g_live_on{false};
+std::atomic<uint32_t> g_live_win{0};
+}  // namespace
+void layer_live_set(bool on) { layer_mult_init(); g_live_on.store(on, std::memory_order_relaxed); }
+bool layer_live_on() { return g_live_on.load(std::memory_order_relaxed); }
+void layer_live_update(int64_t layer, const float* rw, int64_t n_tok, int64_t k, int from) {
+    if (!g_live_on.load(std::memory_order_relaxed) || rw == nullptr || layer < 0 || layer >= kLayerMultCap || k < 1) return;
+    double m = 0.0;
+    for (int64_t t = 0; t < n_tok; ++t)
+        for (int64_t r = from; r < k; ++r) { const float w = rw[(size_t) (t * k + r)]; if (w < kMassRefTau) m += w; }
+    m /= (double) std::max<int64_t>(n_tok, 1);
+    const uint32_t n = g_lmass_n[layer].load(std::memory_order_relaxed);
+    const float a = n < 100 ? 1.0f / (float) (n + 1) : 0.01f;   // a plain mean at first, then a running average over ~100 windows
+    g_lmass[layer].store((1.0f - a) * g_lmass[layer].load(std::memory_order_relaxed) + a * (float) m, std::memory_order_relaxed);
+    g_lmass_n[layer].store(n + 1, std::memory_order_relaxed);
+}
+// Recompute the per-layer multipliers from the live statistic (every 64 windows, at layer 0): layers with fewer than 50 windows keep the table's value or the mean.
+void layer_live_refresh(int n_layers) {
+    if (!g_live_on.load(std::memory_order_relaxed) || n_layers < 1 || n_layers > kLayerMultCap) return;
+    if ((g_live_win.fetch_add(1, std::memory_order_relaxed) & 63u) != 0) return;
+    std::vector<double> sv((size_t) n_layers, -1.0);
+    double mean = 0.0; int cnt = 0;
+    for (int l = 0; l < n_layers; ++l) {
+        double v = -1.0;
+        if (g_lmass_n[l].load(std::memory_order_relaxed) >= 50) {
+            const float c = g_lcalib[l].load(std::memory_order_relaxed);
+            v = (double) g_lmass[l].load(std::memory_order_relaxed) * (c > 0.0f ? (double) c : 1.0);
+        } else if (g_ltable[l].load(std::memory_order_relaxed) > 0.0f) {
+            v = (double) g_ltable[l].load(std::memory_order_relaxed);
+        }
+        sv[(size_t) l] = v;
+        if (v > 0.0) { mean += v; ++cnt; }
+    }
+    if (cnt < n_layers / 2) return;   // not enough yet: the table (or the flat default) stays in force
+    mean /= cnt;
+    std::vector<double> m((size_t) n_layers);
+    double msum = 0.0;
+    for (int l = 0; l < n_layers; ++l) {
+        const double v = sv[(size_t) l] > 0.0 ? sv[(size_t) l] : mean;
+        m[(size_t) l] = std::min(4.0, std::max(0.25, mean / std::max(v, 1e-9)));
+        msum += m[(size_t) l];
+    }
+    float lo = 1e9f, hi = 0.0f;
+    for (int l = 0; l < n_layers; ++l) {
+        const float x = (float) (m[(size_t) l] * n_layers / msum);
+        g_layer_mult[l].store(x, std::memory_order_relaxed);
+        lo = std::min(lo, x); hi = std::max(hi, x);
+    }
+    static std::atomic<uint32_t> g_refreshes{0};
+    if (const uint32_t r = g_refreshes.fetch_add(1, std::memory_order_relaxed); r == 0 || (r % 64) == 0)
+        std::fprintf(stderr, "strata serve: layer live: thresholds x%.2f..x%.2f of tau from %d layers' running statistic (%u windows)\n", (double) lo, (double) hi, cnt, g_live_win.load(std::memory_order_relaxed));
+}
 bool layer_sens_load(const char* path, int n_layers, std::string& err) {
     std::ifstream in(path);
     if (!in) { err = std::string("cannot read ") + path; return false; }
@@ -5896,6 +5958,8 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err) {
         while (ls >> x) v.push_back(x);
     }
     if ((int) v.size() < n_layers) { err = "the file has " + std::to_string(v.size()) + " numbers for " + std::to_string(n_layers) + " layers"; return false; }
+    std::vector<float> stat;   // a table with two numbers a layer (sensitivity, then the live statistic on the capture it measured) calibrates STRATA_LAYER_LIVE
+    if ((int) v.size() >= 2 * n_layers) { stat.assign(n_layers, 0.0f); for (int l = 0; l < n_layers; ++l) { stat[(size_t) l] = v[(size_t) (2 * l + 1)]; v[(size_t) l] = v[(size_t) (2 * l)]; } }
     v.resize((size_t) n_layers);
     double mean = 0.0;
     for (float x : v) mean += std::max(x, 1e-6f);
@@ -5908,7 +5972,11 @@ bool layer_sens_load(const char* path, int n_layers, std::string& err) {
     }
     for (float& x : m) x = (float) (x * n_layers / msum);   // mean 1 after the clamp, so the average threshold stays tau
     layer_mult_init();
-    for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) g_layer_mult[l].store(m[(size_t) l], std::memory_order_relaxed);
+    for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) {
+        g_layer_mult[l].store(m[(size_t) l], std::memory_order_relaxed);
+        g_ltable[l].store(v[(size_t) l], std::memory_order_relaxed);
+        g_lcalib[l].store(!stat.empty() && stat[(size_t) l] > 1e-9f ? v[(size_t) l] / stat[(size_t) l] : 0.0f, std::memory_order_relaxed);
+    }
     return true;
 }
 float tail_weight_layer_mult(int64_t layer) {
@@ -5990,6 +6058,109 @@ void router_trace_write(int64_t layer, const float* x_f, const int32_t* ids, int
     if ((++t.calls & 0x3ffu) == 0) std::fflush(t.f);
 }
 }  // namespace
+
+// ---- the live layer capture (default on when the pack has a directory for it; STRATA_LAYER_CAPTURE=0 turns it off): a few decode windows in STRATA_LAYER_CAPTURE_EVERY
+// (default 25) are written, every MoE layer of each, in the router trace's own record layout, to small segment files <dir>/cap-<n>.bin.  tools/layer_table.py reads
+// them in idle time to refresh the per-layer table (<pack>/layer-sens.txt).  Bounded: at most kLayerCapMaxSegs complete segments of ~4 MB wait on disk; with that many
+// nothing more is written until the job has consumed some (it deletes them).  Cost: one counter per layer and window; a sampled window writes ~270 KB.
+namespace {
+struct LayerCap {
+    std::mutex mu;
+    std::string dir;
+    bool on = false;
+    uint32_t every = 25;
+    std::atomic<uint32_t> win{0};
+    std::atomic<bool> sampled{false};
+    FILE* f = nullptr;
+    std::string tmp_path, final_path;
+    size_t written = 0;
+    uint32_t seq = 0;
+    int complete = 0;           // complete segments known to wait in `dir`
+    uint32_t recount_at = 0;    // sampled windows until the directory is looked at again when it was full
+};
+LayerCap& layer_cap() { static LayerCap c; return c; }
+constexpr int kLayerCapMaxSegs = 8;
+constexpr size_t kLayerCapSegBytes = (size_t) 4 << 20;
+int layer_cap_count_segments(const std::string& dir) {
+    int n = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.size() > 8 && name.compare(0, 4, "cap-") == 0 && name.compare(name.size() - 4, 4, ".bin") == 0) ++n;
+    }
+    return n;
+}
+void layer_cap_close_segment(LayerCap& c, bool keep) {
+    if (c.f == nullptr) return;
+    std::fclose(c.f);
+    c.f = nullptr;
+    std::error_code ec;
+    if (keep) { std::filesystem::rename(c.tmp_path, c.final_path, ec); if (!ec) ++c.complete; }
+    else std::filesystem::remove(c.tmp_path, ec);
+    c.written = 0;
+}
+}  // namespace
+
+void layer_capture_configure(const std::string& dir, uint32_t every) {
+    LayerCap& c = layer_cap();
+    std::lock_guard<std::mutex> lk(c.mu);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) { std::fprintf(stderr, "strata: layer capture: cannot create %s (%s), off\n", dir.c_str(), ec.message().c_str()); return; }
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec))   // a segment left half written by a crash is removed
+        if (e.path().extension() == ".tmp") std::filesystem::remove(e.path(), ec);
+    c.dir = dir;
+    c.every = every < 1 ? 1 : every;
+    c.complete = layer_cap_count_segments(dir);
+    c.seq = (uint32_t) std::time(nullptr);
+    c.on = true;
+}
+
+void layer_capture_write(int64_t layer, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k) {
+    LayerCap& c = layer_cap();
+    if (!c.on) return;
+    if (layer == 0) c.sampled.store((c.win.fetch_add(1, std::memory_order_relaxed) + 1) % c.every == 0, std::memory_order_relaxed);
+    if (!c.sampled.load(std::memory_order_relaxed)) return;
+    constexpr int64_t kH = strata::kernels::cpu::H;
+    std::lock_guard<std::mutex> lk(c.mu);
+    if (c.f != nullptr && layer == 0 && c.written >= kLayerCapSegBytes) layer_cap_close_segment(c, true);   // a segment ends at a window boundary
+    if (c.f == nullptr) {
+        if (layer != 0) return;                                  // a segment starts at a window's first layer
+        if (c.complete >= kLayerCapMaxSegs) {                    // full: look again now and then (the job may have consumed some)
+            if (c.recount_at > 0) { --c.recount_at; return; }
+            c.complete = layer_cap_count_segments(c.dir);
+            c.recount_at = 64;
+            if (c.complete >= kLayerCapMaxSegs) return;
+        }
+        ++c.seq;
+        char name[96];
+        std::snprintf(name, sizeof name, "cap-%u.bin", c.seq);
+        c.final_path = c.dir + "/" + name;
+        c.tmp_path = c.final_path + ".tmp";
+        c.f = std::fopen(c.tmp_path.c_str(), "wb");
+        if (c.f == nullptr) { c.on = false; return; }
+        const uint32_t magic = 0x31525452u;   // "RTR1"
+        std::fwrite(&magic, 4, 1, c.f);
+        c.written = 4;
+    }
+    const uint32_t step = c.win.load(std::memory_order_relaxed);
+    const uint16_t l16 = (uint16_t) layer;
+    const uint8_t nt = (uint8_t) n_tok, kk = (uint8_t) k;
+    std::fwrite(&step, 4, 1, c.f);
+    std::fwrite(&l16, 2, 1, c.f);
+    std::fwrite(&nt, 1, 1, c.f);
+    std::fwrite(&kk, 1, 1, c.f);
+    c.written += 8;
+    std::vector<uint16_t> row((size_t) kH);
+    std::vector<int16_t> tid((size_t) k);
+    for (int64_t tk = 0; tk < n_tok; ++tk) {
+        for (int64_t i = 0; i < kH; ++i) row[(size_t) i] = trace_f32_to_bf16(x_f[(size_t) (tk * kH + i)]);
+        std::fwrite(row.data(), 2, (size_t) kH, c.f);
+        for (int64_t r = 0; r < k; ++r) tid[(size_t) r] = (int16_t) ids[(size_t) (tk * k + r)];
+        std::fwrite(tid.data(), 2, (size_t) k, c.f);
+        c.written += (size_t) kH * 2 + (size_t) k * 2;
+    }
+}
 
 void router_trace_tokens(const int32_t* tokens, int64_t n_tok) {
     if (!router_trace_on() || tokens == nullptr || n_tok < 1 || n_tok > 255) return;
@@ -6112,6 +6283,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (router_trace_on() && x_f != nullptr && ids != nullptr && k >= 1 && k <= 16) router_trace_write(d.layers, x_f, ids, n_tok, k);
+    if (g_live_on.load(std::memory_order_relaxed) && n_tok <= 8 && k == 10) {   // STRATA_LAYER_LIVE: the router's confidence, per layer, as a running statistic
+        if (d.layers == 0) layer_live_refresh((int) std::max<int64_t>(d.n_layers, 1));
+        layer_live_update(d.layers, t_route_w, n_tok, k, tail_weight_from());
+    }
+    if (n_tok <= 8 && x_f != nullptr && ids != nullptr && k >= 1 && k <= 16) layer_capture_write(d.layers, x_f, ids, n_tok, k);   // the live capture: a few decode windows, bounded
     if (d.src != nullptr) d.src->route_layer(d.layers);   // before the look-ahead below queues this layer's guesses
     if (d.fs != nullptr) d.fs->at_layer.store(d.layers, std::memory_order_release);   // STRATA_RING's refill guard
     if (d.gpu_pred != nullptr && d.fs != nullptr && d.fs->ring && d.host_res != nullptr && n_tok <= 8) {

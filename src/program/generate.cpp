@@ -10597,6 +10597,17 @@ int main(int argc, char** argv) {
                 }
             }
             g_layer_sens_path = ls_path;
+            {   // the live capture feeding that table (STRATA_LAYER_CAPTURE=0 turns it off; STRATA_LAYER_CAPTURE_EVERY=<n> windows per sample, default 25): small bounded segments
+                // beside the table, consumed by the server's idle refresh job (serve/layer_maint.py)
+                const char* lc = std::getenv("STRATA_LAYER_CAPTURE");
+                if (!g_layer_sens_path.empty() && !(lc != nullptr && lc[0] == '0')) {
+                    const char* ev = std::getenv("STRATA_LAYER_CAPTURE_EVERY");
+                    const std::string cdir = (std::filesystem::path(g_layer_sens_path).parent_path() / "layer-capture").string();
+                    strata::core::layer_capture_configure(cdir, ev != nullptr && std::atoi(ev) > 0 ? (uint32_t) std::atoi(ev) : 25u);
+                    std::fprintf(stderr, "strata serve: layer capture on: 1 decode window in %s sampled into %s (at most 8 segments of 4 MB wait there; STRATA_LAYER_CAPTURE=0 turns it off)\n",
+                                 ev != nullptr ? ev : "25", cdir.c_str());
+                }
+            }
             g_layer_sens_layers = (int) g.n_layers;
             if (const char* ls = ls_path.c_str(); !ls_path.empty() && (std::getenv("STRATA_LAYER_SENS") != nullptr || std::filesystem::exists(ls_path))) {
                 std::string lerr;
@@ -10605,6 +10616,11 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: STRATA_LAYER_SENS=%s: the weight rule's threshold scales per layer (tau * 1/sensitivity, mean 1, clamped 0.25..4)\n", ls);
                 else
                     std::fprintf(stderr, "strata serve: STRATA_LAYER_SENS=%s ignored: %s\n", ls, lerr.c_str());
+            }
+            if (const char* ll = std::getenv("STRATA_LAYER_LIVE"); ll != nullptr && ll[0] == '1') {
+                strata::core::layer_live_set(true);
+                std::fprintf(stderr, "strata serve: STRATA_LAYER_LIVE=1: the weight rule's threshold scales per layer from the router's own confidence, kept running from every window%s\n",
+                             g_layer_sens_path.empty() ? "" : " (calibrated by the layer table when it has two numbers a layer)");
             }
             // the weight rule skips from the stand-ins' floor (STRATA_ROUTE_RESIDENT_RANKS), not from a fixed rank: the ranks below it - the edge rank included - are always computed
             if (const int fr = strata::kernels::route_cfg_floor(); fr > 0 && fr < 10) strata::core::set_tail_weight_from(fr);

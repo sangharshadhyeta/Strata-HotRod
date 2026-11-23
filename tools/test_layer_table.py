@@ -39,5 +39,17 @@ class LayerTable(unittest.TestCase):
         self.assertEqual(out[0], 0.2)
 
 
+    def test_pairs_roundtrip(self):
+        text = lt.format_table([0.2, None, 0.4], 2, "x", [0.03, None, 0.05])
+        sens, stat = lt.parse_pairs(text)
+        self.assertEqual(len(sens), 3)
+        self.assertEqual(len(stat), 3)
+        self.assertAlmostEqual(stat[0], 0.03)
+        self.assertEqual(lt.parse_table(text)[0], 0.2)
+
+    def test_one_number_table_has_no_statistics(self):
+        self.assertEqual(lt.parse_pairs(lt.format_table([0.2, 0.4], 1, "x"))[1], [])
+
+
 if __name__ == "__main__":
     unittest.main()
