@@ -5904,6 +5904,8 @@ std::atomic<float> g_lshape[kLayerMultCap];            // from a table (0 = none
 std::atomic<bool> g_live_on{false};
 std::atomic<float> g_live_share{0.0f};   // > 0: the share of the missed picks to skip (system-driven); 0: the flat threshold's own skip count
 std::atomic<uint32_t> g_live_win{0};
+std::atomic<bool> g_live_settled{false};   // the thresholds have stopped moving: the histogram is fed 1 window in 16 and re-solved every 1024 windows instead of every 64
+std::atomic<uint32_t> g_live_calm{0};          // consecutive re-solves that moved no layer's threshold by more than 3%
 std::string g_live_path;
 std::atomic<uint64_t> g_dbg_plan{0}, g_dbg_wt{0}, g_dbg_live{0}, g_dbg_note{0}, g_dbg_rank{0}, g_dbg_badw{0};   // why the histogram stays empty (debug)
 int g_live_layers = 0;
@@ -5974,7 +5976,7 @@ void layer_live_persist(const std::string& path, int n_layers) {
 void layer_live_refresh(int n_layers, double tau) {
     if (!g_live_on.load(std::memory_order_relaxed) || n_layers < 1 || n_layers > kLayerMultCap || tau <= 0.0) return;
     const uint32_t win = g_live_win.fetch_add(1, std::memory_order_relaxed);
-    if ((win & 63u) != 0) return;
+    if ((win & (g_live_settled.load(std::memory_order_relaxed) ? 1023u : 63u)) != 0) return;
     if (win > 0 && (win & 4095u) == 0)   // forget slowly: halve the counts every 4096 windows
         for (int l = 0; l < n_layers; ++l) for (int b = 0; b < kBins; ++b) {
             g_lhist[l][b].store(g_lhist[l][b].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
@@ -6022,12 +6024,25 @@ void layer_live_refresh(int n_layers, double tau) {
         (f < target ? lo : hi) = c;
     }
     const double c = std::sqrt(lo * hi);
-    float mn = 1e9f, mx = 0.0f;
+    float mn = 1e9f, mx = 0.0f, delta = 0.0f;
     g_mult_layers.store(n_layers, std::memory_order_relaxed);
+    static std::atomic<bool> g_first{true};
+    const bool first = g_first.exchange(false, std::memory_order_relaxed);
     for (int l = 0; l < n_layers; ++l) {
-        const float m = (float) (c * shape[(size_t) l] / tau);
+        const float target_m = (float) (c * shape[(size_t) l] / tau);
+        const float old = g_layer_mult[l].load(std::memory_order_relaxed);
+        const float m = first ? target_m : 0.7f * old + 0.3f * target_m;   // smoothed: one noisy window cannot move a threshold much
+        delta = std::max(delta, std::fabs(m - old) / std::max(old, 1e-3f));
         g_layer_mult[l].store(m, std::memory_order_relaxed);
         mn = std::min(mn, m); mx = std::max(mx, m);
+    }
+    {   // settle: no layer moved more than 3% over 6 re-solves in a row -> stop feeding and re-solving at the full rate; a move of more than 10% wakes it again
+        const bool was = g_live_settled.load(std::memory_order_relaxed);
+        if (!first && delta < 0.03f) g_live_calm.fetch_add(1, std::memory_order_relaxed); else if (delta > 0.10f || first) g_live_calm.store(0, std::memory_order_relaxed);
+        const bool now = g_live_calm.load(std::memory_order_relaxed) >= 6 && !(was && delta > 0.10f);
+        if (was && delta > 0.10f) g_live_calm.store(0, std::memory_order_relaxed);
+        g_live_settled.store(now, std::memory_order_relaxed);
+        if (now != was) std::fprintf(stderr, "strata serve: layer live: thresholds %s (window %u, largest move %.1f%%)\n", now ? "settled: the histogram is now sampled 1 window in 16 and re-solved every 1024" : "moving again", win, 100.0 * (double) delta);
     }
     static std::atomic<uint32_t> g_refreshes{0};
     if (const uint32_t r = g_refreshes.fetch_add(1, std::memory_order_relaxed); r == 0 || (r % 64) == 0)
@@ -6610,7 +6625,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int tail_w_from = tail_weight_from();   // the stand-ins' floor: the ranks below it are always computed
         const float* rw = t_route_w;
         const bool wt_on = tail_w > 0.0f && rw != nullptr;
-        const bool live_note = wt_on && n_tok <= 8 && g_live_on.load(std::memory_order_relaxed);
+        const bool live_note = wt_on && n_tok <= 8 && g_live_on.load(std::memory_order_relaxed) && (!g_live_settled.load(std::memory_order_relaxed) || (g_live_win.load(std::memory_order_relaxed) & 15u) == 0);
         g_dbg_plan.fetch_add(1, std::memory_order_relaxed);
         if (wt_on) g_dbg_wt.fetch_add(1, std::memory_order_relaxed);
         if (live_note) g_dbg_live.fetch_add(1, std::memory_order_relaxed);
