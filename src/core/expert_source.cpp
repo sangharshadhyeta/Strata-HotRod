@@ -6142,6 +6142,29 @@ bool sample_want(int64_t layer) {
     return !fd ? ((tick + (uint32_t) layer * 5u) % 6u) == 0 : ((tick + (uint32_t) layer) & 15u) == 0;
 }
 
+// ---- STRATA_LAYER_STATS=1 (opt-in diagnostic): per depth band, how the routed picks were served: VRAM hit / PCIe or another GPU / CPU exact / skipped.  Off: one branch per pick. ----
+std::atomic<uint64_t> g_ls[kLayerMultCap][4];
+std::atomic<uint32_t> g_ls_calls{0};
+bool ls_on() { static const bool on = [] { const char* e = std::getenv("STRATA_LAYER_STATS"); return e != nullptr && e[0] == '1'; }(); return on; }
+void ls_note(int64_t layer, int32_t kind) {
+    if (layer < 0 || layer >= kLayerMultCap) return;
+    g_ls[layer][kind == -2 ? 3 : kind == -1 ? 2 : kind == 0 ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+}
+void ls_report(size_t n_layers) {   // every 1024 windows, from the last layer: six depth bands
+    if ((g_ls_calls.fetch_add(1, std::memory_order_relaxed) & 1023u) != 1023u) return;
+    std::fprintf(stderr, "strata serve: layer stats (picks per depth band: VRAM hit / PCIe / CPU exact / skipped, and the share each is of the band's picks):\n");
+    const size_t bands = 6, per = (n_layers + bands - 1) / bands;
+    for (size_t b = 0; b < bands; ++b) {
+        uint64_t v[4] = {0, 0, 0, 0};
+        const size_t lo = b * per, hi = std::min(n_layers, lo + per);
+        for (size_t l = lo; l < hi; ++l) for (int k = 0; k < 4; ++k) v[k] += g_ls[l][k].load(std::memory_order_relaxed);
+        const double t = (double) (v[0] + v[1] + v[2] + v[3]);
+        if (t <= 0 || lo >= hi) continue;
+        std::fprintf(stderr, "  layers %2zu-%2zu: %9llu %8llu %8llu %8llu   (%4.1f%% / %4.1f%% / %4.1f%% / %4.1f%%)\n", lo, hi - 1, (unsigned long long) v[0], (unsigned long long) v[1],
+                     (unsigned long long) v[2], (unsigned long long) v[3], 100.0 * v[0] / t, 100.0 * v[1] / t, 100.0 * v[2] / t, 100.0 * v[3] / t);
+    }
+}
+
 bool skipcnt_on() { static const bool on = [] { const char* e = std::getenv("STRATA_LOWRANK"); return e != nullptr && e[0] == '1'; }(); return on; }   // only the copy sidecar reads the per-expert skip counts
 void layer_skip_note(int64_t layer, int expert) {
     if (!skipcnt_on() || layer < 0 || layer >= kLayerMultCap || expert < 0 || expert >= 512) return;
@@ -7254,6 +7277,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
+            if (ls_on()) ls_note(d.layers, kind[i]);
             if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero - or its low-rank copy's output (STRATA_LOWRANK=1, native only)
                 if (!(native && !latent && lowrank_apply(d.layers, (int) e, x_f + (size_t) t * H, row, Hout)))
                     std::memset(row, 0, (size_t) Hout * sizeof(float));
@@ -7298,6 +7322,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++jb.nt;
             ++d.multi_entries;
         }
+    if (ls_on() && d.layers + 1 == (int64_t) lay.fmt.size()) ls_report(lay.fmt.size());
     const auto c3 = std::chrono::steady_clock::now();
     if (pf_funnel_on()) {   // STRATA_PCIE_STATS: the jobs phase by this call's file-tier misses
         const int jb = st_nf_call > 3 ? 3 : st_nf_call;
