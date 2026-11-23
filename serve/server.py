@@ -1246,6 +1246,13 @@ class StrataEngine:
             ac = tune.get("aux_cpus")
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"
+            # the audit's tail rules for this request (tools/quality_audit.py): STRATA_TAIL_WEIGHT's threshold (0 off) and the tail skip rank (0 off, 1-9)
+            v = tune.get("tail_weight")
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) < 1.0:
+                keys += f" tail_weight={float(v)!r}"
+            v = tune.get("tail_skip")
+            if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 9:
+                keys += f" tail_skip={v}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:

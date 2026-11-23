@@ -1557,6 +1557,16 @@ class SamplingKeys(unittest.TestCase):
             self.assertFalse([x for x in self.keys(temperature=0, strata_tune={"prefill_pipe": bad})
                               if x.startswith("pipe=")], bad)
 
+    def test_tune_tail_rules(self):
+        self.assertIn("tail_weight=0.03", self.keys(strata_tune={"tail_weight": 0.03}))
+        self.assertIn("tail_weight=0.0", self.keys(strata_tune={"tail_weight": 0}))
+        self.assertIn("tail_skip=7", self.keys(strata_tune={"tail_skip": 7}))
+        self.assertIn("tail_skip=0", self.keys(strata_tune={"tail_skip": 0}))
+        for bad in ({"tail_weight": 1.5}, {"tail_weight": -0.1}, {"tail_weight": True}, {"tail_skip": 10}, {"tail_skip": -1}, {"tail_skip": 2.5}):
+            k = self.keys(strata_tune=bad)
+            self.assertNotIn("tail_weight", k, bad)
+            self.assertNotIn("tail_skip", k, bad)
+
     def test_tune_aux_cpus(self):
         for val, want in ((True, "aux_cpus=1"), (1, "aux_cpus=1"), (False, "aux_cpus=0"), (0, "aux_cpus=0"),
                           (1.0, "aux_cpus=1"), (0.0, "aux_cpus=0")):

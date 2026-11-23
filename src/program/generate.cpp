@@ -13670,6 +13670,8 @@ int main(int argc, char** argv) {
             bool req_spec_named = false;   // the request names its own draft floor: the online tuner leaves it alone
             double req_pipe = -1.0;   // --prefill-pipe for this request (setup's calibration of a layer split)
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
+            double req_tail_weight = -1.0;   // tail_weight=<tau>: STRATA_TAIL_WEIGHT for this request (0 = off, -1 = the value in force)
+            int req_tail_skip = -1;          // tail_skip=<R>: the tail skip rank for this request (0 = off, -1 = the value in force)
             // #2228: img_keys=<hex>,<hex>,... (GENI): each picture's key from the server (its normalized bytes' hash),
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
@@ -13726,6 +13728,8 @@ int main(int argc, char** argv) {
                     else if (key == "spec_min_p") { req_spec_min_p = std::clamp((double) fv, 0.0, 1.0); req_spec_named = true; }
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "tail_weight") req_tail_weight = std::clamp((double) fv, 0.0, 0.99);
+                    else if (key == "tail_skip") req_tail_skip = std::clamp((int) std::lround(fv), 0, 9);
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         const char* q = tok.c_str() + eq + 1;
@@ -15546,6 +15550,20 @@ int main(int argc, char** argv) {
                 if (want != was_on)
                     std::fprintf(stderr, "strata serve: aux cpus %s for this request%s\n", strata::aux_cpus::enabled() ? "ON" : "off",
                                  want && !strata::aux_cpus::enabled() ? " (asked for, but no CPU is spare: see the start-up line)" : "");
+            }
+            {   // tail_weight= / tail_skip=: the audit's switches (docs/HOTROD-DETAILS.md).  A request that names one overrides it for this request; the next request
+                // without it gets the value that was in force before back.  Never touched while no request uses the keys.
+                static bool tw_over = false, ts_over = false;
+                static float tw_saved = 0.0f;
+                static int ts_saved = 0;
+                if (req_tail_weight >= 0.0) {
+                    if (!tw_over) { tw_saved = strata::core::tail_weight(); tw_over = true; }
+                    strata::core::set_tail_weight((float) req_tail_weight);
+                } else if (tw_over) { strata::core::set_tail_weight(tw_saved); tw_over = false; }
+                if (req_tail_skip >= 0) {
+                    if (!ts_over) { ts_saved = strata::core::tail_skip_rank(); ts_over = true; }
+                    strata::core::set_tail_skip_rank(req_tail_skip);
+                } else if (ts_over) { strata::core::set_tail_skip_rank(ts_saved); ts_over = false; }
             }
             ver.pause_pcie_balance(req_pcie_set);   // the measured costs keep across requests
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
