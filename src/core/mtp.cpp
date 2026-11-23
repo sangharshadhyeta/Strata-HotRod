@@ -960,13 +960,6 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         x_bf16_ = b.take<uint16_t>(N);
         out_ids_ = b.take<int32_t>(T + 4);
         probs_ = b.take<float>(T + 4);
-        {   // M1: STRATA_MTP_SOFT=k (1..8; 0 = off), STRATA_MTP_SOFT_TEMP=<t> (default 1)
-            const char* sk = std::getenv("STRATA_MTP_SOFT");
-            soft_k_ = sk != nullptr ? std::clamp(std::atoi(sk), 0, 8) : 0;
-            const char* st = std::getenv("STRATA_MTP_SOFT_TEMP");
-            soft_inv_t_ = st != nullptr && std::atof(st) > 0.0 ? (float) (1.0 / std::atof(st)) : 1.0f;
-            if (soft_k_ > 0) { soft_ids_ = b.take<int32_t>(8); soft_w_ = b.take<float>(8); soft_g_ = b.take<float>((size_t) 8 * N); }
-        }
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         top_scratch_ = b.take<uint8_t>(strata::kernels::row_top_prob_scratch_bytes((int) T));
         dummy_inj_ = b.take<float>(HC);
@@ -1444,27 +1437,14 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         const WeightRef* we = wt_->find("token_embd.weight");
         if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
         g_mp.stamp(0, cs);
-        // `ids` rows of the embedding table to `out` (device ids): the GGUF-form table when there is one, else the packed one
-        auto gather = [&](const int32_t* ids, int n_ids, float* out) {
-            if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
-                ne->gather_dev(ids, n_ids, out, cs);
-            } else {
-                const auto* codes = (const uint8_t*) we->data;
-                const auto* scales = (const float*) (codes + we->codes_bytes);
-                const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
-                embedding_gather_dev(codes, scales, offsets, ids, n_ids, we->ne0, we->code_bits, we->code_bias, we->group_elems,
-                                     (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), out, cs);
-            }
-        };
-        if (soft_rec_ && T == 1 && soft_ids_ != nullptr && head_logits_ != nullptr) {
-            // M1: the previous step's head logits are still in head_logits_ (this step's head comes after its front); its k best tokens, mixed
-            const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
-            soft_topk_weights(head_logits_, (int) nv, soft_k_, soft_inv_t_, soft_ids_, soft_w_, cs);
-            if (dhead_ != nullptr) map_ids(soft_ids_, dvocab_, soft_k_, cs);
-            gather(soft_ids_, soft_k_, soft_g_);
-            weighted_rows_sum(soft_g_, soft_w_, soft_k_, (int) N, emb_, cs);
+        if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
+            ne->gather_dev(tok_, T, emb_, cs);
         } else {
-            gather(tok_, T, emb_);
+            const auto* codes = (const uint8_t*) we->data;
+            const auto* scales = (const float*) (codes + we->codes_bytes);
+            const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
+            embedding_gather_dev(codes, scales, offsets, tok_, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
+                                 (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb_, cs);
         }
         native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
         native_quantize_q8_1(en_, xq_, (int) N, T, cs);
@@ -1918,9 +1898,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     coupled_rec_ = coupled;
     coupled_j_ = j;
     g_mp.base = j < kMpGraphs ? j : -1;
-    soft_rec_ = soft_k_ > 0 && !coupled && !force_on_ && j >= 1;   // M1: a plain greedy chain step takes the soft mixture
     bool ok = record_forward(1, row, cs_, err);
-    soft_rec_ = false;
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
     if (ok) g_mp.stamp(16, cs_);

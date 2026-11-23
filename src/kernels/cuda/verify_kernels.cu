@@ -657,56 +657,6 @@ __global__ void row_top_prob_kernel(const float* __restrict__ logits, int n_voca
     }
 }
 
-// M1 (soft draft chain): the k largest logits of one row (k <= 8) and their softmax weights over those k alone, at temperature 1/inv_t.
-// One block; k rounds of a block-wide argmax that skips the ids found so far.  ids_out[r] / w_out[r] in decreasing logit order.
-__global__ void soft_topk_kernel(const float* __restrict__ l, int n_vocab, int k, float inv_t, int32_t* __restrict__ ids_out,
-                                 float* __restrict__ w_out) {
-    __shared__ float sv[32];
-    __shared__ int si[32];
-    __shared__ int found[8];
-    __shared__ float fv[8];
-    for (int r = 0; r < k; ++r) {
-        float bv = -INFINITY;
-        int bi = -1;
-        for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) {
-            bool skip = false;
-            for (int q = 0; q < r; ++q) skip |= (found[q] == i);
-            const float v = l[i];
-            if (!skip && v > bv) { bv = v; bi = i; }
-        }
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) { bv = ov; bi = oi; }
-        }
-        if ((threadIdx.x & 31) == 0) { sv[threadIdx.x >> 5] = bv; si[threadIdx.x >> 5] = bi; }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float tv = -INFINITY;
-            int ti = -1;
-            for (int w = 0; w < (int) (blockDim.x >> 5); ++w)
-                if (sv[w] > tv || (sv[w] == tv && si[w] >= 0 && (ti < 0 || si[w] < ti))) { tv = sv[w]; ti = si[w]; }
-            found[r] = ti;
-            fv[r] = tv;
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        float e[8], z = 0.0f;
-        for (int r = 0; r < k; ++r) { e[r] = __expf((fv[r] - fv[0]) * inv_t); z += e[r]; }
-        for (int r = 0; r < k; ++r) { ids_out[r] = found[r] < 0 ? 0 : found[r]; w_out[r] = e[r] / z; }
-    }
-}
-
-// out[d] = sum over the k rows of w[r] * rows[r * n + d]
-__global__ void weighted_rows_sum_kernel(const float* __restrict__ rows, const float* __restrict__ w, int k, int n, float* __restrict__ out) {
-    for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < n; d += gridDim.x * blockDim.x) {
-        float a = 0.0f;
-        for (int r = 0; r < k; ++r) a += w[r] * rows[(size_t) r * n + d];
-        out[d] = a;
-    }
-}
-
 __global__ void mtp_select_kernel(const float* __restrict__ R_src, int64_t stride, const int32_t* __restrict__ ids,
                                   const int32_t* __restrict__ row_dev, float* __restrict__ R_dst,
                                   int32_t* __restrict__ tok_dst, int32_t* out, int j, const float* probs, float* out_p) {
@@ -794,16 +744,6 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     mtp_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
                                                             probs, out_p);
     check("mtp_select");
-}
-
-void soft_topk_weights(const float* logits, int n_vocab, int k, float inv_t, int32_t* ids_out, float* w_out, void* stream) {
-    soft_topk_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, k < 1 ? 1 : (k > 8 ? 8 : k), inv_t, ids_out, w_out);
-    check("soft_topk_weights");
-}
-
-void weighted_rows_sum(const float* rows, const float* w, int k, int n, float* out, void* stream) {
-    weighted_rows_sum_kernel<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(rows, w, k, n, out);
-    check("weighted_rows_sum");
 }
 
 void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
