@@ -13,6 +13,8 @@ and their limits. Report what you actually measured and label estimates separate
 
 ## Community reports
 
+- [2026-11-23: RTX 3060 12 GB in a Proxmox VM, 64 GB DDR4-3200, Gen 4 NVMe](../bench/results/2026-11-23-community-rtx-3060-ratrod/README.md):
+  Strata-HotRod latest release, Flash-Next IQ3_S; one 120,000-token synthetic prompt (781 prompt tok/s, 40.0 decode tok/s, 8,192 tokens out) and `./bench.sh` medians (997 / 929 prompt tok/s at 4K / 16K, 33.5 decode tok/s). Reported on issue #7; also notes the Arc Pro B50 as slower than stock Strata.
 - [2026-09-30: RTX 5090, Core Ultra 9 285K, 64 GB RAM](../bench/results/2026-09-30-community-rtx-5090/README.md):
   Strata 0.1.29, original Flash-Next IQ2_XS, 131,072-token context; three runs
   each at 4,096, 32,768, and 128,000 prompt tokens, plus six recall checks.
