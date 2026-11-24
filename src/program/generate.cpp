@@ -4992,6 +4992,35 @@ int main(int argc, char** argv) {
     // CUDA0's pairs in `profile` below).  Empty without --expert-profile-save.
     std::vector<std::pair<int32_t, int32_t>> profile_loaded;
     if (!o.expert_profile_save.empty()) profile_loaded = profile;
+    {   // STRATA_LAYOUT_BY_MISS (on by default, =0 off): the cache's slots are laid out from the profile's order, so each layer's share of them follows its saved layout weight (see expert_source.cpp):
+        // the i-th pair of a layer sorts by (i + 0.5) / weight, so a layer with twice the weight gets about twice the slots.  Without a saved file every weight is 1 and the order is unchanged.
+        const char* lb = std::getenv("STRATA_LAYOUT_BY_MISS");
+        if (!(lb != nullptr && lb[0] == '0') && !o.expert_profile.empty() && !profile.empty()) {
+            int nl = 0;
+            for (const auto& pr : profile) nl = std::max(nl, (int) pr.first + 1);
+            std::vector<float> w;
+            // beside the profile and named after it (a data folder holds several profiles, one per model or setup): another profile never inherits these weights
+            strata::core::layout_weights_init(o.expert_profile + ".layer-weights", nl, w);
+            bool any = false;
+            for (float x : w) any = any || std::fabs(x - 1.0f) > 0.02f;
+            if (any) {
+                std::vector<int> idx((size_t) nl, 0);
+                std::vector<std::pair<double, size_t>> keyed;
+                keyed.reserve(profile.size());
+                for (size_t i = 0; i < profile.size(); ++i) {
+                    const int l = (int) profile[i].first;
+                    keyed.emplace_back(((double) idx[(size_t) l]++ + 0.5) / std::max(0.05, (double) w[(size_t) l]), i);
+                }
+                std::stable_sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+                std::vector<std::pair<int32_t, int32_t>> re;
+                re.reserve(profile.size());
+                for (const auto& k : keyed) re.push_back(profile[k.second]);
+                profile.swap(re);
+                std::fprintf(stderr, "strata generate: STRATA_LAYOUT_BY_MISS: the cache's slots follow the saved layout weights (x%.2f..x%.2f per layer): the layers that missed more last time get more of them\n",
+                             (double) *std::min_element(w.begin(), w.end()), (double) *std::max_element(w.begin(), w.end()));
+            }
+        }
+    }
     // ---- layer split across GPUs: "auto" places the split points by a cost model of one decode window, measured on
     // the 5080 + 3090 rig (bench/results/2026-09-29-layer-split):
     //   - every layer costs its GPU a time inversely proportional to SMs x clock (0.33 ms on an RTX 5080, 0.50 on a
@@ -11048,6 +11077,7 @@ int main(int argc, char** argv) {
         uint32_t cross_tick = 0, cross_logs = 0;
         int64_t cross_total = 0;
         bool cross_settled = false;
+        uint32_t cross_saves = 0;
         size_t cross_nc = 0, cross_nv = 0;   // the last look: candidates and victims listed
         int cross_rej[4] = {0, 0, 0, 0};     // ... and the pairs refused: no usable slot, blob too big for the slot, victim too hot, (unused)
         std::vector<float> cross_f;
@@ -11177,6 +11207,7 @@ int main(int argc, char** argv) {
                     std::vector<float> fac((size_t) NL, 1.0f);
                     const int informed = strata::core::slot_share_factors((int) NL, fac.data());
                     const bool ready = informed >= (int) (NL * 9 / 10);   // nothing moves or settles before the layers' factors are real (4,000 picks each)
+                    if (ready && (cross_saves++ % 256) == 0) strata::core::layout_weights_save((int) NL, fac.data());   // the next start's layout weights (damped)
                     if (ready && cross_settled) {
                         double mv = 0.0;
                         for (int64_t l = 0; l < NL && l < (int64_t) cross_f.size(); ++l) mv = std::max(mv, (double) std::fabs(fac[(size_t) l] - cross_f[(size_t) l]) / std::max(1e-3, (double) cross_f[(size_t) l]));
@@ -11233,6 +11264,21 @@ int main(int argc, char** argv) {
                         if (nd == 0 || nr == 0 || cross_idle >= 256) {
                             cross_settled = true;
                             cross_f = fac;
+                            {   // the facts behind the numbers: the layers under their target (count -> target, factor, expert size, whether a donor has slots that hold it), and the totals
+                                double tsum = 0.0;
+                                for (int64_t l = 0; l < NL; ++l) tsum += target[(size_t) l];
+                                std::string under_s;
+                                int shown = 0;
+                                for (int64_t l = 0; l < NL && shown < 10; ++l) {
+                                    const double dev = (double) cnt[(size_t) l] - target[(size_t) l];
+                                    if (dev >= -tol) continue;
+                                    char b[96];
+                                    std::snprintf(b, sizeof b, " L%d(%d->%.0f f%.2f %.2fMB %s)", (int) l, cnt[(size_t) l], target[(size_t) l], (double) fac[(size_t) l], (double) blobs[(size_t) l] / 1e6, can_receive(l) ? "feedable" : "no donor fits");
+                                    under_s += b; ++shown;
+                                }
+                                std::fprintf(stderr, "strata serve: cross-layer swaps: facts: resident %lld in all (mean %.1f per layer), cache slots %lld, targets add up to %.0f, tolerance %.1f; under target:%s\n",
+                                             (long long) tot, mean, (long long) xcache.full_slots(), tsum, tol, under_s.empty() ? " none" : under_s.c_str());
+                            }
                             std::fprintf(stderr, "strata serve: cross-layer swaps: settled (%s): %d layers over their target, %d under, %lld slots moved in all (last look: %zu candidates, %zu victims; pairs refused: %d without a usable slot, %d blob too big, %d victim too hot); nothing is counted until a layer's miss share moves 10%%\n",
                                          nd == 0 || nr == 0 ? "every layer within its tolerance" : "nothing more could be moved", nd, nr, (long long) cross_total,
                                          cross_nc, cross_nv, cross_rej[0], cross_rej[1], cross_rej[2]);

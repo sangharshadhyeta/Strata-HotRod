@@ -6518,6 +6518,44 @@ int slot_share_factors(int n_layers, float* f) {   // returns how many layers ha
     for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) informed += nsm[l] >= 0 ? 1 : 0;
     return informed;
 }
+// ---- the layout weights (STRATA_LAYOUT_BY_MISS, on by default): each layer's share of the cache's slots at the NEXT start.  The cache's slots are laid out from the profile's order, and a slot keeps its
+// layer's expert size, so a layer that is short of slots stays short for the whole run (a swap never moves one between layers of different expert sizes).  The weights are ratios with a mean of 1; the live
+// miss factors (a layer's share of non-skippable misses over the mean) update them with damping: next = used x sqrt(factor), kept between 0.5 and 3 and renormalised, so a layer that still misses more than
+// average gets more slots next time and they stop moving when the miss shares are equal.  File: "LLW1", n layers, n floats.
+std::mutex g_layout_mu;
+std::vector<float> g_layout_used;
+std::string g_layout_path;
+void layout_weights_init(const std::string& path, int n_layers, std::vector<float>& w) {
+    std::lock_guard<std::mutex> lk(g_layout_mu);
+    g_layout_path = path;
+    w.assign((size_t) n_layers, 1.0f);
+    if (FILE* f = std::fopen(path.c_str(), "rb")) {
+        uint32_t mg = 0, n = 0;
+        if (std::fread(&mg, 4, 1, f) == 1 && std::fread(&n, 4, 1, f) == 1 && mg == 0x31574c4cu && n == (uint32_t) n_layers) {
+            std::vector<float> t((size_t) n);
+            if (std::fread(t.data(), 4, (size_t) n, f) == (size_t) n) w = t;
+        }
+        std::fclose(f);
+    }
+    g_layout_used = w;
+}
+void layout_weights_save(int n_layers, const float* fac) {
+    std::lock_guard<std::mutex> lk(g_layout_mu);
+    if (g_layout_path.empty() || (int) g_layout_used.size() != n_layers) return;
+    std::vector<float> nx((size_t) n_layers);
+    double sum = 0.0;
+    for (int l = 0; l < n_layers; ++l) { nx[(size_t) l] = std::min(3.0f, std::max(0.5f, g_layout_used[(size_t) l] * std::sqrt(std::max(0.01f, fac[l])))); sum += nx[(size_t) l]; }
+    const float mean = (float) (sum / n_layers);
+    for (float& x : nx) x /= mean;
+    const std::string tmp = g_layout_path + ".tmp";
+    if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+        const uint32_t mg = 0x31574c4cu, n = (uint32_t) n_layers;
+        std::fwrite(&mg, 4, 1, f); std::fwrite(&n, 4, 1, f); std::fwrite(nx.data(), 4, (size_t) n_layers, f);
+        std::fclose(f);
+        std::error_code ec;
+        std::filesystem::rename(tmp, g_layout_path, ec);
+    }
+}
 uint32_t layer_mult_generation() { return g_mult_gen.load(std::memory_order_relaxed); }
 float layer_mult_shape(int64_t layer) {
     const int n = g_mult_layers.load(std::memory_order_relaxed);
