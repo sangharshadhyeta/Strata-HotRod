@@ -365,9 +365,9 @@ int main() {
         check(near(g::k_target(g::KEvidence{true, 0.02, 8, 8}, 200, 0.05f, 30), 0.025, 1e-6),
               "lowering unchanged: 8 re-checks still lower k to 1.25 r*");
     }
-    // SPEC-substitute-fit stage 2 step 3: k and the control ring per APPLY mode (off 0, dynamic 1, all 2)
+    // SPEC-substitute-fit stage 2 step 3: k and the control ring per APPLY mode (off 0, dynamic 1, all 2, flip 3)
     {
-        check(g::mode_slot(-1) == 0 && g::mode_slot(1) == 1 && g::mode_slot(2) == 2 && g::mode_slot(7) == 2, "mode slots clamp to 0..2");
+        check(g::mode_slot(-1) == 0 && g::mode_slot(1) == 1 && g::mode_slot(2) == 2 && g::mode_slot(3) == 3 && g::mode_slot(7) == 3, "mode slots clamp to 0..3");
         // an old file: the tune file's k and the gate's ring are the off slot, and they seed the other modes
         g::KByMode old;
         const std::vector<unsigned char> legacy{1, 0, 1};
