@@ -12517,7 +12517,9 @@ int main(int argc, char** argv) {
                 if (!xcache.shrink(keep, e)) return false;
                 const int64_t live = xcache.slots();
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= live) {
+                    // F-01: a double whose neighbour slot is now past the end has its spill unmapped: it goes too, and its spill flag is cleared
+                    if (host_res[i] >= live || (xcache.spills(host_res[i]) && (int64_t) host_res[i] + 1 >= live)) {
+                        if (xcache.spills(host_res[i])) xcache.set_spill(host_res[i], false);
                         vram_evicted.emplace_back((int32_t) i, host_res[i]);
                         host_res[i] = strata::core::kNotResident;
                     }
@@ -12528,8 +12530,12 @@ int main(int argc, char** argv) {
                 const int64_t live = xcache.slots();
                 std::string ferr;
                 std::vector<std::pair<int32_t, int32_t>> keep_out;
+                // F-01: a slot the shrink freed may have been given to another expert while the cache was small: such a slot is not refilled
+                std::vector<char> slot_taken((size_t) xcache.full_slots(), 0);
+                for (const int32_t r : host_res)
+                    if (r >= 0 && (int64_t) r < (int64_t) slot_taken.size()) slot_taken[(size_t) r] = 1;
                 for (const auto& [i, slot] : vram_evicted) {
-                    if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
+                    if (slot >= live || slot_taken[(size_t) slot]) { keep_out.emplace_back(i, slot); continue; }
                     const int64_t layer = i / g.n_expert;
                     int64_t pick = i;
                     if (host_res[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
@@ -12543,6 +12549,8 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (pick < 0) continue;
+                    // F-01: an expert bigger than one slot (a double) is not refilled into one slot: its neighbour is not reserved for it any more
+                    if ((int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer) > xcache.slot_capacity(slot)) { keep_out.emplace_back(i, slot); continue; }
                     const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
                     if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
                             (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
