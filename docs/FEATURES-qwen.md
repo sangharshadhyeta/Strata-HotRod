@@ -393,7 +393,7 @@ Arguments (`args`):
 | `STRATA_PF_FUSED_SM75` | unset | upstream |  | Turing (sm_75): the same kernels with plain copies and m8n8k16 MMAs, opt-in (STRATA_PF_FUSED_SM75=1) | src/prefill/moe_fused.cu:651, src/prefill/moe_fused_iq.cu:1295 |
 | `STRATA_PF_FUSED_TILE` | see code | upstream |  | (no comment) | src/prefill/moe_fused_iq.cu:1375 |
 | `STRATA_PF_GEMM` | unset | upstream |  | (no comment) | src/prefill/gemm.cu:1056, src/prefill/gemm.cu:1238, src/prefill/prefill.cpp:510 |
-| `STRATA_PF_GROUP_OVERLAP` | unset | HotRod |  | (no comment) | src/prefill/prefill.cpp:441 |
+| `STRATA_PF_GROUP_OVERLAP` | unset | HotRod |  | (no comment) | removed 24 Nov 2026 (ratrod clean-up; was src/prefill/prefill.cpp:441) |
 | `STRATA_PF_HCDOWN` | unset | upstream |  | (no comment) | src/prefill/prefill.cpp:489 |
 | `STRATA_PF_OCC` | see code | upstream |  | (no comment) | src/prefill/moe_fused.cu:610, src/prefill/moe_fused_iq.cu:1231 |
 | `STRATA_PF_OCC_W` | see code | upstream |  | (no comment) | src/prefill/moe_fused_iq.cu:1244 |
