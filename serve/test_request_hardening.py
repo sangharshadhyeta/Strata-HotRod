@@ -61,6 +61,26 @@ class Hardening(unittest.TestCase):
         code, out = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})
         self.assertEqual(code, 200, out)
 
+    def test_an_infinite_token_limit_is_a_400_that_names_the_field(self):
+        """S-03: JSON 1e400 reads as inf; int(inf) raised OverflowError (uncaught, after the model had loaded).  Now a 400."""
+        for path, field, body in (
+                ("/v1/chat/completions", "max_tokens", b'{"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1e400}'),
+                ("/v1/chat/completions", "max_tokens", b'{"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 1e400}'),
+                ("/v1/messages", "max_tokens", b'{"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1e400}'),
+                ("/v1/messages", "max_tokens", b'{"messages": [{"role": "user", "content": "hi"}], "max_tokens": -1e400}')):
+            with self.subTest(path=path, body=body), mock.patch("builtins.print"):
+                code, out = self.post(path, body)
+                self.assertEqual(code, 400, out)
+                self.assertIn(field, json.dumps(out))
+        # the shared Chat settings (POST /settings): the same value is refused there too, and nothing is changed
+        before = dict(self.svc.shared)
+        with mock.patch("builtins.print"):
+            code, out = self.post("/settings", b'{"defaults": {"max_tokens": 1e400}}',
+                                  headers={"Origin": f"http://127.0.0.1:{self.port}"})
+        self.assertEqual(code, 400, out)
+        self.assertIn("max_tokens", json.dumps(out))
+        self.assertEqual(self.svc.shared, before)
+
     def test_oversized_content_length_is_413_unread(self):
         with mock.patch.dict(os.environ, {"STRATA_MAX_BODY_MIB": "1"}):
             self.assertEqual(body_limit(), 1 << 20)

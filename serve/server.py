@@ -6817,7 +6817,7 @@ def make_handler(svc: Service):
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            max_req = max_new = output_limit(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             if warm:
                 max_new = 1                                   # 20 Oct: a warm reads the prompt and stops after one token
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
@@ -7068,7 +7068,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            max_new = output_limit(req.get("max_tokens") or 0)         # 0/-1: the rest of the context
             if warm:
                 max_new = 1                                   # 20 Oct: a warm reads the prompt and stops after one token
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
@@ -7437,7 +7437,7 @@ def clean_shared_defaults(d) -> dict:
                 raise ValueError("top_k: an integer 1..64")
             value = int(value)
         elif key in ("seed", "max_tokens"):
-            if not number or value != int(value) or value <= 0:
+            if not number or not math.isfinite(value) or value != int(value) or value <= 0:   # S-03: inf has no int()
                 raise ValueError(f"{key}: a positive integer")
             value = int(value)
         elif key == "reasoning_budget_tokens":                 # #123: 0 means no budget, so 0 is allowed here
@@ -7630,6 +7630,15 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         raise SystemExit(f"[strata] replica {i} did not start: {e}")
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
     return rp.ReplicaEngine(engines, load_tokens=load)
+
+
+def output_limit(value, key: str = "max_tokens") -> int:
+    """A max_tokens / max_completion_tokens value as an int.  JSON 1e400 reads as inf, and int(inf) raised OverflowError
+    after the model had loaded (S-03): a value that is not finite is a 400 that names the field, as a bad sampling field
+    is.  Negative values keep their meaning (0 and -1: the rest of the context)."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{key}: a finite whole number of tokens")
+    return int(value)
 
 
 def check_request_sampling(req) -> None:
