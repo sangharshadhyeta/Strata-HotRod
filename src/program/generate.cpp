@@ -11263,6 +11263,7 @@ int main(int argc, char** argv) {
                         for (int64_t l = 0; l < NL && l < (int64_t) cross_f.size(); ++l) mv = std::max(mv, (double) std::fabs(fac[(size_t) l] - cross_f[(size_t) l]) / std::max(1e-3, (double) cross_f[(size_t) l]));
                         if (mv > 0.10) {
                             cross_settled = false; cross_idle = 0;
+                            strata::core::ls_set_sampled(false);   // woke: every window counts again
                             std::fprintf(stderr, "strata serve: cross-layer swaps: woke (a layer's miss share moved %.0f%%): moving toward the new targets\n", 100.0 * mv);
                         }
                     }
@@ -11314,6 +11315,7 @@ int main(int argc, char** argv) {
                         if (nd == 0 || nr == 0 || cross_idle >= 256) {
                             cross_settled = true;
                             cross_f = fac;
+                            strata::core::ls_set_sampled(true);   // settled: the counters sample every 16th window
                             {   // the facts behind the numbers: the layers under their target (count -> target, factor, expert size, whether a donor has slots that hold it), and the totals
                                 double tsum = 0.0;
                                 for (int64_t l = 0; l < NL; ++l) tsum += target[(size_t) l];

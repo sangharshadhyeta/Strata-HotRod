@@ -6181,11 +6181,18 @@ bool ls_stats_on() { static const bool on = [] { const char* e = std::getenv("ST
 bool slot_share_on() { static const bool on = [] { const char* e = std::getenv("STRATA_SLOT_SHARE"); return e != nullptr && e[0] == '1'; }(); return on; }
 bool cross_swap_on() { static const bool on = [] { const char* e = std::getenv("STRATA_CROSS_SWAP"); return e == nullptr || e[0] != '0'; }(); return on; }   // on by default (24 Nov); =0 turns it off
 bool ls_on() { return ls_stats_on() || slot_share_on() || cross_swap_on(); }
+// once the cross-layer swap has settled it reads only ratios (each layer's share of its own picks), so the counters need only a sample: every 16th window
+// (ls_set_sampled(true)); a wake goes back to every window.  The counts stay comparable between layers, so the shares - and the wake test - are unbiased.
+std::atomic<uint32_t> g_ls_win{0};
+std::atomic<uint32_t> g_ls_mask{0};
+void ls_set_sampled(bool on) { g_ls_mask.store(on ? 15u : 0u, std::memory_order_relaxed); }
 void ls_note(int64_t layer, int32_t kind) {
     if (layer < 0 || layer >= kLayerMultCap) return;
+    if ((g_ls_win.load(std::memory_order_relaxed) & g_ls_mask.load(std::memory_order_relaxed)) != 0) return;   // a window outside the sample
     g_ls[layer][kind == -2 ? 3 : kind == -1 ? 2 : kind == 0 ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
 }
 void ls_report(size_t n_layers) {   // every 1024 windows, from the last layer: six depth bands
+    g_ls_win.fetch_add(1, std::memory_order_relaxed);   // the window count the sampled counters follow (ls_report runs once per window, at the last layer)
     if (!ls_stats_on() || (g_ls_calls.fetch_add(1, std::memory_order_relaxed) & 1023u) != 1023u) return;
     std::fprintf(stderr, "strata serve: layer stats (picks per depth band: VRAM hit / PCIe / CPU exact / skipped, and the share each is of the band's picks):\n");
     const size_t bands = 6, per = (n_layers + bands - 1) / bands;
@@ -6565,6 +6572,7 @@ int slot_share_factors(int n_layers, float* f) {   // returns how many layers ha
 // average gets more slots next time and they stop moving when the miss shares are equal.  File: "LLW1", n layers, n floats.
 std::mutex g_layout_mu;
 std::vector<float> g_layout_used;
+std::vector<float> g_layout_written;   // what the file holds now (read at start, then each write): a save that would move no layer by more than 3% is skipped
 std::string g_layout_path;
 void layout_weights_init(const std::string& path, int n_layers, std::vector<float>& w) {
     std::lock_guard<std::mutex> lk(g_layout_mu);
@@ -6580,6 +6588,7 @@ void layout_weights_init(const std::string& path, int n_layers, std::vector<floa
         std::fclose(f);
     }
     g_layout_used = w;
+    g_layout_written = w;
 }
 void layout_weights_save(int n_layers, const float* fac) {
     std::lock_guard<std::mutex> lk(g_layout_mu);
@@ -6589,11 +6598,17 @@ void layout_weights_save(int n_layers, const float* fac) {
     for (int l = 0; l < n_layers; ++l) { nx[(size_t) l] = std::min(3.0f, std::max(0.5f, g_layout_used[(size_t) l] * std::sqrt(std::max(0.01f, fac[l])))); sum += nx[(size_t) l]; }
     const float mean = (float) (sum / n_layers);
     for (float& x : nx) x /= mean;
+    double mv = 0.0;
+    if ((int) g_layout_written.size() == n_layers)
+        for (int l = 0; l < n_layers; ++l) mv = std::max(mv, (double) std::fabs(nx[(size_t) l] - g_layout_written[(size_t) l]) / std::max(1e-3, (double) g_layout_written[(size_t) l]));
+    else mv = 1.0;
+    if (mv <= 0.03) return;   // settled: no layer would move by more than 3%, nothing is written
     const uint32_t mg = 0x31574c4cu, n = (uint32_t) n_layers;
     const bool ok = write_file_atomic(g_layout_path, [&](FILE* f) {
         return put_bytes(f, &mg, 4, 1) && put_bytes(f, &n, 4, 1) && put_bytes(f, nx.data(), 4, (size_t) n_layers);
     });
     if (!ok) std::fprintf(stderr, "strata serve: layer weights: could not write %s (the file is unchanged)\n", g_layout_path.c_str());
+    else g_layout_written = nx;
 }
 uint32_t layer_mult_generation() { return g_mult_gen.load(std::memory_order_relaxed); }
 float layer_mult_shape(int64_t layer) {
