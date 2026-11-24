@@ -51,6 +51,7 @@
 #define NOMINMAX   // std::numeric_limits<T>::max() below
 #endif
 #include <windows.h>
+#include <io.h>   // _commit: the state files' fsync (write_file_atomic)
 #else
 #include <fcntl.h>
 #if defined(__APPLE__)
@@ -6032,24 +6033,48 @@ float g_sh_w[512];                  // the router weight of the missed candidate
 uint32_t g_sh_cand[512];            // the window stamp it was set in
 uint32_t g_sh_stamp = 0;
 bool g_sh_rec = false;              // this window's candidates are to be recorded after the CPU's run
+// F-05: a state file is written whole or not at all.  The bytes go to <path>.tmp, every write is checked, the data is flushed to disk, and only then the
+// temp file replaces the file.  Any failure removes the temp file and returns false: the file on disk stays as it was.  `fill` writes into the open file
+// and returns false when one of its writes failed.
+inline bool put_bytes(FILE* f, const void* p, size_t size, size_t n) { return std::fwrite(p, size, n, f) == n; }
+template <class Fill>
+bool write_file_atomic(const std::string& path, Fill fill) {
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return false;
+    bool ok = fill(f);
+    if (std::fflush(f) != 0) ok = false;
+#if defined(_WIN32)
+    if (ok && _commit(_fileno(f)) != 0) ok = false;
+#else
+    if (ok && ::fsync(fileno(f)) != 0) ok = false;
+#endif
+    if (std::fclose(f) != 0) ok = false;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        std::error_code rm;
+        std::filesystem::remove(tmp, rm);
+        return false;
+    }
+    return true;
+}
 std::string shadow_path() { return (std::filesystem::path(g_live_path).parent_path() / "layer-shadow.bin").string(); }
 // callers hold g_sh_mu
 void shadow_save_locked() {
     if (g_live_path.empty()) return;
-    const std::string p = shadow_path(), tmp = p + ".tmp";
-    FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (f == nullptr) return;
     const uint32_t mg = 0x33484c53u, nl = (uint32_t) kLayerMultCap;   // "SLH3"
-    std::fwrite(&mg, 4, 1, f); std::fwrite(&nl, 4, 1, f);
-    for (int l = 0; l < kLayerMultCap; ++l) {
-        const LearnLayer& L = g_sh[l];
-        const uint8_t fl[2] = {(uint8_t) L.settled, (uint8_t) L.fast_done};
-        std::fwrite(fl, 1, 2, f); std::fwrite(&L.n, 4, 1, f);
-        std::fwrite(&L.sk, 8, 1, f); std::fwrite(&L.us, 8, 1, f); std::fwrite(&L.wsk, 8, 1, f); std::fwrite(&L.wus, 8, 1, f); std::fwrite(&L.mult_at_settle, 4, 1, f);
-    }
-    std::fclose(f);
-    std::error_code ec;
-    std::filesystem::rename(tmp, p, ec);
+    const bool ok = write_file_atomic(shadow_path(), [&](FILE* f) {
+        if (!put_bytes(f, &mg, 4, 1) || !put_bytes(f, &nl, 4, 1)) return false;
+        for (int l = 0; l < kLayerMultCap; ++l) {
+            const LearnLayer& L = g_sh[l];
+            const uint8_t fl[2] = {(uint8_t) L.settled, (uint8_t) L.fast_done};
+            if (!put_bytes(f, fl, 1, 2) || !put_bytes(f, &L.n, 4, 1) || !put_bytes(f, &L.sk, 8, 1) || !put_bytes(f, &L.us, 8, 1) ||
+                !put_bytes(f, &L.wsk, 8, 1) || !put_bytes(f, &L.wus, 8, 1) || !put_bytes(f, &L.mult_at_settle, 4, 1)) return false;
+        }
+        return true;
+    });
+    if (!ok) std::fprintf(stderr, "strata serve: layer learn: could not write %s (the file is unchanged)\n", shadow_path().c_str());
 }
 void shadow_load_locked() {
     g_sh_loaded = true;
@@ -6057,17 +6082,29 @@ void shadow_load_locked() {
     FILE* f = std::fopen(shadow_path().c_str(), "rb");
     if (f == nullptr) return;
     uint32_t mg = 0, nl = 0;
-    if (std::fread(&mg, 4, 1, f) != 1 || std::fread(&nl, 4, 1, f) != 1 || mg != 0x33484c53u || nl != (uint32_t) kLayerMultCap) { std::fclose(f); return; }
-    int settled = 0;
-    for (int l = 0; l < kLayerMultCap; ++l) {
-        LearnLayer L; uint8_t fl[2] = {0, 0};
-        if (std::fread(fl, 1, 2, f) != 2 || std::fread(&L.n, 4, 1, f) != 1 || std::fread(&L.sk, 8, 1, f) != 1 || std::fread(&L.us, 8, 1, f) != 1 ||
-            std::fread(&L.wsk, 8, 1, f) != 1 || std::fread(&L.wus, 8, 1, f) != 1 || std::fread(&L.mult_at_settle, 4, 1, f) != 1) break;
+    const bool got_head = std::fread(&mg, 4, 1, f) == 1 && std::fread(&nl, 4, 1, f) == 1;
+    if (!got_head || mg != 0x33484c53u || nl != (uint32_t) kLayerMultCap) {
+        std::fclose(f);
+        if (!got_head) std::fprintf(stderr, "strata serve: layer learn: %s is incomplete (shorter than its header says): rejected, starting fresh\n", shadow_path().c_str());
+        return;
+    }
+    // read everything first: a short file is rejected as a whole, the learner keeps its fresh state
+    LearnLayer in[kLayerMultCap];
+    bool full = true;
+    for (int l = 0; l < kLayerMultCap && full; ++l) {
+        LearnLayer& L = in[l];
+        uint8_t fl[2] = {0, 0};
+        full = std::fread(fl, 1, 2, f) == 2 && std::fread(&L.n, 4, 1, f) == 1 && std::fread(&L.sk, 8, 1, f) == 1 && std::fread(&L.us, 8, 1, f) == 1 &&
+               std::fread(&L.wsk, 8, 1, f) == 1 && std::fread(&L.wus, 8, 1, f) == 1 && std::fread(&L.mult_at_settle, 4, 1, f) == 1;
         L.settled = fl[0] != 0; L.fast_done = fl[1] != 0;
-        settled += L.settled ? 1 : 0;
-        g_sh[l] = L;
     }
     std::fclose(f);
+    if (!full) {
+        std::fprintf(stderr, "strata serve: layer learn: %s is incomplete (shorter than its header says): rejected, starting fresh\n", shadow_path().c_str());
+        return;
+    }
+    int settled = 0;
+    for (int l = 0; l < kLayerMultCap; ++l) { settled += in[l].settled ? 1 : 0; g_sh[l] = in[l]; }
     std::fprintf(stderr, "strata serve: layer learn: state loaded from %s (%d layers settled: they skip from the start)\n", shadow_path().c_str(), settled);
 }
 int learn_mode() {   // 0 off, 1 sample, 2 full (the default mode)
@@ -6196,16 +6233,13 @@ void slot_share_compute(int n_layers, float* f, double* nsm) {
 }
 void slot_save_locked() {   // "SSH1", layers, settled, factors, shares
     if (g_live_path.empty()) return;
-    const std::string p = slot_path(), tmp = p + ".tmp";
-    FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (f == nullptr) return;
     const uint32_t mg = 0x31485353u, nl = (uint32_t) kLayerMultCap;
     const uint8_t st = g_slot_settled ? 1 : 0;
-    std::fwrite(&mg, 4, 1, f); std::fwrite(&nl, 4, 1, f); std::fwrite(&st, 1, 1, f);
-    std::fwrite(g_slot_f, sizeof(float), kLayerMultCap, f); std::fwrite(g_slot_nsm_settle, sizeof(double), kLayerMultCap, f);
-    std::fclose(f);
-    std::error_code ec;
-    std::filesystem::rename(tmp, p, ec);
+    const bool ok = write_file_atomic(slot_path(), [&](FILE* f) {
+        return put_bytes(f, &mg, 4, 1) && put_bytes(f, &nl, 4, 1) && put_bytes(f, &st, 1, 1) &&
+               put_bytes(f, g_slot_f, sizeof(float), kLayerMultCap) && put_bytes(f, g_slot_nsm_settle, sizeof(double), kLayerMultCap);
+    });
+    if (!ok) std::fprintf(stderr, "strata serve: slot share: could not write %s (the file is unchanged)\n", slot_path().c_str());
 }
 void slot_load_locked() {
     g_slot_loaded = true;
@@ -6215,10 +6249,19 @@ void slot_load_locked() {
     if (f == nullptr) return;
     uint32_t mg = 0, nl = 0; uint8_t st = 0;
     float ff[kLayerMultCap]; double nn[kLayerMultCap];
-    const bool ok = std::fread(&mg, 4, 1, f) == 1 && std::fread(&nl, 4, 1, f) == 1 && std::fread(&st, 1, 1, f) == 1 && mg == 0x31485353u && nl == (uint32_t) kLayerMultCap &&
-                    std::fread(ff, sizeof(float), kLayerMultCap, f) == (size_t) kLayerMultCap && std::fread(nn, sizeof(double), kLayerMultCap, f) == (size_t) kLayerMultCap;
+    const bool got_head = std::fread(&mg, 4, 1, f) == 1 && std::fread(&nl, 4, 1, f) == 1 && std::fread(&st, 1, 1, f) == 1;
+    if (!got_head) {
+        std::fclose(f);
+        std::fprintf(stderr, "strata serve: slot share: %s is incomplete (shorter than its header says): rejected, starting fresh\n", slot_path().c_str());
+        return;
+    }
+    if (mg != 0x31485353u || nl != (uint32_t) kLayerMultCap) { std::fclose(f); return; }
+    const bool ok = std::fread(ff, sizeof(float), kLayerMultCap, f) == (size_t) kLayerMultCap && std::fread(nn, sizeof(double), kLayerMultCap, f) == (size_t) kLayerMultCap;
     std::fclose(f);
-    if (!ok) return;
+    if (!ok) {
+        std::fprintf(stderr, "strata serve: slot share: %s is incomplete (shorter than its header says): rejected, starting fresh\n", slot_path().c_str());
+        return;
+    }
     for (int l = 0; l < kLayerMultCap; ++l) { g_slot_f[l] = ff[l]; g_slot_prev[l] = ff[l]; g_slot_nsm_settle[l] = nn[l]; }
     g_slot_settled = st != 0;
     std::fprintf(stderr, "strata serve: slot share: state loaded from %s (%s)\n", slot_path().c_str(), g_slot_settled ? "settled: the shares are applied, nothing is recomputed" : "still learning");
@@ -6237,35 +6280,32 @@ void layer_live_note(int64_t layer, float w) {
 }
 bool layer_live_save() {
     if (g_live_path.empty() || g_live_layers < 1) return false;
-    const std::string tmp = g_live_path + ".tmp";
-    FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (f == nullptr) return false;
     const uint32_t magic = 0x31484c4cu, nl = (uint32_t) g_live_layers, nb = (uint32_t) kBins;   // "LLH1"
-    std::fwrite(&magic, 4, 1, f); std::fwrite(&nl, 4, 1, f); std::fwrite(&nb, 4, 1, f);
     std::vector<uint32_t> cnt((size_t) kBins); std::vector<uint64_t> ws((size_t) kBins);
-    for (int l = 0; l < g_live_layers; ++l) {
-        for (int b = 0; b < kBins; ++b) { cnt[(size_t) b] = g_lhist[l][b].load(std::memory_order_relaxed); ws[(size_t) b] = g_lwsum[l][b].load(std::memory_order_relaxed); }
-        std::fwrite(cnt.data(), 4, (size_t) kBins, f); std::fwrite(ws.data(), 8, (size_t) kBins, f);
-    }
-    std::fclose(f);
-    std::error_code ec;
-    std::filesystem::rename(tmp, g_live_path, ec);
+    const bool ok = write_file_atomic(g_live_path, [&](FILE* f) {
+        if (!put_bytes(f, &magic, 4, 1) || !put_bytes(f, &nl, 4, 1) || !put_bytes(f, &nb, 4, 1)) return false;
+        for (int l = 0; l < g_live_layers; ++l) {
+            for (int b = 0; b < kBins; ++b) { cnt[(size_t) b] = g_lhist[l][b].load(std::memory_order_relaxed); ws[(size_t) b] = g_lwsum[l][b].load(std::memory_order_relaxed); }
+            if (!put_bytes(f, cnt.data(), 4, (size_t) kBins) || !put_bytes(f, ws.data(), 8, (size_t) kBins)) return false;
+        }
+        return true;
+    });
+    if (!ok) std::fprintf(stderr, "strata serve: layer live: could not write %s (the file is unchanged)\n", g_live_path.c_str());
     if (skipcnt_on()) {   // the skip counts: <dir>/layer-skips.bin, "LSK1", layers, 512, u32 [layers][512]
-        const std::string sp = (std::filesystem::path(g_live_path).parent_path() / "layer-skips.bin").string(), stmp = sp + ".tmp";
-        if (FILE* g = std::fopen(stmp.c_str(), "wb")) {
-            const uint32_t m2 = 0x314b534cu, nl2 = (uint32_t) g_live_layers, ne2 = 512;
-            std::fwrite(&m2, 4, 1, g); std::fwrite(&nl2, 4, 1, g); std::fwrite(&ne2, 4, 1, g);
-            std::vector<uint32_t> row(512);
+        const std::string sp = (std::filesystem::path(g_live_path).parent_path() / "layer-skips.bin").string();
+        const uint32_t m2 = 0x314b534cu, nl2 = (uint32_t) g_live_layers, ne2 = 512;
+        std::vector<uint32_t> row(512);
+        const bool ok2 = write_file_atomic(sp, [&](FILE* g) {
+            if (!put_bytes(g, &m2, 4, 1) || !put_bytes(g, &nl2, 4, 1) || !put_bytes(g, &ne2, 4, 1)) return false;
             for (int l = 0; l < g_live_layers; ++l) {
                 for (int e = 0; e < 512; ++e) row[(size_t) e] = g_skipcnt[l][e].load(std::memory_order_relaxed);
-                std::fwrite(row.data(), 4, 512, g);
+                if (!put_bytes(g, row.data(), 4, 512)) return false;
             }
-            std::fclose(g);
-            std::error_code ec2;
-            std::filesystem::rename(stmp, sp, ec2);
-        }
+            return true;
+        });
+        if (!ok2) std::fprintf(stderr, "strata serve: layer live: could not write %s (the file is unchanged)\n", sp.c_str());
     }
-    return !ec;
+    return ok;
 }
 // `path`: where the histogram lives between runs; loaded now when it matches the model, saved periodically and at exit.
 void layer_live_persist(const std::string& path, int n_layers) {
@@ -6274,16 +6314,22 @@ void layer_live_persist(const std::string& path, int n_layers) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (f != nullptr) {
         uint32_t magic = 0, nl = 0, nb = 0;
-        bool ok = std::fread(&magic, 4, 1, f) == 1 && std::fread(&nl, 4, 1, f) == 1 && std::fread(&nb, 4, 1, f) == 1 && magic == 0x31484c4cu && (int) nl == g_live_layers && (int) nb == kBins;
-        if (ok) {
-            std::vector<uint32_t> cnt((size_t) kBins); std::vector<uint64_t> ws((size_t) kBins);
-            for (int l = 0; l < g_live_layers && ok; ++l) {
-                ok = std::fread(cnt.data(), 4, (size_t) kBins, f) == (size_t) kBins && std::fread(ws.data(), 8, (size_t) kBins, f) == (size_t) kBins;
-                if (ok) for (int b = 0; b < kBins; ++b) { g_lhist[l][b].store(cnt[(size_t) b], std::memory_order_relaxed); g_lwsum[l][b].store(ws[(size_t) b], std::memory_order_relaxed); }
-            }
+        const bool got_head = std::fread(&magic, 4, 1, f) == 1 && std::fread(&nl, 4, 1, f) == 1 && std::fread(&nb, 4, 1, f) == 1;
+        const bool head = got_head && magic == 0x31484c4cu && (int) nl == g_live_layers && (int) nb == kBins;
+        bool ok = head;
+        // read everything first: a short file is rejected as a whole (the histogram stays empty)
+        std::vector<uint32_t> hc((size_t) kBins * (size_t) g_live_layers); std::vector<uint64_t> hw((size_t) kBins * (size_t) g_live_layers);
+        for (int l = 0; l < g_live_layers && ok; ++l) {
+            ok = std::fread(&hc[(size_t) l * kBins], 4, (size_t) kBins, f) == (size_t) kBins && std::fread(&hw[(size_t) l * kBins], 8, (size_t) kBins, f) == (size_t) kBins;
         }
         std::fclose(f);
-        std::fprintf(stderr, "strata serve: layer live: %s %s\n", path.c_str(), ok ? "loaded: the thresholds start from where the last run left off" : "does not match this model, starting fresh");
+        if (ok) {
+            for (int l = 0; l < g_live_layers; ++l)
+                for (int b = 0; b < kBins; ++b) { g_lhist[l][b].store(hc[(size_t) l * kBins + b], std::memory_order_relaxed); g_lwsum[l][b].store(hw[(size_t) l * kBins + b], std::memory_order_relaxed); }
+        }
+        if (ok) std::fprintf(stderr, "strata serve: layer live: %s loaded: the thresholds start from where the last run left off\n", path.c_str());
+        else if (!got_head || (head && !ok)) std::fprintf(stderr, "strata serve: layer live: %s is incomplete (shorter than its header says): rejected, starting fresh\n", path.c_str());
+        else std::fprintf(stderr, "strata serve: layer live: %s does not match this model, starting fresh\n", path.c_str());
     }
     static bool registered = false;
     if (!registered) { registered = true; std::atexit([] { layer_live_save(); }); }
@@ -6533,7 +6579,8 @@ void layout_weights_init(const std::string& path, int n_layers, std::vector<floa
         uint32_t mg = 0, n = 0;
         if (std::fread(&mg, 4, 1, f) == 1 && std::fread(&n, 4, 1, f) == 1 && mg == 0x31574c4cu && n == (uint32_t) n_layers) {
             std::vector<float> t((size_t) n);
-            if (std::fread(t.data(), 4, (size_t) n, f) == (size_t) n) w = t;
+            if (std::fread(t.data(), 4, (size_t) n, f) == (size_t) n) w = t;   // whole or nothing: a short file keeps the ones
+            else std::fprintf(stderr, "strata serve: layer weights: %s is incomplete (shorter than its header says): rejected, starting from ones\n", path.c_str());
         }
         std::fclose(f);
     }
@@ -6547,14 +6594,11 @@ void layout_weights_save(int n_layers, const float* fac) {
     for (int l = 0; l < n_layers; ++l) { nx[(size_t) l] = std::min(3.0f, std::max(0.5f, g_layout_used[(size_t) l] * std::sqrt(std::max(0.01f, fac[l])))); sum += nx[(size_t) l]; }
     const float mean = (float) (sum / n_layers);
     for (float& x : nx) x /= mean;
-    const std::string tmp = g_layout_path + ".tmp";
-    if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
-        const uint32_t mg = 0x31574c4cu, n = (uint32_t) n_layers;
-        std::fwrite(&mg, 4, 1, f); std::fwrite(&n, 4, 1, f); std::fwrite(nx.data(), 4, (size_t) n_layers, f);
-        std::fclose(f);
-        std::error_code ec;
-        std::filesystem::rename(tmp, g_layout_path, ec);
-    }
+    const uint32_t mg = 0x31574c4cu, n = (uint32_t) n_layers;
+    const bool ok = write_file_atomic(g_layout_path, [&](FILE* f) {
+        return put_bytes(f, &mg, 4, 1) && put_bytes(f, &n, 4, 1) && put_bytes(f, nx.data(), 4, (size_t) n_layers);
+    });
+    if (!ok) std::fprintf(stderr, "strata serve: layer weights: could not write %s (the file is unchanged)\n", g_layout_path.c_str());
 }
 uint32_t layer_mult_generation() { return g_mult_gen.load(std::memory_order_relaxed); }
 float layer_mult_shape(int64_t layer) {
