@@ -30,6 +30,13 @@ Severity: critical / high / medium / low. Status: open / fixed (commit) / wontfi
 - Not a defect (by design, documented): with no api_key every client is trusted; "no Origin = not a browser" (server.py 6681-6688) is the CSRF guard for browsers only. SECURITY.md's wording "only as JSON from Strata's own page" should say it guards against other web pages, not other programs - doc fix only: fixed (9fc62651f).
 - Noted, not acted on: local-path and http(s) image sources for an authorised client (the key holder is the owner; SSRF is blind); /health unauthenticated detail (document it); decompression bombs in pass-through formats depend on the external vision decoder (not in repo); supply-chain pins (llama.cpp zip without SHA-256).
 
+## Checked and fine (lead, adversarial pass)
+- P0-B "the async adapt thread (pipelined decode) writes res_dirty_idx without a join": not live. Its pushes (generate.cpp ~10939, ~11675) are under `drive.d.evict_sync`, which needs `serial_windows` (~10966), false in the pipelined loop; the cross-layer / double-slot pushes (~11240) are gated off there too (no fence). pl_apply runs only after the join (~16785).
+- F-01 follow-up by the engine agent (grow refill guard: a slot reused during the shrink, or a blob bigger than one slot, is not refilled): correct; the cost is that a doubled expert evicted by a shrink comes back only as a normal miss (not measured).
+- F-05 readers: a valid file loads exactly as before (fields not in the file keep their fresh defaults, as the old in-place read did); a magic/dims mismatch stays a silent refusal; only a short file gets the new "incomplete" line.
+- F-04 lock: covers write+flush only, never re-entered (`_send` no longer takes it itself); the engine drains stdin on its own reader thread, so a long GEN line cannot hold STOP back for long.
+- S-02 0600: no setup runs the server as a different user than the one that wrote the config (no User=/runuser/sudo -u/chown anywhere), so nothing loses read access.
+
 ## Checked and fine (double slots, 24 Nov)
 - Sized caches are one contiguous allocation (`open_sized` -> one `open` of the summed size; VMM reserves one VA range), and fill/verify clamp to the LARGEST blob (`blob_ = mx`), so the spill copy is not truncated.
 - The second victim goes through the same protocol as the first (`host_res` cleared and `res_dirty_idx` pushed in the same places, dma-batch path included); cross-layer swaps run only with no overlap, no fence, one GPU.
