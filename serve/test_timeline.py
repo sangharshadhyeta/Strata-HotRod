@@ -1,11 +1,14 @@
 """The Monitor's decode timeline: the switch the engine reads, and the snapshot it writes, through /metrics and POST."""
 import json
 import os
+import stat
+import tempfile
 import threading
 import time
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from serve import server
 from serve.frontend import ChatTemplate
@@ -81,6 +84,34 @@ class TimelineTest(unittest.TestCase):
     def test_rejects_bad_requests(self):
         self.assertEqual(self.post({"on": "yes"})[0], 400)
         self.assertEqual(self.post({"on": True}, ctype="text/plain")[0], 415)   # a form post from another site cannot switch it
+
+
+@unittest.skipIf(os.name == "nt", "symlinks and file modes are POSIX")
+class ControlFile(unittest.TestCase):
+    """S-04: the switch file has a predictable name in the shared temp dir: a symlink planted there is not followed,
+    and a new switch file is private."""
+
+    def test_a_planted_symlink_is_not_written_through(self):
+        with tempfile.TemporaryDirectory() as d:
+            victim = Path(d) / "victim.txt"
+            victim.write_text("keep", encoding="utf-8")
+            ctl = Path(d) / "strata-timeline.ctl"
+            os.symlink(victim, ctl)
+            with mock.patch.object(server, "TIMELINE_CTL", str(ctl)):
+                with self.assertRaises(OSError):
+                    server.set_timeline(True)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep")
+
+    def test_a_new_switch_file_is_one_private_byte(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctl = Path(d) / "strata-timeline.ctl"
+            with mock.patch.object(server, "TIMELINE_CTL", str(ctl)):
+                server.set_timeline(True)
+                self.assertEqual(ctl.read_bytes(), b"1")
+                self.assertEqual(stat.S_IMODE(ctl.stat().st_mode), 0o600)
+                self.assertTrue(server.timeline_on())
+                server.set_timeline(True)                 # written in place: still one byte, no truncation
+                self.assertEqual(ctl.read_bytes(), b"1")
 
 
 if __name__ == "__main__":

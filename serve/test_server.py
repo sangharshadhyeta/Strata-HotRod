@@ -2410,6 +2410,7 @@ class NonFiniteLogits(unittest.TestCase):
         """StrataEngine.generate: `DONE ... nonfinite` raises EngineNonFinite after the tokens before it."""
         import queue as queue_
         eng = object.__new__(StrataEngine)
+        eng.wlock = threading.Lock()                    # set by __init__, which this fixture skips
         eng.lines = queue_.Queue()
         for line in ("T 5", "T 6", "DONE 2 3 1.0 2.0 nonfinite 0 0 0"):
             eng.lines.put(line)
@@ -2825,6 +2826,7 @@ class LiveRate(unittest.TestCase):
         import queue
         from types import SimpleNamespace
         engine = StrataEngine.__new__(StrataEngine)
+        engine.wlock = threading.Lock()                 # set by __init__, which this fixture skips
         engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # alive() asks it (#208)
         engine.lines = queue.Queue()
         engine.can_stop = False
@@ -4885,6 +4887,7 @@ class SilentEngine(unittest.TestCase):
         import io
         import queue
         engine = StrataEngine.__new__(StrataEngine)
+        engine.wlock = threading.Lock()                 # set by __init__, which this fixture skips
         engine.proc = mock.Mock()
         engine.proc.stdin = io.StringIO()
         engine.proc.poll.return_value = None

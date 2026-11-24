@@ -16,11 +16,12 @@
 #
 # Run (host needs an NVIDIA driver >= 580 and nvidia-container-toolkit):
 #   docker run --rm --gpus all \
-#     -p 8080:8080 \
+#     -p 127.0.0.1:8080:8080 \
 #     --ulimit memlock=-1 \
 #     -v strata-data:/data \
 #     -e MODEL=IQ2_XS \
 #     strata
+# To open it to your network, set a key and publish on all interfaces: -e API_KEY=<secret> -p 8080:8080
 #
 # Setup choices are env vars, read by docker-entrypoint.sh: FAMILY, MODEL, CONTEXT,
 # VISION (no | yes | cpu), KV (int8 | q4_0 | k8v4), GPU (one card) or GPUS ("0,2"

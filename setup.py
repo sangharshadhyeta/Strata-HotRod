@@ -4648,9 +4648,14 @@ def data_folder(requested: str | None) -> tuple:
 
 def write_config(path: Path, cfg: dict):
     """A run config, written whole or not at all (#459): to a temporary file first, then moved over the old one, so
-    a setup stopped half-way (a closed window, a full disk) never leaves an empty strata-*.json behind."""
+    a setup stopped half-way (a closed window, a full disk) never leaves an empty strata-*.json behind.
+    S-02: the file may hold the API key, so it is created 0600 (POSIX; Windows ignores the mode), not with the umask."""
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    if tmp.exists():
+        os.chmod(tmp, 0o600)                                # an old temporary file keeps its mode through os.open
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(cfg, indent=1))
     os.replace(tmp, path)
 
 

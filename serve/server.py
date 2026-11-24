@@ -836,6 +836,10 @@ class StrataEngine:
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
+        # stdin writes come from several request threads, all through _write_line (F-04).  Made before the lazy return, so an
+        # engine that is not started yet has the lock too; kept across restart(), as the admission state is.
+        if "wlock" not in self.__dict__:
+            self.wlock = threading.Lock()
         if lazy:
             return
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
@@ -1001,7 +1005,6 @@ class StrataEngine:
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
-        self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
@@ -1167,8 +1170,7 @@ class StrataEngine:
         with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
-        self.proc.stdin.flush()
+        self._write_line("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}"))
         deadline = time.time() + timeout
         while True:
             try:
@@ -1278,12 +1280,17 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    def _write_line(self, text: str):
+        """One command line to the engine, written whole under wlock: several request threads write to its stdin, and a
+        line must never interleave with another (F-04).  The lock covers the write and flush only, never a wait for output."""
+        with self.wlock:
+            self.proc.stdin.write(text + "\n")
+            self.proc.stdin.flush()
+
     def _send(self, text: str):
         btrace("send>", text[:60])
         try:
-            with self.wlock:
-                self.proc.stdin.write(text + "\n")
-                self.proc.stdin.flush()
+            self._write_line(text)
         except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
@@ -2089,8 +2096,7 @@ class StrataEngine:
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-            self.proc.stdin.flush()
+            self._write_line(f"{head} {','.join(str(int(t)) for t in ids)}")
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
@@ -2172,8 +2178,7 @@ class StrataEngine:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
+                        self._write_line("STOP")
                     except OSError:
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
@@ -2314,8 +2319,7 @@ class StrataEngine:
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
-            self.proc.stdin.flush()
+            self._write_line(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}")
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
@@ -3184,8 +3188,10 @@ def set_timeline(on: bool) -> None:
     # truncation (a reader in between would see an empty file, read as off).  A busy file is tried again for a moment.
     for attempt in range(20):
         try:
-            with open(TIMELINE_CTL, "r+b" if os.path.exists(TIMELINE_CTL) else "wb") as f:
-                f.seek(0)
+            # S-04: the name is predictable in the shared temp dir, so the open never follows a symlink (O_NOFOLLOW where the OS
+            # has it: a planted link is an error, not a write elsewhere) and a new file is 0600.  No O_TRUNC: see above.
+            fd = os.open(TIMELINE_CTL, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o600)
+            with os.fdopen(fd, "wb") as f:
                 f.write(b"1" if on else b"0")
             break
         except PermissionError:
@@ -6813,7 +6819,7 @@ def make_handler(svc: Service):
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            max_req = max_new = output_limit(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             if warm:
                 max_new = 1                                   # 20 Oct: a warm reads the prompt and stops after one token
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
@@ -7064,7 +7070,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            max_new = output_limit(req.get("max_tokens") or 0)         # 0/-1: the rest of the context
             if warm:
                 max_new = 1                                   # 20 Oct: a warm reads the prompt and stops after one token
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
@@ -7433,7 +7439,7 @@ def clean_shared_defaults(d) -> dict:
                 raise ValueError("top_k: an integer 1..64")
             value = int(value)
         elif key in ("seed", "max_tokens"):
-            if not number or value != int(value) or value <= 0:
+            if not number or not math.isfinite(value) or value != int(value) or value <= 0:   # S-03: inf has no int()
                 raise ValueError(f"{key}: a positive integer")
             value = int(value)
         elif key == "reasoning_budget_tokens":                 # #123: 0 means no budget, so 0 is allowed here
@@ -7626,6 +7632,15 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         raise SystemExit(f"[strata] replica {i} did not start: {e}")
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
     return rp.ReplicaEngine(engines, load_tokens=load)
+
+
+def output_limit(value, key: str = "max_tokens") -> int:
+    """A max_tokens / max_completion_tokens value as an int.  JSON 1e400 reads as inf, and int(inf) raised OverflowError
+    after the model had loaded (S-03): a value that is not finite is a 400 that names the field, as a bad sampling field
+    is.  Negative values keep their meaning (0 and -1: the rest of the context)."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{key}: a finite whole number of tokens")
+    return int(value)
 
 
 def check_request_sampling(req) -> None:
