@@ -11078,6 +11078,7 @@ int main(int argc, char** argv) {
         int64_t cross_total = 0;
         bool cross_settled = false;
         uint32_t cross_saves = 0;
+        auto cross_save_t = Clock::now();
         size_t cross_nc = 0, cross_nv = 0;   // the last look: candidates and victims listed
         int cross_rej[4] = {0, 0, 0, 0};     // ... and the pairs refused: no usable slot, blob too big for the slot, victim too hot, (unused)
         std::vector<float> cross_f;
@@ -11207,7 +11208,10 @@ int main(int argc, char** argv) {
                     std::vector<float> fac((size_t) NL, 1.0f);
                     const int informed = strata::core::slot_share_factors((int) NL, fac.data());
                     const bool ready = informed >= (int) (NL * 9 / 10);   // nothing moves or settles before the layers' factors are real (4,000 picks each)
-                    if (ready && (cross_saves++ % 256) == 0) strata::core::layout_weights_save((int) NL, fac.data());   // the next start's layout weights (damped)
+                    if (ready) {   // the next start's layout weights (damped): at most once a minute, from the counters since the start, so the last save before shutdown is the best-informed one
+                        const auto tnow = Clock::now();
+                        if (cross_saves == 0 || tnow - cross_save_t >= std::chrono::seconds(60)) { strata::core::layout_weights_save((int) NL, fac.data()); cross_save_t = tnow; cross_saves = 1; }
+                    }
                     if (ready && cross_settled) {
                         double mv = 0.0;
                         for (int64_t l = 0; l < NL && l < (int64_t) cross_f.size(); ++l) mv = std::max(mv, (double) std::fabs(fac[(size_t) l] - cross_f[(size_t) l]) / std::max(1e-3, (double) cross_f[(size_t) l]));
