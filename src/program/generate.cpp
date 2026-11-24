@@ -11078,6 +11078,13 @@ int main(int argc, char** argv) {
         int64_t cross_total = 0;
         bool cross_settled = false;
         uint32_t cross_saves = 0;
+        // DOUBLE SLOTS (STRATA_DOUBLE_SLOTS=1, opt-in): a big expert that fits no single victim slot takes two adjacent cold ones, the second's expert evicted and its memory reserved for the spill.  No offset changes.
+        static const bool cross_double_on = [] { const char* e = std::getenv("STRATA_DOUBLE_SLOTS"); return e != nullptr && e[0] == '1'; }();
+        bool cross_double_ok = true;                  // off for the rest of the run if the integrity monitor ever sees a mismatch
+        std::vector<int32_t> cross_doubled;           // the slots that hold a double
+        std::vector<char> cross_consumed;             // per slot: reserved as the spill of the one before it
+        uint32_t cross_mon = 0;
+        int64_t cross_doubles = 0;
         auto cross_save_t = Clock::now();
         size_t cross_nc = 0, cross_nv = 0;   // the last look: candidates and victims listed
         int cross_rej[4] = {0, 0, 0, 0};     // ... and the pairs refused: no usable slot, blob too big for the slot, victim too hot, (unused)
@@ -11143,8 +11150,14 @@ int main(int argc, char** argv) {
                 std::error_code ec;
                 std::filesystem::rename(tmp, res_file, ec);
             }
-            struct Swap { float gain; int32_t layer, in, out; int32_t out_layer = -1; };
+            struct Swap { float gain; int32_t layer, in, out; int32_t out_layer = -1; int32_t out2_layer = -1, out2 = -1; };
             [[maybe_unused]] auto ol = [](const Swap& s) -> int32_t { return s.out_layer >= 0 ? s.out_layer : s.layer; };   // the layer the victim belongs to
+            // a DOUBLE-SLOT swap has a second victim: the expert in the next slot, evicted the same way (its memory is what the big expert runs on into)
+            [[maybe_unused]] auto evict2 = [&](const Swap& s) {
+                if (s.out2 < 0) return;
+                host_res[(size_t) s.out2_layer * g.n_expert + s.out2] = strata::core::kNotResident;
+                srcp->prefetch(s.out2_layer, s.out2);
+            };
             std::vector<Swap> swaps;
             // The experts a prompt's loan has taken out of VRAM are marked missing (host_res < 0) until the refill puts them back into the SAME slots: they must never be swap CANDIDATES (the
             // expert would sit in two slots once the refill ran).  Decode rounds are kept out of a loan by their callers (in_prompt_read); the round itself now holds the same line.
@@ -11203,6 +11216,37 @@ int main(int argc, char** argv) {
                 // Layers above their target (by more than a tolerance) give slots, layers below take them; when every layer is within the tolerance - or nothing can be moved for 8 looks - the shares are
                 // SETTLED: nothing is counted or listed any more, and once in 64 rounds the factors are read again and compared with the ones it settled on (a layer moving more than 10% wakes it).
                 ++cross_tick;
+                if (cross_double_on && cross_double_ok && !cross_doubled.empty() && (cross_tick & 7u) == 0) {
+                    // INTEGRITY: every 8th round two doubled slots are read back from the card and compared with the expert's own bytes; at the edge of the prompt loan a double is dissolved
+                    const int64_t NL2 = g.n_layers, NE2 = g.n_expert, full2 = xcache.full_slots();
+                    std::vector<int32_t> own((size_t) full2, -1);
+                    for (int64_t l = 0; l < NL2; ++l)
+                        for (int64_t e = 0; e < NE2; ++e) { const int32_t sl = host_res[(size_t) (l * NE2 + e)]; if (sl >= 0 && (int64_t) sl < full2) own[(size_t) sl] = (int32_t) (l * NE2 + e); }
+                    const int32_t lf = pf_parts.empty() ? -1 : pf_parts[0].first;
+                    for (int k = 0; k < 2 && !cross_doubled.empty() && cross_double_ok; ++k) {
+                        const int32_t s = cross_doubled[(size_t) (cross_mon++ % cross_doubled.size())];
+                        const int32_t ix = own[(size_t) s];
+                        const bool straddles = lf >= 0 && s < lf && (int64_t) s + 1 >= lf;
+                        std::string verr;
+                        bool bad = false;
+                        if (ix >= 0 && !straddles) {
+                            const uint8_t* blob = srcp->blob_stable(ix / (int32_t) NE2, ix % (int32_t) NE2);
+                            const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(ix / (int32_t) NE2);
+                            bad = blob != nullptr && !xcache.verify_slot(s, blob, verr, nb);
+                        }
+                        if (bad || straddles) {
+                            if (ix >= 0) { host_res[(size_t) ix] = strata::core::kNotResident; drive.d.res_dirty_idx.push_back(ix); drive.d.res_dirty = true; }
+                            xcache.set_spill(s, false);
+                            cross_doubled.erase(std::remove(cross_doubled.begin(), cross_doubled.end(), s), cross_doubled.end());
+                            if (bad) {
+                                cross_double_ok = false;
+                                std::fprintf(stderr, "strata serve: DOUBLE SLOT INTEGRITY FAILED at slot %d (%s): the expert is evicted and double slots are OFF for the rest of this run\n", (int) s, verr.c_str());
+                            } else {
+                                std::fprintf(stderr, "strata serve: double slot %d dissolved: it sat across the edge of the prompt loan\n", (int) s);
+                            }
+                        }
+                    }
+                }
                 if (!cross_settled || (cross_tick & 63u) == 0) {
                     const int64_t NL = g.n_layers, NE = g.n_expert;
                     std::vector<float> fac((size_t) NL, 1.0f);
@@ -11258,7 +11302,7 @@ int main(int argc, char** argv) {
                         int64_t max_donor_blob = 0;
                         for (int64_t l = 0; l < NL; ++l)
                             if ((double) cnt[(size_t) l] - target[(size_t) l] > tol) max_donor_blob = std::max(max_donor_blob, blobs[(size_t) l]);
-                        auto can_receive = [&](int64_t l) { return blobs[(size_t) l] <= max_donor_blob; };
+                        auto can_receive = [&](int64_t l) { return blobs[(size_t) l] <= max_donor_blob || (cross_double_on && cross_double_ok); };   // with double slots every layer can be fed
                         int nd = 0, nr = 0;
                         for (int64_t l = 0; l < NL; ++l) {
                             const double dev = (double) cnt[(size_t) l] - target[(size_t) l];
@@ -11315,10 +11359,23 @@ int main(int argc, char** argv) {
                             int added = 0;
                             cross_nc = cc.size(); cross_nv = vv.size();
                             cross_rej[0] = cross_rej[1] = cross_rej[2] = 0;
+                            const int64_t full_slots = xcache.full_slots();
+                            std::vector<int32_t> owner((size_t) full_slots, -1);   // the expert (flat layer * NE + e) in each slot
+                            for (int64_t l = 0; l < NL; ++l)
+                                for (int64_t e = 0; e < NE; ++e) { const int32_t sl = host_res[(size_t) (l * NE + e)]; if (sl >= 0 && (int64_t) sl < full_slots) owner[(size_t) sl] = (int32_t) (l * NE + e); }
+                            if ((int64_t) cross_consumed.size() != full_slots) cross_consumed.assign((size_t) full_slots, 0);
+                            // a slot's capacity counts its neighbour only while that neighbour holds no expert (so a stale flag can never let an expert run over a live one)
+                            auto eff_cap = [&](int32_t slot) -> int64_t {
+                                int64_t cp = xcache.slot_capacity(slot);
+                                if (xcache.spills(slot) && (int64_t) slot + 1 < full_slots && owner[(size_t) slot + 1] < 0) cp += xcache.slot_stride_bytes(slot + 1);
+                                return cp;
+                            };
+                            std::vector<const CV*> unplaced;   // candidates that no single slot fits
                             for (const CV& c : cc) {
                                 if (added >= budget) break;
                                 if ((double) cnt[(size_t) c.layer] >= target[(size_t) c.layer]) continue;   // this layer has reached its target
                                 CV* best = nullptr;
+                                const int rej1_before = cross_rej[1];
                                 int64_t best_waste = INT64_MAX;
                                 const int64_t need = blobs[(size_t) c.layer];
                                 for (CV& v : vv) {
@@ -11327,11 +11384,12 @@ int main(int argc, char** argv) {
                                     if (c.v < 0.8f * v.v) { ++cross_rej[2]; break; }   // a victim much hotter than the candidate: not worth the move (the list only gets hotter)
                                     const int32_t slot = host_res[(size_t) (v.layer * NE + v.e)];
                                     if (slot < 0 || (int64_t) slot >= xcache.full_slots()) { ++cross_rej[0]; continue; }   // not a slot of this cache: never a victim
-                                    const int64_t cap = xcache.slot_capacity(slot);
+                                    const int64_t cap = eff_cap(slot);
                                     if (cap < need) { ++cross_rej[1]; continue; }   // the expert does not fit this slot
                                     const int64_t waste = cap - need;
                                     if (waste < best_waste) { best_waste = waste; best = &v; if (waste < 4096) break; }   // a slot of the same size: nothing is wasted; take the coldest such
                                 }
+                                if (best == nullptr && cross_rej[1] > rej1_before) unplaced.push_back(&c);
                                 if (best != nullptr) {
                                     Swap sw{c.v - best->v, c.layer, c.e, best->e};
                                     sw.out_layer = best->layer;
@@ -11339,6 +11397,48 @@ int main(int argc, char** argv) {
                                     --cnt[(size_t) best->layer]; ++cnt[(size_t) c.layer];
                                     best->layer = -1;
                                     ++added;
+                                }
+                            }
+                            if (cross_double_on && cross_double_ok && !unplaced.empty() && added < budget) {
+                                // DOUBLE SLOTS: for a candidate that fits no single slot, the cheapest pair of adjacent slots whose experts are both cold, both in layers that should give, outside any other double and
+                                // not across the edge of the prompt loan; the candidate goes in the first, the second's expert is evicted and its memory is the spill.
+                                const int32_t lf = pf_parts.empty() ? -1 : pf_parts[0].first;
+                                std::vector<char> usedx((size_t) (NL * NE), 0);
+                                for (const Swap& s : swaps) { usedx[(size_t) (s.layer * NE + s.in)] = 1; usedx[(size_t) (ol(s) * NE + s.out)] = 1; if (s.out2 >= 0) usedx[(size_t) (s.out2_layer * NE + s.out2)] = 1; }
+                                for (const CV* cp : unplaced) {
+                                    if (added >= budget) break;
+                                    const CV& c = *cp;
+                                    if ((double) cnt[(size_t) c.layer] >= target[(size_t) c.layer]) continue;
+                                    const int64_t need = blobs[(size_t) c.layer];
+                                    int64_t best_s = -1;
+                                    float best_cost = 1e30f;
+                                    for (int64_t sl = 0; sl + 1 < full_slots; ++sl) {
+                                        const int32_t i1 = owner[(size_t) sl], i2 = owner[(size_t) sl + 1];
+                                        if (i1 < 0 || i2 < 0 || usedx[(size_t) i1] || usedx[(size_t) i2]) continue;
+                                        if (xcache.spills((int32_t) sl) || xcache.spills((int32_t) sl + 1) || cross_consumed[(size_t) sl] || cross_consumed[(size_t) sl + 1]) continue;
+                                        if (lf >= 0 && sl < lf && sl + 1 >= lf) continue;   // never across the edge of the prompt loan
+                                        const int l1 = i1 / (int) NE, l2 = i2 / (int) NE;
+                                        if (l1 == c.layer || l2 == c.layer) continue;
+                                        if ((double) cnt[(size_t) l1] <= target[(size_t) l1] || (double) cnt[(size_t) l2] <= target[(size_t) l2]) continue;   // both layers have more than they should
+                                        if (swap_grace != 0 && (swap_round - swapped_at[(size_t) i1] <= swap_grace || swap_round - swapped_at[(size_t) i2] <= swap_grace)) continue;
+                                        if (xcache.slot_stride_bytes((int32_t) sl) + xcache.slot_capacity((int32_t) sl + 1) < need) continue;
+                                        const float cost = drive.d.usage[(size_t) i1] * fac[(size_t) l1] + drive.d.usage[(size_t) i2] * fac[(size_t) l2];
+                                        if (cost < best_cost) { best_cost = cost; best_s = sl; }
+                                    }
+                                    if (best_s < 0 || c.v < best_cost) continue;   // no cold pair, or the candidate is not hotter than the two it would evict
+                                    const int32_t i1 = owner[(size_t) best_s], i2 = owner[(size_t) best_s + 1];
+                                    const int l1 = i1 / (int) NE, l2 = i2 / (int) NE;
+                                    Swap sw{c.v - best_cost, c.layer, c.e, i1 % (int) NE};
+                                    sw.out_layer = l1; sw.out2_layer = l2; sw.out2 = i2 % (int) NE;
+                                    swaps.push_back(sw);
+                                    xcache.set_spill((int32_t) best_s, true);
+                                    cross_consumed[(size_t) best_s + 1] = 1;
+                                    cross_doubled.push_back((int32_t) best_s);
+                                    usedx[(size_t) i1] = usedx[(size_t) i2] = 1;
+                                    --cnt[(size_t) l1]; --cnt[(size_t) l2]; ++cnt[(size_t) c.layer];
+                                    ++added; ++cross_doubles;
+                                    if ((cross_doubles & 15) == 1)
+                                        std::fprintf(stderr, "strata serve: double slot %lld: layer %d's %.2f MB expert takes slots %d and %d (%lld doubles so far)\n", (long long) cross_doubles, (int) c.layer, (double) need / 1e6, (int) best_s, (int) best_s + 1, (long long) cross_doubles);
                                 }
                             }
                             if (added > 0) cross_idle = 0; else if (budget > 0) ++cross_idle;   // only a look that had room to move and moved nothing counts toward giving up
@@ -11539,7 +11639,7 @@ int main(int argc, char** argv) {
                     cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
                     main_live = true;
                     host_res[out] = strata::core::kNotResident;
-                    srcp->prefetch(ol(s), s.out);
+                    srcp->prefetch(ol(s), s.out); evict2(s);
                     pending.emplace_back((int32_t) in, slot);
                     continue;
                 }
@@ -11554,7 +11654,7 @@ int main(int argc, char** argv) {
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
-                srcp->prefetch(ol(s), s.out);   // a file-backed arena released its pages: read them back ahead
+                srcp->prefetch(ol(s), s.out); evict2(s);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
                 if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
                     (agate.hland != nullptr
@@ -11570,7 +11670,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (drive.d.evict_sync && !swaps.empty()) {   // the evicted ones are misses now (see the pre-launch hook)
-                for (const Swap& s : swaps) drive.d.res_dirty_idx.push_back((int32_t) (ol(s) * g.n_expert + s.out));
+                for (const Swap& s : swaps) { drive.d.res_dirty_idx.push_back((int32_t) (ol(s) * g.n_expert + s.out)); if (s.out2 >= 0) drive.d.res_dirty_idx.push_back((int32_t) (s.out2_layer * g.n_expert + s.out2)); }
                 drive.d.res_dirty = true;
             }
             if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),
@@ -19001,8 +19101,14 @@ int main(int argc, char** argv) {
                 return true;   // the previous swaps are still in flight
             }
             if (trace_adapt) std::fprintf(stderr, "strata: ADAPT round=%lld considering\n", (long long) adapt_rounds);
-            struct Swap { float gain; int32_t layer, in, out; int32_t out_layer = -1; };
+            struct Swap { float gain; int32_t layer, in, out; int32_t out_layer = -1; int32_t out2_layer = -1, out2 = -1; };
             [[maybe_unused]] auto ol = [](const Swap& s) -> int32_t { return s.out_layer >= 0 ? s.out_layer : s.layer; };   // the layer the victim belongs to
+            // a DOUBLE-SLOT swap has a second victim: the expert in the next slot, evicted the same way (its memory is what the big expert runs on into)
+            [[maybe_unused]] auto evict2 = [&](const Swap& s) {
+                if (s.out2 < 0) return;
+                host_res[(size_t) s.out2_layer * g.n_expert + s.out2] = strata::core::kNotResident;
+                srcp->prefetch(s.out2_layer, s.out2);
+            };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
             for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -19064,11 +19170,11 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
-                srcp->prefetch(ol(s), s.out);   // a file-backed arena released its pages: read them back ahead
+                srcp->prefetch(ol(s), s.out); evict2(s);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (drive.d.evict_sync && !swaps.empty()) {   // the evicted ones are misses now (see the pre-launch hook)
-                for (const Swap& s : swaps) drive.d.res_dirty_idx.push_back((int32_t) (ol(s) * g.n_expert + s.out));
+                for (const Swap& s : swaps) { drive.d.res_dirty_idx.push_back((int32_t) (ol(s) * g.n_expert + s.out)); if (s.out2 >= 0) drive.d.res_dirty_idx.push_back((int32_t) (s.out2_layer * g.n_expert + s.out2)); }
                 drive.d.res_dirty = true;
             }
             if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),

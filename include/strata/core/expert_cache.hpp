@@ -100,6 +100,12 @@ public:
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
     /// The data bytes a slot can hold (its stride minus the guard; the uniform blob size for a uniform arena): a cross-layer swap only fits an expert whose blob is this small.
     int64_t slot_capacity(int32_t slot) const { return off_.empty() ? blob_ : (int64_t) (off_[(size_t) slot + 1] - off_[(size_t) slot]) - (int64_t) guard_; }
+    /// The slot's own stride in bytes (blob + guard, rounded up); the uniform blob size for a uniform arena.
+    int64_t slot_stride_bytes(int32_t slot) const { return off_.empty() ? blob_ : (int64_t) (off_[(size_t) slot + 1] - off_[(size_t) slot]); }
+    /// DOUBLE SLOTS: a slot flagged here holds an expert that is bigger than the slot and runs on into the next slot's memory, which then holds no expert and is never given one.  Only the flag lives here: the
+    /// caller guarantees that the neighbour is empty (its capacity check counts the neighbour only then) and keeps it so.  Nothing about the offsets changes, so every pointer derived from them stays valid.
+    void set_spill(int32_t slot, bool on) { if (spill_.size() < (size_t) slots_) spill_.assign((size_t) slots_, 0); if (slot >= 0 && (int64_t) slot < slots_) spill_[(size_t) slot] = on ? 1 : 0; }
+    bool spills(int32_t slot) const { return slot >= 0 && (size_t) slot < spill_.size() && spill_[(size_t) slot] != 0; }
     void close();
 
     bool valid() const { return base_ != nullptr; }
@@ -267,6 +273,7 @@ private:
     bool per_layer_ = false;
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
+    std::vector<uint8_t> spill_;        ///< DOUBLE SLOTS: per slot, 1 when it runs on into the next slot's memory
     int64_t admitted_ = 0;
 };
 

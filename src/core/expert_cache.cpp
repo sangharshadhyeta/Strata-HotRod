@@ -604,6 +604,7 @@ void ExpertCache::close() {
 #endif
     off_.clear();
     guard_ = 0;
+    spill_.clear();
     if (!segs_.empty()) {
         release_segmented();
     } else if (vmm_) {
