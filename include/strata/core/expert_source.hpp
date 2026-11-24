@@ -889,24 +889,6 @@ public:
     /// its layer's RAM tier, before any usage order, so its place goes to an expert the router still picks.  Serve thread only, set once.
     void set_mask_low(const std::vector<uint8_t>* mask) { mask_low_ = mask; }
     bool lookahead_promote() const { return promo_on_.load(std::memory_order_acquire); }
-    /// STRATA_PROMO_NETGAIN=1 (opt-in): the RAM tier's promotion compares an expert's recent miss rate with its victim's, instead of the
-    /// victim's usage < 1.0.  The decode dispatch calls this once per distinct missed expert of a layer (decode windows, any tier); a no-op
-    /// unless the rule is on.  Single writer (the serve thread); the io workers read the scores racily, as they read usage.
-    void note_decode_miss(int64_t layer, int64_t expert) {
-        if (!miss_score_.empty()) miss_score_[(size_t) layer * (size_t) n_expert_ + (size_t) expert] += 1.0f;
-    }
-    bool promo_netgain() const { return !miss_score_.empty(); }
-    /// STRATA_PROMO_NETGAIN diagnostics: places holding a promotion not yet used, and how many of those are 300+ windows old (kPromoGrace)
-    void promo_flag_counts(uint64_t& flagged, uint64_t& expired) const {
-        flagged = expired = 0;
-        if (promo_flag_ == nullptr || promo_age_.empty()) return;
-        const uint32_t now = promo_epoch_.load(std::memory_order_relaxed);
-        for (size_t i = 0; i < promo_age_.size(); ++i)
-            if (promo_flag_[i].load(std::memory_order_relaxed) != 0) { ++flagged; if (now - promo_age_[i] >= 300u) ++expired; }
-    }
-    float miss_score_at(int64_t layer, int64_t expert) const {   // the decayed miss score (0 when the rule is off)
-        return miss_score_.empty() ? 0.0f : miss_score_[(size_t) layer * (size_t) n_expert_ + (size_t) expert];
-    }
     /// Serve thread, between windows, with no adaptive round in flight and nothing staged.  `busy` is indexed layer *
     /// n_expert + expert (true: on a GPU).  Returns the number of experts published.  Every queued entry is consumed.
     uint64_t publish_promotions(const std::vector<float>& usage, const std::vector<char>& busy);
@@ -1478,10 +1460,6 @@ private:
     std::vector<std::vector<uint8_t>> promo_spare_;   ///< read buffers the io workers gave back (reused)
     std::unique_ptr<std::atomic<uint8_t>[]> promo_flag_;   ///< per (layer, expert): published by promotion, first demand read not yet seen
     std::unique_ptr<std::atomic<int>[]> promo_starved_;    ///< per layer: predictions that wanted a place the layer did not have
-    std::vector<float> miss_score_;                        ///< STRATA_PROMO_NETGAIN: per (layer, expert) decayed count of decode misses (empty: rule off)
-    std::vector<uint32_t> promo_age_;                      ///< STRATA_PROMO_NETGAIN: the window (promo_epoch_) a place was promoted in; a promotion unused for kPromoGrace windows may be a victim again
-    std::atomic<uint32_t> promo_epoch_{0};                 ///< STRATA_PROMO_NETGAIN: windows seen by publish_promotions
-    std::unique_ptr<std::atomic<float>[]> promo_starved_best_;   ///< STRATA_PROMO_NETGAIN: per layer: the best miss score among candidates that found no place
     std::atomic<uint64_t> promo_n_{0}, promo_hits_{0}, promo_skips_{0};
     std::atomic<bool> promo_pause_{false};   // give_back_ram is releasing + madvise-ing places: the io thread takes none
     detail::ExchangeStorage exchange_storage_; // authoritative when active; original arenas still own memory
