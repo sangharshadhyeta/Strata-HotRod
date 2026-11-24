@@ -1,6 +1,7 @@
 <p align="center"><i> Coming Soon: <s>A system which rewires the model around the way you use it.</s></i></p>
 
 <p align="center">Watch this first: <a href="https://youtu.be/WSJL4SOIZDg?si=qPTa3jeK4YtDLCPy">NoPlaceLikeLocalhost</a></p>
+<p align="center">For Inkling2 use: <a href="https://github.com/robertkarl/UnbiasedStrata">UnbiasedStrata</a></p>
 
 <p align="center"><img src="docs/media/hotrod-hero.gif" width="380" alt="Strata Hot Rod: the Strata hexagon in fire and ice"></p>
 
