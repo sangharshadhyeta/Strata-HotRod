@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from pathlib import Path
 
 # (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
@@ -161,13 +160,25 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
     return new, changed
 
 
+def _open_private(path: Path, text: bool):
+    """A file that may hold the API key (S-02): created 0600 rather than with the umask, and truncated only after its mode
+    is set, so a file that already exists (an old .bak with 0644) is private too.  Windows ignores the mode."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    os.chmod(path, 0o600)
+    os.ftruncate(fd, 0)
+    return os.fdopen(fd, "w", encoding="utf-8") if text else os.fdopen(fd, "wb")
+
+
 def save(path: str | Path, cfg: dict) -> Path:
     """The config written whole (a temporary file moved over the old one), the earlier one kept as <name>.bak."""
     path = Path(path)
     bak = path.with_name(path.name + ".bak")
-    shutil.copyfile(path, bak)
+    data = path.read_bytes()                   # read first, as copyfile did: a missing config writes no .bak
+    with _open_private(bak, text=False) as f:
+        f.write(data)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    with _open_private(tmp, text=True) as f:
+        f.write(json.dumps(cfg, indent=1))
     os.replace(tmp, path)
     return bak
 

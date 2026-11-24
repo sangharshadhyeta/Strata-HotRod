@@ -9,6 +9,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import stat
 import tempfile
 import unittest
 import urllib.error
@@ -159,6 +161,38 @@ class Http(unittest.TestCase):
         for el in ("cfg-card", "cfg-form", "cfg-save", "cfg-msg"):
             self.assertIn(f'id="{el}"', html)
         self.assertIn('fetch("config", {method: "POST", headers: headers(true)', js)
+
+
+@unittest.skipIf(os.name == "nt", "POSIX file modes: Windows ignores them")
+class Private(unittest.TestCase):
+    """S-02: the config holds the API key, so the file and its .bak are 0600 whatever the umask and any old mode."""
+
+    def test_save_writes_the_config_and_the_bak_0600(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "strata-q2_0.json"
+            bak = Path(d) / "strata-q2_0.json.bak"
+            path.write_text(json.dumps(CFG), encoding="utf-8")
+            bak.write_text("an older copy", encoding="utf-8")
+            os.chmod(path, 0o644)
+            os.chmod(bak, 0o644)
+            self.assertEqual(runconfig.save(path, {**CFG, "port": 9000}), bak)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(bak.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["port"], 9000)
+            self.assertEqual(json.loads(bak.read_text(encoding="utf-8")), CFG)
+            self.assertFalse((Path(d) / "strata-q2_0.json.tmp").exists())
+
+    def test_a_new_file_is_0600_under_a_loose_umask(self):
+        old = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "strata-new.json"
+                path.write_text(json.dumps(CFG), encoding="utf-8")       # 0644 under this umask: no .bak yet
+                runconfig.save(path, CFG)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE((Path(d) / "strata-new.json.bak").stat().st_mode), 0o600)
+        finally:
+            os.umask(old)
 
 
 if __name__ == "__main__":
