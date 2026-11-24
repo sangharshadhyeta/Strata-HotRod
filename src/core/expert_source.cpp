@@ -6646,7 +6646,7 @@ void router_trace_write(int64_t layer, const float* x_f, const int32_t* ids, int
 }
 }  // namespace
 
-// ---- the live layer capture (default on when the pack has a directory for it; STRATA_LAYER_CAPTURE=0 turns it off): a few decode windows in STRATA_LAYER_CAPTURE_EVERY
+// ---- the live layer capture (opt-in: STRATA_LAYER_CAPTURE=1, with a pack directory for it; off otherwise): a few decode windows in STRATA_LAYER_CAPTURE_EVERY
 // (default 25) are written, every MoE layer of each, in the router trace's own record layout, to small segment files <dir>/cap-<n>.bin.  tools/layer_table.py reads
 // them in idle time to refresh the per-layer table (<pack>/layer-sens.txt).  Bounded: at most kLayerCapMaxSegs complete segments of ~4 MB wait on disk; with that many
 // nothing more is written until the job has consumed some (it deletes them).  Cost: one counter per layer and window; a sampled window writes ~270 KB.
