@@ -11337,7 +11337,7 @@ int main(int argc, char** argv) {
                             const int allow = cross_copy_ms > 0 && cross_win_ms > 0 ? (int) (0.10 * cross_win_ms / cross_copy_ms) : 8;
                             const int budget = std::max(allow / 2, allow - (int) swaps.size());
                             std::vector<char> used((size_t) (NL * NE), 0);
-                            for (const Swap& s : swaps) { used[(size_t) (s.layer * NE + s.in)] = 1; used[(size_t) (ol(s) * NE + s.out)] = 1; }
+                            for (const Swap& s : swaps) { used[(size_t) (s.layer * NE + s.in)] = 1; used[(size_t) (ol(s) * NE + s.out)] = 1; if (s.out2 >= 0) used[(size_t) (s.out2_layer * NE + s.out2)] = 1; }
                             struct CV { float v; int32_t layer, e; };
                             std::vector<CV> cc, vv;
                             for (int64_t l = 0; l < NL; ++l) {
@@ -11455,7 +11455,10 @@ int main(int argc, char** argv) {
             if (swap2_max > 0) {   // SWAP2: after the demand swaps, into cold slots only
                 strata::kernels::route_repl_drain(usage2.data(), usage2.size());
                 std::vector<char> taken((size_t) (g.n_layers * g.n_expert), 0);
-                for (const Swap& s : swaps) { taken[(size_t) (s.layer * g.n_expert + s.in)] = 1; taken[(size_t) (ol(s) * g.n_expert + s.out)] = 1; }
+                for (const Swap& s : swaps) {
+                    taken[(size_t) (s.layer * g.n_expert + s.in)] = 1; taken[(size_t) (ol(s) * g.n_expert + s.out)] = 1;
+                    if (s.out2 >= 0) taken[(size_t) (s.out2_layer * g.n_expert + s.out2)] = 1;   // a double's second victim is taken too (24 Nov: SWAP2 chose one, its copy found slot -1 and the engine stopped)
+                }
                 std::vector<Swap> extra;
                 std::vector<std::pair<float, int32_t>> c2, v2;
                 for (int64_t l = 0; l < (adapt_layer_limit >= 0 ? std::min<int64_t>(adapt_layer_limit, g.n_layers) : g.n_layers); ++l) {
@@ -11485,6 +11488,24 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: SWAP2: %zu quality swaps this round (%lld in all) into slots with use < %.2f\n", extra.size(), (long long) swap2_total, swap2_cold);
                 swaps.insert(swaps.end(), extra.begin(), extra.end());
                 for (float& v : usage2) v *= o.adapt_decay;
+            }
+            {   // GUARD: every victim (first or second) is evicted by one swap only and is resident when its copy is planned; a later swap that breaks this is dropped,
+                // so a slip in any victim choice costs one swap, not the engine (the copy loop returns false on slot -1).  The double-slot swaps come before SWAP2's, so they are the ones kept.
+                std::vector<char> vic(host_res.size(), 0), inb(host_res.size(), 0);
+                size_t w = 0, dropped = 0;
+                for (size_t i = 0; i < swaps.size(); ++i) {
+                    const Swap& s = swaps[i];
+                    const size_t o1 = (size_t) ol(s) * g.n_expert + s.out, in = (size_t) s.layer * g.n_expert + s.in;
+                    const size_t o2 = s.out2 >= 0 ? (size_t) s.out2_layer * g.n_expert + s.out2 : o1;
+                    const bool bad = vic[o1] || vic[o2] || inb[in] || host_res[o1] < 0 || (s.out2 >= 0 && host_res[o2] < 0);
+                    if (bad) { ++dropped; continue; }
+                    vic[o1] = vic[o2] = 1; inb[in] = 1;
+                    swaps[w++] = s;
+                }
+                swaps.resize(w);
+                static int64_t guard_drops = 0;
+                if (dropped > 0 && (guard_drops += (int64_t) dropped) == (int64_t) dropped)
+                    std::fprintf(stderr, "strata serve: adaptive swaps: %zu swap(s) dropped this round (a victim taken twice or not resident); the rest go on (further drops counted silently)\n", dropped);
             }
             for (const Swap& s : swaps) swapped_at[(size_t) (s.layer * g.n_expert + s.in)] = swap_round;   // the grace starts now
             ++life_rounds;
