@@ -11078,8 +11078,8 @@ int main(int argc, char** argv) {
         int64_t cross_total = 0;
         bool cross_settled = false;
         uint32_t cross_saves = 0;
-        // DOUBLE SLOTS (STRATA_DOUBLE_SLOTS=1, opt-in): a big expert that fits no single victim slot takes two adjacent cold ones, the second's expert evicted and its memory reserved for the spill.  No offset changes.
-        static const bool cross_double_on = [] { const char* e = std::getenv("STRATA_DOUBLE_SLOTS"); return e != nullptr && e[0] == '1'; }();
+        // DOUBLE SLOTS (on by default; STRATA_DOUBLE_SLOTS=0 turns it off): a big expert that fits no single victim slot takes two adjacent cold ones, the second's expert evicted and its memory reserved for the spill.  No offset changes.
+        static const bool cross_double_on = [] { const char* e = std::getenv("STRATA_DOUBLE_SLOTS"); return e == nullptr || e[0] != '0'; }();
         bool cross_double_ok = true;                  // off for the rest of the run if the integrity monitor ever sees a mismatch
         std::vector<int32_t> cross_doubled;           // the slots that hold a double
         std::vector<char> cross_consumed;             // per slot: reserved as the spill of the one before it
