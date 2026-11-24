@@ -128,6 +128,7 @@ Opt-in, measured 24 Oct and left off (same 3-question test, every answer correct
   are used, and a guess is read only when that rate is at least the drive's load ((reads in progress + queued) / workers).
   It won 3% on 19 Oct, before the learned look-ahead. Now 58.5 and 57.4 against 57.7 tokens/s, and the SSD wait rose (8.8 and
   5.9 against 5.4 s): the learned guesses and the stand-in test leave little waste, and what the gate holds back is often needed.
+  **Removed 24 Nov 2026 in the ratrod clean-up** (the switch, its counters and the request-line print; the 58.5 / 57.4 against 57.7 result above is why).
 - **Two kernel switches from 19 Oct** (`STRATA_ROUTER_FUSED=1`: the router's GEMV and top-10 in one launch;
   `STRATA_GR_DOWN_WPC=8|4|2`: warps per staged down block) with their byte-exact bench `bench/micro/hotrod_kernel_ab.sh`:
   ported and measured 24 Oct: `bench/micro/hotrod_kernel_ab.sh` byte-identical on 3 seeds (and the split top-k); live,
@@ -235,7 +236,7 @@ so a skip in the last twelve layers costs 3-5 times what it does in the middle o
 | --- | --- |
 | `STRATA_ROUTE_TAIL_OPEN=1` | ranks 3-9 unchecked until a brake: faster, malformed JSON/code seen |
 | `STRATA_ROUTE_BRAKE_STEP=1` | each brake checks one more rank: a wrong maths answer |
-| `STRATA_IO_GATE=1` | read-ahead gate by drive load: no gain with the learned look-ahead |
+| `STRATA_IO_GATE=1` | read-ahead gate by drive load: no gain with the learned look-ahead. Removed 24 Nov 2026 (ratrod clean-up) |
 | `STRATA_LA_EDGE_SKIP=1`, `STRATA_LA_MODEL=<file>` | superseded by the learned look-ahead |
 | `STRATA_GDN_LOOP=1` | looped middle layers: 10% slower, no clear accuracy gain. Removed 24 Nov 2026 (ratrod clean-up) |
 | `STRATA_ROUTER_FUSED=1`, `STRATA_GR_DOWN_WPC=4\|2` | byte-identical outputs; alone and together within run-to-run spread: no gain |

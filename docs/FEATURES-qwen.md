@@ -252,7 +252,7 @@ Arguments (`args`):
 | `STRATA_IO_ARRIVAL` | see code | HotRod |  | (no comment) | src/core/expert_source.cpp:730 |
 | `STRATA_IO_DEMAND_FIRST` | see code | HotRod |  | (no comment) | src/core/expert_source.cpp:727 |
 | `STRATA_IO_EDF` | unset | HotRod |  | (no comment) | src/core/expert_source.cpp:728, src/core/expert_source.cpp:5828 |
-| `STRATA_IO_GATE` | see code | HotRod |  | (no comment) | src/core/expert_source.cpp:731 |
+| `STRATA_IO_GATE` | see code | HotRod |  | (no comment) | removed 24 Nov 2026 (ratrod clean-up; was src/core/expert_source.cpp:731) |
 | `STRATA_IO_PF_AHEAD` | see code | upstream |  | (no comment) | src/core/expert_source.cpp:726 |
 | `STRATA_IO_PF_STAGE` | see code | upstream |  | solid-wins fork: staging is the DEFAULT (SPEC.md T1 measured the staged variant; the fill variant was not measured on this box). STRATA_IO_PF_STAGE=0 selects the fill variant. | src/core/expert_source.cpp:742, src/program/generate.cpp:5918 |
 | `STRATA_IO_PF_THREADS` | see code | upstream |  | (no comment) | src/program/generate.cpp:5907, src/program/generate.cpp:8264 |
