@@ -692,13 +692,6 @@ FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     c.guess_cap_min = (uint64_t) io_guess_cap_min_.load(std::memory_order_relaxed);
     c.guess_cap_max = (uint64_t) io_guess_cap_max_.load(std::memory_order_relaxed);
     c.guess_moves = io_guess_moves_.load(std::memory_order_relaxed);
-    c.ra_held = ra_held_.load(std::memory_order_relaxed);
-    c.ra_issued = ra_issued_total_.load(std::memory_order_relaxed);
-    for (int di = 0; di < 3; ++di)
-        for (int r = 0; r < kRaRanks; ++r) {
-            c.ra_used_d[di] += ra_used_[di * kRaRanks + r].load(std::memory_order_relaxed);
-            c.ra_issued_d[di] += ra_issued_[di * kRaRanks + r].load(std::memory_order_relaxed);
-        }
     c.crit_us = io_crit_us_.load(std::memory_order_relaxed);
     c.crit_n = io_crit_n_.load(std::memory_order_relaxed);
     c.blob_n = n_blob_.load(std::memory_order_relaxed);
@@ -763,7 +756,6 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     if (const char* v = std::getenv("STRATA_IO_EDF")) io_edf_ = std::atoi(v) != 0;
     if (const char* v = std::getenv("STRATA_IO_PF_YIELD")) io_yield_ = std::atoi(v) != 0;
     if (const char* v = std::getenv("STRATA_IO_ARRIVAL")) io_arrival_ = std::atoi(v) != 0;
-    if (const char* v = std::getenv("STRATA_IO_GATE")) io_gate_ = std::atoi(v) != 0;
     if (io_edf_ || io_yield_)
         std::fprintf(stderr, "FileExpertSource: read-ahead order %s%s\n", io_edf_ ? "next layer first (STRATA_IO_EDF)" : "newest first",
                      io_yield_ ? ", no guess started while the decode's own reads run (STRATA_IO_PF_YIELD)" : "");
@@ -990,7 +982,7 @@ void timeline_tick() {
     hi_prev = hi;
 }
 
-void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, int pos) {
+void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
     {
         std::lock_guard<std::mutex> lk(io_mu_);
         if (io_q_.size() >= 512) {   // the predictions run ahead of the reads: the oldest are the stalest
@@ -998,7 +990,7 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, int pos) {
             io_pf_dropped_.fetch_add(1, std::memory_order_relaxed);
         }
         io_q_.push_back({(int32_t) layer, (int32_t) expert, t_decode_guess ? io_win_.load(std::memory_order_relaxed) : kNoWin,
-                         io_cur_layer_.load(std::memory_order_relaxed), (int32_t) pos});
+                         io_cur_layer_.load(std::memory_order_relaxed)});
     }
     io_cv_.notify_one();
 }
@@ -1007,37 +999,6 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, int pos) {
 size_t FileExpertSource::io_queue_depth() {
     std::lock_guard<std::mutex> lk(io_mu_);
     return io_q_.size();
-}
-
-// STRATA_IO_GATE: the drive's load now (reads in progress plus queued read-aheads); the caller divides it by the worker count
-size_t FileExpertSource::io_inflight() {
-    return (size_t) io_busy_.load(std::memory_order_relaxed) + io_queue_depth();
-}
-
-// STRATA_IO_GATE: a guess is read ahead when its position's use rate is at least the load; the counts are written under stage_mu_ only
-bool FileExpertSource::ra_admit(int pos, double load) {
-    if (pos < 0 || pos >= kRaPos) return true;
-    const double used = ra_used_[pos].load(std::memory_order_relaxed), issued = ra_issued_[pos].load(std::memory_order_relaxed);
-    if ((used + 1.0) / (issued + 2.0) >= load) return true;
-    ra_held_.fetch_add(1, std::memory_order_relaxed);
-    return false;
-}
-
-// a read-ahead from `pos` starts (stage_mu_ held): halve every position's counts after each 4096 issued, so the rates follow the text
-void FileExpertSource::ra_issue(int pos) {
-    ra_issued_[pos].store(ra_issued_[pos].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-    ra_issued_total_.fetch_add(1, std::memory_order_relaxed);
-    if (++ra_since_halve_ < 4096) return;
-    ra_since_halve_ = 0;
-    for (int p = 0; p < kRaPos; ++p) {
-        ra_used_[p].store(ra_used_[p].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
-        ra_issued_[p].store(ra_issued_[p].load(std::memory_order_relaxed) / 2, std::memory_order_relaxed);
-    }
-}
-
-// a layer used the blob read ahead from `pos` (stage_mu_ held)
-void FileExpertSource::ra_outcome(int pos) {
-    ra_used_[pos].store(ra_used_[pos].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 // STRATA_IO_DEMAND_FIRST (prefetch, below): a demand read the workers take before any guess.  A guess already queued for
@@ -1055,13 +1016,10 @@ void FileExpertSource::io_enqueue_demand(int64_t layer, int64_t expert) {
 
 // A read-ahead worker: takes a predicted (layer, expert), skips it when its pages are cached or it is already
 // staged, and otherwise reads the whole blob into a staging buffer (copy_from_files preads what is not cached).
-static std::atomic<uint64_t> pf_guess_skipped{0};   // STRATA_PROMO_GUESS_MIN: decode guesses not read ahead (printed with the promotion funnel)
 void FileExpertSource::io_worker() {
     for (;;) {
         int32_t layer = 0, expert = 0;   // (set by the pick below; initialised for -Wmaybe-uninitialized)
-        int pos = -1;                    // the guess's position (STRATA_IO_GATE); -1: a demand read or untracked
         bool demand = false;
-        bool tagged = false;             // a decode window's guess (the prompt's guesses carry no window)
         {
             std::unique_lock<std::mutex> lk(io_mu_);
             // a guess may start: one is queued and (STRATA_IO_PF_YIELD) the decode is not reading its own blobs right now
@@ -1105,15 +1063,11 @@ void FileExpertSource::io_worker() {
                     if (best == SIZE_MAX) best = io_q_.size() - 1;   // only untagged guesses: the newest, as before
                     layer = io_q_[best].first;
                     expert = io_q_[best].second;
-                    pos = io_q_[best].pos;
-                    tagged = io_q_[best].win != kNoWin;
                     io_q_.erase(io_q_.begin() + (std::ptrdiff_t) best);
                     picked = true;
                 } else {
                     layer = io_q_.back().first;   // the newest prediction first: it is the layer that comes next
                     expert = io_q_.back().second;
-                    pos = io_q_.back().pos;
-                    tagged = io_q_.back().win != kNoWin;
                     io_q_.pop_back();
                     picked = true;
                 }
@@ -1133,11 +1087,6 @@ void FileExpertSource::io_worker() {
                 s->io_cv_.notify_all();
             }
         } guess_slot{this, io_auto_ && !demand};
-        struct Busy {   // counted busy for the whole read (every path out of this iteration)
-            std::atomic<int>& b;
-            explicit Busy(std::atomic<int>& x) : b(x) { b.fetch_add(1, std::memory_order_relaxed); }
-            ~Busy() { b.fetch_sub(1, std::memory_order_relaxed); }
-        } busy(io_busy_);
         io_pf_jobs_.fetch_add(1, std::memory_order_relaxed);
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
         if (demand && !io_fill_) {   // a demand read: the buffer prefetch() reserved for it (nothing when the decode read it first)
@@ -1176,14 +1125,6 @@ void FileExpertSource::io_worker() {
             promote_read(layer, expert);
             continue;
         }
-        // STRATA_PROMO_GUESS_MIN=<score> (with STRATA_PROMO_NETGAIN=1; opt-in): a decode window's guess for an expert whose decayed miss score is below
-        // the minimum is not read ahead - the drive is bandwidth-bound (about 0.9 ms per 3.1 MB blob), and ~56% of the guesses read were never used.  Such
-        // an expert, if it does miss, is read on demand and scores from then on.  The prompt's guesses (no window tag) are always read.
-        static const float guess_min = [] { const char* v = std::getenv("STRATA_PROMO_GUESS_MIN"); return v != nullptr ? (float) std::atof(v) : 0.0f; }();
-        if (!demand && tagged && guess_min > 0.0f && !miss_score_.empty() && miss_score_[index] < guess_min) {
-            pf_guess_skipped.fetch_add(1, std::memory_order_relaxed);
-            continue;
-        }
         if (io_fill_) {   // read what is not cached into a scratch buffer: the pages stay in the page cache for the kernels
 #if defined(__linux__)
             static thread_local std::vector<uint8_t> scratch;
@@ -1220,8 +1161,7 @@ void FileExpertSource::io_worker() {
             if (stage_blob_ == 0) continue;
             const bool have = claim_stage((int64_t) layer * n_expert_ + expert, v, fill, /*ahead=*/true);
             if (have || !fill) continue;   // already staged or being read, or no buffer
-            stage_pf_[v] = (char) (pos >= 0 ? 2 + pos : 1);
-            if (pos >= 0) ra_issue(pos);
+            stage_pf_[v] = 1;
             dst = stage_buf_[v].get();
         }
         const int64_t tl0 = timeline_on() ? tl_ns() : 0;
@@ -1547,8 +1487,6 @@ void FileExpertSource::close() {
     io_cached_.store(0); io_uncached_.store(0); io_pread_bytes_.store(0); io_pread_us_.store(0); io_pread_n_.store(0);
     io_pf_jobs_.store(0); io_pf_blobs_.store(0); io_pf_skips_.store(0); io_pf_dropped_.store(0);
     io_pf_used_.store(0); io_pf_unused_.store(0); io_crit_us_.store(0); io_crit_n_.store(0);
-    for (int p = 0; p < kRaPos; ++p) { ra_used_[p].store(0); ra_issued_[p].store(0); }
-    ra_since_halve_ = 0; ra_held_.store(0); ra_issued_total_.store(0);
     t_blob_us_.store(0); t_blob_lock_us_.store(0); t_blob_wait_us_.store(0); n_blob_.store(0);
     t_pf_probe_us_.store(0); t_pf_fill_us_.store(0); t_pf_thread_us_.store(0); n_pf_calls_.store(0);
 #if defined(_WIN32)
@@ -1757,7 +1695,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         v = it->second;
         stage_epoch_[v] = epoch_;
         stage_used_[v] = seq;
-        if (!ahead && stage_pf_[v]) { if (stage_pf_[v] >= 2) ra_outcome(stage_pf_[v] - 2); stage_pf_[v] = 0; io_pf_used_.fetch_add(1, std::memory_order_relaxed); }   // a layer asked for what was read ahead
+        if (!ahead && stage_pf_[v]) { stage_pf_[v] = 0; io_pf_used_.fetch_add(1, std::memory_order_relaxed); }   // a layer asked for what was read ahead
         return true;
     }
     v = stage_buf_.size();
@@ -2911,6 +2849,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 }
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n, const int* pos) {
+    (void) pos;   // nothing reads the guess positions since the read-ahead gate learner was removed (24 Nov 2026)
     if (all_in_ram_) return;   // every expert is in VRAM or RAM: nothing to warm from the files
     if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
     uint32_t stamp;
@@ -2932,7 +2871,7 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n, co
         if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
         warm_count_.fetch_add(1, std::memory_order_relaxed);
         if (io_pf_ && (direct_.empty() || io_overlay_active())) {   // read it ahead on the I/O threads (pread, or O_DIRECT under the RAM overlay)
-            if (io_ahead_) io_enqueue(layer, e, pos != nullptr ? pos[j] : -1);
+            if (io_ahead_) io_enqueue(layer, e);
             continue;
         }
         if (role_ptr_.empty() || unmapped_) continue;
@@ -3476,7 +3415,7 @@ bool FileExpertSource::take_read_ahead(int64_t layer, int64_t expert, uint8_t* d
         stage_busy_[v] = 1;                                         // held for this copy (a victim is never a busy buffer)
         stage_epoch_[v] = epoch_;
         stage_used_[v] = ++stage_seq_;
-        if (stage_pf_[v]) { if (stage_pf_[v] >= 2) ra_outcome(stage_pf_[v] - 2); stage_pf_[v] = 0; io_pf_used_.fetch_add(1, std::memory_order_relaxed); }   // a layer asked for what was read ahead
+        if (stage_pf_[v]) { stage_pf_[v] = 0; io_pf_used_.fetch_add(1, std::memory_order_relaxed); }   // a layer asked for what was read ahead
     }
     std::memcpy(dst, src, (size_t) layer_blob_bytes_[(size_t) layer]);
     {
@@ -4916,12 +4855,9 @@ bool FileExpertSource::place_expert(int64_t layer, int64_t out, const std::vecto
 static constexpr size_t kPromoQueueMax = 32;
 
 // STRATA_PCIE_STATS=1 (opt-in): the promotion funnel, printed with the PCIe share's line - where a file-tier miss's chance of a RAM place is lost
-static std::atomic<uint64_t> pf_dem_total{0}, pf_dem_qual{0};                               // demand file-tier misses; those whose miss score was >= 1 when they missed
-static std::atomic<uint64_t> pf_w_calls{0}, pf_w_free{0}, pf_w_low{0}, pf_w_novictim{0}, pf_w_yes{0};   // promote_wanted: calls, a free place, score < 1, no victim, a victim
 static std::atomic<uint64_t> pf_released{0}, pf_published{0};                              // places given up for starved layers, promotions published
 static std::atomic<uint64_t> pf_rk_read[3], pf_rk_skip[3];   // STRATA_PCIE_STATS: the plan's missed experts by best rank (0-2, 3-6, 7-9): read / skipped
 static std::atomic<uint64_t> pf_jb_us[4], pf_jb_n[4];   // the CPU lane's `jobs` phase (c2 -> c3) per layer call, bucketed by that call's file-tier misses (0, 1, 2, 3+)
-static constexpr uint32_t kPromoGrace = 300;   // STRATA_PROMO_NETGAIN: windows a promotion may stay unused before its place can be taken back
 static bool pf_funnel_on() { static const bool on = [] { const char* v = std::getenv("STRATA_PCIE_STATS"); return v != nullptr && v[0] == '1'; }(); return on; }
 
 void FileExpertSource::set_lookahead_promote(bool on, const std::vector<float>* usage) {
@@ -4930,15 +4866,6 @@ void FileExpertSource::set_lookahead_promote(bool on, const std::vector<float>* 
         promo_busy_.assign(n, 0);
         promo_flag_.reset(new std::atomic<uint8_t>[n]());
         promo_starved_.reset(new std::atomic<int>[(size_t) n_layers_]());
-        // STRATA_PROMO_NETGAIN=1 (opt-in): promotion by recent miss rate - see promote_wanted, publish_promotions, note_decode_miss
-        const char* ng = std::getenv("STRATA_PROMO_NETGAIN");
-        if (ng != nullptr && ng[0] == '1') {
-            miss_score_.assign(n, 0.0f);
-            promo_age_.assign(n, 0u);
-            promo_starved_best_.reset(new std::atomic<float>[(size_t) n_layers_]());
-            std::fprintf(stderr, "FileExpertSource: STRATA_PROMO_NETGAIN: a file-tier expert takes a RAM place when its decayed miss score is >= %.1f and a RAM-held expert of its layer scores under 1/%.0f of it (not usage < 1.0)\n",
-                         1.0, 2.0);
-        }
     }
     promo_usage_.store(usage, std::memory_order_release);
     promo_on_.store(on && promo_flag_ != nullptr, std::memory_order_release);
@@ -4962,22 +4889,6 @@ bool FileExpertSource::promote_wanted(int64_t layer, int64_t expert) const {
     {   // a place of the layer that release_resident_place gave up
         std::lock_guard<std::mutex> lk(tier_mu_);
         if ((size_t) layer < complement_free_.size() && !complement_free_[(size_t) layer].empty()) return true;
-    }
-    if (!miss_score_.empty()) {   // STRATA_PROMO_NETGAIN: the candidate's decayed miss score against the lowest-scoring RAM-held expert of its layer
-        const float cand = miss_score_[(size_t) layer * (size_t) n_expert_ + (size_t) expert];
-        const bool fn = pf_funnel_on();
-        if (fn) pf_w_calls.fetch_add(1, std::memory_order_relaxed);
-        if (cand < 1.0f) { if (fn) pf_w_low.fetch_add(1, std::memory_order_relaxed); return false; }   // not missing often enough to be worth a place
-        for (int64_t e = 0; e < n_expert_; ++e) {
-            const size_t j = (size_t) layer * (size_t) n_expert_ + (size_t) e;
-            if (j >= complement_offsets_.size() || complement_offsets_[j] == kNoComplement) continue;
-            if (!override_.empty() && override_[j] != nullptr) continue;
-            if (promo_flag_ != nullptr && promo_flag_[j].load(std::memory_order_relaxed) != 0 &&
-                promo_epoch_.load(std::memory_order_relaxed) - promo_age_[j] < kPromoGrace) continue;   // a promotion not yet used (and not expired)
-            if (miss_score_[j] * 2.0f < cand) { if (fn) pf_w_yes.fetch_add(1, std::memory_order_relaxed); return true; }
-        }
-        if (fn) pf_w_novictim.fetch_add(1, std::memory_order_relaxed);
-        return false;
     }
     // else a victim: a RAM-held expert of the layer, not read from an exchange buffer, with usage below 1.0 (decayed to
     // near-unused: the adaptive tier's usage decays x0.7 per window).  Racy reads of the offsets and the usage (heuristic).
@@ -5034,11 +4945,6 @@ void FileExpertSource::promote_read(int64_t layer, int64_t expert) {
         if (!paused) {
             promo_skips_.fetch_add(1, std::memory_order_relaxed);
             promo_starved_[(size_t) layer].fetch_add(1, std::memory_order_relaxed);
-            if (promo_starved_best_ != nullptr && !miss_score_.empty()) {   // STRATA_PROMO_NETGAIN: the best candidate this layer could not place
-                const float cand = miss_score_[i];
-                float cur = promo_starved_best_[(size_t) layer].load(std::memory_order_relaxed);
-                while (cand > cur && !promo_starved_best_[(size_t) layer].compare_exchange_weak(cur, cand, std::memory_order_relaxed)) {}
-            }
         }
         std::lock_guard<std::mutex> lk(promo_mu_);
         promo_busy_[i] = 0;
@@ -5131,10 +5037,6 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
         q.swap(promo_q_);
     }
     uint64_t published = 0;
-    if (!miss_score_.empty()) {   // STRATA_PROMO_NETGAIN: the miss scores decay once per window (half-life about 140 windows)
-        for (float& s : miss_score_) s *= 0.995f;
-        promo_epoch_.fetch_add(1, std::memory_order_relaxed);
-    }
     for (const Promo& p : q) {
         const size_t i = (size_t) p.layer * (size_t) n_expert_ + (size_t) p.expert;
         const bool on_gpu = i < busy.size() && busy[i];   // an expert the GPU holds needs no RAM place
@@ -5148,7 +5050,6 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
             if (pf_funnel_on()) pf_published.fetch_add(1, std::memory_order_relaxed);
             promo_n_.fetch_add(1, std::memory_order_relaxed);
             promo_flag_[i].store(1, std::memory_order_relaxed);
-            if (!promo_age_.empty()) promo_age_[i] = promo_epoch_.load(std::memory_order_relaxed);
         } else {   // no longer wanted (GPU-held, or RAM-held meanwhile): the place is free again
             std::lock_guard<std::mutex> lk(tier_mu_);
             complement_free_[(size_t) p.layer].push_back(p.at);
@@ -5161,10 +5062,7 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
     if (promo_starved_ != nullptr) {
         for (int64_t l = 0; l < n_layers_; ++l) {
             const int starved = promo_starved_[(size_t) l].exchange(0, std::memory_order_relaxed);
-            // STRATA_PROMO_NETGAIN: the victims are the layer's RAM-held experts whose miss score is under half of the best candidate that found no place
-            const bool ng = !miss_score_.empty();
-            const float ng_best = ng && promo_starved_best_ != nullptr ? promo_starved_best_[(size_t) l].exchange(0.0f, std::memory_order_relaxed) : 0.0f;
-            if (starved <= 0 || (!ng && usage.empty())) continue;
+            if (starved <= 0 || usage.empty()) continue;
             // key: (0 masked / 1 not, usage x factor): STRATA_MASK's experts give their places up first
             std::vector<std::pair<std::pair<int, float>, int64_t>> cold;
             for (int64_t e = 0; e < n_expert_; ++e) {
@@ -5172,15 +5070,9 @@ uint64_t FileExpertSource::publish_promotions(const std::vector<float>& usage, c
                 if (j >= complement_offsets_.size() || complement_offsets_[j] == kNoComplement) continue;
                 if (j < busy.size() && busy[j]) continue;
                 if (!override_.empty() && override_[j] != nullptr) continue;
-                if (promo_flag_[j].load(std::memory_order_relaxed) != 0 &&
-                    (!ng || promo_epoch_.load(std::memory_order_relaxed) - promo_age_[j] < kPromoGrace)) continue;   // a promotion not yet used (netgain: and not expired)
-                if (ng) {
-                    if (miss_score_[j] * 2.0f >= ng_best) continue;
-                } else if (j >= usage.size() || usage[j] >= 1.0f) {
-                    continue;
-                }
-                const float u = ng ? miss_score_[j]
-                                   : (keep_bias_ != nullptr && j < keep_bias_->size() ? usage[j] * (*keep_bias_)[j] : usage[j]);
+                if (promo_flag_[j].load(std::memory_order_relaxed) != 0) continue;   // a promotion not yet used
+                if (j >= usage.size() || usage[j] >= 1.0f) continue;
+                const float u = (keep_bias_ != nullptr && j < keep_bias_->size() ? usage[j] * (*keep_bias_)[j] : usage[j]);
                 cold.push_back({{masked_low(j) ? 0 : 1, u}, e});
             }
             std::sort(cold.begin(), cold.end());
@@ -6990,13 +6882,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int64_t n_ranks = tail_read ? 10 : std::min(d.gpu_pred_ranks, 10);
             if (tail_adapt && adapt_lo > 0 && g_ta_restricted.load(std::memory_order_relaxed) != 0) n_ranks = std::min<int64_t>(n_ranks, adapt_lo);
             const int64_t outer = rank_major ? n_ranks : n_tok, inner = rank_major ? n_tok : n_ranks;
-            // STRATA_IO_GATE: a guess is read ahead only when its position's use rate is at least the drive's load (reads in progress and queued, per
-            // worker; each guess queued in this batch adds one).  gate_pos: each queued guess's position (dist slot * 10 + rank) for the source to learn from
-            FileExpertSource* gate_fs = dynamic_cast<FileExpertSource*>(d.src);
-            if (gate_fs != nullptr && !gate_fs->ra_gate_on()) gate_fs = nullptr;
-            const size_t gate_busy = gate_fs != nullptr ? gate_fs->io_inflight() : 0;
-            const double gate_workers = gate_fs != nullptr ? (double) std::max(1, gate_fs->io_workers()) : 1.0;
-            int gate_pos[8 * 10];
             // STRATA_LA_TAIL_SKIP (decode, set per window by the verifier): the ids are ranked (r = the router's own order), so a
             // prediction at rank r >= the floor that no card holds is not read ahead while the tail budget is 0 (a stand-in serves it)
             // (STRATA_LA_TAIL_READ replaces it: the open rule is mode 2 and the stand-in test is the kernel's, route_pred_tail_read)
@@ -7007,7 +6892,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++ra_cons;
                     const int32_t e = d.gpu_pred[(((size_t) target * kRoutePredDists + (size_t) route_pred_slot(dist)) * 8 + (size_t) t) * 10 + (size_t) r];
                     if (e < 0 || e >= d.n_expert || d.host_res[(size_t) target * (size_t) d.n_expert + (size_t) e] >= 0) continue;
-                    if (gate_fs != nullptr && !gate_fs->ra_admit(di * 10 + (int) r, (double) (gate_busy + (size_t) nw) / gate_workers)) continue;
                     // STRATA_RANK_CUTOFF=R: a guess at a rank that is never used at all is not read ahead.  (STRATA_TAIL_CPU=0 does not skip: a tail expert in RAM can be
                     // swapped into the GPU cache, it is only never computed by the CPU.)
                     if (tail_read && ((rank_cutoff() > 0 && r >= rank_cutoff()) || (r >= tail_lo && tail_read_skip()))) {
@@ -7036,13 +6920,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     if (d.gpu_pred_d4 && dist != 4 && g_warm4_mark[mi] == g_warm4_pass) continue;
                     if (std::find(want, want + nw, (int64_t) e) == want + nw) {
                         if (tail_adapt && adapt_lo > 0 && r >= adapt_lo) g_ta_this.store(1, std::memory_order_relaxed);
-                        gate_pos[nw] = di * 10 + (int) r;
                         want[nw++] = e;
                         if (d.gpu_pred_d4 && dist == 4) g_warm4_mark[mi] = g_warm4_pass;
                     }
                 }
             t_decode_guess = true;
-            if (nw > 0) d.src->warm(target, want, nw, gate_fs != nullptr ? gate_pos : nullptr);
+            if (nw > 0) d.src->warm(target, want, nw);
             t_decode_guess = false;
             d.pred_fed += nw;
             ra_queued += nw;
@@ -7196,10 +7079,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static std::mutex st_mu;                 // the per-expert count of misses that were not in the RAM tier (file-tier misses), stats mode only
         static std::vector<uint32_t> st_hist, st_hist_ram;   // file-tier misses and RAM-tier misses (served from RAM) per (layer, expert)
         const FileExpertSource* st_ffs = st_on ? dynamic_cast<const FileExpertSource*>(d.src) : nullptr;
-        // STRATA_PROMO_NETGAIN=1 (opt-in): every distinct missed expert of a decode layer feeds the RAM tier's promotion its miss score
-        static const bool ng_env = [] { const char* v = std::getenv("STRATA_PROMO_NETGAIN"); return v != nullptr && v[0] == '1'; }();
-        FileExpertSource* ng_ffs = ng_env ? dynamic_cast<FileExpertSource*>(d.src) : nullptr;
-        if (ng_ffs != nullptr && !ng_ffs->promo_netgain()) ng_ffs = nullptr;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -7231,13 +7110,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     if (d.fs != nullptr) {
                         d.fs->note_miss(d.src, d.layers, e);
                         if (d.fs->ring) d.fs->ring_skip_plan();   // STRATA_RING: no landed copy at this plan -> the CPU (or PCIe) computes it
-                    }
-                    if (ng_ffs != nullptr) {   // STRATA_PROMO_NETGAIN
-                        if (st_on && st_ffs != nullptr && !st_ffs->in_ram_tier(d.layers, e)) {   // the funnel's first stage: a file-tier miss, and did it already score >= 1
-                            pf_dem_total.fetch_add(1, std::memory_order_relaxed);
-                            if (ng_ffs->miss_score_at(d.layers, e) >= 1.0f) pf_dem_qual.fetch_add(1, std::memory_order_relaxed);
-                        }
-                        ng_ffs->note_decode_miss(d.layers, e);
                     }
                     if (st_ffs != nullptr) {   // STRATA_PCIE_STATS: every miss, counted per expert, in the file tier's or the RAM tier's table
                         std::lock_guard<std::mutex> lk(st_mu);
@@ -7306,11 +7178,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                  (unsigned long long) st_miss.load(), (unsigned long long) st_want.load(), (unsigned long long) st_got.load(),
                                  (unsigned long long) (st_want.load() - std::min(st_want.load(), st_got.load())),
                                  (unsigned long long) st_ref_ram.load(), (unsigned long long) st_ref_file.load());
-                if (st_print && ng_ffs != nullptr)
-                    std::fprintf(stderr, "strata promotion funnel: %llu file-tier demand misses, %llu of them already scored >= 1 (promotable); promote_wanted saw %llu guesses: %llu a free place, %llu score < 1, %llu a victim, %llu no victim; %llu places released for starved layers, %llu promotions published\n",
-                                 (unsigned long long) pf_dem_total.load(), (unsigned long long) pf_dem_qual.load(), (unsigned long long) pf_w_calls.load(),
-                                 (unsigned long long) pf_w_free.load(), (unsigned long long) pf_w_low.load(), (unsigned long long) pf_w_yes.load(),
-                                 (unsigned long long) pf_w_novictim.load(), (unsigned long long) pf_released.load(), (unsigned long long) pf_published.load());
                 if (st_print) {   // the jobs phase (the CPU lane's fetch of its miss blobs) per layer call, by how many of that call's misses were file-tier
                     char b[320]; int o = 0;
                     for (int k = 0; k < 4; ++k) {
@@ -7323,14 +7190,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     std::fprintf(stderr, "strata plan misses by best rank in the window (read / skipped): rank 0-2 %llu / %llu, rank 3-6 %llu / %llu, rank 7-9 %llu / %llu\n",
                                  (unsigned long long) pf_rk_read[0].load(), (unsigned long long) pf_rk_skip[0].load(), (unsigned long long) pf_rk_read[1].load(),
                                  (unsigned long long) pf_rk_skip[1].load(), (unsigned long long) pf_rk_read[2].load(), (unsigned long long) pf_rk_skip[2].load());
-                if (st_print && ng_ffs != nullptr)
-                    std::fprintf(stderr, "strata read-ahead gate (STRATA_PROMO_GUESS_MIN): %llu decode guesses not read\n", (unsigned long long) pf_guess_skipped.load());
-                if (st_print && ng_ffs != nullptr) {
-                    uint64_t fl = 0, ex = 0;
-                    ng_ffs->promo_flag_counts(fl, ex);
-                    std::fprintf(stderr, "strata promotion places: %llu hold a promotion not yet used, %llu of them for 300+ windows (without the expiry these could never be a victim)\n",
-                                 (unsigned long long) fl, (unsigned long long) ex);
-                }
                 if (st_calls.load() % 20000 == 0) {   // how repeated the file-tier misses are: what the N most-missed experts would cover if the RAM tier held them
                     std::vector<uint32_t> h;
                     {

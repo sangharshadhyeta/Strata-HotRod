@@ -202,8 +202,8 @@ Arguments (`args`):
 | `STRATA_GDN_CONV_SERIAL` | unset | upstream | yes | the old walk (A/B) | src/prefill/kernels.cu:2518 |
 | `STRATA_GDN_HEAD` | unset | upstream | yes | Aurora (S23): four lanes per column + the grid-stride norm, the same bits (tests/hip/gdn_rec_head.cpp); STRATA_GDN_HEAD=1 (on by default on gfx1151; off with STRATA_GDN_HEAD=0 or STRATA_GDN_REC_HEADS) takes them (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels) | src/prefill/kernels.cu:2620 |
 | `STRATA_GDN_KEYHEAD` | unset | upstream |  | (no comment) | src/prefill/kernels.cu:727 |
-| `STRATA_GDN_LOOP_K` | see code | HotRod |  | (no comment) | src/core/verify.cpp:497 |
-| `STRATA_GDN_LOOP_LAYERS` | see code | HotRod |  | (no comment) | src/core/verify.cpp:557 |
+| `STRATA_GDN_LOOP_K` | see code | HotRod |  | (no comment) | removed 24 Nov 2026 (ratrod clean-up; was src/core/verify.cpp:497) |
+| `STRATA_GDN_LOOP_LAYERS` | see code | HotRod |  | (no comment) | removed 24 Nov 2026 (ratrod clean-up; was src/core/verify.cpp:557) |
 | `STRATA_GDN_NOY` | unset | upstream |  | (no comment) | src/prefill/kernels.cu:2580 |
 | `STRATA_GDN_PIPELINE` | unset | upstream |  | (no comment) | src/prefill/kernels.cu:2597 |
 | `STRATA_GDN_PP` | 0 | upstream |  | (no comment) | src/prefill/kernels.cu:2573 |
@@ -252,7 +252,7 @@ Arguments (`args`):
 | `STRATA_IO_ARRIVAL` | see code | HotRod |  | (no comment) | src/core/expert_source.cpp:730 |
 | `STRATA_IO_DEMAND_FIRST` | see code | HotRod |  | (no comment) | src/core/expert_source.cpp:727 |
 | `STRATA_IO_EDF` | unset | HotRod |  | (no comment) | src/core/expert_source.cpp:728, src/core/expert_source.cpp:5828 |
-| `STRATA_IO_GATE` | see code | HotRod |  | (no comment) | src/core/expert_source.cpp:731 |
+| `STRATA_IO_GATE` | see code | HotRod |  | (no comment) | removed 24 Nov 2026 (ratrod clean-up; was src/core/expert_source.cpp:731) |
 | `STRATA_IO_PF_AHEAD` | see code | upstream |  | (no comment) | src/core/expert_source.cpp:726 |
 | `STRATA_IO_PF_STAGE` | see code | upstream |  | solid-wins fork: staging is the DEFAULT (SPEC.md T1 measured the staged variant; the fill variant was not measured on this box). STRATA_IO_PF_STAGE=0 selects the fill variant. | src/core/expert_source.cpp:742, src/program/generate.cpp:5918 |
 | `STRATA_IO_PF_THREADS` | see code | upstream |  | (no comment) | src/program/generate.cpp:5907, src/program/generate.cpp:8264 |
@@ -393,7 +393,7 @@ Arguments (`args`):
 | `STRATA_PF_FUSED_SM75` | unset | upstream |  | Turing (sm_75): the same kernels with plain copies and m8n8k16 MMAs, opt-in (STRATA_PF_FUSED_SM75=1) | src/prefill/moe_fused.cu:651, src/prefill/moe_fused_iq.cu:1295 |
 | `STRATA_PF_FUSED_TILE` | see code | upstream |  | (no comment) | src/prefill/moe_fused_iq.cu:1375 |
 | `STRATA_PF_GEMM` | unset | upstream |  | (no comment) | src/prefill/gemm.cu:1056, src/prefill/gemm.cu:1238, src/prefill/prefill.cpp:510 |
-| `STRATA_PF_GROUP_OVERLAP` | unset | HotRod |  | (no comment) | src/prefill/prefill.cpp:441 |
+| `STRATA_PF_GROUP_OVERLAP` | unset | HotRod |  | (no comment) | removed 24 Nov 2026 (ratrod clean-up; was src/prefill/prefill.cpp:441) |
 | `STRATA_PF_HCDOWN` | unset | upstream |  | (no comment) | src/prefill/prefill.cpp:489 |
 | `STRATA_PF_OCC` | see code | upstream |  | (no comment) | src/prefill/moe_fused.cu:610, src/prefill/moe_fused_iq.cu:1231 |
 | `STRATA_PF_OCC_W` | see code | upstream |  | (no comment) | src/prefill/moe_fused_iq.cu:1244 |
@@ -633,8 +633,8 @@ Arguments (`args`):
 | `STRATA_SWAP2_GAP` | unset | HotRod |  | (no comment) | include/strata/kernels/native_router.hpp:155 |
 | `STRATA_SWAP2_MAX` | unset | HotRod |  | (no comment) | include/strata/kernels/native_router.hpp:151 |
 | `STRATA_SWAP2_MIN` | see code | HotRod |  | (no comment) | src/program/generate.cpp:10370 |
-| `STRATA_SWAP_COST` | see code | HotRod |  | STRATA_SWAP_COST=<c> (opt-in): a swap-in candidate whose bytes are not in the page cache has its heat divided by 1 + c (cost-aware, after GreedyDual-Size) | src/program/generate.cpp:10361 |
-| `STRATA_SWAP_GRACE` | 0 | HotRod |  | SPEC 13.36 / 13.49 (T6): a grace period. STRATA_SWAP_GRACE=N rounds: an expert swapped in cannot be chosen as a victim for the next N rounds (0 = off, the rule as it was: the least-used resident expert of the layer is the victim) | src/program/generate.cpp:10357 |
+| `STRATA_SWAP_COST` | see code | HotRod |  | STRATA_SWAP_COST=<c> (opt-in): a swap-in candidate whose bytes are not in the page cache has its heat divided by 1 + c (cost-aware, after GreedyDual-Size) | removed 24 Nov 2026 (ratrod clean-up; was src/program/generate.cpp:10361) |
+| `STRATA_SWAP_GRACE` | 0 | HotRod |  | SPEC 13.36 / 13.49 (T6): a grace period. STRATA_SWAP_GRACE=N rounds: an expert swapped in cannot be chosen as a victim for the next N rounds (0 = off, the rule as it was: the least-used resident expert of the layer is the victim) | removed 24 Nov 2026 (ratrod clean-up; was src/program/generate.cpp:10357) |
 | `STRATA_SYCL_BIN` | unset | upstream |  | (no comment) | serve/server.py:2608 |
 | `STRATA_TAIL_SKIP_MAX_CACHED` | see code | upstream |  | (no comment) | src/program/generate.cpp:10053 |
 | `STRATA_TEST_BELL_SLEEP_US` | see code | upstream |  | (no comment) | src/program/generate.cpp:14428 |

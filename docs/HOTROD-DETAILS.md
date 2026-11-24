@@ -45,7 +45,8 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
 - **Experimental, off by default:** `STRATA_GDN_LOOP=1 STRATA_GDN_LOOP_NORM=1` runs the middle linear-attention layers
   twice per token (a training-free "looped" model). Measured on 210 MMLU-Pro questions: 180 correct against 175 without
   it (not significant: only 9 questions differ), and decode 10% slower (38.5 against 42.7 tokens/s). Not worth it on a
-  model that was not trained to loop, so it stays off.
+  model that was not trained to loop, so it stayed off. **Removed 24 Nov 2026 in the ratrod clean-up** (the switch, its
+  scratch buffers and the looped passes; the measured result above is why).
 
 ## Stand-in experts: confidence, not rank
 
@@ -127,6 +128,7 @@ Opt-in, measured 24 Oct and left off (same 3-question test, every answer correct
   are used, and a guess is read only when that rate is at least the drive's load ((reads in progress + queued) / workers).
   It won 3% on 19 Oct, before the learned look-ahead. Now 58.5 and 57.4 against 57.7 tokens/s, and the SSD wait rose (8.8 and
   5.9 against 5.4 s): the learned guesses and the stand-in test leave little waste, and what the gate holds back is often needed.
+  **Removed 24 Nov 2026 in the ratrod clean-up** (the switch, its counters and the request-line print; the 58.5 / 57.4 against 57.7 result above is why).
 - **Two kernel switches from 19 Oct** (`STRATA_ROUTER_FUSED=1`: the router's GEMV and top-10 in one launch;
   `STRATA_GR_DOWN_WPC=8|4|2`: warps per staged down block) with their byte-exact bench `bench/micro/hotrod_kernel_ab.sh`:
   ported and measured 24 Oct: `bench/micro/hotrod_kernel_ab.sh` byte-identical on 3 seeds (and the split top-k); live,
@@ -213,8 +215,8 @@ so a skip in the last twelve layers costs 3-5 times what it does in the middle o
 | `STRATA_PCIE_BALANCE` | each verify layer's PCIe count from measured CPU and GPU costs (one GPU, native pack, no batch slots) |
 | `STRATA_PCIE_EARLY` (on by default on CUDA; `=0` off; on AMD/HIP still opt-in `=1`, not measured there; a latent pack (the Edge0 model) takes its own layer path and does not use it yet) | the PCIe share's fetch kernel runs on its own stream beside the layer's VRAM experts instead of after them (PCIe mode 2, the default copy-kernel path). Measured on an RTX 3060 PC, Qwen UD-Q4_K_XL, stage timers on: `pcie-experts` 19.9 -> 1.8 ms per window, `vram-experts` 10.2 -> 27.7 ms (the two now overlap), `cpu-wait` 34.6 -> 28.6 ms; about 7% off the window, 1-4% more tok/s, 99th-percentile token gap about 13% lower |
 | `STRATA_PCIE_STATS=1` (opt-in, diagnostics only) | every 20000 layer calls: distinct misses, how many the PCIe share asked for and how many could fly (only a page-locked RAM-tier blob can), the refusals split into RAM-tier-not-pinned and file-tier (93% of the refusals in one run were file-tier blobs), how repeated the file-tier misses are (the share the N most-missed experts cover and the net of swapping them for the N least-missed RAM-tier ones), the CPU lane's `jobs` phase bucketed by the layer's file-tier misses (about 0.9 ms per file-tier miss: the drive's bandwidth), and the promotion funnel when `STRATA_PROMO_NETGAIN` is on. Costs a mutex and a table update per miss: do not leave it on for speed runs |
-| `STRATA_PROMO_NETGAIN=1` (opt-in, measured: no speed gain) | the RAM tier's look-ahead promotion by decayed per-expert miss score (>= 1, half-life about 140 windows) against the lowest-scoring RAM-held expert of the layer, instead of the victim's usage < 1.0; a promotion unused for 300 windows may be a victim again. 12x the promotions (about 1,700-2,100 per request, 60-75% used), file-tier demand misses down 10-14%, but tok/s unchanged (the drive is bandwidth-bound: about 0.9 ms per file-tier miss, and the total bytes read stayed the same) |
-| `STRATA_PROMO_GUESS_MIN=<score>` (opt-in, needs `STRATA_PROMO_NETGAIN=1`; measured: slightly slower) | a decode window's read-ahead guess for an expert whose miss score is below `<score>` is not read. With `1`: the OS read per pass fell 35% (156-186 GB to 101-125 GB) and the file-tier demand misses 26%, but tok/s was 21.1 against 21.6 over six mirrored legs each (p99 gap and stalls slightly worse): the skipped guesses were partly the useful ones, whose misses are then exposed demand reads. Kept for slower or shared drives, where the traffic saving may matter |
+| `STRATA_PROMO_NETGAIN=1` (opt-in, measured: no speed gain; **removed 24 Nov 2026 in the ratrod clean-up**, the measured result is why) | the RAM tier's look-ahead promotion by decayed per-expert miss score (>= 1, half-life about 140 windows) against the lowest-scoring RAM-held expert of the layer, instead of the victim's usage < 1.0; a promotion unused for 300 windows may be a victim again. 12x the promotions (about 1,700-2,100 per request, 60-75% used), file-tier demand misses down 10-14%, but tok/s unchanged (the drive is bandwidth-bound: about 0.9 ms per file-tier miss, and the total bytes read stayed the same) |
+| `STRATA_PROMO_GUESS_MIN=<score>` (opt-in, needs `STRATA_PROMO_NETGAIN=1`; measured: slightly slower; **removed 24 Nov 2026 in the ratrod clean-up**) | a decode window's read-ahead guess for an expert whose miss score is below `<score>` is not read. With `1`: the OS read per pass fell 35% (156-186 GB to 101-125 GB) and the file-tier demand misses 26%, but tok/s was 21.1 against 21.6 over six mirrored legs each (p99 gap and stalls slightly worse): the skipped guesses were partly the useful ones, whose misses are then exposed demand reads. Kept for slower or shared drives, where the traffic saving may matter |
 | `STRATA_TAIL_CPU=0` (the rank rule: the default of 0.1.45 to `ratrod.v1`, now replaced by the weight rule below unless `STRATA_TAIL_WEIGHT=0`; `STRATA_TAIL_CPU=1` turns both tail rules off; +25% in one early run with the mask off, no gain in later paired runs) | the rank rule: the ranks from the stand-ins' floor up are never computed by the CPU or read over PCIe: a missed expert that every token of the window routes at or above the floor is skipped and its weight dropped (no renormalisation). Needs the stand-ins (`STRATA_ROUTE_RESIDENT`); answers differ slightly |
 | `STRATA_TAIL_READ=0` (opt-in, with `STRATA_TAIL_CPU=0`; measured: no difference) | the read-ahead leaves the guesses at the floor rank and above unread. The router already drops the guesses a resident stand-in serves, so little is left to skip |
 | `STRATA_RANK_CUTOFF=R` (opt-in, 1-9; `STRATA_RANK_CUTOFF_CLIP=0` keeps the stand-ins at ranks R-9; measured slower in the same session) | ranks R-9 are not computed at all, resident or not, and the read-ahead does not read them; the stand-in range ends at rank R-1 |
@@ -234,9 +236,9 @@ so a skip in the last twelve layers costs 3-5 times what it does in the middle o
 | --- | --- |
 | `STRATA_ROUTE_TAIL_OPEN=1` | ranks 3-9 unchecked until a brake: faster, malformed JSON/code seen |
 | `STRATA_ROUTE_BRAKE_STEP=1` | each brake checks one more rank: a wrong maths answer |
-| `STRATA_IO_GATE=1` | read-ahead gate by drive load: no gain with the learned look-ahead |
+| `STRATA_IO_GATE=1` | read-ahead gate by drive load: no gain with the learned look-ahead. Removed 24 Nov 2026 (ratrod clean-up) |
 | `STRATA_LA_EDGE_SKIP=1`, `STRATA_LA_MODEL=<file>` | superseded by the learned look-ahead |
-| `STRATA_GDN_LOOP=1` | looped middle layers: 10% slower, no clear accuracy gain |
+| `STRATA_GDN_LOOP=1` | looped middle layers: 10% slower, no clear accuracy gain. Removed 24 Nov 2026 (ratrod clean-up) |
 | `STRATA_ROUTER_FUSED=1`, `STRATA_GR_DOWN_WPC=4\|2` | byte-identical outputs; alone and together within run-to-run spread: no gain |
 
 ## Earlier speed tables (moved from the README)

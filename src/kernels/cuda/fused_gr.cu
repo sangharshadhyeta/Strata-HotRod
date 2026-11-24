@@ -935,20 +935,6 @@ __device__ __forceinline__ void cp_async_wait0() {
 #endif
 }
 
-// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
-__device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const float4 x1) {
-    float acc = 0.0f;
-    acc = fmaf(__uint_as_float(w.x << 16), x0.x, acc);
-    acc = fmaf(__uint_as_float(w.x & 0xffff0000u), x0.y, acc);
-    acc = fmaf(__uint_as_float(w.y << 16), x0.z, acc);
-    acc = fmaf(__uint_as_float(w.y & 0xffff0000u), x0.w, acc);
-    acc = fmaf(__uint_as_float(w.z << 16), x1.x, acc);
-    acc = fmaf(__uint_as_float(w.z & 0xffff0000u), x1.y, acc);
-    acc = fmaf(__uint_as_float(w.w << 16), x1.z, acc);
-    acc = fmaf(__uint_as_float(w.w & 0xffff0000u), x1.w, acc);
-    return acc;
-}
-
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
 // `nt` is the block's thread count (WPC * 32): the tile is copied by whichever threads the block has.
 __device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t, int nt, int k0 = 0) {
