@@ -11,7 +11,7 @@ Source was not changed by this check. Findings and fixes are listed in [FINDINGS
 | Type checking | BLOCKED | No type checker installed. Byte-compile only (see Python tests). |
 | Linting | BLOCKED | No linter installed. |
 | Unit tests (C++) | PASS | ctest: 61 tests, 60 passed, 1 skipped (`expert_multi_test`, no AVX-512), 0 failed. |
-| Python tests | FAIL | Merged: 2 regressions (both reproduced on 2 reruns), plus pre-existing failures. Details below. |
+| Python tests | PASS (no regressions) | Every failure on merged also fails on base (same test names); the two V-1 regressions were a flaky pre-existing test and a test injecting at a call S-02 removed (fixed). Details below. |
 | Integration tests | BLOCKED | The live-server test (`tools/test_conversation_cache_http_smoke.py`) and `bench/results/**/test_replay.py` need a live server and are skipped by design. The mock-engine tests are counted under Python tests. |
 | E2E tests | BLOCKED | Needs a real model on a GPU. The only GPU serves the user's live server. |
 | Security audit | PASS (open items) | 8 of 11 findings fixed; S-04 partly fixed; F-02 and F-03 open (both low). See [FINDINGS.md](FINDINGS.md). |
@@ -43,21 +43,20 @@ Exit 1 in the launch form is partly an invocation artifact: 41 `serve/` and `too
 The 8 extra tests on merged are new tests in `serve/test_write_lock.py` (3), `serve/test_runconfig.py` (+2),
 `serve/test_timeline.py` (+2) and `serve/test_request_hardening.py` (+1).
 
-### Regressions (pass on base, fail on merged)
+### Regressions (pass on base, fail on merged) - none after the lead's follow-up
 
-Both reproduced on two reruns of the merged tree.
+The two reported by V-1, resolved by the lead:
 
-1. **`serve/test_responses.py`** (base: `OK (skipped=1)`, 40 tests; merged: `FAILED (failures=1, skipped=1)`).
-   `NoLeakedSampler.test_server_close_ends_the_sampler`, `serve/test_responses.py` line 284:
-   `AssertionError: 1 != 2`. The test expects `serve()` to add one thread whose name ends in `(_loop)`; the merged
-   tree adds none. Not diagnosed. The F-04 hunks in `serve/server.py` do not obviously touch that thread; this was
-   not verified further, so the cause is open.
+1. **`serve/test_responses.py`** `NoLeakedSampler.test_server_close_ends_the_sampler` (line 284, `1 != 2`): **not a
+   regression - flaky on the base too.** Four runs each (offline, fresh HOME): base 3 OK / 1 FAILED, merged 4 OK. The
+   server agent's own baseline run on the base also failed it once. Pre-existing flaky thread-count test; open.
 
-2. **`tools/test_setup_risk.py`** (base: 5 failures, all also present on merged; merged adds one).
-   New failure: `BrokenEarlierConfig.test_write_config_leaves_no_partial_file`, line 201: `OSError not raised`.
-   The test patches `Path.write_text` to simulate a full disk. S-02 changed `setup.write_config` to write through
-   `os.open` with mode 0600 and then replace the file, so the patched method is never called. Likely the test is
-   coupled to the old implementation; not verified against a real full disk.
+2. **`tools/test_setup_risk.py`** `test_write_config_leaves_no_partial_file`: a real gap - the test injected the full
+   disk through `Path.write_text`, which S-02's `write_config` no longer calls, so the failure path went untested.
+   Fixed in the follow-up commit: the test now injects the full disk at the write `write_config` really does
+   (`os.fdopen(...).write`), and also asserts that no partial `.tmp` is left; `write_config` removes its temp file
+   when the write fails. That test passes on merged; the file's other 5 failures are the same 5 test names on base and
+   merged (pre-existing, below).
 
 ### Pre-existing failures (fail on base and merged)
 

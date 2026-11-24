@@ -197,10 +197,19 @@ class BrokenEarlierConfig(unittest.TestCase):
             setup.write_config(p, {"args": ["--kv", "int8"]})
             self.assertEqual(p.read_text(encoding="utf-8"), json.dumps({"args": ["--kv", "int8"]}, indent=1))
             self.assertEqual([f.name for f in Path(d).iterdir()], ["strata-iq3_s.json"])   # no .tmp left
-            with mock.patch.object(Path, "write_text", side_effect=OSError(28, "No space left on device")):
+            # a full disk while the new file is written (write_config writes through os.fdopen since S-02)
+            real_fdopen = os.fdopen
+            def full_disk(fd, *a, **k):
+                f = real_fdopen(fd, *a, **k)
+                def no_space(_s):
+                    raise OSError(28, "No space left on device")
+                f.write = no_space
+                return f
+            with mock.patch.object(setup.os, "fdopen", side_effect=full_disk):
                 with self.assertRaises(OSError):
                     setup.write_config(p, {"args": []})
             self.assertEqual(json.loads(p.read_text(encoding="utf-8")), {"args": ["--kv", "int8"]})   # kept whole
+            self.assertEqual([f.name for f in Path(d).iterdir()], ["strata-iq3_s.json"])   # and no partial .tmp left
 
 
 class LowRamGpus(unittest.TestCase):

@@ -4654,8 +4654,12 @@ def write_config(path: Path, cfg: dict):
     if tmp.exists():
         os.chmod(tmp, 0o600)                                # an old temporary file keeps its mode through os.open
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(json.dumps(cfg, indent=1))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(cfg, indent=1))
+    except BaseException:
+        tmp.unlink(missing_ok=True)                          # a failed write (a full disk) leaves no partial .tmp behind
+        raise
     os.replace(tmp, path)
 
 
