@@ -10968,7 +10968,9 @@ int main(int argc, char** argv) {
             ver.set_always_publish(true);
             for (auto& st : stages) st->ver.set_always_publish(true);
         }
-        const bool res_checking = std::getenv("STRATA_ADAPT_CHECKRES") != nullptr && serial_windows;
+        // F-07: STRATA_ADAPT_CHECKRES=1 turns the check on; =0 (or any other value) leaves it off
+        const char* res_env = std::getenv("STRATA_ADAPT_CHECKRES");
+        const bool res_checking = res_env != nullptr && res_env[0] == '1' && serial_windows;
         std::vector<int32_t> res_back;
         int64_t res_windows = 0, res_bad = 0, res_bad_windows = 0;
         if (res_checking) {
@@ -18999,7 +19001,8 @@ int main(int argc, char** argv) {
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
         // flight - see the serve path); the hook's captures live in this block, so it is taken off the verifier when the
         // block ends
-        const bool res_checking = std::getenv("STRATA_ADAPT_CHECKRES") != nullptr && d_res != nullptr;
+        const char* res_env = std::getenv("STRATA_ADAPT_CHECKRES");
+        const bool res_checking = res_env != nullptr && res_env[0] == '1' && d_res != nullptr;
         std::vector<int32_t> res_back;
         int64_t res_windows = 0, res_bad = 0, res_bad_windows = 0;
         if (res_checking) {
