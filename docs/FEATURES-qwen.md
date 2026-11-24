@@ -202,8 +202,8 @@ Arguments (`args`):
 | `STRATA_GDN_CONV_SERIAL` | unset | upstream | yes | the old walk (A/B) | src/prefill/kernels.cu:2518 |
 | `STRATA_GDN_HEAD` | unset | upstream | yes | Aurora (S23): four lanes per column + the grid-stride norm, the same bits (tests/hip/gdn_rec_head.cpp); STRATA_GDN_HEAD=1 (on by default on gfx1151; off with STRATA_GDN_HEAD=0 or STRATA_GDN_REC_HEADS) takes them (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels) | src/prefill/kernels.cu:2620 |
 | `STRATA_GDN_KEYHEAD` | unset | upstream |  | (no comment) | src/prefill/kernels.cu:727 |
-| `STRATA_GDN_LOOP_K` | see code | HotRod |  | (no comment) | src/core/verify.cpp:497 |
-| `STRATA_GDN_LOOP_LAYERS` | see code | HotRod |  | (no comment) | src/core/verify.cpp:557 |
+| `STRATA_GDN_LOOP_K` | see code | HotRod |  | (no comment) | removed 24 Nov 2026 (ratrod clean-up; was src/core/verify.cpp:497) |
+| `STRATA_GDN_LOOP_LAYERS` | see code | HotRod |  | (no comment) | removed 24 Nov 2026 (ratrod clean-up; was src/core/verify.cpp:557) |
 | `STRATA_GDN_NOY` | unset | upstream |  | (no comment) | src/prefill/kernels.cu:2580 |
 | `STRATA_GDN_PIPELINE` | unset | upstream |  | (no comment) | src/prefill/kernels.cu:2597 |
 | `STRATA_GDN_PP` | 0 | upstream |  | (no comment) | src/prefill/kernels.cu:2573 |

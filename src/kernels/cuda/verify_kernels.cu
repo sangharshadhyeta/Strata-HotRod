@@ -1269,47 +1269,6 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     check("gdn_step_norm_multi");
 }
 
-// STRATA_GDN_LOOP: the damped sum of a looped GDN mixer's passes (see record_window in src/core/verify.cpp)
-namespace {
-__global__ void axpby_kernel(float* __restrict__ out, const float* __restrict__ a, float alpha,
-                             const float* __restrict__ b, float beta, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = alpha * a[i] + beta * b[i];
-}
-}  // namespace
-
-void axpby(float* out, const float* a, float alpha, const float* b, float beta, int64_t n, void* stream) {
-    if (n <= 0) return;
-    axpby_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(out, a, alpha, b, beta, n);
-    check("axpby");
-}
-
-namespace {
-// STRATA_GDN_LOOP_NORM: one block per row (256 threads): the row's L2 norm and the reference row's, then rows *= ||ref|| / ||row||
-__global__ void row_norm_match_kernel(float* __restrict__ rows, const float* __restrict__ ref, int N) {
-    __shared__ float sa[256], sb[256];
-    float* r = rows + (size_t) blockIdx.x * N;
-    const float* f = ref + (size_t) blockIdx.x * N;
-    float a = 0.0f, b = 0.0f;
-    for (int i = threadIdx.x; i < N; i += blockDim.x) { a += r[i] * r[i]; b += f[i] * f[i]; }
-    sa[threadIdx.x] = a;
-    sb[threadIdx.x] = b;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) { sa[threadIdx.x] += sa[threadIdx.x + s]; sb[threadIdx.x] += sb[threadIdx.x + s]; }
-        __syncthreads();
-    }
-    const float sc = sqrtf(sb[0]) / fmaxf(sqrtf(sa[0]), 1e-20f);   // a zero row stays zero
-    for (int i = threadIdx.x; i < N; i += blockDim.x) r[i] *= sc;
-}
-}  // namespace
-
-void row_norm_match(float* rows, const float* ref_rows, int n_rows, int N, void* stream) {
-    if (n_rows <= 0 || N <= 0) return;
-    row_norm_match_kernel<<<n_rows, 256, 0, (cudaStream_t) stream>>>(rows, ref_rows, N);
-    check("row_norm_match");
-}
-
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
     while (*flag < value) strata_spin_pause();

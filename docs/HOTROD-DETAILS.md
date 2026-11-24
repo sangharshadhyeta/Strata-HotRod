@@ -45,7 +45,8 @@ Upstream Strata, plus (the details and the measurements are in [SPEC.md](SPEC.md
 - **Experimental, off by default:** `STRATA_GDN_LOOP=1 STRATA_GDN_LOOP_NORM=1` runs the middle linear-attention layers
   twice per token (a training-free "looped" model). Measured on 210 MMLU-Pro questions: 180 correct against 175 without
   it (not significant: only 9 questions differ), and decode 10% slower (38.5 against 42.7 tokens/s). Not worth it on a
-  model that was not trained to loop, so it stays off.
+  model that was not trained to loop, so it stayed off. **Removed 24 Nov 2026 in the ratrod clean-up** (the switch, its
+  scratch buffers and the looped passes; the measured result above is why).
 
 ## Stand-in experts: confidence, not rank
 
@@ -236,7 +237,7 @@ so a skip in the last twelve layers costs 3-5 times what it does in the middle o
 | `STRATA_ROUTE_BRAKE_STEP=1` | each brake checks one more rank: a wrong maths answer |
 | `STRATA_IO_GATE=1` | read-ahead gate by drive load: no gain with the learned look-ahead |
 | `STRATA_LA_EDGE_SKIP=1`, `STRATA_LA_MODEL=<file>` | superseded by the learned look-ahead |
-| `STRATA_GDN_LOOP=1` | looped middle layers: 10% slower, no clear accuracy gain |
+| `STRATA_GDN_LOOP=1` | looped middle layers: 10% slower, no clear accuracy gain. Removed 24 Nov 2026 (ratrod clean-up) |
 | `STRATA_ROUTER_FUSED=1`, `STRATA_GR_DOWN_WPC=4\|2` | byte-identical outputs; alone and together within run-to-run spread: no gain |
 
 ## Earlier speed tables (moved from the README)
