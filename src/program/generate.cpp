@@ -11047,6 +11047,10 @@ int main(int argc, char** argv) {
         int cross_prev_n = 0, cross_idle = 0;
         uint32_t cross_tick = 0, cross_logs = 0;
         int64_t cross_total = 0;
+        bool cross_settled = false;
+        size_t cross_nc = 0, cross_nv = 0;   // the last look: candidates and victims listed
+        int cross_rej[4] = {0, 0, 0, 0};     // ... and the pairs refused: no usable slot, blob too big for the slot, victim too hot, (unused)
+        std::vector<float> cross_f;
         auto cross_t_last = Clock::now();
         cudaEvent_t cross_ev0 = nullptr, cross_ev1 = nullptr;
         if (cross_on) { cudaEventCreate(&cross_ev0); cudaEventCreate(&cross_ev1); }
@@ -11164,60 +11168,136 @@ int main(int argc, char** argv) {
                 }
             }
             if (cross_on && !aov && !multi_gpu && !peer.valid() && !remote_opt && !adapt_fence && adapt_layer_limit < 0 && lent_mask.empty()) {
-                int budget = cross_copy_ms > 0 && cross_win_ms > 0 ? (int) (0.10 * cross_win_ms / cross_copy_ms) - (int) swaps.size() : 4;   // the first rounds probe with 4
-                if (cross_idle >= 8 && (++cross_tick % 16) != 0) budget = 0;   // nothing moved for 8 rounds: look at every 16th only
-                if (budget > 0) {
+                // TARGET AND SETTLE.  Each layer's target is its share of the resident experts in proportion to its factor (ratios of non-skippable misses; counts between half and twice the mean).
+                // Layers above their target (by more than a tolerance) give slots, layers below take them; when every layer is within the tolerance - or nothing can be moved for 8 looks - the shares are
+                // SETTLED: nothing is counted or listed any more, and once in 64 rounds the factors are read again and compared with the ones it settled on (a layer moving more than 10% wakes it).
+                ++cross_tick;
+                if (!cross_settled || (cross_tick & 63u) == 0) {
                     const int64_t NL = g.n_layers, NE = g.n_expert;
                     std::vector<float> fac((size_t) NL, 1.0f);
-                    strata::core::slot_share_factors((int) NL, fac.data());
-                    std::vector<char> used((size_t) (NL * NE), 0);
-                    for (const Swap& s : swaps) { used[(size_t) (s.layer * NE + s.in)] = 1; used[(size_t) (ol(s) * NE + s.out)] = 1; }
-                    std::vector<int> cnt((size_t) NL, 0);
-                    int64_t tot = 0;
-                    for (int64_t l = 0; l < NL; ++l)
-                        for (int64_t e = 0; e < NE; ++e)
-                            if (host_res[(size_t) (l * NE + e)] >= 0) { ++cnt[(size_t) l]; ++tot; }
-                    const int mean_cnt = (int) (tot / NL);
-                    struct CV { float v; int32_t layer, e; };
-                    std::vector<CV> cc, vv;
-                    for (int64_t l = 0; l < NL; ++l) {
-                        const float* u = drive.d.usage.data() + l * NE;
-                        const int32_t* r = host_res.data() + l * NE;
-                        for (int32_t e = 0; e < (int32_t) NE; ++e) {
-                            const size_t ix = (size_t) (l * NE + e);
-                            if (used[ix]) continue;
-                            if (r[e] < 0) {
-                                if (u[e] >= 2.0f && !helper_holds(l, e) && !(!lent_mask.empty() && lent_mask[ix])) cc.push_back({u[e] * fac[(size_t) l], (int32_t) l, e});
-                            } else if (swap_grace == 0 || swap_round - swapped_at[ix] > swap_grace) vv.push_back({u[e] * fac[(size_t) l], (int32_t) l, e});
+                    const int informed = strata::core::slot_share_factors((int) NL, fac.data());
+                    const bool ready = informed >= (int) (NL * 9 / 10);   // nothing moves or settles before the layers' factors are real (4,000 picks each)
+                    if (ready && cross_settled) {
+                        double mv = 0.0;
+                        for (int64_t l = 0; l < NL && l < (int64_t) cross_f.size(); ++l) mv = std::max(mv, (double) std::fabs(fac[(size_t) l] - cross_f[(size_t) l]) / std::max(1e-3, (double) cross_f[(size_t) l]));
+                        if (mv > 0.10) {
+                            cross_settled = false; cross_idle = 0;
+                            std::fprintf(stderr, "strata serve: cross-layer swaps: woke (a layer's miss share moved %.0f%%): moving toward the new targets\n", 100.0 * mv);
                         }
                     }
-                    std::sort(cc.begin(), cc.end(), [](const CV& a, const CV& b) { return a.v > b.v; });
-                    std::sort(vv.begin(), vv.end(), [](const CV& a, const CV& b) { return a.v < b.v; });
-                    const int floor_cnt = std::max(1, mean_cnt / 2), ceil_cnt = mean_cnt * 2;
-                    int added = 0;
-                    for (const CV& c : cc) {
-                        if (added >= budget) break;
-                        if (cnt[(size_t) c.layer] >= ceil_cnt) continue;
-                        for (CV& v : vv) {
-                            if (v.layer < 0 || v.layer == c.layer) continue;
-                            if (c.v - v.v < o.adapt_min_gain) break;   // the victims only get hotter down the list
-                            if (cnt[(size_t) v.layer] <= floor_cnt) continue;
-                            const int32_t slot = host_res[(size_t) (v.layer * NE + v.e)];
-                            if (slot < 0 || xcache.slot_capacity(slot) < (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(c.layer)) continue;
-                            Swap sw{c.v - v.v, c.layer, c.e, v.e};
-                            sw.out_layer = v.layer;
-                            swaps.push_back(sw);
-                            --cnt[(size_t) v.layer]; ++cnt[(size_t) c.layer];
-                            v.layer = -1;
-                            ++added;
-                            break;
+                    if (ready && !cross_settled) {
+                        std::vector<int> cnt((size_t) NL, 0);
+                        int64_t tot = 0;
+                        for (int64_t l = 0; l < NL; ++l)
+                            for (int64_t e = 0; e < NE; ++e)
+                                if (host_res[(size_t) (l * NE + e)] >= 0) { ++cnt[(size_t) l]; ++tot; }
+                        const double mean = (double) tot / (double) NL;
+                        double fsum = 0.0;
+                        for (float x : fac) fsum += x;
+                        // targets: each layer's share of the resident experts in proportion to its factor, kept between half and twice the mean; a layer clamped at a bound is fixed there and the rest
+                        // are scaled over what remains, repeated until none moves, so the targets add up to exactly the total (not less: then every layer looks over its target and nothing is under)
+                        std::vector<double> target((size_t) NL, mean);
+                        {
+                            std::vector<char> fixed((size_t) NL, 0);
+                            const double lo = 0.5 * mean, hi = 2.0 * mean;
+                            for (int round = 0; round < 12; ++round) {
+                                double fixed_sum = 0.0, free_f = 0.0;
+                                for (int64_t l = 0; l < NL; ++l) { if (fixed[(size_t) l]) fixed_sum += target[(size_t) l]; else free_f += fac[(size_t) l]; }
+                                const double rest = (double) tot - fixed_sum;
+                                bool changed = false;
+                                for (int64_t l = 0; l < NL; ++l) {
+                                    if (fixed[(size_t) l]) continue;
+                                    const double t = rest * fac[(size_t) l] / std::max(1e-9, free_f);
+                                    if (t < lo) { target[(size_t) l] = lo; fixed[(size_t) l] = 1; changed = true; }
+                                    else if (t > hi) { target[(size_t) l] = hi; fixed[(size_t) l] = 1; changed = true; }
+                                    else target[(size_t) l] = t;
+                                }
+                                if (!changed) break;
+                            }
+                        }
+                        const double tol = std::max(2.0, 0.05 * mean);
+                        // a layer is fed from slots that hold its experts: a donor layer whose experts are at least as big.  No layer is ruled out: a big-expert layer is under target for real
+                        // only while such a donor exists (otherwise it stays as it is and does not hold the settling back).
+                        std::vector<int64_t> blobs((size_t) NL);
+                        for (int64_t l = 0; l < NL; ++l) blobs[(size_t) l] = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                        int64_t max_donor_blob = 0;
+                        for (int64_t l = 0; l < NL; ++l)
+                            if ((double) cnt[(size_t) l] - target[(size_t) l] > tol) max_donor_blob = std::max(max_donor_blob, blobs[(size_t) l]);
+                        auto can_receive = [&](int64_t l) { return blobs[(size_t) l] <= max_donor_blob; };
+                        int nd = 0, nr = 0;
+                        for (int64_t l = 0; l < NL; ++l) {
+                            const double dev = (double) cnt[(size_t) l] - target[(size_t) l];
+                            nd += dev > tol ? 1 : 0;
+                            nr += (dev < -tol && can_receive(l)) ? 1 : 0;
+                        }
+                        if (nd == 0 || nr == 0 || cross_idle >= 256) {
+                            cross_settled = true;
+                            cross_f = fac;
+                            std::fprintf(stderr, "strata serve: cross-layer swaps: settled (%s): %d layers over their target, %d under, %lld slots moved in all (last look: %zu candidates, %zu victims; pairs refused: %d without a usable slot, %d blob too big, %d victim too hot); nothing is counted until a layer's miss share moves 10%%\n",
+                                         nd == 0 || nr == 0 ? "every layer within its tolerance" : "nothing more could be moved", nd, nr, (long long) cross_total,
+                                         cross_nc, cross_nv, cross_rej[0], cross_rej[1], cross_rej[2]);
+                        } else {
+                            // the copies' allowance (10% of a window's time at the measured time per expert) is shared with the same-layer swaps, but the cross-layer ones, which fix the allocation, keep at least half of it
+                            const int allow = cross_copy_ms > 0 && cross_win_ms > 0 ? (int) (0.10 * cross_win_ms / cross_copy_ms) : 8;
+                            const int budget = std::max(allow / 2, allow - (int) swaps.size());
+                            std::vector<char> used((size_t) (NL * NE), 0);
+                            for (const Swap& s : swaps) { used[(size_t) (s.layer * NE + s.in)] = 1; used[(size_t) (ol(s) * NE + s.out)] = 1; }
+                            struct CV { float v; int32_t layer, e; };
+                            std::vector<CV> cc, vv;
+                            for (int64_t l = 0; l < NL; ++l) {
+                                const double dev = (double) cnt[(size_t) l] - target[(size_t) l];
+                                const bool recv = dev < -tol && can_receive(l), donor = dev > tol;
+                                if (!recv && !donor) continue;
+                                const float* u = drive.d.usage.data() + l * NE;
+                                const int32_t* r = host_res.data() + l * NE;
+                                for (int32_t e = 0; e < (int32_t) NE; ++e) {
+                                    const size_t ix = (size_t) (l * NE + e);
+                                    if (used[ix]) continue;
+                                    if (recv && r[e] < 0) {
+                                        if (u[e] >= 2.0f && !helper_holds(l, e) && !(!lent_mask.empty() && lent_mask[ix])) cc.push_back({u[e] * fac[(size_t) l], (int32_t) l, e});
+                                    } else if (donor && r[e] >= 0 && (swap_grace == 0 || swap_round - swapped_at[ix] > swap_grace)) {
+                                        vv.push_back({u[e] * fac[(size_t) l], (int32_t) l, e});
+                                    }
+                                }
+                            }
+                            std::sort(cc.begin(), cc.end(), [](const CV& a, const CV& b) { return a.v > b.v; });
+                            std::sort(vv.begin(), vv.end(), [](const CV& a, const CV& b) { return a.v < b.v; });
+                            int added = 0;
+                            cross_nc = cc.size(); cross_nv = vv.size();
+                            cross_rej[0] = cross_rej[1] = cross_rej[2] = 0;
+                            for (const CV& c : cc) {
+                                if (added >= budget) break;
+                                if ((double) cnt[(size_t) c.layer] >= target[(size_t) c.layer]) continue;   // this layer has reached its target
+                                CV* best = nullptr;
+                                int64_t best_waste = INT64_MAX;
+                                const int64_t need = blobs[(size_t) c.layer];
+                                for (CV& v : vv) {
+                                    if (v.layer < 0 || v.layer == c.layer) continue;
+                                    if ((double) cnt[(size_t) v.layer] <= target[(size_t) v.layer]) continue;   // that layer has given what it should
+                                    if (c.v < 0.8f * v.v) { ++cross_rej[2]; break; }   // a victim much hotter than the candidate: not worth the move (the list only gets hotter)
+                                    const int32_t slot = host_res[(size_t) (v.layer * NE + v.e)];
+                                    if (slot < 0 || (int64_t) slot >= xcache.full_slots()) { ++cross_rej[0]; continue; }   // not a slot of this cache: never a victim
+                                    const int64_t cap = xcache.slot_capacity(slot);
+                                    if (cap < need) { ++cross_rej[1]; continue; }   // the expert does not fit this slot
+                                    const int64_t waste = cap - need;
+                                    if (waste < best_waste) { best_waste = waste; best = &v; if (waste < 4096) break; }   // a slot of the same size: nothing is wasted; take the coldest such
+                                }
+                                if (best != nullptr) {
+                                    Swap sw{c.v - best->v, c.layer, c.e, best->e};
+                                    sw.out_layer = best->layer;
+                                    swaps.push_back(sw);
+                                    --cnt[(size_t) best->layer]; ++cnt[(size_t) c.layer];
+                                    best->layer = -1;
+                                    ++added;
+                                }
+                            }
+                            if (added > 0) cross_idle = 0; else if (budget > 0) ++cross_idle;   // only a look that had room to move and moved nothing counts toward giving up
+                            cross_total += added;
+                            if (added > 0 && (cross_logs++ % 16) == 0)
+                                std::fprintf(stderr, "strata serve: cross-layer swaps: %d this round, %lld in all, %d layers over target, %d under (budget %d: %.3f ms to copy an expert, %.1f ms a window)\n",
+                                             added, (long long) cross_total, nd, nr, budget, cross_copy_ms, cross_win_ms);
                         }
                     }
-                    cross_idle = added > 0 ? 0 : cross_idle + 1;
-                    cross_total += added;
-                    if (added > 0 && (cross_logs++ % 128) == 0)
-                        std::fprintf(stderr, "strata serve: cross-layer swaps: %d this round, %lld in all (budget %d: %.3f ms to copy an expert, %.1f ms a window, 10%% of it for the copies)\n",
-                                     added, (long long) cross_total, budget, cross_copy_ms, cross_win_ms);
                 }
             }
             if (swap2_max > 0) {   // SWAP2: after the demand swaps, into cold slots only

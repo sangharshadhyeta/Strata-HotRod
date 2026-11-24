@@ -734,7 +734,7 @@ float layer_budget_shape(int64_t layer);   ///< per-layer stand-in budget multip
 void slot_share_apply(float* usage, const float* before, int n_layers, int n_expert);   ///< STRATA_SLOT_SHARE=1: scale a swap round's newly drained usage per layer by its share of non-skippable misses (ratios)
 bool slot_share_on();
 bool cross_swap_on();   ///< STRATA_CROSS_SWAP (on by default, =0 off): the adaptive tier may move a slot between layers (see generate.cpp)
-void slot_share_factors(int n_layers, float* f);
+int slot_share_factors(int n_layers, float* f);   ///< the layers' factors; returns how many layers have enough picks for a real one
 uint32_t layer_mult_generation();   ///< moves when the multiplier table really changes; callers that copy it elsewhere ask again only then
 float layer_mult_shape(int64_t layer);   ///< the same multipliers divided by their mean: the shape only (the per-layer stand-in budget, STRATA_LAYER_SUB)
 /// The live per-layer thresholds (default with the default weight rule; STRATA_LAYER_LIVE=0 off): every layer starts at the configured threshold; a running histogram of the router weights

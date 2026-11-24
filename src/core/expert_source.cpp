@@ -6511,9 +6511,12 @@ void slot_share_apply(float* usage, const float* before, int n_layers, int n_exp
     }
 }
 /// The layers' factors now (ratios: each layer's share of non-skippable misses over the mean, 0.5..2; 1 until a layer has enough picks), from the live per-layer counters.
-void slot_share_factors(int n_layers, float* f) {
+int slot_share_factors(int n_layers, float* f) {   // returns how many layers had enough picks to have a real factor
     double nsm[kLayerMultCap];
     slot_share_compute(n_layers, f, nsm);
+    int informed = 0;
+    for (int l = 0; l < n_layers && l < kLayerMultCap; ++l) informed += nsm[l] >= 0 ? 1 : 0;
+    return informed;
 }
 uint32_t layer_mult_generation() { return g_mult_gen.load(std::memory_order_relaxed); }
 float layer_mult_shape(int64_t layer) {
