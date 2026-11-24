@@ -13,6 +13,11 @@ Severity: critical / high / medium / low. Status: open / fixed (commit) / wontfi
 
 ## F-03 (low, open) - the integrity monitor uses a synchronous `cudaMemcpy` on the serve thread
 - 2 x ~4 MB device-to-host every 8th adapt round; a legacy-stream copy waits for the device. Cost not measured; it may be part of the unexplained 19.1 tok/s batch. Measure before changing (the check itself must stay).
+- Measured 24 Nov (same prompts, one restart per arm): double slots off 22.0 tok/s median vs on 21.6 - within noise; by arithmetic the check is ~0.4 ms per 8 rounds of ~170 ms windows (~0.03%). Not worth an async rewrite: wontfix.
+
+## F-08 (high, fixed (ad5831c81)) - the engine stopped on "adaptive swap copy failed (layer 18, slot -1)" (found on 8095, 24 Nov)
+- Cause: SWAP2 (`STRATA_SWAP2_MAX=2` in the install config) builds its taken set from each swap's candidate and FIRST victim only, so it could pick a double slot's second victim; evict2 had already cleared that expert when SWAP2's copy ran, the copy saw slot -1 and `adapt()` returned false (the server restarted the engine; a request in that gap got a 400). Shipped in ratrod.v1.2 (double slots on by default).
+- Fix: SWAP2's taken set and the cross-layer candidate filter include `out2`; and a guard before the copies drops any swap whose victim (first or second) is already another swap's victim, whose candidate is already coming in, or whose victim is not resident - so a slip in any victim choice costs one swap, not the engine (one log line, later drops counted silently). The double-slot swaps precede SWAP2's, so they are kept.
 
 ## From P0-B (architecture map), each checked against the code by the lead
 - **F-04 (medium, fixed (815dbbf43)) - stdin writes bypass the write lock.** `serve/server.py` 1170 (VRAM), 2092 (GEN/GENI), 2175 (STOP), 2317 (SAVE/RESTORE) write `proc.stdin` directly; only `_send` (1281) takes `wlock`, whose own comment says writes come "from several request threads". A `/v1/vram` or session save arriving while a GEN line is written can interleave two lines into one malformed command. Fix: route them through `_send` (keep each one's own error handling). Checked: 2281 is `quit_line` at shutdown (single writer) - fine.
