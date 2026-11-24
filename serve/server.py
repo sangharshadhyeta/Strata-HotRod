@@ -3188,8 +3188,10 @@ def set_timeline(on: bool) -> None:
     # truncation (a reader in between would see an empty file, read as off).  A busy file is tried again for a moment.
     for attempt in range(20):
         try:
-            with open(TIMELINE_CTL, "r+b" if os.path.exists(TIMELINE_CTL) else "wb") as f:
-                f.seek(0)
+            # S-04: the name is predictable in the shared temp dir, so the open never follows a symlink (O_NOFOLLOW where the OS
+            # has it: a planted link is an error, not a write elsewhere) and a new file is 0600.  No O_TRUNC: see above.
+            fd = os.open(TIMELINE_CTL, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o600)
+            with os.fdopen(fd, "wb") as f:
                 f.write(b"1" if on else b"0")
             break
         except PermissionError:
