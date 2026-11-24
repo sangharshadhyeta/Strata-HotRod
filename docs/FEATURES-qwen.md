@@ -633,8 +633,8 @@ Arguments (`args`):
 | `STRATA_SWAP2_GAP` | unset | HotRod |  | (no comment) | include/strata/kernels/native_router.hpp:155 |
 | `STRATA_SWAP2_MAX` | unset | HotRod |  | (no comment) | include/strata/kernels/native_router.hpp:151 |
 | `STRATA_SWAP2_MIN` | see code | HotRod |  | (no comment) | src/program/generate.cpp:10370 |
-| `STRATA_SWAP_COST` | see code | HotRod |  | STRATA_SWAP_COST=<c> (opt-in): a swap-in candidate whose bytes are not in the page cache has its heat divided by 1 + c (cost-aware, after GreedyDual-Size) | src/program/generate.cpp:10361 |
-| `STRATA_SWAP_GRACE` | 0 | HotRod |  | SPEC 13.36 / 13.49 (T6): a grace period. STRATA_SWAP_GRACE=N rounds: an expert swapped in cannot be chosen as a victim for the next N rounds (0 = off, the rule as it was: the least-used resident expert of the layer is the victim) | src/program/generate.cpp:10357 |
+| `STRATA_SWAP_COST` | see code | HotRod |  | STRATA_SWAP_COST=<c> (opt-in): a swap-in candidate whose bytes are not in the page cache has its heat divided by 1 + c (cost-aware, after GreedyDual-Size) | removed 24 Nov 2026 (ratrod clean-up; was src/program/generate.cpp:10361) |
+| `STRATA_SWAP_GRACE` | 0 | HotRod |  | SPEC 13.36 / 13.49 (T6): a grace period. STRATA_SWAP_GRACE=N rounds: an expert swapped in cannot be chosen as a victim for the next N rounds (0 = off, the rule as it was: the least-used resident expert of the layer is the victim) | removed 24 Nov 2026 (ratrod clean-up; was src/program/generate.cpp:10357) |
 | `STRATA_SYCL_BIN` | unset | upstream |  | (no comment) | serve/server.py:2608 |
 | `STRATA_TAIL_SKIP_MAX_CACHED` | see code | upstream |  | (no comment) | src/program/generate.cpp:10053 |
 | `STRATA_TEST_BELL_SLEEP_US` | see code | upstream |  | (no comment) | src/program/generate.cpp:14428 |

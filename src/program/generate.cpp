@@ -11051,14 +11051,6 @@ int main(int argc, char** argv) {
         }
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
-        // SPEC 13.36 / 13.49 (T6): a grace period. STRATA_SWAP_GRACE=N rounds: an expert swapped in cannot be chosen as a victim for the next N
-        // rounds (0 = off, the rule as it was: the least-used resident expert of the layer is the victim)
-        const int swap_grace = [] { const char* v = std::getenv("STRATA_SWAP_GRACE"); return v ? std::max(0, std::atoi(v)) : 0; }();
-        std::vector<int64_t> swapped_at((size_t) (g.n_layers * g.n_expert), -1000000);
-        int64_t swap_round = 0;
-        // STRATA_SWAP_COST=<c> (opt-in): a swap-in candidate whose bytes are not in the page cache has its heat divided by 1 + c (cost-aware, after GreedyDual-Size)
-        const float swap_cost = [] { const char* v = std::getenv("STRATA_SWAP_COST"); return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f; }();
-        int64_t cost_cut = 0;
         // SWAP2 (STRATA_SWAP2_MAX=n, default 0 = off; opt-in): quality swaps.  A non-resident expert of rank >= the floor is replaced by a resident stand-in
         // and never counted as demand, so the swap round never brings it in.  The kernel counts the experts stand-ins replaced (usage2); a round may bring
         // the most replaced ones (usage2 >= STRATA_SWAP2_MIN, default 3) into slots NOTHING needs (a resident whose own use is below STRATA_SWAP2_COLD,
@@ -11120,7 +11112,6 @@ int main(int argc, char** argv) {
                 }
             }
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
-            ++swap_round;
             // STRATA_RESIDENCY_FILE=<path> (the server sets it for the Monitor's residency view): at most every 2 s, one JSON snapshot of which experts
             // are in VRAM - a character per expert, 0 not resident, 1 resident and cold (decayed use < 1), 2 warm (< 4), 3 hot - written aside and renamed
             strata::core::timeline_tick();   // the Monitor's decode timeline: its switch and its chunk (at most every 0.5 s)
@@ -11181,16 +11172,10 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) && !(!lent_mask.empty() && lent_mask[(size_t) (l * g.n_expert + e)])) cand.emplace_back(u[e] * (kbias != nullptr ? kbias[e] : 1.0f), e); }
-                    else if (swap_grace == 0 || swap_round - swapped_at[(size_t) (l * g.n_expert + e)] > swap_grace) vict.emplace_back(u[e] * (kbias != nullptr ? kbias[e] : 1.0f), e);
+                    else vict.emplace_back(u[e] * (kbias != nullptr ? kbias[e] : 1.0f), e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-                if (swap_cost > 0.0f && srcp != nullptr) {   // GreedyDual-Size (the solid page): a swap-in of an expert the page cache lacks costs a drive read, so its heat counts for less
-                    const size_t top = std::min<size_t>(cand.size(), 6);
-                    for (size_t i = 0; i < top; ++i)
-                        if (!srcp->page_cached(l, cand[i].second)) { cand[i].first /= (1.0f + swap_cost); ++cost_cut; }
-                    std::sort(cand.begin(), cand.begin() + (ptrdiff_t) top, [](auto& a, auto& b) { return a.first > b.first; });
-                }
                 const size_t nc = std::min(cand.size(), vict.size());
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
@@ -11351,7 +11336,7 @@ int main(int argc, char** argv) {
                                     if (used[ix]) continue;
                                     if (recv && r[e] < 0) {
                                         if (u[e] >= 2.0f && !helper_holds(l, e) && !(!lent_mask.empty() && lent_mask[ix])) cc.push_back({u[e] * fac[(size_t) l], (int32_t) l, e});
-                                    } else if (donor && r[e] >= 0 && (swap_grace == 0 || swap_round - swapped_at[ix] > swap_grace)) {
+                                    } else if (donor && r[e] >= 0) {
                                         vv.push_back({u[e] * fac[(size_t) l], (int32_t) l, e});
                                     }
                                 }
@@ -11422,7 +11407,6 @@ int main(int argc, char** argv) {
                                         const int l1 = i1 / (int) NE, l2 = i2 / (int) NE;
                                         if (l1 == c.layer || l2 == c.layer) continue;
                                         if ((double) cnt[(size_t) l1] <= target[(size_t) l1] || (double) cnt[(size_t) l2] <= target[(size_t) l2]) continue;   // both layers have more than they should
-                                        if (swap_grace != 0 && (swap_round - swapped_at[(size_t) i1] <= swap_grace || swap_round - swapped_at[(size_t) i2] <= swap_grace)) continue;
                                         if (xcache.slot_stride_bytes((int32_t) sl) + xcache.slot_capacity((int32_t) sl + 1) < need) continue;
                                         const float cost = drive.d.usage[(size_t) i1] * fac[(size_t) l1] + drive.d.usage[(size_t) i2] * fac[(size_t) l2];
                                         if (cost < best_cost) { best_cost = cost; best_s = sl; }
@@ -11470,7 +11454,7 @@ int main(int argc, char** argv) {
                     for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                         if (taken[(size_t) (l * g.n_expert + e)]) continue;
                         if (r[e] < 0) { if (u2[e] >= swap2_min && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) && !(!lent_mask.empty() && lent_mask[(size_t) (l * g.n_expert + e)])) c2.emplace_back(u2[e], e); }
-                        else if (u[e] < swap2_cold && (swap_grace == 0 || swap_round - swapped_at[(size_t) (l * g.n_expert + e)] > swap_grace)) v2.emplace_back(u[e], e);
+                        else if (u[e] < swap2_cold) v2.emplace_back(u[e], e);
                     }
                     if (c2.empty() || v2.empty()) continue;
                     std::sort(c2.begin(), c2.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -11507,7 +11491,6 @@ int main(int argc, char** argv) {
                 if (dropped > 0 && (guard_drops += (int64_t) dropped) == (int64_t) dropped)
                     std::fprintf(stderr, "strata serve: adaptive swaps: %zu swap(s) dropped this round (a victim taken twice or not resident); the rest go on (further drops counted silently)\n", dropped);
             }
-            for (const Swap& s : swaps) swapped_at[(size_t) (s.layer * g.n_expert + s.in)] = swap_round;   // the grace starts now
             ++life_rounds;
             life_swaps += (int64_t) swaps.size();
             // STRATA_TRACE_ADAPT: what each serve swap round saw and did (default off, one getenv)
