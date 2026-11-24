@@ -6502,6 +6502,34 @@ void layout_weights_save(int n_layers, const float* fac) {
     if (!ok) std::fprintf(stderr, "strata serve: layer weights: could not write %s (the file is unchanged)\n", g_layout_path.c_str());
     else g_layout_written = nx;
 }
+// The settled layout as the next start's weights: the live cross-layer swap moves one slot at a time from a colder expert to a hotter one and stops when no move pays, so
+// the layer counts it settles at are the layout worth starting from.  Replaces the compounding update (used x sqrt(miss factor) at every start), which kept growing a
+// layer that misses more than average until the x3 cap whether or not its extra slots helped.  A fixed point by construction: the same settle writes nothing (3% rule).
+void layout_weights_save_counts(int n_layers, const int* cnt) {
+    std::lock_guard<std::mutex> lk(g_layout_mu);
+    if (g_layout_path.empty() || n_layers <= 0) return;
+    double sum = 0.0;
+    for (int l = 0; l < n_layers; ++l) sum += (double) std::max(0, cnt[l]);
+    if (sum <= 0.0) return;
+    const double mean = sum / n_layers;
+    std::vector<float> nx((size_t) n_layers);
+    for (int l = 0; l < n_layers; ++l) nx[(size_t) l] = std::min(3.0f, std::max(0.25f, (float) ((double) std::max(0, cnt[l]) / mean)));
+    double mv = 0.0;
+    if ((int) g_layout_written.size() == n_layers)
+        for (int l = 0; l < n_layers; ++l) mv = std::max(mv, (double) std::fabs(nx[(size_t) l] - g_layout_written[(size_t) l]) / std::max(1e-3, (double) g_layout_written[(size_t) l]));
+    else mv = 1.0;
+    if (mv <= 0.03) return;   // the same layout as the file holds: nothing to write
+    const uint32_t mg = 0x31574c4cu, n = (uint32_t) n_layers;
+    const bool ok = write_file_atomic(g_layout_path, [&](FILE* f) {
+        return put_bytes(f, &mg, 4, 1) && put_bytes(f, &n, 4, 1) && put_bytes(f, nx.data(), 4, (size_t) n_layers);
+    });
+    if (!ok) std::fprintf(stderr, "strata serve: layer weights: could not write %s (the file is unchanged)\n", g_layout_path.c_str());
+    else {
+        g_layout_written = nx;
+        std::fprintf(stderr, "strata serve: layer weights: the settled layout is saved for the next start (x%.2f..x%.2f per layer)\n",
+                     (double) *std::min_element(nx.begin(), nx.end()), (double) *std::max_element(nx.begin(), nx.end()));
+    }
+}
 uint32_t layer_mult_generation() { return g_mult_gen.load(std::memory_order_relaxed); }
 float layer_mult_shape(int64_t layer) {
     const int n = g_mult_layers.load(std::memory_order_relaxed);

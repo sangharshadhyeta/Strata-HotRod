@@ -11241,7 +11241,7 @@ int main(int argc, char** argv) {
                     const bool ready = informed >= (int) (NL * 9 / 10);   // nothing moves or settles before the layers' factors are real (4,000 picks each)
                     if (ready) {   // the next start's layout weights (damped): at most once a minute, from the counters since the start, so the last save before shutdown is the best-informed one
                         const auto tnow = Clock::now();
-                        if (cross_saves == 0 || tnow - cross_save_t >= std::chrono::seconds(60)) { strata::core::layout_weights_save((int) NL, fac.data()); cross_save_t = tnow; cross_saves = 1; }
+                        (void) tnow;   // (the next start's layout is saved where the swap settles, from the settled counts: see layout_weights_save_counts)
                     }
                     if (ready && cross_settled) {
                         double mv = 0.0;
@@ -11301,6 +11301,7 @@ int main(int argc, char** argv) {
                             cross_settled = true;
                             cross_f = fac;
                             strata::core::ls_set_sampled(true);   // settled: the counters sample every 16th window
+                            strata::core::layout_weights_save_counts((int) NL, cnt.data());   // the next start begins from this settled layout
                             {   // the facts behind the numbers: the layers under their target (count -> target, factor, expert size, whether a donor has slots that hold it), and the totals
                                 double tsum = 0.0;
                                 for (int64_t l = 0; l < NL; ++l) tsum += target[(size_t) l];

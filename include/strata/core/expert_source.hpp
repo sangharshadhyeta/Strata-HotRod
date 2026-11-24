@@ -737,7 +737,8 @@ bool cross_swap_on();   ///< STRATA_CROSS_SWAP (on by default, =0 off): the adap
 int slot_share_factors(int n_layers, float* f);
 void layout_weights_init(const std::string& path, int n_layers, std::vector<float>& w);   ///< the saved per-layer layout weights (ratios, mean 1; ones when none); remembers them as the ones this layout uses
 void ls_set_sampled(bool on);   ///< the per-pick counters count every 16th window only (the cross-layer swap settled) or every window
-void layout_weights_save(int n_layers, const float* fac);   ///< writes the next start's weights: used x sqrt(miss factor), damped (see expert_source.cpp)   ///< the layers' factors; returns how many layers have enough picks for a real one
+void layout_weights_save(int n_layers, const float* fac);
+void layout_weights_save_counts(int n_layers, const int* cnt);   ///< the next start's weights = where the live cross-layer swap settled (each layer's resident count over the mean)   ///< writes the next start's weights: used x sqrt(miss factor), damped (see expert_source.cpp)   ///< the layers' factors; returns how many layers have enough picks for a real one
 uint32_t layer_mult_generation();   ///< moves when the multiplier table really changes; callers that copy it elsewhere ask again only then
 float layer_mult_shape(int64_t layer);   ///< the same multipliers divided by their mean: the shape only (the per-layer stand-in budget, STRATA_LAYER_SUB)
 /// The live per-layer thresholds (default with the default weight rule; STRATA_LAYER_LIVE=0 off): every layer starts at the configured threshold; a running histogram of the router weights
