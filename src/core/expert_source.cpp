@@ -51,7 +51,6 @@
 #define NOMINMAX   // std::numeric_limits<T>::max() below
 #endif
 #include <windows.h>
-#include <io.h>   // _commit: the state files' fsync (write_file_atomic)
 #else
 #include <fcntl.h>
 #if defined(__APPLE__)
@@ -6033,9 +6032,10 @@ float g_sh_w[512];                  // the router weight of the missed candidate
 uint32_t g_sh_cand[512];            // the window stamp it was set in
 uint32_t g_sh_stamp = 0;
 bool g_sh_rec = false;              // this window's candidates are to be recorded after the CPU's run
-// F-05: a state file is written whole or not at all.  The bytes go to <path>.tmp, every write is checked, the data is flushed to disk, and only then the
+// F-05: a state file is written whole or not at all.  The bytes go to <path>.tmp, every write is checked, the stream is flushed, and only then the
 // temp file replaces the file.  Any failure removes the temp file and returns false: the file on disk stays as it was.  `fill` writes into the open file
-// and returns false when one of its writes failed.
+// and returns false when one of its writes failed.  No fsync: these saves run under g_sh_mu on the decode path, so a disk sync would stall decode; a
+// short or empty file left by a power cut is rejected whole by the readers and the learner starts fresh.
 inline bool put_bytes(FILE* f, const void* p, size_t size, size_t n) { return std::fwrite(p, size, n, f) == n; }
 template <class Fill>
 bool write_file_atomic(const std::string& path, Fill fill) {
@@ -6044,11 +6044,6 @@ bool write_file_atomic(const std::string& path, Fill fill) {
     if (f == nullptr) return false;
     bool ok = fill(f);
     if (std::fflush(f) != 0) ok = false;
-#if defined(_WIN32)
-    if (ok && _commit(_fileno(f)) != 0) ok = false;
-#else
-    if (ok && ::fsync(fileno(f)) != 0) ok = false;
-#endif
     if (std::fclose(f) != 0) ok = false;
     std::error_code ec;
     if (ok) std::filesystem::rename(tmp, path, ec);
