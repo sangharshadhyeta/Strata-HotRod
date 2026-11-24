@@ -25,7 +25,9 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
 - **API key.** `"api_key"` in the run config (or `STRATA_API_KEY`) is required on `/v1/*` and on every endpoint
   that shows the model's state, requests or answers (`/status`, `/metrics`, `/settings`, `/mcp`, `/props`, `/slots`,
   `/api/requests`, `/config`) and on every `POST`. It is compared in constant time. Set one before you open the
-  server to your network or put a tunnel in front of it.
+  server to your network or put a tunnel in front of it. `/health` is open without a key: it returns the model's
+  name, the context size, whether images and image generation are on, whether an API key is set, and whether the
+  model is loaded.
 - **Host check (DNS rebinding, 0.1.38).** Without an API key the server answers only requests whose `Host` is a name
   it knows (`localhost`, an IP address, the address it listens on and, when it listens beyond this PC, this PC's
   name). Others get 403. `"allowed_hosts"` adds names; with an API key the key decides.
@@ -34,7 +36,8 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
   `"trusted_origins"` / `"cors_origins"`. Changing settings (`/settings`, and `/config`: the few run config keys the
   page's Model settings may change - never the network, key, MCP or program keys), `/load` and `/unload` and the
   MCP tools are accepted only as JSON from Strata's own page (or `"trusted_origins"`), so a page elsewhere cannot
-  change settings or run tools.
+  change settings or run tools. These checks guard against other web pages in a browser. They do not guard against
+  other programs on this PC: with no API key, any program that can reach the server is trusted.
 - **CORS** is off unless `"cors_origins"` lists origins, and then only for `/v1/*`.
 - **MCP tools** are opt-in: only the servers you put in the run config, only for requests from Strata's own page
   that ask for them. They run with your user's rights, and the model decides when to call them.
