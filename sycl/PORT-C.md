@@ -21,6 +21,16 @@ it is the testers' part (issue #7).
 | S3 | kernels: SYCL versions of what the features added since 22 Oct call (23 new kernels in `native_router.cu` - look-ahead learner, stand-ins, MTP zero-copy, route mask; plus smaller ones in 7 files; 4 `.cu` with no copy) | after S2 |
 | S4 | link, then hand the branch to an Arc tester | |
 
+## What the S2b merge gave up on the SYCL build (to bring back)
+
+- `prefill`: the short first chunk (`STRATA_PREFILL_FIRST`, the GPU starting while the rest of the prompt's PLE rows
+  are read) and the setup timers (`lap`, `STRATA_PREFILL_TIMING`): they lived in the chunk loop our side rebuilt
+  (multi-job batches, setup/layer phases).
+- `prefill`: the stager keeps the SYCL design (one job at a time, GGUF reads by the stager, sequence-numbered copies);
+  our batched source reads (`copy_blobs`) and the "a failed read stops the request, not the engine" change are not in it.
+- `verify`: the overlapped layer split (a split's next stage prelaunched): `chain_overlap()` is false (no HostGraphLaunch).
+- The CPU share of the prompt path (`STRATA_PREFILL_CPU_SHARE`) is new to the SYCL build (the copy predated it).
+
 ## The Intel design that has to move (S2b)
 
 From the copies (`grep "SYCL port"`, and the switches only the copies read):

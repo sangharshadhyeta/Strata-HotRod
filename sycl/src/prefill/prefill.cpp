@@ -1,28 +1,15 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
-<<<<<<< sycl
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/copy_queue.hpp"
 #include "strata/prefill/xmx_moe.hpp"
-||||||| base
-=======
 #include "strata/kernels/fused_gr.hpp"
->>>>>>> ours-now
 #include "strata/prefill/prefill.hpp"
-<<<<<<< sycl
 #include "strata/core/gguf_expert_source.hpp"
 #include "../../../src/prefill/mmq_resident_sort.hpp"
 #include "../../../src/prefill/wmma_gemm.h"
-||||||| base
-#include <atomic>
-#if defined(__cpp_lib_atomic_wait)
-#define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
-#endif
-#include "mmq_resident_sort.hpp"
-#include "wmma_gemm.h"
-=======
 #include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/dma_batch.hpp"   // h2d_split (the expert copies)
@@ -30,9 +17,6 @@
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
 #endif
-#include "mmq_resident_sort.hpp"
-#include "wmma_gemm.h"
->>>>>>> ours-now
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
@@ -323,16 +307,13 @@ inline int ring_slots(size_t T) {
     const int big = r < 16 ? 16 : r > ring_cap() ? ring_cap() : r;
     return (int64_t) T >= stream_all_min() ? big : STAGE;
 }
-<<<<<<< sycl
 // A770 port: STRATA_PF_XMX=2 holds up to a group of staged experts until its launch, so routed-only staging needs
 // that many more slots for the lookahead to keep copying (the slots are only reused once the group's event is in)
 inline int stage_slots() { return strata::prefill::xmx::mode() == 2 ? STAGE + strata::prefill::xmx::kMaxGroup : STAGE; }
-||||||| base
-=======
-// The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather.  Counted
-// and taken through this one place, so the bytes the prompt path borrows cover every buffer it writes.
-inline int stage_slots(size_t T) { return std::max(ring_slots(T), STAGE_GRP); }
->>>>>>> ours-now
+// The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather - and, under
+// STRATA_PF_XMX=2, the group of staged experts above.  Counted and taken through this one place, so the bytes the
+// prompt path borrows cover every buffer it writes.
+inline int stage_slots(size_t T) { return std::max(std::max(ring_slots(T), STAGE_GRP), stage_slots()); }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // A770 port: STRATA_PF_XMX=1 dequantizes a whole group of experts, then one grouped XMX launch per product
 inline int dq_slots() { return strata::prefill::xmx::mode() == 1 ? strata::prefill::xmx::kMaxGroup : DQ; }
@@ -780,54 +761,11 @@ struct Stager {
                         std::fprintf(stderr, "prefill: reading expert %d of layer %d from the GGUF failed\n", jb.e, jb.l);
                         std::memset(buf[b], 0, jb.bytes);
                     }
-<<<<<<< sycl
                 } else if (jb.from == nullptr) {
                     std::memcpy(buf[b], jb.src, jb.bytes);
                 } else if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
                     std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
                     std::abort();
-||||||| base
-                    // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
-                    // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
-                    // was a ring entry the routing skipped (an event never recorded returns at once)
-                    cudaEventSynchronize(dma_done[i % kRing]);
-                }
-                int32_t rl[kMaxBatch], re[kMaxBatch];
-                uint8_t* rd[kMaxBatch];
-                size_t nr = 0;
-                core::ExpertSource* from = nullptr;
-                for (int i = j; i < j + k; ++i) {
-                    const Job& jb = jobs[(size_t) i];
-                    if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
-                    from = jb.from;
-                    rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
-                }
-                if (nr > 0 && !from->copy_blobs(rl, re, rd, nr)) {
-                    std::fprintf(stderr, "prefill: the expert source could not copy experts %d.. of layer %d\n", re[0], rl[0]);
-                    std::abort();
-=======
-                    // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
-                    // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
-                    // was a ring entry the routing skipped (an event never recorded returns at once)
-                    cudaEventSynchronize(dma_done[i % kRing]);
-                }
-                int32_t rl[kMaxBatch], re[kMaxBatch];
-                uint8_t* rd[kMaxBatch];
-                size_t nr = 0;
-                core::ExpertSource* from = nullptr;
-                for (int i = j; i < j + k; ++i) {
-                    const Job& jb = jobs[(size_t) i];
-                    if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
-                    from = jb.from;
-                    rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
-                }
-                if (nr > 0 && !from->copy_blobs(rl, re, rd, nr)) {
-                    // a read the drive (and the mapping) refused: the request fails (wait() answers null, the run's copy check
-                    // stops it) - it used to abort the whole engine.  The jobs are still marked ready so no waiter hangs.
-                    std::fprintf(stderr, "prefill: the expert source could not copy experts %d.. of layer %d (the request stops)\n",
-                                 re[0], rl[0]);
-                    failed.store(true, std::memory_order_release);
->>>>>>> ours-now
                 }
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
@@ -1057,21 +995,13 @@ struct Prefill::Impl {
     int32_t* grp_host = nullptr;
     int32_t* grp_dev = nullptr;          // its device alias
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
-<<<<<<< sycl
     uint16_t* dq_gu[strata::prefill::xmx::kMaxGroup] = {};
     uint16_t* dq_d[strata::prefill::xmx::kMaxGroup] = {};
-||||||| base
-    uint16_t* dq_gu[DQ] = {};
-    uint16_t* dq_d[DQ] = {};
-=======
-    uint16_t* dq_gu[DQ] = {};
-    uint16_t* dq_d[DQ] = {};
     // latent-experts branch: a latent pack's prompt path (D over the chunk -> the experts at the latent width -> U into the rows the combine reads)
     float *lat_xl32 = nullptr, *lat_yl = nullptr;
     uint16_t *lat_xl16 = nullptr, *lat_dqd = nullptr;
     uint16_t *lat_yl16 = nullptr, *lat_yg16 = nullptr;   // the latent rows as f16 (expert order), and regrouped by group: the per-group U GEMMs' input
     int32_t *lat_perm = nullptr, *lat_slot2 = nullptr;   // group position -> expert-order row; (token, k) -> its group-order row (the combine's slot table)
->>>>>>> ours-now
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
@@ -1187,25 +1117,13 @@ void Prefill::release() {
         if (impl_->used[i]) dpct::destroy_event(impl_->used[i]);
     }
     for (int b = 0; b < 2; ++b) {
-<<<<<<< sycl
-        if (impl_->hand[b])
-            sycl::free(impl_->hand[b], dpct::get_in_order_queue());
-        if (impl_->ple_copied[b]) dpct::destroy_event(impl_->ple_copied[b]);
-        if (b == 1 && impl_->ple_done_seq) { sycl::free(impl_->ple_done_seq, dpct::get_in_order_queue()); impl_->ple_done_seq = nullptr; }
-        if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty())
-            sycl::free(impl_->ple_emb_host[b], dpct::get_in_order_queue());
-||||||| base
-        if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
-        if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
-        if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
-=======
         if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
         if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
         for (cudaEvent_t& e : impl_->hand_ev[b])
             if (e) cudaEventDestroy(e);
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
+        if (b == 1 && impl_->ple_done_seq) { sycl::free(impl_->ple_done_seq, dpct::get_in_order_queue()); impl_->ple_done_seq = nullptr; }
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
->>>>>>> ours-now
     }
     if (impl_->copy) dpct::get_current_device().destroy_queue(impl_->copy);
     if (impl_->kv_copy) dpct::get_current_device().destroy_queue(
@@ -1718,15 +1636,9 @@ bool Prefill::carve(size_t T, void* alloc) {
         }
         if (base == nullptr) ok = false;
     }
-<<<<<<< sycl
     for (int i = 0; i < dq_slots(); ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
-||||||| base
-    for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
-=======
-    for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
     if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent)   // latent-experts branch: one layer's D as f16 [G * latent, N]
         m.lat_dqd = o.take<uint16_t>((size_t) core::latent_shared_info().groups * (size_t) ly.expert_embd * N, ok);
->>>>>>> ours-now
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         const size_t ids_rows = mmq_ids_rows(T);
@@ -1740,40 +1652,19 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
     }
     m.ring = ring_slots(T);
-<<<<<<< sycl
-    const int ring_n = std::max(m.ring, stage_slots());   // A770 port: STRATA_PF_XMX=2 holds a group of staged experts
-    if (o.base == nullptr && ring_n > 0) {
-||||||| base
-    if (o.base == nullptr && m.ring > 0) {
-=======
     const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
     if (o.base == nullptr && m.ring > 0) {
->>>>>>> ours-now
         // OWNED buffers: the ring in ONE allocation.  384 separate 2.7 MiB cudaMallocs each round up to a 2 MiB page
         // (~1.3 MiB a slot, ~0.5 GiB in all) that no count ever saw.  A borrowed region keeps its per-slot layout (and
         // so its price, `bytes_needed`: the loans' slot counts do not move).
-<<<<<<< sycl
-        uint8_t* ring_base = o.take<uint8_t>((size_t) ring_n * (size_t) MAXBLOB(), ok);
-        for (int i = 0; ok && i < ring_n; ++i) {
-||||||| base
-        uint8_t* ring_base = o.take<uint8_t>((size_t) m.ring * (size_t) MAXBLOB(), ok);
-        for (int i = 0; ok && i < m.ring; ++i) {
-=======
         uint8_t* ring_base = o.take<uint8_t>((size_t) nstage * (size_t) MAXBLOB(), ok);
         for (int i = 0; ok && i < nstage; ++i) {
->>>>>>> ours-now
             m.stage_dev[i] = ring_base + (size_t) i * (size_t) MAXBLOB();
             m.stage_live[i] = false;
             m.used_of[i] = i;
         }
     } else {
-<<<<<<< sycl
-        for (int i = 0; i < ring_n; ++i) {
-||||||| base
-        for (int i = 0; i < m.ring; ++i) {
-=======
         for (int i = 0; i < nstage; ++i) {
->>>>>>> ours-now
             m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
             m.stage_live[i] = false;                        // a new buffer: nothing of an earlier layout to wait for
             m.used_of[i] = i;
@@ -2290,30 +2181,6 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         for (int i = 0; ok && i < PeerPrefill::kGrpEv; ++i)
             ok = DPCT_CHECK_ERROR(pp->ev_grp[i] = new sycl::event()) == 0;
     }
-<<<<<<< sycl
-    auto take = [&](size_t bytes) -> void * {
-        try {
-    void *p = nullptr;
-        if (!ok ||
-            DPCT_CHECK_ERROR(p = (void *)strata::malloc_device_guarded(
-                                 bytes, dpct::get_in_order_queue())) != 0) {
-            ok = false; return nullptr;
-        }
-        pp->owned.push_back(p);
-        return p;
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
-    }
-||||||| base
-    auto take = [&](size_t bytes) -> void* {
-        void* p = nullptr;
-        if (!ok || cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
-        pp->owned.push_back(p);
-        return p;
-=======
     size_t asked = 0;   // what the peer's prompt buffers have asked for so far (for the failure message: how much room they need)
     m.peer_missing_bytes = 0;
     auto take = [&](size_t bytes) -> void* {
@@ -2330,7 +2197,6 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         }
         ok = false;
         return nullptr;
->>>>>>> ours-now
     };
     pp->mixed = (float*) take((size_t) m.T_max * N * 4);
     {
@@ -2431,24 +2297,6 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         }
     }
     size_t fb = 0, tb = 0;
-<<<<<<< sycl
-    /*
-    DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions for
-    device information which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
-    dpct::get_current_device().get_memory_info(fb, tb);
-    /*
-    DPCT1093: The "prev" device may be not the one intended for use. Adjust
-    the selected device if needed.
-    */
-    dpct::select_device(prev);
-    if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
-||||||| base
-    cudaMemGetInfo(&fb, &tb);
-    cudaSetDevice(prev);
-    if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
-=======
     cudaMemGetInfo(&fb, &tb);
     cudaSetDevice(prev);
     if (!ok) {
@@ -2457,7 +2305,6 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
                 "or lower --peer-prefill-rows";
         return false;
     }
->>>>>>> ours-now
     std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk (up to %lld rows per "
                          "layer%s); %zu MiB left free on it\n", pp->dev, (long long) pp->cap_rows,
                  pp->compact ? (pp->ps_frac > 0.0 ? (", compact group buffers, streams " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
@@ -2655,15 +2502,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
-<<<<<<< sycl
     for (int i = 0; i < dq_slots(); ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
-||||||| base
-    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
-=======
-    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (const auto& ly = strata::kernels::cpu::expert_layout(); ly.latent)   // latent-experts branch (as init)
         o.take<uint16_t>((size_t) core::latent_shared_info().groups * (size_t) ly.expert_embd * N, ok);
->>>>>>> ours-now
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         const size_t ids_rows = mmq_ids_rows(T);
@@ -2675,21 +2516,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     }
     const int ring_n = std::max(ring_slots(T), stage_slots());
     if (owned_pages) {
-<<<<<<< sycl
-        if (ring_n > 0) o.take<uint8_t>((size_t) ring_n * (size_t) MAXBLOB(), ok);   // one allocation
-||||||| base
-        if (ring_slots(T) > 0) o.take<uint8_t>((size_t) ring_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
-=======
         if (stage_slots(T) > 0) o.take<uint8_t>((size_t) stage_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
->>>>>>> ours-now
     } else {
-<<<<<<< sycl
-        for (int i = 0; i < ring_n; ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
-||||||| base
-        for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
-=======
         for (int i = 0; i < stage_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
->>>>>>> ours-now
     }
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
@@ -3211,30 +3040,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-<<<<<<< sycl
-    // SYCL port: a short first chunk so the GPU starts while the rest of the prompt's PLE rows are still being read
-    // (27k random 4 KB reads per 2k tokens, 330 ms at the drive's ~85k IOPS, otherwise all before the first kernel).
-    // STRATA_PREFILL_FIRST=<tokens> (0: off), default 256 when the prompt is longer than twice that.
-    // Every chunk streams the experts the cache does not hold (a 4K prompt touches nearly all 512 per layer), over PCIe: with
-    // part of the model in the host mirror a short first chunk costs a whole extra pass of that stream (an Arc Pro B70 on
-    // IQ3_S: a 4,095-token prompt 784 -> 1,002 tok/s without it).  So the default is 256 only when the cache holds every
-    // expert; STRATA_PREFILL_FIRST=<tokens> decides explicitly.
-    const bool all_cached = m.cache != nullptr && m.g != nullptr && m.cache->slots() >= m.g->n_layers * m.g->n_expert;
-    static const char* const first_env = std::getenv("STRATA_PREFILL_FIRST");
-    const int64_t first_chunk = first_env ? std::atoll(first_env) : (all_cached ? 256 : 0);
-    auto chunk_len = [&](int64_t c0) {
-        if (c0 == 0 && first_chunk > 0 && first_chunk < m.T && n > 2 * first_chunk) return first_chunk;
-        return std::min(m.T, n - c0);
-    };
-    auto ple_gather = [&m, &ss, tokens, n, prev0, &chunk_len](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = chunk_len(c0);
-||||||| base
-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(m.T, n - c0);
-=======
     auto ple_gather = [this, &m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = multi_ != nullptr ? multi_->len[(size_t) (c0 / C)] : std::min(C, n - c0);
->>>>>>> ours-now
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         if (multi_ != nullptr) {   // co-prefill: a job starts from its own session's history, not from the job before it in the padded array
@@ -3254,50 +3061,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-<<<<<<< sycl
-    for (int64_t c0 = 0; c0 < n; c0 += chunk_len(c0)) {
-        if (should_stop && should_stop()) { err = "cancelled"; return false; }
-        if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
-        const int64_t T = chunk_len(c0), p0 = pos0 + c0;
-        core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
-        ++stats_.chunks;
-        pt.mark(kPfStart, cs);
-        const auto tsetup = Clock::now();
-        auto tlap = tsetup;   // STRATA_PREFILL_TIMING=1: where the host's chunk setup goes
-        auto lap = [&](const char* what) {
-            if (pt.on) { std::fprintf(stderr, "strata prefill timing: setup %s %.1f ms\n", what, ms_since(tlap)); tlap = Clock::now(); }
-        };
-        if (pt.on) { m.cs->wait(); lap("work queued before the chunk"); }
-        // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
-        // previous stage handed on
-        if (hand_in_ != nullptr) {
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            if (DPCT_CHECK_ERROR(m.cs->memcpy(m.R, hand_in_ + (size_t)c0 * D,
-                                              (size_t)T * D * 4)) != 0) {
-                err = "prefill: the layer split's hand-off upload failed";
-                return false;
-||||||| base
-    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
-        if (should_stop && should_stop()) { err = "cancelled"; return false; }
-        if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
-        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
-        core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
-        ++stats_.chunks;
-        pt.mark(kPfStart, cs);
-        const auto tsetup = Clock::now();
-        // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
-        // previous stage handed on
-        if (hand_in_ != nullptr) {
-            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
-                cudaSuccess) {
-                err = "prefill: the layer split's hand-off upload failed";
-                return false;
-=======
     if (hand_in_ == nullptr) stopped_at_ = -1;
     // Per-run O_DIRECT decision for the prompt's expert reads (the source's flag, read by prompt_copies at the stager's and
     // the jobs' decisions below). Only the first stage decides, for the shared source; prompt_total_ is the whole prompt on a
@@ -3316,7 +3079,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              m.src->prompt_direct_on() ? "a prompt of at least STRATA_PROMPT_DIRECT_MIN_TOKENS (page cache left to decode for shorter ones)"
                              : whole >= min_tok ? "O_DIRECT is off for this model or tier, so the page cache is used"
                                                 : ("a prompt under STRATA_PROMPT_DIRECT_MIN_TOKENS=" + std::to_string((long long) min_tok) + ", its pages stay cached for decode").c_str());
->>>>>>> ours-now
             }
         }
         // O_DIRECT prompt reads: 0 (the look-ahead only warms the page cache, which they skip), unless the switch is on and the
@@ -3462,23 +3224,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             job_ss.ple = ss_main.ple;                                  // the main session's PLE tables and scratch ...
             job_ss.ple.hist = multi_->ss[(size_t) ci]->ple_hist;       // ... with this prompt's own history
         }
-<<<<<<< sycl
-        if (batched) {
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            if (DPCT_CHECK_ERROR(m.cs->memcpy(m.tok_dev, m.tok_host.data(),
-                                              (size_t)T * sizeof(int32_t))) !=
-                0) {
-                err = "prefill: the token id upload failed";
-||||||| base
-        if (batched) {
-            if (!m.tok_up.upload(m.tok_dev, m.tok_host.data(), (size_t) T, m.cs)) {
-                err = "prefill: the token id upload failed";
-=======
         core::SessionState& ss = mj ? job_ss : ss_main;
         const int64_t l_from = phase == PH_LAYER ? lay : LB;
         const int64_t l_to = phase == PH_LAYER ? lay + 1 : phase == PH_TAIL ? LB : LE;   // TAIL: no layers
@@ -3510,36 +3255,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (c0 == lmh.n_dev && !lm_fetch(c0)) return false;
             if (cudaStreamWaitEvent(cs, lm_stage.in[slot], 0) != cudaSuccess) {
                 err = std::string("prefill: the layer-major staging wait failed: ") + cudaGetErrorString(cudaGetLastError());
->>>>>>> ours-now
                 return false;
             }
-<<<<<<< sycl
-            lap("token ids uploaded");
-            if (nemb) {
-                nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
-                if (pt.on) { m.cs->wait(); lap("embedding gather (waited)"); }
-            } else {
-                const auto* codes = (const uint8_t*) wemb->data;
-                const auto* scales = (const float*) (codes + wemb->codes_bytes);
-                const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
-                                                       : nullptr;
-                strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
-                                                      wemb->code_bits, wemb->code_bias, wemb->group_elems,
-                                                      (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                      (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
-||||||| base
-            if (nemb) {
-                nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
-            } else {
-                const auto* codes = (const uint8_t*) wemb->data;
-                const auto* scales = (const float*) (codes + wemb->codes_bytes);
-                const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
-                                                       : nullptr;
-                strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
-                                                      wemb->code_bits, wemb->code_bias, wemb->group_elems,
-                                                      (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                      (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
-=======
             if (!lm_copy(m.R, lmh.stg[slot], (size_t) T * D * 4, cudaMemcpyDeviceToDevice)) return false;
             if (c0 + C < n && !lm_fetch(c0 + C)) return false;
         } else if (phase == PH_LAYER || phase == PH_TAIL) {   // this chunk's residual comes back from the host
@@ -3551,48 +3268,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
                 err = "prefill: the QSA step records' upload failed";
                 return false;
->>>>>>> ours-now
             }
             // Step 1: the norm the layer before left (grs, xn16) is not carried. It is a function of the restored R alone
             // (gr_norm_rs over R with the first half's norm weights: the same kernel call the half loop makes), so the
             // first half recomputes it. lm_carry still records where the old path restored it.
             lm_mark(false);
         }
-<<<<<<< sycl
-        for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T; ++t) {
-            const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
-            if (row) {
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-                API. While the origin API might be synchronous, it depends on
-                the type of operand memory, so you may need to call wait() on
-                event return by memcpy API to ensure synchronization behavior.
-                */
-                if (DPCT_CHECK_ERROR(
-                        m.cs->memcpy(m.emb + t * N, row, (size_t)N * 4)) != 0) {
-                    err = "prefill: the image embedding upload failed";
-||||||| base
-        for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T;) {
-            const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
-            if (row) {
-                // #1996: the picture's rows live in the caller's (pageable) memory.  A run of consecutive rows is
-                // gathered into one pinned slot and goes up as one copy; the slot is guarded by its event.
-                const int64_t row_bytes = N * 4, run_max = std::max<int64_t>(1, (4 << 20) / row_bytes);
-                int64_t t1 = t + 1;
-                while (t1 < T && t1 - t < run_max && embd_rows[p0 + t1]) ++t1;
-                void* stage = m.up_ring.acquire((size_t) ((t1 - t) * row_bytes));
-                cudaError_t e = cudaSuccess;
-                if (stage != nullptr) {
-                    for (int64_t r = t; r < t1; ++r)
-                        std::memcpy((char*) stage + (size_t) ((r - t) * row_bytes), embd_rows[p0 + r], (size_t) row_bytes);
-                    e = m.up_ring.submit(m.emb + t * N, stage, (size_t) ((t1 - t) * row_bytes), m.cs);
-                } else {   // no pinned RAM: row by row from the caller's memory, each waited for
-                    for (int64_t r = t; r < t1 && e == cudaSuccess; ++r)
-                        e = core::PinnedRing::direct(m.emb + r * N, embd_rows[p0 + r], (size_t) row_bytes, m.cs);
-                }
-                if (e != cudaSuccess) {
-                    err = "prefill: the image embedding upload failed";
-=======
         if (setup) {
             if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
             core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
@@ -3647,7 +3328,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (batched) {
                 if (!m.tok_up.upload(m.tok_dev, m.tok_host.data(), (size_t) T, m.cs)) {
                     err = "prefill: the token id upload failed";
->>>>>>> ours-now
                     return false;
                 }
                 if (nemb) {
@@ -3693,13 +3373,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
         }
-<<<<<<< sycl
-        if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
-        lap("embeddings");
-||||||| base
-        if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
-=======
->>>>>>> ours-now
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
         // were read ahead during the previous chunk; the first chunk's are read beside layer 0 - they are needed from
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
@@ -3748,13 +3421,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                       dpct::get_error_string_dummy(0);
                 return false;
             }
-<<<<<<< sycl
-            if (c0 + T < n) {   // SYCL port: T, this chunk's length (the first chunk can be shorter: chunk_len)
-||||||| base
-            if (c0 + m.T < n) {
-=======
             if (c0 + C < n) {
->>>>>>> ours-now
                 // the other buffer's upload (a chunk ago) is done before the SSD thread refills it
                 if (DPCT_CHECK_ERROR([&] {
                         while (*(volatile const uint64_t*) (m.ple_done_seq + (ple_buf ^ 1)) < m.ple_want[ple_buf ^ 1])
@@ -3785,28 +3452,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.ms_ple += ms_since(tp);
             return true;
         };
-<<<<<<< sycl
-        for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
-        lap("PLE rows");
-        // ---- the QSA step records of every position in the chunk
-        for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        m.cs->memcpy(m.steps_dev, m.steps_host.data(),
-                     (size_t)T * strata::kernels::kStepCount * 4);
-||||||| base
-        for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
-        // ---- the QSA step records of every position in the chunk
-        for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
-        if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
-            err = "prefill: the QSA step records' upload failed";
-            return false;
-        }
-=======
         if (setup) {
             if (mj) {
                 int32_t pj[2] = {multi_->prev0[(size_t) ci][0], multi_->prev0[(size_t) ci][1]};
@@ -3825,19 +3470,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::copy_n(m.steps_host.data(), (size_t) T * strata::kernels::kStepCount,
                             lm_steps.data() + (size_t) c0 * strata::kernels::kStepCount);
         }
->>>>>>> ours-now
 
         int64_t qsa_index = 0, gdn_index = 0;
-<<<<<<< sycl
-        for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        lap("step records");
-        int64_t kv_pending = -1;
-||||||| base
-        for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        int64_t kv_pending = -1;
-=======
         for (int64_t l = 0; l < l_from; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
->>>>>>> ours-now
         auto kv_prefetch_after = [&](int64_t layer, int64_t ordinal) -> bool {
             if (!kv_prefetch || p0 <= 0 || phase != PH_FULL) return true;   // layer-major passes run all chunks of a layer before the next layer: layer l+1's prefix is not written yet, so no prefetch (opt-in STRATA_KV_PREFETCH, chunk-major only)
             if (kv_pending >= 0) return true;   // one staging pool: the pending prefetch has not been consumed yet
@@ -3922,30 +3557,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             while (P.p_issued < limit) {
                 const PeerPrefill::PsEntry& en = P.pseq[P.p_issued];
                 const size_t sl = P.p_issued % (size_t) P.RP;
-<<<<<<< sycl
-                if (P.plive[sl])(P.s_cp)->ext_oneapi_submit_barrier(
-                    {*P.pused[sl]});
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-                API. While the origin API might be synchronous, it depends on
-                the type of operand memory, so you may need to call wait() on
-                event return by memcpy API to ensure synchronization behavior.
-                */
-                P.s_cp->memcpy(
-                    P.pstage[sl], en.blob,
-                    (size_t)strata::kernels::cpu::expert_layout().blob_bytes(
-                        en.l));
-                dpct::sync_barrier(P.pcopied[sl], P.s_cp);
-||||||| base
-                if (P.plive[sl]) cudaStreamWaitEvent(P.s_cp, P.pused[sl], 0);
-                cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l),
-                                cudaMemcpyHostToDevice, P.s_cp);
-                cudaEventRecord(P.pcopied[sl], P.s_cp);
-=======
                 if (P.plive[sl]) cudaStreamWaitEvent(P.s_cp, P.pused[sl], 0);
                 xcopy(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l), P.s_cp);
                 cudaEventRecord(P.pcopied[sl], P.s_cp);
->>>>>>> ours-now
                 P.plive[sl] = 1;
                 ++P.p_issued;
             }
@@ -3995,16 +3609,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
-<<<<<<< sycl
                     if (gsrc != nullptr) {   // read by the stager's thread when its turn comes (see Stager::Job)
                         job = (int) js.size();
                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), nullptr, (int32_t) l, e, gsrc});
-                    } else if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
-||||||| base
-                    if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
-=======
-                    if (m.src->prompt_copies(l, e)) {   // CS-T: copied by the source into the stager's buffer
->>>>>>> ours-now
+                    } else if (m.src->prompt_copies(l, e)) {   // CS-T: copied by the source into the stager's buffer
                         job = (int) js.size();
                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
                     } else {
@@ -4048,40 +3656,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (m.stage_live[sl])(m.copy)->ext_oneapi_submit_barrier(
                     {*m.used[m.used_of[sl]]});
                 if (en.job < 0) {
-<<<<<<< sycl
-                    /*
-                    DPCT1124: cudaMemcpyAsync is migrated to asynchronous
-                    memcpy API. While the origin API might be synchronous, it
-                    depends on the type of operand memory, so you may need to
-                    call wait() on event return by memcpy API to ensure
-                    synchronization behavior.
-                    */
-                    m.copy->memcpy(m.stage_dev[sl], en.blob, bytes);
-||||||| base
-                    cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
-=======
                     xcopy(m.stage_dev[sl], en.blob, bytes, m.copy);
->>>>>>> ours-now
                     ++stats_.experts_dma;
                 } else {
                     const auto tw = phase_timers ? Clock::now() : Clock::time_point{};
                     const uint8_t* hb = m.stager->wait(en.job);
-<<<<<<< sycl
-                    /*
-                    DPCT1124: cudaMemcpyAsync is migrated to asynchronous
-                    memcpy API. While the origin API might be synchronous, it
-                    depends on the type of operand memory, so you may need to
-                    call wait() on event return by memcpy API to ensure
-                    synchronization behavior.
-                    */
-                    m.copy->memcpy(m.stage_dev[sl], hb, bytes);
-||||||| base
-                    cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
-=======
                     if (phase_timers) iss_stage_us.fetch_add((int64_t) (ms_since(tw) * 1000.0));
                     if (hb == nullptr) note_copy(cudaErrorUnknown);   // the stager could not read it: the run's copy check stops it
                     else xcopy(m.stage_dev[sl], hb, bytes, m.copy);
->>>>>>> ours-now
                     m.stager->issued_one(en.job, m.copy);
                 }
                 dpct::sync_barrier(m.copied[sl], m.copy);
@@ -4133,40 +3715,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.stage_live[sl])(m.copy)->ext_oneapi_submit_barrier(
                         {*m.used[m.used_of[sl]]});
                     if (en.job < 0) {
-<<<<<<< sycl
-                        /*
-                        DPCT1124: cudaMemcpyAsync is migrated to
-                        asynchronous memcpy API. While the origin API might be
-                        synchronous, it depends on the type of operand memory,
-                        so you may need to call wait() on event return by memcpy
-                        API to ensure synchronization behavior.
-                        */
-                        m.copy->memcpy(m.stage_dev[sl], en.blob, bytes);
-||||||| base
-                        cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
-=======
                         xcopy(m.stage_dev[sl], en.blob, bytes, m.copy);
->>>>>>> ours-now
                         ++iss_dma;
                     } else {
                         const auto tw = phase_timers ? Clock::now() : Clock::time_point{};
                         const uint8_t* hb = m.stager->wait(en.job);
-<<<<<<< sycl
-                        /*
-                        DPCT1124: cudaMemcpyAsync is migrated to
-                        asynchronous memcpy API. While the origin API might be
-                        synchronous, it depends on the type of operand memory,
-                        so you may need to call wait() on event return by memcpy
-                        API to ensure synchronization behavior.
-                        */
-                        m.copy->memcpy(m.stage_dev[sl], hb, bytes);
-||||||| base
-                        cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
-=======
                         if (phase_timers) iss_stage_us.fetch_add((int64_t) (ms_since(tw) * 1000.0));
                         if (hb == nullptr) note_copy(cudaErrorUnknown);   // the stager could not read it: the run stops (copy check)
                         else xcopy(m.stage_dev[sl], hb, bytes, m.copy);
->>>>>>> ours-now
                         m.stager->issued_one(en.job, m.copy);
                     }
                     dpct::sync_barrier(m.copied[sl], m.copy);
@@ -4945,70 +4501,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int32_t* slot_h = grp_mapped ? m.grp_host + m.grp_tk : m.slot_host.data();
                         int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
                         if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
-<<<<<<< sycl
-                        /*
-                        DPCT1124: cudaMemcpyAsync is migrated to
-                        asynchronous memcpy API. While the origin API might be
-                        synchronous, it depends on the type of operand memory,
-                        so you may need to call wait() on event return by memcpy
-                        API to ensure synchronization behavior.
-                        */
-                        else m.cs->memcpy(m.ids_host.data(), m.ids,
-                                          (size_t)T * K * 4);
-||||||| base
-                        else if (m.up_ring.d2h_sync(m.ids_host.data(), m.ids, (size_t) T * K * 4, m.cs) != cudaSuccess) {
-                            err = "prefill: the routed ids' download failed";   // #1996
-                            return false;
-                        }
-                        bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr && !m.cpu_dead &&
-                                         lay.native && !m.pp && !lay.fmt.empty();
-                        // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
-                        // nothing left (0.1.41 report: tight RAM, chats failing).  A buffer that cannot be had ends the share
-                        // for this engine - the GPU takes every expert, as with STRATA_PREFILL_CPU_SHARE=0 - instead of
-                        // failing the request.
-                        auto cpu_share_off = [&](const char* what) {
-                            m.cpu_dead = true;
-                            cpu_maybe = false;
-                            std::fprintf(stderr, "prefill: the CPU share is off for this run: the host could not give %s "
-                                                 "(RAM is short); the GPU streams every expert\n", what);
-                        };
-                        // auto shares only while the layers that share cost less per non-resident expert than their
-                        // neighbours that do not.  #1282 (RX 7900 GRE + 5700X3D): every share lost, auto's 0.47 by
-                        // 4.5%, the host's issue time per streamed expert rising 107 -> 200 us with the CPU busy -
-                        // a cost g / (c + g) cannot see, as both sides are measured with the share on.  The first
-                        // eligible layers alternate, without first, until CPU_MIN_RATIOS ratios are in; then the
-                        // cheaper arm, and every CPU_PROBE-th layer the other one (a prime: the probes move across
-                        // the layers from one chunk to the next), so both stay measured.
-                        if (cpu_maybe && cpu_share_env() < 0.0) {
-                            constexpr int64_t CPU_PROBE = 29;
-                            constexpr int CPU_MIN_RATIOS = 3;
-                            const int64_t i = m.cpu_layers++;
-                            cpu_arm = m.cpu_nratio < CPU_MIN_RATIOS ? (i & 1) != 0 : (i % CPU_PROBE == 0) != m.cpu_gate;
-                            if (m.cpu_first_l < 0) m.cpu_first_l = l;
-                            cpu_cold = l == m.cpu_first_l;
-                            if (m.cpu_wall[0] == nullptr)
-                                for (cudaEvent_t& e : m.cpu_wall) cudaEventCreate(&e);
-                            cpu_set = (int) (i & 1);
-                            cudaEventRecord(m.cpu_wall[2 * cpu_set], m.cs);
-                        }
-                        if (cpu_maybe && cpu_arm) {
-                            const size_t want = (size_t) T * N;
-                            if (m.cpu_x_n < want) {
-                                cpu_cold = true;
-                                if (m.cpu_x) cudaFreeHost(m.cpu_x);
-                                m.cpu_x = nullptr;
-                                m.cpu_x_n = 0;
-                                if (cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-                                    (void) cudaGetLastError();
-                                    m.cpu_x = nullptr;
-                                    cpu_share_off("the activation buffer");
-                                } else {
-                                    m.cpu_x_n = want;
-                                }
-                            }
-                            if (cpu_maybe) cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
-                        }
-=======
                         else if (m.up_ring.d2h_sync(m.ids_host.data(), m.ids, (size_t) T * K * 4, m.cs) != cudaSuccess) {
                             err = "prefill: the routed ids' download failed";   // #1996
                             return false;
@@ -5072,7 +4564,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             if (cpu_maybe) cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
                         }
->>>>>>> ours-now
                         // #579: a stall here is the GPU (this layer's attention and router, or the previous layer's
                         // work), not the host: the watchdog's report says so (only its text changes)
                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
@@ -5143,28 +4634,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         pt.fold();
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
-<<<<<<< sycl
-                            /*
-                            DPCT1093: The "pe.dev" device may be not the one
-                            intended for use. Adjust the selected device if
-                            needed.
-                            */
-                            /*
-                            DPCT1093: The "pd" device may be not the one
-                            intended for use. Adjust the selected device if
-                            needed.
-                            */
-                            int pd = 0; pd = dpct::get_current_device_id();
-                                dpct::select_device(pe.dev); m.pp->s->wait();
-                                pe.fold(); dpct::select_device(pd);
-||||||| base
-                            int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
-                        }
-                        if (defer_shared) {
-                            pt.mark(kPfRouter, cs);   // keep the existing router+shared timing attribution
-                            if (!shared_expert()) return false;
-                            pt.mark(kPfHostGroup, cs);
-=======
                             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
                         }
                         if (defer_shared) {
@@ -5173,7 +4642,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (!shared_expert()) return false;
                             ph(PT_EXPERTS);
                             pt.mark(kPfHostGroup, cs);
->>>>>>> ours-now
                         }
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
                         for (int64_t i = 0; i < T * K; ++i) {
@@ -5832,17 +5300,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (lm_on && !lm_first && lm_off[(size_t) e] >= 0) continue;   // layer-major: in the map
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
-<<<<<<< sycl
                                 if (gsrc != nullptr) {   // SYCL port: --stream-experts - the stager's thread reads it from the GGUF
                                 js.push_back({nullptr, (size_t) lay.blob_bytes(l), nullptr, (int32_t) l, e, gsrc});
                                 continue;
                             }
-                            if (m.src->transient(l, e)) {   // CS-T: copied by the source
-||||||| base
-                                if (m.src->transient(l, e)) {   // CS-T: copied by the source
-=======
                                 if (m.src->prompt_copies(l, e)) {   // CS-T: copied by the source
->>>>>>> ours-now
                                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
                                     continue;
                                 }
@@ -5865,77 +5327,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return true;
                             }
                             const int sl = stage_next;
-<<<<<<< sycl
-                            stage_next = (stage_next + 1) % stage_slots();
-||||||| base
-                            stage_next = (stage_next + 1) % STAGE;
-=======
                             stage_next = (stage_next + 1) % stage_n;
->>>>>>> ours-now
                             const auto th = Clock::now();
                             const bool pinned = m.src->pinned(l, e);   // pinned: never transient
                             const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
                             if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
-<<<<<<< sycl
-                                if (m.stage_live[sl])(m.copy)
-                                    ->ext_oneapi_submit_barrier(
-                                        {*m.used[m.used_of[sl]]});
-                                /*
-                                DPCT1124: cudaMemcpyAsync is migrated to
-                                asynchronous memcpy API. While the origin API
-                                might be synchronous, it depends on the type of
-                                operand memory, so you may need to call wait()
-                                on event return by memcpy API to ensure
-                                synchronization behavior.
-                                */
-                                m.copy->memcpy(m.stage_dev[sl], b,
-                                               (size_t)lay.blob_bytes(l));
-||||||| base
-                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
-=======
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                                 xcopy(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), m.copy);
->>>>>>> ours-now
                                 ++stats_.experts_dma;
                                 if (phase_timers) lm_dma_n.fetch_add(1);
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const auto tw = phase_timers ? Clock::now() : Clock::time_point{};
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
-<<<<<<< sycl
-                                if (m.stage_live[sl])(m.copy)
-                                    ->ext_oneapi_submit_barrier(
-                                        {*m.used[m.used_of[sl]]});
-                                /*
-                                DPCT1124: cudaMemcpyAsync is migrated to
-                                asynchronous memcpy API. While the origin API
-                                might be synchronous, it depends on the type of
-                                operand memory, so you may need to call wait()
-                                on event return by memcpy API to ensure
-                                synchronization behavior.
-                                */
-                                m.copy->memcpy(m.stage_dev[sl], hb,
-                                               (size_t)lay.blob_bytes(l));
-||||||| base
-                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
-=======
                                 if (phase_timers) iss_lm_stage_us.fetch_add((int64_t) (ms_since(tw) * 1000.0));
                                 if (phase_timers) lm_staged_n.fetch_add(1);
                                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                                 if (hb == nullptr) note_copy(cudaErrorUnknown);   // the stager could not read it: stopped just below
                                 else xcopy(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), m.copy);
->>>>>>> ours-now
                                 m.stager->issued_one(job_of[j], m.copy);
                             }
-<<<<<<< sycl
-                            dpct::sync_barrier(m.copied[sl], m.copy);
-||||||| base
-                            cudaEventRecord(m.copied[sl], m.copy);
-=======
                             if (const int cb = copy_bad.load(); cb != 0) {
                                 err = std::string("prefill: an expert copy call failed: ") + cudaGetErrorString((cudaError_t) cb) + " (the prompt's experts are not trusted: the request stops)";
                                 return false;
@@ -5949,7 +5362,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                             }
                             cudaEventRecord(m.copied[sl], m.copy);
->>>>>>> ours-now
                             m.stage_live[sl] = true;
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
@@ -6147,16 +5559,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 } else {
                                     mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 }
-<<<<<<< sycl
-                                if (slot >= 0 && !group_gather) {
-                                    dpct::sync_barrier(m.used[slot], m.cs);
-                                    m.used_of[slot] = slot;
-                                }
-||||||| base
-                                if (slot >= 0 && !group_gather) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
-=======
                                 if (slot >= 0 && !gg_now) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
->>>>>>> ours-now
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                 }
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
@@ -6166,14 +5569,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 int64_t maxr = 0;
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                                 pt.mark(kPfGemmGU, cs);
-<<<<<<< sycl
-                                // the zeroed tail after the group's last expert (see MMQ_TAIL)
-                                m.cs->memset(m.grp_gu + (size_t)ngx * mmq_gub,
-                                             0, MMQ_TAIL);
-                                m.cs->memset(m.grp_d + (size_t)ngx * mmq_db, 0,
-                                             MMQ_TAIL);
-||||||| base
-=======
                                 if (direct) {
                                     // one launch: the direct experts' guards (their down over-read) and the zeroed tail
                                     // after the last gathered expert (see MMQ_TAIL)
@@ -6181,7 +5576,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                     ns ? m.grp_gu + (size_t) ns * mmq_gub : nullptr,
                                                     ns ? m.grp_d + (size_t) ns * mmq_db : nullptr, MMQ_TAIL, m.cs);
                                 }
->>>>>>> ours-now
                                 mmq::Product gu;
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = Kin; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
@@ -6679,34 +6073,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (next_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
-<<<<<<< sycl
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            if (DPCT_CHECK_ERROR(m.cs->memcpy(h, m.R, (size_t)T * D * 4)) !=
-                    0 ||
-                DPCT_CHECK_ERROR(m.cs->wait()) != 0) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does not
-                use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                err = std::string("prefill: the layer split's hand-off: ") +
-                      dpct::get_error_string_dummy(0);
-||||||| base
-            if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
-                cudaStreamSynchronize(m.cs) != cudaSuccess) {
-                err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
-=======
             const int hp = m.hand_pieces;
             if (hp > 0) {
                 // STRATA_HANDOFF_PIPE: the pieces' downloads stay queued; the host waits for the chunk's work only (the
@@ -6727,7 +6093,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             } else if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
                        cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
->>>>>>> ours-now
                 return false;
             }
             // Wait only for the DIRECT successor's previous chunk. That successor

@@ -11,6 +11,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <dpct/graph.hpp>
+#include "strata/sycl_queue.hpp"   // malloc_device_guarded, the device allocation registry
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -272,13 +273,23 @@ enum cudaMemcpyKind : int {
 template <class T> inline cudaError_t cudaMalloc(T **p, size_t n) {
     void *r = nullptr;
     const cudaError_t e = strata_sycl_compat::guard(
-        [&] { r = sycl::malloc_device(n ? n : 1, dpct::get_in_order_queue()); }, cudaErrorMemoryAllocation);
+        [&] { r = strata::malloc_device_guarded(n ? n : 1, dpct::get_in_order_queue()); }, cudaErrorMemoryAllocation);
     if (e != cudaSuccess) return e;
     if (!r) return strata_sycl_compat::fail(cudaErrorMemoryAllocation);
     *p = static_cast<T *>(r);
     return cudaSuccess;
 }
+// Device memory goes through the SYCL engine's guarded allocator (sycl_queue.hpp): a big allocation whose pages the
+// GPU's page table aliases is moved, and every allocation is registered for device_offset_end (the >4 GiB GEMM rule).
 inline cudaError_t cudaFree(void *p) {
+    return strata_sycl_compat::guard([&] {
+        if (!p) return;
+        strata::device_alloc_unregister(p);
+        sycl::free(p, dpct::get_in_order_queue());
+    });
+}
+// Host memory (cudaFreeHost): not in the device registry.
+inline cudaError_t strata_sycl_free_host(void *p) {
     return strata_sycl_compat::guard([&] { if (p) sycl::free(p, dpct::get_in_order_queue()); });
 }
 // Host USM is page-locked and reachable from the device at the same address: every flag gets the same memory.
@@ -292,7 +303,7 @@ template <class T> inline cudaError_t cudaHostAlloc(T **p, size_t n, unsigned = 
     return cudaSuccess;
 }
 template <class T> inline cudaError_t cudaMallocHost(T **p, size_t n) { return cudaHostAlloc(p, n); }
-inline cudaError_t cudaFreeHost(void *p) { return cudaFree(p); }
+inline cudaError_t cudaFreeHost(void *p) { return strata_sycl_free_host(p); }
 template <class T> inline cudaError_t cudaHostGetDevicePointer(T **dev, void *host, unsigned) {
     *dev = static_cast<T *>(host);   // host USM: the same address on the device
     return cudaSuccess;
