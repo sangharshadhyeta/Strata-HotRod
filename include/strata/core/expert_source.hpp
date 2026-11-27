@@ -1016,6 +1016,10 @@ public:
     /// STRATA_EXCHANGE_ROTATE (false, nothing changes).
     bool replace_resident(int64_t layer, int64_t in, int64_t out);
     int64_t ram_adapts() const { return ram_adapts_; }
+    /// STRATA_RAM_STATS=1 (a diagnostic line, off by default; port of jonotonfoto's issue #9 patch): the RAM copy's places counted
+    /// now - `held` by an expert and `free_places` given up by release_resident_place and not taken again.  Reads only; the
+    /// caller's thread, between requests (the free lists under tier_mu_).
+    void ram_places(int64_t& held, int64_t& free_places) const;
     bool exchange_rotation() const { return exchange_storage_.active(); }
     uint64_t rotated_exchanges() const { return exchange_storage_.exchanges(); }
     uint64_t avoided_exchange_copy_bytes() const { return exchange_storage_.avoided_bytes(); }

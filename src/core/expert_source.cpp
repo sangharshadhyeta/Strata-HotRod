@@ -4726,6 +4726,15 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     return true;
 }
 
+void FileExpertSource::ram_places(int64_t& held, int64_t& free_places) const {
+    held = 0;
+    free_places = 0;
+    for (const uint64_t at : complement_offsets_)
+        if (at != kNoComplement) ++held;
+    std::lock_guard<std::mutex> lk(tier_mu_);
+    for (const std::vector<uint64_t>& v : complement_free_) free_places += (int64_t) v.size();
+}
+
 void FileExpertSource::commit_copies() {
     fs_hold_staged(true);   // #2134: held until commit_flip has pointed `out` at its new place
     if (exchange_storage_.active()) return;   // STRATA_EXCHANGE_ROTATE: ownership moves in commit_flip, nothing to copy
