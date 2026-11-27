@@ -1442,14 +1442,17 @@ void route_pred_alloc(int64_t n_layers) {
     for (size_t i = 0; i < n; ++i) g_pred_host[i] = -1;
     note_scratch_dev();
 }
-bool route_pred_active() { return g_pred_host != nullptr; }
+// issue #10: like the router's other scratch, the look-ahead's buffers live on the GPU that allocated them; on any other GPU of a layer split
+// the accessors answer null (that stage runs without the look-ahead) - handing them out made the other stage's graph touch another device's
+// memory (an illegal address without peer access: "layer 0 never rang" on a 4080 + 2080 Ti split)
+bool route_pred_active() { return g_pred_host != nullptr && scratch_here(); }
 const int32_t* route_pred_host() { return g_pred_host; }
 int32_t* route_pred_dev(int64_t target_layer, int dist) {
     const int slot = route_pred_slot(dist);
-    return g_pred_dev && slot >= 0 ? g_pred_dev + ((size_t) target_layer * kRoutePredDists + (size_t) slot) * 80 : nullptr;
+    return g_pred_dev && slot >= 0 && scratch_here() ? g_pred_dev + ((size_t) target_layer * kRoutePredDists + (size_t) slot) * 80 : nullptr;
 }
-float* route_pred_logits() { return g_pred_logits; }
-float* route_pred_weights() { return g_pred_w; }
+float* route_pred_logits() { return scratch_here() ? g_pred_logits : nullptr; }
+float* route_pred_weights() { return scratch_here() ? g_pred_w : nullptr; }
 // SPEC-router-fuse step 1: the per-slot scratch (slot = route_pred_slot(dist)); slot 0 is route_pred_logits / route_pred_weights.
 float* route_pred_logits_at(int slot) { return g_pred_logits != nullptr && slot >= 0 && slot < kRoutePredDists ? g_pred_logits + (size_t) slot * 8 * 512 : nullptr; }
 float* route_pred_weights_at(int slot) { return g_pred_w != nullptr && slot >= 0 && slot < kRoutePredDists ? g_pred_w + (size_t) slot * 8 * 10 : nullptr; }
