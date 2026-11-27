@@ -107,7 +107,9 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
                 m.slot_stamp[sl] = epoch;
                 m.slot_ref[sl] = 1;
             } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
-                m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
+                const int at = atomicAdd(&s_nmiss, 1);
+                if (at < (int) m.n_slots) m.miss_block[at] = b;   // the list holds n_slots: a miss beyond it is un-claimed
+                else m.page_table[b] = -1;                        // (stays out of VRAM: flagged as overflow below, never written past the list)
             }
         }
     }
@@ -115,7 +117,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     __syncthreads();
     // 2. one victim per miss: a clock sweep from the hand. A slot this call uses (stamp == epoch) is never taken;
     //    a referenced one loses its bit as the hand passes it and is taken on the next pass.
-    const int need = s_nmiss, n = (int) m.n_slots;
+    const int n = (int) m.n_slots, need = s_nmiss < n ? s_nmiss : n;   // never more than the list holds
     int hand = m.ctl[1], got = 0;
     for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
         const int j = (int) (((long long) hand + threadIdx.x) % n);
@@ -156,7 +158,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
         m.ctl[0] = epoch;
         m.ctl[1] = hand;
         m.ctl[2] = placed;
-        if (placed < need) m.ctl[3] = 1;
+        if (placed < need || s_nmiss > n) m.ctl[3] = 1;
         unsigned long long* c = reinterpret_cast<unsigned long long*>(m.ctl + 4);
         c[0] += (unsigned long long) placed;
         c[1] += (unsigned long long) s_lookups;
@@ -226,6 +228,16 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
         std::fprintf(stderr, "kv_stream: %lld slots is fewer than the resolve block (%d): the clock sweep would take a "
                              "slot twice\n", (long long) m.n_slots, RT);
         std::exit(1);
+    }
+    // the worst case of one call: every row's selection is `cap` cells over distinct blocks (+2 for the edges); more than
+    // n_slots of them cannot all be resident at once: said once (the kernel stays in bounds and flags the overflow; the cells
+    // that did not fit are masked) - today at most 8 rows x 514 blocks = 4,112 against at least 5,120 slots
+    static bool said_worst = false;
+    if (!said_worst && n_q * (cap / s.page_size + 2) > m.n_slots) {
+        said_worst = true;
+        std::fprintf(stderr, "kv_stream: WARNING: %lld rows of up to %lld cells can need %lld blocks at once, more than the %lld "
+                             "slots: some selected context may be left out (the overflow flag counts it)\n",
+                     (long long) n_q, (long long) cap, (long long) (n_q * (cap / s.page_size + 2)), (long long) m.n_slots);
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
