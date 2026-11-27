@@ -146,6 +146,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <stdexcept>
 #include <string>
 #include <set>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -169,7 +170,9 @@ bool conv_sidecar_write(const std::string& path, const std::vector<ConvSide>& pa
     }
     ok = std::fclose(f) == 0 && ok;
     if (!ok) { std::remove(tmp.c_str()); why = "cannot write " + tmp; return false; }
-    if (std::rename(tmp.c_str(), file.c_str()) != 0) { std::remove(tmp.c_str()); why = "cannot rename it to " + file; return false; }
+    std::error_code ec;   // replaces an existing file on Windows too (std::rename does not; issue #8)
+    std::filesystem::rename(tmp, file, ec);
+    if (ec) { std::remove(tmp.c_str()); why = "cannot rename it to " + file; return false; }
     return true;
 }
 // false (parts unusable): no sidecar, another magic, another part count, a size that is neither 0 nor n_flat, or a short or

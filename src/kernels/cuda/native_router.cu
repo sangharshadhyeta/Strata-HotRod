@@ -33,7 +33,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <system_error>
 #include <cstdio>
+#include <filesystem>
 #include <iterator>
 #include <cstdlib>
 #include <string>
@@ -2789,7 +2791,9 @@ static bool la_save_inst(LaLearn& s, const char* path, std::string& msg) {
     }
     const bool closed = std::fclose(f) == 0;
     if (!ok || !closed) { std::remove(tmp.c_str()); msg = "write failed"; return false; }
-    if (std::rename(tmp.c_str(), path) != 0) { std::remove(tmp.c_str()); msg = "rename failed"; return false; }
+    std::error_code ec;   // replaces an existing file on Windows too (std::rename does not; issue #8)
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) { std::remove(tmp.c_str()); msg = "rename failed"; return false; }
     return true;
 }
 bool la_learn_save(const char* path, std::string& msg) {

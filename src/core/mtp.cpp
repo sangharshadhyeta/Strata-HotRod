@@ -40,8 +40,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <system_error>
 #include <vector>
 #include <cerrno>
 #include <condition_variable>
@@ -161,7 +163,9 @@ struct MtpTally {
         if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
             std::fwrite(h.data(), sizeof(float), h.size(), f);
             std::fclose(f);
-            std::rename(tmp.c_str(), path);
+            std::error_code ec, ec2;   // replaces an existing file on Windows too (std::rename does not; issue #8)
+            std::filesystem::rename(tmp, path, ec);
+            if (ec) std::filesystem::remove(tmp, ec2);
         }
         unsigned int n = 0;   // <file>.seq: u32 tokens, then their ids (int32 x 10 each), then their weights (float x 10 each)
         if (seq_n == nullptr || cudaMemcpy(&n, seq_n, sizeof(n), cudaMemcpyDeviceToHost) != cudaSuccess) return;
@@ -176,7 +180,9 @@ struct MtpTally {
             std::fwrite(si.data(), 4, si.size(), f);
             std::fwrite(sw.data(), 4, sw.size(), f);
             std::fclose(f);
-            std::rename(st.c_str(), sp.c_str());
+            std::error_code ec, ec2;   // replaces an existing file on Windows too (std::rename does not; issue #8)
+            std::filesystem::rename(st, sp, ec);
+            if (ec) std::filesystem::remove(st, ec2);
         }
     }
 } g_tally;

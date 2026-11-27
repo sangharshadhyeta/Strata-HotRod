@@ -35,6 +35,7 @@
 #include <fstream>
 #include <filesystem>
 #include <sstream>
+#include <system_error>
 #include <limits>
 #include <map>
 #include <memory>
@@ -8252,7 +8253,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             ok = std::fwrite(pad.data(), 1, pad.size(), f) == pad.size();
         }
         if (f) ok = std::fclose(f) == 0 && ok;
-        if (ok) ok = std::rename(tmp.c_str(), path.c_str()) == 0;
+        if (ok) {
+            std::error_code ec;   // replaces an existing file on Windows too (std::rename does not; issue #8)
+            std::filesystem::rename(tmp, path, ec);
+            ok = !ec;
+        }
         if (!ok) std::remove(tmp.c_str());
         std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
                      ok ? "wrote" : "could NOT write", path.c_str());
