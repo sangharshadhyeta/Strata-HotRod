@@ -27,6 +27,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+# option C (sycl/PORT-C.md): the engine's own host files are compiled here unchanged; their SYCL-specific branches test this
+add_compile_definitions(STRATA_GPU_SYCL=1)
 
 set(STRATA_SYCL_AOT "" CACHE STRING "AOT device for the GPU code, e.g. bmg-g31 (empty: SPIR-V, JIT at run time)")
 # The device spins on host flags are bounded (include/strata/sycl_doorbell.hpp). The bound is chosen per device at run
@@ -108,7 +110,8 @@ endfunction()
 
 add_library(strata_includes INTERFACE)
 target_include_directories(strata_includes INTERFACE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include      # migrated headers + dpct/ helpers, first
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/sycl_compat   # option C: the CUDA runtime host API over SYCL (cuda_runtime.h ...), first
+  ${CMAKE_CURRENT_SOURCE_DIR}/include      # migrated headers + dpct/ helpers
   ${STRATA_ROOT}/include)
 target_compile_options(strata_includes INTERFACE -Wall -Wextra)
 
@@ -229,9 +232,12 @@ strata_resolve(_engine src/core/layer.cpp src/core/session.cpp src/core/expert_s
                        src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp
                        src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                        src/core/conversation_memory.cpp   # 0.1.31: the conversation snapshots (#216)
-                       src/core/arch_defaults.cpp src/core/vmm.cpp   # vmm.cpp is the port's stub: no driver VMM on Level Zero
+                       src/core/arch_defaults.cpp src/core/vmm.cpp   # the real vmm.cpp: no driver VMM under STRATA_GPU_SYCL (Level Zero)
                        src/core/conversation_file.cpp
-                       src/core/peer_experts.cpp src/core/remote_expert_opt_stub.cpp)         # 0.1.36+: --peer-device (a stub in the port: no second GPU tier yet)
+                       src/core/peer_experts.cpp src/core/remote_expert_opt_stub.cpp
+                       src/core/subfit_samples.cpp src/core/subfit_learn.cpp src/core/subfit_shadow.cpp   # the stand-in learner
+                       src/core/risk_concentration.cpp
+                       src/core/latent_dense.cpp src/core/latent_tab.cpp src/latent/latent_moe.cpp)   # the latent MoE loaders         # 0.1.36+: --peer-device (a stub in the port: no second GPU tier yet)
 add_library(strata_engine STATIC ${_engine} ${CMAKE_CURRENT_SOURCE_DIR}/src/core/gguf_expert_source.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/src/core/copy_queue.cpp)   # 0.1.43: a queue on the copy engine
 target_include_directories(strata_engine PRIVATE ${STRATA_ROOT}/src/core)   # conversation_checked.hpp (#include "...")
