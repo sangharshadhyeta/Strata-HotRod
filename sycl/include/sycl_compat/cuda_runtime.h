@@ -10,13 +10,12 @@
 // A CUDA call with no SYCL meaning returns cudaErrorNotSupported (the engine treats it like an older driver).
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
-#include <chrono>
+#include <dpct/graph.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -196,23 +195,17 @@ inline cudaError_t cudaStreamQuery(cudaStream_t s) {
     }
 }
 
-// ---- events: the barrier a record submits; timing from the host clock at completion -------------------------
-// A record is a barrier on the queue (it completes when everything submitted before it has).  Timing: SYCL gives a
-// barrier no profiling info unless the queue was made with profiling on, which the engine's queues are not, so an
-// event keeps the host time at which it was first seen complete (Synchronize/Query); ElapsedTime subtracts those.
-// That is coarse (it includes the host's polling delay) - the engine uses event times for diagnostics only.
-struct strata_sycl_event {
-    sycl::event ev;
-    bool recorded = false;
-    std::optional<std::chrono::steady_clock::time_point> done;
-};
-using cudaEvent_t = strata_sycl_event *;
+// ---- events: dpct's own type (sycl::event*), so the SYCL-written parts of the engine and the CUDA-written ones share
+// them.  A record is a barrier on the queue: it completes when everything submitted before it has.  Elapsed time comes
+// from the events' profiling info, which a queue has only when it was made with profiling on (DPCT_PROFILING_ENABLED);
+// without it cudaEventElapsedTime answers cudaErrorNotReady (the engine uses event times for diagnostics only).
+using cudaEvent_t = dpct::event_ptr;
 #define cudaEventDefault 0x0
 #define cudaEventBlockingSync 0x1
 #define cudaEventDisableTiming 0x2
 #define cudaEventRecordDefault 0x0
 inline cudaError_t cudaEventCreate(cudaEvent_t *e) {
-    *e = new strata_sycl_event();
+    *e = new sycl::event();   // a default event is complete: waiting on an unrecorded event returns at once, as in CUDA
     return cudaSuccess;
 }
 inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t *e, unsigned) { return cudaEventCreate(e); }
@@ -222,41 +215,36 @@ inline cudaError_t cudaEventDestroy(cudaEvent_t e) {
 }
 inline cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t s = nullptr) {
     if (!e) return strata_sycl_compat::fail(cudaErrorInvalidValue);
-    return strata_sycl_compat::guard([&] {
-        e->ev = strata_sycl_compat::q(s).ext_oneapi_submit_barrier();
-        e->recorded = true;
-        e->done.reset();
-    });
+    return strata_sycl_compat::guard([&] { *e = strata_sycl_compat::q(s).ext_oneapi_submit_barrier(); });
 }
 inline cudaError_t cudaEventRecordWithFlags(cudaEvent_t e, cudaStream_t s, unsigned) { return cudaEventRecord(e, s); }
 inline cudaError_t cudaEventSynchronize(cudaEvent_t e) {
     if (!e) return strata_sycl_compat::fail(cudaErrorInvalidValue);
-    return strata_sycl_compat::guard([&] {
-        if (e->recorded) e->ev.wait_and_throw();
-        if (!e->done) e->done = std::chrono::steady_clock::now();
-    });
+    return strata_sycl_compat::guard([&] { e->wait_and_throw(); });
 }
 inline cudaError_t cudaEventQuery(cudaEvent_t e) {
     if (!e) return strata_sycl_compat::fail(cudaErrorInvalidValue);
-    if (!e->recorded) return cudaSuccess;
     try {
-        const auto st = e->ev.get_info<sycl::info::event::command_execution_status>();
-        if (st != sycl::info::event_command_status::complete) return cudaErrorNotReady;
-        if (!e->done) e->done = std::chrono::steady_clock::now();
-        return cudaSuccess;
+        return e->get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete
+                   ? cudaSuccess : cudaErrorNotReady;
     } catch (const sycl::exception &) {
         return strata_sycl_compat::fail(cudaErrorUnknown);
     }
 }
 inline cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t a, cudaEvent_t b) {
-    if (!a || !b || !a->done || !b->done) return strata_sycl_compat::fail(cudaErrorNotReady);
-    *ms = std::chrono::duration<float, std::milli>(*b->done - *a->done).count();
-    return cudaSuccess;
+    if (!a || !b) return strata_sycl_compat::fail(cudaErrorInvalidValue);
+    try {
+        const auto t0 = a->get_profiling_info<sycl::info::event_profiling::command_end>();
+        const auto t1 = b->get_profiling_info<sycl::info::event_profiling::command_end>();
+        *ms = (float) ((double) ((int64_t) t1 - (int64_t) t0) * 1e-6);
+        return cudaSuccess;
+    } catch (const sycl::exception &) {
+        return strata_sycl_compat::fail(cudaErrorNotReady);
+    }
 }
 inline cudaError_t cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned = 0) {
     if (!e) return strata_sycl_compat::fail(cudaErrorInvalidValue);
-    if (!e->recorded) return cudaSuccess;
-    return strata_sycl_compat::guard([&] { strata_sycl_compat::q(s).ext_oneapi_submit_barrier({e->ev}); });
+    return strata_sycl_compat::guard([&] { strata_sycl_compat::q(s).ext_oneapi_submit_barrier({*e}); });
 }
 using cudaHostFn_t = void (*)(void *);
 inline cudaError_t cudaLaunchHostFunc(cudaStream_t s, cudaHostFn_t fn, void *data) {
@@ -369,17 +357,11 @@ inline cudaError_t cudaMemcpyPeer(void *dst, int, const void *src, int, size_t n
     return cudaMemcpy(dst, src, n, cudaMemcpyDefault);
 }
 
-// ---- graphs: stream capture -> the oneAPI graph extension (record and replay on an in-order queue) -------------
-namespace syclex = sycl::ext::oneapi::experimental;
-struct strata_sycl_graph {
-    std::optional<syclex::command_graph<syclex::graph_state::modifiable>> g;
-};
-struct strata_sycl_graph_exec {
-    std::optional<syclex::command_graph<syclex::graph_state::executable>> g;
-};
-using cudaGraph_t = strata_sycl_graph *;
-using cudaGraphExec_t = strata_sycl_graph_exec *;
-using cudaGraphNode_t = void *;
+// ---- graphs: dpct's types and recorder (the oneAPI graph extension, record and replay on an in-order queue), so a
+// graph the SYCL-written code captured and one captured through these calls are the same kind of object.
+using cudaGraph_t = dpct::experimental::command_graph_ptr;
+using cudaGraphExec_t = dpct::experimental::command_graph_exec_ptr;
+using cudaGraphNode_t = dpct::experimental::node_ptr;
 enum cudaStreamCaptureMode : int {
     cudaStreamCaptureModeGlobal = 0,
     cudaStreamCaptureModeThreadLocal = 1,
@@ -391,67 +373,27 @@ enum cudaGraphNodeType : int {
     cudaGraphNodeTypeMemset = 2,
     cudaGraphNodeTypeEmpty = 6,
 };
-namespace strata_sycl_compat {
-inline std::unordered_map<sycl::queue *, strata_sycl_graph *> &capturing() {
-    static std::unordered_map<sycl::queue *, strata_sycl_graph *> m;
-    return m;
-}
-inline std::mutex &capture_mutex() {
-    static std::mutex m;
-    return m;
-}
-}  // namespace strata_sycl_compat
 inline cudaError_t cudaStreamBeginCapture(cudaStream_t s, cudaStreamCaptureMode) {
-    sycl::queue &qq = strata_sycl_compat::q(s);
-    auto *g = new strata_sycl_graph();
-    const cudaError_t e = strata_sycl_compat::guard([&] {
-        g->g.emplace(qq.get_context(), qq.get_device());
-        g->g->begin_recording(qq);
-    }, cudaErrorStreamCaptureUnsupported);
-    if (e != cudaSuccess) {
-        delete g;
-        return e;
-    }
-    std::lock_guard<std::mutex> lk(strata_sycl_compat::capture_mutex());
-    strata_sycl_compat::capturing()[&qq] = g;
-    return cudaSuccess;
+    return strata_sycl_compat::guard([&] { dpct::experimental::begin_recording(&strata_sycl_compat::q(s)); },
+                                     cudaErrorStreamCaptureUnsupported);
 }
 inline cudaError_t cudaStreamEndCapture(cudaStream_t s, cudaGraph_t *out) {
-    sycl::queue &qq = strata_sycl_compat::q(s);
-    strata_sycl_graph *g = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(strata_sycl_compat::capture_mutex());
-        auto it = strata_sycl_compat::capturing().find(&qq);
-        if (it == strata_sycl_compat::capturing().end()) return strata_sycl_compat::fail(cudaErrorInvalidValue);
-        g = it->second;
-        strata_sycl_compat::capturing().erase(it);
-    }
-    const cudaError_t e = strata_sycl_compat::guard([&] { g->g->end_recording(qq); },
-                                                    cudaErrorStreamCaptureUnsupported);
-    if (e != cudaSuccess) {
-        delete g;
-        return e;
-    }
-    *out = g;
-    return cudaSuccess;
+    return strata_sycl_compat::guard([&] { dpct::experimental::end_recording(&strata_sycl_compat::q(s), out); },
+                                     cudaErrorStreamCaptureUnsupported);
 }
 inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t *x, cudaGraph_t g, unsigned long long = 0) {
-    auto *ex = new strata_sycl_graph_exec();
-    const cudaError_t e = strata_sycl_compat::guard([&] { ex->g.emplace(g->g->finalize()); },
-                                                    cudaErrorStreamCaptureUnsupported);
-    if (e != cudaSuccess) {
-        delete ex;
-        return e;
-    }
-    *x = ex;
-    return cudaSuccess;
+    if (!g) return strata_sycl_compat::fail(cudaErrorInvalidValue);
+    return strata_sycl_compat::guard([&] {
+        *x = new sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>(
+            g->finalize());
+    }, cudaErrorStreamCaptureUnsupported);
 }
 inline cudaError_t cudaGraphInstantiate(cudaGraphExec_t *x, cudaGraph_t g, cudaGraphNode_t *, char *, size_t) {
     return cudaGraphInstantiate(x, g, 0);
 }
 inline cudaError_t cudaGraphLaunch(cudaGraphExec_t x, cudaStream_t s) {
-    if (!x || !x->g) return strata_sycl_compat::fail(cudaErrorInvalidValue);
-    return strata_sycl_compat::guard([&] { strata_sycl_compat::q(s).ext_oneapi_graph(*x->g); });
+    if (!x) return strata_sycl_compat::fail(cudaErrorInvalidValue);
+    return strata_sycl_compat::guard([&] { strata_sycl_compat::q(s).ext_oneapi_graph(*x); });
 }
 inline cudaError_t cudaGraphUpload(cudaGraphExec_t, cudaStream_t) { return cudaSuccess; }
 inline cudaError_t cudaGraphDestroy(cudaGraph_t g) {

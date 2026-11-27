@@ -26,20 +26,67 @@
 #include <dpct/dpct.hpp>
 #include <cstdio>
 
+#include "strata/core/recheck_cheap.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/flag_order.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/subfit_capture.hpp"
+#include "strata/kernels/subfit_apply.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
+#include <memory>
 #include <cstdint>
 #include <chrono>
 #include <string>
 #include <vector>
 
+namespace strata::kernels {
+struct MaskEvs;
+}
+
 namespace strata::core {
+
+/// STRATA_MASK=learn (opt-in): the mask learns from the flip re-checks' divergence (the Verifier's mask_learn_* hooks; the state is kept
+/// here).  _env: the switch is "learn".  _begin(nl, ne, pos): the state and the seed levels (pos = the profile rank of each pair, higher =
+/// less used; empty when off).  _open / _save: the table file of this model.  _report: the request's line (counts reset).
+bool mask_learn_env();
+/// STRATA_MASK as it applies: the env value, else "learn" when route-resident stand-ins are configured (STRATA_ROUTE_RESIDENT, which the
+/// learner needs), else nullptr (no mask).  "0" turns it off.  (Default since 7 Nov.)
+const char* mask_env();
+/// STRATA_MASK=learn's mask test: put this arm's levels on the device (0 base, 1 candidate; no-op when no test runs or it is there)
+void mask_test_arm(int arm);
+bool mask_learn_seeded();   ///< _begin ran: the state exists (the Verifier's buffers follow it)
+std::vector<uint8_t> mask_learn_begin(int64_t n_layers, int64_t n_expert, const std::vector<int64_t>& pos);
+bool mask_learn_open(const std::string& path, std::string& msg);
+bool mask_learn_save(const std::string& path, std::string& msg);
+std::string mask_learn_report();
+/// The request's swap risk concentration line (SPEC-substitute-fit); empty without STRATA_MASK=learn rows. Clears the counts.
+std::string mask_risk_line();
+
+/// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
+/// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
+/// bytes arrive layer by layer: `run` holds a layer's plan (the first thing that lets the GPU read the layer's expert
+/// slots) back until `landed >= layer` for a layer with a swap (`has[layer]`).  Set `active` only around one window.
+struct AdaptGate {
+    struct Tick { AdaptGate* gate; int32_t layer; };
+    std::atomic<int32_t> landed{-1};      ///< the highest layer whose swap copies have landed (n_layers: all of them)
+    std::atomic<bool> active{false};
+    std::vector<uint8_t> has;             ///< per layer: a swap copies into this layer's slots
+    std::vector<Tick> ticks;              ///< host-function contexts, one per layer and the final one (stable storage)
+    const int32_t* dvals = nullptr;       ///< device [0..n_layers]: the source of those copies
+    volatile int32_t* hland = nullptr;   ///< pinned host int the copy stream writes (a D2H copy of the layer number), instead of a host function; null: host functions
+    int32_t reached() const {
+        const int32_t a = landed.load(std::memory_order_acquire);
+        if (hland == nullptr) return a;
+        const int32_t b = *hland;
+        return a > b ? a : b;
+    }
+};
 
 class NativeHead;
 class RemoteExpertOpt;
@@ -56,6 +103,11 @@ struct VerifyHits {
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
 };
+
+namespace subfit_learn {
+struct Changes;
+struct UploadPacker;
+}
 
 class Verifier {
 public:
@@ -87,6 +139,23 @@ public:
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
+    /// #879 GUARD: the first row of the last finished window (run, run_slot_rows, batch_poll, pl_finish) whose head
+    /// logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every window graph
+    /// checks its T rows on the device beside the greedy pick (logits_nonfinite_rows into mapped flags, read after
+    /// the sync the window already does: no extra sync).  On the stage with the head (a layer split asks the last
+    /// stage).  STRATA_NAN_GUARD=0: off (always -1).  STRATA_NAN_INJECT=<n>[,<n>...] (debug): the n-th window the
+    /// guard checks in this process (counted from 1 over every stage-with-head verifier: prompt-tail windows, decode
+    /// windows and batch windows alike) reports row 0 as non-finite, so the whole response can be tested.
+    int nonfinite_row() const { return next_ != nullptr && !last_stage() ? next_->nonfinite_row() : nf_row_; }
+    int64_t nonfinite_pos() const { return next_ != nullptr && !last_stage() ? next_->nonfinite_pos() : nf_pos_; }
+    /// Row t of the last window (a batch window: each slot's own rows) held a non-finite logit.
+    bool nonfinite_in(int t) const {
+        if (next_ != nullptr && !last_stage()) return next_->nonfinite_in(t);
+        return t >= 0 && t < 32 && ((nf_mask_ >> t) & 1u) != 0;
+    }
+    static bool nan_guard_on();
+    /// The most tokens one window holds (`init`'s `max_t`; 0 before it).
+    int max_t() const { return max_t_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -121,6 +190,20 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
+    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyMaxT, the default).  More than --batch's 8 slots on a
+    /// layer split: the pipelined slot groups write their rows at hbase = group * rows-per-group, one row per slot.
+    void set_handoff_rows(int rows) { handoff_rows_ = rows; }
+    /// Is the zero-doorbell graph the one a batch window would run now (every expert of the stage in VRAM by the host
+    /// table)?  Looks at the table, as each window does.  (STRATA_ADMIT_MERGE_FIRST's gate.)
+    bool ar_live() { refresh_ar(); return ar_on(); }
+    /// STRATA_SPLIT_OVERLAP=1 (opt-in; stages on DIFFERENT devices only): the hand-off carries a ready flag (one
+    /// mapped word per hand-off buffer: host and device addresses).  The writing stage raises it from the GPU when
+    /// its hand-off is out (handoff_publish); the reading stage's window graph waits on it (wait_flag_ge) - so the
+    /// next stage's graph is launched while this stage is still running, and the host no longer syncs between the
+    /// stages.  Null (the default): the old order - sync, then launch the next stage.  Set before `init`.
+    void set_handoff_flags(uint32_t* in_host, uint32_t* in_dev, uint32_t* out_host, uint32_t* out_dev) {
+        hflag_in_h_ = in_host; hflag_in_d_ = in_dev; hflag_out_h_ = out_host; hflag_out_d_ = out_dev;
+    }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
@@ -132,6 +215,168 @@ public:
     /// request does not pay for them (a 2,400-node graph takes tens of ms to finalize on this backend).
     bool warm(std::string& err);
     bool commit(int n_keep, std::string& err);
+    /// STRATA_ROUTE_BUDGET_DYN (decode only; verify.cpp): the route budget of the next window.  The serve decode loop calls
+    /// route_budget_begin at a request's first window, route_budget_window before each window (decode or prompt), and
+    /// route_budget_after after a decode window's sync and before its commit.  Off (no calls change anything) when unset.
+    static void route_budget_begin(int64_t prompt_tokens);
+    /// `auto_ok` = false (a decode-loop window that holds prompt tokens, a merged one): the decode budget stays the static one, not the AUTO search's
+    void route_budget_window(bool decode, bool auto_ok = true);
+    void route_budget_after(int n_keep);
+    /// STRATA_ROUTE_BUDGET_AUTO (decode loop only; verify.cpp): one budget b for all ranks, chosen by the measured decode speed.  route_auto_on
+    /// is the switch; route_auto_window after each non-merged decode window's commit (its start = the window's ver.run start, its end = the
+    /// commit's end); route_auto_take gives the AUTO budget and the tests finished since the last call (false when off).
+    static bool route_auto_on();
+    static void route_auto_window(int n_keep, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end);
+    /// STRATA_FRAGILE_BRAKE: a non-merged decode window's committed tokens (n_keep) for the request's flips per token (verify.cpp).
+    static void route_req_commit(int n_keep);
+    static bool route_auto_take(float& budget, long long& tests);
+    /// The decode windows run at b_hi and at b_lo since the last call, with the switch's values (false when the switch is off);
+    /// resets both counts.
+    static bool route_budget_take(long long& n_hi, long long& n_lo, float& b_hi, float& b_lo, float& gap_min);
+    /// STRATA_FRAGILE_RECHECK (decode loop only; verify.cpp).  Before a decode run: route_budget_window zeroes each stage's row_shift
+    /// (the stand-ins' moves per row).  After it: when route_fragile_pending(), route_fragile_gaps(1, ...) of the exact window and
+    /// route_fragile_settle(its row-0 top-1 id), then, when route_fragile_wants(), the gaps and top-1 ids of rows 0..n-1 (route_fragile_gaps),
+    /// the moves (route_fragile_shifts, summed over the stages) and route_fragile_first.  A cut row r >= 1 is kept out of the commit and the
+    /// next window runs exact (route_fragile_cut).  A cut at row 0 is not made: that window's rows stand (a re-run would step the state
+    /// twice, see verify.cpp).  Flips compare argmax ids, never the sampled tokens.
+    static bool route_fragile_wants();
+    static bool route_fragile_pending();
+    /// top1 (optional): the rows' top-1 ids (the argmax; int32 per row).
+    bool route_fragile_gaps(int n, float* out, int32_t* top1 = nullptr);
+    bool route_fragile_shifts(int n, float* out);   ///< adds each stage's row_shift for rows 0..n-1 into out (zeroed by the caller)
+    void route_fragile_zero_shift();
+    /// explore (optional): set true when the cut is an explore cut (no normal cut; every 16th eligible window; ratio in [k, 8k)).
+    /// control (optional): set true when the cut is a control re-check (no normal or explore cut; every 32nd eligible window; a row
+    /// no stand-in moved, shift 0): its flip is the noise floor, kept apart from the k / brake / guard evidence.
+    /// eligible (optional, SPEC-recheck-gated rule 1-3): per row, 1 = the row may be cut (the gate's eligibility); a close row that is not
+    /// eligible is not cut and counted as skipped (route_gate_take).  nullptr: every row is eligible (the gate off).
+    static int route_fragile_first(const float* gap, const float* shift, int n, bool* explore = nullptr, bool* control = nullptr,
+                                   const uint8_t* eligible = nullptr);
+    static void route_fragile_cut(float ratio, int32_t stand_top1, bool explore = false, bool control = false);
+    /// Stop re-check (serve loop, after route_fragile_cut): marks the pending cut as a stop cut, its row's stand-in token being a stop id.
+    static void route_fragile_stop_cut();
+    /// exact_ok false: the exact row could not be read, so the pending cut is dropped without a verdict.
+    static void route_fragile_settle(bool exact_ok, int32_t exact_top1);
+    /// STRATA_ROLLBACK (opt-in; serve decode loop, verify.cpp).  route_gen_now: the request's committed decode tokens before the window;
+    /// route_fragile_pos: the pending cut row's token position (call after route_fragile_cut).  route_brake_take: true once per brake, with its
+    /// flips' first and last position and the budget before and after.  route_rollback_reset: a rewind's reset of the pending cut.
+    /// route_low_open_used / route_low_open_redo: STRATA_ROUTE_LOW_OPEN's early redo (ranks < lo open this request / closed from now on).
+    static void route_gen_now(int64_t n);
+    static void route_fragile_pos(int64_t pos);
+    static bool route_brake_take(int64_t& first, int64_t& last, float& old_b, float& new_b);
+    static void route_rollback_reset();
+    static bool route_low_open_used();
+    static void route_low_open_redo();
+    /// This request's cuts, rows moved by stand-ins and flipped re-decisions, the current k, and the medians of the moved rows' shift and gap
+    /// (false when the switch is off); resets the counts.  Also this request's decode budget at its end (req_b) and its brakes.
+    static bool route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift, float& med_gap,
+                                   float& req_b, long long& brakes, long long& ctrl_rc, long long& ctrl_fl, long long& stop_cuts, long long& stop_kept);
+    /// STRATA_FRAGILE_BRAKE (default on): the per-request decode budget brake (route_fragile_take's req_b and brakes are its).
+    static bool route_brake_on();
+    /// STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL (SPEC-control-windows).  route_window_done, after each decode window of the serve loop: clears
+    /// the fragile control flag and counts the window under its kind (control or other) with its committed tokens (kept; 0 for a merged window)
+    /// and its wall seconds.  route_control_take: this request's control windows against the others, as one line (false: none ran; resets).
+    static void route_window_done(int kept, double secs);
+    /// SPEC-recheck-gated (STRATA_RECHECK_GATE, on by default with the fragile re-check; off restores the re-check of before exactly).
+    /// route_gate_on: the gate is active.  route_gate_audit_next: call once per non-merged decode window before route_gate_rows; true when
+    /// the window is an audit window (rule 4: the rule is suspended, every row eligible).  route_gate_rows(bits, audit): this window's hold
+    /// bitmask of the uncertain rows (rule 2; 0 in an audit window), set before route_budget_window, which composes the device flag from it.
+    /// route_gate_p_hi: the current P_HI (rule 1).  route_gate_window(a0, bucket, shift, eligible, audit): after route_fragile_shifts, for rows
+    /// 1..a0: the eligible moved rows count into the learner's totals (drafter buckets), then rule 5 may move P_HI.  route_gate_cut(row, bucket,
+    /// audit, control, picks): the cut row's accounting and its rank-wise swaps (picks from route_recheck_picks; control cuts are not counted).
+    /// route_gate_settled(exact_ok, flipped): the pending cut's verdict (after route_fragile_settle's exact row).  route_gate_take: this
+    /// request's gate line and rank line (false when nothing ran); resets the request counts.
+    bool route_gate_on() const;
+    bool route_gate_audit_next();
+    void route_gate_rows(uint32_t bits, bool audit);
+    float route_gate_p_hi() const;
+    void route_gate_window(int a0, const int* bucket, const float* shift, const uint8_t* eligible, bool audit);
+    void route_gate_cut(int row, int bucket, bool audit, bool control, const std::vector<strata::core::recheck::Pick>& picks, float shift);
+    void route_gate_settled(bool exact_ok, bool flipped);
+    static bool route_gate_take(std::string& gate_line, std::string& rank_line);
+    /// SPEC-recheck-gated step F: route_shift_cap_window(bucket, p, T, audit): before the window, the device caps of its rows (the class's
+    /// multiplier times the running median of the moved rows' final shifts; an audit window caps nothing).  route_shift_take: this request's
+    /// refused moves and their row launches (device counters), the current caps, and the calibration decile line (false when nothing ran).
+    void route_shift_cap_window(const int* bucket, const float* p, int T, bool audit);
+    static bool route_shift_take(std::string& cap_line, std::string& cal_line);
+    static bool route_control_take(std::string& out);
+    /// STRATA_FRAGILE_BRAKE: at a request's end, its size class learns its start fraction and clean level (route_class_end; the tune file is
+    /// written); route_class_state gives the request's class and that class's start and clean level.
+    static void route_class_end();
+    static void route_class_state(int& cls, float& start, float& clean);
+    /// The FRAGILE switch (STRATA_FRAGILE_RECHECK).  route_tune_open(path, model_fp), once at serve start before the first decode window
+    /// (FRAGILE on): loads the learned b, k, step and counts from `path` when its fingerprint is model_fp, and keeps writing that file
+    /// after each finished AUTO test and each k update.  An empty path keeps nothing.
+    static bool route_fragile_on();
+    static void route_tune_open(const std::string& path, uint64_t model_fp);
+    /// STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned corrections.  la_learn_open(path, msg) loads the saved state of this model
+    /// (false with msg when there is none); la_learn_request_end(path, report) saves it to path (when not empty) and returns the stats
+    /// line(s) for the request's log.  Both are no-ops when the feature is off.
+    static bool la_learn_on();
+    /// STRATA_STANDIN_LEARN=1 (opt-in; needs STRATA_FRAGILE_RECHECK; whole model on one GPU, else off): each stand-in learns a correction
+    /// for its (layer, true expert, stand-in) pair from the flip re-checks (y_s of the cut window, y_e of the exact successor).
+    /// standin_learn_active(): the buffers exist.  _open / _save: the pairs of this model (file in data/, see generate.cpp).  _cut(r): the
+    /// window was cut at row r (after route_fragile_cut).  _settle(exact_ok): after the exact successor (with route_fragile_settle).
+    /// _report: the request's stats line (and the counts reset).
+    bool standin_learn_active() const;
+    bool standin_learn_open(const std::string& path, std::string& msg);
+    bool standin_learn_save(const std::string& path, std::string& msg) const;
+    void standin_learn_cut(int row);
+    void standin_learn_settle(bool exact_ok);
+    /// One sample's three sums (y_s.y_e, y_s.y_s, y_e.y_e) for the pair (layer, true expert e, stand-in s) into the stand-in learner: the pair, its (layer, e) group and its layer group, and the device
+    /// table once the pair is ready.  standin_learn_settle ends in it; the samples a prompt read takes enter here.  Between windows only (it may write the device table).  A no-op when the learner is off.
+    void standin_learn_add_sums(int64_t layer, int64_t e, int64_t s, double sxy, double sxx, double syy);
+    /// STRATA_SUBFIT_LOG=1 (static: one sample file per process): the path is set at startup, the file opens at the first decode window,
+    /// and subfit_probe_collect() runs after each window that was a probe window (between windows: the host reads the probe buffers).
+    static void subfit_set_path(const std::string& path);
+    /// SPEC-substitute-fit shadow samples: the pack directory whose experts.bin the idle-time CPU evaluator reads (generate.cpp, --pack)
+    static void subfit_set_pack(const std::string& pack);
+    void subfit_shadow_collect(int layer, int e, int s);   ///< shadow samples after the exact successor (verify.cpp)
+    void subfit_probe_collect();
+    /// SPEC-substitute-fit stage 2 step 1 (STRATA_SUBFIT_LEARN=1, opt-in; needs the stand-in learner): the live per-pair learner.  Its file
+    /// opens at start (false with msg when there is none, the learner starts empty); subfit_learn_report() refits at a request's end
+    /// (between windows), saves the file when path is not empty, and returns the request-end line.  "" when the learner is off.
+    bool subfit_learn_open(const std::string& path, uint64_t fp, std::string& msg);
+    bool subfit_learn_save(const std::string& path, uint64_t fp, std::string& msg) const;
+    std::string subfit_learn_report();
+    /// STRATA_SUBFIT_LEARN is on (the learner and the layer-input capture)
+    bool subfit_learn_active() const;
+    /// SPEC-substitute-fit stage 2 steps 2-5: the device tables' start (A uploaded once; the learner's fits written) and the upload of the
+    /// learner's changes (between windows: the request's end and the start).  Both no-ops with STRATA_SUBFIT_APPLY off.
+    void subfit_tables_start();
+    void subfit_tables_sync(const strata::core::subfit_learn::Changes& ch);
+    strata::kernels::SubfitRoute subfit_route_(int64_t l, int tb) const;
+    /// STRATA_MASK=learn: the mask_learn_* hooks, after the window that ran (cut / settle as the stand-in learn's; window: every decode window
+    /// of n <= 8 rows with `kept` rows kept; cut: true when the window was cut at its row kept).  active: the buffers and the state exist.
+    bool mask_learn_active() const;
+    void mask_learn_cut(int row, int32_t stand_top1, int T, bool control);
+    /// SPEC-recheck-cheap change 2: the replaced picks (layer, expert) of decode row `row` (>= 1) of the window that was cut, from the
+    /// mask-learn event list (STRATA_MASK=learn; none without it).  Call after the window ran and before the successor.  Returns the count.
+    size_t route_recheck_picks(int row, std::vector<strata::core::recheck::Pick>& out);
+    /// STRATA_RECHECK_PREFETCH (default on, =0 off) and STRATA_RECHECK_PREFETCH_MAX (default 96): the cut row's prefetch switch and its cap.
+    static bool route_recheck_prefetch_on();
+    static size_t route_recheck_prefetch_max();
+    void mask_learn_settle(bool exact_ok, int32_t exact_top1);
+    void mask_learn_window(int T, int kept, bool cut);
+    std::string standin_learn_report();
+    /// STRATA_STANDIN_BALANCE=1 (opt-in; needs STRATA_STANDIN_LEARN): the stand-ins' risk per pair and the per-expert keep / give-up decision.
+    /// standin_balance_on(): the switch.  standin_balance_commit(n, use, miss, keep): n committed decode tokens; every 256 of them one round:
+    /// per layer, experts ranked by use x best err / (decayed demand misses + 1); the top decile gets factor 4 (kept), the bottom decile 0.25
+    /// (given up first), one step a round, back to 1 only after 2 rounds on the other side.  Writes keep (flat [layers][512]).  True when a round ran.
+    static bool standin_balance_on();
+    bool standin_balance_commit(int n_tok, const std::vector<float>& use, const std::vector<float>& miss, std::vector<float>& keep);
+private:
+    void standin_learn_fill_table();
+    void standin_learn_pe_layer(int64_t l);
+    void standin_learn_begin_window(bool decode, bool exact);
+public:
+    /// STRATA_LA_LEARN unset (auto): the serve start reports whether a learned predictor file exists, before init allocates
+    static void la_learn_set_saved(bool saved);
+    static bool la_learn_open(const std::string& path, std::string& msg);
+    static void la_learn_request_end(const std::string& path, std::string& report);
+    /// STRATA_MTP_LA=1 (opt-in): the drafter's look-ahead reads layer src's router input in each learning window: gate is the drafter's
+    /// router weight (bf16 [512 x n_embd], MtpDrafter::gate_weight), src the layer.  Set before any window is captured.
+    void set_mtp_la(const uint16_t* gate, int src_layer) { mtp_gate_ = gate; mtp_src_ = src_layer; }
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -146,6 +391,10 @@ public:
     // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
+    /// The opposite of init_slots (the live BATCHSET command, docs/LIVE_BATCH.md): destroys every captured batch graph (they were captured against the
+    /// slots' memory), frees the batch arena and the commit staging, and forgets the slots, so init_slots can run again over new sessions.  The caller has
+    /// synchronized the device and no batch window is in flight.  A no-op when no slots are set.
+    void release_slots();
     int n_slots() const { return (int) slots_.size(); }
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
@@ -161,6 +410,10 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    /// The VRAM the batch graphs leave free (the engine's --vram-reserve-mib): a new batch window graph is captured only above it; below it the least recently used
+    /// layouts are freed first (they are captured again when needed).  Without it the captures took the last free MiB and the next long prompt's buffers found none:
+    /// the engine died with "out of memory" (--batch 8 --batch-mtp on a 12 GB card, 21 Nov).  0 = no floor (the old behaviour).
+    void set_batch_graph_floor(uint64_t bytes) { batch_graph_floor_ = bytes; }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -171,13 +424,27 @@ public:
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
-    bool batch_busy() const { return b_running_; }
+    bool batch_busy() const { return b_running_.load(std::memory_order_acquire); }
+    /// Serves the layers of this stage's window that have rung (the CPU pool and the flags), with no CUDA call: 1 once
+    /// every layer is served (or the window raises no host doorbells), 0 while one is still to ring.  batch_poll
+    /// calls it, unless set_external_serve(true) moved it to a thread of its own (STRATA_PIPED_CONCURRENT: a CUDA
+    /// call can wait for the driver's lock while another thread holds it waiting for the GPU, whose window waits
+    /// for its doorbell, #31); batch_poll then makes no CUDA call before every layer is served.
+    int batch_serve(PoolMultiFn pool, void* user);
+    void set_external_serve(bool on) { ext_serve_.store(on, std::memory_order_release); }
     /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
     /// its row is drawn again on the last stage with Philox(seed, position), as a solo window draws it.  Greedy by
     /// default.  Set on the first stage, it reaches the last.
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
         if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
         if (next_) next_->set_slot_sampling(slot, sp);
+    }
+    /// PROBABILISTIC DRAFT ACCEPTANCE in batch windows (spec_prob.hpp; the flag the solo path uses, STRATA_SPEC_PROB): the drafter's q list (host, kSpecQStride int32s)
+    /// for the proposal in `slot`'s NEXT batch window.  sample_rows then judges that slot's two rows (the token and its proposal) by rejection sampling - accept with
+    /// min(1, p/q), the residual sample on a reject, out[t] = the proposal when kept - instead of keeping the proposal only when it equals the target's sample.  Taken
+    /// once: the pointer is forgotten after the window.  Single GPU only (the caller does not set it on a layer split).
+    void set_slot_spec_q(int slot, const int32_t* q) {
+        if (slot >= 0 && slot < (int) slot_q_.size()) slot_q_[(size_t) slot] = q;
     }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
@@ -203,9 +470,21 @@ public:
     /// Every layer copies the token rows to the host (doorbell_publish), not only the layers with a routed expert
     /// outside the VRAM tier by the device's residency table: with windows in flight the adaptive tier marks an
     /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
-    /// the device-planned layers (E-6) off.  Before `init`.
-    void set_always_publish(bool on) { always_publish_ = on; }
-    dpct::queue_ptr stream() const { return cs_; }
+    /// the device-planned layers (E-6) off, which read the device table this mode lets lag.  Before the first window
+    /// (its graphs are captured there).
+    void set_always_publish(bool on) {
+        always_publish_ = on;
+        if (on) device_plan_ = false;
+    }
+    /// 0.1.43: the adaptive tier's overlap gate (see AdaptGate).  Refused (false) with the device-planned layers (E-6),
+    /// which never ask the host.  The pointer must outlive the verifier's windows.
+    bool set_adapt_gate(AdaptGate* g) {
+        if (g != nullptr && device_plan_) return false;
+        adapt_gate_ = g;
+        return true;
+    }
+    double ms_gate = 0;   ///< host time spent holding a layer's plan for the adaptive copies (decode timing prints it)
+    cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
     bool capture_all(std::string& err);
@@ -253,7 +532,22 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    /// Called before every window this verifier launches (run, the batch and pipelined launches): the device's
+    /// residency table catches up with the host's (the adaptive tier's evictions while its copies are in flight).
+    /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
+    void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+
+    /// The PCIe count of each layer from measured costs (PcieModel) instead of a fixed share: the spin kernels stamp
+    /// each step's GPU work (the plan's arrival, the PCIe part's start, the wait for the CPU's rows; GPU clock), the host
+    /// times its pool, and after each window *model (the dispatch's) takes the costs. One GPU, no batch slots. Set
+    /// before `init` (the stamps are captured). `paused`: a request's own --pcie-frac holds meanwhile.
+    void set_pcie_balance(PcieModel* model) { bal_ = model; }
+    void pause_pcie_balance(bool paused) {
+        bal_paused_ = paused;
+        if (bal_ != nullptr && m_bal_ != nullptr) bal_->on = !paused;
+    }
+    bool pcie_balance_on() const { return bal_ != nullptr && m_bal_ != nullptr; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
@@ -275,6 +569,7 @@ private:
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU, only with a graph limit)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
+    uint64_t batch_graph_floor_ = 0;       ///< set_batch_graph_floor
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
@@ -288,12 +583,25 @@ private:
         for (int t = 0; t < S; ++t) k.push_back(rows[t]);
         return k;
     }
-    // batch_launch / batch_poll
-    bool b_running_ = false;
-    int64_t b_k_ = 0, b_steps_ = 0;
-    std::chrono::steady_clock::time_point b_last_;
+    // batch_launch / batch_poll (with external serving, batch_serve runs on another thread: running and the served
+    // layer count are atomics, set by batch_launch before running)
+    std::atomic<bool> b_running_{false};
+    std::atomic<int64_t> b_k_{0};
+    int64_t b_steps_ = 0;
+    std::atomic<bool> ext_serve_{false};
+    // when a layer was last served (steady clock ticks): the serving thread writes it, batch_poll's checks read it
+    std::atomic<int64_t> b_last_{0};
+    void ring_now() {
+        b_last_.store((int64_t) std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+    }
+    std::chrono::steady_clock::time_point last_ring() const {
+        return std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(b_last_.load(std::memory_order_acquire)));
+    }
+    std::chrono::steady_clock::time_point ext_checked_{};   ///< batch_poll's last check with external serving
     int32_t b_out_[8] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
+    std::vector<const int32_t*> slot_q_;   ///< set_slot_spec_q: the drafter's q list per slot for the next window (nullptr: none)
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
@@ -345,8 +653,24 @@ private:
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
+    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
+    uint32_t* hflag_in_h_ = nullptr;     ///< set_handoff_flags: the incoming hand-off's ready word (host / device)
+    uint32_t* hflag_in_d_ = nullptr;
+    uint32_t* hflag_out_h_ = nullptr;    ///< ... and the outgoing one's
+    uint32_t* hflag_out_d_ = nullptr;
+    uint32_t* hcount_d_ = nullptr;       ///< handoff_publish's block counter (device memory)
+    uint32_t* herr_h_ = nullptr;         ///< the bounded hand-off wait gave up (mapped; the reading stage's)
+    uint32_t* herr_d_ = nullptr;
+    uint32_t* hdrop_h_ = nullptr;        ///< STRATA_TEST_HANDOFF_DROP: the writing stage withholds its flag (mapped)
+    uint32_t* hdrop_d_ = nullptr;
+    bool handoff_failed(std::string& err) const;   ///< the bounded hand-off wait timed out in the last window
+    int prelaunched_ = 0;                ///< prelaunch ran for a window of this size: run skips staging + launch
+    /// The overlapped split: stage this window's inputs and launch its graph now (the graph waits on the hand-off
+    /// flag); `run` then only serves the host side.  Called on a helper thread while the previous stage runs.
+    bool prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    bool chain_overlap() const;          ///< this stage hands off through a flag to a next stage that waits on it
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
@@ -367,6 +691,8 @@ private:
     std::vector<std::pair<int64_t, int>> seg_at_[9];   ///< the (layer, group) after segment i; the last has none
     std::vector<char> seg_kind_[9];                    ///< 1: a serve point, 0: a split point
     bool capture_segments(int T, std::string& err);
+    /// The one-token self-commit for a window of T tokens: the window advances its own state (see verify.cpp).
+    bool window_self_commits(int T) const;
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)
     void trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const;
@@ -380,6 +706,29 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    // STRATA_DECODE_STAGE_TIMERS=1 (off: no events, the graphs unchanged): stage boundaries recorded on the capturing
+    // stream as event-record nodes inside each decode window graph, read back after the window's own sync in run().
+    // Keyed by the window size and the graph variant (T * 2 + ar_off_).  The times of one window are the intervals
+    // between consecutive boundaries in the stream's order; the forked shared-expert stream is a separate pair.
+    static constexpr int kStageN = 15;         // other, hc-read, attn, gdn, ffn-read, router, doorbell, shared, plan-wait, vram-experts, pcie-wait, pcie-experts, cpu-wait, rows+combine, hc-write
+    static constexpr int kStagePerLayer = 16;  // boundaries per layer and token group (7 pre, the shared stream's pair, 7 post)
+    struct StageMark { cudaEvent_t ev; int stage; };
+    struct StageChain {
+        std::vector<cudaEvent_t> owned;   // created before the capture, destroyed with the verifier
+        size_t used = 0;
+        std::vector<StageMark> marks;     // the capturing stream's boundaries in its order; marks[0] = the window's start
+        std::vector<std::pair<cudaEvent_t, cudaEvent_t>> shared;   // the forked shared stream: (fork on cs, end on sh)
+    };
+    std::map<int, StageChain> stage_chains_;
+    StageChain* stage_cur_ = nullptr;   // set by capture() around record_window (null: off, or a batch window)
+    double stage_ms_[kStageN] = {};     // summed over the windows harvested, all layers and groups
+    double stage_shared_ms_ = 0.0;      // the forked shared stream's time (it overlaps the chain: not in the sum)
+    int64_t stage_windows_ = 0;
+    void stage_prepare(int key, int64_t n_layers);
+    cudaEvent_t stage_event(cudaStream_t s, std::string& err);
+    bool stage_mark(cudaStream_t s, int stage, std::string& err);
+    void stage_harvest(int key);
+    void stage_report() const;
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
@@ -393,16 +742,42 @@ private:
     int64_t last_pos0_ = 0;
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
-    dpct::queue_ptr cs_ = &dpct::get_in_order_queue();
+    cudaStream_t cs_ = &dpct::get_in_order_queue();   // SYCL: never null (the SYCL-written paths use cs_-> directly)
     float* dbgR_ = nullptr;   ///< SYCL port debug: R (token 0) after every layer, n_layers x n_embd
     float* dbgM_ = nullptr;   ///< SYCL port debug: mixed_ (token 0) after every layer
-    dpct::queue_ptr sh_cs_ = &dpct::get_in_order_queue();
-    dpct::event_ptr ev_fork_ = nullptr, ev_join_ = nullptr;
-    dpct::experimental::command_graph_exec_ptr exec_[9] = {};
-    dpct::experimental::command_graph_exec_ptr exec_nr_[9] =
-        {}; // #871: the doorbell variant of a stage that is all-resident
-            // otherwise
-    dpct::experimental::command_graph_exec_ptr commit_exec_ = nullptr;
+    cudaStream_t sh_cs_ = &dpct::get_in_order_queue();
+    cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    cudaEvent_t ev_q8_ = nullptr;   // STRATA_VERIFY_QDEDUP with the forked shared stream: cs's q8_1 of the MoE input, waited on by sh_cs_
+    // STRATA_PCIE_EARLY (pcie mode 2, the missed experts fetched by a copy kernel): the fetch runs on pf_cs_, forked from cs once the
+    // layer's plan is on the device and joined back before the PCIe groups, so it overlaps the VRAM groups instead of following them
+    cudaStream_t pf_cs_ = nullptr;
+    cudaEvent_t ev_pf_fork_ = nullptr, ev_pf_join_ = nullptr;
+    // STRATA_LOOKAHEAD_GPU_STREAM (CUDA): the look-ahead node on its own stream, forked from cs after the layer's MoE input
+    // (mixed_) is complete and before the router; cs waits on ev_la_read_done_ before it next writes mixed_ (pre of the next
+    // layer, grp 0) and joins ev_la_done_ at the window's end.  nullptr: the node stays on cs
+    cudaStream_t la_cs_ = nullptr;
+    cudaEvent_t ev_la_fork_ = nullptr, ev_la_read_done_ = nullptr, ev_la_done_ = nullptr;
+    // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
+    // on these side streams (record_window); the same kernels on the same inputs, only their order is freer
+    bool df_branch_ = false;
+    cudaStream_t df_side_[2] = {};
+    cudaEvent_t df_fork_ = nullptr;
+    cudaEvent_t df_join_[2] = {};
+    cudaGraphExec_t exec_[9] = {};
+    cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    bool la_win_[9] = {};               // STRATA_LA_LEARN: this window size's graph runs the learner (its batch follows each launch)
+    const uint16_t* mtp_gate_ = nullptr; // STRATA_MTP_LA: the drafter's router weight (set_mtp_la)
+    int mtp_src_ = -1;                   // STRATA_MTP_LA: the source layer whose router input the drafter's learner reads
+    void la_learn_before_launch();      // before a window's graph launch: the last batch's weights are done
+    bool la_learn_after_launch(int T, std::string& err);   // after a learning window's launch: its batch, on the side stream
+    // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
+    // mixer's projections, joined before the recurrence / the attention
+    cudaStream_t side_ = nullptr;
+    cudaEvent_t mfork_ = nullptr, mjoin_ = nullptr;
+    // fork b063c13 (STRATA_SIDE_MIXER=2): a second branch for the GDN gate projection and the QSA queries' chain
+    cudaStream_t side2_ = nullptr;
+    cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
+    cudaGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
@@ -418,17 +793,25 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
-    dpct::event_ptr commit_done_ =
-        nullptr; // recorded after an async commit (set_commit_async); see
-                 // wait_commit
+    // set_pcie_balance: per step (layer x group, stride 2 groups) the GPU's clock as the plan arrives, as the PCIe
+    // part starts and as it waits for the CPU rows (4 words a step); the pool's ms, its experts, the PCIe ones, and
+    // whether the step had a plan
+    unsigned long long* h_bal_ = nullptr; unsigned long long* m_bal_ = nullptr;
+    std::vector<double> bal_p_;
+    std::vector<int32_t> bal_nc_, bal_np_;
+    std::vector<char> bal_ok_;
+    PcieModel* bal_ = nullptr;
+    bool bal_paused_ = false;
+    void pcie_balance_window(int64_t steps, int G);
+    cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
-    dpct::queue_ptr copy_ =
-        &dpct::get_in_order_queue(); // the copy engine's stream (DMA of missed
-                                     // experts)
-    struct FlagSet { uint32_t* flag; uint32_t value; };
+    cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    using FlagSet = strata::core::FlagRaise;
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
     static void raise_flag(uint32_t* flag, uint32_t value);
+    /// Flag B for `want`, behind every copy queued on copy_ (an empty plan must not overtake an earlier layer's DMA).
+    void raise_flag_b_ordered(uint32_t want);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
@@ -436,8 +819,25 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
+    std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
+
+    // latent MoE (latent-experts branch): every pointer stays null for an ordinary pack.  The experts of a latent pack run in a latent
+    // space: D (hidden -> one latent vector per group) before them, U (latent -> hidden, per group) after.  The D/U pair, the group labels
+    // and the sizes come from the session-level LatentTab (core/latent_share.hpp); nothing here is sized by a constant.
+    bool latent_ = false;
+    int lat_fmt_ = 8, lat_G_ = 0;
+    bool lat_u_packed_ = false;   // the device U was repacked (LatentTab): latent_u_grouped takes the int4-load kernel
+    int64_t lat_ELL_ = 0, lat_E_ = 0;
+    size_t lat_d_layer_ = 0, lat_u_layer_ = 0;                // one layer's D and U bytes
+    const uint8_t *lat_d_ = nullptr, *lat_u_ = nullptr;       // the session pair (device, not owned)
+    const int32_t* lat_labels_dev_ = nullptr;                 // [n_layers * n_expert] (device, not owned)
+    uint8_t *lat_xq_ = nullptr, *lat_xlq_ = nullptr, *lat_uq_ = nullptr;   // q8_1 of x [T], of xl [T*G], of yl [T*K]
+    float *lat_xl_ = nullptr, *lat_yl_ = nullptr;             // [T*G, ELL] (D's output), [T*K, ELL] (the GPU's A output)
+    float* lat_yfull_ = nullptr;                              // [T*K, ELL]: the GPU's and the CPU pool's A rows together, U's input
+    float* h_latxl_ = nullptr;   float* m_latxl_ = nullptr;    // mapped: the D rows for the CPU pool (row t*G + g)
+    uint32_t* h_xlseq_ = nullptr; uint32_t* m_xlseq_ = nullptr;   // mapped: the D stage's doorbell (layer + 1 once layer's rows landed)
 
     // device
     void* arena_ = nullptr;
@@ -448,6 +848,9 @@ private:
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
     float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
+    // STRATA_DRAFT_TRACE (measurement only; zero-sized when off): the window's residual after each traced layer, [layer][max_t][hc * n_embd]
+    float* dtr_ = nullptr;
+    void draft_trace_write(int T, const int32_t* tokens, int64_t pos0, const int32_t* out);
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
@@ -465,6 +868,46 @@ private:
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
+    float* dyn_gap_ = nullptr;         ///< STRATA_ROUTE_BUDGET_DYN: the head's top-1 minus top-2 raw logit per row (T floats; off: none)
+    int32_t* dyn_top1_ = nullptr;      ///< STRATA_FRAGILE_RECHECK: the head's top-1 id per row (T ints; off: none); flips are judged on it
+    float* row_shift_ = nullptr;       ///< STRATA_FRAGILE_RECHECK: per row, the stand-ins' moves this stage's layers made (T floats; off: none)
+    // STRATA_STANDIN_LEARN (opt-in, whole model on one GPU, needs STRATA_FRAGILE_RECHECK; null when off): the stand-in corrections
+    float* lrn_c_ = nullptr;           ///< device [n_layers][512][512]: the learned weight scale per (layer, true expert e, stand-in s); 1 until ready
+    int32_t* lrn_rec_ = nullptr;       ///< device [T][4]: each row's first stand-in (layer, rank, true expert, stand-in); layer -1 none (reset per decode window)
+    float* lrn_ys_ = nullptr;          ///< device [T][N]: the cut window's stand-in down output per row (y_s)
+    float* lrn_ye_ = nullptr;          ///< device [N]: the exact re-run's true-expert down output (y_e) at the pending layer
+    int32_t* lrn_gate_ = nullptr;      ///< device [4]: mode (0 off, 1 capture y_s, 2 capture y_e), layer, rank
+    float* lrn_pe_ = nullptr;          ///< device [n_layers][512][512] (STRATA_STANDIN_BALANCE): the risk factor per pair (1 until ready)
+    strata::kernels::MaskEvs* mev_ = nullptr;   ///< STRATA_MASK=learn: device, the replaced picks of each decode row (native_router.hpp)
+    float* mlr_logit0_ = nullptr;               ///< STRATA_MASK=learn: device [vocab] the cut row's first-pass logits (head stage)
+    float* mlr_kl_ = nullptr;                   ///< STRATA_MASK=learn: device [1] the re-check's KL
+    struct StandinLearnState;
+    float* lrn_x_ = nullptr;           ///< device [T][N] (STRATA_SUBFIT_LOG): each stand-in row's layer input at its first stand-in's layer
+    strata::kernels::SubfitProbeBufs sp_{};   ///< STRATA_SUBFIT_LOG: the probe buffers (kernels/subfit_capture.hpp)
+    // SPEC-substitute-fit stage 2 (STRATA_SUBFIT_APPLY set, not off; the learner on): the original pick of each substituted slot (int16
+    // [T][10], -1 none) and its corrected flag ([T][10]); both consumed by subfit_apply.  The device tables: LUT, A, B, c, resid, nfit.
+    int16_t* sub_orig_ = nullptr;
+    uint8_t* sub_flag_ = nullptr;
+    strata::kernels::SubfitTables sub_tab_{};
+    bool sub_on_ = false;              ///< the apply path exists (buffers, tables, the route wiring, the apply launch)
+    int sub_mode_ = 0;                 ///< 1 dynamic, 2 all (0 when off)
+    bool sub_started_ = false;         ///< A uploaded and the learner's state written to the tables
+    // SPEC-substitute-fit shadow samples (the learner on, STRATA_SUBFIT_SHADOW > 0): the router's list of each row's substitutions
+    // ([T][cap][4], counts [T]) and the exact successor's capture of row 0 per layer (picks [L][10], input [L][N], outputs [L][10][N])
+    int32_t* shd_list_ = nullptr;
+    uint32_t* shd_n_ = nullptr;
+    int32_t* shd_ids_ = nullptr;
+    float* shd_x_ = nullptr;
+    float* shd_y_ = nullptr;
+    int shd_cap_ = 0;
+    bool shd_on_ = false;
+    uint32_t shd_salt_ = 0;
+    bool sp_on_ = false;               ///< the logger's buffers exist
+    bool x_on_ = false;                ///< the layer-input capture exists (STRATA_SUBFIT_LOG or STRATA_SUBFIT_LEARN: lrn_x_ and its launch)
+    bool sp_win_ = false;              ///< this window is a probe window (set at its begin)
+    int sp_every_ = 64;                ///< STRATA_SUBFIT_PROBE_EVERY: decode windows per probe window
+    uint64_t sp_decode_ = 0;           ///< decode windows seen
+    std::shared_ptr<StandinLearnState> lrn_st_;   ///< host: the pairs, the pending sample, this request's counts (verify.cpp)
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

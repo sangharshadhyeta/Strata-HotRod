@@ -33,6 +33,7 @@
 namespace strata::core {
 
 class NativeHead;
+struct MtpSlotLoader;   // STRATA_MTP_SLOTS: the host loader (mtp.cpp)
 
 class MtpDrafter {
 public:
@@ -93,7 +94,11 @@ public:
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
-    dpct::queue_ptr stream() const { return cs_; }
+    /// A prompt read beside running batch windows (STRATA_PIPED_CONCURRENT): the prompt pass's graphs captured and its
+    /// input records sized for chunks of up to n rows now, with nothing in flight.  On the read's thread a capture or
+    /// a free waits for the device, whose windows wait for the main thread's doorbell service (#31).
+    bool reserve_prefill(int64_t n, std::string& err);
+    cudaStream_t stream() const { return cs_; }
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
@@ -115,6 +120,16 @@ public:
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
     bool coupled() const { return coupled_active_; }
+
+    /// STRATA_MTP_LA=1 (opt-in): the drafter's router weight (bf16 [512 x n_embd]): the verify window's learner applies it to a main layer's input.
+    const uint16_t* gate_weight() const { return bf16("mlp.gate.weight"); }
+    /// STRATA_MTP_SLOTS is on (the learner needs the slot loader).
+    bool slots_on() const { return slots_n_ > 0; }
+    /// STRATA_MTP_LA: turns the drafter's learner on or off.  On needs the slots, a drafter whose round graphs are not captured yet (their
+    /// label is part of them) and the learner (la_mtp_alloc); false otherwise (the reason is not kept: the caller says the feature is off).
+    bool set_la_mtp(bool on);
+    /// STRATA_MTP_LA_LOADS (default 4, 0..16): the predicted experts loaded per window at most.
+    static int la_loads();
 
     // ---- --pipeline-windows 2: the chain as one asynchronous launch (the round and its steps back to back, no host
     // wait), its first `n_force` steps fed the given tokens instead of their own picks (teacher forcing: the drafts of
@@ -289,6 +304,49 @@ private:
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
+
+    // ---- STRATA_MTP_SLOTS=<n> (opt-in): only n of the 512 drafter experts are on the GPU, in slots 0..n-1.  A pick whose
+    // expert is resident uses its slot; a miss takes a stand-in (mtp_slot_remap, native_router.cu).  A rank 0-1 miss is
+    // loaded by the host loader thread from experts.bin and installed between rounds (slot_service), evicting by CLOCK.
+    bool slots_load(const std::string& rt_dir, std::string& err);   ///< experts_ as n slots, the maps, the loader thread
+    void slot_service();     ///< the host's share of a round: installs, evictions, wants; a no-op while the stream is busy
+    void slot_stop();       ///< joins the loader, frees its buffers, prints the stats line (destructor)
+    void slot_service_zc();  ///< STRATA_MTP_ZC: slot_service's share in zero-copy mode (no loader: wants are installed from the pinned RAM copy)
+    // ---- STRATA_MTP_ZC=1 (opt-in, with STRATA_MTP_SLOTS): a drafter expert that is not in a slot is computed exactly from its pinned RAM copy
+    // (zc_h_, all 512 experts, mapped; zc_d_ its device address).  h_ptr_/d_ptr_ (512 u64): each expert's blob address, its slot or its RAM copy;
+    // the grouping reads d_ptr_ (moe_group_ptr).  Set in slots_load; no loader thread in this mode.
+    bool zc_on_ = false;
+    uint8_t* zc_h_ = nullptr;
+    uint8_t* zc_d_ = nullptr;
+    unsigned long long* h_ptr_ = nullptr;
+    unsigned long long* d_ptr_ = nullptr;
+    int zc_installs_ = 8;            ///< STRATA_MTP_ZC_INSTALLS: the wanted experts copied into slots per round at most
+    int slots_n_ = 0;
+    bool slots_default_ = false;     ///< the slots came from the default (STRATA_MTP_SLOTS unset): no RAM copy -> the whole drafter
+    int32_t* d_slot_ = nullptr;      ///< device: expert id -> slot or -1 (512 int32)
+    int32_t* h_slot_ = nullptr;      ///< pinned host copy of d_slot_ (512 int32)
+    std::vector<int> expert_of_;     ///< slot -> the expert it holds (-1 none)
+    uint8_t* ref_h_ = nullptr;       ///< mapped: CLOCK reference bit per slot (set by the remap kernel on a hit)
+    uint8_t* ref_d_ = nullptr;
+    int32_t* want_h_ = nullptr;      ///< mapped: the rank 0-1 misses the kernel saw (4096 entries)
+    int32_t* want_d_ = nullptr;
+    unsigned int* want_n_h_ = nullptr;   ///< mapped: how many misses were written (may exceed the entries)
+    unsigned int* want_n_d_ = nullptr;
+    unsigned long long* st_h_ = nullptr; ///< mapped: 20 counters, picks[r] at r, hits[r] at 10 + r
+    unsigned long long* st_d_ = nullptr;
+    unsigned int want_read_ = 0;
+    int clock_hand_ = 0;
+    uint64_t slot_loads_ = 0, slot_rounds_ = 0;
+    std::vector<bool> pending_;      ///< host: an expert requested from the loader and not yet installed
+    MtpSlotLoader* slot_ld_ = nullptr;
+
+    // ---- STRATA_MTP_LA=1 (opt-in, with STRATA_MTP_SLOTS): the drafter's first step is predicted by a learner (native_router.cu la_mtp_*).
+    // Its round graph writes the label (the first draft's router logits), each round takes its source row, and the loader reads the window's
+    // predictions and loads the predicted experts that are not resident.
+    bool la_mtp_on_ = false;          ///< set_la_mtp(true) before the round graphs are captured
+    bool la_label_rec_ = false;       ///< capture_round: the record_rest that routes the round's first draft (the label)
+    bool la_label_ready_ = false;     ///< a round was entered: its label is written by its graph; the next entry runs its batch
+    bool la_mtp_entry(int a, std::string& err);   ///< at a round's entry (draft, chain_launch): the last batch, this round's source row
 };
 
 }  // namespace strata::core

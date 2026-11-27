@@ -1,11 +1,39 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
+<<<<<<< sycl
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+||||||| base
+#include "strata/core/batch_rows.hpp"
+#include "strata/kernels/gfx_arch.hpp"
+=======
+#include "strata/core/batch_rows.hpp"
+#include "strata/core/sm75_series.hpp"
+#include "strata/kernels/gfx_arch.hpp"
+>>>>>>> ours-now
 #include "strata/core/verify.hpp"
+#include "strata/core/standin_pool.hpp"
+#include "strata/core/subfit_samples.hpp"
+#include "strata/core/subfit_shadow.hpp"
+#include "strata/core/expert_source.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/core/subfit_learn.hpp"
+#include "strata/core/risk_concentration.hpp"
+#include "strata/kernels/subfit_capture.hpp"
+#include <random>
+#include "strata/core/route_control.hpp"
+#include <cstring>
+#include <system_error>
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+#include "strata/core/host_graph_launch.hpp"
+#endif
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
+#include "strata/core/spec_prob.hpp"
+#include "strata/core/paired_test.hpp"
+#include "strata/core/recheck_cheap.hpp"
+#include "strata/core/recheck_gate.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -20,6 +48,7 @@
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/gr.hpp"
@@ -31,6 +60,8 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
+#include "strata/core/latent_share.hpp"   // latent-experts branch: the session's latent D/U tables
+#include "strata/kernels/latent.hpp"      // latent-experts branch: latent_plan_rows, latent_u_grouped
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -44,13 +75,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <filesystem>
 #include <map>
 #include <string>
+#include <optional>
 #include <thread>
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -68,11 +102,495 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// STRATA_DECODE_STAGE_TIMERS=1: the decode window's stage boundaries (Verifier::stage_mark); the ids index stage_ms_
+inline bool g_stage_timers() { static const bool on = [] { const char* v = std::getenv("STRATA_DECODE_STAGE_TIMERS"); return v != nullptr && v[0] == '1'; }(); return on; }
+// STRATA_PCIE_EARLY (on by default on CUDA; =0 off): the PCIe share's fetch kernel runs on its own stream beside the VRAM groups (Verifier::pf_cs_).
+// Measured on an RTX 3060 (Qwen UD-Q4_K_XL): about 7% off the decode window.  Not measured on AMD (HIP): there it stays opt-in (=1).
+inline bool pcie_early_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PCIE_EARLY");
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+        return v != nullptr && v[0] == '1';
+#else
+        return v == nullptr || v[0] != '0';
+#endif
+    }();
+    return on;
+}
+enum StageId : int { kStOther = 0, kStHc, kStAttn, kStGdn, kStFfn, kStRouter, kStDoor, kStShared,
+                     kStPlan, kStVram, kStPcieWait, kStPcieExp, kStCpuWait, kStRows, kStHcWrite };
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
+// STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
+struct RouteResidentCfg;
+RouteResidentCfg& route_resident_cfg();
+// STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned correction (native_router.cu la_learn_*); STRATA_LA_LEARN_TIMING=1 times its training
+// STRATA_LA_LEARN unset = auto: on.  A learned predictor already on disk (data/predictor-*.bin; the serve start says so through
+// la_learn_set_saved, before the verifier allocates) is loaded; without one the learner starts from the plain router and learns from scratch.
+// =1 on, the same; =0 off.
+static int g_la_saved = 0;
+static bool la_learn_env_on() {
+    static const int mode = [] { const char* e = std::getenv("STRATA_LA_LEARN"); return e == nullptr ? 2 : (e[0] == '0' ? 0 : 1); }();
+    return mode != 0;   // auto (2) and =1: on; =0: off (g_la_saved only decides whether a file is loaded)
+}
+static bool la_learn_timing_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_LA_LEARN_TIMING"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+// STRATA_MASK_RESIDENT (opt-in, =1; unset or 0: the old rule): the mask moves a pick only onto a cheap expert, the masked set is chosen by
+// the measured SSD demand, and p and g move only by the live flip comparison (no mask test).  Read once.  Opt-in since 7 Nov: on 8095 it
+// cut SSD reads ~20% but not decode time, and with STRATA_MASK_FLOOR=all its MMLU-Pro reasoning ran longer (7 of 40 past 3000 tokens).
+static bool mask_resident_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MASK_RESIDENT"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+// SPEC-router-fuse (STRATA_ROUTER_FUSE=0: all off; STRATA_ROUTER_FUSE_LA=0: the look-ahead's step off; STRATA_ROUTER_FUSE_POST=0: the
+// post-routing step off).  Default on.  Read once.
+static bool router_fuse_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSE"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+static bool la_fuse_la_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSE_LA"); return router_fuse_on() && (v == nullptr || v[0] != '0'); }();
+    return on;
+}
+static bool router_post_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSE_POST"); return router_fuse_on() && (v == nullptr || v[0] != '0'); }();
+    return on;
+}
+// STRATA_MASK_CTRL (default on, =0 off): the mask's control windows also run without STRATA_MASK_RESIDENT (SPEC-control-windows): the
+// "without" side of the mask's re-checks then comes from them.  Off: only the resident rule runs control windows (the old gate).
+static bool mask_ctrl_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MASK_CTRL"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+struct RouteResidentCfg {
+    float margin = 0.0f;
+    int lo = 6, hi = 9;
+    bool count = false;   ///< decode windows count the router's own top-10 on the device (route_want_*)
+    float repl_gap = strata::kernels::route_swap2_gap(); ///< STRATA_SWAP2_GAP=<logits>: a replaced pick counts for a quality swap only when its stand-in scores at least this far below it
+    float want_lo = 1.0f; ///< STRATA_WANT_LOW=<w>: the swap round's demand counts a pick the floor replaces (rank >= lo) as w, a pick below the floor as 1
+    int maxrank = 0;      ///< STRATA_ROUTE_MAXRANK=<n>: a stand-in must be within the router's first n places of all 512 (0: any)
+    float bias = 0.0f;    ///< STRATA_ROUTE_BIAS=<beta>: the CCE bias, ln(1 + beta) added to a resident expert's logit before the top-10
+    float wmax = 0.0f;    ///< STRATA_ROUTE_WMAX=<w>: a missed pick is replaced only when the router's weight on it is below w (0: off)
+    float budget = 0.0f;  ///< STRATA_ROUTE_BUDGET=<b>: a missed pick of rank < lo is replaced only when w * gap <= b (w: its weight, gap: its logit minus the stand-in's); 0: off
+    float budget_tail = 0.0f;  ///< STRATA_ROUTE_BUDGET_TAIL=<b>: a missed pick of rank >= lo is replaced only when w * gap <= b (the margin does not apply); 0: off
+    float edge = -1.0f;   ///< STRATA_ROUTE_RESIDENT_EDGE=<logits>: the rank below `lo` is replaced only by a close substitute
+    // STRATA_ROUTE_BUDGET_DYN=<b_hi>,<gap_min>[,<b_lo>]: decode only, and it overrides `budget` there.  The next decode window runs at
+    // b_lo when the smallest top-1 minus top-2 raw-logit gap over the rows the last window kept is below gap_min (a NaN counts as
+    // below), else at b_hi.  A request's first decode window runs at b_lo.  Prompt windows keep `budget`, or b_lo when that is 0.
+    bool dyn_on = false;
+    float dyn_hi = 0.0f, dyn_gap = 0.0f, dyn_lo = 0.0f;
+    bool dyn_cur_hi = false;                  ///< the next decode window runs at b_hi
+    long long dyn_n_hi = 0, dyn_n_lo = 0;     ///< decode windows run at b_hi / at b_lo since the stats line last took them
+    // STRATA_FRAGILE_RECHECK=1 (decode only; the serial decode loop): a row r of a window with stand-ins is a close call when a stand-in
+    // moved it (row_shift[r] > 0, route_resident_k) and gap[r] < fragile_k * row_shift[r] (gap: its top-1 minus top-2 raw logit).
+    // The window is cut before its first close call: rows before it are kept, and the close-call row is decided exactly by the next
+    // window (ranks < lo with no stand-in).  A close call at row 0 makes no cut: a re-run would step the GDN/PLE state twice.
+    // fragile_k is learned: from the first 64 decode windows (route_fragile_first: the 10th percentile of the moved rows' gap / shift, no
+    // cut meanwhile), then by the re-checks (route_fragile_settle: every 50 re-checks of this process, k = 1.25 times the largest flipped ratio
+    // in the ring; k never shrinks without a flip; a raise needs the ring's flip rate above the control ring's noise (Wilson 90%), and each
+    // update moves k at most to 1.5 times or 0.5 times its value).  Flips are argmax changes (route_fragile_settle).
+    // STRATA_FRAGILE_K0=<k> pins k: no learning, no updates, the file's k is not loaded over it.
+    // Exploration: when no normal cut is found, every 16th eligible window cuts at the first moved row r >= 1 with ratio in [k, 8k) (explore cut).
+    bool fragile_on = false;
+    float fragile_k = 4.0f;                   ///< the close-call factor (set by the learning below, or STRATA_FRAGILE_K0)
+    bool fragile_k_set = false;               ///< k is set: STRATA_FRAGILE_K0, or learned from the first kFragileLearn windows (no cut before)
+    bool fragile_k_pinned = false;            ///< STRATA_FRAGILE_K0 is set: k never learns or updates, and the file's k does not replace it
+    float fragile_k_file = 0.0f;              ///< the k the tune file holds (loaded); written back in place of a pinned k (0: none)
+    // SPEC-substitute-fit stage 2 step 3: STRATA_SUBFIT_APPLY's mode slot (0 off, 1 dynamic, 2 all), read once.  The k and the control ring
+    // of this slot are the process's; the other slots stay in the gate file as they were (gate::KByMode).
+    int subfit_mode = 1;
+    enum { kFragileLearn = 64, kFragileSamples = 20000, kFragileK = 50 };
+    long long fr_eligible = 0;                ///< eligible windows (k set, stand-in moves) counted by route_fragile_first: every 16th may explore
+    long long fr_session = 0;                 ///< re-checks settled in this process (the ring's entries; the k update every 50)
+    int fr_learn_windows = 0;                 ///< the learning windows counted so far
+    std::vector<float> fr_learn_ratio;        ///< the learning windows' gap / shift of their moved rows 1.. (cleared when k is set)
+    std::vector<float> fr_samp_shift, fr_samp_gap;   ///< this request's moved rows: stand-in shift and gap (medians on the stats line)
+    enum { kFragileRing = 200 };              ///< the re-checks kept for the k update (collected in this process only)
+    float fr_ratio[kFragileRing] = {};        ///< per re-check (ring): gap / row_shift of the cut row
+    bool fr_flip[kFragileRing] = {};          ///< per re-check (ring): the exact row differed from the stand-in's token
+    bool fr_explore[kFragileRing] = {};       ///< per re-check (ring): the cut was an explore cut
+    int fr_pos = 0, fr_n = 0;                 ///< the ring's next slot and its filled count
+    // Noise control (STRATA_FRAGILE_RECHECK): every kCtrlEvery eligible windows with no normal or explore cut, the first accepted row r >= 1
+    // that no stand-in moved (row_shift 0) is re-checked the same way.  Its flips are the noise of a re-decision (two windows of the same
+    // tokens differ on their own), so they never enter fr_flip / req_fl / auto_fl.  The last kCtrlRing control re-checks are kept.
+    enum { kCtrlEvery = 32, kCtrlRing = 400 };   // (400 = the gate's persisted control re-checks, gate::kCtrlKeep: the seed fills it whole)
+    // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 = the old selection below): every n-th eligible decode window (a non-merged window of a
+    // learned k, with a stand-in budget or AUTO, not an exact re-run) is a control window decided BEFORE it runs: route_fragile_control sets
+    // the device flag, so route_resident_k and the mask kernel move no pick and row_shift stays 0.  Its selection then takes the first
+    // row r >= 1 (every row is unmoved), so the re-check compares exact with exact.  A mask control window waits for the next window.
+    long long fr_ctrl_every = 128;
+    bool win_fctl = false;                    ///< this window is a fragile control window (set by route_budget_window; route_fragile_first selects its row)
+    bool fr_ctrl[kCtrlRing] = {};             ///< per control re-check (ring): the exact row's top-1 differed from the stand-in's
+    int fr_ctrl_pos = 0, fr_ctrl_n = 0;       ///< the control ring's next slot and its filled count
+    long long fr_ctrl_win = 0;                ///< eligible windows counted for the control cadence (the old selection's counter when fr_ctrl_every is 0)
+    // control windows' counts and tokens / seconds per window kind (0 other decode, 1 fragile control, 2 mask control, 3 exact re-run, not counted),
+    // this request's (route_control_take takes and resets them)
+    long long kn[4] = {0, 0, 0, 0}, ktok[4] = {0, 0, 0, 0};
+    double ksec[4] = {0.0, 0.0, 0.0, 0.0};
+    int win_kind = 0;                         ///< the kind of the window being run (set by route_budget_window)
+    long long fr_ctrl_rc = 0, fr_ctrl_fl = 0; ///< this request's control re-checks and their flips (the stats line takes them)
+    long long fragile_rechecks = 0, fragile_flips = 0;   ///< all re-checks and flips
+    float fragile_pend_ratio = 0.0f;          ///< the pending cut's gap / row_shift
+    bool fragile_pend_explore = false;        ///< the pending cut is an explore cut
+    bool fragile_pend_control = false;        ///< the pending cut is a control re-check (its verdict is the noise floor)
+    bool fragile_exact = false;               ///< the next decode window runs ranks < lo exact (after a cut)
+    bool win_exact = false;                   ///< this window is a flip re-check's exact re-run (set by route_budget_window): no STRATA_MASK moves in it
+    // SPEC-recheck-cheap change 1: STRATA_RECHECK_ROW_ONLY (default on): the exact successor of a cut makes only its row 0 exact (the fragile
+    // flag's row count is 1 for it); the request's budget stays for the other rows.  Off: the whole-window exact successor (budget 0, win_exact).
+    bool recheck_row_only = true;
+    // SPEC-recheck-gated: STRATA_RECHECK_GATE (default on, needs the fragile re-check; 0 = the re-check of before).  Rule 1-3 per row from the
+    // drafter's probability (the decode loop computes the uncertain rows' bits, route_gate_rows); eligibility for a cut (route_fragile_first);
+    // rule 4 audit windows; rule 5 the threshold mover on gs (the learner's totals, eligible rows only).
+    bool gate_on = false;                     ///< the gate is active (STRATA_RECHECK_GATE, and the fragile re-check)
+    long long gate_audit_every = 256;         ///< STRATA_RECHECK_AUDIT_EVERY: every n-th decode window is an audit window (0 = none)
+    long long gate_win = 0;                   ///< decode windows counted for the audit cadence (process-wide)
+    uint32_t gate_bits = 0;                   ///< this window's uncertain-row hold bits (route_gate_rows; consumed by route_budget_window)
+    bool gate_bits_set = false;               ///< route_gate_rows was called for this window
+    gate::State gs;                           ///< the learner's state: totals (eligible rows), P_HI, rank table (in-process for now)
+    struct GateReq {                          ///< this request's gate counts (route_gate_take takes and resets them)
+        long long held = 0, skipped = 0, audit_wins = 0, cuts = 0;
+        long long au_moved[gate::kNone + 1] = {}, au_cut[gate::kNone + 1] = {}, au_flip[gate::kNone + 1] = {};
+        gate::RankTable rk;
+    } gq;
+    struct ShiftReq {                         ///< step F: this request's calibration by shift decile and its refusals (route_shift_take resets them)
+        gate::ShiftCal cal;
+        long long cap_moves = 0, cap_rows = 0;   ///< refused moves and row launches with a refusal (the device counters, read at the request's end)
+    } sq;
+    // SPEC-recheck-gated step F: the per-row shift cap (STRATA_SHIFT_CAP, with the gate) and its multipliers; the calibration by shift decile
+    bool cap_on = false;                      ///< caps are set before each non-audit window (the gate on, STRATA_SHIFT_CAP not 0)
+    gate::CapMult cap_mult;                   ///< STRATA_SHIFT_CAP_CONF / _UNC / _NONE: multipliers of the running median (conf default +inf)
+    float cap_last[3] = {INFINITY, INFINITY, INFINITY};   ///< the caps of the last window's classes (conf, unc, none), for the request line
+    int gate_pend_sdec = 0;                   ///< the pending cut's shift decile (calibration)
+    bool gate_pend = false, gate_pend_audit = false;   ///< a gate cut is waiting for its verdict
+    int gate_pend_bucket = gate::kNone;
+    long long gate_pend_rank[gate::kRankSlots][gate::kBands] = {};   ///< the pending cut's rank-wise swaps
+    bool fragile_pend = false;                ///< a cut's row is waiting for the exact window that re-decides it
+    int32_t fragile_pend_tok = 0;             ///< the stand-in window's top-1 id at the cut row (argmax, not the sampled token)
+    bool fragile_pend_stop = false;           ///< the pending cut is a stop re-check (route_fragile_stop_cut: its row's stand-in token is a stop id)
+    long long fr_stop_cuts = 0, fr_stop_kept = 0;   ///< this request's stop re-checks, and those whose exact top-1 agreed with the stand-in's (kept)
+    float win_low = 0.0f, win_tail = 0.0f;   ///< the budgets (ranks < lo, ranks >= lo) the last window ran with
+    long long fr_cuts = 0, fr_explore_cuts = 0, fr_moved = 0, fr_flips = 0;   ///< this request's cuts (explore ones too), explore cuts, rows moved by stand-ins, flipped re-decisions (the stats line takes them)
+    // STRATA_ROUTE_BUDGET_AUTO=1 (needs fragile_on; decode loop only): the engine chooses ONE budget b for ranks < lo and ranks >= lo alike.
+    // Process-wide (kept across requests).  An INTERLEAVED test compares two arms over the same stretch of decode, so content drift cancels:
+    // the base arm at b and the candidate arm at b * s^d (s: auto_step, 1.25 at the start; auto_dir d: +1 up, -1 down).  Runs of kAutoRun non-merged decode windows
+    // alternate between the arms; the first run of each pair alternates: arm of run r = (r % 2) ^ ((r / 2) % 2) (base, cand, cand, base, ...).
+    // A test is a PAIRED sequential test (core/paired_test.hpp): the runs come in blocks of two (runs 2k, 2k+1 hold one run per arm), and
+    // each block is a pair with d = ln(rate_cand / rate_base).  After each pair the test moves (mean d - 2 se > ln(1 + STRATA_TUNE_MIN_EFFECT)),
+    // keeps (mean d + 2 se < that delta, or the pair cap: 160 budget, 240 mask), or continues.  The look waits while a cut is pending, so the
+    // exact successor is charged to its block first.
+    // An arm's speed = its committed tokens / its wall seconds: each window adds end - max(start, the previous window's end) when the previous
+    // window was the same request, else end - start.  A cut window's exact successor is charged to the cut window's arm (its re-checks
+    // cost that arm) but is not a scheduled window.
+    // State machine: a round tests auto_first (stage 0).  A move (paired decision) sets b to the candidate and the next round starts with
+    // that direction.  A keep starts the other direction (stage 1) against the same base; a keep there keeps b, and the next round starts
+    // with the other direction (paired::DirState).  b is clamped to [0.02, 4].
+    // The static STRATA_ROUTE_BUDGET / _TAIL / _DYN are ignored for decode (DYN is switched off); a prompt window keeps them.
+    // The test's length is set by its pair count (paired::budget_rule / mask_rule), not by windows.
+    enum { kAutoRun = 8 };
+    bool auto_on = false;
+    float auto_b = 0.1f, auto_b0 = 0.1f;      ///< the base budget of ranks < lo and of ranks >= lo; the start (STRATA_ROUTE_BUDGET_AUTO_B0)
+    bool auto_testing = false;                ///< a test is running (its arms below)
+    float auto_cand_b = 0.1f;                 ///< the running test's candidate budget (b * s^d, clamped)
+    int auto_dir = 1;                         ///< the running test's candidate direction
+    int auto_first = 1;                       ///< the direction the next round tests first
+    int auto_stage = 0;                       ///< 0: the round tests auto_first; 1: the other direction
+    long long auto_n[2] = {0, 0};             ///< the running test's scheduled windows per arm (0 base, 1 candidate)
+    long long auto_tok[2] = {0, 0};           ///< its committed tokens per arm (scheduled and exact windows)
+    double auto_secs[2] = {0.0, 0.0};         ///< its wall seconds per arm
+    long long auto_runs = 0;                  ///< the running test's runs started
+    int auto_run_left = 0;                    ///< windows left in the current run
+    int auto_run_arm = 0;                     ///< the current run's arm
+    int auto_win_arm = 0;                     ///< the arm of the window being run (set before its run)
+    bool auto_win_sched = false;              ///< that window is a scheduled one (a run's window)
+    int auto_cut_arm = 0;                     ///< the arm of the last cut window (its exact successor runs at this arm's budget)
+    long long auto_req = 0;                   ///< the request counter (route_budget_begin)
+    bool auto_have_last = false;              ///< a window of the search ran before (auto_last_end / auto_last_req are its)
+    std::chrono::steady_clock::time_point auto_last_end{};
+    long long auto_last_req = -1;
+    long long auto_tests = 0, auto_tests_take = 0;   ///< tests finished; tests since the stats line took them
+    // SPEC-recheck-cheap change 4: the running test's cuts per arm (route_fragile_cut, charged to the cut window's arm; control re-checks and
+    // windows not timed by the arms are left out, as their tokens are).  Printed in the test line; the cut guard in the paired decision.
+    long long auto_cuts[2] = {0, 0};
+    // STRATA_MASK=learn x AUTO: after each budget test the next one is a MASK test (the mask's depth (p, g), see mask_test_begin): the same
+    // interleaved arms, both at req_b; the arms are the mask's levels (uploaded when the arm changes).  Its state (p, g) lives in the learner.
+    bool auto_mask = false;                   ///< the running test is a mask test
+    // SPEC-recheck-gated step G: the rotation budget -> mask -> cap -> prefetch -> budget (tune_steps.hpp).  auto_next_kind: the kind the
+    // scheduler starts next; auto_kind: the running test's kind (tune::Kind).  The cap and prefetch tests use the budget test's rule and
+    // decision (paired::decide, the quality veto, the cut guard); their candidates are in auto_cap_cu / _cn and auto_pf_cand.
+    int auto_next_kind = 0;                   ///< tune::Kind of the next test
+    int auto_kind = 0;                        ///< tune::Kind of the running test (Budget when none runs)
+    bool tune_cap_on = false, tune_pf_on = false;   ///< STRATA_TUNE_CAP / STRATA_TUNE_PREFETCH (with the gate; 0 = fixed)
+    double auto_cap_cu = 0.0, auto_cap_cn = 0.0;    ///< the running cap test's candidate multipliers (the arm 1 values)
+    long long auto_pf_cand = 0;               ///< the running prefetch test's candidate count (the arm 1 value)
+    // SPEC-recheck-gated step H2: the margin test (m, the rotation's fifth kind).  The explore cuts per arm (route_fragile_settle: the first row
+    // with ratio in [k_eff, 8 k_eff), every 16th window), flipped or not: the quality veto of the margin test (tune_steps.hpp explore_veto).
+    double auto_k_cand = 1.0;                 ///< the running margin test's candidate m (the arm 1 value)
+    long long auto_xrc[2] = {0, 0}, auto_xfl[2] = {0, 0};   ///< explore cuts / their flips per arm (base, candidate)
+    bool tune_k_on = false;                   ///< STRATA_TUNE_K (with the gate; 0 = m fixed at 1.0)
+    bool auto_mask_ok = false;                ///< the mask learner is active for this window (route_budget_window sets it before the scheduler)
+    // Learned state across restarts (route_tune_open): standin-tune.txt beside the expert profile, keyed to the model fingerprint.
+    // Written after each finished test and each k update; read once at serve start (AUTO / FRAGILE on).
+    bool tune_open = false;                   ///< the file is kept (a model fingerprint and a path are known)
+    uint64_t tune_fp = 0;                     ///< the model fingerprint the file is keyed to
+    std::string tune_path;                    ///< the file
+    bool auto_b0_env = false;                 ///< STRATA_ROUTE_BUDGET_AUTO_B0 is set: it overrides the file's b
+    float auto_step = 1.25f;                  ///< the candidate's step factor s: candidate = b * s^d (saved; after a win in the same direction as the last win s grows to 2, after a loss it shrinks toward 1.1)
+    int auto_last_win = 0;                    ///< the direction of the last win (0: no win yet)
+    // The paired test (paired_test.hpp): the running test's pair statistics, the sums of the running pair block per arm (its two runs), a
+    // block that ended and waits for a cut's exact successor (auto_pair_ready), and the minimum effect (STRATA_TUNE_MIN_EFFECT, 0.03 = 3%).
+    paired::PairStats auto_pair;
+    double auto_pt_tok[2] = {0.0, 0.0}, auto_pt_secs[2] = {0.0, 0.0};
+    bool auto_pair_ready = false;
+    double auto_min_effect = 0.03;
+    // STRATA_FRAGILE_BRAKE (default on, =0 off; with FRAGILE and AUTO): each request has its own decode budget req_b, used for its decode
+    // windows instead of auto_b.  route_budget_begin sets req_b = s[c] * auto_b (at least the class's clean level L[c], at most auto_b; per-class
+    // learned, see cls_start).  A brake stops at L[c] while L[c] is known (route_fragile_settle).  The AUTO arms scale it: base req_b, candidate req_b * s^d.
+    // A settled re-check of the request counts into req_rc / req_fl.  Evidence (route_wilson90, z = 1.645): the brake acts only with >= 15
+    // re-checks and a Wilson 90% lower bound of flips / rechecks above 0.2; then req_b halves (below 0.01 it is 0) and the counts reset,
+    // so it takes 15 more re-checks to act again.  Flips per committed token (the harm rises with it; the re-check rate does not): the
+    // request's flips and committed decode tokens since its last brake (req_fl, req_tok) brake it when >= 3 flips, >= 100 tokens and the
+    // Wilson 90% lower bound of flips / tokens is above 0.01.  Every 64 decode windows of the request, req_b grows by 1.25 (never above
+    // auto_b; from 0 it becomes 0.25 * auto_b) when the request has >= 15 re-checks, a Wilson 90% upper bound <= 0.2 of its re-check
+    // flip rate and a Wilson 90% upper bound <= 0.01 of flips per token.  The request's first grow check (window 64) sets req_b = auto_b
+    // at once when that holds.  The search (auto_b) is unchanged by the brake.
+    enum { kBrakeMin = 15, kBrakeWindows = 64, kAutoTokMin = 200, kBrakeTokMin = 100, kBrakeFlips = 3, kCleanTok = 400, kExploreMinRc = 16 };   // (kExploreMinRc: step H2)
+    bool brake_on = true;                     ///< STRATA_FRAGILE_BRAKE: the per-request brake (off: req_b is auto_b for every request)
+    float req_b = 0.1f;                       ///< this request's decode budget
+    long long req_rc = 0, req_fl = 0;         ///< this request's re-checks and flips since its last brake
+    long long req_tok = 0;                    ///< this request's committed decode tokens since its last brake (route_req_commit)
+    long long req_wins = 0;                   ///< this request's decode windows (the grow check every kBrakeWindows)
+    long long req_brakes = 0;                 ///< this request's brakes (the stats line takes it at the end)
+    long long auto_rc[2] = {0, 0}, auto_fl[2] = {0, 0};   ///< the running test's re-checks and flips per arm (of the cut window's arm)
+    // The learned ceiling (kept in standin-tune.txt as "clean"): b_clean is the largest candidate budget of a completed test whose
+    // candidate arm had <= 0.5 flips per 100 committed tokens over >= kCleanTok tokens.  A candidate above 2 * b_clean is not tested
+    // (a loss); while b_clean is 0 the ceiling is 2 * auto_b0 (the start).
+    double b_clean = 0.0;
+    // STRATA_FRAGILE_BRAKE, learned per request size class c = floor(log2(prompt tokens)) (route_size_class; kClasses of them, the last
+    // one takes the rest): cls_start[c] is the start fraction s of auto_b (initial 0.5); cls_clean[c] is the clean level L, the highest
+    // req_b at which a request of the class finished with >= 100 committed tokens and a Wilson 90% upper bound of flips per token <= 0.01
+    // (0 = unknown).  Kept in standin-tune.txt as "class <c> start <s> clean <L>" lines, for the classes seen (route_class_end).
+    enum { kClasses = 32 };
+    std::vector<float> cls_start = std::vector<float>(kClasses, 0.5f);
+    std::vector<double> cls_clean = std::vector<double>(kClasses, 0.0);
+    std::vector<bool> cls_seen = std::vector<bool>(kClasses, false);
+    int req_class = 0;                        ///< this request's size class (route_budget_begin)
+    long long req_tok_all = 0, req_fl_all = 0;   ///< this request's committed decode tokens and flips over the whole request (a brake does not reset them)
+    // STRATA_ROLLBACK=1 (opt-in, --serve decode): the flips' token positions (generate.cpp's committed count: gen_now before the window,
+    // fragile_pend_pos = gen_now + the cut row).  A brake also fires when >= kBrakeFlips flips fall within the last kRecentTok committed
+    // tokens; the brake's evidence (first and last flip position, old and new budget) is kept for the caller (route_brake_take).
+    enum { kRecentTok = 64, kFlipPosCap = 256 };
+    bool rollback_on = false;                 ///< STRATA_ROLLBACK (read once)
+    long long gen_now = 0;                    ///< the request's committed decode tokens before the window (route_gen_now)
+    long long fragile_pend_pos = 0;           ///< the pending cut row's token position (route_fragile_pos)
+    std::vector<long long> req_flip_pos;      ///< flips' positions since the request's last brake (capped, oldest dropped)
+    long long brake_seq = 0;                  ///< brakes so far in the process (route_brake_take compares it)
+    long long brake_taken = 0;                ///< the last brake_seq the caller took
+    long long brake_first = -1, brake_last = -1;   ///< the evidence of the last brake: its first and last flip positions
+    float brake_old = 0.0f, brake_new = 0.0f;
+    bool low_open_off = false;                ///< STRATA_ROUTE_LOW_OPEN's rollback redo: ranks < lo follow the learned budget from the start
+    bool low_open_seen = false;               ///< this request's windows ran with ranks < lo open (route_low_open_used)
+    // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
+    // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
+    // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
+    // picks the block by the host thread's current device.  nullptr (the allocation failed): the kernel runs without counters.
+    std::mutex mu;
+    std::map<int, unsigned long long*> blocks;
+    unsigned long long* stats_on(int dev) {
+        if (margin <= 0.0f || dev < 0) return nullptr;
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = blocks.find(dev);
+        if (it != blocks.end()) return it->second;
+        unsigned long long* p = nullptr;
+        {
+            const OnDevice on(dev);
+            // 9 counters: [0..3] the prompt windows (T>8), [4..7] the decode windows (T<=8), [8] the decode windows' rank 0-1 stand-ins for an
+            // expert outside the RAM tier (STRATA_ROUTE_RAM_FLOOR; the prompt windows never take that path), [9..11] the STRATA_ROUTE_BUDGET
+            // replacements of ranks 0, 1 and 2 (both kinds of window), [12] the STRATA_ROUTE_BUDGET_TAIL replacements of ranks >= lo and
+            // [13] the tail picks the bound kept exact (a stand-in existed); the kernel's bstats pointer is this block + 9
+            if (cudaMalloc((void**) &p, 14 * sizeof(unsigned long long)) != cudaSuccess ||
+                cudaMemset(p, 0, 14 * sizeof(unsigned long long)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (p != nullptr) cudaFree(p);
+                p = nullptr;
+                std::fprintf(stderr, "route-resident: the counters could not be allocated on GPU %d; it runs without them\n", dev);
+            }
+        }
+        if (blocks.empty()) {
+            std::atexit([] {
+                RouteResidentCfg& c = route_resident_cfg();
+                for (const auto& kv : c.blocks) {
+                    if (kv.second == nullptr) continue;
+                    unsigned long long h[14] = {};
+                    if (cudaSetDevice(kv.first) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess ||
+                        cudaMemcpy(h, kv.second, sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        continue;
+                    }
+                    char who[32] = "";
+                    if (c.blocks.size() > 1) std::snprintf(who, sizeof who, " (GPU %d)", kv.first);
+                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
+                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
+                                 who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
+                    if (strata::kernels::route_ram_floor_on())   // STRATA_ROUTE_RAM_FLOOR: rank 0-1 picks outside the RAM tier that took a stand-in
+                        std::fprintf(stderr, "route-resident%s: ram floor (STRATA_ROUTE_RAM_FLOOR) rank 0-1 stand-ins for an expert not in the RAM tier (decode): %llu\n",
+                                     who, h[8]);
+                    if (c.budget > 0.0f)   // STRATA_ROUTE_BUDGET: the replacements of ranks 0, 1, 2 (prompt and decode windows together)
+                        std::fprintf(stderr, "route-resident: budget %g: rank0 %llu rank1 %llu rank2 %llu replaced\n", c.budget, h[9], h[10], h[11]);
+                    if (c.budget_tail > 0.0f)   // STRATA_ROUTE_BUDGET_TAIL: the ranks >= lo replaced by the bound, and the picks it kept exact
+                        std::fprintf(stderr, "route-resident: tail budget %g: %llu replaced, %llu kept exact\n", c.budget_tail, h[12], h[13]);
+                }
+            });
+        }
+        blocks[dev] = p;
+        return p;
+    }
+};
+RouteResidentCfg& route_resident_cfg() {
+    static RouteResidentCfg c;
+    static const bool parsed = [] {
+        RouteResidentCfg& r = c;
+        // STRATA_STANDIN=1 (SPEC.md 13.20): every non-resident pick of every rank gets the best resident expert, whatever its
+        // score (an unlimited margin over ranks 0-9 is exactly "the k best resident experts, softmax over the chosen"), and
+        // the router's own top-10 is counted for the swap round. An explicit STRATA_ROUTE_RESIDENT / _RANKS still wins.
+        const char* si = std::getenv("STRATA_STANDIN");
+        if (si != nullptr && std::atoi(si) != 0) { r.margin = 1e30f; r.lo = 0; r.hi = 9; r.count = true; }
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) r.margin = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &r.lo, &r.hi);
+        // STRATA_ROUTE_RESIDENT_COUNT=1|0: count what the unmasked router wanted (decode windows) for the swap round
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_COUNT")) r.count = std::atoi(v) != 0;
+        // a fractional floor: STRATA_ROUTE_RESIDENT_RANKS=2-9 with STRATA_ROUTE_RESIDENT_EDGE=1 is "floor 1.5" (rank 1 is
+        // replaced only by a substitute within 1 logit of it)
+        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_EDGE")) r.edge = (float) std::atof(v);
+        if (const char* v = std::getenv("STRATA_WANT_LOW")) r.want_lo = std::max(0.0f, (float) std::atof(v));
+        if (const char* v = std::getenv("STRATA_ROUTE_MAXRANK")) r.maxrank = std::max(0, std::atoi(v));
+        if (const char* v = std::getenv("STRATA_ROUTE_WMAX")) r.wmax = std::max(0.0f, (float) std::atof(v));
+        // STRATA_ROUTE_BUDGET=<b> (> 0): the ranks below lo replace a missed pick only when w * gap <= b (see route_resident_k); off when unset or <= 0
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET")) r.budget = std::max(0.0f, (float) std::atof(v));
+        // STRATA_ROUTE_BUDGET_TAIL=<b> (> 0): the ranks lo and up replace a missed pick only when w * max(gap, 0) <= b; off when unset or <= 0
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET_TAIL")) r.budget_tail = std::max(0.0f, (float) std::atof(v));
+        // STRATA_ROUTE_BUDGET_DYN=<b_hi>,<gap_min>[,<b_lo>] (see RouteResidentCfg); off when unset or malformed
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET_DYN")) {
+            float hi = 0.0f, gap = 0.0f, lo = 0.0f;
+            const int n = std::sscanf(v, "%f,%f,%f", &hi, &gap, &lo);
+            if (n >= 2 && hi >= 0.0f && gap > 0.0f) {
+                r.dyn_on = true;
+                r.dyn_hi = hi;
+                r.dyn_gap = gap;
+                r.dyn_lo = n >= 3 ? std::max(0.0f, lo) : 0.0f;
+            } else {
+                std::fprintf(stderr, "strata: STRATA_ROUTE_BUDGET_DYN=%s: want <b_hi>,<gap_min>[,<b_lo>] (b_hi >= 0, gap_min > 0); off\n", v);
+            }
+        }
+        // STRATA_FRAGILE_RECHECK (default on, =0 off): close calls of a stand-in window are decided exactly (see RouteResidentCfg);
+        // STRATA_FRAGILE_K0 its start.  Default since 24 Oct: with AUTO, 21 of 21 answers clean where a fixed 0.25 budget broke words
+        // STRATA_FRAGILE_RECHECK: opt-in since 9 Nov (=1 on). Off by default: on 8095 (Qwen IQ3_S) re-check off ran 42.4-43.6 tok/s against
+        // 31.0-33.7 with it on, and every answer read (3 short, 3 long x2, thinking text included) was correct and clean in both arms. The
+        // re-check and everything that lives in it (gate, k learning, cap, stand-in learner, substitute-fit learner and flip mode) stay: =1.
+        { const char* v = std::getenv("STRATA_FRAGILE_RECHECK"); r.fragile_on = v != nullptr && std::atoi(v) != 0; }
+        // STRATA_FRAGILE_BRAKE (default on, =0 off): the per-request decode budget brake (see RouteResidentCfg)
+        { const char* v = std::getenv("STRATA_FRAGILE_BRAKE"); r.brake_on = v == nullptr || std::atoi(v) != 0; }
+        // SPEC-recheck-cheap change 1 (default on, =0 the whole-window exact successor of before): the exact successor makes row 0 only exact
+        { const char* v = std::getenv("STRATA_RECHECK_ROW_ONLY"); r.recheck_row_only = v == nullptr || std::atoi(v) != 0; }
+        // SPEC-recheck-gated: the gate (default on, needs the fragile re-check), its start P_HI and the audit cadence
+        { const char* v = std::getenv("STRATA_RECHECK_GATE"); r.gate_on = r.fragile_on && (v == nullptr || std::atoi(v) != 0); }
+        if (const char* v = std::getenv("STRATA_RECHECK_P_HI")) r.gs.p_hi = gate::clamp_p_hi((float) std::atof(v));
+        if (const char* v = std::getenv("STRATA_RECHECK_AUDIT_EVERY")) r.gate_audit_every = std::max(0LL, std::atoll(v));
+        // SPEC-recheck-gated step F: the shift cap (opt-in since 9 Nov, STRATA_SHIFT_CAP=1 with the gate; off = +inf everywhere), its multipliers.
+        // Off by default: two frozen-state A/Bs on 8095 (8-9 Nov) had the cap off faster in every run (+3.5%, +3.7%): each refused move is an
+        // exact pick and a read, and the re-check on flip already guards the rows the cap protects.
+        { const char* v = std::getenv("STRATA_SHIFT_CAP"); r.cap_on = r.gate_on && v != nullptr && std::atoi(v) != 0; }
+        // SPEC-recheck-gated step G: the cap multipliers and the prefetch count are the paired tuner's (persisted in the .gate file); the env
+        // values are their start values only when no saved state exists (route_gate_read sets tune.set)
+        if (const char* v = std::getenv("STRATA_SHIFT_CAP_UNC")) r.gs.tune.cap_unc = std::atof(v);
+        if (const char* v = std::getenv("STRATA_SHIFT_CAP_NONE")) r.gs.tune.cap_none = std::atof(v);
+        if (const char* v = std::getenv("STRATA_RECHECK_PREFETCH_MAX")) r.gs.tune.prefetch = std::max(0LL, std::min(64LL, std::atoll(v)));
+        else if (r.gate_on) r.gs.tune.prefetch = 12;
+        { const char* v = std::getenv("STRATA_TUNE_CAP"); r.tune_cap_on = r.gate_on && (v == nullptr || std::atoi(v) != 0); }
+        { const char* v = std::getenv("STRATA_TUNE_PREFETCH"); r.tune_pf_on = r.gate_on && std::getenv("STRATA_RECHECK_PREFETCH_MAX") == nullptr && (v == nullptr || std::atoi(v) != 0); }
+        // SPEC-recheck-gated step H2: the margin m (start 1.0; STRATA_FRAGILE_K_MULT sets the start value; STRATA_TUNE_K=0 fixes it)
+        { const char* v = std::getenv("STRATA_TUNE_K"); r.tune_k_on = r.gate_on && (v == nullptr || std::atoi(v) != 0); }
+        if (const char* v = std::getenv("STRATA_FRAGILE_K_MULT")) r.gs.tune.k_mult = std::min(1.5, std::max(0.6, std::atof(v)));
+        if (const char* v = std::getenv("STRATA_SHIFT_CAP_CONF")) r.cap_mult.conf = (float) std::atof(v);
+        // STRATA_FRAGILE_CTRL_EVERY=<n> (default 128, 0 off): every n-th eligible decode window is a fragile control window (see RouteResidentCfg)
+        if (const char* v = std::getenv("STRATA_FRAGILE_CTRL_EVERY")) r.fr_ctrl_every = std::max(0LL, std::atoll(v));
+        r.subfit_mode = strata::core::gate::mode_slot((int) strata::core::subfit_learn::apply_env(std::getenv("STRATA_SUBFIT_APPLY")));
+        if (const char* v = std::getenv("STRATA_FRAGILE_K0")) {
+            const float k0 = (float) std::atof(v);
+            if (k0 > 0.0f) {
+                r.fragile_k = k0;
+                r.fragile_k_set = true;
+                r.fragile_k_pinned = true;
+            }
+        }
+        // STRATA_ROUTE_BUDGET_AUTO (default on, =0 off): one decode budget for all ranks, searched by the measured speed (see
+        // RouteResidentCfg).  It needs the FRAGILE re-check (the quality guard); it replaces DYN for decode.
+        // STRATA_ROUTE_BUDGET_AUTO_B0=<b> starts the search (0.1, or the saved standin-tune.txt)
+        {
+            const char* v = std::getenv("STRATA_ROUTE_BUDGET_AUTO");
+            if (v == nullptr) v = "1";
+            if (std::atoi(v) != 0) {
+                if (!r.fragile_on) {
+                    if (std::getenv("STRATA_ROUTE_BUDGET_AUTO") != nullptr)
+                        std::fprintf(stderr, "strata: STRATA_ROUTE_BUDGET_AUTO=%s needs STRATA_FRAGILE_RECHECK=1; off\n", v);
+                } else {
+                    r.auto_on = true;
+                    if (r.dyn_on) {
+                        std::fprintf(stderr, "strata: STRATA_ROUTE_BUDGET_AUTO: STRATA_ROUTE_BUDGET_DYN is ignored (decode) and off\n");
+                        r.dyn_on = false;
+                    }
+                    if (r.budget > 0.0f || r.budget_tail > 0.0f)
+                        std::fprintf(stderr, "strata: STRATA_ROUTE_BUDGET_AUTO: STRATA_ROUTE_BUDGET / _TAIL are ignored for decode (prompt windows keep them)\n");
+                }
+            }
+        }
+        if (const char* v = std::getenv("STRATA_ROUTE_BUDGET_AUTO_B0")) {
+            const float b0 = (float) std::atof(v);
+            if (b0 > 0.0f) {
+                r.auto_b0 = std::min(4.0f, std::max(0.02f, b0));
+                r.auto_b0_env = true;
+            }
+        }
+        r.auto_b = r.auto_b0;
+        // STRATA_TUNE_MIN_EFFECT (0.03): the smallest speed gain a tuner's move needs (a fraction; ln(1 + it) is the paired test's delta)
+        if (const char* v = std::getenv("STRATA_TUNE_MIN_EFFECT")) {
+            const double me = std::atof(v);
+            if (me > 0.0 && me < 1.0) r.auto_min_effect = me;
+        }
+        // STRATA_ROUTE_BIAS=<beta>: the CCE bias.  (v0.1.42 has the same idea as STRATA_ROUTE_PRIOR, route_prior.cu: to be merged into one)
+        if (const char* v = std::getenv("STRATA_ROUTE_BIAS")) { const double b = std::atof(v); r.bias = b > 0.0 ? (float) std::log1p(b) : 0.0f; }
+        return true;
+    }();
+    (void) parsed;
+    return c;
+}
 inline bool g_lfuse_gate() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_GATE"); return v == nullptr || v[0] != '0'; }(); return on; }
 inline bool g_lfuse_pair() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_PAIR"); return v == nullptr || v[0] != '0'; }(); return on; }
 inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv("STRATA_VERIFY_QDEDUP"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 // S26 STRATA_QFUSE=1: activation q8_1 images written by their producers (the GDN output norm) - the same bytes
+// fork F4 (Eddoursul): 2-4 token dense projections read an interleaved copy of the q8_1 activations (bitwise the same
+// outputs); STRATA_MMVQ_IL=0 keeps native_mmvq's multi-column kernels
+inline bool g_mmvq_il() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL"); return v == nullptr || v[0] != '0'; }(); return on; }
+// 143-amdk: STRATA_QFUSE_HC - only the hyper-connection read writes its consumer's q8_1 image (not the GDN recurrence): gfx12 default (=0 / 1 forces off / on)
+inline bool g_qfuse_hc() {
+#if defined(STRATA_USE_HIP)
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QFUSE_HC");
+        if (v != nullptr) return std::atoi(v) != 0;
+        int dev = 0;
+        cudaDeviceProp p;
+        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+               strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
+// fork 34a35db + b063c13 (Eddoursul), STRATA_SIDE_MIXER=1 / =2 (opt-in): the mixer's work that reads only the layer's
+// input on branches of the window's graph (bitwise the same outputs); 0 / unset = in line, and no branch stream is created
+inline int g_side_mixer() { static const int m = [] { const char* v = std::getenv("STRATA_SIDE_MIXER"); return v ? std::max(0, std::min(2, std::atoi(v))) : 0; }(); return m; }
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
@@ -150,6 +668,66 @@ int pipe_helper_cpu() {
 }
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
+// STRATA_BATCH_SELF_COMMIT=1 (opt-in): a batch window whose rows are each another slot's one token keeps them itself,
+// as a one-token window does (record_window): the GDN conv histories and states advance inside the window graph, and
+// no commit graph runs after it.  Such a window's commit is unconditional (each slot keeps its one row), and the rest
+// of the commit graph only repeats what the window wrote: the indexer tails are put back and appended again from the
+// same rows, the PLE histories are put back to the window's own snapshot.
+const bool g_batch_self_commit = env_on("STRATA_BATCH_SELF_COMMIT");
+// STRATA_QSA_SLOTS=1 (opt-in): in a batch window, a QSA layer's block scores, top-k and attention run as one launch
+// each over the window's rows (up to 8 per launch, each row reading its own slot's indexer keys and K/V) instead of
+// one call per row; every row is computed by the same kernel with the same arithmetic as its own call.  Not with a
+// streamed KV cache (a row's block resolve could evict the blocks an earlier row of the same slot selected).
+const bool g_qsa_slots = env_on("STRATA_QSA_SLOTS");
+
+// every row of a batch window is another slot's (no slot has proposal rows)
+bool one_row_per_slot(const int* rows, int S) {
+    for (int i = 0; i < S; ++i)
+        for (int j = i + 1; j < S; ++j)
+            if (rows[i] == rows[j]) return false;
+    return S >= 1;
+}
+bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && one_row_per_slot(rows, S); }
+
+// STRATA_DRAFT_TRACE=<file> (measurement only, off by default): for every single-GPU, single-sequence verify window, its rows' tokens, the
+// model's picks and the residual after each layer of STRATA_DRAFT_TRACE_LAYERS (default 5,15,25,35,45: the layers the DFlash 2 drafter
+// for this model reads, incoai/Qwen3.8-Flash-Next-DFlash2), averaged over the hyper-connection streams as that drafter was trained.
+// tools/drafter/dflash_offline.py replays the drafter on it.  The capture is a device copy per traced layer inside the window graph;
+// the host writes the window once it has finished.  File: u32 "DFT1", u32 L, u32 n_embd, u32 hc, i32 layer[L]; then per window
+// i64 pos0 | i32 T | i32 tokens[T] | i32 picks[T] | u16 bf16 [T][L][n_embd].  Later windows rewrite a position its rejected drafts held.
+struct DraftTrace {
+    std::mutex mu;
+    FILE* f = nullptr;
+    bool header = false;
+    std::vector<int> layers;
+};
+DraftTrace& draft_trace() {
+    static DraftTrace d;   // (a mutex: filled in place, once)
+    static const bool opened = [] {
+        const char* p = std::getenv("STRATA_DRAFT_TRACE");
+        if (p == nullptr || *p == 0) return false;
+        const char* lv = std::getenv("STRATA_DRAFT_TRACE_LAYERS");
+        std::string ls = lv != nullptr && *lv != 0 ? lv : "5,15,25,35,45";
+        for (size_t i = 0; i < ls.size();) {
+            const size_t j = ls.find(',', i);
+            d.layers.push_back(std::atoi(ls.substr(i, j == std::string::npos ? std::string::npos : j - i).c_str()));
+            i = j == std::string::npos ? ls.size() : j + 1;
+        }
+        d.f = std::fopen(p, "wb");
+        if (d.f == nullptr) std::fprintf(stderr, "strata: STRATA_DRAFT_TRACE: cannot open %s\n", p);
+        else std::fprintf(stderr, "strata: STRATA_DRAFT_TRACE=%s (measurement: the residual after layers %s of every verify window)\n", p, ls.c_str());
+        return d.f != nullptr;
+    }();
+    (void) opened;
+    return d;
+}
+bool draft_trace_on() { return draft_trace().f != nullptr; }
+int draft_trace_slot(int64_t l) {
+    const std::vector<int>& ls = draft_trace().layers;
+    for (size_t i = 0; i < ls.size(); ++i)
+        if (ls[i] == l) return (int) i;
+    return -1;
+}
 
 // The shared expert runs on its own stream, forked off and joined back per layer (`sh_fork` in record_window).  The
 // overlap pays off on CUDA, where it was added (cfd3b72).  On HIP a cross-stream event dependency costs more than the
@@ -185,6 +763,91 @@ bool head_mix_multi_enabled() {
         return v == nullptr || std::atoi(v) != 0;
     }();
     return on;
+#endif
+}
+
+// 143-amdk: the wait for a host flag folded into the copy that follows it (wait_copy_i32_from_mapped,
+// copy_rows_from_mapped_after): same reads, same values, one kernel node fewer each.  A dependent kernel costs ~2.4 us in a
+// gfx1201 graph whatever it does; measured on gfx12 only, so it is on there by default.  STRATA_FUSE_WAIT=0 / 1 forces it
+// off / on (HIP builds; a CUDA build never fuses).
+// the Turing series (STRATA_SM75_PERF=1, sm75_series.hpp) defaults of the CUDA build's switches below, read per device
+bool device_is_sm75() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        int maj = 0, mnr = 0;
+        const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        per_dev[dev] = ok && strata::sm75_default(maj, mnr) ? 2 : 1;   // a Turing card with STRATA_SM75_PERF=1
+    }
+    return per_dev[dev] == 2;
+#endif
+}
+
+bool fuse_wait_on() {
+#if defined(STRATA_USE_HIP)
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_FUSE_WAIT");
+        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+    }();
+    if (env >= 0) return env != 0;
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        cudaDeviceProp p;
+        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#else
+    // CUDA: STRATA_FUSE_WAIT=1 folds both waits (the plan's and the CPU rows'), =2 only the plan's, =0 neither.  Turing
+    // default 2 (RTX 2080 Ti, Flash-Next Q2_0, two runs each: +0.6..+1.4 % decode); the rows' version makes every row
+    // block of the copy poll the flag over PCIe and was -1.5 % there, so it stays opt-in.
+    static const int env = [] { const char* v = std::getenv("STRATA_FUSE_WAIT"); return v != nullptr ? std::atoi(v) : -1; }();
+    if (env >= 0) return env == 1 || env == 2;
+    return device_is_sm75();
+#endif
+}
+// 143-amdk's rows version of the folded wait (copy_rows_from_mapped_after): HIP with fuse_wait_on, CUDA STRATA_FUSE_WAIT=1
+bool fuse_rows_on() {
+#if defined(STRATA_USE_HIP)
+    return fuse_wait_on();
+#else
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_WAIT"); return v != nullptr && std::atoi(v) == 1; }();
+    return on;
+#endif
+}
+
+// 143-amdk: STRATA_FUSE_CONVAB=1 - the GDN conv and the a/b projections in one launch.  Opt-in: measured -0.3% on gfx1201 (the a/b dot chain is the longer one).
+bool fuse_convab_on() {
+#if defined(STRATA_USE_HIP)
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_CONVAB"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+// 143-amdk: STRATA_FUSE_HITS - moe_hit_add folded into the combine (gfx12 default; =0 / 1 forces off / on)
+bool fuse_hits_on() {
+#if defined(STRATA_USE_HIP)
+    static const int env = [] { const char* v = std::getenv("STRATA_FUSE_HITS"); return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
+    if (env >= 0) return env != 0;
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        cudaDeviceProp p;
+        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#else
+    return false;
 #endif
 }
 
@@ -309,6 +972,19 @@ const int64_t g_test_stall = [] {
     const char* e = std::getenv("STRATA_TEST_VERIFY_STALL");
     return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
 }();
+// The overlapped split's hand-off wait on the GPU is bounded: STRATA_SPLIT_WAIT_MS (default 30000, 0 = no bound).
+// The host's own per-layer wait (20 s, #267) normally ends a stalled window first; this bound is the backstop for
+// a host that is gone (a killed process must not leave a kernel spinning on its card).
+const unsigned long long g_split_wait_ns = [] {
+    const char* e = std::getenv("STRATA_SPLIT_WAIT_MS");
+    return (unsigned long long) (e != nullptr ? std::atoll(e) : 30000) * 1000000ull;
+}();
+// test hook: STRATA_TEST_HANDOFF_DROP=N - the writing stage's N-th window (1-based) leaves its hand-off flag down, as
+// if the publish were lost; the reading stage's bounded wait (or the host's) must then end the window cleanly.
+const int64_t g_test_drop = [] {
+    const char* e = std::getenv("STRATA_TEST_HANDOFF_DROP");
+    return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 0;
+}();
 }  // namespace
 
 bool Verifier::release_gpu_waits(int timeout_ms) try {
@@ -317,7 +993,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) try {
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
-    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_})   // + an overlapped split's hand-off wait
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
@@ -410,27 +1086,134 @@ void Verifier::diag(std::FILE* f) const {
     trace_dump(f);   // #649: STRATA_VERIFY_TRACE=1 only
 }
 
+<<<<<<< sycl
 Verifier::~Verifier() try {
     // SYCL port: at process exit the Level Zero context can already be gone (serve mode's end), and a destructor
     // that throws aborts the process (exit 139); the waits and frees below are best-effort then.
+||||||| base
+
+Verifier::~Verifier() {
+#if defined(STRATA_GPU_METAL)
+    strata::metal_engine::window_destroy(metal_);
+    metal_ = nullptr;
+#endif
+=======
+
+// STRATA_DECODE_STAGE_TIMERS: the event pool of one window graph (its capture's events, created before the capture)
+void Verifier::stage_prepare(int key, int64_t n_layers) {
+    StageChain& c = stage_chains_[key];
+    for (cudaEvent_t e : c.owned) cudaEventDestroy(e);
+    c.owned.clear();
+    c.used = 0;
+    c.marks.clear();
+    c.shared.clear();
+    const size_t need = (size_t) n_layers * 2 * kStagePerLayer + 8;   // two token groups at most, plus the window's ends
+    c.owned.reserve(need);
+    for (size_t i = 0; i < need; ++i) {
+        cudaEvent_t e = nullptr;
+        if (cudaEventCreateWithFlags(&e, cudaEventDefault) != cudaSuccess) {   // timing on: cudaEventElapsedTime reads it
+            (void) cudaGetLastError();
+            break;
+        }
+        c.owned.push_back(e);
+    }
+}
+
+// The next pooled event, recorded on `s` while it is captured as an external event-record node: the graph node records
+// the event each time the graph replays (a plain capture-time record would leave no timing at replay).
+cudaEvent_t Verifier::stage_event(cudaStream_t s, std::string& err) {
+    StageChain& c = *stage_cur_;
+    if (c.used >= c.owned.size()) {
+        err = "verify: the decode stage timers ran out of events";
+        return nullptr;
+    }
+#if defined(cudaEventRecordExternal)
+    cudaEvent_t e = c.owned[c.used++];
+    if (cudaEventRecordWithFlags(e, s, cudaEventRecordExternal) != cudaSuccess) {
+        err = "verify: a decode stage timer could not be recorded in the window graph";
+        return nullptr;
+    }
+    return e;
+#else
+    (void) s;
+    err = "verify: STRATA_DECODE_STAGE_TIMERS needs cudaEventRecordExternal (CUDA 12.3 or newer)";
+    return nullptr;
+#endif
+}
+
+bool Verifier::stage_mark(cudaStream_t s, int stage, std::string& err) {
+    if (stage_cur_ == nullptr) return true;
+    cudaEvent_t e = stage_event(s, err);
+    if (e == nullptr) return false;
+    stage_cur_->marks.push_back({e, stage});
+    return true;
+}
+
+// After a window's sync: the time of each interval of the chain, charged to the stage that ends it
+void Verifier::stage_harvest(int key) {
+    auto it = stage_chains_.find(key);
+    if (it == stage_chains_.end()) return;
+    const StageChain& c = it->second;
+    for (size_t k = 1; k < c.marks.size(); ++k) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, c.marks[k - 1].ev, c.marks[k].ev) == cudaSuccess)
+            stage_ms_[c.marks[k].stage] += (double) ms;
+        else
+            (void) cudaGetLastError();
+    }
+    for (const auto& p : c.shared) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, p.first, p.second) == cudaSuccess) stage_shared_ms_ += (double) ms;
+        else (void) cudaGetLastError();
+    }
+    if (++stage_windows_ % 200 == 0) stage_report();
+}
+
+void Verifier::stage_report() const {
+    if (stage_windows_ == 0) return;
+    const double w = (double) stage_windows_;
+    std::fprintf(stderr,
+                 "strata decode stages (ms/window over %lld windows): plan-wait %.3f, vram-experts %.3f, pcie-wait %.3f, "
+                 "pcie-experts %.3f, cpu-wait %.3f, rows+combine %.3f, hc-write %.3f, hc-read %.3f, attn %.3f, gdn %.3f, "
+                 "ffn-read %.3f, router %.3f, doorbell %.3f, shared %.3f, other %.3f; shared stream %.3f (forked, overlaps, "
+                 "not in the sum)\n",
+                 (long long) stage_windows_, stage_ms_[kStPlan] / w, stage_ms_[kStVram] / w, stage_ms_[kStPcieWait] / w,
+                 stage_ms_[kStPcieExp] / w, stage_ms_[kStCpuWait] / w, stage_ms_[kStRows] / w, stage_ms_[kStHcWrite] / w,
+                 stage_ms_[kStHc] / w, stage_ms_[kStAttn] / w, stage_ms_[kStGdn] / w, stage_ms_[kStFfn] / w,
+                 stage_ms_[kStRouter] / w, stage_ms_[kStDoor] / w, stage_ms_[kStShared] / w, stage_ms_[kStOther] / w,
+                 stage_shared_ms_ / w);
+}
+
+Verifier::~Verifier() {
+#if defined(STRATA_GPU_METAL)
+    strata::metal_engine::window_destroy(metal_);
+    metal_ = nullptr;
+#endif
+>>>>>>> ours-now
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     for (auto& slot : g_live) {
         Verifier* me = this;
         slot.compare_exchange_strong(me, nullptr);
     }
-    // a window left spinning on a flag (an error path that returned without serving it) would make the waits below wait forever,
-    // and the watchdog no longer sees this verifier: release its waits first - only when work is still queued (released_ is
-    // sticky, and a normal shutdown leaves the flags as they are)
+    // a window left spinning on a flag (an error path that returned without serving it) would make the syncs below wait forever,
+    // and the watchdog no longer sees this verifier: release its waits first - only when work is still in flight on its streams
+    // (a normal shutdown leaves the flags, a split's hand-off flag among them, as they are)
     {
         const OnDevice on_device(device_);
         bool busy = false;
-        for (dpct::queue_ptr q : {cs_, copy_})
-            if (q != nullptr && !q->ext_oneapi_empty()) busy = true;
+        for (cudaStream_t s : {cs_, copy_})
+            if (s != nullptr && cudaStreamQuery(s) == cudaErrorNotReady) busy = true;
+        (void) cudaGetLastError();
         if (busy) (void) release_gpu_waits(5000);
     }
-    if (cs_) cs_->wait();
-    if (sh_cs_) sh_cs_->wait();
+    if (cs_) cudaStreamSynchronize(cs_);
+    if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (pf_cs_) cudaStreamSynchronize(pf_cs_);
+    if (la_cs_) cudaStreamSynchronize(la_cs_);
+    stage_report();   // STRATA_DECODE_STAGE_TIMERS: the cumulative per-window averages, if any window was timed
+    for (auto& kv : stage_chains_)
+        for (cudaEvent_t e : kv.second.owned) cudaEventDestroy(e);
     for (auto& e : exec_)
         if (e) delete (e);
     for (auto& e : exec_nr_)
@@ -442,6 +1225,7 @@ Verifier::~Verifier() try {
     for (auto& kv : exec_bm_)
         if (kv.second) delete (kv.second);
     for (auto& kv : commit_bm_)
+<<<<<<< sycl
         if (kv.second) delete (kv.second);
     if (arena_b_) sycl::free(arena_b_, dpct::get_in_order_queue());
     if (h_commitb_) sycl::free(h_commitb_, dpct::get_in_order_queue());
@@ -457,28 +1241,943 @@ Verifier::~Verifier() try {
     if (ev_fork_) dpct::destroy_event(ev_fork_);
     if (ev_join_) dpct::destroy_event(ev_join_);
     if (arena_) sycl::free(arena_, dpct::get_in_order_queue());
+||||||| base
+        if (kv.second) cudaGraphExecDestroy(kv.second);
+    if (arena_b_) cudaFree(arena_b_);
+    if (h_commitb_) cudaFreeHost(h_commitb_);
+    if (qcnt_) cudaFree(qcnt_);
+    if (d_spec_) cudaFree(d_spec_);
+    if (logit_bias_device_) cudaFree(logit_bias_device_);
+    if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
+    if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
+    if (commit_done_) cudaEventDestroy(commit_done_);
+    if (ev_done_) cudaEventDestroy(ev_done_);
+    if (ev_commit_) cudaEventDestroy(ev_commit_);
+    if (prof_pin_) cudaFreeHost(prof_pin_);
+    if (ev_fork_) cudaEventDestroy(ev_fork_);
+    if (ev_join_) cudaEventDestroy(ev_join_);
+    for (cudaStream_t s : df_side_)
+        if (s) cudaStreamDestroy(s);
+    if (df_fork_) cudaEventDestroy(df_fork_);
+    for (cudaEvent_t e : df_join_)
+        if (e) cudaEventDestroy(e);
+    if (arena_) cudaFree(arena_);
+=======
+        if (kv.second) cudaGraphExecDestroy(kv.second);
+    if (arena_b_) cudaFree(arena_b_);
+    if (h_commitb_) cudaFreeHost(h_commitb_);
+    if (qcnt_) cudaFree(qcnt_);
+    if (d_spec_) cudaFree(d_spec_);
+    if (logit_bias_device_) cudaFree(logit_bias_device_);
+    if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
+    if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (pf_cs_) cudaStreamDestroy(pf_cs_);
+    if (ev_pf_fork_) cudaEventDestroy(ev_pf_fork_);
+    if (ev_pf_join_) cudaEventDestroy(ev_pf_join_);
+    if (la_cs_) cudaStreamDestroy(la_cs_);
+    if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
+    if (side_) cudaStreamDestroy(side_);
+    if (side2_) cudaStreamDestroy(side2_);
+    for (cudaEvent_t e : {mfork_, mjoin_, pfork_, pjoin_})
+        if (e) cudaEventDestroy(e);
+    if (commit_done_) cudaEventDestroy(commit_done_);
+    if (ev_done_) cudaEventDestroy(ev_done_);
+    if (ev_commit_) cudaEventDestroy(ev_commit_);
+    if (prof_pin_) cudaFreeHost(prof_pin_);
+    if (ev_fork_) cudaEventDestroy(ev_fork_);
+    if (ev_q8_) cudaEventDestroy(ev_q8_);
+    if (ev_join_) cudaEventDestroy(ev_join_);
+    for (cudaEvent_t e : {ev_la_fork_, ev_la_read_done_, ev_la_done_})
+        if (e) cudaEventDestroy(e);
+    for (cudaStream_t s : df_side_)
+        if (s) cudaStreamDestroy(s);
+    if (df_fork_) cudaEventDestroy(df_fork_);
+    for (cudaEvent_t e : df_join_)
+        if (e) cudaEventDestroy(e);
+    if (arena_) cudaFree(arena_);
+    if (hcount_d_) cudaFree(hcount_d_);
+>>>>>>> ours-now
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_latxl_, h_xlseq_};
     for (void* h : hosts)
         if (h) strata::host_free_polled(h, dpct::get_in_order_queue());
 } catch (...) {
 }
 
 
-bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
-                    SessionState &ss, const VerifyHits &hits,
-                    const NativeHead *head, int max_t, std::string &err) try {
+// ---- STRATA_STANDIN_LEARN (opt-in).  A stand-in's output differs from the true expert's.  A flip re-check cuts the window at row r with
+// a stand-in (its first stand-in: layer l, rank k, true expert e, stand-in s).  The cut window captured y_s (the stand-in's down output at
+// layer l, rank k, per row); the exact successor (row 0, same position and prefix) captures y_e at the same layer and rank.  Per pair the
+// decayed least squares over the channels: num += y_s.y_e, den += y_s.y_s, ee += y_e.y_e (decay 0.98); c = num / den (>= 0, no clip),
+// used (the table's scale on the stand-in's weight) after kLrnReady samples, 1 before.  Pairs per layer: LRU of kLrnPerLayer.
+// The pairs persist across runs (standin-learn-<fp>.bin in data/).
+namespace sdp = strata::standin;
+namespace {
+constexpr int kLrnPerLayer = sdp::kPerLayer, kLrnReady = sdp::kReady;
+constexpr double kLrnDecay = sdp::kDecay;
+constexpr uint32_t kLrnMagic = sdp::kMagic;   // "STSL"
+// STRATA_STANDIN_POOL_APPLY=1: the corrections table takes the pooled c (the pair's estimate with its parent groups, standin_pool.hpp);
+// unset, it takes each pair's own c after its own kLrnReady samples, as before pooling.  The risk table and the balance always pool.
+bool standin_pool_apply_env() {
+    const char* e = std::getenv("STRATA_STANDIN_POOL_APPLY");
+    return e != nullptr && std::atoi(e) != 0;
+}
+// STRATA_STANDIN_LEARN=observe: the samples are collected and the table saved, but no correction is applied and the balance stays off
+// (the answers stay the default's) - so a server always learns; =1 applies the corrections
+// STRATA_SUBFIT_LOG=1 (SPEC-substitute-fit stage 1a): the sample logger.  It needs the learn tap, so it turns the learner on in observe
+// mode when STRATA_STANDIN_LEARN is unset or 0 (no correction applied; the answers stay the default's).
+bool subfit_log_env_on() { return strata::core::subfit::log_on_env(std::getenv("STRATA_SUBFIT_LOG")); }
+// SPEC-substitute-fit stage 2 step 1 (STRATA_SUBFIT_LEARN=1, opt-in): the live per-pair learner and its layer-input capture.
+// STRATA_SUBFIT_LEARN unset: on when STRATA_SUBFIT_APPLY is set to something but off (the apply needs the learner)
+bool subfit_apply_env_on() {
+    const char* e = std::getenv("STRATA_SUBFIT_APPLY");
+    return e != nullptr && std::strcmp(e, "off") != 0;
+}
+bool subfit_learn_env_on() {
+    const char* e = std::getenv("STRATA_SUBFIT_LEARN");
+    return e != nullptr ? strata::core::subfit::log_on_env(e) : subfit_apply_env_on();
+}
+// the apply mode when on: 1 dynamic (unset or any other value), 2 all; 0 off
+int subfit_apply_mode_env() {
+    if (!subfit_apply_env_on()) return 0;
+    return (int) strata::core::subfit_learn::apply_env(std::getenv("STRATA_SUBFIT_APPLY"));
+}
+// the APPLY mode for the request-end lines: 'off' unless STRATA_SUBFIT_APPLY is set (the gate's own slot index is not changed by this)
+const char* subfit_mode_text(const RouteResidentCfg& c) {
+    return subfit_apply_env_on() ? strata::core::subfit_learn::apply_name((strata::core::subfit_learn::Apply) c.subfit_mode) : "off";
+}
+bool g_sub_apply_on = false;                 // SPEC-substitute-fit stage 2: the apply path exists (the Verifier's sub_on_, for the static readers)
+long long g_sub_req_corr = 0, g_sub_req_subs = 0, g_sub_req_refused = 0;   // this request's counters (route_shift_take reads them)
+std::unique_ptr<strata::core::subfit_learn::Learner> g_sub_learn;   // created with the stand-in learner's dims (make_sub_learn)
+std::unique_ptr<strata::core::subfit_learn::UploadPacker> g_sub_packer;   // the host side of the device tables (the mirror, the writes)
+uint64_t g_sub_learn_req = 0;                                         // the learner's samples since the request's end (the stats line)
+// SPEC-substitute-fit shadow samples: the idle-time CPU evaluation of the stand-in on the exact input (subfit_shadow.hpp)
+std::unique_ptr<strata::core::subfit_shadow::Queue> g_shadow;
+std::string g_subfit_pack;                                            // --pack (Verifier::subfit_set_pack)
+uint64_t g_shadow_taken = 0, g_shadow_listed = 0, g_shadow_nomatch = 0;   // this request: fed to the learner, listed, pick not found
+strata::core::subfit_shadow::Eval make_shadow_eval(int64_t layers) {
+    // a read-only view of the pack's experts.bin of its own (opened on the worker's first call; the engine's source is not touched)
+    auto src = std::make_shared<strata::core::FileExpertSource>();
+    auto state = std::make_shared<int>(0);   // 0 not tried, 1 open, -1 failed
+    const std::string pack = g_subfit_pack;
+    return [src, state, pack, layers](int layer, int s, const float* x, float* ys) -> bool {
+        if (*state == 0) {
+            std::string err;
+            *state = (!pack.empty() && src->open(pack, layers, 512, err)) ? 1 : -1;
+            if (*state < 0) std::fprintf(stderr, "strata subfit: shadow samples off (%s)\n", pack.empty() ? "no pack" : err.c_str());
+        }
+        if (*state < 0) return false;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        if (layer < 0 || (size_t) layer >= lay.fmt.size()) return false;
+        const auto& fm = lay.fmt[(size_t) layer];
+        const uint8_t* blob = src->blob_stable(layer, s);
+        if (blob == nullptr) return false;
+        std::vector<float> h((size_t) fm.n_ff);
+        strata::kernels::cpu::native_expert_forward(fm, blob, x, h.data(), ys);
+        return true;
+    };
+}
+void make_sub_learn(int64_t dim, int64_t layers) {
+    if (g_sub_learn || dim <= 0 || layers <= 0) return;
+    strata::core::subfit_learn::Config cfg;
+    cfg.n = (int) dim;
+    cfg.n_layers = (int) layers;
+    cfg.rank = strata::core::subfit_learn::rank_env(std::getenv("STRATA_SUBFIT_RANK"));
+    cfg.max_pairs = strata::core::subfit_learn::pairs_env(std::getenv("STRATA_SUBFIT_PAIRS"));
+    cfg.ladder = strata::core::subfit_learn::ladder_env(std::getenv("STRATA_SUBFIT_LADDER"));
+    cfg.gain_fit = strata::core::subfit_learn::gain_env(std::getenv("STRATA_SUBFIT_GAIN_FIT"), strata::core::subfit_learn::kGainFit);
+    cfg.gain_revoke = strata::core::subfit_learn::gain_env(std::getenv("STRATA_SUBFIT_GAIN_REVOKE"), cfg.gain_fit - 0.10);
+    if (const char* v = std::getenv("STRATA_SUBFIT_PAIR_MIN_SEEN")) cfg.pair_min_seen = std::max(1, std::atoi(v));
+    g_sub_learn = std::make_unique<strata::core::subfit_learn::Learner>(cfg);
+    g_sub_packer = std::make_unique<strata::core::subfit_learn::UploadPacker>(cfg.n_layers);
+}
+bool standin_learn_observe_env() {
+    const char* e = std::getenv("STRATA_STANDIN_LEARN");
+    if (e != nullptr && std::strcmp(e, "observe") == 0) return true;
+    // (STRATA_SUBFIT_LEARN=1 alone is observe too: the live learner runs and no stand-in correction is applied)
+    return (subfit_log_env_on() || subfit_learn_env_on()) && (e == nullptr || std::atoi(e) == 0);
+}
+std::unique_ptr<strata::core::subfit::SampleWriter> g_subfit;   // STRATA_SUBFIT_LOG: the sample file (opened at the first decode window)
+std::string g_subfit_path;                                        // where it goes (Verifier::subfit_set_path); cleared when it cannot be opened
+bool standin_balance_env() {
+    const char* e = std::getenv("STRATA_STANDIN_BALANCE");
+    return e != nullptr && std::atoi(e) != 0 && !standin_learn_observe_env();
+}
+constexpr int kLrnBalRound = 256;
+bool standin_learn_env() {
+    const char* e = std::getenv("STRATA_STANDIN_LEARN");
+    return (e != nullptr && (std::atoi(e) != 0 || standin_learn_observe_env())) || subfit_log_env_on() || subfit_learn_env_on();
+}
+uint64_t lrn_key(int64_t l, int64_t e, int64_t s) { return ((uint64_t) l << 40) | ((uint64_t) e << 20) | (uint64_t) s; }
+}  // namespace
+
+struct Verifier::StandinLearnState {
+    using Pair = sdp::Pair;
+    struct Pending {   // the cut row's sample, copied at the cut (the next windows overwrite the device buffers)
+        bool valid = false;
+        int layer = -1, rank = -1, e = -1, s = -1;
+        std::vector<float> ys;
+        std::vector<float> x;   // STRATA_SUBFIT_LOG: the cut row's layer input (the stand-in window's)
+        std::vector<int32_t> shadow;   // shadow samples: the cut row's listed substitutions, 4 ints each (layer, rank, e, s)
+    } pend;
+    std::unordered_map<uint64_t, Pair> pairs;
+    std::vector<int> count;      // pairs held per layer
+    // the pooled sums: per layer, and per (layer, e) (sdp::expert_key); every sample updates both (pairs evicted by the LRU keep theirs)
+    std::vector<sdp::Sums> layer_g;
+    std::unordered_map<uint64_t, sdp::Sums> exp_g;
+    // a pair's estimate with its parent groups (standin_pool.hpp)
+    sdp::Est est(uint64_t key, const Pair& p) const {
+        const int64_t l = (int64_t) (key >> 40), e = (int64_t) ((key >> 20) & 0xFFFFFu);
+        const auto it = exp_g.find(sdp::expert_key(l, e));
+        const sdp::Sums* eg = it == exp_g.end() ? nullptr : &it->second;
+        const sdp::Sums* lg = l >= 0 && l < (int64_t) layer_g.size() ? &layer_g[(size_t) l] : nullptr;
+        return sdp::estimate(p, eg, lg);
+    }
+    uint64_t tick = 0;
+    bool table_ready = false;    // the device table holds the pairs' scales (filled at the first decode window)
+    int64_t dim = 0, layers = 0;
+    long long samples_req = 0;   // this request's samples (the stats line takes them)
+    // STRATA_SUBFIT_LOG: this request's probe windows, those with no candidate, and the probe records written; the rng picks one candidate
+    long long probe_win = 0, probe_none = 0, probe_recs = 0;
+    std::mt19937_64 rng{0x51u};
+    // STRATA_STANDIN_BALANCE
+    bool bal_on = false;
+    std::vector<int8_t> bal_state;     // [layers][512]: -1 given up first, 0 as it was, +1 kept
+    std::vector<uint8_t> bal_opp;      // [layers][512]: rounds on the other side of the current state
+    std::vector<float> miss_dec, miss_last;   // [layers][512]: decayed demand misses; the counts at the last round
+    int tok_since = 0;                 // committed decode tokens since the last round
+    long long bal_rounds = 0;
+};
+
+// The risk factor of the layer's ready pairs: err = sqrt((ee - 2c num + c^2 den) / ee), factor = err / mean err (no clip); 1 otherwise.
+void Verifier::standin_learn_pe_layer(int64_t l) {
+    StandinLearnState& st = *lrn_st_;
+    std::vector<float> host((size_t) 512 * 512, 1.0f);
+    std::vector<std::pair<int64_t, double>> errs;
+    double sum = 0.0;
+    for (const auto& kv : st.pairs) {
+        if ((int64_t) (kv.first >> 40) != l) continue;
+        const sdp::Est es = st.est(kv.first, kv.second);
+        if (!es.ready) continue;
+        const double err = es.err;
+        const int64_t e = (int64_t) ((kv.first >> 20) & 0xFFFFFu), s = (int64_t) (kv.first & 0xFFFFFu);
+        errs.emplace_back(e * 512 + s, err);
+        sum += err;
+    }
+    if (!errs.empty() && sum > 0.0) {
+        const double mean = sum / (double) errs.size();
+        for (const auto& x : errs) {   // the measured relative error (9 Nov: no [0.25, 4] clip); a mean of 0 leaves the factor 1
+            const double f = mean > 0.0 ? x.second / mean : 1.0;
+            host[(size_t) x.first] = std::isfinite(f) ? (float) f : 1.0f;
+        }
+    }
+    const OnDevice on(device_);
+    if (cudaMemcpy(lrn_pe_ + (size_t) l * 512 * 512, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
+        (void) cudaGetLastError();
+}
+
+bool Verifier::standin_balance_on() { return standin_balance_env() && standin_learn_env(); }
+
+// One round every kLrnBalRound committed decode tokens.  Value = use x the best err of the expert's ready pairs; cost = its decayed misses
+// + 1 (the read cost is one number per layer, so it does not change the ranking inside a layer).  Layers with fewer than 10 ranked experts
+// make no decision.  Top decile desires +1, bottom decile -1; a state moves one step a round, and leaves +1 / -1 for 0 only after 2 rounds
+// on the other side.  Experts outside the ranking keep their state.
+bool Verifier::standin_balance_commit(int n_tok, const std::vector<float>& use, const std::vector<float>& miss, std::vector<float>& keep) {
+    if (lrn_st_ == nullptr || !lrn_st_->bal_on || lrn_pe_ == nullptr || n_tok < 1) return false;
+    StandinLearnState& st = *lrn_st_;
+    st.tok_since += n_tok;
+    if (st.tok_since < kLrnBalRound) return false;
+    st.tok_since = 0;
+    const int64_t nl = st.layers, cnt = nl * 512;
+    if ((int64_t) use.size() < cnt || (int64_t) miss.size() < cnt) return false;
+    if ((int64_t) st.bal_state.size() != cnt) {
+        st.bal_state.assign((size_t) cnt, 0);
+        st.bal_opp.assign((size_t) cnt, 0);
+        st.miss_dec.assign((size_t) cnt, 0.0f);
+        st.miss_last.assign((size_t) cnt, 0.0f);
+    }
+    std::vector<double> best((size_t) cnt, -1.0);
+    for (const auto& kv : st.pairs) {
+        // pooled: an expert whose (layer, e) group is ready ranks with no ready pair of its own.  An expert known only through its layer's
+        // mean does not rank: its err is the layer's, so its place would follow use and misses, not how well it is stood in for
+        // (8 Nov live: the hit rate slid 96.1 -> 94.8% while such experts were given up)
+        const sdp::Est es = st.est(kv.first, kv.second);
+        if (!es.own_expert) continue;
+        const int64_t i = (int64_t) (kv.first >> 40) * 512 + (int64_t) ((kv.first >> 20) & 0xFFFFFu);
+        if (i < cnt && (best[(size_t) i] < 0.0 || es.err < best[(size_t) i])) best[(size_t) i] = es.err;
+    }
+    for (int64_t i = 0; i < cnt; ++i) {
+        const float dm = miss[(size_t) i] - st.miss_last[(size_t) i];
+        st.miss_dec[(size_t) i] = 0.5f * st.miss_dec[(size_t) i] + std::max(0.0f, dm);
+        st.miss_last[(size_t) i] = miss[(size_t) i];
+    }
+    keep.assign((size_t) cnt, 1.0f);
+    sdp::balance_step(st.bal_state, st.bal_opp, best, use, st.miss_dec, nl);
+    for (int64_t i = 0; i < cnt; ++i) {
+        const int8_t s = st.bal_state[(size_t) i];
+        keep[(size_t) i] = s > 0 ? 4.0f : s < 0 ? 0.25f : 1.0f;
+    }
+    ++st.bal_rounds;
+    return true;
+}
+
+
+
+// Sets the device table from the host pairs: 1 everywhere, the ready pairs' c.  Called once the table exists (the first decode window).
+void Verifier::standin_learn_fill_table() {
+    StandinLearnState& st = *lrn_st_;
+    const int64_t nl = st.layers;
+    std::vector<float> host((size_t) nl * 512 * 512, 1.0f);
+    const bool pool = standin_pool_apply_env();
+    for (const auto& kv : st.pairs) {
+        const StandinLearnState::Pair& p = kv.second;
+        const int64_t l = (int64_t) (kv.first >> 40), e = (int64_t) ((kv.first >> 20) & 0xFFFFFu), s = (int64_t) (kv.first & 0xFFFFFu);
+        if (l >= nl || e >= 512 || s >= 512) continue;
+        if (pool) {
+            const sdp::Est es = st.est(kv.first, p);
+            if (es.ready) host[((size_t) l * 512 + (size_t) e) * 512 + (size_t) s] = (float) es.c;
+        } else if (p.n >= kLrnReady) {
+            host[((size_t) l * 512 + (size_t) e) * 512 + (size_t) s] = p.c;
+        }
+    }
+    const OnDevice on(device_);
+    if (cudaMemcpy(lrn_c_, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+    st.table_ready = true;
+    if (st.bal_on && lrn_pe_ != nullptr)
+        for (int64_t l = 0; l < nl; ++l) standin_learn_pe_layer(l);
+}
+
+bool Verifier::standin_learn_active() const { return lrn_st_ != nullptr && lrn_gate_ != nullptr; }
+
+// Each decode window: the first-stand-in records are reset; the capture mode is 2 (the exact successor of a cut: y_e at the pending layer
+// and rank) or 1 (the stand-in windows: y_s per row).  Other windows: 0.  The gate is copied before the launch (device-gated, graph-safe).
+void Verifier::standin_learn_begin_window(bool decode, bool exact) {
+    if (lrn_st_ == nullptr) return;
+    StandinLearnState& st = *lrn_st_;
+    const OnDevice on(device_);
+    if (!st.table_ready) standin_learn_fill_table();
+    int32_t gate[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (decode) {
+        if (cudaMemset(lrn_rec_, 0xff, (size_t) max_t_ * 4 * sizeof(int32_t)) != cudaSuccess) (void) cudaGetLastError();
+        if (shd_on_ && cudaMemset(shd_n_, 0, (size_t) max_t_ * sizeof(uint32_t)) != cudaSuccess) (void) cudaGetLastError();
+        if (g_shadow) g_shadow->set_paused(true);   // shadow samples: no CPU evaluation or expert read while this request decodes
+        const bool y_e = exact && st.pend.valid;
+        gate[0] = y_e ? 2 : 1;
+        gate[1] = st.pend.layer;
+        gate[2] = st.pend.rank;
+        gate[4] = exact ? 1 : 0;   // STRATA_SUBFIT_APPLY=flip: this is a flip re-check's exact window (the router corrects fitted stand-ins in it)
+    }
+    // STRATA_SUBFIT_LEARN: the live learner exists from the first decode window (the stand-in learner's dims are known)
+    if (x_on_ && decode && subfit_learn_env_on()) make_sub_learn(st.dim, st.layers);
+    if (sub_on_ && !sub_started_ && g_sub_learn) subfit_tables_start();   // SPEC-substitute-fit stage 2: A and the fits, before the window
+    // STRATA_SUBFIT_LOG: the sample file opens here (the dims are known now); one decode window in sp_every_ is a probe window (gate[3])
+    sp_win_ = false;
+    if (sp_on_ && decode) {
+        if (!g_subfit && !g_subfit_path.empty()) {
+            g_subfit = std::make_unique<strata::core::subfit::SampleWriter>();
+            std::string msg;
+            if (g_subfit->open(g_subfit_path, (uint32_t) st.dim, (uint32_t) st.layers, msg)) {
+                std::fprintf(stderr, "strata subfit: samples to %s\n", g_subfit_path.c_str());
+            } else {
+                std::fprintf(stderr, "strata subfit: %s (the logger is off)\n", msg.c_str());
+                g_subfit.reset();
+                g_subfit_path.clear();
+            }
+        }
+        if (sp_decode_++ % (uint64_t) sp_every_ == 0) {
+            gate[3] = 1;
+            sp_win_ = true;
+        }
+    }
+    // shadow samples: the exact successor of a cut whose row listed substitutions captures row 0 per layer (gate[3] = 2; the logger's
+    // probe, gate[3] = 1, gives way for this window)
+    if (shd_on_ && decode && exact && st.pend.valid && !st.pend.shadow.empty()) {
+        gate[3] = 2;
+        sp_win_ = false;
+    }
+    ++shd_salt_;
+    if (cudaMemcpy(lrn_gate_, gate, sizeof gate, cudaMemcpyHostToDevice) != cudaSuccess) (void) cudaGetLastError();
+}
+
+// After a window cut at row `row` (the stand-in window, synced): the row's first stand-in and its y_s are kept on the host.
+void Verifier::standin_learn_cut(int row) {
+    if (lrn_st_ == nullptr || row < 0 || row >= max_t_) return;
+    StandinLearnState& st = *lrn_st_;
+    st.pend.valid = false;
+    st.pend.shadow.clear();
+    const OnDevice on(device_);
+    int32_t rec[4] = {-1, -1, -1, -1};
+    if (cudaMemcpy(rec, lrn_rec_ + (size_t) row * 4, sizeof rec, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    if (rec[0] < 0) return;   // no stand-in in this row (a control re-check, or a window that moved none)
+    std::vector<float> ys((size_t) st.dim);
+    if (cudaMemcpy(ys.data(), lrn_ys_ + (size_t) row * st.dim, sizeof(float) * (size_t) st.dim, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    if (x_on_ && lrn_x_ != nullptr) {   // STRATA_SUBFIT_LOG / STRATA_SUBFIT_LEARN: the cut row's layer input (this stand-in window's)
+        std::vector<float> x((size_t) st.dim);
+        if (cudaMemcpy(x.data(), lrn_x_ + (size_t) row * st.dim, sizeof(float) * (size_t) st.dim, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+        st.pend.x = std::move(x);
+    }
+    if (shd_on_) {   // shadow samples: the row's listed substitutions (all layers, reservoir past the cap)
+        uint32_t cnt = 0;
+        if (cudaMemcpy(&cnt, shd_n_ + row, sizeof cnt, cudaMemcpyDeviceToHost) == cudaSuccess) {
+            const size_t m = std::min<size_t>(cnt, (size_t) shd_cap_);
+            st.pend.shadow.resize(m * 4);
+            if (m > 0 && cudaMemcpy(st.pend.shadow.data(), shd_list_ + (size_t) row * shd_cap_ * 4, m * 4 * sizeof(int32_t),
+                                    cudaMemcpyDeviceToHost) != cudaSuccess) {
+                (void) cudaGetLastError();
+                st.pend.shadow.clear();
+            }
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+    st.pend.valid = true;
+    st.pend.layer = rec[0];
+    st.pend.rank = rec[1];
+    st.pend.e = rec[2];
+    st.pend.s = rec[3];
+    st.pend.ys = std::move(ys);
+}
+
+// After the exact successor of a cut (its window ran, exact_ok): the sample (y_s, y_e) updates the pair.
+void Verifier::standin_learn_settle(bool exact_ok) {
+    if (lrn_st_ == nullptr) return;
+    StandinLearnState& st = *lrn_st_;
+    if (!st.pend.valid) return;
+    st.pend.valid = false;
+    if (!exact_ok) return;
+    const int64_t D = st.dim, n_exp = 512;
+    std::vector<float> ye((size_t) D);
+    {
+        const OnDevice on(device_);
+        if (cudaMemcpy(ye.data(), lrn_ye_, sizeof(float) * (size_t) D, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+    }
+    const std::vector<float>& ys = st.pend.ys;
+    double sxy = 0.0, sxx = 0.0, syy = 0.0;
+    for (int64_t d = 0; d < D; ++d) {
+        sxy += (double) ys[(size_t) d] * ye[(size_t) d];
+        sxx += (double) ys[(size_t) d] * ys[(size_t) d];
+        syy += (double) ye[(size_t) d] * ye[(size_t) d];
+    }
+    if (!std::isfinite(sxy) || !std::isfinite(sxx) || !std::isfinite(syy) || !(sxx > 0.0)) return;
+    const int64_t l = st.pend.layer, e = st.pend.e, s = st.pend.s;
+    if (l < 0 || l >= st.layers || e < 0 || e >= n_exp || s < 0 || s >= n_exp) return;
+    // STRATA_SUBFIT_LOG: the sample (x, y_s, y_e) of this stand-in, between windows (issue #31: no CUDA call inside a window)
+    if (g_subfit && g_subfit->is_open() && (int64_t) st.pend.x.size() == D)
+        g_subfit->write_stand_in((uint16_t) l, (uint16_t) e, (uint16_t) s, (uint8_t) st.pend.rank, st.pend.x.data(), ys.data(), ye.data());
+    // STRATA_SUBFIT_LEARN: the same sample feeds the live learner (between windows; its refit is at the request's end)
+    if (g_sub_learn && (int64_t) st.pend.x.size() == D) {
+        g_sub_learn->add_sample((int) l, (int) e, (int) s, st.pend.x.data(), ys.data(), ye.data());
+        ++g_sub_learn_req;
+    }
+    if (shd_on_ && g_sub_learn && !st.pend.shadow.empty()) subfit_shadow_collect((int) l, (int) e, (int) s);
+    standin_learn_add_sums(l, e, s, sxy, sxx, syy);
+}
+
+// One sample's three sums (y_s.y_e, y_s.y_s, y_e.y_e) for the pair (layer l, true expert e, stand-in s): the pair, its (layer, e) group and its layer group, the device table when the pair is
+// ready.  standin_learn_settle ends in it (a flip re-check's sample); the samples a prompt read takes enter here.  Between windows only: it may write the device table.
+void Verifier::standin_learn_add_sums(int64_t l, int64_t e, int64_t s, double sxy, double sxx, double syy) {
+    if (lrn_st_ == nullptr) return;
+    StandinLearnState& st = *lrn_st_;
+    const int64_t n_exp = 512;
+    if (!std::isfinite(sxy) || !std::isfinite(sxx) || !std::isfinite(syy) || !(sxx > 0.0)) return;
+    if (l < 0 || l >= st.layers || e < 0 || e >= n_exp || s < 0 || s >= n_exp) return;
+    const uint64_t key = lrn_key(l, e, s);
+    const bool pool = standin_pool_apply_env();
+    if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
+    if ((int64_t) st.layer_g.size() < st.layers) st.layer_g.resize((size_t) st.layers);
+    auto it = st.pairs.find(key);
+    if (it == st.pairs.end()) {
+        if (st.count[(size_t) l] >= kLrnPerLayer) {   // the layer's least recently used pair goes (its table entry back to 1)
+            auto old = st.pairs.end();
+            for (auto q = st.pairs.begin(); q != st.pairs.end(); ++q)
+                if ((int64_t) (q->first >> 40) == l && (old == st.pairs.end() || q->second.used < old->second.used)) old = q;
+            if (old != st.pairs.end()) {
+                if (!pool && old->second.n >= kLrnReady && st.table_ready) {
+                    const int64_t oe = (int64_t) ((old->first >> 20) & 0xFFFFFu), os = (int64_t) (old->first & 0xFFFFFu);
+                    const float one = 1.0f;
+                    const OnDevice on(device_);
+                    if (cudaMemcpy(lrn_c_ + ((size_t) l * 512 + (size_t) oe) * 512 + (size_t) os, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess)
+                        (void) cudaGetLastError();
+                }
+                st.pairs.erase(old);
+                --st.count[(size_t) l];
+            }
+        }
+        it = st.pairs.emplace(key, StandinLearnState::Pair{}).first;
+        ++st.count[(size_t) l];
+    }
+    StandinLearnState::Pair& p = it->second;
+    p.num = kLrnDecay * p.num + sxy;
+    p.den = kLrnDecay * p.den + sxx;
+    p.ee = kLrnDecay * p.ee + syy;
+    p.used = ++st.tick;
+    ++p.n;
+    ++st.samples_req;
+    sdp::add_sample(st.layer_g[(size_t) l], sxy, sxx, syy);
+    sdp::add_sample(st.exp_g[sdp::expert_key(l, e)], sxy, sxx, syy);
+    if (!pool && p.n >= kLrnReady) {
+        const float c = (float) std::max(0.0, p.num / std::max(p.den, 1e-30));   // the measured scale (9 Nov: no [0.5, 2] clip; a weight is >= 0)
+        if (c != p.c) {
+            p.c = c;
+            if (st.table_ready) {
+                const OnDevice on(device_);
+                if (cudaMemcpy(lrn_c_ + ((size_t) l * 512 + (size_t) e) * 512 + (size_t) s, &c, sizeof c, cudaMemcpyHostToDevice) != cudaSuccess)
+                    (void) cudaGetLastError();
+            }
+        }
+    } else if (pool && st.table_ready) {
+        // the pooled c of every pair in the layer may have moved (the layer and (layer, e) groups): the layer's slab, one upload
+        std::vector<float> slab((size_t) 512 * 512, 1.0f);
+        for (const auto& kv : st.pairs) {
+            if ((int64_t) (kv.first >> 40) != l) continue;
+            const sdp::Est es = st.est(kv.first, kv.second);
+            if (!es.ready) continue;
+            slab[((size_t) ((kv.first >> 20) & 0xFFFFFu)) * 512 + (size_t) (kv.first & 0xFFFFFu)] = (float) es.c;
+        }
+        const OnDevice on(device_);
+        if (cudaMemcpy(lrn_c_ + (size_t) l * 512 * 512, slab.data(), slab.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
+            (void) cudaGetLastError();
+    }
+    if (st.bal_on && lrn_pe_ != nullptr) standin_learn_pe_layer(l);
+}
+
+// The pairs kept across runs: "STSL", layers, experts, count (u32 each), then per pair key (u64), num, den, ee (f64), n (u32), c (f32).
+bool Verifier::standin_learn_open(const std::string& path, std::string& msg) {
+    if (lrn_st_ == nullptr) { msg = "not on"; return false; }
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) { msg = "no saved state yet"; return false; }
+    StandinLearnState& st = *lrn_st_;
+    std::vector<uint8_t> buf;
+    uint8_t chunk[1 << 14];
+    for (size_t k; (k = std::fread(chunk, 1, sizeof chunk, f)) > 0;) buf.insert(buf.end(), chunk, chunk + k);
+    std::fclose(f);
+    std::vector<sdp::Loaded> recs;
+    if (!sdp::parse_table(buf.data(), buf.size(), st.layers, recs)) { msg = "not this model's state"; return false; }
+    if ((int64_t) st.count.size() < st.layers) st.count.resize((size_t) st.layers, 0);
+    size_t got = 0;
+    for (const sdp::Loaded& r : recs) {
+        const size_t l = (size_t) (r.key >> 40);
+        if (st.count[l] >= kLrnPerLayer) continue;
+        StandinLearnState::Pair p = r.p;
+        p.used = ++st.tick;
+        st.pairs[r.key] = p;
+        ++st.count[l];
+        ++got;
+    }
+    // the groups are rebuilt from the pairs (the file keeps no groups; samples of pairs the LRU dropped before the save are not in them)
+    sdp::rebuild_groups(st.pairs, st.layer_g, st.exp_g);
+    if (st.table_ready) standin_learn_fill_table();
+    msg = std::to_string(got) + " pairs";
+    return true;
+}
+
+bool Verifier::standin_learn_save(const std::string& path, std::string& msg) const {
+    if (lrn_st_ == nullptr) { msg = "not on"; return false; }
+    const StandinLearnState& st = *lrn_st_;
+    if (st.pairs.empty()) { msg = "no pairs"; return true; }
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { msg = "cannot open"; return false; }
+    const uint32_t hd[4] = {kLrnMagic, (uint32_t) st.layers, 512u, (uint32_t) st.pairs.size()};
+    bool ok = std::fwrite(hd, 4, 4, f) == 4;
+    for (const auto& kv : st.pairs) {
+        const StandinLearnState::Pair& p = kv.second;
+        ok = ok && std::fwrite(&kv.first, 8, 1, f) == 1 && std::fwrite(&p.num, 8, 1, f) == 1 && std::fwrite(&p.den, 8, 1, f) == 1 &&
+             std::fwrite(&p.ee, 8, 1, f) == 1 && std::fwrite(&p.n, 4, 1, f) == 1 && std::fwrite(&p.c, 4, 1, f) == 1;
+    }
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        msg = "write failed";
+        return false;
+    }
+    msg = "saved";
+    return true;
+}
+
+// The request's line: the ready pairs, this request's samples, and the mean |c - 1| of the ready pairs (the counts reset).
+void Verifier::subfit_set_path(const std::string& path) { g_subfit_path = path; }
+void Verifier::subfit_set_pack(const std::string& pack) { g_subfit_pack = pack; }
+
+// Shadow samples, after the exact successor of a cut (between windows): for each substitution the cut row listed, the successor's row-0
+// input of that layer and the true pick's output (found among the layer's exact picks) are queued; the CPU adds the stand-in's output
+// on that same input in idle time.  The primary sample (the first stand-in, its y_s from the GPU) is not queued again.
+void Verifier::subfit_shadow_collect(int l0, int e0, int s0) {
+    StandinLearnState& st = *lrn_st_;
+    const std::vector<int32_t> list = std::move(st.pend.shadow);
+    st.pend.shadow.clear();
+    const int64_t D = st.dim, L = st.layers, K = 10;
+    if (!g_shadow) {
+        g_shadow = std::make_unique<strata::core::subfit_shadow::Queue>();
+        g_shadow->set_eval(make_shadow_eval(L));
+        g_shadow->set_paused(true);   // made inside a request: evaluated after it
+    }
+    std::vector<int32_t> ids((size_t) (L * K));
+    std::vector<float> xs((size_t) (L * D));
+    const OnDevice on(device_);
+    if (cudaMemcpy(ids.data(), shd_ids_, ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(xs.data(), shd_x_, xs.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    for (size_t i = 0; i + 3 < list.size(); i += 4) {
+        const int l = list[i], e = list[i + 2], s = list[i + 3];
+        if (l < 0 || l >= L || e < 0 || e >= 512 || s < 0 || s >= 512) continue;
+        ++g_shadow_listed;
+        if (l == l0 && e == e0 && s == s0) continue;   // the primary sample
+        int k = -1;
+        for (int q = 0; q < K; ++q)
+            if (ids[(size_t) (l * K + q)] == e) { k = q; break; }
+        // the exact row did not pick e at this layer (its input moved): skipped, or with STRATA_SUBFIT_SHADOW_CPU_YE=1 the idle-time CPU
+        // computes y_e = e(x) as well (e is not resident: one more expert read, at the idle I/O class)
+        static const bool cpu_ye = strata::core::subfit_shadow::cpu_ye_env(std::getenv("STRATA_SUBFIT_SHADOW_CPU_YE"));
+        if (k < 0) ++g_shadow_nomatch;
+        if (k < 0 && !cpu_ye) continue;
+        strata::core::subfit_shadow::Item it;
+        it.layer = l;
+        it.e = e;
+        it.s = s;
+        it.x.assign(xs.begin() + l * D, xs.begin() + (l + 1) * D);
+        if (k < 0) {
+            it.need_ye = true;
+            g_shadow->push(std::move(it));
+            continue;
+        }
+        it.ye.resize((size_t) D);
+        if (cudaMemcpy(it.ye.data(), shd_y_ + (size_t) (l * K + k) * D, sizeof(float) * (size_t) D, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            continue;
+        }
+        g_shadow->push(std::move(it));
+    }
+}
+
+// STRATA_SUBFIT_LOG: after a probe window (the host is between windows; the window's buffers are complete).  One candidate
+// (layer, rank) of row 0 is drawn at random among the resident, unreplaced picks, and its input, raw output and router weight are written.
+void Verifier::subfit_probe_collect() {
+    if (!sp_win_ || !sp_on_ || lrn_st_ == nullptr) return;
+    sp_win_ = false;
+    StandinLearnState& st = *lrn_st_;
+    const int64_t L = st.layers, N = st.dim, K = 10;
+    ++st.probe_win;
+    if (!g_subfit || !g_subfit->is_open() || L <= 0 || N <= 0) return;
+    std::vector<int32_t> flag((size_t) L * K), pre((size_t) L * K);
+    std::vector<float> w((size_t) L * K);
+    {
+        const OnDevice on(device_);
+        if (cudaMemcpy(flag.data(), sp_.flag, sizeof(int32_t) * flag.size(), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(pre.data(), sp_.pre, sizeof(int32_t) * pre.size(), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(w.data(), sp_.w, sizeof(float) * w.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+    }
+    std::vector<std::pair<int64_t, int64_t>> cand;
+    for (int64_t l = 0; l < L; ++l)
+        for (int64_t k = 0; k < K; ++k)
+            if (flag[(size_t) (l * K + k)] == 1 && pre[(size_t) (l * K + k)] >= 0) cand.push_back({l, k});
+    if (cand.empty()) {
+        ++st.probe_none;
+        return;
+    }
+    std::uniform_int_distribution<size_t> pick(0, cand.size() - 1);
+    const auto chosen = cand[pick(st.rng)];
+    const int64_t l = chosen.first, k = chosen.second;
+    std::vector<float> x((size_t) N), y((size_t) N);
+    {
+        const OnDevice on(device_);
+        if (cudaMemcpy(x.data(), sp_.x + (size_t) l * N, sizeof(float) * (size_t) N, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(y.data(), sp_.y + (size_t) (l * K + k) * N, sizeof(float) * (size_t) N, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+    }
+    if (g_subfit->write_probe((uint16_t) l, (uint16_t) pre[(size_t) (l * K + k)], (uint8_t) k, w[(size_t) (l * K + k)], x.data(), y.data()))
+        ++st.probe_recs;
+}
+
+// SPEC-substitute-fit stage 2 step 1: the live learner's file (per model fingerprint), its request-end refit and its stats line.
+bool Verifier::subfit_learn_active() const { return lrn_st_ != nullptr && subfit_learn_env_on(); }
+
+bool Verifier::subfit_learn_open(const std::string& path, uint64_t fp, std::string& msg) {
+    if (!subfit_learn_active()) {
+        msg = "not on";
+        return false;
+    }
+    make_sub_learn(lrn_st_->dim, lrn_st_->layers);
+    if (!g_sub_learn) {
+        msg = "no dims";
+        return false;
+    }
+    if (!std::filesystem::exists(path)) {
+        msg = "no saved state yet";
+        return false;
+    }
+    std::string err;
+    if (g_sub_learn->load(path, fp, err)) {
+        msg = "loaded";
+        return true;
+    }
+    msg = err;
+    return false;
+}
+
+bool Verifier::subfit_learn_save(const std::string& path, uint64_t fp, std::string& msg) const {
+    if (!g_sub_learn) {
+        msg = "not on";
+        return false;
+    }
+    return g_sub_learn->save(path, fp, msg);
+}
+
+strata::kernels::SubfitRoute Verifier::subfit_route_(int64_t l, int tb) const {
+    strata::kernels::SubfitRoute r;   // all null: the kernels do what they did before the learner
+    if (shd_on_) {   // shadow samples: the router lists each row's substitutions (the learner on; the apply need not be)
+        r.list = shd_list_ + (size_t) tb * (size_t) shd_cap_ * 4;
+        r.list_n = shd_n_ + tb;
+        r.list_cap = shd_cap_;
+        r.salt = shd_salt_;
+    }
+    if (!sub_on_ || sub_tab_.lut == nullptr) return r;
+    {
+        const size_t L = (size_t) sub_tab_.layers, pair_n = L * 512 * 512;
+        r.elut = sub_tab_.lut + pair_n + (size_t) l * 512;   // the ladder: the (layer, expert) slots, then the layer's slot
+        r.llut = sub_tab_.lut + pair_n + L * 512 + (size_t) l;
+    }
+    r.orig = sub_orig_ + (size_t) tb * 10;
+    r.flag = sub_flag_ + (size_t) tb * 10;
+    r.lut = sub_tab_.lut + (size_t) l * 512 * 512;
+    r.resid = sub_tab_.resid;
+    r.mode = sub_mode_;
+    r.gate = lrn_gate_;
+    return r;
+}
+
+// SPEC-substitute-fit stage 2 (steps 2, 3): A_l once per layer (fp16), then the learner's current fits.  Between windows only.
+void Verifier::subfit_tables_start() {
+    if (!sub_on_ || sub_started_ || !g_sub_learn || sub_tab_.lut == nullptr) return;
+    const size_t per = (size_t) sub_tab_.r * (size_t) sub_tab_.N;
+    const OnDevice on(device_);
+    for (int l = 0; l < sub_tab_.layers; ++l) {
+        const std::vector<uint16_t> A = g_sub_learn->features_f16(l);
+        if (A.size() != per) return;
+        if (cudaMemcpy(sub_tab_.A + (size_t) l * per, A.data(), per * sizeof(uint16_t), cudaMemcpyDefault) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+    }
+    sub_started_ = true;
+    subfit_tables_sync(g_sub_learn->all_fitted());
+}
+
+// The learner's changes as device writes: LUT entries, each slot's B (fp16), c and resid, and the fitted counts per layer.
+void Verifier::subfit_tables_sync(const strata::core::subfit_learn::Changes& ch) {
+    if (!sub_on_ || sub_tab_.lut == nullptr || !g_sub_packer) return;
+    std::vector<strata::core::subfit_learn::LutWrite> lw;
+    std::vector<strata::core::subfit_learn::SlotWrite> sw;
+    g_sub_packer->pack(ch, lw, sw);
+    const OnDevice on(device_);
+    const size_t N = (size_t) sub_tab_.N, r = (size_t) sub_tab_.r;
+    for (const auto& w : lw) {
+        if (cudaMemcpy(sub_tab_.lut + w.index, &w.value, sizeof(int16_t), cudaMemcpyDefault) != cudaSuccess) (void) cudaGetLastError();
+    }
+    for (const auto& w : sw) {
+        if (w.slot < 0 || w.slot >= sub_tab_.slots) continue;
+        if (!w.freed && w.b.size() == N * r &&
+            cudaMemcpy(sub_tab_.B + (size_t) w.slot * N * r, w.b.data(), w.b.size() * sizeof(uint16_t), cudaMemcpyDefault) != cudaSuccess)
+            (void) cudaGetLastError();
+        if (cudaMemcpy(sub_tab_.c + w.slot, &w.c, sizeof(float), cudaMemcpyDefault) != cudaSuccess) (void) cudaGetLastError();
+        if (cudaMemcpy(sub_tab_.resid + w.slot, &w.resid, sizeof(float), cudaMemcpyDefault) != cudaSuccess) (void) cudaGetLastError();
+    }
+    const std::vector<int32_t>& nf = g_sub_packer->fit_n();
+    if ((int) nf.size() == sub_tab_.layers && cudaMemcpy(sub_tab_.nfit, nf.data(), nf.size() * sizeof(int32_t), cudaMemcpyDefault) != cudaSuccess)
+        (void) cudaGetLastError();
+}
+
+std::string Verifier::subfit_learn_report() {
+    if (!subfit_learn_active() || !g_sub_learn) return "";
+    // shadow samples finished by the idle-time CPU evaluator since the last request's end feed the learner first
+    strata::core::subfit_shadow::Stats sst{};
+    if (g_shadow) g_shadow->set_paused(false);   // the request has ended: the idle-time evaluation may run until the next one
+    if (g_shadow) {
+        for (const auto& it : g_shadow->take_done()) {
+            g_sub_learn->add_sample(it.layer, it.e, it.s, it.x.data(), it.ys.data(), it.ye.data());
+            ++g_shadow_taken;
+        }
+        sst = g_shadow->take_stats();
+    }
+    // the request's end: the pairs with new samples refit and the gate moves; the changes go to the device tables (between windows)
+    const strata::core::subfit_learn::Changes ch = g_sub_learn->refit();
+    subfit_tables_sync(ch);
+    const strata::core::subfit_learn::Summary s = g_sub_learn->summary();
+    const size_t ready = g_sub_learn->pairs_with_holdout(strata::core::subfit_learn::kHoldWindow);
+    const char* mode = sub_on_ ? strata::core::subfit_learn::apply_name((strata::core::subfit_learn::Apply) sub_mode_) : "off";
+    char buf[512];
+    std::snprintf(buf, sizeof buf,
+                  "strata serve: subfit: mode %s, pairs sampled %zu, fitted %zu (held-out gain median %.3f, min %.3f), corrected moves %lld of "
+                  "%lld substituted, refusals left %lld, samples this request %llu, pairs with >=32 held-out %zu\n",
+                  mode, s.pairs, s.fitted, s.gain_median, s.gain_min, g_sub_req_corr, g_sub_req_subs, g_sub_req_refused,
+                  (unsigned long long) g_sub_learn_req, ready);
+    g_sub_learn_req = 0;
+    g_sub_req_corr = g_sub_req_subs = g_sub_req_refused = 0;
+    char b2[1024];
+    std::snprintf(b2, sizeof b2,
+                  "strata serve: subfit ladder: groups pair/expert/layer %zu/%zu/%zu, held-out ready %zu/%zu/%zu (gain median %.3f/%.3f/%.3f, best %.3f/%.3f/%.3f), "
+                  "fitted %zu/%zu/%zu (median gain %.3f/%.3f/%.3f); "
+                  "shadow: listed %llu, queued %llu, evaluated %llu, fed %llu, dropped %llu, failed %llu, pick not found %llu, waiting %zu\n",
+                  s.groups[0], s.groups[1], s.groups[2], s.ready_lv[0], s.ready_lv[1], s.ready_lv[2], s.ready_median_lv[0], s.ready_median_lv[1],
+                  s.ready_median_lv[2], s.ready_best_lv[0], s.ready_best_lv[1], s.ready_best_lv[2], s.fitted_lv[0], s.fitted_lv[1], s.fitted_lv[2], s.gain_median_lv[0],
+                  s.gain_median_lv[1], s.gain_median_lv[2], (unsigned long long) g_shadow_listed, (unsigned long long) sst.queued,
+                  (unsigned long long) sst.evaluated, (unsigned long long) g_shadow_taken, (unsigned long long) sst.dropped,
+                  (unsigned long long) sst.failed, (unsigned long long) g_shadow_nomatch, g_shadow ? g_shadow->pending() : (size_t) 0);
+    g_shadow_taken = g_shadow_listed = g_shadow_nomatch = 0;
+    return std::string(buf) + b2;
+}
+
+std::string Verifier::standin_learn_report() {
+    if (lrn_st_ == nullptr) return "";
+    StandinLearnState& st = *lrn_st_;
+    int ready = 0, own = 0;
+    double dev = 0.0;
+    for (const auto& kv : st.pairs) {
+        if (kv.second.n >= kLrnReady) ++own;
+        const sdp::Est es = st.est(kv.first, kv.second);
+        if (!es.ready) continue;
+        ++ready;
+        dev += std::fabs(es.c - 1.0);
+    }
+    int pooled = 0;
+    for (const auto& kv : st.exp_g)
+        if (kv.second.n >= kLrnReady) ++pooled;
+    char buf[224];
+    std::snprintf(buf, sizeof buf,
+                  "strata serve: stand-in learn: %d pairs ready (%d own), %d experts pooled, %lld samples this request, mean |c-1| %.4f\n",
+                  ready, own, pooled, st.samples_req, ready > 0 ? dev / ready : 0.0);
+    st.samples_req = 0;
+    std::string out = buf;
+    if (g_subfit && g_subfit->is_open()) {   // STRATA_SUBFIT_LOG: this request's records, the file's size, the probe windows
+        char sb[224];
+        std::snprintf(sb, sizeof sb, "strata serve: subfit log: %llu samples written (file %.1f MB), probe windows %lld, no candidate %lld\n",
+                      (unsigned long long) g_subfit->take_request_count(), (double) g_subfit->bytes() / 1048576.0, st.probe_win, st.probe_none);
+        out += sb;
+        st.probe_win = 0;
+        st.probe_none = 0;
+        st.probe_recs = 0;
+    }
+    if (st.bal_on) {
+        int kept = 0, soft = 0;
+        for (const int8_t s : st.bal_state) {
+            if (s > 0) ++kept;
+            else if (s < 0) ++soft;
+        }
+        char b2[160];
+        std::snprintf(b2, sizeof b2, "strata serve: stand-in balance: %lld rounds, %d experts kept fast, %d given up\n", st.bal_rounds, kept, soft);
+        out += b2;
+    }
+    return out;
+}
+
+bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
+                    const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
+    if (strata::kernels::native_router_fused_on()) strata::kernels::native_router_fused_init();   // STRATA_ROUTER_FUSED: its counter, before any capture
+    if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count)
+        strata::kernels::route_want_alloc((size_t) (g.n_layers * g.n_expert));
+    if (route_resident_cfg().margin > 0.0f && strata::kernels::route_swap2_max() > 0)
+        strata::kernels::route_repl_alloc((size_t) (g.n_layers * g.n_expert));
+    // SPEC 13.40 (T5): STRATA_COUNT_KEPT=1 counts only the kept rows of a verify window (the host applies them after the acceptance)
+    if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count && std::getenv("STRATA_COUNT_KEPT") != nullptr &&
+        std::atoi(std::getenv("STRATA_COUNT_KEPT")) != 0)
+        strata::kernels::route_rows_alloc(g.n_layers);
+    if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_TRACE_ADAPT") != nullptr)
+        strata::kernels::route_detail_alloc();
+    // STRATA_RING_GPU (default on with the ring): the look-ahead as a graph node, its table (allocated here, before any graph capture)
+    // STRATA_LOOKAHEAD_GPU (default on; =0 off): the same table without the ring - the GPU look-ahead warms the file tier
+    // (20 Oct A/B: 48.1 -> 47.2 ms a decode window, the host's per-layer time 15.8 -> 12.6 ms: the CPU's router recompute is gone)
+    if (route_resident_cfg().margin > 0.0f && g.n_expert == 512 &&
+        ((std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0 &&
+          (std::getenv("STRATA_RING_GPU") == nullptr || std::atoi(std::getenv("STRATA_RING_GPU")) != 0)) ||
+         (std::getenv("STRATA_LOOKAHEAD_GPU") == nullptr || std::atoi(std::getenv("STRATA_LOOKAHEAD_GPU")) != 0)))
+        strata::kernels::route_pred_alloc(g.n_layers);
+    // STRATA_LA_MODEL=<file> (opt-in): the next-layer guess from the published linear predictors instead of the next layer's router
+    // (tools/predictor: rank 0-1 found in the top 2 on 71.7% of tokens against 55.3%, in the top 4 on 89.4% against 74.4%)
+    if (const char* lam = std::getenv("STRATA_LA_MODEL"); lam != nullptr && lam[0] != '\0' && strata::kernels::route_pred_active()) {
+        std::string msg;
+        const bool ok = strata::kernels::route_pred_model_load(lam, g.n_layers, g.n_embd, msg);
+        std::fprintf(stderr, "strata verify: STRATA_LA_MODEL %s: %s%s\n", lam, ok ? "loaded, " : "NOT loaded (the routers stay the look-ahead): ",
+                     msg.c_str());
+    }
+    // STRATA_LA_EDGE_SKIP (opt-in =1 since 24 Oct: under the confidence budget its skipped rank-2 reads became misses, reasoning wait 5.2 -> 11.8 s): the look-ahead's edge-skip counter, allocated before any graph capture
+    if ((std::getenv("STRATA_LA_EDGE_SKIP") != nullptr && std::atoi(std::getenv("STRATA_LA_EDGE_SKIP")) != 0) && strata::kernels::route_pred_active())
+        strata::kernels::route_pred_edge_skip_alloc();
+    // STRATA_LA_LEARN=1 (opt-in): the look-ahead's learned correction, its buffers allocated before any graph capture
+    if (la_learn_env_on() && g.n_expert == 512 && strata::kernels::route_pred_active()) {
+        std::string lm;
+        const bool ok = strata::kernels::la_learn_alloc(g.n_layers, g.n_embd, route_resident_cfg().lo, la_learn_timing_on(), lm);
+        std::fprintf(stderr, "strata verify: STRATA_LA_LEARN: %s%s\n", ok ? "on, " : "NOT on: ", lm.c_str());
+    }
+    // STRATA_LA_TAIL_READ=1: its stand-in counter (the same rule: allocated before any graph capture)
+    if (strata::core::la_tail_read_level() != 0 && strata::kernels::route_pred_active())
+        strata::kernels::route_pred_tail_read_alloc();
+    // STRATA_RING=1: the look-ahead ring's landed flags, read by the router (allocated here, before any graph capture)
+    if (route_resident_cfg().margin > 0.0f && std::getenv("STRATA_RING") != nullptr && std::atoi(std::getenv("STRATA_RING")) != 0)
+        strata::kernels::route_ring_alloc((size_t) (g.n_layers * g.n_expert));
+    // STRATA_ROUTE_RAM_FLOOR=1: the RAM-tier table the router reads (host-mapped; FileExpertSource keeps it equal to the tier)
+    if (route_resident_cfg().margin > 0.0f && strata::kernels::route_ram_floor_on())
+        strata::kernels::route_cheap_alloc((size_t) (g.n_layers * g.n_expert));
+    // STRATA_FRAGILE_CTRL_EVERY: the fragile control flag, allocated here so every kernel captured after this reads it (the mask kernel too)
+    // (SPEC-recheck-cheap: the row-only successor needs the flag too, so it is allocated for STRATA_RECHECK_ROW_ONLY as well)
+    if (route_resident_cfg().fragile_on && (route_resident_cfg().fr_ctrl_every > 0 || route_resident_cfg().recheck_row_only) &&
+        !strata::kernels::route_fragile_control_alloc())
+        std::fprintf(stderr, "strata: STRATA_FRAGILE_CTRL_EVERY: no host-mapped control flag, so no fragile control windows\n");
+    // SPEC-recheck-gated step F: the shift cap's array and counters (before any capture, as the flag); without them nothing is capped
+    if (route_resident_cfg().cap_on && !strata::kernels::route_shift_cap_alloc()) {
+        route_resident_cfg().cap_on = false;
+        std::fprintf(stderr, "strata: STRATA_SHIFT_CAP: no host-mapped cap array, so no shift cap\n");
+    }
+    if (route_resident_cfg().margin > 0.0f) {
+        // the one floor, in host-mapped memory the router kernel reads at every launch (so the floor can be moved between
+        // windows, which a controller that follows the drive's load needs, SPEC 19.8; nothing moves it today)
+        strata::kernels::route_cfg_init(route_resident_cfg().lo,
+                                        // STRATA_RANK_CUTOFF=R: ranks R..9 are not computed at all, so no stand-in either - the stand-in range ends at rank R-1
+                                        // (the read-ahead leaves those ranks unread: expert_source.cpp's warm loop; the plan skips them: the tail skip block)
+                                        strata::core::rank_cutoff() > 0 && !(std::getenv("STRATA_RANK_CUTOFF_CLIP") != nullptr && std::atoi(std::getenv("STRATA_RANK_CUTOFF_CLIP")) == 0)
+                                            ? std::min<int>(route_resident_cfg().hi, strata::core::rank_cutoff() - 1) : route_resident_cfg().hi,
+                                        route_resident_cfg().margin,
+                                        route_resident_cfg().edge, route_resident_cfg().bias, route_resident_cfg().maxrank, route_resident_cfg().want_lo, route_resident_cfg().repl_gap, route_resident_cfg().wmax,
+                                        route_resident_cfg().budget, route_resident_cfg().budget_tail);
+        strata::kernels::route_cfg_set_experts((int) g.n_expert);   // the stand-in stage reads the logits rows at this stride (512 for Flash-Next; REAP25: 130)
+    }
+    if (route_resident_cfg().margin > 0.0f)
+        std::fprintf(stderr, "strata verify: residency-biased routing ON (margin %g, ranks %d-%d, edge %g, router bias ln(1+beta) %g, stand-in within the router's first %d places, decode windows %s)\n",
+                     route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi, route_resident_cfg().edge, route_resident_cfg().bias,
+                     route_resident_cfg().maxrank,
+                     strata::kernels::route_want_active() ? "counted from the router's own top-10 for the swap round" : "counted as routed");
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
         Verifier* none = nullptr;
         if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
     }
     release_gpu_fn().store(&release_live_verifiers);
-    device_ = dpct::get_current_device_id(); // a layer split's stage on another
-                                             // GPU: its streams, graphs and
-                                             // buffers live there
+    cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
+    rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
+    strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -487,6 +2186,11 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
+#if defined(STRATA_GPU_METAL)
+    if (metal_ == nullptr) metal_ = strata::metal_engine::window_create();
+    return strata::metal_engine::window_init(metal_, g, ss, max_t, ss.qsa_states[ss.qsa_primary()].max_cells, &n_vocab_,
+                                             err);
+#endif
     if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
@@ -532,6 +2236,38 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
+    // ---- latent MoE (latent-experts branch): a pack whose experts run in a latent space.  Everything comes from the pack's layout and the
+    // session-level LatentTab (core/latent_tab.hpp), which the engine loads before the expert cache is sized; no constant of a model or a card.
+    {
+        const auto& lay0 = strata::kernels::cpu::expert_layout();
+        latent_ = lay0.native && lay0.latent;
+        if (latent_) {
+            const strata::core::LatentShared& li = strata::core::latent_shared_info();
+            if (strata::core::latent_shared_d() == nullptr || strata::core::latent_shared_u() == nullptr || li.labels_dev == nullptr ||
+                li.groups <= 0) {
+                err = "verify: this pack's experts are latent, and the session's latent D/U tables are not loaded (the engine loads them before the verifier)";
+                return false;
+            }
+            if (lay0.expert_embd % 32 != 0 || (int64_t) N != g.n_embd) { err = "verify: a latent width that is not a multiple of 32"; return false; }
+            lat_fmt_ = li.fmt;
+            lat_G_ = li.groups;
+            lat_ELL_ = lay0.expert_embd;
+            lat_E_ = lay0.n_expert;
+            lat_d_layer_ = li.d_layer_bytes;
+            lat_u_layer_ = li.u_layer_bytes;
+            lat_d_ = strata::core::latent_shared_d();
+            lat_u_ = strata::core::latent_shared_u();
+            lat_labels_dev_ = li.labels_dev;
+            lat_u_packed_ = li.u_packed;
+            {   // STRATA_LATENT_STANDIN_GROUP: 0 (default) counts the stand-ins that cross groups, 1 forbids them
+                const char* gv = std::getenv("STRATA_LATENT_STANDIN_GROUP");
+                const char* gb = std::getenv("STRATA_LATENT_STANDIN_GROUP_BONUS");   // logits; > 0: the soft preference (mode 2)
+                const float bonus = gb != nullptr ? (float) std::atof(gb) : 0.0f;
+                const int mode = gv != nullptr ? std::atoi(gv) : (bonus > 0.0f ? 2 : 0);
+                strata::kernels::route_group_set(li.labels_dev, mode, bonus);
+            }
+        }
+    }
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
@@ -539,6 +2275,8 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
+              mapped((size_t) strata::kernels::kVerifyMaxT * strata::kernels::kNonfiniteBlocks * 4, (void**) &h_nf_,
+                     (void**) &m_nf_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
@@ -549,12 +2287,29 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    if (latent_ && (!mapped(T * (uint64_t) lat_G_ * (uint64_t) lat_ELL_ * 4, (void**) &h_latxl_, (void**) &m_latxl_) ||
+                    !mapped(64, (void**) &h_xlseq_, (void**) &m_xlseq_))) {
+        err = "verify: mapped latent staging allocation failed";
+        return false;
+    }
+    if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
+        if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
+            err = "verify: mapped balance stamps allocation failed";
+            return false;
+        }
+        bal_p_.assign((size_t) g.n_layers * 2, 0.0);
+        bal_nc_.assign((size_t) g.n_layers * 2, 0);
+        bal_np_.assign((size_t) g.n_layers * 2, 0);
+        bal_ok_.assign((size_t) g.n_layers * 2, 0);
+        bal_->on = true;
+    }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
-        // even: the second group's plan starts plan_i32_ + 16 words in, and its u64 pointers must stay 8-byte aligned
+        // even: the second group's plan starts plan_i32_ + 16 words in, and its u64 pointers must stay 8-byte aligned (T*K odd -
+        // an odd K - made the stride odd: a misaligned-address fault)
         plan_i32_ = (ptr_off + 4 * cap + (cap + 1) + 1 + 1) & ~1ll;
         if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
             err = "verify: mapped plan allocation failed";
@@ -593,6 +2348,9 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
+        // STRATA_DRAFT_TRACE (one GPU, the whole model): nothing is taken otherwise, so the arena is unchanged and dtr_ stays null
+        dtr_ = draft_trace_on() && lb_ == 0 && le_ >= g.n_layers ? b.take<float>((uint64_t) draft_trace().layers.size() * T * HC * N)
+                                                                 : nullptr;
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
@@ -602,15 +2360,107 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), latent_ ? strata::kernels::cpu::expert_layout().expert_ff : g.n_ff)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+        dyn_gap_ = b.take<float>(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on ? T : 0);   // STRATA_ROUTE_BUDGET_DYN, STRATA_FRAGILE_RECHECK
+        dyn_top1_ = b.take<int32_t>(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on ? T : 0);   // the rows' top-1 ids (the flips' argmax)
+        row_shift_ = b.take<float>(route_resident_cfg().fragile_on ? T : 0);   // STRATA_FRAGILE_RECHECK: the stand-ins' moves per row (decode windows)
+        // a zero-size take returns the NEXT buffer's address (Bump::take), not null: a switched-off feature must hold no pointer, or
+        // a kernel that tests it for null writes into that buffer (row_shift_ into arg_scratch_ broke every token with the re-check off)
+        if (!(route_resident_cfg().dyn_on || route_resident_cfg().fragile_on)) { dyn_gap_ = nullptr; dyn_top1_ = nullptr; }
+        if (!route_resident_cfg().fragile_on) row_shift_ = nullptr;
+        // STRATA_MASK=learn (opt-in): the replaced picks of each decode row and the cut row's first-pass logits; the whole model on one GPU
+        const bool mlr_on = mask_learn_seeded() && route_resident_cfg().fragile_on && route_resident_cfg().margin > 0.0f && lb_ == 0 &&
+                            le_ >= g.n_layers && g.n_expert == 512 && ss.k == 10;
+        uint32_t* mev_raw = b.take<uint32_t>(mlr_on ? (sizeof(strata::kernels::MaskEvs) + 3) / 4 : 0);
+        mev_ = mlr_on ? reinterpret_cast<strata::kernels::MaskEvs*>(mev_raw) : nullptr;
+        mlr_logit0_ = b.take<float>(mlr_on ? (uint64_t) n_vocab_ : 0);
+        mlr_kl_ = b.take<float>(mlr_on ? 1 : 0);
+        if (!mlr_on) { mlr_logit0_ = nullptr; mlr_kl_ = nullptr; }
+        // STRATA_STANDIN_LEARN (opt-in): the whole model on one GPU, the flip re-check and route-resident on; else nothing is taken
+        const bool lrn_on = standin_learn_env() && route_resident_cfg().fragile_on && route_resident_cfg().margin > 0.0f && lb_ == 0 &&
+                            le_ >= g.n_layers && g.n_expert == 512 && ss.k == 10;
+        lrn_c_ = b.take<float>(lrn_on ? (uint64_t) g.n_layers * 512 * 512 : 0);
+        lrn_rec_ = b.take<int32_t>(lrn_on ? T * 4 : 0);
+        lrn_ys_ = b.take<float>(lrn_on ? T * N : 0);
+        lrn_ye_ = b.take<float>(lrn_on ? N : 0);
+        lrn_gate_ = b.take<int32_t>(lrn_on ? 8 : 0);
+        // STRATA_SUBFIT_LOG=1 (opt-in): the stand-in rows' layer inputs and row 0's probe buffers (K = 10); nothing else is taken
+        const bool sp_on = lrn_on && subfit_log_env_on();
+        const uint64_t spL = (uint64_t) g.n_layers;
+        // STRATA_SUBFIT_LEARN=1 (opt-in, stage 2): the layer input of each stand-in row too (the learner's x); off: nothing extra is taken
+        x_on_ = lrn_on && (sp_on || subfit_learn_env_on());
+        lrn_x_ = b.take<float>(x_on_ ? (uint64_t) T * N : 0);
+        sp_.x = b.take<float>(sp_on ? spL * N : 0);
+        sp_.y = b.take<float>(sp_on ? spL * 10 * N : 0);
+        sp_.w = b.take<float>(sp_on ? spL * 10 : 0);
+        sp_.flag = b.take<int32_t>(sp_on ? spL * 10 : 0);
+        sp_.pre = b.take<int32_t>(sp_on ? spL * 10 : 0);
+        sp_.clean = b.take<int32_t>(sp_on ? spL : 0);
+        sp_on_ = sp_on;
+        sp_every_ = strata::core::subfit::probe_every_env(std::getenv("STRATA_SUBFIT_PROBE_EVERY"));
+        if (!sp_on) sp_ = strata::kernels::SubfitProbeBufs{};
+        if (!x_on_) lrn_x_ = nullptr;
+        // SPEC-substitute-fit stage 2: the apply's orig / flag rows and the device tables, only with STRATA_SUBFIT_APPLY set (not off)
+        const bool sub_on = lrn_on && subfit_apply_env_on();
+        sub_orig_ = b.take<int16_t>(sub_on ? T * 10 : 0);
+        sub_flag_ = b.take<uint8_t>(sub_on ? T * 10 : 0);
+        sub_on_ = false;
+        sub_mode_ = 0;
+        if (sub_on && strata::kernels::route_shift_cap_alloc()) {
+            const int rk = strata::core::subfit_learn::rank_env(std::getenv("STRATA_SUBFIT_RANK"));
+            if (cudaMemset(sub_orig_, 0xff, (size_t) T * 10 * sizeof(int16_t)) == cudaSuccess && cudaMemset(sub_flag_, 0, (size_t) T * 10) == cudaSuccess &&
+                strata::kernels::subfit_tables_alloc(sub_tab_, (int) g.n_layers, strata::core::subfit_learn::kMaxFitted, (int) N, rk)) {
+                sub_on_ = true;
+                sub_mode_ = subfit_apply_mode_env();
+                if (sub_tab_.host_bytes > 0)
+                    std::fprintf(stderr, "strata: STRATA_SUBFIT_APPLY: %.1f MiB of the correction tables in pinned host memory (kept out of VRAM: the window graphs need its margin)\n",
+                                 (double) sub_tab_.host_bytes / 1048576.0);
+                g_sub_apply_on = true;
+            } else if (sub_orig_ != nullptr) {   // (the sizing pass has no arena: nothing to report there)
+                std::fprintf(stderr, "strata: STRATA_SUBFIT_APPLY: no device tables, so no correction applied\n");
+            }
+        }
+        if (!sub_on_) { sub_orig_ = nullptr; sub_flag_ = nullptr; }
+        // SPEC-substitute-fit shadow samples (the learner on, STRATA_SUBFIT_SHADOW > 0, default 64): nothing taken otherwise
+        const int shd_cap = (x_on_ && subfit_learn_env_on())
+                                ? strata::core::subfit_shadow::per_cut_env(std::getenv("STRATA_SUBFIT_SHADOW")) : 0;
+        shd_list_ = b.take<int32_t>(shd_cap > 0 ? T * (uint64_t) shd_cap * 4 : 0);
+        shd_n_ = b.take<uint32_t>(shd_cap > 0 ? T : 0);
+        shd_ids_ = b.take<int32_t>(shd_cap > 0 ? spL * 10 : 0);
+        shd_x_ = b.take<float>(shd_cap > 0 ? spL * N : 0);
+        shd_y_ = b.take<float>(shd_cap > 0 ? spL * 10 * N : 0);
+        shd_cap_ = shd_cap;
+        shd_on_ = shd_cap > 0;
+        if (!shd_on_) { shd_list_ = nullptr; shd_n_ = nullptr; shd_ids_ = nullptr; shd_x_ = nullptr; shd_y_ = nullptr; }
+        lrn_pe_ = b.take<float>(lrn_on && standin_balance_env() ? (uint64_t) g.n_layers * 512 * 512 : 0);
+        if (!(lrn_on && standin_balance_env())) lrn_pe_ = nullptr;
+        if (!lrn_on) { lrn_c_ = nullptr; lrn_rec_ = nullptr; lrn_ys_ = nullptr; lrn_ye_ = nullptr; lrn_gate_ = nullptr; }
+        if (lrn_on) {
+            lrn_st_ = std::make_shared<StandinLearnState>();
+            lrn_st_->dim = (int64_t) N;
+            lrn_st_->layers = g.n_layers;
+            lrn_st_->layer_g.assign((size_t) g.n_layers, sdp::Sums{});
+            lrn_st_->bal_on = standin_balance_env();
+        } else {
+            lrn_st_.reset();
+        }
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+        if (latent_) {   // the latent stages' scratch: all sized from T, K, the group count and the latent width
+            const uint64_t LG = (uint64_t) lat_G_, LELL = (uint64_t) lat_ELL_;
+            lat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+            lat_xlq_ = b.take<uint8_t>(T * LG * (LELL / 32) * 36);
+            lat_uq_ = b.take<uint8_t>(T * K * (LELL / 32) * 36);
+            lat_xl_ = b.take<float>(T * LG * LELL);
+            lat_yl_ = b.take<float>(T * K * LELL);
+            lat_yfull_ = b.take<float>(T * K * LELL);
+        }
     };
     Bump count;
     carve(count);
@@ -619,7 +2469,20 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
     }
+<<<<<<< sycl
     strata::big_fill_zero(dpct::get_in_order_queue(), arena_, count.used);
+||||||| base
+    cudaMemset(arena_, 0, count.used);
+=======
+    cudaMemset(arena_, 0, count.used);
+    if (hflag_out_d_ != nullptr && hcount_d_ == nullptr) {   // the overlapped split's hand-off counter
+        if (cudaMalloc((void**) &hcount_d_, 64) != cudaSuccess) { err = "verify: hand-off counter allocation failed"; return false; }
+        cudaMemset(hcount_d_, 0, 64);
+        if (!mapped(64, (void**) &hdrop_h_, (void**) &hdrop_d_)) { err = "verify: hand-off test word allocation failed"; return false; }
+    }
+    if (hflag_in_d_ != nullptr && herr_h_ == nullptr &&
+        !mapped(64, (void**) &herr_h_, (void**) &herr_d_)) { err = "verify: hand-off error word allocation failed"; return false; }
+>>>>>>> ours-now
     if (g_trace && trace_h_ == nullptr) {   // #649: the breadcrumbs, mapped so they read while the GPU hangs
         trace_n_ = (size_t) (g.n_layers + 1) * kProfPer * 2;
         if (!mapped(trace_n_ * 8, (void**) &trace_h_, (void**) &trace_m_)) {
@@ -666,15 +2529,67 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
+<<<<<<< sycl
     /*
     DPCT1025: The SYCL queue is created ignoring the flag and priority
     options.
     */
     if (DPCT_CHECK_ERROR(
             copy_ = dpct::get_current_device().create_queue(true)) != 0) {
+||||||| base
+    bool copy_made = false;
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    // engine-latency, STRATA_COPY_HIP_PRIO=1 (opt-in): the copy stream at high priority, so it gets a hardware queue of
+    // its own (ROCm hands queues out per priority).  Sharing one with the window's stream, --pcie-mode dma's copies and
+    // their host function queue behind the window's graph, which spins on the flag they raise (a timeout at layer 1).
+    {
+        static const bool cp = [] { const char* v = std::getenv("STRATA_COPY_HIP_PRIO"); return v != nullptr && std::atoi(v) != 0; }();
+        int lo = 0, hi = 0;
+        if (cp && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
+            copy_made = hipStreamCreateWithPriority(&copy_, hipStreamNonBlocking, hi) == hipSuccess;
+        (void) cudaGetLastError();
+    }
+#endif
+    if (!copy_made && cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) != cudaSuccess) {
+=======
+    // STRATA_PIPED_CONCURRENT=1 (opt-in): a prompt can run on the same GPU while the batch windows run, so the windows'
+    // streams get the device's highest priority (HIP: the default priority, as the drafter's)
+    auto make_stream = [](cudaStream_t* s) -> cudaError_t {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        static const bool hi = [] {   // (STRATA_PIPED_CONCURRENT_PRIO=0: the default priority)
+            const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
+            const char* p = std::getenv("STRATA_PIPED_CONCURRENT_PRIO");
+            return v != nullptr && std::atoi(v) != 0 && (p == nullptr || std::atoi(p) != 0);
+        }();
+        int lo = 0, top = 0;
+        if (hi) {
+            if (cudaDeviceGetStreamPriorityRange(&lo, &top) == cudaSuccess &&
+                cudaStreamCreateWithPriority(s, cudaStreamNonBlocking, top) == cudaSuccess)
+                return cudaSuccess;
+            cudaGetLastError();   // (only the failed priority call's error: the default path clears nothing)
+        }
+#endif
+        return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
+    };
+    bool copy_made = false;
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    // engine-latency, STRATA_COPY_HIP_PRIO=1 (opt-in): the copy stream at high priority, so it gets a hardware queue of
+    // its own (ROCm hands queues out per priority).  Sharing one with the window's stream, --pcie-mode dma's copies and
+    // their host function queue behind the window's graph, which spins on the flag they raise (a timeout at layer 1).
+    {
+        static const bool cp = [] { const char* v = std::getenv("STRATA_COPY_HIP_PRIO"); return v != nullptr && std::atoi(v) != 0; }();
+        int lo = 0, hi = 0;
+        if (cp && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
+            copy_made = hipStreamCreateWithPriority(&copy_, hipStreamNonBlocking, hi) == hipSuccess;
+        (void) cudaGetLastError();
+    }
+#endif
+    if (!copy_made && make_stream(&copy_) != cudaSuccess) {
+>>>>>>> ours-now
         err = "verify: copy stream create failed";
         return false;
     }
+<<<<<<< sycl
     if (ext_stream_ != nullptr) cs_ =
         ext_stream_; // set_stream (pipelined windows): the stage's shared
                      // stream
@@ -692,14 +2607,89 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     if (cs_ == &dpct::get_in_order_queue() ||
         DPCT_CHECK_ERROR(
             sh_cs_ = dpct::get_current_device().create_queue(true)) != 0) {
+||||||| base
+    if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
+    else if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
+    if (cs_ == nullptr || cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
+=======
+    // STRATA_LA_PRIO (default 1, 0 = the priorities as before): the window's decode streams (cs_, sh_cs_) at the device's greatest
+    // priority, the learner's batch stream (la_cs_, below) at the least, so the batch runs on the SMs the window leaves idle.
+    // A stage's shared stream (set_stream) keeps the priority its owner gave it.
+    static const bool la_prio_on = [] { const char* v = std::getenv("STRATA_LA_PRIO"); return v == nullptr || std::atoi(v) != 0; }();
+    auto make_stream_at = [](cudaStream_t* s, bool least) -> cudaError_t {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        int lo = 0, top = 0;
+        if (cudaDeviceGetStreamPriorityRange(&lo, &top) == cudaSuccess &&
+            cudaStreamCreateWithPriority(s, cudaStreamNonBlocking, least ? lo : top) == cudaSuccess)
+            return cudaSuccess;
+        cudaGetLastError();   // (the priority call failed: the default priority, as make_stream)
+#else
+        (void) least;
+#endif
+        return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
+    };
+    auto make_decode_stream = [&](cudaStream_t* s) { return la_prio_on ? make_stream_at(s, false) : make_stream(s); };
+    if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
+    else if (make_decode_stream(&cs_) != cudaSuccess) cs_ = nullptr;
+    if (cs_ == nullptr || make_decode_stream(&sh_cs_) != cudaSuccess) {
+>>>>>>> ours-now
         err = "verify: stream create failed";
         return false;
     }
+<<<<<<< sycl
     if (DPCT_CHECK_ERROR(commit_done_ = new sycl::event()) != 0 ||
         DPCT_CHECK_ERROR(ev_fork_ = new sycl::event()) != 0 ||
         DPCT_CHECK_ERROR(ev_join_ = new sycl::event()) != 0) {
+||||||| base
+    if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
+=======
+    if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_q8_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
+>>>>>>> ours-now
         err = "verify: event create failed";
         return false;
+    }
+    if (pcie_early_env()) {   // optional: on any failure it stays off (pf_cs_ nullptr) and the fetch stays on cs
+        if (make_decode_stream(&pf_cs_) != cudaSuccess || cudaEventCreateWithFlags(&ev_pf_fork_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev_pf_join_, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            if (pf_cs_) { cudaStreamDestroy(pf_cs_); pf_cs_ = nullptr; }
+            if (ev_pf_fork_) { cudaEventDestroy(ev_pf_fork_); ev_pf_fork_ = nullptr; }
+            if (ev_pf_join_) { cudaEventDestroy(ev_pf_join_); ev_pf_join_ = nullptr; }
+            std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the side stream could not be made, the PCIe fetch stays on the window's stream\n");
+        } else {
+            std::fprintf(stderr, "strata verify: STRATA_PCIE_EARLY: the PCIe share's fetch overlaps the VRAM experts (own stream, pcie mode 2; STRATA_PCIE_EARLY=0 turns it off)\n");
+        }
+    }
+#if !defined(STRATA_USE_HIP)
+    // the look-ahead node's own stream (record_window, STRATA_LOOKAHEAD_GPU_STREAM), made like sh_cs_.  Optional: on any
+    // failure it is left off (nullptr) and the node stays on cs
+    if ((la_prio_on ? make_stream_at(&la_cs_, true) : make_stream(&la_cs_)) != cudaSuccess) la_cs_ = nullptr;
+    if (la_cs_ != nullptr &&
+        (cudaEventCreateWithFlags(&ev_la_fork_, cudaEventDisableTiming) != cudaSuccess ||
+         cudaEventCreateWithFlags(&ev_la_read_done_, cudaEventDisableTiming) != cudaSuccess ||
+         cudaEventCreateWithFlags(&ev_la_done_, cudaEventDisableTiming) != cudaSuccess)) {
+        cudaStreamDestroy(la_cs_);   // the events created so far are freed with the rest in the destructor
+        la_cs_ = nullptr;
+    }
+    (void) cudaGetLastError();
+#endif
+    {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
+        // stage's window with the branches stopped inside its graph when an NVML query (nvidia-smi) came between
+        // requests (2x RTX 3090 and 2x RTX 2080 Ti, #905); never seen on Windows.  0 / unset: one stream, as before
+        const char* v = std::getenv("STRATA_DF_BRANCH");
+        df_branch_ = v != nullptr && std::atoi(v) != 0;
+        if (df_branch_ && df_fork_ == nullptr) {
+            bool okb = cudaEventCreateWithFlags(&df_fork_, cudaEventDisableTiming) == cudaSuccess;
+            for (int i = 0; i < 2 && okb; ++i)
+                okb = cudaStreamCreateWithFlags(&df_side_[i], cudaStreamNonBlocking) == cudaSuccess &&
+                      cudaEventCreateWithFlags(&df_join_[i], cudaEventDisableTiming) == cudaSuccess;
+            if (!okb) { cudaGetLastError(); df_branch_ = false; }
+        }
     }
     // Check whether 100% of experts across [lb_, le_) are resident in this stage's VRAM cache.
     // When true, every layer plans on device and writes directly into parts_ without any CPU doorbells,
@@ -722,6 +2712,16 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
             }
             all_resident_ = all_ok;
         }
+    }
+    if (g_side_mixer() > 0 &&
+        (cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&mfork_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&mjoin_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&side2_, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&pfork_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&pjoin_, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "verify: the mixer branch's stream / events could not be created";
+        return false;
     }
     // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
@@ -790,6 +2790,13 @@ catch (sycl::exception const &exc) {
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
 
+// The one-token self-commit: record_window advances the window's own state, and Verifier::commit then skips the commit graph.
+// Keep the two in step: batch_rec_ is true only while a batch window is recorded, so commit() (where it reads false) does
+// not share that term; a QFUSE window (g_qfuse) must not self-commit on either side.
+bool Verifier::window_self_commits(int T) const {
+    return T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();
+}
+
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
 // Plan v0.3 P6 (split window): with `groups_ == 2` the window's tokens are cut into two groups A = [0, T/2 up) and
@@ -800,7 +2807,36 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
-bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
+bool Verifier::la_learn_on() { return la_learn_env_on(); }
+void Verifier::la_learn_set_saved(bool saved) { g_la_saved = saved ? 1 : 0; }
+bool Verifier::la_learn_open(const std::string& path, std::string& msg) {
+    if (!strata::kernels::la_learn_active()) { msg = "not on"; return false; }
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) { msg = "no saved state yet"; return false; }
+    return strata::kernels::la_learn_load(path.c_str(), msg);
+}
+void Verifier::la_learn_request_end(const std::string& path, std::string& report) {
+    if (!strata::kernels::la_learn_active()) return;
+    if (!path.empty()) {
+        std::string msg;
+        if (!strata::kernels::la_learn_save(path.c_str(), msg))
+            std::fprintf(stderr, "strata serve: look-ahead learner: cannot save %s (%s)\n", path.c_str(), msg.c_str());
+    }
+    report = strata::kernels::la_learn_report();
+}
+void Verifier::la_learn_before_launch() {
+    if (la_learn_env_on()) strata::kernels::la_learn_pre_launch(cs_);
+    if (strata::kernels::la_mtp_active()) strata::kernels::la_mtp_pre_launch(cs_);   // STRATA_MTP_LA: the drafter's batch and copies first
+}
+bool Verifier::la_learn_after_launch(int T, std::string& err) {
+    if (T < 0 || T >= 9 || !la_win_[T]) return true;
+    try {
+        strata::kernels::la_learn_post_launch(cs_, hits_.d_res, T);
+    } catch (const std::exception& e) { err = "verify look-ahead learner: " + std::string(e.what()); return false; }
+    return true;
+}
+
+bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     // 0.1.43 (STRATA_VERIFY_LEAN=0 turns it off): with the device plan under STRATA_VERIFY_NO_HOST no host ever answers a doorbell, so
@@ -827,11 +2863,28 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
-    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
+    // (a one-token window advances its state in place (window_self_commits); Verifier::commit then skips the commit graph)
+    const bool self_commit = window_self_commits(T);
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+<<<<<<< sycl
     // SYCL port, STRATA_VERIFY_EAGER=1: the window runs on the queue instead of as a graph, and each stage stamp is
     // a host-side wait + clock (there is no %globaltimer here), so the existing stage profiler reports ms per stage.
     static const bool eager = std::getenv("STRATA_VERIFY_EAGER") != nullptr;
+||||||| base
+=======
+    // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
+    const int side_mixer_mode = g_side_mixer();
+    const bool side_mixer = side_mixer_mode >= 1;
+    const bool side_proj = side_mixer_mode >= 2 && !batch_rec_;   // fork b063c13: the GDN gate projection, the QSA queries
+    auto branch = [&](cudaEvent_t e, cudaStream_t from, cudaStream_t to, const char* what) {
+        if (cudaEventRecord(e, from) == cudaSuccess && cudaStreamWaitEvent(to, e, 0) == cudaSuccess) return true;
+        err = std::string("verify: the mixer branch could not ") + what;
+        return false;
+    };
+    // a batch window's rows each read their own slot's indexer: in line there
+    const bool sidem = side_mixer && !batch_rec_;
+>>>>>>> ours-now
     auto stamp = [&](int64_t l, int i, int grp) {
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
         if (!prof_on_ || grp != 0) return;
@@ -846,10 +2899,34 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
     if (!batch_rec_) groups_[T] = G;
+    // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
+    // projections may start while the kernel before them finishes, loading their weights before they wait for its
+    // output.  Only a launch whose predecessors in the graph are all kernels gets programmatic edges; every value is
+    // the same as without them.
+    struct PdlScope {
+        bool prev;
+        explicit PdlScope(bool on) : prev(pdl_scope()) { pdl_scope() = on; }
+        ~PdlScope() { pdl_scope() = prev; }
+    } pdl_window(G == 1 && pdl_supported());
+    // STRATA_DF_BRANCH: mixer work that reads only the layer's input runs on a side stream inside the graph.  fork(i)
+    // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
+    // side i: a branch never races with what came before its fork or after its join.  Not in a split or batch window,
+    // nor under the stage profiler (whose stamps are on `cs`).
+    const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer;   // STRATA_SIDE_MIXER wins
+    auto fork = [&](int i) {
+        cudaEventRecord(df_fork_, cs);
+        cudaStreamWaitEvent(df_side_[i], df_fork_, 0);
+    };
+    auto join = [&](int i) {
+        cudaEventRecord(df_join_[i], df_side_[i]);
+        cudaStreamWaitEvent(cs, df_join_[i], 0);
+    };
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
+    // STRATA_BATCH_SELF_COMMIT: the window keeps its rows (no commit graph, nothing to snapshot for one)
+    const bool keep_rows = batch_rec_ && batch_self_commits(brow_, T);
 
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
@@ -864,6 +2941,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     const int64_t HB = Verifier::handoff_floats(g);
     if (lb_ > 0) {
         const float* hin = hand_in_ + (size_t) hrow0 * HB;   // the group's rows: [R][bo][inj] contiguous
+        // the overlapped split: this graph was launched before the previous stage finished - wait for its hand-off
+        if (hflag_in_d_ != nullptr && !batch_rec_) wait_handoff(hflag_in_d_, 1u, herr_d_, g_split_wait_ns, cs);
         copy_from_mapped(R_, hin, (int64_t) T * HC * N, cs);
         copy_from_mapped(bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
         copy_from_mapped(inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
@@ -896,10 +2975,31 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         }
     }
 
+    // STRATA_LOOKAHEAD_GPU_STREAM: set once this window has recorded a look-ahead node on la_cs_ (the join and the wait below)
+    bool la_stream_used = false;
+    // STRATA_LA_LEARN: this window learns its look-ahead (a single stage, one group of n <= 8 rows, every layer's look-ahead on cs,
+    // every layer's router with its two look-ahead GEMVs): the forward and the training steps are recorded in the window
+    bool la_all_gates = true;
+    for (int64_t l = 0; l < g.n_layers && la_all_gates && la_learn_env_on(); ++l) {
+        const WeightRef* wr = LayerView(wt, l).get("ffn_gate_inp.weight");
+        la_all_gates = wr != nullptr && wr->kind == WeightKind::Bf16InF32;
+    }
+    const bool la_learn_win = la_learn_env_on() && la_all_gates && strata::kernels::la_learn_active() && G == 1 && !batch_rec_ &&
+                              T <= 8 && lb_ == 0 && le_ == g.n_layers && NE == 512 && K == 10 && hits_.d_res != nullptr &&
+                              native_router_enabled() && strata::kernels::route_pred_active() &&
+                              strata::kernels::route_pred_logits() != nullptr;
+    // the launches of this window size run the batch after them (a --batch-mtp capture of the same size must not clear the flag
+    // of the single-request graph, whose learner nodes would then run without their training batch: 24 Oct review)
+    if (T >= 0 && T < 9 && !batch_rec_) la_win_[T] = la_learn_win;
+
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
+        // the previous layer's look-ahead node reads mixed_ (its MoE input); this layer's gr_read_group writes mixed_ on cs.
+        // One wait per layer, on grp 0: the latest record on la_cs_ is the previous layer's last group's node, and la_cs_ runs
+        // in order, so it covers both groups.  The node was forked a whole post() earlier, so the wait is normally free.
+        if (la_stream_used && grp == 0) cudaStreamWaitEvent(cs, ev_la_read_done_, 0);
         const LayerView v(wt, l);
         const char* pfx[2] = {"hc_attn_", "hc_ffn_"};
         const WeightRef *wn[2], *wd[2], *wu[2], *wi[2];
@@ -981,7 +3081,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                     err = std::string("verify PLE: ") + e.what();
                     return false;
                 }
-                copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
+                if (!keep_rows) copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
             }
             pending = false;
         }
@@ -995,6 +3095,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
                 a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
                 a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
+                a.s_down = wd[half]->q8_scale; a.s_up = wu[half]->q8_scale;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
                 if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
@@ -1003,12 +3104,42 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                     else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
                 }
             }
+            if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
         stamp(l, 1, grp);
+        if (!stage_mark(cs, kStHc, err)) return false;
         float* xm = mixed_ + tb * N;
+        bool il_ready = false;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
+        // a projection input's q8_1 blocks and their interleaved copy in one launch (native_quantize_q8_1_il, the same
+        // bytes): Turing default (+0.5..+1 % decode, two launches fewer per GDN layer and per QSA layer); STRATA_QIL=0 / 1
+        // forces it off / on
+        auto quant_in = [&](const float* x, int n_in) {
+#if !defined(STRATA_USE_HIP)
+            static const int qil_env = [] { const char* v = std::getenv("STRATA_QIL"); return v != nullptr ? std::atoi(v) : -1; }();
+            const bool qil = qil_env >= 0 ? qil_env != 0 : device_is_sm75();
+            if (qil && n >= 2 && n <= 4 && g_mmvq_il()) {
+                strata::kernels::native_quantize_q8_1_il(x, xq_, xil_, n_in, n, cs);
+                il_ready = true;
+                return;
+            }
+#endif
+            native_quantize_q8_1(x, xq_, n_in, n, cs);
+            il_ready = false;
+        };
+        auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
+            if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
+                if (!il_ready && n >= 2) {   // one column reads the plain q8_1 blocks
+                    strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, n, cs);
+                    il_ready = true;
+                }
+                strata::kernels::native_mmvq_il(w->native_type, w->native_data, xq_, xil_, out, n_in, n_out, n, cs);
+            } else {
+                native_mmvq(w->native_type, w->native_data, xq_, out, n_in, n_out, n, cs);
+            }
+        };
         try {
             if (!is_qsa_layer(g, l)) {
                 // ======================= GDN =======================
@@ -1028,8 +3159,41 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 float* hb = h_L_ + (size_t) gi * MT * C;
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
-                if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
+                if (sidem) {   // the gates (a few blocks, latency-bound) beside the projections, joined below
+                    if (!branch(mfork_, cs, side_, "fork")) return false;
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                 (int) HV, n, side_);
+                    if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
+                }
+                if (!q8_attn) quant_in(xm, (int) N);
+                if (side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv
+                    // the branch reads F4's interleaved copy too (written on cs before the fork; bitwise native_mmvq's
+                    // output), and qkv is recorded before the branch's launch, so its grid is dispatched first and the
+                    // conv / recurrence that wait for it start sooner (z is read only after the recurrence)
+                    const bool g_il = g_mmvq_il() && strata::kernels::native_mmvq_il_supported(wg->native_type, n, (int) ZV);
+                    if (g_il && !il_ready && n >= 2) {
+                        strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, n, cs);
+                        il_ready = true;
+                    }
+                    if (!branch(pfork_, cs, side2_, "fork")) return false;
+                    mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                    if (g_il) strata::kernels::native_mmvq_il(wg->native_type, wg->native_data, xq_, xil_, z_ + (size_t) tb * ZV,
+                                                              (int) N, (int) ZV, n, side2_);
+                    else native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, side2_);
+                    if (cudaEventRecord(pjoin_, side2_) != cudaSuccess) { err = "verify: the gate projection's branch could not join"; return false; }
+                }
+                if (br) {   // STRATA_DF_BRANCH: a/b and z beside q/k/v and the conv; all of them read only this layer's input
+                    fork(0);
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                 (int) HV, n, df_side_[0]);
+                    fork(1);
+                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
+                                df_side_[1]);
+                }
+                const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
+                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1039,20 +3203,61 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                         const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
                                           (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                         gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
-                                          hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0);
+                                          hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0,
+                                          keep_rows);
                     }
                 } else
                 // a one-token window keeps its token: it advances the conv history and the state itself (commit)
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
                                   self_commit);
                 stamp(l, 3, grp);
+                if (br) {   // gate, beta and z, before the recurrence reads them
+                    join(0);
+                    join(1);
+                } else {
+                if (!fuse_ab && !sidem)   // the gates: the HIP fused conv kernel (143-amdk) or the side mixer's branch, else here
                 gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
+<<<<<<< sycl
                 native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+||||||| base
+                mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+=======
+                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+>>>>>>> ours-now
                 stamp(l, 5, grp);
+                if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
+                    err = "verify: the gate projection's branch could not join";
+                    return false;
+                }
+                if (sidem && cudaStreamWaitEvent(cs, mjoin_, 0) != cudaSuccess) {
+                    err = "verify: the GDN gates' branch could not join";
+                    return false;
+                }
+                }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
+                static const bool gdn_groups_on = [] {   // STRATA_BATCH_GDN_GROUPS=1, all slots in one launch
+                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                // (not when the window self-commits: the groups kernel never stores the state, and no commit graph replays it then -
+                // the conv history would advance while the recurrent state stayed frozen; the per-slot branch commits it)
+                if (batch_rec_ && gdn_groups_on && te - tb <= 8 && !keep_rows) {
+                    strata::kernels::GdnGroups gg;
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        SessionState& sx = slot_ss(first);
+                        gg.state[gg.n] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
+                        gg.first[gg.n] = first;
+                        gg.ntok[gg.n] = t - first;
+                        ++gg.n;
+                    }
+                    strata::kernels::gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
+                                                          y_, (int) HK, (int) HV, false, cs);
+                } else
                 if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
                     for (int t = tb; t < te;) {
                         const int first = t;
@@ -1062,14 +3267,28 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                         gdn_step_norm_multi(stx, hb + (size_t) first * C, (int) C, gate + (size_t) first * HV,
                                             beta + (size_t) first * HV, z_ + (size_t) first * ZV,
                                             (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
-                                            (int) HK, (int) HV, t - first, nullptr, cs, 0);
+                                            (int) HK, (int) HV, t - first, keep_rows ? one_ : nullptr, cs, 0);
                     }
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
                 stamp(l, 6, grp);
+<<<<<<< sycl
                 if (!g_qfuse()) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);   // STRATA_QFUSE: done above
                 native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+||||||| base
+                // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
+                // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
+                if (!g_qfuse() || batch_rec_) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
+                il_ready = false;
+                mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+=======
+                // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
+                // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
+                if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
+                else il_ready = false;
+                mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+>>>>>>> ours-now
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1100,11 +3319,154 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
-                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
-                if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
-                else for (int t = tb; t < te; ++t)
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                // STRATA_DF_QB_Q4 (default on since 0.1.45; STRATA_DF_QB_Q4=0 gives the old token-by-token path): a Q4_0 KV cache
+                // takes the batched window too - its one per-token extra, the query's rotation, is row-wise and the batched
+                // path rotates (270650e).  The generated ids are identical (p620 gfx1201, A4000 sm_86, P100 sm_60, short and
+                // long prompts), and the 6-token verify graph is 1950 nodes instead of 2610 (#2403: an RX 6900 XT faulted in
+                // the first verify graph launch with --kv q4_0 + KV streaming + MTP; whether the graph size is the cause is
+                // not confirmed)
+                static const bool qb_q4 = [] {
+                    const char* e = std::getenv("STRATA_DF_QB_Q4");
+                    return e == nullptr || std::atoi(e) != 0;
+                }();
+                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
+                if (!q8_attn) quant_in(xm, (int) N);
+                // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
+                // beside the K/V side; the indexer query joins before the block scores, the query before attention
+                const bool qbr = br && qb;
+                if (qbr) {
+                    fork(0);
+                    native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                (int) (NH * 2 * HD), n, df_side_[0]);
+                    copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD,
+                                      df_side_[0]);
+                    norm_rope_on(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, df_side_[0]);
+                    if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);   // <Hq, Hk> = <q, k>
+                    fork(1);
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
+                                              IQ * ID, N, IQ * ID, n, df_side_[1]);
+                    norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
+                }
+                // STRATA_SIDE_MIXER=1 / =2 (fork Eddoursul 34a35db + b063c13): the indexer's key projection,
+                // the tail's snapshot, its keys appended, its query projection, norm and RoPE, the block scores and the
+                // top-k read only the mixer's input and the indexer's own state - =1 runs them on a branch beside the
+                // attention's projections; =2 also the queries' chain on a second branch.  Each step below is
+                // the in-line code with its stream as a parameter; with the switch off they run on cs in the same order
+                // as before (STRATA_DF_BRANCH, the same idea for fewer of these steps, is off whenever this is on).
+                auto norm_rope_s = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos, cudaStream_t ns) {
+                    if (fuse_nr && native_norm_rope_usable(cols, (int) s.n_rot)) {
+                        native_qsa_rms_norm_rope(data, cols, (const float*) norm->data, data, rows, cols, (int) s.n_rot, EPS,
+                                                 rope_scaling(), pos, ns);
+                        return;
+                    }
+                    norm_rope_on(data, norm, rows, cols, pos, ns);
+                };
+                auto idx_key = [&](cudaStream_t ns) {
+                    if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, ns);
+                    else for (int t = tb; t < te; ++t)
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, ns);
+                };
+                auto idx_snap = [&](cudaStream_t ns) {
+                    if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
+                        for (int t = tb; t < te && !keep_rows; ++t)
+                            if (t == tb || brow_[t] != brow_[t - 1])
+                                copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
+                                                 slot_ss(t).qsa_states[qi].idx_tail, TS, ns);
+                    } else
+                    if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
+                };
+                auto idx_append = [&](cudaStream_t ns) {
+                    if (dec_batch && !g_no_batch_kv && !batch_rec_) {
+                        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                        native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
+                                                        n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                        rope_scaling(), ns);
+                    } else {
+                        for (int t = tb; t < te; ++t) {
+                            const QsaState& sx = slot_ss(t).qsa_states[qi];
+                            const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
+                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                                      (const float*) wikn->data, EPS, ib, s, sx.max_cells,
+                                                      rope_scaling(), ns);
+                        }
+                    }
+                };
+                auto idx_query = [&](cudaStream_t ns) {
+                    if (qb) {
+                        bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
+                                                  N, IQ * ID, n, ns);
+                        norm_rope_s(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, ns);
+                    } else
+                        for (int t = tb; t < te; ++t) {
+                            float* qx = qidx_ + t * IQ * ID;
+                            bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), ns);
+                            norm_rope_s(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH, ns);
+                        }
+                };
+                auto idx_select = [&](cudaStream_t ns) {
+                    qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
+                                     s, scores_ + (size_t) tb * max_blocks_, ns);
+                    qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
+                                   sel_ + (size_t) tb * cap_, ns);
+                };
+                // the attention's queries: the projection (mm on cs, which may read F4's interleaved copy; on a branch
+                // F4's kernel too, its copy written on cs before the fork - bitwise the same), the q/gate
+                // split with norm and RoPE, the rotation
+                const bool q_il = side_proj && g_mmvq_il() &&
+                                  strata::kernels::native_mmvq_il_supported(wq->native_type, n, (int) (NH * 2 * HD));
+                auto q_chain = [&](cudaStream_t ns) -> bool {
+                    if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                    else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
+                                                                   qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
+                    else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                     (int) (NH * 2 * HD), n, ns);
+                    if (qb) {
+                        if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
+                            native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data,
+                                                     qcur_ + tb * NH * HD, (int) (n * NH), (int) HD, (int) s.n_rot, EPS,
+                                                     rope_scaling(), pos_ + tb * NH, ns);
+                        } else {
+                            copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD, ns);
+                            norm_rope_s(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, ns);
+                        }
+                        if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, ns);   // <Hq, Hk> = <q, k>
+                    } else {
+                        for (int t = tb; t < te; ++t) {
+                            float* qc = qcur_ + t * NH * HD;
+                            if (fuse_nr) {
+                                native_qsa_rms_norm_rope(qfull_ + t * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data, qc,
+                                                         (int) NH, (int) HD, (int) s.n_rot, EPS, rope_scaling(), pos_ + t * NH, ns);
+                            } else {
+                                if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
+                                                      (size_t) HD * 4, (size_t) NH, cudaMemcpyDeviceToDevice, ns) != cudaSuccess) {
+                                    err = "verify: the q/gate split failed";
+                                    return false;
+                                }
+                                norm_rope_s(qc, wqn, (int) NH, (int) HD, pos_ + t * NH, ns);
+                            }
+                            if (st.kv_rot) fwht256_inplace_cuda(qc, NH, ns);   // <Hq, Hk> = <q, k>
+                        }
+                    }
+                    return true;
+                };
+                if (sidem) {
+                    if (!branch(mfork_, cs, side_, "fork")) return false;
+                    idx_key(side_);
+                    idx_snap(side_);
+                    idx_append(side_);
+                    idx_query(side_);
+                    idx_select(side_);
+                    if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the indexer's branch could not join"; return false; }
+                }
+                if (side_proj) {   // the queries beside the keys and values (fork b063c13)
+                    if (q_il && !il_ready && n >= 2) {   // the copy before the fork (mm(wk) / mm(wv) on cs reuse it)
+                        strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, n, cs);
+                        il_ready = true;
+                    }
+                    if (!branch(pfork_, cs, side2_, "fork") || !q_chain(side2_)) return false;
+                    if (cudaEventRecord(pjoin_, side2_) != cudaSuccess) { err = "verify: the queries' branch could not join"; return false; }
+                }
+                if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
                 native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
@@ -1117,13 +3479,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 }
                 stamp(l, 8, grp);
-                if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
-                    for (int t = tb; t < te; ++t)
-                        if (t == tb || brow_[t] != brow_[t - 1])
-                            copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
-                                             slot_ss(t).qsa_states[qi].idx_tail, TS, cs);
-                } else
-                if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                if (!sidem) idx_snap(cs);
                 // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token (a
                 // batch's rows each have their own K/V, so that case keeps the loop)
                 if (dec_batch && !g_no_batch_kv && !batch_rec_) {
@@ -1166,21 +3522,9 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                         kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
                                        vcur_ + t * NKV * HD, s, cs, &st.host);
                 }
-                if (dec_batch && !g_no_batch_kv && !batch_rec_) {
-                    const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                    native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
-                                                    n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                    rope_scaling(), cs);
-                } else {
-                    for (int t = tb; t < te; ++t) {
-                        const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                        native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                                  (const float*) wikn->data, EPS, ib, s, sx.max_cells,
-                                                  rope_scaling(), cs);
-                    }
-                }
+                if (!sidem) idx_append(cs);
                 stamp(l, 9, grp);
+<<<<<<< sycl
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
                 if (qb) {
@@ -1241,8 +3585,123 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                     norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
                 }
                 }
+||||||| base
+                if (qbr) {
+                    join(1);   // the indexer query, for the block scores
+                } else {
+                mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                if (qb) {
+                    if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
+                        native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data,
+                                                 qcur_ + tb * NH * HD, (int) (n * NH), (int) HD, (int) s.n_rot, EPS,
+                                                 rope_scaling(), pos_ + tb * NH, cs);
+                    } else {
+                    // the q/gate split as a copy kernel: the window's chain stays kernel to kernel (PDL)
+                    copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD, cs);
+                    norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
+                    }
+                    if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
+                                              N, IQ * ID, n, cs);
+                    norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
+                } else {
+                for (int t = tb; t < te; ++t) {
+                    float* qc = qcur_ + t * NH * HD;
+                    if (fuse_nr) {
+                        native_qsa_rms_norm_rope(qfull_ + t * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data, qc,
+                                                 (int) NH, (int) HD, (int) s.n_rot, EPS, rope_scaling(), pos_ + t * NH, cs);
+                    } else {
+                    if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
+                                          (size_t) HD * 4, (size_t) NH, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                        err = "verify: the q/gate split failed";
+                        return false;
+                    }
+                    norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
+                    }
+                    if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
+                }
+                for (int t = tb; t < te; ++t) {
+                    float* qx = qidx_ + t * IQ * ID;
+                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
+                    norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
+                }
+                }
+                }
+=======
+                if (qbr) {
+                    join(1);   // the indexer query, for the block scores
+                } else {
+                    if (!side_proj && !q_chain(cs)) return false;
+                    if (!sidem) idx_query(cs);
+                }
+>>>>>>> ours-now
                 stamp(l, 10, grp);
-                if (batch_rec_) {   // each row selects and attends over its own slot's K/V
+                bool streamed = false;   // a streamed KV cache keeps the per-row resolve-then-attend order
+                if (batch_rec_ && g_qsa_slots)
+                    for (int t = tb; t < te; ++t) streamed = streamed || slot_ss(t).qsa_states[qi].kv_mode == 1;
+                // STRATA_BATCH_ATTN_ROWS=1: the window's rows in ONE launch per step - scores with each row's
+                // own indexer keys, the top-k over all rows (row-independent), attention with each row's own pools -
+                // instead of 3-4 one-row launches per row; the same per-row arithmetic.  Not with KV streaming
+                // (qsa_kv_resolve has work per slot then).
+                static const bool attn_rows = [] {
+                    const char* v = std::getenv("STRATA_BATCH_ATTN_ROWS");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
+                for (int t = tb; rows_ok && t < te; ++t) rows_ok = slot_ss(t).qsa_states[qi].kv_mode != 1;
+                if (rows_ok) {
+                    const int n_rows = te - tb;
+                    strata::kernels::QsaScoreRows sr;
+                    strata::kernels::QsaAttnPoolsRows pr;
+                    sr.n = pr.n = n_rows;
+                    for (int t = tb; t < te; ++t) {
+                        const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        sr.pooled[t - tb] = sx.idx_pooled;
+                        sr.dead[t - tb] = sx.idx_dead;
+                        pr.p[t - tb] = qsa_attn_pools(sx);
+                    }
+                    qsa_block_scores_rows(sr, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n_rows, max_blocks_, s,
+                                          scores_ + (size_t) tb * max_blocks_, cs);
+                    qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n_rows, max_blocks_, cap_,
+                                   s, sel_ + (size_t) tb * cap_, cs);
+                    qsa_decode_attn_batch_rows(qcur_ + tb * NH * HD, pr, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount,
+                                               cap_, s, attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                                               attn_ + tb * NH * HD, n_rows, cs);
+                } else
+                if (batch_rec_ && g_qsa_slots && !streamed) {
+                    // the rows' block scores, top-k and attention, up to 8 rows per launch.  The rows only read
+                    // their slots' keys and K/V here and write their own scores/sel/scratch/attn rows, so running
+                    // each step for all rows before the next is the per-row loop's result
+                    for (int t0 = tb; t0 < te; t0 += kQsaAttnMaxSlots) {
+                        const int m = std::min(te - t0, kQsaAttnMaxSlots);
+                        const float* pooled[kQsaAttnMaxSlots];
+                        const float* dead[kQsaAttnMaxSlots];
+                        QsaAttnSlotPools px;
+                        for (int i = 0; i < m; ++i) {
+                            const QsaState& sx = slot_ss(t0 + i).qsa_states[qi];
+                            pooled[i] = sx.idx_pooled;
+                            dead[i] = sx.idx_dead;
+                            px.p[i] = qsa_attn_pools(sx);
+                        }
+                        // a launcher that would not run the per-row call's kernel launches nothing: per-row calls
+                        if (!qsa_block_scores_slots(pooled, dead, qidx_ + t0 * IQ * ID, step_ + t0 * kStepCount, m,
+                                                    max_blocks_, s, scores_ + (size_t) t0 * max_blocks_, cs))
+                            for (int t = t0; t < t0 + m; ++t)
+                                qsa_block_scores(pooled[t - t0], dead[t - t0], qidx_ + t * IQ * ID, step_ + t * kStepCount,
+                                                 1, max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
+                        qsa_block_topk(scores_ + (size_t) t0 * max_blocks_, step_ + t0 * kStepCount, m, max_blocks_,
+                                       cap_, s, sel_ + (size_t) t0 * cap_, cs);
+                        if (!qsa_decode_attn_slots(qcur_ + t0 * NH * HD, px, sel_ + (size_t) t0 * cap_,
+                                                   step_ + t0 * kStepCount, cap_, s,
+                                                   attn_scratch_ + (size_t) t0 * attn_scratch_floats_,
+                                                   attn_ + t0 * NH * HD, m, cs))
+                            for (int t = t0; t < t0 + m; ++t)
+                                qsa_decode_attn_batch(qcur_ + t * NH * HD, px.p[t - t0], sel_ + (size_t) t * cap_,
+                                                      step_ + t * kStepCount, cap_, s,
+                                                      attn_scratch_ + (size_t) t * attn_scratch_floats_,
+                                                      attn_ + t * NH * HD, 1, cs);
+                    }
+                } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
                         qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
@@ -1256,15 +3715,26 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                                               attn_ + t * NH * HD, 1, cs);
                     }
                 } else {
-                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
-                                 s, scores_ + (size_t) tb * max_blocks_, cs);
-                qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
-                               sel_ + (size_t) tb * cap_, cs);
+                if (!sidem) idx_select(cs);
+                else if (cudaStreamWaitEvent(cs, mjoin_, 0) != cudaSuccess) {
+                    err = "verify: the indexer's branch could not join";
+                    return false;
+                }
+                if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
+                    err = "verify: the queries' branch could not join";
+                    return false;
+                }
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
+                // STRATA_QSA_SPLIT_ATTN=1: the split tensor-core attention where it applies (int8 KV, sm_80+)
+                static const bool split_attn = [] { const char* v = std::getenv("STRATA_QSA_SPLIT_ATTN"); return v != nullptr && std::atoi(v) != 0; }();
+                if (!(split_attn && qsa_decode_attn_split(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_,
+                                                          step_ + tb * kStepCount, cap_, s,
+                                                          attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                                                          (uint64_t) n * (uint64_t) attn_scratch_floats_, attn_ + tb * NH * HD, n, cs)))
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
@@ -1281,15 +3751,43 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
                 }
                 stamp(l, 14, grp);
+<<<<<<< sycl
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
+||||||| base
+                native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
+                il_ready = false;
+                mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+=======
+                quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
+                mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+>>>>>>> ours-now
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
             return false;
         }
         stamp(l, 16, grp);
+        if (!stage_mark(cs, is_qsa_layer(g, l) ? kStAttn : kStGdn, err)) return false;
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
+        if (latent_) {   // latent-experts branch: the D stage for this group's rows, before the router and the doorbell
+            // not ported yet: these fail loudly instead of running wrong
+            if (G != 1 || lb_ != 0 || device_plan_ || ar_on() || remote_opt_ != nullptr || m_bal_ != nullptr) {
+                err = "verify: a latent pack runs in single-group windows on one GPU without the device plan, the all-resident plan, helper GPUs or the PCIe balance (not ported yet)";
+                return false;
+            }
+            const size_t xrow = (size_t) (N / 32) * 36, xlrow = (size_t) (lat_ELL_ / 32) * 36;
+            quantize_q8_1_rows(mixed_ + (size_t) tb * N, n, (int) N, lat_xq_ + (size_t) tb * xrow, cs);
+            iq_mmvq(lat_fmt_ == 4 ? 2 : 8, lat_d_ + (size_t) l * lat_d_layer_, lat_xq_ + (size_t) tb * xrow,
+                    lat_xl_ + (size_t) tb * lat_G_ * lat_ELL_, (int) N, (int) (lat_G_ * lat_ELL_), n, cs);   // Q8_0 / Q4_0 D, one latent vector per group
+            quantize_q8_1_rows(lat_xl_ + (size_t) tb * lat_G_ * lat_ELL_, n * lat_G_, (int) lat_ELL_, lat_xlq_ + (size_t) tb * lat_G_ * xlrow, cs);
+            // the D rows to the host for the CPU pool, then the doorbell (one stream: the copy has landed when the word is written)
+            cudaMemcpyAsync(m_latxl_ + (size_t) tb * lat_G_ * lat_ELL_, lat_xl_ + (size_t) tb * lat_G_ * lat_ELL_,
+                            (size_t) n * lat_G_ * lat_ELL_ * sizeof(float), cudaMemcpyDeviceToHost, cs);
+            doorbell_publish_value(nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr, m_xlseq_, (uint32_t) (l - lb_) + 1, cs);
+        }
+        stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
+        if (!stage_mark(cs, kStFfn, err)) return false;
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
         static const bool sh_fork_late_env = [] {
@@ -1300,10 +3798,164 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                              sh_cs_ != &dpct::get_in_order_queue() &&
                              ev_fork_ != nullptr && ev_join_ != nullptr;
         const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
-        dpct::queue_ptr sh_stream = sh_fork ? sh_cs_ : cs;
+        cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
+        cudaEvent_t sh_fk = nullptr;   // STRATA_DECODE_STAGE_TIMERS: the fork's boundary on cs (paired with the shared stream's end)
         if (sh_fork && !sh_fork_late) {
+<<<<<<< sycl
             dpct::sync_barrier(ev_fork_, cs);
             (sh_cs_)->ext_oneapi_submit_barrier({*ev_fork_});
+||||||| base
+            cudaEventRecord(ev_fork_, cs);
+            cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+=======
+            cudaEventRecord(ev_fork_, cs);
+            cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+            if (stage_cur_ != nullptr && (sh_fk = stage_event(cs, err)) == nullptr) return false;
+        }
+        // STRATA_RING_GPU: the look-ahead as a graph node.  Layers l+1 and l+2's routers on THIS layer's MoE input (the residual stream
+        // changes little from one layer to the next), their top-10 into host-mapped memory before the doorbell below.
+        // STRATA_LOOKAHEAD_GPU_STREAM=1 (opt-in; default off: the node on cs).  20 Oct A/B: router stage 4.21 -> 3.55 ms, read wait
+        // unchanged (9.30 / 9.29: the hints keep their lead time), but cpu-wait +0.5 ms and decode 52.2 / 52.3, 40.1 / 40.0 tok/s:
+        // neutral - decode waits on the CPU miss path, so GPU time saved before the doorbell becomes cpu-wait.  The node runs on its own stream la_cs_, forked
+        // here, after gr_read_group(1) has completed mixed_ and before cs's router, so it runs beside the router and is done about
+        // when it was on cs, before the doorbell.  It joins back into cs only at the window's end (after the layer loop).
+        // STRATA_LOOKAHEAD_GPU_FORK=1 (opt-in; the node on the shared stream sh_cs_, after its fork): the shared stream forks after
+        // the doorbell by default, so the hints land later (20 Oct A/B: read wait 9.0 -> 11.4 ms, decode 52.1 -> 51.5 tok/s).
+        // With sh_fork the node on sh_cs_ is the opt-in path; with neither, the node stays on cs.
+        // The node reads only mixed_ (complete here) and writes only route_pred_logits/dev/weights, which nothing else touches.
+        // Host reads of route_pred_host(): each slot is one int32 stored by a single 32-bit kernel store, so the host never sees a
+        // torn id; a reader may see the old or the new value of a slot, each a valid expert id or -1, and the readers range-check both.
+        // A table that lands later on another stream only makes a hint later.
+        static const bool la_gpu_fork_env = [] {
+            const char* e = std::getenv("STRATA_LOOKAHEAD_GPU_FORK");
+            return e != nullptr && e[0] == '1';
+        }();
+        static const bool la_gpu_stream_env = [] {
+            const char* e = std::getenv("STRATA_LOOKAHEAD_GPU_STREAM");
+            return e != nullptr && e[0] == '1';
+        }();
+        // (route_pred_logits is null on a GPU other than the scratch's - a layer split's later stage: no look-ahead node there)
+        const bool la_gpu = strata::kernels::route_pred_active() && strata::kernels::route_pred_logits() != nullptr && n <= 8 &&
+                            NE == 512 && K == 10 && native_router_enabled();
+        const bool la_on_sh = la_gpu && sh_fork && la_gpu_fork_env && !la_learn_win;
+#if !defined(STRATA_USE_HIP)
+        const bool la_on_stream = la_gpu && !la_gpu_fork_env && la_gpu_stream_env && la_cs_ != nullptr && ev_la_fork_ != nullptr &&
+                                  ev_la_read_done_ != nullptr && ev_la_done_ != nullptr && !la_learn_win;
+#else
+        const bool la_on_stream = false;   // HIP: the node stays on cs (the shared stream's cross-stream cost, as sh_stream_on)
+#endif
+        static const bool la_edge_skip = [] { const char* e = std::getenv("STRATA_LA_EDGE_SKIP"); return e != nullptr && std::atoi(e) != 0; }();
+        static const int la_tail_read_v = strata::core::la_tail_read_level();
+        static const bool la_tail_read = la_tail_read_v != 0;   // =2: ranks below lo take the predicted stand-in test too
+        auto lookahead_node = [&](cudaStream_t s) -> bool {
+            try {
+                // STRATA_MTP_LA: in a learning window, the drafter's plain router on the source layer's input, then the learner's forward (once
+                // per window: this layer only, before the dists)
+                if (la_learn_win && l == mtp_src_ && mtp_gate_ != nullptr && strata::kernels::la_mtp_active()) {
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, mtp_gate_, strata::kernels::la_mtp_route(), 512, N, 512, n, s);
+                    strata::kernels::la_mtp_forward(mixed_ + tb * N, n, s);
+                }
+                // dist 4 (STRATA_LA_LEARN=1 only, after dists 1 and 2: the nearest deadline first in the warm loop); without the learner, dists 1 and 2
+                static constexpr int kLookDist[3] = {1, 2, 4};
+                const int n_look = la_learn_env_on() ? 3 : 2;
+                // SPEC-router-fuse step 1 (STRATA_ROUTER_FUSE=0 or STRATA_ROUTER_FUSE_LA=0: off): the dists' router GEMVs in ONE launch
+                // (bf16_gemv_fp32_mmvf_multi3, each output bitwise its single call), the learner's forward per dist where it learns, then the
+                // post-GEMV chain of all dists in ONE launch (route_pred_select).  Off, when a predictor replaces dist 1's router (STRATA_LA_MODEL),
+                // or when the GEMV declines: the per-dist loop below, as before.
+                bool la_done = false;
+                if (la_fuse_la_on() && strata::kernels::route_pred_model_w(l + 1) == nullptr) {
+                    const uint16_t* wgt[3] = {nullptr, nullptr, nullptr};
+                    uint32_t live = 0;
+                    for (int di = 0; di < n_look; ++di) {
+                        const int dist = kLookDist[di];
+                        if (l + dist >= g.n_layers) break;
+                        const LayerView vt(wt, l + dist);
+                        const WeightRef* w_next = vt.get("ffn_gate_inp.weight");
+                        if (w_next == nullptr || w_next->kind != WeightKind::Bf16InF32) continue;
+                        wgt[di] = (const uint16_t*) w_next->data;
+                        live |= 1u << di;
+                    }
+                    if (live != 0u && strata::kernels::bf16_gemv_fp32_mmvf_multi3(mixed_ + tb * N, N, wgt, live, strata::kernels::route_pred_logits(),
+                                                                                  NE, (int64_t) 8 * NE, N, NE, n, s)) {
+                        for (int di = 0; di < n_look; ++di) {
+                            if (((live >> di) & 1u) == 0u) continue;
+                            if (la_learn_win)
+                                strata::kernels::la_learn_forward_at(l, kLookDist[di], mixed_ + tb * N, n, s,
+                                                                     strata::kernels::route_pred_logits_at(strata::kernels::route_pred_slot(kLookDist[di])));
+                        }
+                        strata::kernels::RoutePredDist pd[3];
+                        for (int di = 0; di < 3; ++di) {
+                            strata::kernels::RoutePredDist& p = pd[di];
+                            p = strata::kernels::RoutePredDist{};
+                            if (((live >> di) & 1u) == 0u) continue;
+                            const int dist = kLookDist[di];
+                            const int slot = strata::kernels::route_pred_slot(dist);
+                            p.logits = strata::kernels::route_pred_logits_at(slot);
+                            p.ids = strata::kernels::route_pred_dev(l + dist, dist);
+                            p.w = strata::kernels::route_pred_weights_at(slot);
+                            p.layer = l + dist;
+                            if (NE == 512 && K == 10 && !route_resident_cfg().win_exact)
+                                p.mask = strata::kernels::route_mask_layer(l + dist, g.n_expert);
+                            const bool mres_on = mask_resident_on();
+                            p.mres = mres_on && hits_.d_res != nullptr ? hits_.d_res + (l + dist) * g.n_expert : nullptr;
+                            p.ring = mres_on ? strata::kernels::route_ring_layer(l + dist, g.n_expert) : nullptr;
+                            p.cheap = mres_on ? strata::kernels::route_cheap_layer(l + dist, g.n_expert) : nullptr;
+                            p.res = hits_.d_res != nullptr ? hits_.d_res + (l + dist) * g.n_expert : nullptr;
+                            p.edge_on = la_edge_skip;
+                            p.tail_on = la_tail_read;
+                        }
+                        strata::kernels::route_pred_select(pd, n, la_tail_read_v == 2 ? 1 : 0, s);
+                        la_done = true;
+                    }
+                }
+                for (int di = 0; !la_done && di < n_look; ++di) {
+                    const int dist = kLookDist[di];
+                    if (l + dist >= g.n_layers) break;
+                    const LayerView vt(wt, l + dist);
+                    const WeightRef* w_next = vt.get("ffn_gate_inp.weight");
+                    if (w_next == nullptr || w_next->kind != WeightKind::Bf16InF32) continue;
+                    // STRATA_LA_MODEL: the next layer's guess from its trained predictor (on this layer's router input, as it was trained)
+                    const uint16_t* w_lam = dist == 1 ? strata::kernels::route_pred_model_w(l + 1) : nullptr;
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, w_lam != nullptr ? w_lam : (const uint16_t*) w_next->data,
+                                              strata::kernels::route_pred_logits(), NE, N, NE, n, s);
+                    if (w_lam != nullptr)
+                        strata::kernels::route_pred_bias_add(strata::kernels::route_pred_logits(), strata::kernels::route_pred_model_b(l + 1), n, s);
+                    // STRATA_LA_LEARN: the leader's slot of the learned correction replaces the guess; this window's input is kept for the training steps
+                    if (la_learn_win) strata::kernels::la_learn_forward(l, dist, mixed_ + tb * N, n, s);
+                    native_router_top10_multi(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
+                                              strata::kernels::route_pred_weights(), n, s);
+                    // STRATA_MASK: the guesses follow the target layer's mask by the router's rule (no row_shift: a prefetch, not an output)
+                    if (NE == 512 && K == 10 && !route_resident_cfg().win_exact)
+                        if (const uint8_t* mk = strata::kernels::route_mask_layer(l + dist, g.n_expert)) {
+                            // STRATA_MASK_RESIDENT: the same residency tables of the target layer, so the guesses follow the router's new rule
+                            const bool mres = mask_resident_on();
+                            strata::kernels::native_route_mask(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
+                                                               strata::kernels::route_pred_weights(), mk, n, nullptr, s, nullptr, (int) (l + dist), 0,
+                                                               mres && hits_.d_res != nullptr ? hits_.d_res + (l + dist) * g.n_expert : nullptr,
+                                                               mres ? strata::kernels::route_ring_layer(l + dist, g.n_expert) : nullptr,
+                                                               mres ? strata::kernels::route_cheap_layer(l + dist, g.n_expert) : nullptr);
+                        }
+                    // STRATA_LA_EDGE_SKIP (decode windows: this node runs only for n <= 8): a predicted rank lo-1 pick that a resident
+                    // stand-in within the edge would replace is not read ahead (its id becomes -1; route_pred_edge_skip)
+                    if (la_edge_skip && hits_.d_res != nullptr)
+                        strata::kernels::route_pred_edge_skip(strata::kernels::route_pred_logits(), strata::kernels::route_pred_dev(l + dist, dist),
+                                                              hits_.d_res + (l + dist) * g.n_expert, n, s);
+                    // STRATA_LA_TAIL_READ (opt-in): a predicted rank >= lo that the router would serve with a resident stand-in is not read
+                    // (its id becomes -1).  The window's budgets are read on the device; under the open rule the kernel returns at once.
+                    if (la_tail_read && hits_.d_res != nullptr)
+                        strata::kernels::route_pred_tail_read(hits_.d_res + (l + dist) * g.n_expert, strata::kernels::route_pred_dev(l + dist, dist), n, s,
+                                                              la_tail_read_v == 2 ? 1 : 0);
+                }
+            } catch (const std::exception& e) { err = "verify look-ahead node: " + std::string(e.what()); return false; }
+            return true;
+        };
+        if (la_on_stream) {
+            cudaEventRecord(ev_la_fork_, cs);
+            cudaStreamWaitEvent(la_cs_, ev_la_fork_, 0);
+            if (!lookahead_node(la_cs_)) return false;
+            cudaEventRecord(ev_la_read_done_, la_cs_);
+            la_stream_used = true;
+>>>>>>> ours-now
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
@@ -1312,8 +3964,23 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+<<<<<<< sycl
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && (NE == 512 || NE == 256) && K == 10) {
             try {   // SYCL port: the fused multi-token router for 256 experts as well (it was 512-only)
+||||||| base
+        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+            try {
+=======
+        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && fused_router_experts(NE) && K == 10) {
+            try {
+                // STRATA_ROUTER_FUSED=1: the GEMV and the top-10 in one launch (native_router.cu).  Taken only without the _aux
+                // (STRATA_LFUSE shared-gate) row, which needs the GEMV launch of its own; n <= 4 rows (shared memory).
+                if (w_sgi == nullptr && native_router_fused_on() &&
+                    native_router_fused_supported(N, NE, n, mixed_ + tb * N, N, w_router->data)) {
+                    native_router_gemv_top10_fused(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE,
+                                                   ids_ + tb * K, w_ + tb * K, N, NE, n, cs);
+                } else {
+>>>>>>> ours-now
                 if (w_sgi != nullptr)
                     sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
                                                              logits_ + tb * NE, NE, N, NE, n,
@@ -1321,7 +3988,14 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+<<<<<<< sycl
                 native_router_top10_multi_ne(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, (int) NE, cs);
+||||||| base
+                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+=======
+                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                }
+>>>>>>> ours-now
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
         } else if (dec_batch) {
@@ -1338,6 +4012,107 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
+        // the look-ahead node: on la_cs_ (above) or the shared stream (STRATA_LOOKAHEAD_GPU_FORK=1), else here on cs
+        if (la_gpu && !la_on_sh && !la_on_stream && !lookahead_node(cs)) return false;
+        // SPEC-router-fuse step 2 (STRATA_ROUTER_FUSE_POST=0 or STRATA_ROUTER_FUSE=0: off): the layer's mask, its stand-in stage and the learner's
+        // label are one launch (native_route_post, below) when the mask or the stand-ins are on; the label is copied there, after route_prior
+        // (which writes ids and weights, not the logits).  Otherwise the separate calls, as before.
+        const strata::kernels::SubfitRoute sub_r = subfit_route_(l, (int) tb);   // SPEC-substitute-fit stage 2 (all null: off)
+        const bool own_mask_on = NE == 512 && K == 10 && !route_resident_cfg().win_exact && strata::kernels::route_mask_layer(l, g.n_expert) != nullptr;
+        const bool own_res_on = route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr;
+        const bool post_own = router_post_on() && NE == 512 && (own_mask_on || own_res_on);   // (NE != 512: the separate calls below)
+        float* const lab_dev = post_own && la_learn_win ? strata::kernels::la_learn_label_dev(l, n) : nullptr;
+        // STRATA_LA_LEARN: this layer's router logits are the label of this window's batch (copied here; the batch runs after the window)
+        if (la_learn_win && lab_dev == nullptr) {
+            try {
+                strata::kernels::la_learn_label(l, logits_ + tb * NE, n, cs);
+            } catch (const std::exception& e) { err = "verify look-ahead learner: " + std::string(e.what()); return false; }
+        }
+        // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
+        // resident experts; the weights stay the router's (route_prior.cu)
+        // STRATA_SUBFIT_LOG (opt-in): row 0's router picks before route-resident (the probe's "not replaced" test compares against them)
+        if (sp_on_ && lrn_gate_ != nullptr && tb == 0)
+            strata::kernels::subfit_probe_pre(ids_, lrn_rec_, lrn_gate_, (int) l, K, sp_.pre, sp_.clean, sp_.flag, cs);
+        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
+        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
+            route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+        if (post_own) {
+            try {
+                strata::kernels::RoutePostArgs pa{};
+                pa.logits = logits_ + tb * NE; pa.ids = ids_ + tb * K; pa.weights = w_ + tb * K;
+                pa.n_tok = (int) n; pa.layer = (int) l; pa.row_base = (int) tb;
+                pa.mask = own_mask_on ? strata::kernels::route_mask_layer(l, g.n_expert) : nullptr;
+                const bool mres = mask_resident_on();   // STRATA_MASK_RESIDENT: this layer's residency tables (the rule's `cheap`)
+                pa.mev = n <= 8 ? mev_ : nullptr;
+                pa.mres = mres && hits_.d_res != nullptr ? hits_.d_res + l * g.n_expert : nullptr;
+                pa.mring = mres ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr;
+                pa.mcheap = mres ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr;
+                pa.row_shift = n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr;
+                pa.res = own_res_on ? hits_.d_res + l * g.n_expert : nullptr;
+                pa.rstats = rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr;
+                pa.want = n <= 8 && !strata::kernels::route_rows_active() ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr;
+                pa.rows = n <= 8 ? strata::kernels::route_rows_layer(l) : nullptr;
+                pa.repl = n <= 8 ? strata::kernels::route_repl_layer(l, g.n_expert) : nullptr;
+                pa.rring = n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr;
+                pa.rcheap = n <= 8 ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr;
+                pa.bstats = rr_stats_ != nullptr ? rr_stats_ + 9 : nullptr;
+                pa.pair_c = lrn_c_ != nullptr && !standin_learn_observe_env() ? lrn_c_ + (size_t) l * 512 * 512 : nullptr;
+                pa.lrn_rec = lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr;
+                pa.sub = &sub_r;
+                pa.pair_pe = lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr;
+                pa.label = lab_dev;
+                strata::kernels::native_route_post(pa, cs);
+            } catch (const std::exception& e) { err = "verify route-post: " + std::string(e.what()); return false; }
+        }
+        // STRATA_MASK (opt-in, changes the output): the layer's masked picks move before the stand-ins see them; each move adds its w x gap to
+        // the row's row_shift (the flip re-check's risk).  The flip re-check's exact re-run (win_exact) runs unmasked.
+        if (!post_own) {
+        if (NE == 512 && K == 10 && !route_resident_cfg().win_exact) {
+            if (const uint8_t* mk = strata::kernels::route_mask_layer(l, g.n_expert)) {
+                try {
+                    // STRATA_MASK_RESIDENT: this layer's residency tables (the rule's `cheap`); none when it is off (the old rule)
+                    const bool mres = mask_resident_on();
+                    strata::kernels::native_route_mask(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, mk, n,
+                                                       n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr, cs,
+                                                       n <= 8 ? mev_ : nullptr, (int) l, (int) tb,   // (STRATA_MASK=learn: the list)
+                                                       mres && hits_.d_res != nullptr ? hits_.d_res + l * g.n_expert : nullptr,
+                                                       mres ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr,
+                                                       mres ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr, &sub_r);
+                } catch (const std::exception& e) { err = "verify mask: " + std::string(e.what()); return false; }
+            }
+        }
+        if (route_resident_cfg().margin > 0.0f && NE <= 512 && K == 10 && hits_.d_res != nullptr) {   // any expert count up to 512 (RouteCfg::ne)
+            // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
+            try {
+                native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
+                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs,
+                                      n <= 8 && !strata::kernels::route_rows_active() ? strata::kernels::route_want_layer(l, g.n_expert) : nullptr,
+                                      n <= 8 ? strata::kernels::route_rows_layer(l) : nullptr,
+                                      n <= 8 ? strata::kernels::route_repl_layer(l, g.n_expert) : nullptr,
+                                      n <= 8 ? strata::kernels::route_ring_layer(l, g.n_expert) : nullptr,
+                                      n <= 8 ? strata::kernels::route_cheap_layer(l, g.n_expert) : nullptr,
+                                      rr_stats_ != nullptr ? rr_stats_ + 9 : nullptr,   // STRATA_ROUTE_BUDGET counters [9..11], STRATA_ROUTE_BUDGET_TAIL [12..13]
+                                      n <= 8 && row_shift_ != nullptr ? row_shift_ + tb : nullptr,   // STRATA_FRAGILE_RECHECK: this group's rows
+                                      lrn_c_ != nullptr && !standin_learn_observe_env() ? lrn_c_ + (size_t) l * 512 * 512 : nullptr,   // STRATA_STANDIN_LEARN: the layer's corrections (=observe: none applied)
+                                      lrn_rec_ != nullptr ? lrn_rec_ + (size_t) tb * 4 : nullptr, (int) l,
+                                      lrn_pe_ != nullptr ? lrn_pe_ + (size_t) l * 512 * 512 : nullptr,
+                                      n <= 8 ? mev_ : nullptr, (int) tb, nullptr, &sub_r);   // (STRATA_MASK=learn: this layer's replaced picks, by row; SPEC-substitute-fit: sub_r)
+            } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
+        }
+        }   // !post_own
+        // STRATA_SUBFIT_LOG (opt-in): the stand-in rows' layer input; row 0's probe flags, weights and input after route-resident
+        if ((sp_on_ || x_on_) && lrn_gate_ != nullptr) {   // (x_on_ alone: the layer input only, for the learner)
+            strata::kernels::subfit_capture_x(mixed_ + (size_t) tb * N, lrn_rec_ + (size_t) tb * 4, lrn_gate_, (int) l,
+                                              lrn_x_ + (size_t) tb * N, N, n, cs);
+        }
+        if (shd_on_ && lrn_gate_ != nullptr && tb == 0)   // shadow samples: row 0's picks and input (device-gated: gate[3] == 2)
+            strata::kernels::subfit_shadow_xi(ids_, mixed_, lrn_gate_, (int) l, (int) K, N, shd_ids_, shd_x_, cs);
+        if (sp_on_ && lrn_gate_ != nullptr) {
+            if (tb == 0 && hits_.d_res != nullptr)
+                strata::kernels::subfit_probe_post(ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, sp_.pre, sp_.clean, lrn_gate_,
+                                                   mixed_ + (size_t) tb * N, (int) l, K, N, sp_.x, sp_.w, sp_.flag, cs);
+        }
+        if (!stage_mark(cs, kStRouter, err)) return false;
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1361,15 +4136,28 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
             else if (!lean) {   // (lean: nobody reads the doorbell)
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
+                // the routing weights go with the ids (k floats): STRATA_TAIL_WEIGHT and the live per-layer thresholds read them on the host.  Until 24 Nov this publish left them
+                // out, so h_w_ stayed zero and the weight rule skipped every missed tail expert whatever its weight.
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
-                                     m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
+                                     m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs, w_ + tb * K, m_w_ + tb * K);
             }
             if (sh_fork_late) {
+<<<<<<< sycl
                 dpct::sync_barrier(ev_fork_, cs);
                 (sh_cs_)->ext_oneapi_submit_barrier({*ev_fork_});
+||||||| base
+                cudaEventRecord(ev_fork_, cs);
+                cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+=======
+                cudaEventRecord(ev_fork_, cs);
+                cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+                if (stage_cur_ != nullptr && (sh_fk = stage_event(cs, err)) == nullptr) return false;
+>>>>>>> ours-now
             }
             if (step_hook_ && !step_hook_(l, grp)) { if (err.empty()) err = "verify: stepped serve failed"; return false; }
         }
+        if (!stage_mark(cs, kStDoor, err)) return false;
+        if (!stage_mark(cs, kStOther, err)) return false;   // what came after the doorbell before the shared expert's stamp
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
         {
@@ -1384,11 +4172,20 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
+            // STRATA_LOOKAHEAD_GPU_FORK: the look-ahead node first on the shared stream (after the fork, before ev_join_)
+            if (la_on_sh && !lookahead_node(sh_stream)) return false;
             // STRATA_VERIFY_QDEDUP=1 (not with the forked shared-expert stream, which quantizes into its own buffer): the
             // experts' q8_1 image of xm is made first and the shared expert's gate/up read it (quantize_q8_1_rows and
             // native_quantize_q8_1 write the same bytes)
-            qdedup = g_qdedup() && !sh_fork && strata::kernels::cpu::expert_layout().native;
-            if (qdedup && !q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            // With the forked shared stream (sh_fork): the experts' quantize goes on cs first, and sh_cs_ waits on an event
+            // recorded after it, so the shared expert reads the same image (q8_ffn keeps the old path: no qdedup with sh_fork)
+            const bool sh_q8_first = sh_fork && g_qdedup() && strata::kernels::cpu::expert_layout().native && !q8_ffn;
+            qdedup = sh_q8_first || (g_qdedup() && !sh_fork && strata::kernels::cpu::expert_layout().native);
+            if (sh_q8_first) {
+                quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                cudaEventRecord(ev_q8_, cs);
+                cudaStreamWaitEvent(sh_stream, ev_q8_, 0);
+            } else if (qdedup && !q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
             if (!shared_expert_native_bf16_enabled()) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
@@ -1403,7 +4200,18 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
             }
+<<<<<<< sycl
             if (sh_fork) dpct::sync_barrier(ev_join_, sh_cs_);
+||||||| base
+            if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
+=======
+            if (sh_fk != nullptr) {   // the shared stream's end, paired with its fork (not in the cs chain)
+                cudaEvent_t sh_end = stage_event(sh_cs_, err);   // before ev_join_: the join back to cs covers this node
+                if (sh_end == nullptr) return false;
+                stage_cur_->shared.push_back({sh_fk, sh_end});
+            }
+            if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
+>>>>>>> ours-now
         }
         if (strata::kernels::cpu::expert_layout().native) {
             if (!qdedup)
@@ -1411,6 +4219,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         stamp(l, 18, grp);
+        if (!stage_mark(cs, kStShared, err)) return false;   // the cs side of the shared expert (its stream: the pair above)
         return true;
     };
 
@@ -1451,26 +4260,109 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
             }
         };
+        bool hits_in_combine = false;
+        if (latent_) {
+            // latent-experts branch: the experts at the latent width.  D ran in `pre` (xlq = the q8_1 rows of xl, row token*G + group).  Here: the GPU's
+            // share (the VRAM groups, the PCIe groups) as A, the CPU pool's A rows merged in, then U for every route into `parts_out`, which
+            // the combine reads as it reads any expert rows - so none of the old hit-add or CPU-row paths below applies.
+            wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
+            copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+            if (!stage_mark(cs, kStPlan, err)) return false;
+            stamp(l, 19, grp);
+            strata::kernels::latent_plan_rows(const_cast<int32_t*>(p_tok), p_dst, p_counts, ids_ + (size_t) tb * K,
+                                              lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_, tb, lat_G_, (int) K, cs);
+            float* ylg = lat_yl_ + (size_t) tb * K * (size_t) lat_ELL_;
+            float* yfull = lat_yfull_ + (size_t) tb * K * (size_t) lat_ELL_;
+            const auto& LF = lay.fmt[(size_t) l];
+            const NativeExpertLayout La = native_expert_layout(LF.gu_type, LF.d_type, (int) lat_ELL_, LF.n_ff);
+            native_expert_grouped(La, p_ptr, p_start, p_counts, p_dst, p_tok, cap, cap, lat_xlq_, hit_scratch_, ylg, cs, 0);   // the VRAM groups
+            stamp(l, 20, grp);
+            if (!stage_mark(cs, kStVram, err)) return false;
+            wait_flag_ge(m_flagB_, ring, cs);                  // the PCIe share is in staging (DMA) or mapped
+            if (!stage_mark(cs, kStPcieWait, err)) return false;
+            if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging (G == 1 here)
+                uint8_t* stage = staging_ + (size_t) (grp * kStagingBlobs) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) kStagingBlobs, cs);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            }
+            stamp(l, 21, grp);
+            native_expert_grouped(La, p_ptr2, p_start2, p_counts + 2, p_dst, p_tok, cap, cap, lat_xlq_, hit_scratch_, ylg, cs, kPcieGroupRows);
+            stamp(l, 22, grp);
+            if (!stage_mark(cs, kStPcieExp, err)) return false;
+            wait_flag_ge(m_flag_, ring, cs);                   // the CPU pool's A rows are in the mapped rows (latent width, stride ELL)
+            if (!stage_mark(cs, kStCpuWait, err)) return false;
+            stamp(l, 23, grp);
+            // the CPU rows into yfull (the GPU's own rows zeroed there), then the GPU's A rows added at their routes: yfull = every route's A row
+            copy_rows_from_mapped(yfull, m_ymiss_ + (size_t) tb * K * (size_t) lat_ELL_, (int64_t) n * K, lat_ELL_, p_dst, p_counts + 1, cs);
+            moe_hit_add(yfull, ylg, p_dst, p_counts + 1, cap, lat_ELL_, cs);
+            const size_t xlrow = (size_t) (lat_ELL_ / 32) * 36;
+            quantize_q8_1_rows(yfull, cap, (int) lat_ELL_, lat_uq_ + (size_t) tb * K * xlrow, cs);
+            strata::kernels::latent_u_grouped(lat_u_ + (size_t) l * lat_u_layer_, lat_uq_ + (size_t) tb * K * xlrow, ids_ + (size_t) tb * K,
+                                              lat_labels_dev_ + (size_t) l * (size_t) lat_E_, lat_E_, cap, (int) lat_ELL_, (int) N, parts_out, cs, lat_fmt_, (int) lat_G_, lat_u_packed_);
+            stamp(l, 24, grp);
+        } else
         if (ar_on()) {
+            if (!stage_mark(cs, kStPlan, err)) return false;   // no plan wait on this path: plan-wait reads ~0
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
+            if (!stage_mark(cs, kStVram, err)) return false;
         } else {
             if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
                 if (!lean) wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
                 if (!lean) copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
             } else {
-                wait_flag_ge(m_flagA_, ring, cs);                  // the pool published this group's GPU plan
+                if (fuse_wait_on() && !prof_on_ && m_bal_ == nullptr) {   // 143-amdk: one launch for the wait and the copy
+                    wait_copy_i32_from_mapped(m_flagA_, ring, pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+                } else {
+                if (m_bal_ != nullptr)   // set_pcie_balance: the GPU's share starts as the plan arrives
+                    wait_flag_ge_stamped(m_flagA_, ring, nullptr, m_bal_ + ((l - lb_) * 2 + grp) * 4, cs);
+                else
+                    wait_flag_ge(m_flagA_, ring, cs);              // the pool published this group's GPU plan
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
+            if (!stage_mark(cs, kStPlan, err)) return false;   // plan-wait: the GPU plan's flag and its copy
             stamp(l, 19, grp);
+            // STRATA_PCIE_EARLY: the PCIe share's fetch starts on pf_cs_ as soon as the plan is on the device and the host has published the
+            // share (flag B), while cs runs the VRAM groups; the join below makes the PCIe groups wait for it.  cs keeps its own (stamped)
+            // wait on flag B, so the balance's timestamps mean what they did.  The staging region is this group's, reused only by the same
+            // group of the next layer, whose fork comes after this layer's PCIe groups on cs.
+            const bool pf_early = pf_cs_ != nullptr && sink_.pcie_mode == 2 && !device_plan_ && !prof_on_;
+            if (pf_early) {
+                cudaEventRecord(ev_pf_fork_, cs);
+                cudaStreamWaitEvent(pf_cs_, ev_pf_fork_, 0);
+                wait_flag_ge(m_flagB_, ring, pf_cs_);
+                const int64_t per_e = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage_e = staging_ + (size_t) (grp * per_e) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage_e, (int64_t) lay.blob_bytes(l), (int) per_e, pf_cs_);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage_e, (int64_t) lay.blob_bytes(l), pf_cs_);
+                cudaEventRecord(ev_pf_join_, pf_cs_);
+            }
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
+<<<<<<< sycl
             // stepped mode: the plan copy + VRAM groups end a segment, so they run while the CPU computes its rows
             if (step_hook2_ && !step_hook2_(l, grp)) { if (err.empty()) err = "verify: stepped split failed"; return false; }
             if (device_plan_) { if (!lean) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs); }
+||||||| base
+            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+=======
+            if (!stage_mark(cs, kStVram, err)) return false;   // vram-experts: the resident groups
+            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+            else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
+                wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
+>>>>>>> ours-now
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+<<<<<<< sycl
             if (!lean && sink_.pcie_mode == 2) {                 // stage it with a copy kernel, then point at staging
+||||||| base
+            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+=======
+            if (!stage_mark(cs, kStPcieWait, err)) return false;   // pcie-wait: the PCIe share's flag
+            if (pf_early) {
+                cudaStreamWaitEvent(cs, ev_pf_join_, 0);           // STRATA_PCIE_EARLY: the fetch ran beside the VRAM groups
+            } else if (sink_.pcie_mode == 2) {                     // stage it with a copy kernel, then point at staging
+>>>>>>> ours-now
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
@@ -1481,12 +4373,27 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
             if (!lean) grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);   // (lean: the device plan leaves it empty)
             stamp(l, 22, grp);
+            if (!stage_mark(cs, kStPcieExp, err)) return false;   // pcie-experts: the fetch and the PCIe groups (no fetch at pcie mode 0)
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+<<<<<<< sycl
                 if (!lean) wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+||||||| base
+                wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+=======
+                wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+                if (!stage_mark(cs, kStCpuWait, err)) return false;
+>>>>>>> ours-now
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
             } else {
-                wait_flag_ge(m_flag_, ring, cs);               // the CPU's share is in the mapped rows
+                const bool fuse_rows = fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr;   // 143-amdk
+                if (!fuse_rows) {
+                    if (m_bal_ != nullptr)   // set_pcie_balance: ... and ends as it waits for the CPU's rows
+                        wait_flag_ge_stamped(m_flag_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 2, nullptr, cs);
+                    else
+                        wait_flag_ge(m_flag_, ring, cs);           // the CPU's share is in the mapped rows
+                }
+                if (!stage_mark(cs, kStCpuWait, err)) return false;   // cpu-wait: the CPU's rows (~0 when fused into the copy)
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
@@ -1496,7 +4403,12 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 else
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
-            moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
+            // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
+            // (SPEC-substitute-fit stage 2: with the apply on, the hit rows are added before the combine, so the apply reads the whole parts)
+            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 && !sub_on_ && !shd_on_ &&
+                              native_moe_combine_enabled() && n <= 8 &&
+                              native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
+            if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
@@ -1505,23 +4417,79 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             ev_join_ != nullptr) {
             cs->ext_oneapi_submit_barrier({*ev_join_});
         }
+        // STRATA_STANDIN_LEARN: the combine kernels copy the learner's y_s / y_e from the parts they already read (learn_tap.hpp).
+        // The tap is built per call's first row; the kernels' row index is the call's own.  Null when learning is off.
+        // STRATA_SUBFIT_LOG (opt-in): row 0's raw expert outputs of this layer, after the experts and their join, before the combine
+        if (sp_on_ && lrn_gate_ != nullptr && tb == 0)
+            strata::kernels::subfit_probe_y(parts_, lrn_gate_, (int64_t) K * N, sp_.y + (size_t) l * K * N, cs);
+        if (shd_on_ && lrn_gate_ != nullptr && tb == 0)   // shadow samples: row 0's raw expert outputs (device-gated: gate[3] == 2)
+            strata::kernels::subfit_shadow_y(parts_, lrn_gate_, (int) l, (int64_t) K * N, shd_y_, cs);
+        // SPEC-substitute-fit stage 2 (step 3): the substituted slots' outputs are corrected before the combine: parts = c parts + B A x.
+        // One launch per layer and group whenever the apply is on (the window graph is captured once); a layer with no fit is a no-op on device.
+        if (sub_on_ && sub_tab_.lut != nullptr) {
+            strata::kernels::SubfitApplyArgs aa;
+            aa.parts = parts_ + (size_t) tb * K * N;
+            aa.x = mixed_ + (size_t) tb * N;
+            aa.ids = ids_ + (size_t) tb * K;
+            aa.orig = sub_orig_ + (size_t) tb * K;
+            aa.flag = sub_flag_ + (size_t) tb * K;
+            aa.lut = sub_tab_.lut + (size_t) l * 512 * 512;
+            aa.A = sub_tab_.A + (size_t) l * sub_tab_.r * sub_tab_.N;
+            aa.B = sub_tab_.B;
+            aa.c = sub_tab_.c;
+            aa.nfit = sub_tab_.nfit + l;
+            aa.elut = sub_tab_.lut + (size_t) sub_tab_.layers * 512 * 512 + (size_t) l * 512;
+            aa.llut = sub_tab_.lut + (size_t) sub_tab_.layers * 512 * 512 + (size_t) sub_tab_.layers * 512 + (size_t) l;
+            aa.r = sub_tab_.r;
+            aa.N = (int) N;
+            aa.K = (int) K;
+            aa.n = n;
+            aa.mode = sub_mode_;
+            strata::kernels::subfit_apply(aa, cs);
+        }
+        const bool learn = lrn_gate_ != nullptr;
+        auto learn_tap_at = [&](int row) {
+            strata::kernels::MoeLearnTap t;
+            t.ys = lrn_ys_ + (size_t) row * N; t.ye = lrn_ye_; t.rec = lrn_rec_ + (size_t) row * 4; t.gate = lrn_gate_;
+            t.layer = (int32_t) l; t.row0 = row == 0 ? 1 : 0;
+            return t;
+        };
+        const strata::kernels::MoeLearnTap tap_grp = learn ? learn_tap_at(tb) : strata::kernels::MoeLearnTap{};
+        const strata::kernels::MoeLearnTap* tap_p = learn ? &tap_grp : nullptr;
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
-                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs, tap_p);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else
+        if (hits_in_combine) {
+            try {
+                native_moe_combine_multi_hits_added(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                                                    shared_ + tb * N, bo_ + tb * N, N, K, n, cs, tap_p);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
-                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs, tap_p);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
+            if (learn) {   // one row at a time, the same combine as moe_combine_parts with the row's tap
+                const strata::kernels::MoeLearnTap tt = learn_tap_at(t);
+                try {
+                    if (native_moe_combine_enabled())
+                        strata::kernels::native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, bo_ + t * N, g.n_embd, K, cs, &tt);
+                    else
+                        strata::kernels::moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, bo_ + t * N, g.n_embd, K, cs, &tt);
+                } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+                continue;
+            }
             MoEBuffers mb = ss.moe;
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
+        if (!stage_mark(cs, kStRows, err)) return false;   // rows+combine: the copy, the hit add, the shared join, the combine
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
@@ -1532,22 +4500,53 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
         }
+        if (!stage_mark(cs, kStHcWrite, err)) return false;   // hc-write: the gr_write (or the cvec apply) that follows the combine
         return true;
     };
 
+    if (!stage_mark(cs, kStOther, err)) return false;   // the window's start (marks[0]: no time of its own)
     for (int grp = 0; grp < G; ++grp)
         if (!pre(lb_, grp)) return false;
     for (int64_t l = lb_; l < le_; ++l)
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
+<<<<<<< sycl
             if (dbgR_ && grp == 0) {   // recorded into the window graph as memcpy nodes
                 cs->memcpy(dbgR_ + (size_t) l * N, Rt(0), (size_t) N * 4);
                 cs->memcpy(dbgM_ + (size_t) l * N, mixed_, (size_t) N * 4);
             }
+||||||| base
+=======
+            // STRATA_DRAFT_TRACE: this group's rows of the residual after layer l (single-sequence windows; read once the window is done)
+            if (dtr_ != nullptr && !batch_rec_)
+                if (const int slot = draft_trace_slot(l); slot >= 0 &&
+                    cudaMemcpyAsync(dtr_ + ((size_t) slot * MT + tb_[grp]) * HC * N, Rt(tb_[grp]),
+                                    (size_t) (te_[grp] - tb_[grp]) * HC * N * sizeof(float), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                    err = "verify: the draft trace's copy failed";
+                    return false;
+                }
+>>>>>>> ours-now
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
         }
+    // STRATA_LOOKAHEAD_GPU_STREAM: the look-ahead stream joins back into cs once per window, after the last layer's node.
+    // Before the layer-split return too: graph capture needs every forked stream joined to the origin stream.
+    if (la_stream_used) {
+        cudaEventRecord(ev_la_done_, la_cs_);
+        cudaStreamWaitEvent(cs, ev_la_done_, 0);
+    }
+    // STRATA_LA_LEARN: the window's decisions (the leader, the freeze, a reset) are device code, after the last layer's training
+    if (la_learn_win) {
+        try {
+            strata::kernels::la_learn_window_end(cs);
+        } catch (const std::exception& e) { err = "verify look-ahead learner: " + std::string(e.what()); return false; }
+    }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
+        if (hflag_out_d_ != nullptr && !batch_rec_) {   // the overlapped split: payload + the next stage's flag
+            handoff_publish(hout, R_, (int64_t) T * HC * N, bo_, (int64_t) T * N, inj2_, (int64_t) T * HC, hcount_d_,
+                            hflag_out_d_, cs, g_test_drop > 0 ? hdrop_d_ : nullptr);   // the test word only with the hook on
+            return true;
+        }
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);
         copy_from_mapped(hout + (size_t) T * HC * N, bo_, (int64_t) T * N, cs);
         copy_from_mapped(hout + (size_t) T * (HC + 1) * N, inj2_, (int64_t) T * HC, cs);
@@ -1640,7 +4639,12 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             sp.temperature = 0.0f;
             sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
         }
+        // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
+        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        // STRATA_ROUTE_BUDGET_DYN: each row's top-1 minus top-2 raw logit (read by route_budget_after, after the window's sync)
+        if ((route_resident_cfg().dyn_on || route_resident_cfg().fragile_on) && dyn_gap_ != nullptr) strata::kernels::logits_margin_rows(head_logits_, T, (int) n_vocab_, dyn_gap_, dyn_top1_, cs);
     }
+    if (!stage_mark(cs, kStOther, err)) return false;   // the head
     stamp(g.n_layers, 1, 0);
     return true;
 }
@@ -1744,16 +4748,41 @@ bool Verifier::capture(int T, std::string &err) try {
     dpct::experimental::command_graph_exec_ptr &exec_t =
         ar_off_ ? exec_nr_[T] : exec_[T];
     if (exec_t != nullptr) return true;
+<<<<<<< sycl
     if (std::getenv("STRATA_VERIFY_EAGER") != nullptr) return true;   // SYCL port: no graph, run() replays the body
     if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
+||||||| base
+    {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
+            std::fprintf(stderr, "strata verify: capturing the %d-token window (%zu MiB of VRAM free)\n", T, free_b >> 20);
+        else
+            (void) cudaGetLastError();
+    }
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+=======
+    {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
+            std::fprintf(stderr, "strata verify: capturing the %d-token window (%zu MiB of VRAM free)\n", T, free_b >> 20);
+        else
+            (void) cudaGetLastError();
+    }
+    // STRATA_DECODE_STAGE_TIMERS: the stage events are created before the capture starts (its thread-local mode)
+    const int stage_key = T * 2 + (ar_off_ ? 1 : 0);
+    const bool stage_on = g_stage_timers();
+    if (stage_on) stage_prepare(stage_key, g_->n_layers);
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+>>>>>>> ours-now
         err = "verify: begin capture failed";
         return false;
     }
     std::string rerr;
+    stage_cur_ = stage_on ? &stage_chains_[stage_key] : nullptr;
     const bool ok = record_window(T, cs_, rerr);
-    dpct::experimental::command_graph_ptr graph = nullptr;
-    const dpct::err0 ce =
-        DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs_, &graph));
+    stage_cur_ = nullptr;
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
         if (graph) delete (graph);
         err = rerr;
@@ -1950,7 +4979,17 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_xlseq_ != nullptr) {   // latent-experts branch: the D stage's doorbell restarts with the window, and the CPU pool finds this verifier's D rows
+        *(volatile uint32_t*) h_xlseq_ = 0;
+        strata::core::latent_xl_current() = (const uint8_t*) h_latxl_;
+        strata::core::latent_xlseq_current() = h_xlseq_;
+    }
+    // the overlapped split: the next stage's graph is launched after this, and must see THIS window's raise
+    if (hflag_out_h_ != nullptr) *(volatile uint32_t*) hflag_out_h_ = 0;
+    if (herr_h_ != nullptr) *(volatile uint32_t*) herr_h_ = 0;
+    if (hdrop_h_ != nullptr) *(volatile uint32_t*) hdrop_h_ = (g_test_drop > 0 && windows + 1 == g_test_drop) ? 1u : 0u;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
     last_t_ = T;
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
@@ -1999,21 +5038,99 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
     ++prof_windows_;
 }
 
-bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
-                   void *user, int32_t *out, std::string &err) try {
+// 0.1.43 (STRATA_ADAPT_OVERLAP): hold the host until the adaptive tier's copies up to `layer` have landed.  The wait
+// is a spin on an atomic the copy stream's host functions raise (no driver call here); 20 s is the window's own limit.
+bool Verifier::adapt_gate_wait(int32_t layer, std::string& err) {
+    const Clock::time_point t0 = Clock::now();
+    uint32_t spins = 0;
+    while (adapt_gate_->reached() < layer) {
+        _mm_pause();
+        if ((++spins & 1023u) != 0) continue;
+        if (Clock::now() - t0 > std::chrono::seconds(20)) {
+            err = "verify: the adaptive tier's copies for layer " + std::to_string(layer) + " never landed" +
+                  released_note(release_gpu_waits(5000));
+            return false;
+        }
+    }
+    ms_gate += ms_since(t0);
+    return true;
+}
+
+bool Verifier::handoff_failed(std::string& err) const {
+    if (herr_h_ == nullptr || *(const volatile uint32_t*) herr_h_ == 0) return false;
+    err = "verify: layer split: the hand-off into layer " + std::to_string(lb_) + " did not arrive within " +
+          std::to_string(g_split_wait_ns / 1000000ull) + " ms (STRATA_SPLIT_WAIT_MS); the window was not used. "
+          "STRATA_SPLIT_OVERLAP=0 runs the serial order";
+    trace_ev("HANDOFF-TIMEOUT", -1, lb_, (int64_t) (g_split_wait_ns / 1000000ull));
+    return true;
+}
+
+bool Verifier::chain_overlap() const {
+    return next_ != nullptr && hflag_out_h_ != nullptr && hflag_out_d_ != nullptr && hcount_d_ != nullptr &&
+           next_->hflag_in_h_ == hflag_out_h_ && next_->device_ != device_ && !next_->ple_stage();
+}
+
+bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+    const OnDevice on_device(device_);
+    prelaunched_ = 0;
+    cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[T] : exec_[T];   // #871: the variant the previous stage refreshed
+    if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
+    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    if (pos0 + T > ss_->qsa_states[ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    stage_inputs(T, tokens, pos0);
+    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    trace_ev("WINDOW-PRE", -1, -1, pos0 * 16 + T);
+    ms_host += ms_since(t0);
+    if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
+    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
+    // 0.1.43: the same gate run() applies before it launches (the adaptive tier's copies land first)
+    if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+        !adapt_gate_wait((int32_t) g_->n_layers, err)) return false;
+    la_learn_before_launch();
+    const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
+    if (le == cudaSuccess && !la_learn_after_launch(T, err)) return false;
+    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    prelaunched_ = T;
+    return true;
+}
+
+bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                   std::string& err) {
+#if defined(STRATA_GPU_METAL)
+    (void) pool;
+    (void) user;
+    return strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err);
+#endif
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    if (lb_ == 0) router_trace_tokens(tokens, T);   // STRATA_ROUTER_TRACE (measurement): the window's tokens beside its routing
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    refresh_ar();
+    // the overlapped split launched this stage's window already: keep the graph variant (#871) chosen for it then,
+    // or this thread would serve the window as the other variant
+    const bool pre = prelaunched_ == T;
+    prelaunched_ = 0;
+    if (!pre && pre_launch_ && !pre_launch_(cs_, err)) return false;   // (a prelaunched window's was served with the first stage's)
+    if (!pre) refresh_ar();
     if (!capture(T, err) || !capture_commit(err)) return false;
+    const bool chain = chain_overlap();
+    if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
+        const OnDevice on_next(next_->device_);
+        next_->refresh_ar();                     // #871: the variant its prelaunch and its run() will both use
+        if (!next_->capture(T, err) || !next_->capture_commit(err)) return false;
+    }
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
-    if (!staged_) stage_inputs(T, tokens, pos0);
+    if (!pre && !staged_) stage_inputs(T, tokens, pos0);
     staged_ = false;
     const bool do_ple = ss.ple.ready() && ple_stage();
     uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
@@ -2026,6 +5143,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
         }
     }
+<<<<<<< sycl
     if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
@@ -2115,7 +5233,57 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                             CPU_SET(helper_cpu, &s);
                             (void) pthread_setaffinity_np(pthread_self(), sizeof s, &s);
                         }
+||||||| base
+    if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
+    ms_host += ms_since(t0);
+    VDBG("staged; launching\n");
+    if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
+    // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
+    if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+        !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
+    static const bool threaded_launch = [] {
+        const char* value = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    HostGraphLaunch launch(ar_off_ ? exec_nr_[T] : exec_[T], cs_, device_, threaded_launch,
+                           [this] { (void) release_gpu_waits(5000); });
+    const cudaError_t le = launch.status();
+#else
+    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+=======
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    std::optional<HostGraphLaunch> launch_o;   // (not set when the previous stage launched this window already)
 #endif
+    if (!pre) {
+        if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
+        ms_host += ms_since(t0);
+        VDBG("staged; launching\n");
+        if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
+        if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
+        // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
+        if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+            !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+        la_learn_before_launch();   // STRATA_LA_LEARN: the last batch's weights are done before this window reads them
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
+        static const bool threaded_launch = [] {
+            const char* value = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
+            return value != nullptr && value[0] == '1';
+        }();
+        launch_o.emplace(ar_off_ ? exec_nr_[T] : exec_[T], cs_, device_, threaded_launch,
+                         [this] { (void) release_gpu_waits(5000); });
+        const cudaError_t le = launch_o->status();
+#else
+        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+>>>>>>> ours-now
+#endif
+<<<<<<< sycl
                         try { run_pool(); } catch (const std::exception& e) { herr = e.what(); }
                         done.store(true, std::memory_order_release);
                     });
@@ -2185,6 +5353,51 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     }
     (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
     VDBG("launched\n");
+||||||| base
+    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    (void) launch.query();
+#else
+    (void) cudaStreamQuery(cs_);
+#endif
+    VDBG("launched\n");
+=======
+        trace_ev("LAUNCHED", -1, -1, (int64_t) le);
+        if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        (void) launch_o->query();
+#else
+        (void) cudaStreamQuery(cs_);
+#endif
+        VDBG("launched\n");
+        if (!la_learn_after_launch(T, err)) return false;   // STRATA_LA_LEARN: this window's batch, on the side stream
+    }
+    // The overlapped split: the next stage's window is staged and launched on a helper thread while this thread
+    // serves this stage's layers; its graph waits on the GPU for this stage's hand-off flag.  The guard joins the
+    // helper on every return, and on an early return (an error after the launch) releases the next stage's GPU
+    // waits so no spin kernel outlives the window (#267).
+    struct NextLaunch {
+        Verifier* next = nullptr;
+        std::thread th;
+        bool ok = true;
+        bool handed = false;
+        std::string err;
+        bool join(std::string& e) {
+            if (th.joinable()) th.join();
+            if (!ok) e = err;
+            return ok;
+        }
+        ~NextLaunch() {
+            if (th.joinable()) th.join();
+            if (next != nullptr && !handed) (void) next->release_gpu_waits(5000);
+        }
+    } nl;
+    if (chain) {
+        nl.next = next_;
+        nl.th = std::thread([&nl, T, tokens, pos0] { nl.ok = nl.next->prelaunch(T, tokens, pos0, nl.err); });
+    }
+>>>>>>> ours-now
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
@@ -2203,7 +5416,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) {
-                (void) release_gpu_waits(5000);   // the window is launched and spins on *flag: let it finish, or nothing ever will
+                (void) release_gpu_waits(5000);   // the graph is launched and spins on *flag: let it finish, or nothing ever will
                 return false;
             }
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2279,9 +5492,11 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         }
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
+        strata::core::expert_dispatch_set_weights(h_w_ + (size_t) tb * ss.k);   // STRATA_TAIL_WEIGHT reads the slice's router weights
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        strata::core::expert_dispatch_set_weights(nullptr);
         if (remote_opt_) remote_opt_->end();
         VDBG("layer %lld served\n", (long long) l);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
@@ -2289,6 +5504,13 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
+        if (h_bal_ != nullptr) {   // set_pcie_balance: the step's plan, its CPU and its PCIe experts
+            const size_t bi = (size_t) ((k / G) * 2 + grp);
+            bal_ok_[bi] = *(volatile uint32_t*) h_flagA_ == want;
+            bal_nc_[bi] = bal_ok_[bi] ? sink_.cpu_jobs : 0;
+            bal_np_[bi] = bal_ok_[bi] ? sink_.counts[2] : 0;
+            sink_.cpu_jobs = 0;
+        }
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -2297,7 +5519,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
@@ -2306,7 +5528,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         if (k == 0 && do_ple) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) {
-                (void) release_gpu_waits(5000);   // layer 0's flags are up, *flag is not: the launched window would spin forever
+                (void) release_gpu_waits(5000);   // layer 0's flags are up, *flag is not: the launched graph would spin forever
                 return false;
             }
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2314,14 +5536,49 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             ms_host += ms_since(tp);
         }
         if (!(test_stall && k + 1 == steps)) *flag = want;
+        if (h_bal_ != nullptr) bal_p_[(size_t) ((k / G) * 2 + grp)] = ms_since(b);
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
     // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
+    if (chain) {
+        // The overlapped split: no host sync between the stages.  The next stage's GPU starts on this stage's flag;
+        // this thread goes straight to serving the next stage's layers, and syncs this stage once the chain is done.
+        if (!nl.join(err)) return false;
+        nl.handed = true;
+        ++windows;
+        const bool ok = next_->run(T, tokens, pos0, pool, next_user_, out, err);
+        const OnDevice back(device_);
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (copy_used_) {
+            cudaStreamSynchronize(copy_);
+            copy_used_ = false;
+        }
+        if (!ok) return false;
+        if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+        if (handoff_failed(err)) return false;   // a middle stage of three or more: its own hand-in
+        if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871, as below
+            *(volatile uint32_t*) h_plan_err_ = 0;
+            err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
+            return false;
+        }
+        commit_pending_ = false;
+        if (prof_on_ && G == 1) collect_profile();
+        return true;
+    }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     // #267: a window the GPU never finishes (a spin kernel that never sees its flag) holds the host here; the stall
     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
-    // spin kernel outlives the process.  The wait itself stays a blocking sync (a polling wait cost decode upstream).
+    // spin kernel outlives the process - the case that left Windows GPUs "lost" until a power cycle.  The wait
+    // itself stays a blocking sync: a cudaStreamQuery poll here cost IQ3_S ~3% decode (a core calling the driver
+    // beside the expert workers).
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    const cudaError_t launch_result = launch_o ? launch_o->finish() : cudaSuccess;
+    if (launch_result != cudaSuccess) {
+        err = std::string("verify: launch: ") + cudaGetErrorString(launch_result);
+        return false;
+    }
+#endif
     trace_ev("SYNC", -1, -1, 0);
     const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
     trace_ev("SYNCED", -1, -1, (int64_t) se);
@@ -2406,6 +5663,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         stat("R_", R_, (size_t) g.n_embd);
         stat("mixed_", mixed_, (size_t) g.n_embd);
     }
+    if (g_stage_timers()) stage_harvest(T * 2 + (ar_off_ ? 1 : 0));   // after the window's own sync: no new one
+    if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
@@ -2418,6 +5677,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                        // the next one
         copy_used_ = false;
     }
+    if (h_bal_ != nullptr && !all_resident_ && !bal_paused_) pcie_balance_window(steps, G);
     if (prof_on_ && G == 1) {   // the window's GPU stage stamps
         collect_profile();
         if (std::getenv("STRATA_VERIFY_EAGER") != nullptr)   // SYCL port: the stage table per window, host-clocked
@@ -2443,6 +5703,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    note_nonfinite(T, nullptr);
+    if (dtr_ != nullptr) draft_trace_write(T, tokens, pos0, out);   // STRATA_DRAFT_TRACE (measurement)
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
@@ -2473,6 +5735,20 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// set_pcie_balance: each stamped step's times into the model's fits (PcieModel::sample), solved once a window.
+void Verifier::pcie_balance_window(int64_t steps, int G) {
+    const volatile unsigned long long* st = h_bal_;
+    PcieModel& M = *bal_;
+    for (int64_t k = 0; k < steps; ++k) {
+        const size_t i = (size_t) ((k / G) * 2 + k % G);
+        if (!bal_ok_[i]) continue;
+        const unsigned long long ta = st[4 * i], tb = st[4 * i + 1], tw = st[4 * i + 2];
+        if (ta == 0 || tb < ta || tw < tb || tw - ta > 1000000000ull) continue;   // not stamped in this window
+        M.sample(bal_nc_[i], bal_np_[i], bal_p_[i], (double) (tw - ta) * 1e-6);
+    }
+    M.solve();
+}
+
 void Verifier::set_plan_slot(int grp) {
     const int64_t cap = sink_.cap;
     int32_t* base = h_plan_ + (size_t) grp * (size_t) plan_i32_;
@@ -2492,19 +5768,21 @@ void Verifier::set_plan_slot(int grp) {
 }
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
-void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
-    volatile long* f = (volatile long*) flag;
-#if defined(_WIN32)
-    long cur = *f;
-    while ((uint32_t) cur < value) {
-        const long prev = _InterlockedCompareExchange(f, (long) value, cur);
-        if (prev == cur) break;
-        cur = prev;
+void Verifier::raise_flag(uint32_t* flag, uint32_t value) { strata::core::flag_raise_max(flag, value); }
+
+// Flag B for layer `want - 1`, behind every copy queued on the copy stream (PR #5096, @AlanJager).  The counter only
+// rises and the graph waits for "flag B >= layer + 1", so raising it on the spot for a layer with nothing to copy
+// releases an earlier layer (or the other token group of a split window) whose uploads are still in flight.
+void Verifier::raise_flag_b_ordered(uint32_t want) {
+    FlagSet& fs = flag_sets_[(want - 1) % (sizeof flag_sets_ / sizeof flag_sets_[0])];
+    const cudaError_t e = strata::core::raise_flag_b_ordered(copy_used_, copy_, &fs, h_flagB_, want);
+    if (e != cudaSuccess) {
+        // The flag was not raised: the consumers must not be released to staging that is still being written.
+        std::fprintf(stderr, "strata DMA: ordered flag B completion failed: %s\n", cudaGetErrorString(e));
+        std::fflush(stderr);
+        release_gpu_waits(5000);
+        std::abort();
     }
-#else
-    uint32_t cur = __atomic_load_n((uint32_t*) flag, __ATOMIC_SEQ_CST);
-    while (cur < value && !__atomic_compare_exchange_n((uint32_t*) flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
-#endif
 }
 
 // Plan v0.3 P6: the PCIe share by DMA.  The copy engine moves the blobs while the CPU computes its own share and the
@@ -2514,7 +5792,7 @@ void Verifier::fetch_dma(void *ctx, const uint8_t *const *src, int n,
                          size_t bytes) try {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    if (n <= 0) { v->raise_flag_b_ordered(want); return; }   // an empty plan stays behind the copies already queued
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
@@ -2523,14 +5801,7 @@ void Verifier::fetch_dma(void *ctx, const uint8_t *const *src, int n,
     // copied.
     const int batch_mode = strata::core::dma_batch_mode();
     if (batch_mode == 0) {
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        for (int i = 0; i < n; ++i)
-            v->copy_->memcpy(stage + (size_t)i * bytes, src[i], bytes);
+        for (int i = 0; i < n; ++i) strata::core::h2d_split(stage + (size_t) i * bytes, src[i], bytes, v->copy_);
     } else {
         const auto copied = strata::core::copy_expert_blobs(stage, src, n, bytes, v->copy_, batch_mode);
         /*
@@ -2553,13 +5824,7 @@ void Verifier::fetch_dma(void *ctx, const uint8_t *const *src, int n,
             std::abort();
         }
     }
-    FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
-    fs.flag = v->h_flagB_;
-    fs.value = want;
-  FlagSet* fsp = &fs;
-  v->copy_->submit([&](sycl::handler &cgh) {
-    cgh.host_task([=]() { raise_flag(fsp->flag, fsp->value); });
-  });
+    v->raise_flag_b_ordered(want);   // copy_used_ is set: the host function runs after this group's uploads
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -2631,6 +5896,1427 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
 
 namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+
+// STRATA_ROUTE_BUDGET_AUTO / STRATA_FRAGILE_RECHECK: the learned state across restarts.  standin-tune.txt (beside the expert profile)
+// holds "key value" lines: fingerprint (the model's, hex; a file keyed to another model is ignored), budget, step, k, tests, rechecks,
+// flips, clean (the learned ceiling b_clean: 0 or missing = none yet).  Written to a temp name and renamed, after each finished test and each k update; read once at serve start (route_tune_open).
+namespace {
+// SPEC-recheck-gated step H2: the threshold factor k_eff = m x k_safe.  m is the tuned margin; in a running margin test, arm 1 of its windows
+// uses the candidate.  The cut selection (route_fragile_first) and the explore band use k_eff.
+float route_k_eff(const RouteResidentCfg& c) {
+    double m = c.gs.tune.k_mult;
+    if (c.auto_kind == tune::KMult && c.auto_testing && c.auto_win_arm == 1) m = c.auto_k_cand;
+    return (float) (m * (double) c.fragile_k);
+}
+
+// SPEC-recheck-gated (persistence): the gate's state (totals, P_HI, rank table, shifts, calibration, margin deciles) beside the tune file,
+// <tune file>.gate, keyed by the same fingerprint.  Written with the tune file (route_tune_write), read at open (route_tune_open).
+void route_gate_write(const RouteResidentCfg& c) {
+    const std::string path = c.tune_path + ".gate";
+    const std::string tmp = path + ".tmp";
+    // step 3: this mode's k and ring go back into its slot (a pinned k is not learned: its slot keeps the k it had)
+    strata::core::gate::State saved = c.gs;
+    const float k_slot = c.gs.km.k_set[c.subfit_mode] ? c.gs.km.k[c.subfit_mode] : c.fragile_k;
+    strata::core::gate::store_active(saved, c.subfit_mode, c.fragile_k_pinned ? k_slot : c.fragile_k);
+    const std::string text = strata::core::gate::serialize(saved, c.tune_fp);
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (f == nullptr) return;
+    bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        std::fprintf(stderr, "strata serve: recheck gate state: cannot write %s\n", path.c_str());
+    }
+}
+
+// Reads the gate state of this model (false: missing, unreadable, another model's fingerprint, or malformed; c.gs is then unchanged).
+bool route_gate_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) return false;
+    std::string text;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    return strata::core::gate::parse(text, fp, c.gs);
+}
+
+void route_tune_write(const RouteResidentCfg& c) {
+    if (!c.tune_open || c.tune_path.empty()) return;
+    if (c.gate_on) route_gate_write(c);   // (gate off: no new file, as before)
+    const std::string tmp = c.tune_path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (f == nullptr) {
+        std::fprintf(stderr, "strata serve: stand-in tuning: cannot write %s (errno %d)\n", tmp.c_str(), errno);
+        return;
+    }
+    bool ok = std::fprintf(f, "fingerprint %016llx\n", (unsigned long long) c.tune_fp) > 0;
+    ok = ok && std::fprintf(f, "budget %.9g\n", (double) c.auto_b) > 0;
+    ok = ok && std::fprintf(f, "step %.9g\n", (double) c.auto_step) > 0;
+    // a pinned k (STRATA_FRAGILE_K0) is not what the file keeps: the k the file held (or none) is written back
+    if (c.fragile_k_pinned ? c.fragile_k_file > 0.0f : c.fragile_k_set)
+        ok = ok && std::fprintf(f, "k %.9g\n", (double) (c.fragile_k_pinned ? c.fragile_k_file : c.fragile_k)) > 0;
+    ok = ok && std::fprintf(f, "tests %lld\n", c.auto_tests) > 0;
+    ok = ok && std::fprintf(f, "rechecks %lld\n", c.fragile_rechecks) > 0;
+    ok = ok && std::fprintf(f, "flips %lld\n", c.fragile_flips) > 0;
+    ok = ok && std::fprintf(f, "clean %.9g\n", c.b_clean) > 0;
+    for (int k = 0; k < RouteResidentCfg::kClasses && ok; ++k)
+        if (c.cls_seen[(size_t) k])
+            ok = ok && std::fprintf(f, "class %d start %.9g clean %.9g\n", k, (double) c.cls_start[(size_t) k], c.cls_clean[(size_t) k]) > 0;
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, c.tune_path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        std::fprintf(stderr, "strata serve: stand-in tuning: cannot write %s\n", c.tune_path.c_str());
+    }
+}
+
+// Reads the file into c when its fingerprint is the model's; false otherwise (missing, unreadable, another model, no fingerprint line).
+// b is kept unless STRATA_ROUTE_BUDGET_AUTO_B0 is set, k unless STRATA_FRAGILE_K0 is (fragile_k_set); a saved k skips the learning.
+bool route_tune_read(const std::string& path, uint64_t fp, RouteResidentCfg& c) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) return false;
+    char line[256];
+    bool fp_ok = false;
+    double budget = -1.0, step = -1.0, k = -1.0, clean = -1.0;
+    long long tests = -1, rechecks = -1, flips = -1;
+    struct ClassLine { int c; double start, clean; };
+    std::vector<ClassLine> classes;
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+        char key[32] = "";
+        char val[64] = "";
+        if (std::sscanf(line, "%31s %63s", key, val) != 2) continue;
+        if (std::strcmp(key, "class") == 0) {
+            ClassLine cl{-1, -1.0, -1.0};
+            if (std::sscanf(line, "class %d start %lf clean %lf", &cl.c, &cl.start, &cl.clean) == 3) classes.push_back(cl);
+        } else if (std::strcmp(key, "fingerprint") == 0) fp_ok = std::strtoull(val, nullptr, 16) == (unsigned long long) fp;
+        else if (std::strcmp(key, "budget") == 0) budget = std::atof(val);
+        else if (std::strcmp(key, "step") == 0) step = std::atof(val);
+        else if (std::strcmp(key, "k") == 0) k = std::atof(val);
+        else if (std::strcmp(key, "tests") == 0) tests = std::atoll(val);
+        else if (std::strcmp(key, "rechecks") == 0) rechecks = std::atoll(val);
+        else if (std::strcmp(key, "flips") == 0) flips = std::atoll(val);
+        else if (std::strcmp(key, "clean") == 0) clean = std::atof(val);
+    }
+    std::fclose(f);
+    if (!fp_ok) return false;
+    if (budget > 0.0 && !c.auto_b0_env) c.auto_b = std::min(4.0f, std::max(0.02f, (float) budget));
+    if (step > 0.0) c.auto_step = std::min(2.0f, std::max(1.1f, (float) step));
+    if (k > 0.0) c.fragile_k_file = std::min(50.0f, std::max(0.005f, (float) k));
+    if (k > 0.0 && !c.fragile_k_set) {   // a pinned k (STRATA_FRAGILE_K0) is not replaced by the file's
+        c.fragile_k = c.fragile_k_file;
+        c.fragile_k_set = true;
+        c.fr_learn_ratio.clear();
+    }
+    if (tests >= 0) c.auto_tests = tests;
+    if (rechecks >= 0) c.fragile_rechecks = rechecks;
+    if (flips >= 0) c.fragile_flips = flips;
+    if (clean >= 0.0) c.b_clean = clean;
+    for (const ClassLine& cl : classes) {
+        if (cl.c < 0 || cl.c >= RouteResidentCfg::kClasses || cl.start <= 0.0 || cl.clean < 0.0) continue;
+        c.cls_start[(size_t) cl.c] = std::min(1.0f, std::max(0.05f, (float) cl.start));
+        c.cls_clean[(size_t) cl.c] = cl.clean;
+        c.cls_seen[(size_t) cl.c] = true;
+    }
+    return true;
+}
+}  // namespace
+
+// The model's fingerprint and the file's path, given once at serve start (before the first decode window).  Only with FRAGILE on.
+void Verifier::route_tune_open(const std::string& path, uint64_t model_fp) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (path.empty()) return;
+    if (!c.fragile_on) {
+        // 9 Nov: with the re-check off nothing tunes the budget; the learned one bounds the stand-ins, fixed (route_budget_window): read it
+        // (and only read: tune_open stays false, nothing is written back).  STRATA_ROUTE_BUDGET_FIXED=0: the open tail, the file not read.
+        const char* fx = std::getenv("STRATA_ROUTE_BUDGET_FIXED");
+        if (fx != nullptr && std::atoi(fx) == 0) return;
+        if (std::filesystem::exists(path) && route_tune_read(path, model_fp, c))
+            std::fprintf(stderr, "strata serve: stand-in budget %.3f from %s (re-check off: fixed at the learned value, not tuned)\n",
+                         (double) c.auto_b, path.c_str());
+        else
+            std::fprintf(stderr, "strata serve: stand-in budget %.3f (re-check off: the start value, not tuned; no learned one in %s)\n",
+                         (double) c.auto_b, path.c_str());
+        return;
+    }
+    c.tune_open = true;
+    c.tune_fp = model_fp;
+    c.tune_path = path;
+    // SPEC-recheck-gated: the gate's saved state (P_HI, totals, ranks, shifts, calibration), when it is this model's
+    bool gate_loaded = false;
+    if (c.gate_on && std::filesystem::exists(path + ".gate")) {
+        if (route_gate_read(path + ".gate", model_fp, c)) {
+            gate_loaded = true;
+            // step 3: a file without per-mode rings keeps its ring (the active one) as the off slot, and that seeds the others; this
+            // process's mode takes its own ring as the active ring
+            const bool has_ring_modes = c.gs.km.ctrl_set[0] || c.gs.km.ctrl_set[1] || c.gs.km.ctrl_set[2];
+            strata::core::gate::seed_by_mode(c.gs.km, 0.0f, has_ring_modes ? nullptr : &c.gs.ctrl);
+            float mode_k_unused = 0.0f;
+            (void) strata::core::gate::activate(c.gs, c.subfit_mode, mode_k_unused);
+            // the saved control re-checks seed the window's control ring: the k evidence and the brake have the noise floor from the first window
+            c.fr_ctrl_n = strata::core::gate::ctrl_seed(c.gs, c.fr_ctrl, RouteResidentCfg::kCtrlRing, c.fr_ctrl_pos);
+            double ctl_lo = 0.0, ctl_hi = 0.0;
+            route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, ctl_lo, ctl_hi);
+            std::fprintf(stderr, "strata serve: recheck gate state loaded: P_HI %.2f, %lld moves so far, noise floor from %d saved control re-checks "
+                         "(%lld flipped in all; flip rate upper bound %.3f) (%s)\n",
+                         (double) c.gs.p_hi, c.gs.moves, c.fr_ctrl_n, c.gs.ctrl_flips_total, ctl_hi, (path + ".gate").c_str());
+        }
+        else
+            std::fprintf(stderr, "strata serve: recheck gate state in %s ignored (its model fingerprint differs or it is malformed)\n", (path + ".gate").c_str());
+    }
+    const bool tune_exists = std::filesystem::exists(path);
+    const bool tune_ok = tune_exists && route_tune_read(path, model_fp, c);
+    if (tune_exists && !tune_ok)
+        std::fprintf(stderr, "strata serve: stand-in tuning in %s ignored (its model fingerprint differs or it has none)\n", path.c_str());
+    // step 3: this mode's own k.  The tune file's k is the active mode's (written back as `k`), so it seeds the off slot only when the
+    // gate file has no per-mode k lines; an unset mode takes the off slot's k (seed_by_mode); the mode's k then skips the learning.
+    if (gate_loaded && !c.fragile_k_pinned) {
+        const bool has_k_modes = c.gs.km.k_set[0] || c.gs.km.k_set[1] || c.gs.km.k_set[2];
+        strata::core::gate::seed_by_mode(c.gs.km, has_k_modes || !tune_ok ? 0.0f : c.fragile_k_file, nullptr);
+        float mode_k = 0.0f;
+        if (strata::core::gate::activate(c.gs, c.subfit_mode, mode_k)) {
+            c.fragile_k = mode_k;
+            c.fragile_k_set = true;
+            c.fr_learn_ratio.clear();
+        }
+    }
+    if (!tune_ok) return;
+    std::fprintf(stderr, "strata serve: stand-in tuning loaded: budget %.3f, k %.4f (%lld tests) from %s (APPLY mode slot %d)\n",
+                 (double) c.auto_b, (double) c.fragile_k, (long long) c.auto_tests, path.c_str(), c.subfit_mode);
+}
+
+bool Verifier::route_fragile_on() { return route_resident_cfg().fragile_on; }
+bool Verifier::route_brake_on() { return route_resident_cfg().brake_on; }
+
+// STRATA_ROUTE_BUDGET_DYN (decode only).  route_budget_window sets the budget before a window: a decode window at the current
+// decode budget, a prompt window at STRATA_ROUTE_BUDGET or b_lo.  route_budget_after runs after a decode window's sync and before
+// its commit: it reads the gaps of the rows the window kept (0..n_keep-1, the bonus row among them) and sets the next decode
+// window's budget.  Both write the host-mapped RouteCfg between windows only, as route_cfg_set_floor does.
+// STRATA_MASK=learn x STRATA_ROUTE_BUDGET_AUTO (defined with the mask-learn section at the end of this file): the mask test's start (false:
+// none is testable now), its arm's levels on the device, and its end (won: the candidate's (p, g) is kept; out = base p, g, candidate p, g).
+bool mask_test_begin();
+void mask_test_arm(int arm);
+bool mask_test_end(bool won, double out[4]);
+long long mask_ctrl_every();   // STRATA_MASK_CTRL: the mask control's cadence in decode windows (defined with the mask-learn section)
+// the mask control's cadence counters: decode windows counted by the mask gate (route_window_control), control windows since the last mask line
+static long long g_mask_ctrl_n = 0, g_mask_ctrl_win = 0;
+namespace {
+void route_auto_schedule(RouteResidentCfg& c);   // defined with the test helpers below route_auto_window
+float route_auto_arm_b(const RouteResidentCfg& c, int arm);   // defined with the test helpers below route_auto_window
+
+// STRATA_FRAGILE_BRAKE: every kBrakeWindows decode windows of the request, the request's budget grows when it has >= kBrakeMin re-checks,
+// the Wilson 90% upper bound of its re-check flip rate is at most 0.2 and that of its flips per token is at most 0.01: req_b * 1.25 (never above auto_b; from 0, 0.25 * auto_b).  The request's
+// first grow check (window kBrakeWindows) sets req_b = auto_b at once when that holds.  The counts are kept (only a brake resets them).
+void route_brake_grow(RouteResidentCfg& c) {
+    if (c.req_rc < RouteResidentCfg::kBrakeMin) return;
+    double lo = 0.0, hi = 0.0, tok_lo = 0.0, tok_hi = 0.0;
+    route_wilson90(c.req_fl, c.req_rc, lo, hi);
+    route_wilson90(c.req_fl, c.req_tok, tok_lo, tok_hi);
+    if (hi > 0.2 || tok_hi > 0.01) return;
+    if (c.req_wins == RouteResidentCfg::kBrakeWindows) {
+        c.req_b = c.auto_b;
+        return;
+    }
+    c.req_b = c.req_b <= 0.0f ? 0.25f * c.auto_b : std::min(c.auto_b, c.req_b * 1.25f);
+}
+
+// STRATA_FRAGILE_BRAKE: the request size class of a prompt: floor(log2(max(1, prompt tokens))), the last class taking the rest.
+int route_size_class(int64_t prompt_tokens) {
+    int64_t n = std::max<int64_t>(1, prompt_tokens);
+    int c = 0;
+    while (n > 1) {
+        n >>= 1;
+        ++c;
+    }
+    return std::min(c, RouteResidentCfg::kClasses - 1);
+}
+}  // namespace
+
+// prompt_tokens: the request's prompt token count (generate.cpp), which picks its size class.
+void Verifier::route_budget_begin(int64_t prompt_tokens) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (c.dyn_on) c.dyn_cur_hi = false;   // a request's first decode window starts at b_lo
+    c.fragile_exact = false;              // STRATA_FRAGILE_RECHECK: a request starts with no pending cut
+    c.fragile_pend = false;
+    c.fragile_pend_stop = false;
+    if (c.auto_on) ++c.auto_req;          // STRATA_ROUTE_BUDGET_AUTO: the request whose windows the next arm time counts
+    // STRATA_FRAGILE_BRAKE: this request starts at its class's start fraction s of auto_b, at least the class's clean level L when known,
+    // and never above auto_b (auto_b itself when the brake is off)
+    c.req_class = route_size_class(prompt_tokens);
+    const size_t k = (size_t) c.req_class;
+    c.req_b = c.brake_on ? std::min(c.auto_b, std::max((float) c.cls_clean[k], c.cls_start[k] * c.auto_b)) : c.auto_b;
+    c.req_rc = c.req_fl = c.req_tok = c.req_wins = c.req_brakes = 0;
+    c.req_tok_all = c.req_fl_all = 0;
+    static const bool rollback_env = [] { const char* v = std::getenv("STRATA_ROLLBACK"); return v != nullptr && std::atoi(v) != 0; }();
+    c.rollback_on = rollback_env;   // STRATA_ROLLBACK (opt-in): the fast brake and the flips' positions
+    c.req_flip_pos.clear();
+    c.gen_now = 0;
+    c.fragile_pend_pos = 0;
+    c.low_open_off = false;
+    c.low_open_seen = false;
+}
+
+// STRATA_ROLLBACK (generate.cpp's serve decode loop): the committed count before the window, and the token position of a cut's row.
+void Verifier::route_gen_now(int64_t n) { route_resident_cfg().gen_now = (long long) n; }
+void Verifier::route_fragile_pos(int64_t pos) { route_resident_cfg().fragile_pend_pos = (long long) pos; }
+
+// The brakes since the last call: true with the first and last flip positions and the budget before and after (the rewind's evidence).
+bool Verifier::route_brake_take(int64_t& first, int64_t& last, float& old_b, float& new_b) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (c.brake_seq == c.brake_taken) return false;
+    c.brake_taken = c.brake_seq;
+    first = (int64_t) c.brake_first;
+    last = (int64_t) c.brake_last;
+    old_b = c.brake_old;
+    new_b = c.brake_new;
+    return true;
+}
+
+// STRATA_ROLLBACK: a rewind's reset of the switch's pending state (a cut's exact successor, the pending verdict) - the redo starts clean.
+void Verifier::route_rollback_reset() {
+    RouteResidentCfg& c = route_resident_cfg();
+    c.fragile_pend = false;
+    c.fragile_pend_stop = false;
+    c.fragile_exact = false;
+    c.req_flip_pos.clear();
+}
+
+// STRATA_ROUTE_LOW_OPEN's early redo (generate.cpp): whether this request's windows ran ranks < lo open, and the redo that closes them.
+bool Verifier::route_low_open_used() { return route_resident_cfg().low_open_seen; }
+void Verifier::route_low_open_redo() { route_resident_cfg().low_open_off = true; }
+
+// STRATA_LA_TAIL_SKIP=1 (opt-in): the decode read-ahead drops its predictions at ranks >= lo that no card holds while this window's tail
+// budget is 0, because route_resident_k then serves those ranks with a resident stand-in.  The rule is exactly that serving rule only where
+// it is "any stand-in": the margin is unlimited (1e30, the production config) and the tail budget is 0 (win_tail, or the static budget_tail
+// when the AUTO budget is off).  A finite margin or a tail budget > 0 (a braked request) keeps every read.  lo is the configured floor
+// (STRATA_ROUTE_RESIDENT_RANKS); a floor below 2 is left alone (ranks 0-1 have the RAM floor's own margins).  Published to
+// strata::core::la_tail_skip_from for the look-ahead (expert_source.cpp), -1 = off.
+static void la_tail_skip_update(const RouteResidentCfg& c) {
+    static const bool on = [] { const char* e = std::getenv("STRATA_LA_TAIL_SKIP"); return e != nullptr && std::atoi(e) != 0; }();
+    int from = -1;
+    if (on && c.margin >= 1e30f && c.lo >= 2 && c.win_tail <= 0.0f && c.budget_tail <= 0.0f) from = c.lo;
+    strata::core::la_tail_skip_from.store(from, std::memory_order_relaxed);
+    // STRATA_LA_TAIL_READ=1 (opt-in): the read-ahead's ranks >= lo for this window, by the budgets the router's kernel reads now (the
+    // host-mapped config after this window's route_cfg_set_budgets): mode 2 = the open rule (no tail read), 1 = read, with the stand-in
+    // test on the device (route_pred_tail_read); 0 = off (the router is off too, or the switch is unset)
+    static const bool tail_read_on = strata::core::la_tail_read_level() != 0;
+    int mode = 0;
+    if (tail_read_on && c.margin > 0.0f) mode = strata::kernels::route_cfg_tail_open() ? 2 : 1;
+    strata::core::la_tail_read_lo.store(c.lo, std::memory_order_relaxed);
+    strata::core::la_tail_read_mode.store(mode, std::memory_order_relaxed);
+}
+
+// STRATA_FRAGILE_CTRL_EVERY: true when this decode window is a fragile control window.  Every fr_ctrl_every-th eligible window gets the device
+// flag (route_fragile_control): an eligible window is a non-merged decode window of a learned k, not an exact re-run, with a stand-in budget or
+// AUTO.  Counted only in eligible windows.  A window that is not a control clears the flag (the flag is written every window).
+static bool route_fragile_ctrl_next(RouteResidentCfg& c, bool eligible) {
+    const bool due = eligible && c.fragile_on && c.fragile_k_set && !c.fragile_exact && c.fr_ctrl_every > 0 &&
+                     (c.auto_on || c.dyn_on || c.budget > 0.0f || c.budget_tail > 0.0f);
+    // the cadence: 128 eligible windows apart while the noise floor has fewer than 20 control re-checks (gate::ctrl_every), the configured one after
+    if (!due || !route_ctrl_due(c.fr_ctrl_win, strata::core::gate::ctrl_every(c.fr_ctrl_every, c.fr_ctrl_n)) ||
+        !strata::kernels::route_fragile_control(true)) {
+        strata::kernels::route_fragile_control(false);
+        return false;
+    }
+    return true;
+}
+
+// STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL: after a decode window ran (its flag is cleared here, so a drafter between windows sees none), its
+// kind's count and committed tokens and seconds.  kept < 1 (a merged window, nothing committed) counts nothing; a window of an exact re-run is not counted.
+void Verifier::route_window_done(int kept, double secs) {
+    RouteResidentCfg& c = route_resident_cfg();
+    strata::kernels::route_fragile_control(false);
+    if (c.win_kind >= 3 || kept < 1) return;
+    ++c.kn[c.win_kind];
+    c.ktok[c.win_kind] += kept;
+    c.ksec[c.win_kind] += secs;
+}
+
+// STRATA_FRAGILE_CTRL_EVERY / STRATA_MASK_CTRL: this request's control windows against the other decode windows (count, tokens per second), for
+// the request's end line.  Takes and resets the counts.  false (out unset) when no control window ran in the request.
+bool Verifier::route_control_take(std::string& out) {
+    RouteResidentCfg& c = route_resident_cfg();
+    const bool any = c.kn[1] + c.kn[2] > 0;
+    if (any) {
+        auto rate = [&c](int k) { return c.ksec[k] > 0.0 ? (double) c.ktok[k] / c.ksec[k] : 0.0; };
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "control windows: fragile %lld (%.1f tok/s vs %.1f), mask %lld (%.1f vs %.1f)", c.kn[1], rate(1), rate(0),
+                      c.kn[2], rate(2), rate(0));
+        out = buf;
+    }
+    for (int k = 0; k < 4; ++k) {
+        c.kn[k] = 0;
+        c.ktok[k] = 0;
+        c.ksec[k] = 0.0;
+    }
+    return any;
+}
+
+// ---- SPEC-recheck-gated (see verify.hpp: route_gate_*).  The learner's state is process-wide; the request counts are taken at the request's end.
+bool Verifier::route_gate_on() const { return route_resident_cfg().gate_on; }
+float Verifier::route_gate_p_hi() const { return route_resident_cfg().gs.p_hi; }
+
+bool Verifier::route_gate_audit_next() {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_on) return false;
+    ++c.gate_win;
+    const int every = (int) std::min<long long>(c.gate_audit_every, 1000000000LL);
+    const bool audit = strata::core::gate::audit_due(c.gate_win, every);
+    if (audit) ++c.gq.audit_wins;
+    return audit;
+}
+
+void Verifier::route_gate_rows(uint32_t bits, bool audit) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_on) return;
+    c.gate_bits = audit ? 0u : bits;
+    c.gate_bits_set = true;
+    for (uint32_t b = c.gate_bits; b != 0; b &= b - 1) ++c.gq.held;
+}
+
+void Verifier::route_gate_window(int a0, const int* bucket, const float* shift, const uint8_t* eligible, bool audit) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_on) return;
+    // rows 1..a0 (row 0 is never cut): the eligible moved rows, by their drafter bucket (kNone for none rows)
+    for (int q = 1; q <= a0; ++q) {
+        if (!(shift[q] > 0.0f)) continue;
+        // step F: the cap's median and deciles take only uncapped shifts - an audit window caps nothing, and before 64 samples no cap is
+        // active.  A capped row's shift is held at its cap, so feeding it would ratchet the median (and the caps) down over time.
+        if (audit || c.gs.shift.n() < 64) c.gs.shift.add(shift[q], strata::core::gate::kShiftRing);
+        if (eligible[q] == 0) continue;
+        strata::core::gate::add_moved(c.gs, bucket[q]);
+        if (audit) ++c.gq.au_moved[bucket[q]];
+    }
+    const int dir = strata::core::gate::step(c.gs);   // rule 5 (acts only with 2,000 moved rows since its last move)
+    if (dir != 0)
+        std::fprintf(stderr, "strata serve: recheck gate: P_HI %s to %.2f (move %lld)\n", dir > 0 ? "up" : "down", (double) c.gs.p_hi,
+                     c.gs.moves);
+}
+
+void Verifier::route_gate_cut(int row, int bucket, bool audit, bool control, const std::vector<strata::core::recheck::Pick>& picks, float shift) {
+    RouteResidentCfg& c = route_resident_cfg();
+    c.gate_pend = false;
+    if (!c.gate_on || control) return;   // a noise control re-check is not the gate's evidence
+    c.gate_pend = true;
+    c.gate_pend_audit = audit;
+    c.gate_pend_bucket = bucket;
+    c.gate_pend_sdec = c.gs.shift.decile(shift);   // step F: the cut row's final shift, by decile of the running shifts
+    for (int s = 0; s < strata::core::gate::kRankSlots; ++s)
+        for (int b = 0; b < strata::core::gate::kBands; ++b) c.gate_pend_rank[s][b] = 0;
+    for (const strata::core::recheck::Pick& p : picks) {   // the cut row's swaps, by rank and layer band (a mask move counts as a swap too)
+        const int s = strata::core::gate::rank_slot(p.rank);
+        if (s >= 0) ++c.gate_pend_rank[s][strata::core::gate::band_of(p.layer)];
+    }
+    strata::core::gate::add_cut(c.gs, bucket);
+    ++c.gq.cuts;
+    if (audit) ++c.gq.au_cut[bucket];
+    (void) row;
+}
+
+void Verifier::route_gate_settled(bool exact_ok, bool flipped) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_pend) return;
+    c.gate_pend = false;
+    if (!exact_ok) return;   // the exact row was not read: no verdict
+    const int b = c.gate_pend_bucket;
+    if (flipped) {
+        strata::core::gate::add_flip(c.gs, b);
+        if (c.gate_pend_audit) ++c.gq.au_flip[b];
+    }
+    // step F: the calibration by shift decile, split by the verdict (the state and this request's copy)
+    if (flipped) {
+        ++c.gs.cal.flip[c.gate_pend_sdec];
+        ++c.sq.cal.flip[c.gate_pend_sdec];
+    } else {
+        ++c.gs.cal.not_flip[c.gate_pend_sdec];
+        ++c.sq.cal.not_flip[c.gate_pend_sdec];
+    }
+    const int f = flipped ? 1 : 0;
+    for (int s = 0; s < strata::core::gate::kRankSlots; ++s)
+        for (int band = 0; band < strata::core::gate::kBands; ++band) {
+            const long long n = c.gate_pend_rank[s][band];
+            if (n == 0) continue;
+            c.gs.rank.n[s][band][f] += n;
+            c.gq.rk.n[s][band][f] += n;
+        }
+    const int dir = strata::core::gate::step(c.gs);
+    if (dir != 0)
+        std::fprintf(stderr, "strata serve: recheck gate: P_HI %s to %.2f (move %lld)\n", dir > 0 ? "up" : "down", (double) c.gs.p_hi,
+                     c.gs.moves);
+}
+
+bool Verifier::route_gate_take(std::string& gate_line, std::string& rank_line) {
+    RouteResidentCfg& c = route_resident_cfg();
+    RouteResidentCfg::GateReq& q = c.gq;
+    gate_line.clear();
+    rank_line.clear();
+    bool any_rank = false;
+    for (int s = 0; s < strata::core::gate::kRankSlots; ++s)
+        for (int b = 0; b < strata::core::gate::kBands; ++b) any_rank = any_rank || q.rk.n[s][b][0] + q.rk.n[s][b][1] > 0;
+    const bool any = q.held > 0 || q.skipped > 0 || q.audit_wins > 0 || q.cuts > 0;
+    if (c.gate_on && any) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "P_HI %.2f, rows held up front %lld, cuts skipped (rule 1) %lld, audit windows %lld; audit moved/cut/flipped:",
+                      (double) c.gs.p_hi, q.held, q.skipped, q.audit_wins);
+        gate_line = buf;
+        for (int b = 0; b <= strata::core::gate::kNone; ++b) {
+            if (q.au_moved[b] + q.au_cut[b] + q.au_flip[b] == 0) continue;
+            std::snprintf(buf, sizeof buf, " %s %lld/%lld/%lld", b == strata::core::gate::kNone ? "none" : std::to_string(b).c_str(),
+                          q.au_moved[b], q.au_cut[b], q.au_flip[b]);
+            gate_line += buf;
+        }
+    }
+    if (c.gate_on && any_rank) {
+        // re-check by rank: per rank (flipped / not) over the layer bands, then per band
+        std::string s = "re-check by rank (flipped / not):";
+        char buf[64];
+        for (int r = 0; r < strata::core::gate::kRankSlots; ++r) {
+            long long fl = 0, nf = 0;
+            for (int b = 0; b < strata::core::gate::kBands; ++b) { fl += q.rk.n[r][b][1]; nf += q.rk.n[r][b][0]; }
+            std::snprintf(buf, sizeof buf, " r%d %lld/%lld", r + 3, fl, nf);
+            s += buf;
+        }
+        s += "; layer bands";
+        static const char* band_name[4] = {"0-11", "12-23", "24-35", "36-47"};
+        for (int b = 0; b < strata::core::gate::kBands; ++b) {
+            long long fl = 0, nf = 0;
+            for (int r = 0; r < strata::core::gate::kRankSlots; ++r) { fl += q.rk.n[r][b][1]; nf += q.rk.n[r][b][0]; }
+            std::snprintf(buf, sizeof buf, " %s %lld/%lld", band_name[b], fl, nf);
+            s += buf;
+        }
+        rank_line = s;
+    }
+    q = RouteResidentCfg::GateReq{};
+    return c.gate_on && (any || any_rank);
+}
+
+// ---- SPEC-recheck-gated step F: the per-row shift cap (see verify.hpp: route_shift_cap_window, route_shift_take)
+void Verifier::route_shift_cap_window(const int* bucket, const float* p, int T, bool audit) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.cap_on) return;
+    const float median = c.gs.shift.median();
+    const size_t n = c.gs.shift.n();
+    // SPEC-recheck-gated step G: the multipliers are the tuned pair; arm 1 of a running cap test uses its candidate (the window is timed
+    // as that arm by route_auto_window, so the candidate is the only difference between the arms)
+    strata::core::gate::CapMult m = c.cap_mult;
+    m.unc = (float) c.gs.tune.cap_unc;
+    m.none = (float) c.gs.tune.cap_none;
+    if (c.auto_kind == tune::Cap && c.auto_testing && c.auto_win_arm == 1) {
+        m.unc = (float) c.auto_cap_cu;
+        m.none = (float) c.auto_cap_cn;
+    }
+    float caps[32];
+    strata::core::gate::fill_caps(caps, bucket, p, T, c.gs.p_hi, audit, median, n, m);
+    strata::kernels::route_shift_cap_set(caps, 32);   // between windows (the kernels read the array at each launch)
+    using strata::core::gate::Rule;
+    c.cap_last[0] = strata::core::gate::cap_for(Rule::Confident, median, n, m);
+    c.cap_last[1] = strata::core::gate::cap_for(Rule::Uncertain, median, n, m);
+    c.cap_last[2] = strata::core::gate::cap_for(Rule::None, median, n, m);
+}
+
+bool Verifier::route_shift_take(std::string& cap_line, std::string& cal_line) {
+    RouteResidentCfg& c = route_resident_cfg();
+    cap_line.clear();
+    cal_line.clear();
+    unsigned long long mv = 0, rw = 0, cc = 0, ss = 0;
+    if ((c.cap_on || g_sub_apply_on) && strata::kernels::route_shift_cap_read(mv, rw, &cc, &ss)) {   // (between requests: the windows are synced)
+        c.sq.cap_moves += (long long) mv;
+        c.sq.cap_rows += (long long) rw;
+        g_sub_req_corr += (long long) cc;       // SPEC-substitute-fit stage 2: corrected moves, substituted moves, refusals left
+        g_sub_req_subs += (long long) ss;
+        g_sub_req_refused += (long long) mv;
+    }
+    if (c.cap_on && (c.sq.cap_moves > 0 || c.sq.cap_rows > 0)) {
+        auto cap_txt = [](float v, char* buf) { if (v < INFINITY) std::snprintf(buf, 32, "%.4f", (double) v); else std::snprintf(buf, 32, "inf"); };
+        char a[32], b[32], d[32];
+        cap_txt(c.cap_last[0], a);
+        cap_txt(c.cap_last[1], b);
+        cap_txt(c.cap_last[2], d);
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "shift cap: moves refused %lld (rows capped %lld), caps conf/unc/none %s/%s/%s", c.sq.cap_moves,
+                      c.sq.cap_rows, a, b, d);
+        cap_line = buf;
+    }
+    bool any = false;
+    for (int b = 0; b < strata::core::gate::kBuckets; ++b) any = any || c.sq.cal.flip[b] + c.sq.cal.not_flip[b] > 0;
+    if (c.gate_on && any) {
+        std::string s = "re-check by row shift (deciles 0-9, flipped / not):";
+        char buf[48];
+        for (int b = 0; b < strata::core::gate::kBuckets; ++b) {
+            std::snprintf(buf, sizeof buf, " d%d %lld/%lld", b, c.sq.cal.flip[b], c.sq.cal.not_flip[b]);
+            s += buf;
+        }
+        cal_line = s;
+    }
+    c.sq = RouteResidentCfg::ShiftReq{};
+    return !cap_line.empty() || !cal_line.empty();
+}
+
+// STRATA_FRAGILE_RECHECK chooses a decode window's budget after a cut (exact: ranks < lo with no stand-in), else the DYN / static value.
+// STRATA_ROUTE_BUDGET_AUTO: a decode window (auto_ok) takes the search's b for both ranks; a cut's next window is exact for ranks < lo only.
+void Verifier::route_budget_window(bool decode, bool auto_ok) {
+    RouteResidentCfg& c = route_resident_cfg();
+    {   // STRATA_LAYER_SUB=1 (opt-in): the stand-in budgets scale per layer with the same multipliers as the skip thresholds (the live ones, or a table's): a layer where dropping costs
+        // little takes looser stand-ins, a sensitive layer refuses more.  Cheap: up to 128 stores to host-mapped memory per window.
+        static const bool sub_on = [] { const char* e = std::getenv("STRATA_LAYER_SUB"); return e != nullptr && e[0] == '1'; }();
+        static uint32_t pushed_gen = 0;   // stop asking: the multipliers are copied to the kernel's configuration only when they changed
+        if (sub_on && strata::core::layer_mult_generation() != pushed_gen) {
+            pushed_gen = strata::core::layer_mult_generation();
+            for (int l = 0; l < 128; ++l) strata::kernels::route_cfg_set_layer_budget_mult(l, std::max(0.05f, strata::core::layer_budget_shape(l)));
+        }
+    }
+    // STRATA_FRAGILE_CTRL_EVERY: this window's fragile control flag, decided and written before the window runs (the kernels read it at launch)
+    const bool fctl = route_fragile_ctrl_next(c, decode && auto_ok);
+    c.win_fctl = fctl;
+    // STRATA_MASK_RESIDENT / STRATA_MASK_CTRL with the mask learner: this window's mask control flag, written before the window runs (every
+    // window passes here, the kernels read the flag only inside a window).  A fragile control window takes the window (route_window_control).
+    const bool mgate = mask_learn_active() && (mask_resident_on() || mask_ctrl_on()) && decode;
+    const strata::core::WindowControl wc = strata::core::route_window_control(fctl, mgate, g_mask_ctrl_n, mask_ctrl_every());
+    if (wc.mask) ++g_mask_ctrl_win;
+    strata::kernels::route_mask_control(wc.mask);
+    c.win_kind = decode && c.fragile_exact ? 3 : fctl ? 1 : wc.mask ? 2 : 0;
+    if (!c.dyn_on && !c.fragile_on) {
+        // 9 Nov: with the re-check off no tuner runs, so nothing sets the decode budget: ranks lo-9 take ANY resident stand-in (the
+        // margin test; 1e30 in the Qwen config) - the open tail (it broke JSON and code on 24 Oct with an older engine; clean on 9 Nov).
+        // The learned budget as a fixed bound is the default below.  Ranks below the floor keep the rank rule (STRATA_ROUTE_BUDGET_LOW as in the tuned path).
+        // Default on (9 Nov, 37.7 against 39.1 tok/s for the open tail, JSON and answers clean in both: the bound that kept JSON and code
+        // clean on 24 Oct, for ~3.5%).  STRATA_ROUTE_BUDGET_FIXED=0 brings back the open tail.  Prompt windows keep the static budgets.
+        static const bool fixed = [] { const char* v = std::getenv("STRATA_ROUTE_BUDGET_FIXED"); return v == nullptr || std::atoi(v) != 0; }();
+        if (fixed && c.auto_b > 0.0f) {
+            static const bool budget_low_on = [] { const char* v = std::getenv("STRATA_ROUTE_BUDGET_LOW"); return v != nullptr && std::atoi(v) != 0; }();
+            const float bd = decode ? c.auto_b : c.budget;
+            const float td = decode ? c.auto_b : c.budget_tail;
+            const float low = budget_low_on ? bd : (decode ? 0.0f : c.budget);
+            c.win_low = low;
+            c.win_tail = td;
+            strata::kernels::route_cfg_set_budgets(low, td);
+        }
+        la_tail_skip_update(c);   // (with the open tail the static budget_tail decides: win_tail is never set)
+        return;
+    }
+    if (decode && c.fragile_on) route_fragile_zero_shift();   // STRATA_FRAGILE_RECHECK: this window's stand-in moves start at zero
+    if (decode && c.brake_on && ++c.req_wins % RouteResidentCfg::kBrakeWindows == 0) route_brake_grow(c);   // STRATA_FRAGILE_BRAKE
+    float b = c.budget;
+    float tail = c.budget_tail;
+    if (c.dyn_on) {
+        if (decode) {
+            ++(c.dyn_cur_hi ? c.dyn_n_hi : c.dyn_n_lo);
+            b = c.dyn_cur_hi ? c.dyn_hi : c.dyn_lo;
+        } else {
+            b = c.budget > 0.0f ? c.budget : c.dyn_lo;
+        }
+    }
+    if (decode && c.auto_on && auto_ok) {
+        if (c.fragile_exact) {
+            c.auto_win_arm = c.auto_cut_arm;   // the exact successor of a cut: its cut window's arm, not a scheduled window
+            c.auto_win_sched = false;
+        } else {
+            c.auto_mask_ok = mask_learn_active() && !mask_resident_on();   // STRATA_MASK=learn: a mask test may start here (not with the resident rule: p, g move live)
+            route_auto_schedule(c);
+        }
+        b = route_auto_arm_b(c, c.auto_win_arm);   // the request's budget (base arm) or its scaled candidate
+        // ranks >= lo take the same budget as ranks < lo from the request's first window (24 Oct evening, the user saw malformed
+        // JSON and code with the open tail).  STRATA_ROUTE_TAIL_OPEN=1 (opt-in) brings back the open tail: any resident stand-in
+        // (budget_tail 0 sends the kernel to its margin test) until the request brakes - faster (card hits 92% against 87-89%,
+        // 8.5K run 56 against 53.6 tok/s on 24 Oct) but the re-check alone did not keep code and JSON clean
+        static const bool tail_open = [] { const char* v = std::getenv("STRATA_ROUTE_TAIL_OPEN"); return v != nullptr && std::atoi(v) != 0; }();
+        tail = tail_open && c.req_brakes == 0 ? 0.0f : b;
+        // STRATA_ROUTE_LOW_OPEN=1 (opt-in experiment, 24 Oct): ranks < lo also start open (any resident stand-in) and take the
+        // learned budget only after the request's first brake (the re-check saw flips)
+        static const bool low_open = [] { const char* v = std::getenv("STRATA_ROUTE_LOW_OPEN"); return v != nullptr && std::atoi(v) != 0; }();
+        if (low_open && !c.low_open_off && c.req_brakes == 0) {   // (low_open_off: STRATA_ROLLBACK's early redo runs at the learned budget)
+            b = 1e30f;
+            c.low_open_seen = true;
+        }
+    }
+    // A cut's exact successor decides every rank exactly: before 25 Oct only ranks < lo were made exact here and the tail kept its
+    // stand-ins, so a "re-decided" token could still be moved by a rank 3-9 stand-in.  A tail budget of ~0 lets only a stand-in that
+    // the router scored at least as high as the pick through (gap <= 0), i.e. no change.
+    // SPEC-recheck-cheap change 1: the successor's flag row count is 1 (route_fragile_rows; false when the flag is not allocated, then the
+    // whole-window exact path of before runs).  Its request budget stays; only the whole-window exact state and budget 0 are dropped.
+    const bool succ = decode && c.fragile_exact;
+    const bool row_only = succ && c.recheck_row_only && strata::kernels::route_fragile_hold_ready();
+    // SPEC-recheck-gated: the hold bitmask of this window = every row (the control window), else the successor's row 0 and the uncertain
+    // rows of the gate (rule 2; route_gate_rows, none in an audit window).  With the gate off the bits are the successor's row 0 alone (or none).
+    {
+        uint32_t bits = fctl ? strata::core::gate::kAllBits : 0u;
+        if (!fctl) {
+            if (row_only) bits |= 1u;
+            if (c.gate_bits_set) bits |= c.gate_bits;
+        }
+        strata::kernels::route_fragile_hold(bits);
+        c.gate_bits = 0;
+        c.gate_bits_set = false;
+    }
+    const strata::core::recheck::SuccessorPlan sp = strata::core::recheck::successor_plan(succ, row_only);
+    c.win_exact = sp.win_exact;   // STRATA_MASK: the exact re-run is unmasked too (its outputs are the re-decision)
+    if (decode && c.auto_on && auto_ok && c.auto_mask && !c.win_exact) mask_test_arm(c.auto_win_arm);   // STRATA_MASK=learn: this arm's levels on the device
+    if (decode && c.fragile_exact) {
+        if (sp.zero_budget) {
+            b = 0.0f;
+            tail = 1e-30f;
+        }
+        c.fragile_exact = false;
+    }
+    // Ranks below the configured floor (STRATA_ROUTE_RESIDENT_RANKS=3-9: ranks 0-2) follow the configured rank rule - ranks 0-1 exact,
+    // the edge rank lo-1 only within STRATA_ROUTE_RESIDENT_EDGE logits - and the confidence budget acts on ranks lo-9 (25 Oct: with the
+    // budget on ranks 0-2 too, 4 of 11 emoji in 60 "hi" replies broke - a rank 0-1 stand-in on one byte-piece - against 0 of 6 under
+    // the rank rule).  STRATA_ROUTE_BUDGET_LOW=1 puts ranks below the floor under the budget again (the 24 Oct behaviour).
+    static const bool budget_low = [] { const char* v = std::getenv("STRATA_ROUTE_BUDGET_LOW"); return v != nullptr && std::atoi(v) != 0; }();
+    const float low = budget_low || b >= 1e29f ? b : 0.0f;   // (b >= 1e29: STRATA_ROUTE_LOW_OPEN's open start keeps its value)
+    // STRATA_ROUTE_BRAKE_STEP=1 (opt-in, 24 Oct, the user's rule; the default checks every rank from the first window): ranks >= lo
+    // start open (any resident stand-in) and each brake of the request moves the floor one rank up - the rank just above the checked
+    // ones joins them (the budget test), the ranks above it stay open.  The floor returns to lo for the next request.
+    static const bool brake_step = [] { const char* v = std::getenv("STRATA_ROUTE_BRAKE_STEP"); return v != nullptr && std::atoi(v) != 0; }();
+    if (brake_step && decode && c.auto_on) {
+        tail = 0.0f;
+        strata::kernels::route_cfg_set_floor((int) std::min<long long>((long long) c.lo + c.req_brakes, (long long) c.hi + 1));
+    } else if (brake_step) {
+        strata::kernels::route_cfg_set_floor(c.lo);
+    }
+    c.win_low = low;
+    c.win_tail = tail;
+    strata::kernels::route_cfg_set_budgets(low, tail);
+    // STRATA_STANDIN_LEARN: this window's record and capture mode.  The y_e capture belongs to the fragile successor (its row 0 is the
+    // exact re-decision in both forms: the row-only successor keeps win_exact false, so keying on win_exact alone never captured y_e
+    // and every sample's y_e stayed zero since row-only became the default).
+    if (lrn_gate_ != nullptr) standin_learn_begin_window(decode, succ || c.win_exact);
+    la_tail_skip_update(c);
+}
+
+// STRATA_FRAGILE_RECHECK.  route_fragile_wants: the window that just ran had a stand-in budget (ranks < lo or the tail).
+bool Verifier::route_fragile_wants() {
+    const RouteResidentCfg& c = route_resident_cfg();
+    // (under AUTO the tail runs the old any-stand-in rule with budget 0: its stand-ins are watched too)
+    return c.fragile_on && (c.win_low > 0.0f || c.win_tail > 0.0f || c.auto_on);
+}
+
+// The top-1 minus top-2 gaps of the last window's rows 0..n-1 (the last stage holds the head's logits).
+// top1 (optional): the rows' top-1 ids, read with the gaps.
+bool Verifier::route_fragile_gaps(int n, float* out, int32_t* top1) {
+    if (next_ != nullptr) return next_->route_fragile_gaps(n, out, top1);
+    if (dyn_gap_ == nullptr || dyn_top1_ == nullptr || n < 1 || n > max_t_) return false;
+    const OnDevice on(device_);
+    if (cudaMemcpy(out, dyn_gap_, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (top1 != nullptr && cudaMemcpy(top1, dyn_top1_, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+// The stand-ins' moves on rows 0..n-1, each stage's own layers summed over the chain (out is zeroed by the caller).
+bool Verifier::route_fragile_shifts(int n, float* out) {
+    if (n < 1 || n > max_t_) return false;
+    std::vector<float> s((size_t) n);
+    for (Verifier* v = this; v != nullptr; v = v->next_) {
+        if (v->row_shift_ == nullptr) return false;
+        const OnDevice on(v->device_);
+        if (cudaMemcpy(s.data(), v->row_shift_, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        for (int i = 0; i < n; ++i) out[i] += s[(size_t) i];
+    }
+    return true;
+}
+
+// Before a decode window: every stage's stand-in moves start at zero (the previous window was synced).
+void Verifier::route_fragile_zero_shift() {
+    for (Verifier* v = this; v != nullptr; v = v->next_) {
+        if (v->row_shift_ == nullptr) continue;
+        const OnDevice on(v->device_);
+        if (cudaMemset(v->row_shift_, 0, (size_t) v->max_t_ * sizeof(float)) != cudaSuccess) (void) cudaGetLastError();
+    }
+}
+
+// The first close call among rows 0..n-1, or -1.  A row is a close call when a stand-in moved it (shift > 0) and its gap is below
+// fragile_k * shift (a NaN gap counts as one).  Also counts this request's rows that a stand-in moved.
+// Row 0 is never cut (a re-run would step the state twice), so the search is over rows 1..n-1.  Until k is set (STRATA_FRAGILE_K0, or learned
+// from the first kFragileLearn windows: the ratios gap / shift of their moved rows 1.., k = their 10th percentile, no cut meanwhile) it
+// returns -1.  The moved rows' shift and gap are sampled for the request's medians (route_fragile_take).
+int Verifier::route_fragile_first(const float* gap, const float* shift, int n, bool* explore, bool* control, const uint8_t* eligible) {
+    RouteResidentCfg& c = route_resident_cfg();
+    // SPEC-recheck-gated step H2: the cut threshold is k_eff = m x k_safe (m: the tuned margin; the arm-1 candidate in a running margin test)
+    const float k_eff = route_k_eff(c);
+    if (explore != nullptr) *explore = false;
+    if (control != nullptr) *control = false;
+    if (!c.fragile_k_set) {
+        for (int r = 1; r < n; ++r)
+            if (shift[r] > 0.0f && gap[r] == gap[r]) c.fr_learn_ratio.push_back(gap[r] / shift[r]);
+        if (++c.fr_learn_windows >= RouteResidentCfg::kFragileLearn) {
+            std::vector<float> v = c.fr_learn_ratio;
+            c.fr_learn_ratio.clear();
+            c.fr_learn_ratio.shrink_to_fit();
+            c.fragile_k_set = true;
+            if (v.empty()) {
+                std::fprintf(stderr, "strata serve: fragile recheck: k %.4f (no moved rows in the first %d windows: default kept)\n",
+                             (double) c.fragile_k, RouteResidentCfg::kFragileLearn);
+            } else {
+                std::sort(v.begin(), v.end());
+                const float p10 = v[v.size() / 10], p50 = v[v.size() / 2];
+                c.fragile_k = std::min(50.0f, std::max(0.005f, p10));
+                std::fprintf(stderr, "strata serve: fragile recheck: k from %lld rows: %.4f (ratio p10; p50 %.4f)\n",
+                             (long long) v.size(), (double) c.fragile_k, (double) p50);
+            }
+            route_tune_write(c);   // the learned k is kept from now on (a restart skips the learning)
+        }
+    }
+    int first = -1;
+    for (int r = 0; r < n; ++r) {
+        if (!(shift[r] > 0.0f)) continue;
+        ++c.fr_moved;
+        if (c.fr_samp_shift.size() < RouteResidentCfg::kFragileSamples && gap[r] == gap[r]) {
+            c.fr_samp_shift.push_back(shift[r]);
+            c.fr_samp_gap.push_back(gap[r]);
+        }
+        // SPEC-recheck-gated: a close call on a row the gate does not allow to be cut is skipped (and counted), not taken
+        if (r >= 1 && c.fragile_k_set && !(gap[r] >= k_eff * shift[r])) {
+            if (eligible != nullptr && !eligible[r]) ++c.gq.skipped;
+            else if (first < 0) first = r;
+        }
+    }
+    // Exploration (deterministic: every 16th eligible window, not a random draw): with no normal cut, the first moved row r >= 1 whose
+    // ratio gap / shift is in [k, 8k) is an explore cut.  Rows with ratio below k would have been normal cuts, so they are not explored.
+    if (c.fragile_k_set && c.fr_eligible++ % 16 == 0 && first < 0) {
+        for (int r = 1; r < n && first < 0; ++r) {
+            if (!(shift[r] > 0.0f)) continue;
+            const float ratio = gap[r] / shift[r];
+            if (ratio >= k_eff && ratio < 8.0f * k_eff && (eligible == nullptr || eligible[r])) first = r;   // the explore band of k_eff
+        }
+        if (first >= 0 && explore != nullptr) *explore = true;
+    }
+    // Noise control: every kCtrlEvery-th eligible window (k set) with no normal or explore cut re-checks its first accepted row r >= 1 that
+    // no stand-in moved (shift 0; rows 0..n-1 are the accepted ones).
+    // STRATA_FRAGILE_CTRL_EVERY > 0: a control window is decided before it runs (win_fctl: no move, every row unmoved, so the first row r >= 1
+    // is taken); off (0): the old selection, every kCtrlEvery-th eligible window, which finds a row only when no stand-in moved one.
+    if (c.fragile_k_set && first < 0 && (c.fr_ctrl_every > 0 ? c.win_fctl : ++c.fr_ctrl_win % RouteResidentCfg::kCtrlEvery == 0)) {
+        first = route_ctrl_first_unmoved(shift, n);
+        if (first >= 0 && control != nullptr) *control = true;
+    }
+    return first;
+}
+
+// A window is cut at its row r >= 1 (the caller keeps rows 0..r-1).  The row's stand-in token and its gap / shift wait for the exact
+// decision of the same position: the next window's row 0, which runs with ranks < lo exact.
+void Verifier::route_fragile_cut(float ratio, int32_t stand_top1, bool explore, bool control) {
+    RouteResidentCfg& c = route_resident_cfg();
+    ++c.fr_cuts;
+    if (explore) ++c.fr_explore_cuts;
+    c.auto_cut_arm = c.auto_win_arm;   // STRATA_ROUTE_BUDGET_AUTO: the cut window's arm; its exact successor is charged to it
+    // SPEC-recheck-cheap change 4: a cut of a timed window (kinds 0 and 3, as route_auto_window times them) counts for its arm
+    if (!control && c.win_kind != 1 && c.win_kind != 2) ++c.auto_cuts[c.auto_cut_arm];
+    c.fragile_pend = true;
+    c.fragile_pend_explore = explore;
+    c.fragile_pend_control = control;
+    c.fragile_pend_ratio = ratio;
+    c.fragile_pend_tok = stand_top1;   // the stand-in window's top-1 id at the cut row (argmax, not the sampled token)
+    c.fragile_exact = true;
+}
+
+// Stop re-check (generate.cpp's serve loop, after route_fragile_cut): the cut row's stand-in token is one of the model's stop ids (o.eos_ids,
+// by id equality).  Counted apart in route_fragile_take; route_fragile_settle counts it kept when the exact run's top-1 agrees.
+void Verifier::route_fragile_stop_cut() {
+    RouteResidentCfg& c = route_resident_cfg();
+    ++c.fr_stop_cuts;
+    c.fragile_pend_stop = true;
+}
+
+bool Verifier::route_fragile_pending() { return route_resident_cfg().fragile_pend; }
+
+// The exact decision of a pending cut row (the first output of the exact window that follows it): a flip is a changed top-1 id.
+// The ring holds the last 200 re-checks of this process (normal and explore cuts).  Every 50 re-checks of this process (and only once the
+// ring holds 50 of them, which the 50th does), k = 1.25 times the largest ratio of the flipped re-checks in the ring, clamped to
+// [0.005, 50].  With no flip in the ring k stays as it is: k never shrinks without evidence.  A pinned k (STRATA_FRAGILE_K0) never moves.
+void Verifier::route_fragile_settle(bool exact_ok, int32_t exact_top1) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.fragile_pend) return;
+    c.fragile_pend = false;
+    const bool stop = c.fragile_pend_stop;   // a stop re-check (route_fragile_stop_cut): counted kept below when the exact top-1 agrees
+    c.fragile_pend_stop = false;
+    if (!exact_ok) return;   // the exact row was not read: no verdict
+    // a flip compares the argmax ids (the stand-in window's top-1 of the cut row, the exact window's top-1 of row 0), not the sampled tokens
+    const bool flipped = exact_top1 != c.fragile_pend_tok;
+    if (stop && !flipped) ++c.fr_stop_kept;
+    if (c.fragile_pend_control) {   // noise control: its own ring and counts, nothing else
+        ++c.fr_ctrl_rc;
+        if (flipped) ++c.fr_ctrl_fl;
+        c.fr_ctrl[c.fr_ctrl_pos] = flipped;
+        strata::core::gate::ctrl_add(c.gs, flipped);   // the persisted noise floor (the last kCtrlKeep control re-checks, cumulative counts)
+        c.fr_ctrl_pos = (c.fr_ctrl_pos + 1) % RouteResidentCfg::kCtrlRing;
+        if (c.fr_ctrl_n < RouteResidentCfg::kCtrlRing) ++c.fr_ctrl_n;
+        return;
+    }
+    // SPEC-recheck-gated step H2: an explore cut's verdict counts for its arm (the margin test's quality veto: flipped or not)
+    if (c.fragile_pend_explore) {
+        ++c.auto_xrc[c.auto_cut_arm];
+        if (flipped) ++c.auto_xfl[c.auto_cut_arm];
+    }
+    ++c.fragile_rechecks;
+    if (flipped) {
+        ++c.fragile_flips;
+        ++c.fr_flips;
+    }
+    // STRATA_FRAGILE_BRAKE / AUTO quality: the request's counts, and the counts of the arm of the cut window (auto_cut_arm)
+    ++c.req_rc;
+    ++c.auto_rc[c.auto_cut_arm];
+    if (flipped) {
+        ++c.req_fl;
+        ++c.req_fl_all;
+        ++c.auto_fl[c.auto_cut_arm];
+        if (c.rollback_on) {   // STRATA_ROLLBACK: where the flip is (route_fragile_pos), for the brake's evidence and the rewind
+            c.req_flip_pos.push_back(c.fragile_pend_pos);
+            if ((int) c.req_flip_pos.size() > RouteResidentCfg::kFlipPosCap) c.req_flip_pos.erase(c.req_flip_pos.begin());
+        }
+    }
+    double flip_lo = 0.0, flip_hi = 0.0, tok_lo = 0.0, tok_hi = 0.0, ctrl_lo = 0.0, ctrl_hi = 0.0;
+    route_wilson90(c.req_fl, c.req_rc, flip_lo, flip_hi);
+    route_wilson90(c.req_fl, c.req_tok, tok_lo, tok_hi);
+    route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, ctrl_lo, ctrl_hi);   // the noise floor: the re-check flips must exceed it too
+    const bool by_recheck = c.req_rc >= RouteResidentCfg::kBrakeMin && flip_lo > std::max(0.2, ctrl_hi);
+    const bool by_token = c.req_tok >= RouteResidentCfg::kBrakeTokMin && c.req_fl >= RouteResidentCfg::kBrakeFlips && tok_lo > 0.01;
+    // STRATA_ROLLBACK: the fast brake - >= kBrakeFlips flips within the last kRecentTok committed tokens (their positions in req_flip_pos)
+    int n_recent = 0;
+    if (c.rollback_on)
+        for (long long q : c.req_flip_pos)
+            if (q >= c.gen_now - RouteResidentCfg::kRecentTok) ++n_recent;
+    const bool by_recent = c.rollback_on && n_recent >= RouteResidentCfg::kBrakeFlips;
+    if (c.brake_on && c.req_b > 0.0f && (by_recheck || by_token || by_recent)) {
+        const float old = c.req_b;
+        // the class's clean level L (0 = none yet): the brake stops at L, unless the request already runs at L (it flipped there: not clean)
+        const float known = (float) c.cls_clean[(size_t) c.req_class];
+        const bool at_known = known > 0.0f && old <= known;
+        float cut = old * 0.5f;
+        if (known > 0.0f && !at_known) cut = std::max(known, cut);
+        c.req_b = cut < 0.01f ? 0.0f : cut;
+        if (at_known) c.cls_clean[(size_t) c.req_class] = (double) c.req_b;   // the known-clean level flipped: it was not clean
+        ++c.req_brakes;
+        std::fprintf(stderr, "strata serve: stand-in brake: budget %.3f -> %.3f (%lld of %lld re-checks flipped, %lld flips in %lld tokens, %s)\n",
+                     (double) old, (double) c.req_b, c.req_fl, c.req_rc, c.req_fl, c.req_tok,
+                     by_recent && !by_token && !by_recheck ? "per 64 tokens" : by_token ? "per token" : "per re-check");
+        if (c.rollback_on) {   // the evidence for the caller's rewind: the flips since the last brake, or the recent ones for the fast brake
+            const bool recent_only = by_recent && !by_token && !by_recheck;
+            long long first = -1, last = -1;
+            for (long long q : c.req_flip_pos) {
+                if (recent_only && q < c.gen_now - RouteResidentCfg::kRecentTok) continue;
+                if (first < 0 || q < first) first = q;
+                if (q > last) last = q;
+            }
+            c.brake_first = first;
+            c.brake_last = last;
+            c.brake_old = old;
+            c.brake_new = c.req_b;
+            ++c.brake_seq;
+            c.req_flip_pos.clear();
+        }
+        c.req_rc = 0;
+        c.req_fl = 0;
+        c.req_tok = 0;
+    }
+    c.fr_ratio[c.fr_pos] = c.fragile_pend_ratio;
+    c.fr_flip[c.fr_pos] = flipped;
+    c.fr_explore[c.fr_pos] = c.fragile_pend_explore;
+    c.fr_pos = (c.fr_pos + 1) % RouteResidentCfg::kFragileRing;
+    if (c.fr_n < RouteResidentCfg::kFragileRing) ++c.fr_n;
+    ++c.fr_session;
+    if (c.fragile_k_pinned || c.fr_session < 50 || c.fr_session % 50 != 0) return;
+    // SPEC-recheck-gated step H1: k_safe from the evidence above the noise floor (k_evidence: the largest flipped ratio whose entries
+    // at or above it have a Wilson lower bound above the control's upper bound); with no such evidence and a full ring, half of the old k
+    double kctrl_lo = 0.0, kctrl_hi = 0.0;
+    route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, kctrl_lo, kctrl_hi);
+    const strata::core::gate::KEvidence ev = strata::core::gate::k_evidence(c.fr_ratio, c.fr_flip, c.fr_n, kctrl_hi);
+    const float old = c.fragile_k;
+    float target = strata::core::gate::k_target(ev, c.fr_n, old, c.fr_ctrl_n);   // (8 Nov: lowering needs measured noise)
+    // a step is bounded: up to 1.5 times the old k, down to 0.5 times it
+    if (target > old) target = std::min(target, 1.5f * old);
+    if (target < old) target = std::max(target, 0.5f * old);
+    c.fragile_k = target;
+    // H3: the k line with the base k_safe, r*, n_t, f_t and the control's upper bound
+    if (c.fragile_k != old) {
+        if (ev.found)
+            std::fprintf(stderr, "strata serve: fragile recheck (APPLY mode %s): k %.3f (base k_safe %.3f (r* %.3f, n_t %lld, f_t %lld; control upper bound %.3f over %d "
+                         "control re-checks); %lld rechecks, %lld flips in all)\n",
+                         subfit_mode_text(c),
+                         (double) c.fragile_k, (double) c.fragile_k, ev.r_star, ev.n_t, ev.f_t, kctrl_hi, c.fr_ctrl_n, c.fragile_rechecks, c.fragile_flips);
+        else
+            std::fprintf(stderr, "strata serve: fragile recheck (APPLY mode %s): k %.3f (no flip above the control's noise (upper bound %.3f over %d control "
+                         "re-checks): k lowered by half; %lld rechecks)\n",
+                         subfit_mode_text(c),
+                         (double) c.fragile_k, kctrl_hi, c.fr_ctrl_n, c.fragile_rechecks);
+        route_tune_write(c);
+    }
+}
+
+// A non-merged decode window's commit: this request's committed tokens (the brake's flips per token; route_fragile_settle).
+void Verifier::route_req_commit(int n_keep) {
+    RouteResidentCfg& c = route_resident_cfg();
+    c.req_tok += n_keep;
+    c.req_tok_all += n_keep;
+}
+
+// STRATA_FRAGILE_BRAKE, at a request's end: its size class learns.  A request that braked lowers the class's start s (x 0.8, at least 0.05).
+// A clean one (>= kBrakeTokMin = 100 committed tokens and a Wilson 90% upper bound of its flips per token <= 0.01) raises s (x 1.1, at most
+// 1.0) and its clean level L to the req_b it ended at (when higher).  Then the file is written.
+void Verifier::route_class_end() {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.brake_on) return;
+    const size_t k = (size_t) c.req_class;
+    c.cls_seen[k] = true;
+    double lo = 0.0, hi = 0.0;
+    route_wilson90(c.req_fl_all, c.req_tok_all, lo, hi);
+    const bool clean = c.req_tok_all >= RouteResidentCfg::kBrakeTokMin && hi <= 0.01;
+    if (c.req_brakes > 0) c.cls_start[k] = std::max(0.05f, 0.8f * c.cls_start[k]);
+    if (clean) {
+        c.cls_start[k] = std::min(1.0f, 1.1f * c.cls_start[k]);
+        c.cls_clean[k] = std::max(c.cls_clean[k], (double) c.req_b);
+    }
+    route_tune_write(c);
+}
+
+// The request's size class, its start fraction and its clean level (after route_class_end), for the stats line.
+void Verifier::route_class_state(int& cls, float& start, float& clean) {
+    const RouteResidentCfg& c = route_resident_cfg();
+    cls = c.req_class;
+    start = c.cls_start[(size_t) c.req_class];
+    clean = (float) c.cls_clean[(size_t) c.req_class];
+}
+
+// This request's cuts, rows moved by stand-ins, flipped re-decisions and k; false when the switch is off.  Takes and resets the counts.
+bool Verifier::route_fragile_take(long long& cuts, long long& explores, long long& moved, long long& flips, float& k, float& med_shift,
+                                  float& med_gap, float& req_b, long long& brakes, long long& ctrl_rc, long long& ctrl_fl, long long& stop_cuts,
+                                  long long& stop_kept) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.fragile_on) return false;
+    cuts = c.fr_cuts;
+    explores = c.fr_explore_cuts;
+    moved = c.fr_moved;
+    flips = c.fr_flips;
+    ctrl_rc = c.fr_ctrl_rc;   // this request's noise control re-checks and their flips
+    ctrl_fl = c.fr_ctrl_fl;
+    c.fr_ctrl_rc = 0;
+    c.fr_ctrl_fl = 0;
+    stop_cuts = c.fr_stop_cuts;   // this request's stop re-checks, and those kept (the exact top-1 agreed)
+    stop_kept = c.fr_stop_kept;
+    c.fr_stop_cuts = 0;
+    c.fr_stop_kept = 0;
+    k = c.fragile_k;
+    req_b = c.req_b;   // this request's budget at its end, and its brakes (not reset here: route_budget_begin resets them)
+    brakes = c.req_brakes;
+    // the medians of the moved rows' stand-in shift and gap (this request's samples; diagnosis)
+    auto median = [](std::vector<float>& v) -> float {
+        if (v.empty()) return 0.0f;
+        std::nth_element(v.begin(), v.begin() + (long) v.size() / 2, v.end());
+        return v[v.size() / 2];
+    };
+    med_shift = median(c.fr_samp_shift);
+    med_gap = median(c.fr_samp_gap);
+    c.fr_samp_shift.clear();
+    c.fr_samp_gap.clear();
+    c.fr_cuts = 0;
+    c.fr_explore_cuts = 0;
+    c.fr_moved = 0;
+    c.fr_flips = 0;
+    return true;
+}
+
+void Verifier::route_budget_after(int n_keep) {
+    if (next_ != nullptr) return next_->route_budget_after(n_keep);   // the last stage holds the head's logits
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.dyn_on) return;
+    bool close = false;   // any kept row with gap < gap_min (or NaN: no comparison holds) makes the next window a close one
+    if (dyn_gap_ == nullptr || n_keep < 1 || n_keep > max_t_) {
+        close = true;
+    } else {
+        std::vector<float> gap((size_t) n_keep);
+        const OnDevice on(device_);
+        if (cudaMemcpy(gap.data(), dyn_gap_, (size_t) n_keep * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void) cudaGetLastError();
+            close = true;
+        } else {
+            for (const float g : gap)
+                if (!(g >= c.dyn_gap)) close = true;
+        }
+    }
+    c.dyn_cur_hi = !close;
+    strata::kernels::route_cfg_set_budget(c.dyn_cur_hi ? c.dyn_hi : c.dyn_lo);
+}
+
+bool Verifier::route_budget_take(long long& n_hi, long long& n_lo, float& b_hi, float& b_lo, float& gap_min) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.dyn_on) return false;
+    n_hi = c.dyn_n_hi;
+    n_lo = c.dyn_n_lo;
+    b_hi = c.dyn_hi;
+    b_lo = c.dyn_lo;
+    gap_min = c.dyn_gap;
+    c.dyn_n_hi = 0;
+    c.dyn_n_lo = 0;
+    return true;
+}
+
+// STRATA_ROUTE_BUDGET_AUTO (see RouteResidentCfg): the interleaved test.  The helpers below run between windows, under the decode loop.
+namespace {
+float auto_clamp_b(double b) { return std::min(4.0f, std::max(0.02f, (float) b)); }
+
+// The decode budget of an arm's window: the base arm runs at the request's req_b, the candidate at req_b * s^d (clamped; 0 stays 0).
+// A mask test runs both arms at req_b.
+float route_auto_arm_b(const RouteResidentCfg& c, int arm) {
+    if (arm == 0 || c.req_b <= 0.0f || c.auto_mask || c.auto_kind != tune::Budget) return c.req_b;   // (step G: cap and prefetch tests too)
+    return auto_clamp_b((double) c.req_b * std::pow((double) c.auto_step, (double) c.auto_dir));
+}
+
+// Clears the running test's arms (counts and times) and starts it.
+void auto_reset_arms(RouteResidentCfg& c) {
+    c.auto_n[0] = c.auto_n[1] = 0;
+    c.auto_tok[0] = c.auto_tok[1] = 0;
+    c.auto_secs[0] = c.auto_secs[1] = 0.0;
+    c.auto_rc[0] = c.auto_rc[1] = 0;
+    c.auto_fl[0] = c.auto_fl[1] = 0;
+    c.auto_cuts[0] = c.auto_cuts[1] = 0;
+    c.auto_xrc[0] = c.auto_xrc[1] = 0;   // step H2: the margin test's explore cuts per arm
+    c.auto_xfl[0] = c.auto_xfl[1] = 0;
+    c.auto_runs = 0;
+    c.auto_run_left = 0;
+    c.auto_testing = true;
+    c.auto_pair = paired::PairStats();
+    c.auto_pt_tok[0] = c.auto_pt_tok[1] = 0.0;
+    c.auto_pt_secs[0] = c.auto_pt_secs[1] = 0.0;
+    c.auto_pair_ready = false;
+}
+
+// Starts a budget test of direction d at the base b.
+void auto_begin_test(RouteResidentCfg& c, int d) {
+    c.auto_dir = d;
+    c.auto_cand_b = auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d));
+    c.auto_mask = false;
+    auto_reset_arms(c);
+}
+
+// A direction whose candidate clamps to the base (b at a bound) is not tested: it counts as a loss at once.
+void auto_next_stage(RouteResidentCfg& c, bool won, int d) {
+    if (won) c.auto_b = c.auto_cand_b;
+    paired::DirState ds{c.auto_first, c.auto_stage};   // a win tests the winning direction first; a keep the other one (paired_test.hpp)
+    ds.update(won, d);
+    c.auto_first = ds.first;
+    c.auto_stage = ds.stage;
+}
+
+// The next scheduled window's arm: runs of kAutoRun windows; run r is arm (r % 2) ^ ((r / 2) % 2), so each pair of runs alternates which arm is first.
+// SPEC-recheck-gated step G: the rotation's next kind after `k` (tune_steps.hpp: budget -> mask -> cap -> prefetch -> budget).
+static int rot_next(const RouteResidentCfg& c, int k) { return tune::next_kind(k, mask_learn_env(), c.tune_cap_on, c.tune_pf_on, c.tune_k_on); }
+
+// SPEC-recheck-gated step H2: a margin test: the candidate m x step^d of its direction (paired::DirState, the step state of the tune); at a
+// bound, a loss at once (no test, false).
+static bool k_test_begin(RouteResidentCfg& c) {
+    auto& t = c.gs.tune;
+    paired::DirState ds{t.k_first, t.k_stage};
+    const int d = ds.dir();
+    double cand = 0.0;
+    if (!tune::k_mult_candidate(t.k_mult, (double) t.k_step, d, cand)) {
+        ds.update(false, d);
+        t.k_first = ds.first;
+        t.k_stage = ds.stage;
+        return false;
+    }
+    c.auto_k_cand = cand;
+    c.auto_kind = tune::KMult;
+    c.auto_mask = false;
+    c.auto_dir = d;
+    auto_reset_arms(c);
+    return true;
+}
+
+// A cap test: the candidate of its direction (paired::DirState); a candidate at the bound is a loss at once (no test, false).
+static bool cap_test_begin(RouteResidentCfg& c) {
+    auto& t = c.gs.tune;
+    paired::DirState ds{t.cap_first, t.cap_stage};
+    const int d = ds.dir();
+    double cu = 0.0, cn = 0.0;
+    if (!tune::cap_candidate(t.cap_unc, t.cap_none, (double) t.cap_step, d, cu, cn)) {
+        ds.update(false, d);
+        t.cap_first = ds.first;
+        t.cap_stage = ds.stage;
+        return false;
+    }
+    c.auto_cap_cu = cu;
+    c.auto_cap_cn = cn;
+    c.auto_kind = tune::Cap;
+    c.auto_mask = false;
+    c.auto_dir = d;
+    auto_reset_arms(c);
+    return true;
+}
+
+// A prefetch test: the candidate count of its direction; at a bound, a loss at once (no test, false).
+static bool pf_test_begin(RouteResidentCfg& c) {
+    auto& t = c.gs.tune;
+    paired::DirState ds{t.pf_first, t.pf_stage};
+    const int d = ds.dir();
+    long long cand = 0;
+    if (!tune::prefetch_candidate(t.prefetch, d, cand)) {
+        ds.update(false, d);
+        t.pf_first = ds.first;
+        t.pf_stage = ds.stage;
+        return false;
+    }
+    c.auto_pf_cand = cand;
+    c.auto_kind = tune::Prefetch;
+    c.auto_mask = false;
+    c.auto_dir = d;
+    auto_reset_arms(c);
+    return true;
+}
+
+void route_auto_schedule(RouteResidentCfg& c) {
+    while (!c.auto_testing) {
+        const int k = c.auto_next_kind;
+        // SPEC-recheck-gated step G / STRATA_MASK=learn: the rotation's mask, cap and prefetch tests start when they can; else the rotation moves on
+        if (k == tune::Mask) {
+            if (c.auto_mask_ok && mask_test_begin()) {
+                c.auto_kind = tune::Mask;
+                c.auto_mask = true;
+                auto_reset_arms(c);
+                break;
+            }
+            c.auto_next_kind = rot_next(c, k);
+            continue;
+        }
+        if (k == tune::Cap || k == tune::Prefetch || k == tune::KMult) {
+            const bool started = k == tune::Cap ? cap_test_begin(c) : k == tune::Prefetch ? pf_test_begin(c) : k_test_begin(c);
+            if (started) break;
+            c.auto_next_kind = rot_next(c, k);
+            continue;
+        }
+        c.auto_kind = tune::Budget;
+        const int d = c.auto_stage == 0 ? c.auto_first : -c.auto_first;
+        const double cand = auto_clamp_b((double) c.auto_b * std::pow((double) c.auto_step, (double) d));
+        // the learned ceiling (b_clean; 2 x the start while none is learned): a candidate above it is not tested (a loss)
+        const double ceiling = c.b_clean > 0.0 ? 2.0 * c.b_clean : 2.0 * (double) c.auto_b0;
+        if (cand != c.auto_b && !(cand > c.auto_b && cand > ceiling)) {
+            auto_begin_test(c, d);
+        } else {
+            auto_next_stage(c, false, d);   // clamped to the base: nothing to test
+        }
+    }
+    if (c.auto_run_left == 0) {
+        c.auto_run_arm = (int) ((c.auto_runs % 2) ^ ((c.auto_runs / 2) % 2));
+        ++c.auto_runs;
+        c.auto_run_left = RouteResidentCfg::kAutoRun;
+    }
+    --c.auto_run_left;
+    c.auto_win_arm = c.auto_run_arm;
+    c.auto_win_sched = true;
+}
+
+// Each pair block (one run per arm) is one sample: d = ln(rate_cand / rate_base) of the block (a block with no committed tokens or no time
+// is no sample).  The look is paired::decide: quality first (the veto: the candidate's flips per committed token, paired::quality_veto, with
+// >= kAutoTokMin tokens per arm, ends the test as a keep), then the sequential rule (move / keep / continue at the cap).
+// A completed test whose candidate had <= 0.5 flips per 100 tokens over >= kCleanTok tokens raises b_clean (the ceiling) to its budget.
+void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why);
+// SPEC-recheck-cheap change 4: cuts per 100 committed tokens of an arm (0 with no tokens)
+double cut_per_100(long long cuts, long long tok) { return tok > 0 ? 100.0 * (double) cuts / (double) tok : 0.0; }
+const char* auto_reason_name(paired::Reason why) {
+    switch (why) {
+        case paired::Reason::Move: return "move";
+        case paired::Reason::BelowDelta: return "keep: below the minimum effect";
+        case paired::Reason::Cap: return "keep: pair cap";
+        case paired::Reason::Quality: return "keep: quality";
+        case paired::Reason::Cuts: return "keep: cuts";
+        default: return "keep";
+    }
+}
+
+// The pair block that just ended: one more sample, then the look.
+void route_auto_pair_done(RouteResidentCfg& c) {
+    c.auto_pair_ready = false;
+    double d = 0.0;
+    if (paired::pair_diff(c.auto_pt_tok[0], c.auto_pt_secs[0], c.auto_pt_tok[1], c.auto_pt_secs[1], d)) c.auto_pair.add(d);
+    c.auto_pt_tok[0] = c.auto_pt_tok[1] = 0.0;
+    c.auto_pt_secs[0] = c.auto_pt_secs[1] = 0.0;
+    bool blocked = paired::quality_veto(c.auto_fl[0], c.auto_tok[0], c.auto_fl[1], c.auto_tok[1], RouteResidentCfg::kAutoTokMin,
+                                        RouteResidentCfg::kBrakeFlips);
+    // SPEC-recheck-gated step H2: the margin test's quality veto is the explore cuts' flips (speed alone never passes the veto)
+    if (c.auto_kind == tune::KMult) {
+        double kc_lo = 0.0, kc_hi = 0.0;
+        route_ctrl_bounds(c.fr_ctrl, c.fr_ctrl_n, kc_lo, kc_hi);
+        blocked = blocked || tune::explore_veto(c.auto_xfl[0], c.auto_xrc[0], c.auto_xfl[1], c.auto_xrc[1], kc_hi, RouteResidentCfg::kExploreMinRc);
+    }
+    // SPEC-recheck-cheap change 4: the candidate's cuts per token (Wilson 90%) against twice the base's: no move (reason "cuts")
+    const bool cut_blocked = paired::cut_veto(c.auto_cuts[0], c.auto_tok[0], c.auto_cuts[1], c.auto_tok[1], RouteResidentCfg::kAutoTokMin);
+    const paired::Rule rule = c.auto_mask ? paired::mask_rule(c.auto_min_effect) : paired::budget_rule(c.auto_min_effect);
+    paired::Reason why = paired::Reason::None;
+    const paired::Verdict v = paired::decide(c.auto_pair, rule, blocked, &why, cut_blocked);
+    if (v != paired::Verdict::Continue) route_auto_test_done(c, v == paired::Verdict::Move, why);
+}
+
+// SPEC-recheck-gated step G: the end of a cap or a prefetch test.  Same arms, same rule, same veto and cut guard as the budget test; a move
+// takes the candidate (the cap's ratio unc / none is kept), the step and direction states move as the budget's do, and the values are saved.
+static void tune_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
+    auto& t = c.gs.tune;
+    const int d = c.auto_dir;
+    const double sb = c.auto_secs[0] > 0.0 ? (double) c.auto_tok[0] / c.auto_secs[0] : 0.0;
+    const double sc = c.auto_secs[1] > 0.0 ? (double) c.auto_tok[1] / c.auto_secs[1] : 0.0;
+    const double pb = c.auto_tok[0] > 0 ? (double) c.auto_fl[0] / (double) c.auto_tok[0] : 0.0;
+    const double pc = c.auto_tok[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_tok[1] : 0.0;
+    const long long pairs = c.auto_pair.n;
+    const double pmean = c.auto_pair.mean, pse = c.auto_pair.se();
+    if (c.auto_kind == tune::Cap) {
+        std::fprintf(stderr, "strata serve: auto cap test %.3f/%.3f vs %.3f/%.3f (unc/none): pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
+                     "%.1f vs %.1f tok/s over %d+%d windows; flips/100 tok %.2f vs %.2f; cuts %lld vs %lld\n",
+                     c.auto_cap_cu, c.auto_cap_cn, t.cap_unc, t.cap_none, pairs, pmean, pse, won ? "move" : "keep", auto_reason_name(why), sc, sb,
+                     (int) c.auto_n[1], (int) c.auto_n[0], 100.0 * pc, 100.0 * pb, c.auto_cuts[1], c.auto_cuts[0]);
+        paired::BudgetStep bs{t.cap_step, t.cap_last_win};
+        bs.update(won, d);
+        t.cap_step = bs.step;
+        t.cap_last_win = bs.last_win;
+        paired::DirState ds{t.cap_first, t.cap_stage};
+        ds.update(won, d);
+        t.cap_first = ds.first;
+        t.cap_stage = ds.stage;
+        if (won) {
+            t.cap_unc = c.auto_cap_cu;
+            t.cap_none = c.auto_cap_cn;
+        }
+        t.set = true;
+        c.auto_next_kind = rot_next(c, tune::Cap);
+    } else if (c.auto_kind == tune::KMult) {
+        // SPEC-recheck-gated step H3: "auto k test m a vs b (k_eff x vs y): pairs N, mean d ..., explore flips f/n vs f/n, -> move|keep (reason)"
+        std::fprintf(stderr, "strata serve: auto k test m %.3f vs %.3f (k_eff %.4f vs %.4f): pairs %lld, mean d %+.4f (se %.4f), "
+                     "explore flips %lld/%lld vs %lld/%lld, -> %s (%s); %.1f vs %.1f tok/s over %d+%d windows\n",
+                     c.auto_k_cand, t.k_mult, c.auto_k_cand * (double) c.fragile_k, t.k_mult * (double) c.fragile_k, pairs, pmean, pse,
+                     c.auto_xfl[1], c.auto_xrc[1], c.auto_xfl[0], c.auto_xrc[0], won ? "move" : "keep", auto_reason_name(why), sc, sb,
+                     (int) c.auto_n[1], (int) c.auto_n[0]);
+        paired::BudgetStep bs{t.k_step, t.k_last_win};
+        bs.update(won, d);
+        t.k_step = bs.step;
+        t.k_last_win = bs.last_win;
+        paired::DirState ds{t.k_first, t.k_stage};
+        ds.update(won, d);
+        t.k_first = ds.first;
+        t.k_stage = ds.stage;
+        if (won) t.k_mult = c.auto_k_cand;
+        t.set = true;
+        c.auto_next_kind = rot_next(c, tune::KMult);
+    } else {
+        std::fprintf(stderr, "strata serve: auto prefetch test %lld vs %lld: pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
+                     "%.1f vs %.1f tok/s over %d+%d windows; flips/100 tok %.2f vs %.2f; cuts %lld vs %lld\n",
+                     (long long) c.auto_pf_cand, t.prefetch, pairs, pmean, pse, won ? "move" : "keep", auto_reason_name(why), sc, sb,
+                     (int) c.auto_n[1], (int) c.auto_n[0], 100.0 * pc, 100.0 * pb, c.auto_cuts[1], c.auto_cuts[0]);
+        paired::DirState ds{t.pf_first, t.pf_stage};
+        ds.update(won, d);
+        t.pf_first = ds.first;
+        t.pf_stage = ds.stage;
+        if (won) t.prefetch = c.auto_pf_cand;
+        t.set = true;
+        c.auto_next_kind = rot_next(c, tune::Prefetch);
+    }
+    c.auto_kind = tune::Budget;
+    c.auto_mask = false;
+    c.auto_testing = false;
+    route_tune_write(c);
+}
+
+void route_auto_test_done(RouteResidentCfg& c, bool won, paired::Reason why) {
+    if (c.auto_kind == tune::Cap || c.auto_kind == tune::Prefetch || c.auto_kind == tune::KMult) {
+        tune_test_done(c, won, why);
+        return;
+    }
+    const int d = c.auto_dir;
+    const double sb = c.auto_secs[0] > 0.0 ? (double) c.auto_tok[0] / c.auto_secs[0] : 0.0;
+    const double sc = c.auto_secs[1] > 0.0 ? (double) c.auto_tok[1] / c.auto_secs[1] : 0.0;
+    const double fb = c.auto_rc[0] > 0 ? (double) c.auto_fl[0] / (double) c.auto_rc[0] : 0.0;
+    const double fc = c.auto_rc[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_rc[1] : 0.0;
+    const double pb = c.auto_tok[0] > 0 ? (double) c.auto_fl[0] / (double) c.auto_tok[0] : 0.0;   // flips per committed token
+    const double pc = c.auto_tok[1] > 0 ? (double) c.auto_fl[1] / (double) c.auto_tok[1] : 0.0;
+    const long long pairs = c.auto_pair.n;
+    const double pmean = c.auto_pair.mean, pse = c.auto_pair.se();
+    if (c.auto_mask) {   // STRATA_MASK=learn: a mask test decides the mask's (p, g); no budget state moves
+        double pg[4] = {0.0, 0.0, 0.0, 0.0};
+        const bool moved = mask_test_end(won, pg);
+        std::fprintf(stderr, "strata serve: auto mask test (%.3f,%.3f) vs (%.3f,%.3f): pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
+                     "%.1f vs %.1f tok/s over %d+%d windows -> (%.3f,%.3f); flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f; "
+                     "cuts %lld vs %lld (%.1f vs %.1f /100 tok)\n",
+                     pg[2], pg[3], pg[0], pg[1], pairs, pmean, pse, moved ? "move" : "keep", auto_reason_name(why), sc, sb,
+                     (int) c.auto_n[1], (int) c.auto_n[0], moved ? pg[2] : pg[0], moved ? pg[3] : pg[1], fc, fb, c.auto_rc[1], c.auto_rc[0],
+                     100.0 * pc, 100.0 * pb, c.auto_cuts[1], c.auto_cuts[0], cut_per_100(c.auto_cuts[1], c.auto_tok[1]),
+                     cut_per_100(c.auto_cuts[0], c.auto_tok[0]));
+        c.auto_mask = false;
+        c.auto_kind = tune::Budget;
+        c.auto_next_kind = rot_next(c, tune::Mask);   // step G: the rotation's next kind (cap, prefetch or budget)
+        c.auto_testing = false;
+        return;
+    }
+    if (c.auto_tok[1] >= RouteResidentCfg::kCleanTok && 100.0 * (double) c.auto_fl[1] <= 0.5 * (double) c.auto_tok[1]
+        && (double) c.auto_cand_b > c.b_clean)
+        c.b_clean = (double) c.auto_cand_b;
+    const float b_old = c.auto_b, cand = c.auto_cand_b, step = c.auto_step;   // step: the factor this test's candidate used
+    paired::BudgetStep bs{c.auto_step, c.auto_last_win};   // the step (paired_test.hpp): a win in the same direction grows it, a keep shrinks it
+    bs.update(won, d);
+    c.auto_step = bs.step;
+    c.auto_last_win = bs.last_win;
+    auto_next_stage(c, won, d);
+    std::fprintf(stderr, "strata serve: auto budget test %.3f vs %.3f: pairs %lld, mean d %+.4f (se %.4f), -> %s (%s); "
+                 "%.1f vs %.1f tok/s over %d+%d windows step %.2f -> %.3f; flip rate %.3f vs %.3f (%lld vs %lld re-checks); flips/100 tok %.2f vs %.2f; "
+                 "cuts %lld vs %lld (%.1f vs %.1f /100 tok)\n",
+                 (double) cand, (double) b_old, pairs, pmean, pse, won ? "move" : "keep", auto_reason_name(why), sc, sb,
+                 (int) c.auto_n[1], (int) c.auto_n[0], (double) step, (double) c.auto_b, fc, fb, c.auto_rc[1], c.auto_rc[0], 100.0 * pc, 100.0 * pb,
+                 c.auto_cuts[1], c.auto_cuts[0], cut_per_100(c.auto_cuts[1], c.auto_tok[1]), cut_per_100(c.auto_cuts[0], c.auto_tok[0]));
+    c.auto_testing = false;
+    ++c.auto_tests;
+    ++c.auto_tests_take;
+    c.auto_kind = tune::Budget;
+    c.auto_next_kind = rot_next(c, tune::Budget);   // step G: the rotation's next kind (mask when on, else cap, prefetch, budget)
+    route_tune_write(c);
+}
+}  // namespace
+
+bool Verifier::route_auto_on() { return route_resident_cfg().auto_on; }
+
+// One non-merged decode window's commit.  Its wall time: from its ver.run start, or, when the previous window was the same request, from
+// that window's end (the loop's own work between the windows counts; the gap between two requests does not).  The window's time and
+// tokens go to the arm that ran it (auto_win_arm).  A pair block that ended is decided once no cut is pending.
+void Verifier::route_auto_window(int n_keep, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.auto_on) return;
+    const bool same = c.auto_have_last && c.auto_last_req == c.auto_req;
+    const std::chrono::steady_clock::time_point seg = same ? c.auto_last_end : start;
+    const int arm = c.auto_win_arm;
+    double dt = 0.0;
+    if (end > seg) dt = std::chrono::duration<double>(end - seg).count();
+    // a control window (win_kind 1 fragile, 2 mask: stand-in or mask moves off, slower or faster by design) is not either arm's speed:
+    // its time and tokens are left out of the test, while the run bookkeeping below still counts it
+    if (c.win_kind != 1 && c.win_kind != 2) {
+        c.auto_secs[arm] += dt;
+        c.auto_pt_secs[arm] += dt;
+        c.auto_tok[arm] += n_keep;
+        c.auto_pt_tok[arm] += n_keep;
+    }
+    c.auto_last_end = end;
+    c.auto_last_req = c.auto_req;
+    c.auto_have_last = true;
+    if (c.auto_win_sched) {
+        ++c.auto_n[arm];
+        // the second run of a pair block (runs 2k, 2k+1: one run per arm) ended
+        if (c.auto_run_left == 0 && (c.auto_runs - 1) % 2 == 1) c.auto_pair_ready = true;
+    }
+    if (c.auto_testing && c.auto_pair_ready && !c.fragile_exact) route_auto_pair_done(c);
+}
+
+// The AUTO budget and the tests finished since the last call (false when the switch is off).
+bool Verifier::route_auto_take(float& budget, long long& tests) {
+    RouteResidentCfg& c = route_resident_cfg();
+    if (!c.auto_on) return false;
+    budget = c.auto_b;
+    tests = c.auto_tests_take;
+    c.auto_tests_take = 0;
+    return true;
+}
 
 bool Verifier::commit(int n_keep, std::string &err) try {
     const OnDevice on_device(device_);
@@ -2779,8 +7465,10 @@ bool Verifier::init_slots(const std::vector<SessionState *> &slots,
     }
     for (SessionState* x : slots) {
         if (x == nullptr || x->layer_lo != ss_->layer_lo || x->layer_hi != ss_->layer_hi ||
-            x->max_cells != ss_->max_cells || x->gdn_ord0 != ss_->gdn_ord0 || x->qsa_ord0 != ss_->qsa_ord0) {
-            err = "verify: a slot's session is not carved like the stage's own (layer range, context)";
+            x->max_cells > ss_->max_cells || x->gdn_ord0 != ss_->gdn_ord0 || x->qsa_ord0 != ss_->qsa_ord0) {
+            // (a slot may hold FEWER cells than the stage's own session, --batch-context: the verifier's scratch is sized from the stage's own, and
+            // the window's positions are checked against each slot's own max_cells further down; a larger one would overrun that scratch)
+            err = "verify: a slot's session is not carved like the stage's own (layer range) or holds more cells than it (context)";
             return false;
         }
     }
@@ -2805,8 +7493,9 @@ bool Verifier::init_slots(const std::vector<SessionState *> &slots,
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     slots_ = slots;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
-    std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))\n", (long long) S,
-                 (long long) lb_, (long long) le_);
+    slot_q_.assign(slots.size(), nullptr);
+    std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s\n", (long long) S,
+                 (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "");
     return true;
 }
 catch (sycl::exception const &exc) {
@@ -2815,10 +7504,34 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-bool Verifier::capture_batch(const int *rows, int S, int hbase,
-                             std::string &err) try {
-    dpct::experimental::command_graph_exec_ptr &ex =
-        exec_bm_[bkey(rows, S, hbase)];
+void Verifier::release_slots() {
+    if (slots_.empty() && arena_b_ == nullptr && exec_bm_.empty() && commit_bm_.empty() && h_commitb_ == nullptr) return;
+    const OnDevice on_device(device_);
+    if (cs_) cudaStreamSynchronize(cs_);
+    for (auto& kv : exec_bm_)
+        if (kv.second) cudaGraphExecDestroy(kv.second);
+    exec_bm_.clear();
+    for (auto& kv : commit_bm_)
+        if (kv.second) cudaGraphExecDestroy(kv.second);
+    commit_bm_.clear();
+    bm_used_.clear();
+    bm_tick_ = 0;
+    if (arena_b_) { cudaFree(arena_b_); arena_b_ = nullptr; }
+    commitb_ = nullptr;
+    tail_snap_b_ = nullptr;
+    if (h_commitb_) { cudaFreeHost(h_commitb_); h_commitb_ = nullptr; }
+    m_commitb_ = nullptr;
+    slots_.clear();
+    slot_sp_.clear();
+    slot_q_.clear();
+    last_batch_ = false;
+    batch_rec_ = false;
+    for (int& r : last_rows_) r = 0;
+    for (int64_t& p : last_pos_b_) p = 0;
+}
+
+bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
+    cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
     if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
         err = "verify: begin batch capture failed";
@@ -2883,10 +7596,9 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-bool Verifier::capture_commit_batch(const int *rows, int S, int hbase,
-                                    std::string &err) try {
-    dpct::experimental::command_graph_exec_ptr &cex =
-        commit_bm_[bkey(rows, S, hbase)];
+bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
+    if (batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
+    cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
     if (cex != nullptr) return true;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -2913,6 +7625,15 @@ bool Verifier::capture_commit_batch(const int *rows, int S, int hbase,
             if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
+                // STRATA_BATCH_GDN_GROUPS=1: one-row groups (no --batch-mtp proposals) commit their recurrence
+                // in one launch for all slots; the conv commits stay per slot
+                static const bool gdn_groups_on = [] {
+                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                bool one_row = S <= 8;
+                for (int t = 1; one_row && t < S; ++t) one_row = rows[t] != rows[t - 1];
+                strata::kernels::GdnGroups gg;
                 for (int t = 0; t < S;) {
                     const int first = t;
                     while (t < S && rows[t] == rows[first]) ++t;
@@ -2922,6 +7643,14 @@ bool Verifier::capture_commit_batch(const int *rows, int S, int hbase,
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                     gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) first * C,
                                     (int) C, keep, cs_);
+                    if (gdn_groups_on && one_row) {
+                        gg.state[gg.n] = state;
+                        gg.keep[gg.n] = keep;
+                        gg.first[gg.n] = first;
+                        gg.ntok[gg.n] = 1;
+                        ++gg.n;
+                        continue;
+                    }
                     gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, (int) C,
                                         gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
                                         beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
@@ -2930,6 +7659,11 @@ bool Verifier::capture_commit_batch(const int *rows, int S, int hbase,
                                         (int) HV, t - first, keep, cs_,
                                         t - first > 1 ? t - first : 0);   // a 1-row group keeps the 0.1.39 kernel
                 }
+                if (gg.n > 0)
+                    gdn_step_norm_groups(gg, h_L_ + (size_t) gdn_index * MT * C, (int) C,
+                                         gate_L_ + (size_t) gdn_index * MT * HV, beta_L_ + (size_t) gdn_index * MT * HV,
+                                         z_, (const float*) wnm->data, EPS, y_dummy_, (int) g.ssm_k_heads, (int) HV, true,
+                                         cs_);
                 ++gdn_index;
             } else {
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
@@ -2992,13 +7726,50 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key,
+                                   const char* what, std::string& err) {
+    // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
+    // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
+    // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
+    int freed = 0;
+    // keep the floor (set_batch_graph_floor): free the least recently used layouts BEFORE the capture takes the last of the VRAM a prompt's buffers need
+    if (batch_graph_floor_ > 0) {
+        constexpr uint64_t kGraphMargin = 64ull << 20;   // a batch graph pair is 20-30 MiB
+        for (bool evicted = true; evicted;) {
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) != cudaSuccess || (uint64_t) fb >= batch_graph_floor_ + kGraphMargin) break;
+            if (!evict_batch_graph(key, evicted, err)) return false;
+            if (evicted) ++freed;   // (nothing older to free: capture anyway)
+        }
+    }
+    cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
+    for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
+        (void) cudaGetLastError();
+        if (!evict_batch_graph(key, evicted, err)) return false;
+        if (evicted) {
+            ++freed;
+            ie = cudaGraphInstantiate(&ex, graph, 0);
+        }
+    }
+    if (freed > 0)
+        std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed the graphs of %d older batch slot "
+                             "layouts, %zu kept (a larger --vram-reserve-mib keeps more)\n", freed, exec_bm_.size());
+    if (ie != cudaSuccess) {
+        err = std::string(what) + cudaGetErrorString(ie);
+        return false;
+    }
+    return true;
+}
+
 bool Verifier::stage_batch(const int *rows, int S, int hbase,
                            const int32_t *tokens, const int64_t *pos,
                            std::string &err) try {
     using namespace strata::kernels;
-    if (S < 1 || S > max_t_ || hbase < 0 ||
-        (next_ != nullptr && hbase + S > (int) slots_.size())) {
-        err = "verify: batch rows out of range (init_slots)";
+    // the row layout: a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split,
+    // whose hand-off buffers hold kVerifyMaxT rows, or set_handoff_rows' (a stage that hands rows on or takes them)
+    if (const char* why = batch_rows_error(rows, S, pos, (int) slots_.size(), max_t_, hbase,
+                                           next_ != nullptr || lb_ > 0, handoff_rows_ > 0 ? handoff_rows_ : kVerifyMaxT)) {
+        err = why;
         return false;
     }
     for (int t = 0; t < S; ++t) {
@@ -3098,6 +7869,11 @@ bool Verifier::stage_batch(const int *rows, int S, int hbase,
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_xlseq_ != nullptr) {   // latent-experts branch: the D stage's doorbell restarts with the window, and the CPU pool finds this verifier's D rows
+        *(volatile uint32_t*) h_xlseq_ = 0;
+        strata::core::latent_xl_current() = (const uint8_t*) h_latxl_;
+        strata::core::latent_xlseq_current() = h_xlseq_;
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
@@ -3126,6 +7902,8 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
+    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    if (lb_ == 0) router_trace_tokens(tokens, S);   // STRATA_ROUTER_TRACE (measurement)
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
     const dpct::err0 le =
         DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*exec_bm_[bkey(rows, S, 0)]));
@@ -3227,7 +8005,13 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
         cur_layer_ = want - 1;
         set_plan_slot(0);
         progress_at("verify batch: the CPU experts of layer", l);
+        // The recorded graph consumes the helper mask and weighted sum just as
+        // the solo graph does. Reset both and supply this layer's routing weights.
+        if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
+        strata::core::expert_dispatch_set_weights(h_w_);
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        strata::core::expert_dispatch_set_weights(nullptr);
+        if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -3239,7 +8023,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
@@ -3305,40 +8089,11 @@ bool Verifier::commit_slot_prefixes(const int *keep, std::string &err) try {
             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const dpct::err0 le = DPCT_CHECK_ERROR(
-        (cs_)->ext_oneapi_graph(*commit_bm_[bkey(last_rows_, S, row_base_)]));
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (le != 0) {
-      err = std::string("verify: batch commit launch: ") +
-            dpct::get_error_string_dummy(le);
-      return false;
-    }
-    const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (se != 0) {
-      err = std::string("verify: batch commit: ") +
-            dpct::get_error_string_dummy(se);
-      return false;
+    if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
+        const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
+        if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
     }
     if (ple_stage())
         for (int t = 0; t < S;) {
@@ -3361,18 +8116,53 @@ catch (sycl::exception const &exc) {
 
 bool Verifier::sample_rows(int S, std::string &err) try {
     bool any = false;
-    for (int t = 0; t < S; ++t) {
-        strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
-        sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        sp.penalty_last_n = 0;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
-                                       m_out_ + t, cs_);
-        any = true;
+    for (int t = 0; t < S;) {
+        const int slot = last_rows_[t];
+        int n = 1;   // the slot's contiguous rows: one, or two (the token and its proposal, --batch-mtp)
+        while (t + n < S && last_rows_[t + n] == slot) ++n;
+        strata::kernels::SamplerParams sp = slot_sp_[(size_t) slot];
+        if (!(sp.greedy || sp.temperature <= 0.0f)) {
+            sp.penalty_last_n = 0;
+            // STRATA_SPEC_PROB: the slot's proposal was drawn from the drafter's q, so judge it by rejection sampling (spec_prob.hpp): row t judges the proposal
+            // last_tokens_[t + 1], with the same uniforms as the solo window at this position (counter = the first row's position).  Where the kernel cannot run the
+            // rows are sampled one by one as before: the proposal is then kept when it equals the target's sample, which is still exactly the target's distribution.
+            const int32_t* q = (size_t) slot < slot_q_.size() ? slot_q_[(size_t) slot] : nullptr;
+            bool judged = false;
+            if (n == 2 && q != nullptr) {
+                if (d_spec_ == nullptr &&
+                    cudaMalloc((void**) &d_spec_, (size_t) strata::kernels::kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    d_spec_ = nullptr;
+                }
+                if (d_spec_ != nullptr) {
+                    int32_t* d_q = d_spec_ + strata::kernels::kVerifyMaxT;
+                    strata::kernels::SamplerParams gp = sp;
+                    gp.counter = (uint64_t) last_pos_b_[t];
+                    int32_t proposal = last_tokens_[t + 1];
+                    if (cudaMemcpyAsync(d_spec_, &proposal, sizeof(int32_t), cudaMemcpyHostToDevice, cs_) == cudaSuccess &&
+                        cudaMemcpyAsync(d_q, q, (size_t) strata::core::kSpecQStride * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) == cudaSuccess)
+                        judged = strata::kernels::sample_tokens_spec(head_logits_ + (size_t) t * (size_t) n_vocab_, 2, (int) n_vocab_, nullptr, 0, gp,
+                                                                     d_spec_, d_q, 1, m_out_ + t, cs_);
+                    if (judged) {
+                        // the copies above read `proposal` and the next group reuses d_spec_: finish them before this frame ends
+                        if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+                        ++spec_windows;
+                    }
+                }
+            }
+            if (!judged)
+                for (int j = 0; j < n; ++j) {
+                    strata::kernels::SamplerParams rp = sp;
+                    rp.counter = (uint64_t) last_pos_b_[t + j];   // Philox(seed, position): the solo window's draw for this position
+                    strata::kernels::sample_tokens(head_logits_ + (size_t) (t + j) * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, rp,
+                                                   m_out_ + t + j, cs_);
+                }
+            any = true;
+        }
+        t += n;
     }
-    if (any && DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-      err = "verify batch: the row sampling failed"; return false;
-    }
+    for (const int32_t*& q : slot_q_) q = nullptr;   // taken once
+    if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
     return true;
 }
 catch (sycl::exception const &exc) {
@@ -3387,38 +8177,24 @@ bool Verifier::batch_launch(int base, int S, const int32_t *tokens,
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    if (lb_ == 0) router_trace_tokens(tokens, S);   // STRATA_ROUTER_TRACE (measurement)
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
-    dpct::err0 le = DPCT_CHECK_ERROR(
-        (cs_)->ext_oneapi_graph(*exec_bm_[bkey(rows, S, base)]));
-    if (le == 0) le = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*commit_bm_[bkey(
-        rows, S, base)])); // right behind it: every row is kept
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (le != 0) {
-      err = std::string("verify: batch launch: ") +
-            dpct::get_error_string_dummy(le);
-      return false;
-    }
-    (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
+    if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
+        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+    if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
         for (int t = 0; t < S; ++t) {
             SessionState& sx = *slots_[(size_t) rows[t]];
             sx.ple_prev[0] = sx.ple_prev[1];
             sx.ple_prev[1] = tokens[t];
         }
-    b_running_ = true;
     b_k_ = 0;
     b_steps_ = le_ - lb_;
-    b_last_ = Clock::now();
+    ring_now();
+    b_running_.store(true, std::memory_order_release);   // last: an external server reads the rest after it
     return true;
 }
 catch (sycl::exception const &exc) {
@@ -3427,53 +8203,38 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
-    if (!b_running_) return 1;
-    const OnDevice on_device(device_);
+int Verifier::batch_serve(PoolMultiFn pool, void* user) {
+    if (!b_running_.load(std::memory_order_acquire)) return 1;
     volatile uint32_t* const seq = h_seq_;
-    const int S = last_t_;
     // #646: an all-resident stage's graph raises no host doorbells (see run_slot_rows): nothing to serve per layer,
-    // so the poll is just "has the graph finished" - except the PLE flag, which the graph's first wait reads and
-    // only the host can raise (the same raise run_slot_rows makes).
-    if (all_resident_ && ss_->ple.ready() && ple_stage()) {
+    // except the PLE flag, which the graph's first wait reads and only the host can raise (the same raise
+    // run_slot_rows makes).  Per-window (ar_on): with a loan in flight the doorbell graph needs the per-layer service.
+    if (ar_on() && ss_->ple.ready() && ple_stage()) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
         *h_flag_ = 1;
     }
-    while (!all_resident_ && b_k_ < b_steps_) {
-        const uint32_t want = (uint32_t) (b_k_ + 1);
-        if (*seq < want) {
-            const auto now = Clock::now();
-            if (now - b_last_ > std::chrono::milliseconds(2)) {
-                const dpct::err0 q = cs_->ext_oneapi_empty() ? 0 : 1;
-                if (q != 1 && *seq < want) {
-                    err = "verify batch: layer " + std::to_string(lb_ + b_k_) +
-                          " never rang (" +
-                          /*
-                          DPCT1009: SYCL reports errors using exceptions and
-                          does not use error codes. Please replace the
-                          "get_error_string_dummy(...)" with a real
-                          error-handling function.
-                          */
-                          (q == 0
-                               ? std::string("graph finished")
-                               : std::string(dpct::get_error_string_dummy(q))) +
-                          ")";
-                    b_running_ = false;
-                    return -1;
-                }
-                if (now - b_last_ > strata_ring_timeout()) {
-                    err = "verify batch: timed out at layer " + std::to_string(lb_ + b_k_) + released_note(release_gpu_waits(5000));
-                    b_running_ = false;
-                    return -1;
-                }
-            }
-            return 0;
-        }
+    for (;;) {
+        // the window's row count is read after the served-layer count: with external serving the window this call
+        // began on can have finished and the next one been launched meanwhile, and batch_launch writes its rows
+        // (stage_batch) before it resets b_k_, so a count that is the new window's comes with the new rows
+        const int64_t k = b_k_.load(std::memory_order_acquire);
+        if (ar_on() || k >= b_steps_) break;
+        const uint32_t want = (uint32_t) (k + 1);
+        if (*seq < want) return 0;
+        if (released_.load()) return 1;   // the poll gave this window up (release_gpu_waits): serve nothing more
+        const int S = last_t_;
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
         set_plan_slot(0);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+        if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
+        strata::core::expert_dispatch_set_weights(h_w_);
+        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + k);
+        strata::core::expert_dispatch_set_weights(nullptr);
+        if (remote_opt_) remote_opt_->end();
+        // with external serving the poll may have released the GPU's waits (flags at UINT32_MAX) while this layer's pool ran: the
+        // plain stores below would lower them again and block the GPU at the next layer with nobody serving it
+        if (released_.load()) return 1;
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -3485,12 +8246,68 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         *(volatile uint32_t*) h_flag_ = want;
         ms_pool += ms_since(b);
-        b_last_ = Clock::now();
-        ++b_k_;
+        ring_now();
+        b_k_.fetch_add(1, std::memory_order_release);
+    }
+    return 1;
+}
+
+int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+    if (!b_running_) return 1;
+    // set_external_serve: another thread serves the doorbells (batch_serve) and this one only checks for a window that
+    // will not finish, as below: its graph ended (or failed) with a layer still to ring, or no layer rang for 20 s.
+    // The stream query can wait for the driver's lock while a read's call holds it; the doorbells go on meanwhile.
+    // The served count is read before the query and the ring count after it: a layer served in between rang first.
+    if (ext_serve_.load(std::memory_order_acquire) && !ar_on()) {
+        const int64_t k = b_k_.load(std::memory_order_acquire);
+        if (k < b_steps_) {
+            const auto now = Clock::now();
+            if (now - last_ring() <= std::chrono::milliseconds(2) || now - ext_checked_ < std::chrono::milliseconds(1))
+                return 0;
+            ext_checked_ = now;   // (at most one query a millisecond: pump calls this in a loop)
+            const OnDevice on_device(device_);
+            const cudaError_t q = cudaStreamQuery(cs_);
+            if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < (uint32_t) (k + 1)) {
+                err = "verify batch: layer " + std::to_string(lb_ + k) + " never rang (" +
+                      (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                b_running_ = false;
+                return -1;
+            }
+            if (now - last_ring() > std::chrono::seconds(20)) {
+                err = "verify batch: timed out at layer " + std::to_string(lb_ + k) +
+                      released_note(release_gpu_waits(5000));
+                b_running_ = false;
+                return -1;
+            }
+            return 0;
+        }
+    }
+    const OnDevice on_device(device_);
+    const int S = last_t_;
+    // the layers that have rung so far (batch_serve); with one still to ring: did the graph finish without it, or
+    // has it waited too long?
+    if (!batch_serve(pool, user)) {
+        const auto now = Clock::now();
+        if (now - last_ring() > std::chrono::milliseconds(2)) {
+            const cudaError_t q = cudaStreamQuery(cs_);
+            if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < (uint32_t) (b_k_ + 1)) {
+                err = "verify batch: layer " + std::to_string(lb_ + b_k_) + " never rang (" +
+                      (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                b_running_ = false;
+                return -1;
+            }
+            if (now - last_ring() > std::chrono::seconds(20)) {
+                err = "verify batch: timed out at layer " + std::to_string(lb_ + b_k_) +
+                      released_note(release_gpu_waits(5000));
+                b_running_ = false;
+                return -1;
+            }
+        }
+        return 0;
     }
     const dpct::err0 q = cs_->ext_oneapi_empty() ? 0 : 1;
     /*
@@ -3668,6 +8485,8 @@ bool Verifier::pl_launch(int T, const int32_t *tokens, int64_t pos0,
         err = "verify: pipelined window not prepared (capture_all)";
         return false;
     }
+    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    if (lb_ == 0) router_trace_tokens(tokens, T);   // STRATA_ROUTER_TRACE (measurement)
     const Clock::time_point t0 = Clock::now();
     last_batch_ = false;
     bool staged = pl_prestaged_ && last_t_ == T && last_pos0_ == pos0;
@@ -3685,7 +8504,9 @@ bool Verifier::pl_launch(int T, const int32_t *tokens, int64_t pos0,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
-    const dpct::err0 le = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*exec_[T]));
+    la_learn_before_launch();
+    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    if (le == cudaSuccess && !la_learn_after_launch(T, err)) return false;
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     /*
     DPCT1009: SYCL reports errors using exceptions and does not use error
@@ -3801,9 +8622,11 @@ int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
             return -1;
         }
         progress_at("verify window (pipelined): the CPU experts of layer", l);
+        strata::core::expert_dispatch_set_weights(h_w_ + (size_t) tb * ss.k);   // STRATA_TAIL_WEIGHT reads the slice's router weights
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        strata::core::expert_dispatch_set_weights(nullptr);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", fl_k_, l,
                               (int64_t) ms_since(b));
         progress_tick();
@@ -3817,7 +8640,7 @@ int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         if (fl_k_ == 0 && !gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = want;
@@ -3888,6 +8711,9 @@ bool Verifier::pl_finish(int32_t *out, std::string &err) try {
     }
     if (out != nullptr)
         for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    note_nonfinite(T, nullptr);
+    if (dtr_ != nullptr && T == last_t_)   // STRATA_DRAFT_TRACE (measurement): the window pl_launch staged
+        draft_trace_write(T, last_tokens_, last_pos0_, h_out_);
     progress_beat();
     return true;
 }
@@ -3897,7 +8723,49 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-bool Verifier::pl_commit_async(int n_keep, std::string &err) try {
+void Verifier::draft_trace_write(int T, const int32_t* tokens, int64_t pos0, const int32_t* out) {
+    DraftTrace& d = draft_trace();
+    const int64_t N = g_->n_embd, HC = g_->hc, L = (int64_t) d.layers.size();
+    std::vector<float> res((size_t) (L * max_t_ * HC * N));
+    if (cudaMemcpy(res.data(), dtr_, res.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    std::vector<uint16_t> row((size_t) (T * L * N));
+    for (int t = 0; t < T; ++t)
+        for (int64_t s = 0; s < L; ++s) {
+            const float* r = res.data() + ((size_t) s * max_t_ + t) * HC * N;   // HC streams of N, stream-major
+            uint16_t* o = row.data() + ((size_t) t * L + s) * N;
+            for (int64_t i = 0; i < N; ++i) {
+                float m = 0.0f;
+                for (int64_t h = 0; h < HC; ++h) m += r[h * N + i];
+                m /= (float) HC;
+                uint32_t b;
+                std::memcpy(&b, &m, 4);
+                b += 0x7fffu + ((b >> 16) & 1u);   // bf16, round to nearest even (the values are finite: the NaN guard reports otherwise)
+                o[i] = (uint16_t) (b >> 16);
+            }
+        }
+    std::vector<int32_t> picks((size_t) T);
+    for (int t = 0; t < T; ++t) picks[(size_t) t] = ((const volatile int32_t*) out)[t];
+    std::lock_guard<std::mutex> lk(d.mu);
+    if (d.f == nullptr) return;
+    if (!d.header) {
+        const uint32_t hdr[4] = {0x31544644u /* "DFT1" */, (uint32_t) L, (uint32_t) N, (uint32_t) HC};
+        std::fwrite(hdr, 4, 4, d.f);
+        std::fwrite(d.layers.data(), 4, d.layers.size(), d.f);
+        d.header = true;
+    }
+    const int32_t t32 = T;
+    std::fwrite(&pos0, 8, 1, d.f);
+    std::fwrite(&t32, 4, 1, d.f);
+    std::fwrite(tokens, 4, (size_t) T, d.f);
+    std::fwrite(picks.data(), 4, (size_t) T, d.f);
+    std::fwrite(row.data(), 2, row.size(), d.f);
+    std::fflush(d.f);
+}
+
+bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
@@ -3979,6 +8847,683 @@ void Verifier::absorb_stats(Verifier& o) {
         for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
     prof_windows_ += o.prof_windows_;
     o.prof_windows_ = 0;
+}
+
+}  // namespace strata::core
+
+// ================================ STRATA_MASK=learn (opt-in) ================================
+// The mask learns from the model's own divergence on the user's traffic (the DeepSeek port, ds4 DS4_MASK=learn).  A flip re-check cuts a
+// decode window at its row r; the next window runs exact and its row 0 re-decides that position.  D = KL(exact || the cut row's first pass)
+// is shared over the row's replaced picks (w x gap) as harm; every replaced pick of a decode row is exposure.  A (layer, expert) harm rate
+// = harm / exposure (both decayed).  The masked experts are the lowest-rate ones among the least-used (the profile seeds them), up to the
+// share p; p follows the re-checks' agreement; an expert with enough exposure and a rate under its layer's 10th percentile is masked at
+// every rank (level 2).  The table is in mask-learn-<model>.bin beside the stand-in tuning file.
+namespace strata::core {
+namespace {
+constexpr double kMlP0 = 0.05, kMlPMax = 0.95;
+constexpr long long kMlMaskEvery = 256, kMlDecayEvery = 8192, kMlSampleEvery = 64, kMlSaveEvery = 4096;
+constexpr double kMlMinAg = 32.0, kMlMinExpo = 256.0;
+constexpr double kMlMinSide = 16.0, kMlPMin = 0.025;   // re-checks needed on each side of the comparison; the share's floor
+constexpr int kMlMinPop = 8;
+constexpr double kMtStepP = 0.025, kMtStepG = 0.1;   // a mask test's candidate: one step of the share p and of the level-2 fraction g
+constexpr long long kMlControlEvery = 8;   // STRATA_MASK_RESIDENT: one decode window in 8 is a control (no mask moves), so p and g get their "without" side
+
+struct MaskLearnState {
+    struct Pick {
+        int64_t l, e;
+        double x;
+    };
+    int64_t nl = 0, ne = 0;
+    std::vector<int64_t> pos;        // [nl][ne] the profile rank of each pair (higher = less used; INT64_MAX: not ranked)
+    std::vector<double> harm, expo;  // [nl][ne] decayed
+    std::vector<uint8_t> lv;         // [nl][ne] 0 unmasked, 1 masked (the rank rule), 2 masked at every rank
+    std::vector<uint32_t> stamp;     // [nl][ne] dedup of one row's entries
+    uint32_t stamp_id = 0;
+    // STRATA_MASK_RESIDENT: the SSD demand per (layer, expert): the router's picks that are not cheap, decayed (cost); cost_last is the device
+    // counter as last read (its deltas are added to cost); dem_tot / dem_mask count the deltas since the request's line (all, and on masked experts)
+    std::vector<double> cost;
+    std::vector<uint32_t> cost_last;
+    long long dem_tot = 0, dem_mask = 0;
+    double p = kMlP0;
+    // the depth of the mask at level 2: at most round(g x the layer's masked count) of a layer's graduated experts are level 2 (the lowest
+    // harm rates first); g is a mask test's second number (STRATA_MASK=learn x AUTO), starts at the loaded table's level-2 share (else 0.25)
+    double g = 0.25;
+    // the running mask test (mask_test_begin): its candidate (p, g) and direction, the arms' levels (0 base, 1 candidate), the arm on the device
+    // (-1: none yet), and the direction state (first direction, stage 0 / 1: as the budget test's)
+    bool mt_on = false;
+    int mt_d = -1, mt_cur = -1, mt_first = -1, mt_stage = 0;
+    int mt_win_d = 0;                // unused since the paired test (kept at 0 for the file format): the two-wins rule is gone
+    double mt_step = 1.0;            // the step's multiple (p step kMtStepP x it, g step kMtStepG x it): x2 after a move in the same direction
+    int mt_last_move = 0;            // as the last move (to 8), halved after a loss (to 1) - the budget test's growing step (7 Nov: from 0.35 the
+                                     // fixed 0.025 steps needed ~44 winning tests to reach the depth the live run had found)
+    double mt_cand_p = 0.0, mt_cand_g = 0.0;
+    std::vector<uint8_t> mt_lv[2];
+    double ag_ok = 0.0, ag_tot = 0.0;
+    // the re-checks split by whether the mask moved a pick in the cut row (flips, count; decayed): the share follows the flips the mask
+    // ADDS beyond the stand-ins' (6 Nov: re-checks are close calls that flip often whatever the mask does; raw agreement only shrank p)
+    double fm = 0.0, nm = 0.0, fs = 0.0, fsn = 0.0;
+    long long tok = 0, nrc = 0;      // the kept decode tokens; the non-cut windows (every kMlSampleEvery-th is read)
+    double dsum = 0.0;
+    long long dn = 0;
+    std::string path;
+    bool pend = false;               // the pending cut: its row's replaced picks, their risk sum, the stand-in window's top-1
+    int32_t pend_tok = -1;
+    std::vector<Pick> pend_picks;
+    double pend_sum = 0.0;
+    bool pend_masked = false;        // the pending row has a mask move
+    std::vector<double> pend_rx;     // the pending row's event risks (the concentration counter)
+    strata::core::risk::RowShares pend_rc;   // ... their shares (top 1/3/10, events to 50/80/90%), kept until the verdict
+    strata::core::risk::Concentration rc;    // the request's swap risk concentration, by the verdict (flipped / held)
+    // the churn line: the levels that went up (lv_up) and down (lv_down) in the relevels since the last report (STRATA_MASK_RESIDENT)
+    long long lv_up = 0, lv_down = 0;
+};
+std::shared_ptr<MaskLearnState> g_mlr;
+
+size_t mlr_at(const MaskLearnState& s, int64_t l, int64_t e) { return (size_t) l * (size_t) s.ne + (size_t) e; }
+
+// The levels of every layer for the share p and the level-2 fraction g, from the scores (s.lv only orders the keep set).  The pool is the
+// least-used pairs by the profile (2 p n of them), the lowest rates first; the masked set (p n per layer) keeps the current level-2 pairs
+// first.  Level 2 goes to the graduated ones (enough exposure, a rate under the layer's 10th percentile), the lowest rates first, at most
+// round(g x the layer's masked count) of them.  A layer with no ranked pair gets none.
+void mlr_levels(const MaskLearnState& s, double p, double g, std::vector<uint8_t>& out) {
+    const int64_t ne = s.ne;
+    const int64_t per = (int64_t) std::floor(p * (double) ne + 1e-9);
+    const int64_t pool_n = std::min<int64_t>(ne, 2 * per);
+    const bool res_rule = mask_resident_on();   // STRATA_MASK_RESIDENT: the pool is the most expensive experts (SSD demand), not the least used
+    out.assign((size_t) (s.nl * ne), 0);
+    std::vector<double> rate((size_t) ne), pop;
+    std::vector<int> ord((size_t) ne), keep, cand, grad_set;
+    for (int64_t il = 0; il < s.nl; ++il) {
+        const uint8_t* lv = s.lv.data() + (size_t) il * (size_t) ne;
+        uint8_t* nlv = out.data() + (size_t) il * (size_t) ne;
+        const double* hm = s.harm.data() + (size_t) il * (size_t) ne;
+        const double* ex = s.expo.data() + (size_t) il * (size_t) ne;
+        const int64_t* pr = s.pos.data() + (size_t) il * (size_t) ne;
+        const double* cs = res_rule ? s.cost.data() + (size_t) il * (size_t) ne : nullptr;
+        bool ranked = false;
+        if (res_rule) {
+            double tot = 0.0;
+            for (int64_t e = 0; e < ne; ++e) tot += cs[e];
+            ranked = tot > 0.0;   // STRATA_MASK_RESIDENT: a layer with no SSD demand gets nothing masked
+        } else
+            for (int64_t e = 0; e < ne; ++e) ranked = ranked || pr[e] != INT64_MAX;
+        if (!ranked) continue;
+        pop.clear();
+        for (int64_t e = 0; e < ne; ++e) {
+            rate[(size_t) e] = hm[e] / std::max(1.0, ex[e]);
+            if (ex[e] >= kMlMinExpo) pop.push_back(rate[(size_t) e]);
+        }
+        const bool grad = (int) pop.size() >= kMlMinPop;
+        double p10 = 0.0;
+        if (grad) {
+            std::sort(pop.begin(), pop.end());
+            p10 = pop[pop.size() / 10];
+        }
+        int64_t masked = 0;
+        // the masked set: the current level-2 pairs first (the lowest rates first), then the pool's least-used pairs (higher profile rank
+        // first; ties: the lower id), the lowest rates first
+        keep.clear();
+        for (int64_t e = 0; e < ne; ++e)
+            if (lv[e] == 2) keep.push_back((int) e);
+        std::stable_sort(keep.begin(), keep.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+        for (int e : keep) {
+            if (masked >= per) break;
+            nlv[(size_t) e] = 1;
+            ++masked;
+        }
+        for (int64_t e = 0; e < ne; ++e) ord[(size_t) e] = (int) e;
+        cand.clear();
+        if (res_rule) {
+            // STRATA_MASK_RESIDENT: the pool is the most expensive experts (SSD demand, ties: the lower id), the first pool_n of them not masked
+            // yet; only those with measured harm (exposure >= kMlMinAg) are candidates, the lowest harm rate first (below)
+            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return cs[a] > cs[b]; });
+            int64_t pooled = 0;
+            for (int64_t q = 0; q < ne && pooled < pool_n; ++q) {
+                const int e = ord[(size_t) q];
+                if (nlv[(size_t) e] != 0) continue;
+                ++pooled;
+                if (ex[e] >= kMlMinAg) cand.push_back(e);
+            }
+        } else {
+            std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return pr[a] > pr[b]; });
+            for (int64_t q = 0; q < pool_n; ++q)
+                if (nlv[(size_t) ord[(size_t) q]] == 0) cand.push_back(ord[(size_t) q]);
+        }
+        std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+        for (int e : cand) {
+            if (masked >= per) break;
+            nlv[(size_t) e] = 1;
+            ++masked;
+        }
+        // level 2: the graduated masked pairs (enough exposure and a rate under the 10th percentile), at most round(g x masked), lowest first
+        if (grad) {
+            grad_set.clear();
+            for (int64_t e = 0; e < ne; ++e)
+                if (nlv[(size_t) e] == 1 && ex[e] >= kMlMinExpo && rate[(size_t) e] < p10) grad_set.push_back((int) e);
+            std::stable_sort(grad_set.begin(), grad_set.end(), [&](int a, int b) { return rate[(size_t) a] < rate[(size_t) b]; });
+            const int64_t cap = (int64_t) std::lround(g * (double) masked);
+            for (size_t i = 0; i < grad_set.size() && (int64_t) i < cap; ++i) nlv[(size_t) grad_set[i]] = 2;
+        }
+    }
+}
+
+// The levels for the state's (p, g); true when they changed.
+bool mlr_relevel(MaskLearnState& s) {
+    std::vector<uint8_t> nlv;
+    mlr_levels(s, s.p, s.g, nlv);
+    const bool changed = nlv != s.lv;
+    if (changed && nlv.size() == s.lv.size())   // the churn line: each entry's level change, up or down
+        for (size_t i = 0; i < nlv.size(); ++i) {
+            if (nlv[i] > s.lv[i]) ++s.lv_up;
+            else if (nlv[i] < s.lv[i]) ++s.lv_down;
+        }
+    s.lv = std::move(nlv);
+    return changed;
+}
+
+// STRATA_MASK=learn x AUTO: the mask test's direction state, as the budget test's (auto_next_stage): a win keeps the direction first;
+// a loss tries the other direction; both lost: the other direction first next round.
+void mt_next_stage(int& first, int& stage, bool won, int d) {
+    paired::DirState ds{first, stage};
+    ds.update(won, d);
+    first = ds.first;
+    stage = ds.stage;
+}
+
+// STRATA_MASK_RESIDENT: the device's SSD-demand counters since the last read; each delta joins the decayed cost, and the request's counts
+// (all demand, and the demand on experts the mask holds).  The counters are never reset, so a wrapped u32 delta is still right.
+void mlr_read_cost(MaskLearnState& s) {
+    std::vector<uint32_t> cur;
+    const size_t cnt = (size_t) s.nl * (size_t) s.ne;
+    if (!strata::kernels::route_mask_cost_read(cur) || cur.size() != cnt || s.cost_last.size() != cnt || s.cost.size() != cnt) return;
+    for (size_t i = 0; i < cnt; ++i) {
+        const uint32_t d = cur[i] - s.cost_last[i];
+        s.cost_last[i] = cur[i];
+        if (d == 0) continue;
+        s.cost[i] += (double) d;
+        s.dem_tot += d;
+        if (s.lv[i] >= 1) s.dem_mask += d;
+    }
+}
+
+// Every kMlMaskEvery kept tokens the masks move: p follows the re-checks' agreement (98% up, under 95% down), then the levels; the changed rows go
+// to the device.  While a mask test runs its arms' levels are fixed (the test's end relevels): the harm and exposure keep learning.
+void mlr_update(MaskLearnState& s) {
+    const bool res_rule = mask_resident_on();
+    if (res_rule) mlr_read_cost(s);
+    if (s.mt_on) return;
+    // the flip rate of re-checks with a mask move against those without (the stand-ins' own): > 2 SE above -> p -0.05; within 1 SE -> +0.025
+    // STRATA_MASK_RESIDENT: g moves with p (-0.1 with -0.05, +0.1 with +0.025); there is no mask test to set it
+    if (s.nm >= kMlMinSide && s.fsn >= kMlMinSide) {
+        const double rm = s.fm / s.nm, rs = s.fs / s.fsn, r = (s.fm + s.fs) / (s.nm + s.fsn);
+        const double se = std::sqrt(std::max(1e-9, r * (1.0 - r) * (1.0 / s.nm + 1.0 / s.fsn)));
+        if (rm - rs > 2.0 * se) {
+            s.p = std::max(kMlPMin, s.p - 0.05);
+            if (res_rule) s.g = std::max(0.0, s.g - 0.1);
+        } else if (rm - rs < se) {
+            s.p = std::min(kMlPMax, s.p + 0.025);
+            if (res_rule) s.g = std::min(1.0, s.g + 0.1);
+        }
+    }
+    // the upload is tried every round (it compares rows itself): a failed one is retried, not only when the levels change again
+    (void) mlr_relevel(s);
+    if (!strata::kernels::route_mask_update(s.lv)) std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
+}
+
+// The table file: "MLRN", version 5, nl, ne, p, the agreement's two sums, the re-checks' split (4 sums), the kept token count, g, the mask
+// test's progress (version 4: mt_step as a double, then mt_first, mt_stage, mt_win_d, mt_last_move as int32), then harm and exposure (double),
+// the levels, and (version 5) the SSD demand cost (double, [nl][ne]).  Versions 1 and 2 have no g (it is the loaded levels' level-2 share);
+// versions 1 to 3 have no test progress (the defaults); versions 1 to 4 have no cost (zero).
+// A running test (mt_on) is not saved: the direction state, the step and an unconfirmed win carry over, the test itself starts again.
+bool mlr_save(const MaskLearnState& s, const std::string& path, std::string& msg) {
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+        msg = "cannot open " + tmp;
+        return false;
+    }
+    const uint32_t ver = 5;   // 2: + the mask/stand-in split of the re-checks; 3: + g; 4: + the mask test's direction state, step and unconfirmed win; 5: + cost
+    const double split[4] = {s.fm, s.nm, s.fs, s.fsn};
+    const int32_t nl = (int32_t) s.nl, ne = (int32_t) s.ne;
+    const long long tok = s.tok;
+    const double g = s.g;
+    const int32_t mt_first = s.mt_first, mt_stage = s.mt_stage, mt_win_d = s.mt_win_d, mt_last_move = s.mt_last_move;
+    bool ok = std::fwrite("MLRN", 1, 4, f) == 4 && std::fwrite(&ver, sizeof ver, 1, f) == 1 && std::fwrite(&nl, sizeof nl, 1, f) == 1 &&
+              std::fwrite(&ne, sizeof ne, 1, f) == 1 && std::fwrite(&s.p, sizeof s.p, 1, f) == 1 && std::fwrite(&s.ag_ok, sizeof s.ag_ok, 1, f) == 1 &&
+              std::fwrite(&s.ag_tot, sizeof s.ag_tot, 1, f) == 1 && std::fwrite(split, sizeof(double), 4, f) == 4 && std::fwrite(&tok, sizeof tok, 1, f) == 1 &&
+              std::fwrite(&g, sizeof g, 1, f) == 1 &&
+              std::fwrite(&s.mt_step, sizeof s.mt_step, 1, f) == 1 && std::fwrite(&mt_first, sizeof mt_first, 1, f) == 1 &&
+              std::fwrite(&mt_stage, sizeof mt_stage, 1, f) == 1 && std::fwrite(&mt_win_d, sizeof mt_win_d, 1, f) == 1 &&
+              std::fwrite(&mt_last_move, sizeof mt_last_move, 1, f) == 1 &&
+              std::fwrite(s.harm.data(), sizeof(double), s.harm.size(), f) == s.harm.size() &&
+              std::fwrite(s.expo.data(), sizeof(double), s.expo.size(), f) == s.expo.size() &&
+              std::fwrite(s.lv.data(), 1, s.lv.size(), f) == s.lv.size() &&
+              std::fwrite(s.cost.data(), sizeof(double), s.cost.size(), f) == s.cost.size();
+    ok = std::fclose(f) == 0 && ok;
+    std::error_code ec;   // replaces an existing file on Windows too (std::rename does not; issue #8)
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        msg = "not written: " + path;
+        return false;
+    }
+    return true;
+}
+
+// The saved table, when its version and shape are this model's (else the fresh start stays).  Nothing is changed on a mismatch.
+bool mlr_load(MaskLearnState& s, const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    const size_t cnt = (size_t) s.nl * (size_t) s.ne;
+    char magic[4] = {0, 0, 0, 0};
+    uint32_t ver = 0;
+    int32_t nl = 0, ne = 0;
+    double p = 0.0, ok = 0.0, tot = 0.0;
+    long long tok = 0;
+    double g = 0.0;
+    double mt_step = 1.0;
+    int32_t mt_first = -1, mt_stage = 0, mt_win_d = 0, mt_last_move = 0;   // (version 4 only; the defaults otherwise)
+    std::vector<double> harm(cnt), expo(cnt);
+    std::vector<uint8_t> lv(cnt);
+    std::vector<double> cost(cnt, 0.0);       // (version 5 only; zero before)
+    double split[4] = {0.0, 0.0, 0.0, 0.0};   // (version 1: the scores kept, the split starts empty)
+    bool good = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "MLRN", 4) == 0 && std::fread(&ver, sizeof ver, 1, f) == 1 &&
+                (ver >= 1 && ver <= 5) &&
+                std::fread(&nl, sizeof nl, 1, f) == 1 && std::fread(&ne, sizeof ne, 1, f) == 1 && nl == s.nl && ne == s.ne &&
+                std::fread(&p, sizeof p, 1, f) == 1 && std::fread(&ok, sizeof ok, 1, f) == 1 && std::fread(&tot, sizeof tot, 1, f) == 1 &&
+                (ver == 1 || std::fread(split, sizeof(double), 4, f) == 4) && std::fread(&tok, sizeof tok, 1, f) == 1 &&
+                (ver < 3 || std::fread(&g, sizeof g, 1, f) == 1) &&
+                (ver < 4 || (std::fread(&mt_step, sizeof mt_step, 1, f) == 1 && std::fread(&mt_first, sizeof mt_first, 1, f) == 1 &&
+                             std::fread(&mt_stage, sizeof mt_stage, 1, f) == 1 && std::fread(&mt_win_d, sizeof mt_win_d, 1, f) == 1 &&
+                             std::fread(&mt_last_move, sizeof mt_last_move, 1, f) == 1)) &&
+                std::fread(harm.data(), sizeof(double), cnt, f) == cnt && std::fread(expo.data(), sizeof(double), cnt, f) == cnt &&
+                std::fread(lv.data(), 1, cnt, f) == cnt &&
+                (ver < 5 || std::fread(cost.data(), sizeof(double), cnt, f) == cnt);
+    std::fclose(f);
+    if (!good) return false;
+    if (ver < 3) {   // g: the loaded levels' level-2 share of the masked pairs (0.25 when nothing is masked)
+        long long masked = 0, level2 = 0;
+        for (uint8_t v : lv) {
+            masked += v != 0;
+            level2 += v == 2;
+        }
+        g = masked > 0 ? (double) level2 / (double) masked : 0.25;
+    }
+    s.g = std::min(1.0, std::max(0.0, g));
+    if (ver >= 4) {   // the mask test's progress (a running test is not resumed: mt_on stays as it is)
+        s.mt_step = std::min(8.0, std::max(1.0, mt_step));
+        s.mt_first = mt_first == 1 || mt_first == -1 ? mt_first : -1;
+        s.mt_stage = mt_stage == 0 || mt_stage == 1 ? mt_stage : 0;
+        s.mt_win_d = mt_win_d == 0 || mt_win_d == 1 || mt_win_d == -1 ? mt_win_d : 0;
+        s.mt_last_move = mt_last_move == 0 || mt_last_move == 1 || mt_last_move == -1 ? mt_last_move : 0;
+    } else {
+        s.mt_step = 1.0;
+        s.mt_first = -1;
+        s.mt_stage = 0;
+        s.mt_win_d = 0;
+        s.mt_last_move = 0;
+    }
+    s.p = std::min(kMlPMax, std::max(kMlPMin, p));
+    s.ag_ok = ok;
+    s.ag_tot = tot;
+    s.fm = split[0];
+    s.nm = split[1];
+    s.fs = split[2];
+    s.fsn = split[3];
+    s.tok = tok;
+    s.harm = std::move(harm);
+    s.expo = std::move(expo);
+    s.lv = std::move(lv);
+    s.cost = std::move(cost);
+    return true;
+}
+
+// Exposure: each row's replaced picks of a read list (layer and expert in range), each counted once per row, by w.
+void mlr_expose_rows(MaskLearnState& s, const strata::kernels::MaskEvs& ev, int rows, double w) {
+    for (int r = 0; r < rows && r < strata::kernels::kMaskEvRows; ++r) {
+        ++s.stamp_id;
+        const unsigned n = std::min<unsigned>(ev.n[r], (unsigned) strata::kernels::kMaskEvCap);
+        for (unsigned i = 0; i < n; ++i) {
+            const strata::kernels::MaskEv& a = ev.e[r][i];
+            if (a.layer < 0 || a.layer >= s.nl || a.expert < 0 || a.expert >= s.ne) continue;
+            const size_t k = mlr_at(s, a.layer, a.expert);
+            if (s.stamp[k] == s.stamp_id) continue;
+            s.stamp[k] = s.stamp_id;
+            s.expo[k] += w;
+        }
+    }
+}
+
+}  // namespace
+
+// STRATA_MASK as it applies (default since 7 Nov): unset -> "learn" when the route-resident stand-ins it learns from are configured.
+const char* mask_env() {
+    const char* v = std::getenv("STRATA_MASK");
+    if (v != nullptr) return v;
+    return std::getenv("STRATA_ROUTE_RESIDENT") != nullptr ? "learn" : nullptr;
+}
+
+bool mask_learn_env() {
+    const char* v = mask_env();
+    return v != nullptr && std::strcmp(v, "learn") == 0;
+}
+
+bool mask_learn_seeded() { return g_mlr != nullptr; }
+
+std::vector<uint8_t> mask_learn_begin(int64_t n_layers, int64_t n_expert, const std::vector<int64_t>& pos) {
+    if (n_layers < 1 || n_expert < 1 || pos.size() != (size_t) (n_layers * n_expert)) return {};
+    auto s = std::make_shared<MaskLearnState>();
+    s->nl = n_layers;
+    s->ne = n_expert;
+    s->pos = pos;
+    const size_t cnt = (size_t) (n_layers * n_expert);
+    s->harm.assign(cnt, 0.0);
+    s->expo.assign(cnt, 0.0);
+    s->lv.assign(cnt, 0);
+    s->stamp.assign(cnt, 0u);
+    s->cost.assign(cnt, 0.0);
+    s->cost_last.assign(cnt, 0u);
+    mlr_relevel(*s);   // from zero scores: the profile's least-used pairs at the share p0 (STRATA_MASK_RESIDENT: none until demand is measured)
+    g_mlr = s;
+    return s->lv;
+}
+
+bool mask_learn_open(const std::string& path, std::string& msg) {
+    if (!g_mlr) {
+        msg = "not on";
+        return false;
+    }
+    MaskLearnState& s = *g_mlr;
+    s.path = path;
+    const bool loaded = mlr_load(s, path);
+    mlr_relevel(s);
+    if (!strata::kernels::route_mask_update(s.lv)) {
+        msg = "the mask rows not uploaded";
+        return false;
+    }
+    msg = std::string(loaded ? "the saved table" : "a fresh table") + ", p " + std::to_string(s.p) +
+          (mask_resident_on() ? ", resident swap, expensive experts, live" : ", the old rule (STRATA_MASK_RESIDENT=0)");
+    return loaded;
+}
+
+bool mask_learn_save(const std::string& path, std::string& msg) {
+    if (!g_mlr) {
+        msg = "not on";
+        return false;
+    }
+    return mlr_save(*g_mlr, path, msg);
+}
+
+// STRATA_MASK_RESIDENT / STRATA_MASK_CTRL control windows: every kMlControlEvery-th decode window (counted from the start) runs with the mask's
+// moves off, so the re-checks it gives have no mask move and land on the "without" side.  g_mask_ctrl_n counts the decode windows (route_budget_window,
+// route_window_control); g_mask_ctrl_win the control windows since the last mask line.  A fragile control window takes its window first and does
+// not advance the count (SPEC-control-windows).
+// The share follows the evidence: while the "without" side holds fewer than kMlMinSide re-checks (it is halved every kMlDecayEvery kept
+// tokens, so at 1 in 8 it settled near 7-14 on 8095, 7 Nov, and p never moved), every (kMlControlEvery / 2)-th window is a control.
+long long mask_ctrl_every() { return g_mlr && g_mlr->fsn < kMlMinSide ? kMlControlEvery / 2 : kMlControlEvery; }
+
+// The request's swap risk concentration line (cut rows, shares, events to 50/80/90%), then its counts are cleared.
+std::string mask_risk_line() {
+    if (!g_mlr) return "";
+    const std::string out = g_mlr->rc.line();
+    g_mlr->rc.reset();
+    return out;
+}
+
+std::string mask_learn_report() {
+    if (!g_mlr) return "";
+    MaskLearnState& s = *g_mlr;
+    long long m = 0, a = 0, scored = 0;
+    for (size_t i = 0; i < s.lv.size(); ++i) {
+        m += s.lv[i] != 0;
+        a += s.lv[i] == 2;
+        scored += s.expo[i] > 0.0;
+    }
+    const double dm = s.dn > 0 ? s.dsum / (double) s.dn : 0.0;
+    char buf[768];
+    int n = std::snprintf(buf, sizeof buf, "strata serve: mask learn: p %.3f, g %.3f, %lld masked (%lld at all ranks), re-check D mean %.4f (%lld), %lld experts scored; "
+                          "re-check flips with a mask move %.0f/%.0f, without %.0f/%.0f",
+                          s.p, s.g, m, a, dm, s.dn, scored, s.fm, s.nm, s.fs, s.fsn);
+    if ((mask_resident_on() || mask_ctrl_on()) && n > 0 && n < (int) sizeof buf) {
+        // STRATA_MASK_RESIDENT: the request's SSD demand (the router's non-cheap picks, and those on masked experts), then what the moved count means
+        if (mask_resident_on()) {
+            const double frac = s.dem_tot > 0 ? 100.0 * (double) s.dem_mask / (double) s.dem_tot : 0.0;
+            n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; SSD demand this request: %lld picks on masked experts of %lld (%.1f%%); "
+                               "the moved count on the mask line above is picks moved off the SSD to a cheap expert (SSD reads avoided)",
+                               s.dem_mask, s.dem_tot, frac);
+        }
+        // STRATA_MASK_RESIDENT / STRATA_MASK_CTRL: the decode windows run with the mask's moves off (control windows) since the last line
+        if (n < (int) sizeof buf) n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; control windows %lld", g_mask_ctrl_win);
+        // STRATA_MASK_RESIDENT: the churn line, the levels that changed since the last line (up / down)
+        if (mask_resident_on() && n < (int) sizeof buf) n += std::snprintf(buf + n, sizeof buf - (size_t) n, "; levels changed +%lld -%lld", s.lv_up, s.lv_down);
+    }
+    if (n > 0 && n < (int) sizeof buf - 1) std::snprintf(buf + n, sizeof buf - (size_t) n, "\n");
+    s.dsum = 0.0;
+    s.dn = 0;
+    s.dem_tot = 0;
+    s.dem_mask = 0;
+    s.lv_up = 0;
+    s.lv_down = 0;
+    g_mask_ctrl_win = 0;
+    return buf;
+}
+
+bool Verifier::mask_learn_active() const { return g_mlr != nullptr && mev_ != nullptr && mlr_logit0_ != nullptr && mlr_kl_ != nullptr && next_ == nullptr; }
+
+// A window cut at row `row` (after route_fragile_cut): the row's first-pass logits are kept, and its replaced picks wait for the settle.
+// Every row of the window is exposure.  A control re-check moves nothing, so it gives no credit.
+void Verifier::mask_learn_cut(int row, int32_t stand_top1, int T, bool control) {
+    if (!mask_learn_active() || row < 1 || row >= strata::kernels::kMaskEvRows || T < 1 || T > strata::kernels::kMaskEvRows) return;
+    MaskLearnState& s = *g_mlr;
+    const OnDevice on(device_);
+    if (cudaMemcpy(mlr_logit0_, head_logits_ + (size_t) row * (size_t) n_vocab_, sizeof(float) * (size_t) n_vocab_, cudaMemcpyDeviceToDevice) !=
+        cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    auto ev = std::make_unique<strata::kernels::MaskEvs>();
+    if (cudaMemcpy(ev.get(), mev_, sizeof(strata::kernels::MaskEvs), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    if (control) return;
+    mlr_expose_rows(s, *ev, T, 1.0);
+    s.pend = true;
+    s.pend_tok = stand_top1;
+    s.pend_picks.clear();
+    s.pend_sum = 0.0;
+    s.pend_masked = false;
+    s.pend_rx.clear();
+    const unsigned n = std::min<unsigned>(ev->n[row], (unsigned) strata::kernels::kMaskEvCap);
+    for (unsigned i = 0; i < n; ++i) {
+        const strata::kernels::MaskEv& a = ev->e[row][i];
+        if (a.layer < 0 || a.layer >= s.nl || a.expert < 0 || a.expert >= s.ne) continue;
+        const double x = std::max(0.0, (double) a.x);
+        s.pend_picks.push_back({a.layer, a.expert, x});
+        s.pend_masked = s.pend_masked || strata::kernels::mask_ev_kind(a.kind) == 1;
+        s.pend_sum += x;
+        s.pend_rx.push_back(x);
+    }
+    s.pend_rc = strata::core::risk::row_shares(s.pend_rx);   // SPEC-substitute-fit: the row's risk concentration, kept to the verdict
+}
+
+size_t Verifier::route_recheck_picks(int row, std::vector<strata::core::recheck::Pick>& out) {
+    out.clear();
+    if (!mask_learn_active() || row < 1 || row >= strata::kernels::kMaskEvRows || g_mlr == nullptr) return 0;
+    const MaskLearnState& s = *g_mlr;
+    const OnDevice on(device_);
+    unsigned n = 0;
+    if (cudaMemcpy(&n, &mev_->n[row], sizeof n, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    n = std::min<unsigned>(n, (unsigned) strata::kernels::kMaskEvCap);
+    if (n == 0) return 0;
+    std::vector<strata::kernels::MaskEv> evs(n);
+    if (cudaMemcpy(evs.data(), &mev_->e[row][0], n * sizeof(strata::kernels::MaskEv), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    // both kinds: a stand-in swap's replaced pick and a mask move's; the successor's row 0 reads the router's pick of each
+    for (const strata::kernels::MaskEv& a : evs)
+        if (a.layer >= 0 && a.layer < s.nl && a.expert >= 0 && a.expert < s.ne)
+            out.push_back({a.layer, a.expert, strata::kernels::mask_ev_rank(a.kind), a.x});   // SPEC-recheck-gated: the rank and risk (E, D)
+    return out.size();
+}
+
+bool Verifier::route_recheck_prefetch_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_RECHECK_PREFETCH"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+
+size_t Verifier::route_recheck_prefetch_max() {
+    // SPEC-recheck-gated (E, G): with the gate, the tuned count per cut (start 12; STRATA_RECHECK_PREFETCH_MAX fixes it), the candidate for the
+    // cut windows of arm 1 while a prefetch test runs; with the gate off, the old 96 (or the env value)
+    static const bool fixed = std::getenv("STRATA_RECHECK_PREFETCH_MAX") != nullptr;
+    static const size_t fixed_v = fixed ? (size_t) std::max(0LL, std::atoll(std::getenv("STRATA_RECHECK_PREFETCH_MAX"))) : (size_t) 96;
+    const RouteResidentCfg& c = route_resident_cfg();
+    if (!c.gate_on || fixed) return fixed_v;
+    if (c.auto_kind == tune::Prefetch && c.auto_testing && c.auto_cut_arm == 1) return (size_t) c.auto_pf_cand;
+    return (size_t) c.gs.tune.prefetch;
+}
+
+// The exact successor (the window that just ran): D = KL(exact row 0 || the cut row's first pass) on the device; the pending row's picks take
+// their share of D as harm; the agreement and the request's mean D count.
+void Verifier::mask_learn_settle(bool exact_ok, int32_t exact_top1) {
+    if (!mask_learn_active()) return;
+    MaskLearnState& s = *g_mlr;
+    if (!s.pend) return;
+    s.pend = false;
+    if (!exact_ok) return;
+    const OnDevice on(device_);
+    strata::kernels::logit_kl(head_logits_, mlr_logit0_, n_vocab_, mlr_kl_, cs_);
+    float D = 0.0f;
+    if (cs_ != nullptr && cudaStreamSynchronize(cs_) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    if (cudaMemcpy(&D, mlr_kl_, sizeof D, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    const bool flipped = exact_top1 != s.pend_tok;
+    s.rc.add(s.pend_rc, flipped);   // the concentration counter: this row's shares, by its verdict
+    if (s.pend_sum > 0.0)
+        for (const MaskLearnState::Pick& pk : s.pend_picks) s.harm[mlr_at(s, pk.l, pk.e)] += (double) D * pk.x / s.pend_sum;
+    s.ag_tot += 1.0;
+    s.ag_ok += flipped ? 0.0 : 1.0;
+    (s.pend_masked ? s.nm : s.fsn) += 1.0;
+    (s.pend_masked ? s.fm : s.fs) += flipped ? 1.0 : 0.0;
+    s.dsum += (double) D;
+    ++s.dn;
+}
+
+// After each decode window of n <= 8 rows (not merged): `kept` rows stand (a cut keeps rows 0..r-1).  Every kMlSampleEvery-th non-cut window
+// reads its list and counts it that many times.  Every kMlMaskEvery kept tokens the masks move; the table is saved every kMlSaveEvery.
+void Verifier::mask_learn_window(int T, int kept, bool cut) {
+    if (!mask_learn_active() || T < 1 || T > strata::kernels::kMaskEvRows) return;
+    MaskLearnState& s = *g_mlr;
+    const bool exact = route_resident_cfg().win_exact;   // the exact re-run: its rows are the re-decisions, no exposure of its own
+    if (!cut && !exact && ++s.nrc % kMlSampleEvery == 0) {
+        auto ev = std::make_unique<strata::kernels::MaskEvs>();
+        const OnDevice on(device_);
+        if (cudaMemcpy(ev.get(), mev_, sizeof(strata::kernels::MaskEvs), cudaMemcpyDeviceToHost) == cudaSuccess)
+            mlr_expose_rows(s, *ev, T, (double) kMlSampleEvery);
+        else
+            (void) cudaGetLastError();
+    }
+    if (kept < 1) return;
+    const long long before = s.tok;
+    s.tok += kept;
+    if (s.tok / kMlDecayEvery != before / kMlDecayEvery) {
+        for (double& v : s.harm) v *= 0.5;
+        for (double& v : s.expo) v *= 0.5;
+        for (double& v : s.cost) v *= 0.5;   // STRATA_MASK_RESIDENT: the demand decays with the harm and exposure
+        s.ag_ok *= 0.5;
+        s.ag_tot *= 0.5;
+        // STRATA_MASK_RESIDENT: the flip split that moves p and g is halved 4x less often than the scores, so it keeps its evidence long
+        // enough to act (8095, 7 Nov: the "without" side reached kMlMinSide and was halved back before the next mlr_update)
+        if (!mask_resident_on() || (s.tok / kMlDecayEvery) % 4 == 0) {
+            s.fm *= 0.5;
+            s.nm *= 0.5;
+            s.fs *= 0.5;
+            s.fsn *= 0.5;
+        }
+    }
+    if (s.tok / kMlMaskEvery != before / kMlMaskEvery) mlr_update(s);
+    if (s.tok / kMlSaveEvery != before / kMlSaveEvery && !s.path.empty()) {
+        std::string msg;
+        if (!mlr_save(s, s.path, msg)) std::fprintf(stderr, "strata: STRATA_MASK=learn: %s\n", msg.c_str());
+    }
+}
+
+// STRATA_MASK=learn x STRATA_ROUTE_BUDGET_AUTO: the mask test (the budget test's method, on the mask's depth).  Every other budget test is
+// a mask test (route_auto_test_done).  Base = (p, g) now; candidate = one step deeper (p + 0.025, g + 0.1) or shallower (the minus signs),
+// clamped; the direction starts shallower (the live case was slowing).  Both arms run at the request's budget.  The arms' levels are
+// computed here, once; the arm's levels go to the device when the arm changes (mask_test_arm).  At the end the candidate's (p, g) is kept
+// on a win, and the levels are recomputed for the final (p, g).
+bool mask_test_begin() {
+    if (!g_mlr || g_mlr->mt_on) return false;
+    MaskLearnState& s = *g_mlr;
+    for (int tries = 0; tries < 2; ++tries) {   // the two directions of the stage machine: one of them may be at a bound
+        const int d = s.mt_stage == 0 ? s.mt_first : -s.mt_first;
+        const double cp = std::min(kMlPMax, std::max(kMlPMin, s.p + kMtStepP * s.mt_step * d));
+        const double cg = std::min(1.0, std::max(0.0, s.g + kMtStepG * s.mt_step * d));
+        if (cp != s.p || cg != s.g) {
+            s.mt_d = d;
+            s.mt_cand_p = cp;
+            s.mt_cand_g = cg;
+            mlr_levels(s, s.p, s.g, s.mt_lv[0]);
+            mlr_levels(s, cp, cg, s.mt_lv[1]);
+            s.mt_cur = -1;   // the first window uploads its arm
+            s.mt_on = true;
+            return true;
+        }
+        mt_next_stage(s.mt_first, s.mt_stage, false, d);   // at both bounds: nothing to test this way
+    }
+    return false;
+}
+
+// The arm's levels on the device (route_mask_update uploads only the rows that differ from the device's), only when the arm changes.
+void mask_test_arm(int arm) {
+    if (!g_mlr || !g_mlr->mt_on || arm == g_mlr->mt_cur) return;
+    MaskLearnState& s = *g_mlr;
+    s.mt_cur = arm;
+    if (!strata::kernels::route_mask_update(s.mt_lv[arm != 0 ? 1 : 0]))
+        std::fprintf(stderr, "strata: STRATA_MASK=learn: the test arm's mask rows not uploaded\n");
+}
+
+// The test's end: out = base p, base g, candidate p, candidate g.  The paired test (paired_test.hpp) decides: a move (won) takes the candidate's
+// (p, g) at once; a keep leaves it.  The step as before: a move the same way as the last move doubles it, a keep halves it.
+// Returns whether (p, g) moved.  The levels are recomputed and uploaded; the table is saved.
+bool mask_test_end(bool won, double out[4]) {
+    if (!g_mlr) return false;
+    MaskLearnState& s = *g_mlr;
+    out[0] = s.p;
+    out[1] = s.g;
+    out[2] = s.mt_cand_p;
+    out[3] = s.mt_cand_g;
+    const bool moved = won;
+    paired::MaskStep ms{s.mt_step, s.mt_last_move};
+    if (won) {
+        s.p = s.mt_cand_p;
+        s.g = s.mt_cand_g;
+        ms.on_move(s.mt_d);
+    } else {
+        ms.on_loss();
+    }
+    s.mt_step = ms.step;
+    s.mt_last_move = ms.last_move;
+    s.mt_win_d = 0;   // (the two-wins-in-a-row rule is gone; the field stays in the file format, always 0)
+    mt_next_stage(s.mt_first, s.mt_stage, won, s.mt_d);   // the direction state (a keep tries the other direction)
+    s.mt_on = false;
+    s.mt_cur = -1;
+    mlr_relevel(s);
+    if (!strata::kernels::route_mask_update(s.lv)) std::fprintf(stderr, "strata: STRATA_MASK=learn: the mask rows not uploaded\n");
+    if (!s.path.empty()) {
+        std::string msg;
+        if (!mlr_save(s, s.path, msg)) std::fprintf(stderr, "strata: STRATA_MASK=learn: %s\n", msg.c_str());
+    }
+    return moved;
 }
 
 }  // namespace strata::core
