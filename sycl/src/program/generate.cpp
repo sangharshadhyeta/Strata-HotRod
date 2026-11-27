@@ -38,16 +38,11 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
-<<<<<<< sycl
 #include "strata/core/gguf_expert_source.hpp"
 namespace strata::prefill { void set_nonresident_share(double share); }   // SYCL port: prefill.cpp
 #include "strata/kernels/resident_plan_mirror.hpp"
-||||||| base
-#include "strata/core/foresight_swap.hpp"
-=======
 #include "strata/core/latent_tab.hpp"
 #include "strata/core/foresight_swap.hpp"
->>>>>>> ours-now
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -350,24 +345,12 @@ dpct::err0 adapt_copy_h2d(void *dst, const void *src, size_t bytes,
         (void) cudaGetLastError();   // not registered / not mapped: the ordinary copy
     }
 #endif
-<<<<<<< sycl
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    return DPCT_CHECK_ERROR(st->memcpy(dst, src, bytes));
+    return strata::core::h2d_split(dst, src, bytes, st);   // a blob at a STRATA_PIN_SEGS segment's edge: copied in runs
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
-||||||| base
-    return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, st);
-=======
-    return strata::core::h2d_split(dst, src, bytes, st);   // a blob at a STRATA_PIN_SEGS segment's edge: copied in runs
->>>>>>> ours-now
 }
 int pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*>& live) {
     int failed = 0;   // ranges left pageable (a copy from them still works, through the driver's staging)
@@ -1115,18 +1098,6 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
-<<<<<<< sycl
-                 "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
-                 "                       session file (default 2560)\n"
-||||||| base
-                 "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
-                 "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
-                 "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
-                 "                       the container cannot see its real limit (also STRATA_MEMORY_LIMIT_MIB; the flag\n"
-                 "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
-                 "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
-                 "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
-=======
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default: 8%% of the RAM, 1-4 GiB)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
@@ -1137,7 +1108,6 @@ void usage() {
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
->>>>>>> ours-now
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -2653,26 +2623,6 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
-<<<<<<< sycl
-// #1980: a start-up refusal ends the process here instead of returning from main.  Returning ran main's destructors
-// (the stages' caches, queues and Level Zero objects) in an order the UR loader did not survive: 2x Arc Pro B60, every
-// REFUSED start segfaulted in libur_loader after its message, and a trimmed one also left an xe page fault (bcs CAT error)
-// on the second card that hung the next start.  The device work queued so far finishes first; nothing is freed.
-[[noreturn]] static void refuse_exit(int code) {
-    std::fflush(stdout);
-    std::fflush(stderr);
-    try {
-        for (unsigned int d = 0; d < dpct::device_count(); ++d) dpct::get_device(d).queues_wait_and_throw();
-    } catch (...) {
-    }
-    std::fflush(stderr);
-    std::_Exit(code);
-}
-
-int main(int argc, char **argv) try {
-||||||| base
-int main(int argc, char** argv) {
-=======
 // STRATA_LOOKAHEAD_PROMOTE (default on; =0: the look-ahead stays off under the RAM overlay as before): the decode look-ahead's
 // predictions are promoted into the RAM tier (FileExpertSource::set_lookahead_promote) instead of read into stage buffers
 static bool lookahead_promote_env() {
@@ -2724,8 +2674,22 @@ static void recheck_prefetch(strata::core::ExpertSource* src, const std::vector<
     }
 }
 
-int main(int argc, char** argv) {
->>>>>>> ours-now
+// #1980: a start-up refusal ends the process here instead of returning from main.  Returning ran main's destructors
+// (the stages' caches, queues and Level Zero objects) in an order the UR loader did not survive: 2x Arc Pro B60, every
+// REFUSED start segfaulted in libur_loader after its message, and a trimmed one also left an xe page fault (bcs CAT error)
+// on the second card that hung the next start.  The device work queued so far finishes first; nothing is freed.
+[[noreturn]] static void refuse_exit(int code) {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    try {
+        for (unsigned int d = 0; d < dpct::device_count(); ++d) dpct::get_device(d).queues_wait_and_throw();
+    } catch (...) {
+    }
+    std::fflush(stderr);
+    std::_Exit(code);
+}
+
+int main(int argc, char **argv) try {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -3945,7 +3909,6 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
     }
-<<<<<<< sycl
     // SYCL port, Arc on the xe driver (Arc Pro B60/B65/B70, B580): the GPU page-faults when a kernel reads ordinary
     // (pageable) host memory, and the card times the job out (seen on a B70: Timedout job, Fault response -EINVAL,
     // faulted address in the CPU's mmap range). Without --stream-experts the experts outside the VRAM cache stay in a
@@ -3964,8 +3927,6 @@ int main(int argc, char** argv) {
                                  "--pcie-frac 0\n", o.pcie_frac);
         }
     }
-||||||| base
-=======
     // STRATA_PCIE_BALANCE (on by default; =0 off): each verify layer's PCIe count from measured costs
     // (Verifier::set_pcie_balance) instead of the probe's fixed share above - the CPU's speed sets the right share as much
     // as the link's.  IQ2_XS, one AVX2 pool worker (emulated on an RTX 5090 + 9950X3D): 16.8-17.2 -> 12.8-13.0 ms a round;
@@ -3975,7 +3936,6 @@ int main(int argc, char** argv) {
         const char* e = std::getenv("STRATA_PCIE_BALANCE");
         return !pcie_given && native_pack && !multi_gpu && o.batch <= 0 && (e == nullptr || std::strcmp(e, "0") != 0);
     };
->>>>>>> ours-now
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) {
         // #2347: an NVFP4 / i-quant / Unsloth pack IS a native pack and runs on an AVX2 CPU (its rows have AVX2
@@ -5132,24 +5092,6 @@ int main(int argc, char** argv) {
             cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, i + 1 == ns, true);
             if (late_weights) cap[(size_t) i] = std::max<int64_t>(cap[(size_t) i] - (int64_t) stage_pool[(size_t) i], 0);
             int sms = 0, khz = 0;
-<<<<<<< sycl
-            sms = dpct::get_device(dev).get_max_compute_units();
-            if (DPCT_CHECK_ERROR(
-                    khz = dpct::get_device(dev).get_max_clock_frequency()) !=
-                    0 ||
-                khz <= 0) khz = 1800000;
-            /*
-            DPCT1026: The call to cudaGetLastError was removed because this
-            functionality is redundant in SYCL.
-            */
-            const double speed =
-                std::max(1.0, (double)sms * (double)khz / 1e6); // SMs x GHz
-||||||| base
-            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-            if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev) != cudaSuccess || khz <= 0) khz = 1800000;
-            cudaGetLastError();
-            const double speed = std::max(1.0, (double) sms * (double) khz / 1e6);   // SMs x GHz
-=======
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
             if (cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, dev) != cudaSuccess || khz <= 0) khz = 1800000;
             cudaGetLastError();
@@ -5162,7 +5104,6 @@ int main(int argc, char** argv) {
                 const double f = p != nullptr ? std::atof(p) : 0.0;
                 if (f > 0.0) speed = std::max(1.0, speed * f);
             }
->>>>>>> ours-now
             layer_ms[(size_t) i] = 0.33 * (84.0 * 2.617) / speed;
             std::fprintf(stderr, "strata generate: layer split auto: CUDA%d %d SMs at %.2f GHz -> %.2f ms per layer, "
                                  "%.2f GiB free before its session carve\n", dev, sms, khz / 1e6, layer_ms[(size_t) i],
@@ -5410,60 +5351,6 @@ int main(int argc, char** argv) {
             // 163,185 at five).  Nothing on this rig reaches it.
             proportional();
         }
-<<<<<<< sycl
-        if (split_headroom && scored.size() > 1) {
-            const size_t first = strata::program::split_rules::fastest(scored);
-            const size_t pick = strata::program::split_rules::pick_with_headroom(scored, headroom_tol);
-            if (pick != first && scored[first].cuts == best) {
-                auto fmt_k = [](const std::vector<int64_t>& v) {
-                    std::string s;
-                    for (const int64_t k : v) s += (s.empty() ? "" : ",") + std::to_string(k);
-                    return s;
-                };
-                std::fprintf(stderr, "strata generate: layer split auto: K=%s instead of K=%s (predicted %.1f vs %.1f ms): its "
-                                     "tightest card keeps %.2f GiB beyond all its layers' experts, against %.2f GiB "
-                                     "(#1440: a full card can page to system memory); STRATA_SPLIT_HEADROOM=0 keeps K=%s\n",
-                             fmt_k(scored[pick].cuts).c_str(), fmt_k(best).c_str(), scored[pick].ms, best_ms,
-                             (double) scored[pick].min_spare / 1073741824.0,
-                             (double) scored[first].min_spare / 1073741824.0, fmt_k(best).c_str());
-                best = scored[pick].cuts;
-                best_ms = scored[pick].ms;
-                best_mass = scored_mass[pick];
-                best_held = scored_held[pick];
-||||||| base
-        };
-        search();
-        // ---- #1616: a stage with one or two layers holds a handful of expert slots (a 12 GB 3060: 512), and the
-        // prompt chunk of every card is clamped to what the smallest cache can lend.  When the pick has such a
-        // stage, look again among placements that give every stage at least kMinStageLayers layers; keep the new
-        // pick if there is one, and say so.  Recommend, never force: with none startable the first pick stays.
-        if (!best.empty() && strata::program::split_rules::restriction_possible(g.n_layers, ns) &&
-            strata::program::split_rules::has_tiny_stage(best, g.n_layers)) {
-            const std::vector<int64_t> first = best;
-            const double first_ms = best_ms;
-            best.clear();
-            best_ms = 1e30; best_max = 1e30; best_mass = 0; best_held = 0;
-            min_stage_layers = strata::program::split_rules::kMinStageLayers;
-            search();
-            min_stage_layers = 1;
-            auto fmt = [](const std::vector<int64_t>& v) {
-                std::string s;
-                for (const int64_t k : v) s += (s.empty() ? "" : ",") + std::to_string(k);
-                return s;
-            };
-            if (best.empty()) {
-                best = first; best_ms = first_ms;
-                std::fprintf(stderr, "strata generate: layer split auto: K=%s gives a stage fewer than %lld layers (a "
-                                     "tiny expert cache clamps the prompt chunk, #1616), but no placement with at least "
-                                     "that many layers can start; keeping it\n", fmt(first).c_str(),
-                             (long long) strata::program::split_rules::kMinStageLayers);
-            } else {
-                std::fprintf(stderr, "strata generate: layer split auto: K=%s would give a stage fewer than %lld layers "
-                                     "(a tiny expert cache there clamps the prompt chunk of every card, #1616); chose "
-                                     "K=%s instead (%.1f ms per decode window, not %.1f)\n", fmt(first).c_str(),
-                             (long long) strata::program::split_rules::kMinStageLayers, fmt(best).c_str(), best_ms,
-                             first_ms);
-=======
         };
         search();
         // ---- #1616: a stage with one or two layers holds a handful of expert slots (a 12 GB 3060: 512), and the
@@ -5525,7 +5412,27 @@ int main(int argc, char** argv) {
                                  (long long) strata::program::split_rules::kMinStageLayers, fmt(best).c_str(), best_ms,
                                  first_ms);
                 }
->>>>>>> ours-now
+            }
+        }
+        if (split_headroom && scored.size() > 1) {
+            const size_t first = strata::program::split_rules::fastest(scored);
+            const size_t pick = strata::program::split_rules::pick_with_headroom(scored, headroom_tol);
+            if (pick != first && scored[first].cuts == best) {
+                auto fmt_k = [](const std::vector<int64_t>& v) {
+                    std::string s;
+                    for (const int64_t k : v) s += (s.empty() ? "" : ",") + std::to_string(k);
+                    return s;
+                };
+                std::fprintf(stderr, "strata generate: layer split auto: K=%s instead of K=%s (predicted %.1f vs %.1f ms): its "
+                                     "tightest card keeps %.2f GiB beyond all its layers' experts, against %.2f GiB "
+                                     "(#1440: a full card can page to system memory); STRATA_SPLIT_HEADROOM=0 keeps K=%s\n",
+                             fmt_k(scored[pick].cuts).c_str(), fmt_k(best).c_str(), scored[pick].ms, best_ms,
+                             (double) scored[pick].min_spare / 1073741824.0,
+                             (double) scored[first].min_spare / 1073741824.0, fmt_k(best).c_str());
+                best = scored[pick].cuts;
+                best_ms = scored[pick].ms;
+                best_mass = scored_mass[pick];
+                best_held = scored_held[pick];
             }
         }
         split_at = best;
@@ -5754,27 +5661,9 @@ int main(int argc, char** argv) {
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
-<<<<<<< sycl
-                if (DPCT_CHECK_ERROR(buf = (void *)sycl::malloc_device(
-                                         bytes, dpct::get_in_order_queue())) !=
-                        0 ||
-                    strata::core::session_init(g, o.max_context, K, buf, *u, lo,
-                                               hi) == 0) {
-                    /*
-                    DPCT1026: The call to cudaGetLastError was removed
-                    because this functionality is redundant in SYCL.
-                    */
-                    if (buf != nullptr)
-                        sycl::free(buf, dpct::get_in_order_queue());
-||||||| base
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
-                    cudaGetLastError();
-                    if (buf != nullptr) cudaFree(buf);
-=======
                 if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, slot_cells, K, buf, *u, lo, hi) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
->>>>>>> ours-now
                     size_t fb = 0, tb = 0;
                     /*
                     DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
@@ -7197,70 +7086,6 @@ int main(int argc, char** argv) {
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
     // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).
     strata::core::RouterLookahead lookahead;
-<<<<<<< sycl
-    if (srcp == &src && src.warms() && [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
-        std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
-        bool ok = true;
-        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
-            ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
-                 w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
-            if (!ok) break;
-            routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
-            ok = DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                      .memcpy(routers[(size_t)l].data(),
-                                              w->data, (size_t)w->bytes)
-                                      .wait()) == 0;
-        }
-        const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, &src, err)) {
-            drive.d.lookahead = &lookahead;
-            std::fprintf(stderr, "strata generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
-        } else {
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            (void)0;
-            std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
-                         ok ? err.c_str() : "the routers are not BF16 in the arena");
-            err.clear();
-||||||| base
-    // #1348, one prefetch design: with the Foresight swap space on (STRATA_FS_SLOTS) the look-ahead also runs on the pinned-RAM
-    // tiers, where there are no pages to warm, and feeds its predictions to the swap space (STRATA_FS_AHEAD=0: not)
-    const bool fs_ahead = srcp != nullptr && [] { const char* v = std::getenv("STRATA_FS_SLOTS"); return v != nullptr && std::atoi(v) > 0; }() &&
-                          [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
-    // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
-    const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
-        [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
-        std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
-        bool ok = true;
-        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
-            ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
-                 w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
-            if (!ok) break;
-            routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
-            ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
-        }
-        const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats)) {
-            drive.d.lookahead = &lookahead;
-            if (la_stats) lookahead.enable_stats(g.n_layers);
-            if (const char* dv = std::getenv("STRATA_IO_PREFETCH_DEPTH"); dv != nullptr && std::atoi(dv) > 0)
-                lookahead.set_depth(std::atoi(dv));
-            else if (srcp == &src && src.io_prefetch())
-                lookahead.set_depth(2);
-            std::fprintf(stderr, "strata generate: routing-aware prefetch on (the next layer's router%s)\n",
-                         fs_ahead ? ", feeding the Foresight swap space" : ", file tier");
-        } else {
-            (void) cudaGetLastError();
-            std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
-                         ok ? err.c_str() : "the routers are not BF16 in the arena");
-            err.clear();
-=======
     // #1348, one prefetch design: with the Foresight swap space on (STRATA_FS_SLOTS) the look-ahead also runs on the pinned-RAM
     // tiers, where there are no pages to warm, and feeds its predictions to the swap space (STRATA_FS_AHEAD=0: not)
     // STRATA_RING=1 (the look-ahead ring) turns the swap space on by itself (8 slots a layer unless STRATA_FS_SLOTS says otherwise)
@@ -7335,7 +7160,6 @@ int main(int argc, char** argv) {
                              ok ? err.c_str() : "the routers are not BF16 in the arena");
                 err.clear();
             }
->>>>>>> ours-now
         }
     };
     start_routing_lookahead();
@@ -9310,13 +9134,6 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-<<<<<<< sycl
-            if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes))
-||||||| base
-            if (share_pool) sp.set_cpu_pool(&pool);
-            if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
-                         o.prefill_head_alias))
-=======
             if (share_pool) sp.set_cpu_pool(&pool);
             // the prompt path's use of the router lookahead (STRATA_PREFILL_LOOKAHEAD_TOK tokens a layer; 512 by default for a buffered
             // prompt, 0 for an O_DIRECT one - prefill.cpp's la_tok), as in the one-shot path below: the lookahead takes that many
@@ -9334,7 +9151,6 @@ int main(int argc, char** argv) {
             }
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
->>>>>>> ours-now
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
         };
@@ -11672,46 +11488,6 @@ int main(int argc, char** argv) {
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(ol(s), s.out); evict2(s);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
-<<<<<<< sycl
-            }
-            if (!cp_dst.empty() &&
-                strata::core::copy_blobs(cp_dst.data(), cp_src.data(),
-                                         cp_bytes.data(), cp_dst.size(),
-                                         adapt_stream, dma_mode) != 0) {
-                std::fprintf(
-                    stderr,
-                    "strata serve: adaptive swap copy failed (batched): %s\n",
-                    /*
-                    DPCT1009: SYCL reports errors using exceptions and does
-                    not use error codes. Please replace the
-                    "get_error_string_dummy(...)" with a real error-handling
-                    function.
-                    */
-                    /*
-                    DPCT1010: SYCL uses exceptions to report errors and
-                    does not use the error codes. The cudaGetLastError function
-                    call was replaced with 0. You need to rewrite this code.
-                    */
-                    dpct::get_error_string_dummy(0));
-||||||| base
-                if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
-                    (agate.hland != nullptr
-                         ? cudaMemcpyAsync((void*) agate.hland, agate.dvals + s.layer, 4, cudaMemcpyDeviceToHost, adapt_stream)
-                         : cudaLaunchHostFunc(adapt_stream, [](void* p) {
-                        auto* t = (strata::core::AdaptGate::Tick*) p;
-                        int32_t cur = t->gate->landed.load(std::memory_order_relaxed);
-                        while (cur < t->layer && !t->gate->landed.compare_exchange_weak(cur, t->layer, std::memory_order_release)) {}
-                    }, &agate.ticks[(size_t) s.layer])) != cudaSuccess) {
-                    (void) cudaGetLastError();
-                    cudaStreamSynchronize(adapt_stream);   // no callback: wait here, the gate opens at once
-                    agate.landed.store((int32_t) g.n_layers, std::memory_order_release);
-                }
-            }
-            if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),
-                                                            adapt_stream, dma_mode) != cudaSuccess) {
-                std::fprintf(stderr, "strata serve: adaptive swap copy failed (batched): %s\n",
-                             cudaGetErrorString(cudaGetLastError()));
-=======
                 if (aov && (si + 1 == swaps.size() || swaps[si + 1].layer != s.layer) &&
                     (agate.hland != nullptr
                          ? cudaMemcpyAsync((void*) agate.hland, agate.dvals + s.layer, 4, cudaMemcpyDeviceToHost, adapt_stream)
@@ -11733,23 +11509,13 @@ int main(int argc, char** argv) {
                                                             adapt_stream, dma_mode) != cudaSuccess) {
                 std::fprintf(stderr, "strata serve: adaptive swap copy failed (batched): %s\n",
                              cudaGetErrorString(cudaGetLastError()));
->>>>>>> ours-now
                 return false;
             }
-<<<<<<< sycl
-            if (!swaps.empty()) dpct::sync_barrier(adapt_ev, adapt_stream);
-||||||| base
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
-            // #2188: hand the copies and their landing signals to the GPU now.  WDDM batches a stream's work until a
-            // driver call flushes it, and the verify window only spins on the pinned int (Linux submits at once: no-op)
-            if (aov && agate.hland != nullptr && !swaps.empty()) (void) cudaStreamQuery(adapt_stream);
-=======
             if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
             if (cross_on && !swaps.empty()) { cudaEventRecord(cross_ev1, adapt_stream); cross_prev_n = (int) swaps.size(); }
             // #2188: hand the copies and their landing signals to the GPU now.  WDDM batches a stream's work until a
             // driver call flushes it, and the verify window only spins on the pinned int (Linux submits at once: no-op)
             if (aov && agate.hland != nullptr && !swaps.empty()) (void) cudaStreamQuery(adapt_stream);
->>>>>>> ours-now
             (void) main_live;
             for (auto& st : stages)
                 if (st->adapt_live) {
@@ -11885,59 +11651,6 @@ int main(int argc, char** argv) {
                 if (!w.exchange) continue;
                 AHome& h = ahomes[(size_t) w.home];
                 const strata::core::OnDevice on(h.dev);
-<<<<<<< sycl
-                /*
-                DPCT1000: Error handling if-stmt was detected but could not
-                be rewritten.
-                */
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous
-                memcpy API. While the origin API might be synchronous, it
-                depends on the type of operand memory, so you may need to call
-                wait() on event return by memcpy API to ensure synchronization
-                behavior.
-                */
-                if (const dpct::err0 e = DPCT_CHECK_ERROR(h.stream->memcpy(
-                        src.exchange_buffer(w.j), h.cache->device_slot(w.slot),
-                        (size_t)strata::kernels::cpu::expert_layout()
-                            .blob_bytes(w.layer)));
-                    e != 0) {
-                    std::fprintf(stderr,
-                                 "strata serve: adaptive tier: copy back of "
-                                 "layer %d slot %d (CUDA%d) failed: %s\n",
-                                 /*
-                                 DPCT1009: SYCL reports errors using
-                                 exceptions and does not use error codes. Please
-                                 replace the "get_error_string_dummy(...)" with
-                                 a real error-handling function.
-                                 */
-                                 (int)w.layer, (int)w.slot, h.dev,
-                                 dpct::get_error_string_dummy(e));
-                    /*
-                    DPCT1001: The statement could not be removed.
-                    */
-||||||| base
-                for (const ASwap& w : aswaps) {
-                    if (w.home != hi || !w.exchange) continue;
-                    if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(w.j), h.cache->device_slot(w.slot),
-                                                              (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
-                                                              cudaMemcpyDeviceToHost, h.stream); e != cudaSuccess) {
-                        std::fprintf(stderr, "strata serve: adaptive tier: copy back of layer %d slot %d (CUDA%d) failed: %s\n",
-                                     (int) w.layer, (int) w.slot, h.dev, cudaGetErrorString(e));
-                        a_err = true;
-                    }
-                    any = true;
-                }
-            }
-            if (any) a_mark(h);
-        };
-        auto a_from = [&](const ASwap& w) -> const uint8_t* {   // step 2: where `in` is copied from (host work)
-            if (a_arena) {   // the arena's blob, pinned or not (a pageable one blocks the job thread, not the host)
-                const uint8_t* b = arena_src.blob_at(w.layer, w.in);   // (blob() counts reads_: not from this thread)
-                if (b == nullptr) {
-                    std::fprintf(stderr, "strata serve: adaptive tier: layer %d expert %d is not in the arena\n",
-                                 (int) w.layer, (int) w.in);
-=======
                 for (const ASwap& w : aswaps) {
                     if (w.home != hi || !w.exchange) continue;
                     if (const cudaError_t e = cudaMemcpyAsync(src.exchange_buffer(w.j, w.layer), h.cache->device_slot(w.slot),
@@ -11958,7 +11671,6 @@ int main(int argc, char** argv) {
                 if (b == nullptr) {
                     std::fprintf(stderr, "strata serve: adaptive tier: layer %d expert %d is not in the arena\n",
                                  (int) w.layer, (int) w.in);
->>>>>>> ours-now
                     a_err = true;
                 }
                 h.used = true;
@@ -11971,63 +11683,6 @@ int main(int argc, char** argv) {
           std::exit(1);
         }
         };
-<<<<<<< sycl
-        auto a_copy_in = [&]() { // step 2, on the job thread
-            try {
-        for (AHome &h : ahomes) h.used = false;
-            for (const ASwap& w : aswaps) {
-                AHome& h = ahomes[(size_t) w.home];
-                const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer);
-                const uint8_t* b = src.pinned(w.layer, w.in) ? src.resident_blob(w.layer, w.in) : nullptr;
-                if (b == nullptr) {   // pageable, or not in the RAM copy: through a bounce buffer (an async copy)
-                    uint8_t* bb = src.exchange_buffer(a_cap + w.j);
-                    if (bb == nullptr || !src.copy_blob(w.layer, w.in, bb)) {
-                        std::fprintf(stderr, "strata serve: adaptive tier: layer %d expert %d could not be read\n",
-                                     (int) w.layer, (int) w.in);
-                        a_err = true;
-                        continue;
-                    }
-                    b = bb;
-                }
-                const strata::core::OnDevice on(h.dev);
-                /*
-                DPCT1000: Error handling if-stmt was detected but could not
-                be rewritten.
-                */
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous
-                memcpy API. While the origin API might be synchronous, it
-                depends on the type of operand memory, so you may need to call
-                wait() on event return by memcpy API to ensure synchronization
-                behavior.
-                */
-                if (const dpct::err0 e = DPCT_CHECK_ERROR(
-                        h.stream->memcpy(h.cache->device_slot(w.slot), b, nb));
-                    e != 0) {
-                    std::fprintf(stderr,
-                                 "strata serve: adaptive tier: copy of layer "
-                                 "%d into slot %d (CUDA%d) failed: %s\n",
-                                 /*
-                                 DPCT1009: SYCL reports errors using
-                                 exceptions and does not use error codes. Please
-                                 replace the "get_error_string_dummy(...)" with
-                                 a real error-handling function.
-                                 */
-                                 (int)w.layer, (int)w.slot, h.dev,
-                                 dpct::get_error_string_dummy(e));
-                    /*
-                    DPCT1001: The statement could not be removed.
-                    */
-                    a_err = true;
-||||||| base
-        auto a_copy_in = [&]() {   // step 2 on the job thread (the serial loop): each source read, then copied in
-            std::vector<uint8_t> used(ahomes.size(), 0);
-            for (size_t i = a_lo; i < a_hi; ++i) {   // (the batch; all the round's swaps unless the arena caps it)
-                const ASwap& w = aswaps[i];
-                if (const uint8_t* b = a_from(w)) {
-                    a_in_one(w, b);
-                    used[(size_t) w.home] = 1;
-=======
         auto a_copy_in = [&]() {   // step 2 on the job thread (the serial loop): each source read, then copied in
             std::vector<uint8_t> used(ahomes.size(), 0);
             for (size_t i = a_rng.lo; i < a_rng.hi; ++i) {   // (the batch; all the round's swaps unless the arena caps it)
@@ -12035,40 +11690,9 @@ int main(int argc, char** argv) {
                 if (const uint8_t* b = a_from(w)) {
                     a_in_one(w, b);
                     used[(size_t) w.home] = 1;
->>>>>>> ours-now
                 }
                 h.used = true;
             }
-<<<<<<< sycl
-            a_flush();
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
-||||||| base
-            for (size_t hi = 0; hi < ahomes.size(); ++hi)
-                if (used[hi]) a_mark(ahomes[hi]);
-        };
-        auto a_post_batch = [&]() {   // step 2: the next batch of copies in goes to the job thread (all of them but for the arena's cap)
-            a_lo = a_bi;
-            a_hi = a_batch > 0 ? std::min(aswaps.size(), a_bi + a_batch) : aswaps.size();
-            a_bi = a_hi;
-            ajob->post(a_copy_in);
-        };
-        auto a_stage_in = [&]() {   // step 2's host part on the job thread (the pipelined loop: a_in queues the copies)
-            for (ASwap& w : aswaps) w.from = a_from(w);
-        };
-        auto a_in = [&](int hi) {   // step 2's copies in to home hi (the pipelined loop, at its gap)
-            bool any = false;
-            for (const ASwap& w : aswaps)
-                if (w.home == hi && w.from != nullptr) {
-                    a_in_one(w, w.from);
-                    any = true;
-                }
-            if (any) a_mark(ahomes[(size_t) hi]);
-=======
             for (size_t hi = 0; hi < ahomes.size(); ++hi)
                 if (used[hi]) a_mark(ahomes[hi]);
         };
@@ -12087,7 +11711,6 @@ int main(int argc, char** argv) {
                     any = true;
                 }
             if (any) a_mark(ahomes[(size_t) hi]);
->>>>>>> ours-now
         };
         auto a_ready =
             [&](bool wait) -> bool { // the job and its copies are done
@@ -12164,26 +11787,6 @@ int main(int argc, char** argv) {
                         aswaps[k++] = w;
                     }
                     aswaps.resize(k);
-<<<<<<< sycl
-                    res_upload();
-                    ajob->post(a_copy_in);
-||||||| base
-                    if (aswaps.empty()) {   // nothing to move (converged, or the table moved since the snapshot): the round ends here
-                        a_ms += std::chrono::duration<double, std::milli>(Clock::now() - a_t0).count();
-                        astate = AState::Idle;
-                        continue;
-                    }
-                    for (AHome& h : ahomes) h.used = false;
-                    if (pl) {   // the copies in at each card's next gap: after this step, so fenced (see above)
-                        a_res_dirty = true;
-                        for (const ASwap& w : aswaps) a_in_due[(size_t) w.home] = 1;
-                        ajob->post(a_stage_in);
-                    } else {
-                        res_upload();
-                        a_lo = a_hi = a_bi = 0;
-                        a_post_batch();
-                    }
-=======
                     if (aswaps.empty()) {   // nothing to move (converged, or the table moved since the snapshot): the round ends here
                         a_ms += std::chrono::duration<double, std::milli>(Clock::now() - a_t0).count();
                         astate = AState::Idle;
@@ -12202,7 +11805,6 @@ int main(int argc, char** argv) {
                         a_rng.clear();
                         a_post_batch();
                     }
->>>>>>> ours-now
                     astate = AState::SwapIn;
                     if (!drain) return true;
                     continue;
@@ -12664,15 +12266,9 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (pick < 0) continue;
-<<<<<<< sycl
-                    const uint8_t* b = srcp->blob(layer, pick % g.n_expert);
-||||||| base
-                    const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
-=======
                     // F-01: an expert bigger than one slot (a double) is not refilled into one slot: its neighbour is not reserved for it any more
                     if ((int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer) > xcache.slot_capacity(slot)) { keep_out.emplace_back(i, slot); continue; }
                     const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
->>>>>>> ours-now
                     if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
                             (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
                         e = "VRAM: refilling the cache failed: " + ferr;
@@ -14021,15 +13617,8 @@ int main(int argc, char** argv) {
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         auto admit = [&](uint64_t need, std::string& why) {
-<<<<<<< sycl
-                            const auto avail = strata::core::available_host_bytes();
-||||||| base
-                            const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
-=======
                             auto mem = strata::core::sample_host_memory();
                             std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
->>>>>>> ours-now
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             // the RAM tier gives back its coldest experts for the save, as it does for a prompt's layer-major
                             // state (20 Oct: a 45k session's save was refused at 2.8 GiB available against 0.35 + 2.5 needed)
@@ -14121,18 +13710,9 @@ int main(int argc, char** argv) {
                         strata::core::SessionReadLimits limits;
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-<<<<<<< sycl
-                        limits.admit = [floor, &o](uint64_t need, std::string& why) {
-                            const auto avail = strata::core::available_host_bytes();
-||||||| base
-                        limits.admit = [floor, &o](uint64_t need, std::string& why) {
-                            const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
-=======
                         limits.admit = [&, floor](uint64_t need, std::string& why) {
                             auto mem = strata::core::sample_host_memory();
                             std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
->>>>>>> ours-now
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                             // the RAM tier gives back its coldest experts for the restore, as it does for a save (21 Oct: a 45k
                             // session's restore was refused at 3361 MiB available against 914 + 2560 needed, and the
@@ -14273,17 +13853,12 @@ int main(int argc, char** argv) {
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
-<<<<<<< sycl
-            double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
-||||||| base
-=======
             // CO-PREFILL (default on, STRATA_COPREFILL=0 turns it off; docs/CO_PREFILL.md): warm=<slot>:<ids>;<slot>:<ids> - OTHER waiting short prompts of the server, whose prefixes (all but each last
             // token) are read into their own batch slots in one layer-major run before this request's read; their own requests then find the slot warm.  Unknown to an older engine
             // (skipped like any unknown key).
             struct WarmJob { int slot = -1; std::vector<int64_t> ids; };
             std::vector<WarmJob> req_warm;
             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
->>>>>>> ours-now
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -14325,22 +13900,13 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-<<<<<<< sycl
                     else if (key == "logprobs") req_logprobs = std::clamp(std::atoi(tok.c_str() + eq + 1), -1, 20);
-                    else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
-                    else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
-||||||| base
-                    else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
-                    else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
-                    else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
-=======
                     else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
                     else if (key == "spec_min_p") { req_spec_min_p = std::clamp((double) fv, 0.0, 1.0); req_spec_named = true; }
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "tail_weight") req_tail_weight = std::clamp((double) fv, 0.0, 0.99);
                     else if (key == "tail_skip") req_tail_skip = std::clamp((int) std::lround(fv), 0, 9);
->>>>>>> ours-now
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         const char* q = tok.c_str() + eq + 1;
@@ -15245,11 +14811,6 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(p.dev);
                 size_t queued = 0;
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-<<<<<<< sycl
-                    const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-||||||| base
-                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-=======
                     strata::core::BlobPart parts[3];
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
                     if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
@@ -15258,7 +14819,6 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
->>>>>>> ours-now
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
@@ -16219,11 +15779,6 @@ int main(int argc, char** argv) {
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
             int64_t at = read_from;
-<<<<<<< sycl
-            for (const int64_t to : {reread_to, root_at, message_at, turn_at, n - 1}) {
-||||||| base
-            for (const int64_t to : cuts) {
-=======
             ram_last_read_tokens = n - read_from;   // (for the RAM guard of the next request)
             for (PfPart& p : pf_parts) if (p.sp != nullptr) p.sp->clear_tail();   // STRATA_PROMPT_TAIL: this prompt's routing only
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
@@ -16389,7 +15944,6 @@ int main(int argc, char** argv) {
                 }
             }
             for (const int64_t to : cuts) {
->>>>>>> ours-now
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
@@ -17821,10 +17375,10 @@ int main(int argc, char** argv) {
                 first_window = false;
                 rb_fresh = false;
                 bool eos = false;
-<<<<<<< sycl
-                for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
-                    std::printf("T %d\n", (int) outv[(size_t) i]);
-                    if (req_logprobs >= 0) {   // row i of this window's head logits is the distribution token i came from
+                for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
+                    if (rb_on) rb_emitted.push_back(outv[(size_t) i]);   // STRATA_ROLLBACK: held, released below
+                    else std::printf("T %d\n", (int) outv[(size_t) i]);
+                    if (!rb_on && req_logprobs >= 0) {   // (STRATA_ROLLBACK holds the tokens: no LP lines then)   // row i of this window's head logits is the distribution token i came from
                         static std::vector<float> lrow;
                         static std::vector<int32_t> lord;
                         lrow.resize((size_t) ver.vocab());
@@ -17848,14 +17402,6 @@ int main(int argc, char** argv) {
                             std::printf("\n");
                         }
                     }
-||||||| base
-                for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
-                    std::printf("T %d\n", (int) outv[(size_t) i]);
-=======
-                for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
-                    if (rb_on) rb_emitted.push_back(outv[(size_t) i]);   // STRATA_ROLLBACK: held, released below
-                    else std::printf("T %d\n", (int) outv[(size_t) i]);
->>>>>>> ours-now
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);
