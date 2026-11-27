@@ -11,6 +11,7 @@ How to read the table:
 
 | Folder | Hardware | Model | Prompt tok/s | Output tok/s | Strata | PR |
 |---|---|---|---|---|---|---|
+| [2026-11-26-community-rtx-3060-qwen3-8-flash-next-abliterated-iq3-s](2026-11-26-community-rtx-3060-qwen3-8-flash-next-abliterated-iq3-s/) | RTX 3060 12 GB (Proxmox LXC, GPU at x4), Ryzen 9 5900X, 64 GB DDR4-3600, WD SN850X 1 TB (Gen 4) | Qwen3.8-Flash-Next Swift-1.5 abliterated IQ3_S, 131K | bench.sh 1,041.8 / 720.9 (4K / 16K) | bench.sh 47.7 (short chat), 50.2 (agent follow-up, median) | ratrod.v1.2 (4ea40f1d) | issue #7 (VenimK) |
 | [2026-11-23-community-rtx-3060-ratrod](2026-11-23-community-rtx-3060-ratrod/) | RTX 3060 12 GB (Proxmox VM), 64 GB DDR4-3200, Gen 4 NVMe | Flash-Next IQ3_S, 131K | 781 (one 120K prompt); bench.sh 997 / 929 (4K / 16K) | 40.0 (120K synthetic, 8K out); bench.sh 33.6 / 33.4 | Strata-HotRod latest release (ratrod.v1) | issue #7 |
 | [2026-10-01-0.1.31-release](2026-10-01-0.1.31-release/) | RX 7900 XTX 24 GB, Ryzen 7 7700X | Coder IQ1_M | 545 to 900 median (0.1.30 to 0.1.31) | 16-34 to 17-65 | 0.1.30 / 0.1.31 | #404 |
 | [2026-10-01-community-2x-rtx-pro-4500](2026-10-01-community-2x-rtx-pro-4500/) | 2x RTX PRO 4500 32 GB, Threadripper 7960X | Swift IQ3_XXS | 1,428 / 2,454 / 2,785 | 115 / 120 / 93 | 0.1.30 | #418 |
