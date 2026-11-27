@@ -21,6 +21,24 @@ it is the testers' part (issue #7).
 | S3 | kernels: SYCL versions of what the features added since 22 Oct call (23 new kernels in `native_router.cu` - look-ahead learner, stand-ins, MTP zero-copy, route mask; plus smaller ones in 7 files; 4 `.cu` with no copy) | after S2 |
 | S4 | link, then hand the branch to an Arc tester | |
 
+## S3: the kernels (from tmp/sycl_kernel_survey: our .cu changes since the copies)
+
+| .cu | lines changed | new kernels the SYCL copy cannot have |
+|---|---|---|
+| `kernels/cuda/native_router.cu` | 2,438 | the look-ahead learner (`la_b_*`, `la_fwd_*`, `la_mtp_pub_k`), MTP zero-copy (`mtp_slot_remap_k`, `mtp_zc_mark_k`), `pred_bias_add_k`, `pred_tail_read_k`, `route_mask_k`, `route_post_k`, `route_pred_sel_k`, `route_tally_k`, `router_gemv_top10_fused_k` |
+| `kernels/cuda/verify_kernels.cu` | 119 | - |
+| `kernels/cuda/fused_gr.cu` | 92 | - |
+| `kernels/cuda/native_bf16.cu` | 79 | `bf16_f32_mmvf_multi3_kernel` |
+| `kernels/cuda/s2_expert_grouped.cu` | 49 | `group_ptr_kernel` |
+| `kernels/cuda/iq_kernels.cu` | 49 | `nvfp4_dequant_gu_kernel`, `nvfp4_dequant_sub_kernel` |
+| `prefill/kernels.cu` | 38 | `standin_agree_mark_k`, `standin_agree_restore_k` |
+| `kernels/cuda/native_moe.cu`, `kv_stream.cu`, `sampler.cu`, `shared_expert.cu`, `elementwise.cu`, `ple.cu`, `gdn.cu` | 2-29 each | - (signature changes: e.g. `native_moe_combine` takes a `MoeLearnTap`) |
+| new `.cu` with no copy | | `core/remote_expert_opt.cu`, `kernels/cuda/subfit_apply.cu`, `subfit_capture.cu`, `latent.cu` (+ parity tests) |
+
+Two ways: re-migrate the changed `.cu` with SYCLomatic and 3-way merge onto the copies (how `tools/merge_upstream.py`
+keeps them; SYCLomatic 20260928 is unpacked in /home/intel/syclomatic, its use needs the maintainer's go), or port by
+hand.  Kernels with no SYCL version yet can start as stubs that report "unsupported" so the features they serve stay off.
+
 ## What the S2b merge gave up on the SYCL build (to bring back)
 
 - `prefill`: the short first chunk (`STRATA_PREFILL_FIRST`, the GPU starting while the rest of the prompt's PLE rows
