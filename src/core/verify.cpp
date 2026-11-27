@@ -3649,7 +3649,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && fused_router_experts(NE) && K == 10) {
             try {
                 // STRATA_ROUTER_FUSED=1: the GEMV and the top-10 in one launch (native_router.cu).  Taken only without the _aux
                 // (STRATA_LFUSE shared-gate) row, which needs the GEMV launch of its own; n <= 4 rows (shared memory).

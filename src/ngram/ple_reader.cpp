@@ -1,5 +1,7 @@
 // src/ngram/ple_reader.cpp - see include/strata/ngram/ple_reader.hpp.
 #include "strata/ngram/ple_reader.hpp"
+#include <cstdlib>
+#include <cstdio>
 #include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
@@ -88,7 +90,16 @@ struct Job {
 
 struct TicketState {
     uint32_t pending = 0;  // jobs not yet completed
+    uint32_t jobs = 0;     // STRATA_PLE_TRACE: jobs issued, and when they were issued / first submitted / last completed
+    double t_issue = 0, t_first = 0, t_last = 0;
 };
+
+// STRATA_PLE_TRACE=1: one line per collected gather - where a decode round's PLE wait goes (from the SYCL engine's
+// trace; any backend).
+bool ple_trace() {
+    static const bool v = std::getenv("STRATA_PLE_TRACE") != nullptr;
+    return v;
+}
 
 }  // namespace
 
@@ -153,6 +164,10 @@ struct PleReader::Impl {
             queue.pop_front();
             Job& j = inflight[s];
             j.issued_us = now_us();
+            if (ple_trace()) {
+                auto tt = tickets.find(j.ticket);
+                if (tt != tickets.end() && tt->second.t_first == 0) tt->second.t_first = j.issued_us;
+            }
             std::string kerr;             // a keep-alive read that cannot go out must not fail the reader
             if (!file.submit(j.offset, slot_buf(s), j.length, s, j.keepalive ? kerr : error)) {
                 if (j.keepalive) {                 // no more of them: the SSD may sleep as before
@@ -245,6 +260,7 @@ struct PleReader::Impl {
         }
         auto it = tickets.find(j.ticket);
         if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
+        if (ple_trace() && it != tickets.end()) it->second.t_last = now_us();
         j.uses.clear();
         free_slots.push_back(s);
         return error.empty() ? pump() : true;
@@ -466,6 +482,8 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     // Sorted by offset: prefill chunks then read the SSD in near-sequential order.
     std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.offset < b.offset; });
     ts.pending = (uint32_t) jobs.size();
+    ts.jobs = ts.pending;
+    ts.t_issue = now_us();
     const bool has_jobs = ts.pending > 0;
     for (Job& j : jobs) m.queue.push_back(std::move(j));
     if (m.threaded) {
@@ -497,6 +515,13 @@ bool PleReader::collect(Ticket t, std::string& err) {
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
         if (!m.error.empty()) { err = m.error; return false; }
         m.stats.wait_us += now_us() - start;
+        if (ple_trace() && it->second.jobs > 0 && it->second.jobs < 200) {
+            const TicketState& ts = it->second;
+            const double now = now_us();
+            std::fprintf(stderr, "ple trace: %3u jobs  issue->submit %8.1f  submit->last %8.1f  last->return %8.1f  "
+                         "collect wait %8.1f us\n", ts.jobs, ts.t_first - ts.t_issue, ts.t_last - ts.t_first,
+                         now - ts.t_last, now - start);
+        }
         m.tickets.erase(it);
         return true;
     }
@@ -510,6 +535,13 @@ bool PleReader::collect(Ticket t, std::string& err) {
     }
     if (!m.error.empty()) { err = m.error; return false; }
     m.stats.wait_us += now_us() - start;
+    if (ple_trace() && it->second.jobs > 0 && it->second.jobs < 200) {
+        const TicketState& ts = it->second;
+        const double now = now_us();
+        std::fprintf(stderr, "ple trace: %3u jobs  issue->submit %8.1f  submit->last %8.1f  last->return %8.1f  "
+                     "collect wait %8.1f us\n", ts.jobs, ts.t_first - ts.t_issue, ts.t_last - ts.t_first,
+                     now - ts.t_last, now - start);
+    }
     m.tickets.erase(it);
     return true;
 }

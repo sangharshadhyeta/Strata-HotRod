@@ -371,7 +371,13 @@ bool DirectFile::open(const std::string& path, std::string& err) {
                          path.c_str());
         });
     }
+#if defined(STRATA_GPU_SYCL)
+    // the SYCL engine (the B70 box, 2026-09-30): the PLE rows of a 2,184-token prompt are ~27k random 4 KB O_DIRECT reads;
+    // with 16 threads they took 466 ms (p50 1.0 ms per read), with 64 332 ms (0.7 ms). Not measured on the CUDA engine.
+    const int n = io_threads(hdd ? 2 : 64);
+#else
     const int n = io_threads(hdd ? 2 : 16);
+#endif
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { strata::aux_cpus::pin_current_thread(); impl_->worker(); });
     return true;
 }

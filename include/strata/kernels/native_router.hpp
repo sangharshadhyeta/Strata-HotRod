@@ -31,6 +31,15 @@ struct MaskEvs {
 // This experiment is off by default and does not modify the legacy router.
 void native_router_set_enabled(bool enabled);
 bool native_router_enabled();
+/// The expert counts the fused top-10 router serves: 512 everywhere; the SYCL kernel serves 256 as well (the
+/// 35B-class models), the CUDA one was not extended.
+constexpr bool fused_router_experts(int64_t n_expert) {
+#if defined(STRATA_GPU_SYCL)
+    return n_expert == 512 || n_expert == 256;
+#else
+    return n_expert == 512;
+#endif
+}
 
 // Pinned CUDA topk-moe contract for ONE token, 512 experts, top 10, softmax,
 // no selection bias, lower normalization clamp 2^-14, and scale 1.
