@@ -13,7 +13,7 @@
 //   - mode off (or no fit): the cap refuses a move past the cap, exactly as before the learner existed.
 #pragma once
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define STRATA_SUBFIT_HD __host__ __device__ __forceinline__
 #else
 #define STRATA_SUBFIT_HD inline

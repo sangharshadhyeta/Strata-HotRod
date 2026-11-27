@@ -16,7 +16,7 @@
 #include <climits>
 #include <cmath>
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define STRATA_LA_HD __host__ __device__ __forceinline__
 #else
 #define STRATA_LA_HD inline

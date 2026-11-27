@@ -112,11 +112,20 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
 }
 // One warp's top-10 of one token's 512 logits (the route_multi body, shared with the fused router below): lane = the warp's lane.
 // The logits are read through L2 (__ldcg), so a warp may read a row another CTA of the same launch just wrote.
+// A load through L2 (see route_warp_top10).  HIP has no float __ldcg: a relaxed device-scope atomic load is the same
+// visibility there (it bypasses the per-CU cache, which another workgroup's stores do not update).
+__device__ __forceinline__ float ld_l2(const float* p) {
+#if defined(__HIPCC__)
+    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    return __ldcg(p);
+#endif
+}
 __device__ __forceinline__ void route_warp_top10(const float* __restrict__ logits, int32_t* __restrict__ ids,
                                                  float* __restrict__ weights, const int lane) {
     float values[16];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) values[i] = __ldcg(logits + lane + i * 32);
+    for (int i = 0; i < 16; ++i) values[i] = ld_l2(logits + lane + i * 32);
     __syncwarp();
     float maximum = -INFINITY;
 #pragma unroll
@@ -1931,7 +1940,13 @@ __device__ __forceinline__ float la_block_sum(float v, float* sh) {
 }
 __device__ __forceinline__ unsigned long long la_now() {   // the GPU's clock (ns), for the timing only
     unsigned long long now;
+#if defined(STRATA_HIP_GFX906)
+    now = wall_clock64() * 40ull;   // gfx906: a 25 MHz wall clock -> ns (as verify_kernels.cu)
+#elif defined(__HIPCC__)
+    now = wall_clock64() * 10ull;   // gfx10.3 / gfx11 / gfx12: a constant 100 MHz counter -> ns
+#else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+#endif
     return now;
 }
 
