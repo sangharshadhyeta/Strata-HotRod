@@ -66,6 +66,35 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
                           const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
                           void* scratch, int32_t* out_id, float* out_prob, void* stream);
 
+// ---- PROBABILISTIC DRAFT ACCEPTANCE (include/strata/core/spec_prob.hpp, STRATA_SPEC_PROB=1).  Device pointers.
+// The drafter's last step in this mode: as coupled_draft_sample, but the draft is drawn from the chain's distribution
+// q with the drafter's own Philox stream, and q's (id, probability) list goes to qrows + j * kSpecQStride (the
+// drafter's mapped host memory; host-readable once the stream has synced).  *out_prob is q's top probability, or the
+// drawn token's own when gate_pick (what --spec-min-p gates a further draft on).
+void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
+                       const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
+                       void* scratch, int32_t* out_id, float* out_prob, int32_t* qrows, int gate_pick, float tscale, void* stream);
+// The verify window's head under rejection sampling: row t (< n_tokens - 1) judges the draft dtok[t] (n_tokens - 1
+// ids, device); rows < n_q have the drafter's list at qbuf + t * kSpecQStride (device), the others are point masses.
+// out[t] = the draft when kept, the residual sample when not, a plain sample on the last row; `p.counter` is the
+// window's first position, as sample_tokens.  False (nothing launched) where the split sampler cannot run - the
+// caller then calls sample_tokens (exact match).
+bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        void* stream);
+
+// #4590: which tokens the repeat / frequency / presence penalties count.  By default only the current reply: the
+// tokens the answer has written (the window starts at the last prompt token, the one the first decode step feeds in).
+// The prompt, including earlier assistant turns in it, is not counted, so a number or a quoted answer in the new
+// task is not penalised just for being there.  STRATA_PENALTY_PROMPT=1 restores the old window, the last
+// penalty_last_n tokens of prompt + reply.  Any other value (or none) is the default.
+inline bool penalty_counts_prompt(const char* env) { return env != nullptr && env[0] == '1'; }
+// The first index of the session's consumed tokens (prompt, then reply) the penalty window may read, given how
+// many were consumed when the request's decode began (the prompt without its last token).
+inline size_t penalty_window_from(size_t consumed_at_decode_start, bool counts_prompt) {
+    return counts_prompt ? 0 : consumed_at_decode_start;
+}
+
 // The penalty-history rows of a verify window, on the host: row t of `out` (T rows of `h` slots) is the last `h`
 // tokens of `tail[0..n_tail)` followed by `window[0..t]`, most recent LAST, -1 in the unused front slots.
 // `tail` is what the state consumed before the window, `window[0]` the fed-back token and `window[1..]` the

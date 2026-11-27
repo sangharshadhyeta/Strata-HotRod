@@ -85,4 +85,75 @@ private:
     std::vector<unsigned long long> ptr_;
 };
 
+/// STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path's view of the expert tiers, where a blob a helper
+/// GPU already holds in its VRAM cache is copied from that cache instead of being read from the files again.
+/// Everything else is forwarded to `fallback` unchanged, so its batched unbuffered reads, its pinned RAM copy
+/// and the prompt path's own decisions keep their meaning.  Nothing is cached here: every call asks the
+/// helpers, so an entry an adaptive tier moves between requests is a miss (a file read), never a wrong blob.
+///
+/// The serve loop builds this only for a serial request path (no batch slots, no layer split), while the
+/// helpers are idle: during a prompt read the helper GPUs compute nothing, so their caches can be read
+/// without ordering the copies against their kernel streams.
+class RemotePrefillSource final : public ExpertSource {
+public:
+    RemotePrefillSource(ExpertSource& fallback, const std::vector<RemoteExperts*>& helpers)
+        : fallback_(fallback), helpers_(helpers) {}
+
+    /// Whether any helper's VRAM cache holds (layer, expert) right now.
+    bool from_helper(int64_t layer, int64_t expert) const {
+        for (const RemoteExperts* h : helpers_) if (h->holds(layer, (int32_t) expert)) return true;
+        return false;
+    }
+    /// Blobs / bytes this source has taken from the helpers so far (the per-request evidence line).
+    uint64_t helper_blobs() const { return helper_blobs_.load(std::memory_order_relaxed); }
+    uint64_t helper_bytes() const { return helper_bytes_.load(std::memory_order_relaxed); }
+
+    const uint8_t* blob(int64_t layer, int64_t expert) override { return fallback_.blob(layer, expert); }
+    const uint8_t* blob_stable(int64_t layer, int64_t expert) override {
+        return fallback_.blob_stable(layer, expert);
+    }
+    int blob_parts(int64_t layer, int64_t expert, BlobPart* out) override {
+        return from_helper(layer, expert) ? 0 : fallback_.blob_parts(layer, expert, out);
+    }
+    int64_t reads() const override { return fallback_.reads(); }
+    bool pinned(int64_t layer, int64_t expert) const override {
+        return from_helper(layer, expert) ? false : fallback_.pinned(layer, expert);
+    }
+    void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override {
+        fallback_.begin_layer(layer, ids, k);
+    }
+    const uint8_t* device_alias(int64_t layer, int64_t expert) const override {
+        return from_helper(layer, expert) ? nullptr : fallback_.device_alias(layer, expert);
+    }
+    void prefetch(int64_t layer, int64_t expert) override { fallback_.prefetch(layer, expert); }
+    uint64_t release(int64_t layer, int64_t expert) override {
+        return from_helper(layer, expert) ? 0 : fallback_.release(layer, expert);
+    }
+    bool pcie_layer(int64_t layer) const override { return fallback_.pcie_layer(layer); }
+    /// True where a helper holds the blob: the prompt path's stager must then take the copy_blob(s) route,
+    /// which is where the cache-to-host copy happens.  Everywhere else the fallback answers as it always did.
+    bool transient(int64_t layer, int64_t expert) const override {
+        return from_helper(layer, expert) ? true : fallback_.transient(layer, expert);
+    }
+    double cached_share(int64_t samples) const override { return fallback_.cached_share(samples); }
+    bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
+    void prefetch(int64_t layer, const int64_t* experts, int64_t n) override {
+        fallback_.prefetch(layer, experts, n);
+    }
+    void warm(int64_t layer, const int64_t* experts, int64_t n, const int* pos = nullptr) override {
+        fallback_.warm(layer, experts, n, pos);
+    }
+    bool warms() const override { return fallback_.warms(); }
+    bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override {
+        return fallback_.advise_pairs(pairs, n);
+    }
+
+private:
+    void warn(const std::string& err);
+    ExpertSource& fallback_;
+    std::vector<RemoteExperts*> helpers_;
+    std::atomic<uint64_t> helper_blobs_{0}, helper_bytes_{0};
+    std::atomic<bool> warned_{false};
+};
 } // namespace strata::core

@@ -18,6 +18,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -74,6 +75,45 @@ catch (sycl::exception const &exc) {
 
 }  // namespace detail
 
+/// A host-to-device copy whose source is only partly page-locked (a blob at the edge of a STRATA_PIN_SEGS segment: part of
+/// it in a registered page range, part not) is refused by the driver with cudaErrorInvalidValue.  Only that refusal is
+/// handled here: the copy then goes in runs, one cudaMemcpyAsync per maximal run of pages that are, or are not, registered
+/// (cudaHostGetFlags tells them apart).  Any other result is returned as it is.  No effect when nothing is registered.
+inline cudaError_t h2d_split(void* dst, const void* src, size_t n, cudaStream_t stream) {
+    const cudaError_t e = cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, stream);
+    if (e != cudaErrorInvalidValue || n == 0) return e;
+    (void) cudaGetLastError();
+    constexpr uintptr_t kPage = 4096;
+    const uintptr_t s0 = (uintptr_t) src, s1 = s0 + (uintptr_t) n;
+    auto registered = [](uintptr_t p) {
+        unsigned flags = 0;
+        if (cudaHostGetFlags(&flags, (void*) p) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        return true;
+    };
+    cudaError_t first = cudaSuccess;
+    auto issue = [&](uintptr_t a, uintptr_t b) {
+        const cudaError_t r = cudaMemcpyAsync((uint8_t*) dst + (a - s0), (const void*) a, (size_t) (b - a),
+                                              cudaMemcpyHostToDevice, stream);
+        if (r != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (first == cudaSuccess) first = r;
+        }
+    };
+    uintptr_t run = s0;
+    bool run_registered = registered(s0);
+    for (uintptr_t p = s0; p < s1;) {
+        const bool reg = registered(p);
+        if (reg != run_registered) {
+            issue(run, p);
+            run = p;
+            run_registered = reg;
+        }
+        p = std::min<uintptr_t>(s1, (p & ~(kPage - 1)) + kPage);
+    }
+    issue(run, s1);
+    return first;
+}
+
 /// `n` independent copies, dst[i] <- src[i] (bytes[i] each), on `stream`.  The sources are immutable pinned host
 /// blobs and the destinations disjoint; the caller keeps them alive until the stream completes.  Ordering with
 /// earlier and later work on the stream is that of the copies one by one.  Returns the first error (the loop
@@ -114,23 +154,9 @@ inline dpct::err0 copy_blobs(void *const *dst, const void *const *src,
 #else
     (void) batch_mode;
 #endif
-    for (size_t i = 0; i < n; ++i) {
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        const dpct::err0 e =
-            DPCT_CHECK_ERROR(stream->memcpy(dst[i], src[i], bytes[i]));
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (e != 0) return e;
+    for (size_t i = 0; i < n; ++i) {   // a batch the driver refused (or a blob split at a lock edge): each one on its own
+        const cudaError_t e = h2d_split(dst[i], src[i], bytes[i], stream);
+        if (e != cudaSuccess) return e;
     }
     return 0;
 }
@@ -148,22 +174,8 @@ inline dpct::err0 copy_expert_blobs(uint8_t *dst, const uint8_t *const *src,
     constexpr size_t cap = 128;
     if (batch_mode == 0 || (size_t) n > cap) {   // the old loop, with no staging of its own
         for (int i = 0; i < n; ++i) {
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            const dpct::err0 e = DPCT_CHECK_ERROR(
-                stream->memcpy(dst + (size_t)i * bytes, src[i], bytes));
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (e != 0) return e;
+            const cudaError_t e = h2d_split(dst + (size_t) i * bytes, src[i], bytes, stream);
+            if (e != cudaSuccess) return e;
         }
         return 0;
     }
