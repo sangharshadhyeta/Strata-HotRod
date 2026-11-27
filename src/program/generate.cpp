@@ -18523,11 +18523,15 @@ int main(int argc, char** argv) {
                     const strata::kernels::KvStreamCounters c =
                         strata::kernels::kv_stream_counters(ss.qsa_states[ss.qsa_ord0 + j].map);
                     miss += c.misses; look += c.lookups; over = over || c.overflow;
+                    if (c.overflow) strata::kernels::kv_stream_clear_overflow(ss.qsa_states[ss.qsa_ord0 + j].map);
                 }
                 std::fprintf(stderr, "strata serve: KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read "
                                      "from RAM%s\n", look ? 100.0 * (double) (look - miss) / (double) look : 100.0,
                              (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
                              over ? " - OVERFLOW (too few resident cells)" : "");
+                if (over)   // this request's own (the flag is cleared once reported): its attention may have left out some selected context
+                    std::fprintf(stderr, "strata serve: WARNING: KV streaming overflowed in this request: more blocks were selected than VRAM slots, "
+                                         "so some selected context was left out of attention (more resident cells: --kv-resident)\n");
             }
             if (sfx_windows > 0)
                 std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",

@@ -114,6 +114,7 @@ struct KvStreamCounters {
 };
 /// Synchronous read of the counters (debug and the end-of-request summary).
 KvStreamCounters kv_stream_counters(const KvStreamMap& m);
+void kv_stream_clear_overflow(const KvStreamMap& m);   ///< clears the overflow flag (ctl[3]) once it has been reported
 
 /// Bytes of one block (page) of K and V together.
 uint64_t kv_block_bytes(const QsaShapes& s, int fmt);

@@ -90,7 +90,8 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
                                                      const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
     __shared__ int s_nmiss, s_lookups, s_cut;
     __shared__ int warp_sums[32];
-    const int epoch = m.ctl[0] + 1;
+    int epoch = (int) ((unsigned) m.ctl[0] + 1u);   // unsigned: no signed overflow after 2^31 calls
+    if (epoch == -1) epoch = 0;                       // -1 is the stamp of a slot no call has used (kv_stream_reset)
     if (threadIdx.x == 0) { s_nmiss = 0; s_lookups = 0; }
     __syncthreads();
     // 1. hits take this epoch and their reference bit; a missing block is claimed exactly once (-1 -> -2)
@@ -283,6 +284,9 @@ void kv_unstage_to_host(const QsaAttnPools& stage, const KvHostPools& host, int 
             check("unstage");
 }
 
+void kv_stream_clear_overflow(const KvStreamMap& m) {   // ctl[3] is sticky: cleared once reported, so the next report is that request's own
+    if (m.ctl != nullptr && cudaMemset(m.ctl + 3, 0, sizeof(int32_t)) != cudaSuccess) (void) cudaGetLastError();
+}
 KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     int32_t c[kKvCtlInts] = {};
     KvStreamCounters r;
