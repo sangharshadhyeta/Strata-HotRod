@@ -48,6 +48,16 @@
 #include <set>
 #include <tuple>
 #endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+#include "rocblas_tuning.hpp"
+#include <hip/hip_runtime_api.h>
+#include <rocblas/rocblas.h>
+#include <filesystem>
+#include <map>
+#include <string>
+#include <system_error>
+#include <tuple>
+#endif
 
 #if defined(__HIPCC__)
 #include <hip/hip_fp16.h>
@@ -56,6 +66,18 @@
 namespace strata::prefill {
 namespace {
 #if defined(__HIPCC__)
+// STRATA_F16_RANGE (gemm_set_f16_range): the largest |value| and the count beyond 65504 / non-finite, for the BF16
+// weights converted to FP16 (slot 0, bf16_to_f16_rows) and the FP16 GEMM outputs widened (slot 1, widen_rows_f16 -
+// an output rocBLAS wrote as FP16 is Inf there, not saturated).  As the activation counter in kernels.cu.
+__device__ int g_f16_range_on_g = 0;
+__device__ unsigned g_f16_range_max_g[2] = {0, 0};
+__device__ unsigned long long g_f16_range_over_g[2] = {0, 0};
+__device__ __forceinline__ void f16_range_note_g(int k, float f) {
+    const float a = fabsf(f);
+    const unsigned bits = sycl::bit_cast<uint32_t>(a);
+    if (bits > g_f16_range_max_g[k]) atomicMax(&g_f16_range_max_g[k], bits);
+    if (a > 65504.0f || isnan(f)) atomicAdd(&g_f16_range_over_g[k], 1ull);
+}
 // Y's rows, written by an FP16-out GEMM as FP16 at the start of each FP32 row (ldc = 2 ldy halves), widened in place.
 // Float c overwrites halves 2c and 2c+1, so a row is walked from its end in blocks: a block's halves are read into
 // registers, the block syncs, then writes its floats - which only cover halves of blocks already read.
@@ -69,6 +91,7 @@ __global__ void widen_rows_f16(float* __restrict__ Y, int64_t n, int64_t ldy, in
         const int64_t c = b * blockDim.x + threadIdx.x;
         const float v = c < n ? __half2float(h[c]) : 0.0f;
         if (count_nonfinite && c < n && !isfinite(v)) atomicAdd(&g_f16_nonfinite, 1ull);
+        if (c < n && g_f16_range_on_g) f16_range_note_g(1, v);
         __syncthreads();
         if (c < n) y[c] = v;
         __syncthreads();
@@ -78,10 +101,42 @@ __global__ void widen_rows_f16(float* __restrict__ Y, int64_t n, int64_t ldy, in
 __global__ void bf16_to_f16_rows(const uint16_t* __restrict__ s, __half* __restrict__ d, int64_t n) {
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
         const float f = __uint_as_float((uint32_t) s[i] << 16);
+        if (g_f16_range_on_g) f16_range_note_g(0, f);
         d[i] = __float2half(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f));   // as hf_sat: a NaN stays NaN
     }
 }
 #endif
+}  // namespace
+
+void gemm_set_f16_range(bool on) {
+#if defined(__HIPCC__)
+    const int v = on ? 1 : 0;
+    if (cudaMemcpyToSymbol(g_f16_range_on_g, &v, sizeof v) != cudaSuccess) {
+        std::fprintf(stderr, "prefill gemm: setting the FP16 range check failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        std::exit(1);
+    }
+#else
+    (void) on;
+#endif
+}
+bool gemm_f16_range_read(float max_abs[2], unsigned long long over[2], bool reset) {
+#if defined(__HIPCC__)
+    unsigned bits[2] = {0, 0}; unsigned long long o[2] = {0, 0};
+    if (cudaMemcpyFromSymbol(bits, g_f16_range_max_g, sizeof bits) != cudaSuccess ||
+        cudaMemcpyFromSymbol(o, g_f16_range_over_g, sizeof o) != cudaSuccess) { cudaGetLastError(); return false; }
+    for (int k = 0; k < 2; ++k) { union { unsigned u; float f; } c; c.u = bits[k]; max_abs[k] = c.f; over[k] = o[k]; }
+    if (reset) {
+        const unsigned z[2] = {0, 0}; const unsigned long long zz[2] = {0, 0};
+        cudaMemcpyToSymbol(g_f16_range_max_g, z, sizeof z); cudaMemcpyToSymbol(g_f16_range_over_g, zz, sizeof zz);
+    }
+    return true;
+#else
+    (void) max_abs; (void) over; (void) reset;
+    return false;
+#endif
+}
+
+namespace {
 
 void ck(int s, const char *what) {
     if (s != 0) {
@@ -352,6 +407,137 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
 }
 #endif
 
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+// The rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING: a table file, or a directory holding
+// <arch>-rocblas-<version>.txt for this card and rocBLAS build; src/prefill/rocblas_tuning.hpp).  rocBLAS's own
+// pick for some shapes is up to 6x slower than the best kernel it holds for them (gfx1030: tools/hip/tune_rocblas.cpp).
+struct RocBlasState {
+    rocblas_handle handle = nullptr;
+    strata::prefill::rocblas_tuning::Table table;
+    struct Pick { bool tuned = false; int solution = 0; int refusals = 0; };
+    std::map<std::tuple<int, int, int, int>, Pick> cache;   // (T, N, K, ldy) -> the solution to run, or the default
+    uint64_t tuned_launches = 0;
+    uint64_t fallbacks = 0;
+
+    ~RocBlasState() {
+        if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
+            std::fprintf(stderr, "prefill gemm: rocBLAS tuning summary tuned_launches=%llu fallbacks=%llu\n",
+                         (unsigned long long) tuned_launches, (unsigned long long) fallbacks);
+        }
+        if (handle) rocblas_destroy_handle(handle);
+    }
+};
+
+std::unique_ptr<RocBlasState> create_rocblas_state(void* stream) {
+    const char* path = std::getenv("STRATA_ROCBLAS_TUNING");
+    if (!path || !*path) return nullptr;
+    auto state = std::make_unique<RocBlasState>();
+    if (rocblas_create_handle(&state->handle) != rocblas_status_success) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS handle creation failed; its default kernels run\n");
+        return nullptr;
+    }
+    rocblas_set_stream(state->handle, (hipStream_t) stream);
+    char version[128] = {0};
+    if (rocblas_get_version_string(version, sizeof version) != rocblas_status_success) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS version query failed; its default kernels run\n");
+        return nullptr;
+    }
+    int device = 0;
+    hipDeviceProp_t properties{};
+    if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess) {
+        std::fprintf(stderr, "prefill gemm: HIP device query failed; rocBLAS's default kernels run\n");
+        return nullptr;
+    }
+    std::string arch(properties.gcnArchName);
+    if (const auto suffix = arch.find(':'); suffix != std::string::npos) arch.resize(suffix);
+    std::filesystem::path file(path);
+    std::error_code ec;
+    if (std::filesystem::is_directory(file, ec)) {
+        // the table of this card and this rocBLAS build (its version string, trailing dots dropped)
+        std::string tag(version);
+        while (!tag.empty() && tag.back() == '.') tag.pop_back();
+        file /= arch + "-rocblas-" + tag + ".txt";
+    }
+    std::string error;
+    if (!state->table.load(file.string(), arch, version, error)) {
+        std::fprintf(stderr, "prefill gemm: %s (%s); rocBLAS's default kernels run\n", error.c_str(),
+                     file.string().c_str());
+        return nullptr;
+    }
+    // rocBLAS loads its kernel library on the first product through a handle; a solution-index call before that
+    // fails (rocblas_status_internal_error) although the index is valid.  One tiny default product opens it.
+    {
+        uint16_t* tiny = nullptr;
+        if (hipMalloc(&tiny, 4 * 64 * 64 * 2) == hipSuccess) {
+            const float one = 1.0f, zero = 0.0f;
+            (void) rocblas_gemm_ex(state->handle, rocblas_operation_transpose, rocblas_operation_none, 64, 64, 64, &one,
+                                   tiny, rocblas_datatype_f16_r, 64, tiny + 64 * 64, rocblas_datatype_f16_r, 64, &zero,
+                                   tiny + 2 * 64 * 64, rocblas_datatype_f16_r, 128, tiny + 2 * 64 * 64,
+                                   rocblas_datatype_f16_r, 128, rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+            (void) hipStreamSynchronize((hipStream_t) stream);
+            (void) hipFree(tiny);
+        }
+    }
+    size_t tuned_rows = 0;
+    for (const auto& row : state->table.rows()) tuned_rows += row.tuned ? 1 : 0;
+    std::fprintf(stderr, "prefill gemm: rocBLAS tuning enabled (%zu rows, %zu with a solution, %s, rocBLAS %s)\n",
+                 state->table.rows().size(), tuned_rows, arch.c_str(), version);
+    return state;
+}
+
+// Gemm::f16_inplace's product through the table's solution for its shape.  False when the shape has no row, or the
+// launch was refused (then the default kernel runs, and for that shape from now on).
+bool try_rocblas_f16o(void* opaque_state, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
+                      int64_t K, int64_t ldy) {
+    auto* state = static_cast<RocBlasState*>(opaque_state);
+    if (!state || T <= 0 || N <= 0 || K <= 0 || T > INT_MAX || N > INT_MAX || K > INT_MAX || ldy > INT_MAX / 2) return false;
+    const auto key = std::make_tuple((int) T, (int) N, (int) K, (int) ldy);
+    auto it = state->cache.find(key);
+    if (it == state->cache.end()) {
+        RocBlasState::Pick pick;
+        if (const auto* row = state->table.closest((int) N, (int) K, (int) ldy, (int) T); row && row->tuned) {
+            pick.tuned = true;
+            pick.solution = row->solution;
+        }
+        if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
+            if (pick.tuned)
+                std::fprintf(stderr, "prefill gemm: rocBLAS solution %d for T=%lld N=%lld K=%lld ldy=%lld\n",
+                             pick.solution, (long long) T, (long long) N, (long long) K, (long long) ldy);
+            else
+                std::fprintf(stderr, "prefill gemm: rocBLAS default kernel; no row for T=%lld N=%lld K=%lld ldy=%lld\n",
+                             (long long) T, (long long) N, (long long) K, (long long) ldy);
+        }
+        it = state->cache.emplace(key, pick).first;
+    }
+    if (!it->second.tuned) return false;
+    const float one = 1.0f, zero = 0.0f;
+    const rocblas_status status = rocblas_gemm_ex(
+        state->handle, rocblas_operation_transpose, rocblas_operation_none, (int) N, (int) T, (int) K, &one, W,
+        rocblas_datatype_f16_r, (int) K, X, rocblas_datatype_f16_r, (int) K, &zero, Y, rocblas_datatype_f16_r,
+        (int) (2 * ldy), Y, rocblas_datatype_f16_r, (int) (2 * ldy), rocblas_datatype_f32_r,
+        rocblas_gemm_algo_solution_index, it->second.solution, 0);
+    if (status == rocblas_status_success) {
+        ++state->tuned_launches;
+        return true;
+    }
+    // A refusal writes nothing (the default kernel runs now).  The first one can be rocBLAS still setting up for the
+    // kernel (its device workspace: seen as invalid_value once, success after); a solution refused three times is
+    // dropped for this shape.
+    ++state->fallbacks;
+    if (++it->second.refusals >= 3) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS solution %d refused (status %d) for T=%lld N=%lld K=%lld ldy=%lld "
+                             "three times; the default kernel runs for this shape\n", it->second.solution, (int) status,
+                     (long long) T, (long long) N, (long long) K, (long long) ldy);
+        it->second.tuned = false;
+    } else if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS solution %d refused (status %d) for T=%lld N=%lld K=%lld ldy=%lld; "
+                             "the default kernel this time\n", it->second.solution, (int) status, (long long) T,
+                     (long long) N, (long long) K, (long long) ldy);
+    }
+    return false;
+}
+#endif
+
 }  // namespace
 
 bool prompt_f16() {
@@ -389,6 +575,9 @@ Gemm::~Gemm() {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     delete static_cast<HipLtState*>(hipblaslt_state_);
 #endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    delete static_cast<RocBlasState*>(rocblas_state_);
+#endif
     if (handle_) delete ((dpct::blas::descriptor_ptr)handle_);
     if (tc_w_) sycl::free(tc_w_, dpct::get_in_order_queue());
     if (tc_x_) sycl::free(tc_x_, dpct::get_in_order_queue());
@@ -424,6 +613,9 @@ bool Gemm::init_external(void *stream, uint16_t *scratch, int64_t scratch_elems,
     scratch_elems_ = scratch_elems;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws_bytes).release();
+#endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    rocblas_state_ = create_rocblas_state(stream).release();
 #endif
     return true;
 }
@@ -493,6 +685,9 @@ bool Gemm::init(void *stream, int64_t scratch_elems, std::string &err) try {
          "cublasSetMathMode");
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws).release();
+#endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    rocblas_state_ = create_rocblas_state(stream).release();
 #endif
     if (scratch_elems > 0) {
         /*
@@ -686,6 +881,7 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
 #endif
 }
 
+<<<<<<< sycl
 namespace {
 // oneMKL's GEMM reads the last, partial tile of an operand from the wrong place when it lies more than 4 GiB into its
 // allocation (Arc A770, oneMKL 2026.1: a BF16 B placed past 4 GiB of a 10.5 GiB allocation gave its last 21 columns
@@ -746,8 +942,128 @@ inline bool staged_gemm(sycl::queue& q, void* handle, const uint16_t* W, int lda
 // (#2091, CUDA Turing only) no FP16 activation image on this backend
 bool Gemm::bf16_converts_x() const { return false; }
 
+||||||| base
+=======
+#if defined(__HIPCC__)
+// ---- RDNA2 (gfx103x): the prompt path's GEMMs as FP32 SGEMMs ------------------------------------------------------
+// The GEMMs here take 16-bit inputs (FP16 or BF16) and write FP32 (rocBLAS's "HS" / "BS" types).  The rocBLAS the engine
+// ships has tuned gfx1030 kernels for FP16 -> FP16 ("HH"), int8 and FP32 -> FP32 ("SS") only: every 16-bit-input,
+// FP32-output GEMM runs a "fallback" kernel at ~5 TFLOPS.  Measured on an RX 6800 (ROCm 10.2.0a20260930) with the
+// engine's exact calls (opA = T, opB = N, fp32 compute): at the Coder's prompt shapes the FP16 GEMMs of one fresh
+// 12K-token prompt take 14.1 s, the same GEMMs as SGEMM on widened copies 4.7 s including the widening (e.g.
+// N 10240 x T 8192 x K 2560: 86.7 -> 27.7 ms); the BF16 hyper-connection GEMMs 10.9 -> 7.5 ms (N 320, K 10240).
+// Widening FP16 / BF16 to FP32 is exact and SGEMM accumulates in FP32 like the native call, so the products are the
+// same up to summation order.  The weight is widened once per call, the activations in slices of up to 128 MiB of
+// FP32 (an 8,192-token chunk at K = 2560 is one slice).  Small N (< 64: routers, gates) keeps the native call:
+// there the widening costs more than the GEMM gains.  If the FP32 buffers cannot be allocated, the native call runs.
+//   OPT-IN here: STRATA_RDNA2_SGEMM=1 turns it on for gfx103x devices (other cards keep the native call, also in a
+//   mixed layer split); =all turns it on for every AMD card (A/B arms, tests); unset or 0 is the native path.  The
+//   author ran it as the gfx103x default (RX 6800 343 -> 534 tok/s); it is not bit-identical to the native call.
+namespace {
+__global__ void rdna2_bf16_to_f32_kernel(const uint16_t* __restrict__ in, float* __restrict__ out, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __uint_as_float((uint32_t) in[i] << 16);
+}
+__global__ void rdna2_f16_to_f32_kernel(const __half* __restrict__ in, float* __restrict__ out, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(in[i]);
+}
+void rdna2_widen(const uint16_t* in, float* out, int64_t n, bool bf16, cudaStream_t st) {
+    if (n <= 0) return;
+    const unsigned blocks = (unsigned) ((n + 255) / 256);
+    if (bf16) rdna2_bf16_to_f32_kernel<<<blocks, 256, 0, st>>>(in, out, n);
+    else rdna2_f16_to_f32_kernel<<<blocks, 256, 0, st>>>(reinterpret_cast<const __half*>(in), out, n);
+}
+// whether this GEMM runs as an SGEMM (see above)
+bool rdna2_sgemm_on(int64_t N) {
+    static const int mode = [] {   // 0 off (unset), 1 gfx103x devices, 2 every AMD device
+        const char* v = std::getenv("STRATA_RDNA2_SGEMM");
+        if (v == nullptr || v[0] == '\0') return 0;
+        if (std::strcmp(v, "all") == 0) return 2;
+        return std::atoi(v) > 0 ? 1 : 0;
+    }();
+    if (mode == 0 || N < 64) return false;
+    if (mode == 2) return true;
+    static std::atomic<int> arch[64] = {};   // per device: 0 not known, 1 gfx103x, 2 another architecture
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { (void) hipGetLastError(); return false; }
+    int v = arch[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+        v = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ? 1 : 2;
+        arch[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+// `have`, `want`: FP32 elements (the buffers are the instance's 2-byte tc_ buffers, sized in 2-byte elements)
+bool rdna2_grow(uint16_t*& p, int64_t& have_u16, int64_t want_f32) {
+    const int64_t want = 2 * want_f32;
+    if (have_u16 >= want) return true;
+    if (p) cudaFree(p);
+    p = nullptr;
+    have_u16 = 0;
+    if (cudaMalloc((void**) &p, (size_t) want * 2) != cudaSuccess) { (void) cudaGetLastError(); p = nullptr; return false; }
+    have_u16 = want;
+    return true;
+}
+constexpr int64_t kRdna2SliceF32 = 32ll << 20;   // 128 MiB of FP32 activations per slice
+}  // namespace
+
+// Y^T[N, T] (+)= W[N, K] . X^T[K, T] as SGEMMs on FP32 copies; false: not this card / shape, or no buffers (the caller
+// runs its native GEMM, nothing was written)
+bool Gemm::rdna2_sgemm(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                       float beta, bool bf16) {
+    if (K <= 0 || !rdna2_sgemm_on(N)) return false;
+    const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(T, kRdna2SliceF32 / K));
+    // growing frees a buffer an earlier GEMM on this stream may still read (as the sm_60 FP32 route does)
+    if (tc_w_elems_ < 2 * N * K || tc_x_elems_ < 2 * rows * K) (void) hipStreamSynchronize((hipStream_t) stream_);
+    if (!rdna2_grow(tc_w_, tc_w_elems_, N * K) || !rdna2_grow(tc_x_, tc_x_elems_, rows * K)) return false;
+    float* const wf = reinterpret_cast<float*>(tc_w_);
+    float* const xf = reinterpret_cast<float*>(tc_x_);
+    const float alpha = 1.0f;
+    rdna2_widen(W, wf, N * K, bf16, (cudaStream_t) stream_);
+    for (int64_t t0 = 0; t0 < T; t0 += rows) {
+        const int64_t n = std::min<int64_t>(rows, T - t0);
+        rdna2_widen(X + t0 * K, xf, n * K, bf16, (cudaStream_t) stream_);
+        // every slice is a disjoint block of Y, so each gets the caller's beta
+        ck(hipblasSgemm((hipblasHandle_t) handle_, HIPBLAS_OP_T, HIPBLAS_OP_N, (int) N, (int) n, (int) K, &alpha, wf,
+                        (int) K, xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
+           "hipblasSgemm (RDNA2)");
+    }
+    return true;
+}
+#endif
+
+bool Gemm::bf16_converts_x() const {
+#if defined(__HIPCC__) || defined(STRATA_EXPERIMENTAL_SM60)
+    return false;
+#else
+    return bf16_path() == 1;
+#endif
+}
+__dpct_inline__ void f16_to_bf16_kernel(const sycl::half *__restrict__ in,
+                                        uint16_t *__restrict__ out, int64_t n) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i < n) out[i] =
+        (uint16_t)(sycl::bit_cast<unsigned int>(
+                       sycl::vec<sycl::half, 1>(in[i])
+                           .convert<float,
+                                    sycl::rounding_mode::automatic>()[0]) >>
+                   16); // exact: the value was a BF16
+}
+>>>>>>> ours-now
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+<<<<<<< sycl
                 float beta, int64_t ldx, bool /*x_f16*/) {
+||||||| base
+                float beta, int64_t ldx) {
+=======
+                float beta, int64_t ldx, bool x_f16) {
+>>>>>>> ours-now
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;
@@ -783,6 +1099,10 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return;
     }
 #endif
+#if defined(__HIPCC__)
+    // a padded X (STRATA_PF_PAD, ldx > K) keeps the native call: the widening copies contiguous rows
+    if (ldx == 0 && rdna2_sgemm(X, W, Y, T, N, K, ldy, beta, true)) return;
+#endif
 #if !defined(__HIPCC__)
     if (const int path = K > 0 ? bf16_path() : 0; path == 1 && N > 1 && beta == 0.0f) {
         // a single output row stays cuBLAS's GEMV, faster than the conversions; beta = 1: see above
@@ -798,6 +1118,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         }
     }
 #if defined(STRATA_EXPERIMENTAL_SM60)
+<<<<<<< sycl
     else if (path == 2) {
         // Pascal: fp32 copies (2 elements of the 2-byte buffers each).  Every tile is a disjoint block of Y, so each
         // gets the caller's beta.
@@ -812,15 +1133,109 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                 ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &alpha,
                                wf, (int) K, xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
                    "cublasSgemm (bf16 on Pascal)");
+||||||| base
+                    float* const wf = reinterpret_cast<float*>(tc_w_);
+                    float* const xf = reinterpret_cast<float*>(tc_x_);
+                    bf16_to_f32(W + n0 * K, wf, nn * K, (cudaStream_t) stream_);
+                    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+                        const int64_t n = std::min<int64_t>(x_rows, T - t0);
+                        bf16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
+                        ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) nn, (int) n, (int) K, &alpha,
+                                       wf, (int) K, xf, (int) K, &beta, Y + t0 * ldy + n0, (int) ldy),
+                           "cublasSgemm (bf16 on Pascal)");
+                    }
+#endif
+                } else {
+                    bf16_to_f16(W + n0 * K, tc_w_, nn * K,
+                                strata::q_of(stream_));
+                    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+                        const int64_t n = std::min<int64_t>(x_rows, T - t0);
+                        bf16_to_f16(X + t0 * K, tc_x_, n * K,
+                                    strata::q_of(stream_));
+                        f16(tc_x_, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
+                    }
+                }
+=======
+                    float* const wf = reinterpret_cast<float*>(tc_w_);
+                    float* const xf = reinterpret_cast<float*>(tc_x_);
+                    bf16_to_f32(W + n0 * K, wf, nn * K, (cudaStream_t) stream_);
+                    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+                        const int64_t n = std::min<int64_t>(x_rows, T - t0);
+                        bf16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
+                        ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) nn, (int) n, (int) K, &alpha,
+                                       wf, (int) K, xf, (int) K, &beta, Y + t0 * ldy + n0, (int) ldy),
+                           "cublasSgemm (bf16 on Pascal)");
+                    }
+#endif
+                } else {
+                    bf16_to_f16(W + n0 * K, tc_w_, nn * K,
+                                strata::q_of(stream_));
+                    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+                        const int64_t n = std::min<int64_t>(x_rows, T - t0);
+                        if (x_f16) {   // already the converted values (the same slices: the same GEMMs)
+                            f16(X + t0 * K, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
+                        } else {
+                            bf16_to_f16(X + t0 * K, tc_x_, n * K,
+                                        strata::q_of(stream_));
+                            f16(tc_x_, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
+                        }
+                    }
+                }
+>>>>>>> ours-now
             }
             return;
         }
     }
 #endif
+<<<<<<< sycl
 #endif
     if (staged_gemm(*strata::q_of(stream_), handle_, W, (int) K, X, (int) (ldx ? ldx : K), dpct::library_data_t::real_bfloat16, N, T, K,
                     alpha, beta, Y, ldy))
         return;
+||||||| base
+=======
+#if !defined(__HIPCC__)
+    if (x_f16) {   // not the tensor-core path after all (one output row, or no room): X back to BF16, a slice at a time
+        const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
+        if (!grow(tc_x_, tc_x_elems_, x_rows * K)) {
+            std::fprintf(stderr, "prefill gemm: no GPU memory for converting an FP16 image back to BF16\n");
+            std::exit(1);
+        }
+        for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+            const int64_t n = std::min<int64_t>(x_rows, T - t0);
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+                dpct::has_capability_or_fail(
+                    strata::q_of(stream_)->get_device(),
+                    {sycl::aspect::fp16});
+
+                strata::q_of(stream_)
+                    ->submit([&](sycl::handler &cgh) {
+                        auto X_t0_K_ct0 =
+                            reinterpret_cast<const sycl::half *>(X + t0 * K);
+                        auto tc_x__ct1 = tc_x_;
+                        auto n_K_ct2 = n * K;
+
+                        cgh.parallel_for<
+                            dpct_kernel_name<class f16_to_bf16_kernel_f2fb73>>(
+                            sycl::nd_range<3>(
+                                sycl::range(1, 1,
+                                            (unsigned)((n * K + 255) / 256)) *
+                                    sycl::range(1, 1, 256),
+                                sycl::range(1, 1, 256)),
+                            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                                f16_to_bf16_kernel(X_t0_K_ct0, tc_x__ct1,
+                                                   n_K_ct2);
+                            });
+                    });
+            }
+            bf16(tc_x_, W, Y + t0 * ldy, n, N, K, ldy, beta, 0, false);
+        }
+        return;
+    }
+#endif
+>>>>>>> ours-now
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
     ck(DPCT_CHECK_ERROR(dpct::blas::gemm(
            (dpct::blas::descriptor_ptr)handle_, oneapi::mkl::transpose::trans,
@@ -859,6 +1274,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         return;
     }
 #endif
+<<<<<<< sycl
     if (staged_gemm(*strata::q_of(stream_), handle_, W, (int) K, X, (int) K, dpct::library_data_t::real_half, N, T, K, alpha, beta, Y, ldy))
         return;
     ck(DPCT_CHECK_ERROR(dpct::blas::gemm(
@@ -868,6 +1284,146 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
            dpct::library_data_t::real_half, (int)K, &beta, Y,
            dpct::library_data_t::real_float, (int)ldy,
            dpct::compute_type::f32)),
+||||||| base
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    // Pascal, STRATA_DENSE_F32=1: cublasSgemm on FP32 copies (dense_f32_on above: where it is bitwise the FP16 call)
+    if (const int64_t min_t = beta == 0.0f ? dense_f32_min_t(N, K) : 0; min_t > 0 && T >= min_t && dense_f32_on()) {
+        const int64_t n_sl = (T * K + kXSliceElems - 1) / kXSliceElems;   // even slices of at most 64 MiB as fp32
+        const int64_t x_rows = (T + n_sl - 1) / n_sl;
+        // grow() frees a buffer an earlier GEMM on this stream may still read
+        if (tc_w_elems_ < 2 * N * K || tc_x_elems_ < 2 * x_rows * K) cudaStreamSynchronize((cudaStream_t) stream_);
+        if (grow(tc_w_, tc_w_elems_, 2 * N * K) && grow(tc_x_, tc_x_elems_, 2 * x_rows * K)) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "prefill gemm: the dense projections' FP16 GEMMs run as cublasSgemm on FP32 copies "
+                                     "(STRATA_DENSE_F32=1; gemm_f32_parity checks the bits against this cuBLAS)\n");
+            }
+            float* const wf = reinterpret_cast<float*>(tc_w_);
+            float* const xf = reinterpret_cast<float*>(tc_x_);
+            f16_to_f32(W, wf, N * K, (cudaStream_t) stream_);
+            for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+                const int64_t n = std::min<int64_t>(x_rows, T - t0);
+                f16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
+                ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &alpha, wf, (int) K,
+                               xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
+                   "cublasSgemm (FP16 operands, STRATA_DENSE_F32)");
+            }
+            return;
+        }
+        cudaGetLastError();   // no room for the copies: the FP16 call below
+    }
+#endif
+#if !defined(__HIPCC__)
+    const auto f16_gemm = [&](int algo) {
+        /*
+        DPCT1020: Migration of cublasGemmEx, if it is called from
+        __global__ or __device__ function, is not supported. You may need to
+        redesign the code to use the host-side dpct::blas::gemm instead, which
+        submits this call to the SYCL queue automatically.
+        */
+        /*
+        DPCT1021: Migration of cublasHandle_t in __global__ or __device__
+        function is not supported. You may need to redesign the code.
+        */
+        return cublasGemmEx((cublasHandle_t)handle_,
+                            oneapi::mkl::transpose::trans,
+                            oneapi::mkl::transpose::nontrans, (int)N, (int)T,
+                            (int)K, &alpha, W, dpct::library_data_t::real_half,
+                            (int)K, X, dpct::library_data_t::real_half, (int)K,
+                            &beta, Y, dpct::library_data_t::real_float,
+                            (int)ldy, dpct::compute_type::f32, algo);
+    };
+    // Issue #1650: with a second CUDA device initialized in the process, cuBLAS 12 answers the default algorithm of a
+    // few shapes - narrow ones, and the set moves with K - with CUBLAS_STATUS_INTERNAL_ERROR; a fixed algorithm keeps
+    // a kernel that state does not break.  Only the shapes that fail are moved (the failing call itself is harmless);
+    // the wide shapes, for which the fixed algorithms are markedly slower, stay on the default.
+    const int64_t shape = ((int64_t) K << 32) | (uint32_t) N;
+    int algo = -1;
+    for (int i = 0; i < f16_algo_n_; ++i)
+        if (f16_algo_shape_[i] == shape) { algo = 2; break; }
+    int st = f16_gemm(algo);
+    if (st == 14 && algo == -1) {
+        if (f16_algo_n_ < kF16AlgoSlots) f16_algo_shape_[f16_algo_n_++] = shape;
+        st = f16_gemm(2);
+    }
+    ck(st, "cublasGemmEx f16");
+#else
+    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                    CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+=======
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    // Pascal, STRATA_DENSE_F32=1: cublasSgemm on FP32 copies (dense_f32_on above: where it is bitwise the FP16 call)
+    if (const int64_t min_t = beta == 0.0f ? dense_f32_min_t(N, K) : 0; min_t > 0 && T >= min_t && dense_f32_on()) {
+        const int64_t n_sl = (T * K + kXSliceElems - 1) / kXSliceElems;   // even slices of at most 64 MiB as fp32
+        const int64_t x_rows = (T + n_sl - 1) / n_sl;
+        // grow() frees a buffer an earlier GEMM on this stream may still read
+        if (tc_w_elems_ < 2 * N * K || tc_x_elems_ < 2 * x_rows * K) cudaStreamSynchronize((cudaStream_t) stream_);
+        if (grow(tc_w_, tc_w_elems_, 2 * N * K) && grow(tc_x_, tc_x_elems_, 2 * x_rows * K)) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "prefill gemm: the dense projections' FP16 GEMMs run as cublasSgemm on FP32 copies "
+                                     "(STRATA_DENSE_F32=1; gemm_f32_parity checks the bits against this cuBLAS)\n");
+            }
+            float* const wf = reinterpret_cast<float*>(tc_w_);
+            float* const xf = reinterpret_cast<float*>(tc_x_);
+            f16_to_f32(W, wf, N * K, (cudaStream_t) stream_);
+            for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+                const int64_t n = std::min<int64_t>(x_rows, T - t0);
+                f16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
+                ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &alpha, wf, (int) K,
+                               xf, (int) K, &beta, Y + t0 * ldy, (int) ldy),
+                   "cublasSgemm (FP16 operands, STRATA_DENSE_F32)");
+            }
+            return;
+        }
+        cudaGetLastError();   // no room for the copies: the FP16 call below
+    }
+#endif
+#if defined(__HIPCC__)
+    if (rdna2_sgemm(X, W, Y, T, N, K, ldy, beta, false)) return;
+#endif
+#if !defined(__HIPCC__)
+    const auto f16_gemm = [&](int algo) {
+        /*
+        DPCT1020: Migration of cublasGemmEx, if it is called from
+        __global__ or __device__ function, is not supported. You may need to
+        redesign the code to use the host-side dpct::blas::gemm instead, which
+        submits this call to the SYCL queue automatically.
+        */
+        /*
+        DPCT1021: Migration of cublasHandle_t in __global__ or __device__
+        function is not supported. You may need to redesign the code.
+        */
+        return cublasGemmEx((cublasHandle_t)handle_,
+                            oneapi::mkl::transpose::trans,
+                            oneapi::mkl::transpose::nontrans, (int)N, (int)T,
+                            (int)K, &alpha, W, dpct::library_data_t::real_half,
+                            (int)K, X, dpct::library_data_t::real_half, (int)K,
+                            &beta, Y, dpct::library_data_t::real_float,
+                            (int)ldy, dpct::compute_type::f32, algo);
+    };
+    // Issue #1650: with a second CUDA device initialized in the process, cuBLAS 12 answers the default algorithm of a
+    // few shapes - narrow ones, and the set moves with K - with CUBLAS_STATUS_INTERNAL_ERROR; a fixed algorithm keeps
+    // a kernel that state does not break.  Only the shapes that fail are moved (the failing call itself is harmless);
+    // the wide shapes, for which the fixed algorithms are markedly slower, stay on the default.
+    const int64_t shape = ((int64_t) K << 32) | (uint32_t) N;
+    int algo = -1;
+    for (int i = 0; i < f16_algo_n_; ++i)
+        if (f16_algo_shape_[i] == shape) { algo = 2; break; }
+    int st = f16_gemm(algo);
+    if (st == 14 && algo == -1) {
+        if (f16_algo_n_ < kF16AlgoSlots) f16_algo_shape_[f16_algo_n_++] = shape;
+        st = f16_gemm(2);
+    }
+    ck(st, "cublasGemmEx f16");
+#else
+    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                    CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+>>>>>>> ours-now
        "cublasGemmEx f16");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
@@ -941,10 +1497,16 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
 void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
 #if defined(__HIPCC__)
     const float one = 1.0f, zero = 0.0f;
-    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, W, CUDA_R_16F,
-                    (int) K, X, CUDA_R_16F, (int) K, &zero, Y, CUDA_R_16F, (int) (2 * ldy), CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT),
-       "cublasGemmEx f16 out");
+    bool done = false;
+#if defined(STRATA_ROCBLAS_AVAILABLE)
+    done = try_rocblas_f16o(rocblas_state_, X, W, Y, T, N, K, ldy);   // the table's kernel for this shape, if any
+#endif
+    if (!done) {
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, W,
+                        CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &zero, Y, CUDA_R_16F, (int) (2 * ldy),
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+           "cublasGemmEx f16 out");
+    }
     static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
     widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
     if (dbg_nan) {   // debug only: a sync per GEMM

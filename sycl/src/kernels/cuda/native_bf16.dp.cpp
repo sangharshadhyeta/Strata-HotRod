@@ -350,7 +350,13 @@ the work-group size if needed.
             auto ldy_aux_ct10 = ldy_aux;                                       \
                                                                                \
             cgh.parallel_for<dpct_kernel_name<                                 \
+<<<<<<< sycl
                 class bf16_f32_mmvf_rows_kernel_7c05e5, dpct_kernel_scalar<B>, \
+||||||| base
+                class bf16_f32_mmvf_rows_kernel_56ae49, dpct_kernel_scalar<B>, \
+=======
+                class bf16_f32_mmvf_rows_kernel_fc65f4, dpct_kernel_scalar<B>, \
+>>>>>>> ours-now
                 dpct_kernel_scalar<4>, dpct_kernel_scalar<RPB>,                \
                 dpct_kernel_scalar<TSV>, dpct_kernel_scalar<true>>>(           \
                 sycl::nd_range<3>(sycl::range(1, 1, nb + 1) *                  \
@@ -383,7 +389,13 @@ the work-group size if needed.
             auto ldy_aux_ct10 = ldy_aux;                                       \
                                                                                \
             cgh.parallel_for<dpct_kernel_name<                                 \
+<<<<<<< sycl
                 class bf16_f32_mmvf_rows_kernel_681929, dpct_kernel_scalar<B>, \
+||||||| base
+                class bf16_f32_mmvf_rows_kernel_7e6aff, dpct_kernel_scalar<B>, \
+=======
+                class bf16_f32_mmvf_rows_kernel_365d6f, dpct_kernel_scalar<B>, \
+>>>>>>> ours-now
                 dpct_kernel_scalar<8>, dpct_kernel_scalar<RPB>,                \
                 dpct_kernel_scalar<TSV>, dpct_kernel_scalar<true>>>(           \
                 sycl::nd_range<3>(sycl::range(1, 1, nb + 1) *                  \
@@ -418,7 +430,13 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
                 parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                     class bf16_f32_mmvf_rows_kernel_ff3610,
+||||||| base
+                    class bf16_f32_mmvf_rows_kernel_6d83ee,
+=======
+                    class bf16_f32_mmvf_rows_kernel_314cd0,
+>>>>>>> ours-now
                     dpct_kernel_scalar<B>, dpct_kernel_scalar<4>,
                     dpct_kernel_scalar<RPB>, dpct_kernel_scalar<true>,
                     dpct_kernel_scalar<false>>>(
@@ -446,7 +464,13 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
                 parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                     class bf16_f32_mmvf_rows_kernel_1b1bb5,
+||||||| base
+                    class bf16_f32_mmvf_rows_kernel_2280fa,
+=======
+                    class bf16_f32_mmvf_rows_kernel_a358b6,
+>>>>>>> ours-now
                     dpct_kernel_scalar<B>, dpct_kernel_scalar<8>,
                     dpct_kernel_scalar<RPB>, dpct_kernel_scalar<true>,
                     dpct_kernel_scalar<false>>>(
@@ -476,7 +500,13 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
             parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                 class bf16_f32_mmvf_rows_kernel_7ff80d, dpct_kernel_scalar<B>,
+||||||| base
+                class bf16_f32_mmvf_rows_kernel_d3b190, dpct_kernel_scalar<B>,
+=======
+                class bf16_f32_mmvf_rows_kernel_b14ccb, dpct_kernel_scalar<B>,
+>>>>>>> ours-now
                 dpct_kernel_scalar<4>, dpct_kernel_scalar<RPB>,
                 dpct_kernel_scalar<false>,
                 dpct_kernel_scalar<false>>>(
@@ -503,7 +533,13 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
             parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                 class bf16_f32_mmvf_rows_kernel_13db68, dpct_kernel_scalar<B>,
+||||||| base
+                class bf16_f32_mmvf_rows_kernel_65d63c, dpct_kernel_scalar<B>,
+=======
+                class bf16_f32_mmvf_rows_kernel_f36886, dpct_kernel_scalar<B>,
+>>>>>>> ours-now
                 dpct_kernel_scalar<8>, dpct_kernel_scalar<RPB>,
                 dpct_kernel_scalar<false>,
                 dpct_kernel_scalar<false>>>(
@@ -856,6 +892,167 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         throw std::runtime_error(
             std::string("bf16_gemv_fp32_mmvf_multi launch: ") +
             dpct::get_error_string_dummy(result));
+}
+
+// SPEC-router-fuse step 1: the three look-ahead projections in one launch.  Block (d * n_out + row) computes row `row` of dist d's
+// matrix for NT tokens with bf16_f32_mmvf_multi_kernel's arithmetic (the same pairs, the same two ordered FMAs per pair and token,
+// the same warp and block sums); the PDL prefetch is the only thing left out (no programmatic launch here).
+template <int BLOCK_SIZE, int NT>
+__dpct_inline__ void bf16_f32_mmvf_multi3_kernel(
+    const float *__restrict__ x, int64_t ldx, const uint16_t *__restrict__ w0,
+    const uint16_t *__restrict__ w1, const uint16_t *__restrict__ w2,
+    uint32_t live, float *__restrict__ y, int64_t ldy, int64_t ldy_d, int n_in,
+    int n_out, int n_tok) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int d = (int)item_ct1.get_group(2) / n_out;
+    const int row = (int)item_ct1.get_group(2) - d * n_out;
+    if (((live >> d) & 1u) == 0u) return;   // uniform across the block
+    const uint16_t* wd = d == 0 ? w0 : (d == 1 ? w1 : w2);
+    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(wd + (size_t) row * n_in);
+    const int t = item_ct1.get_local_id(2);
+    auto &partials =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NT][32]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    if (t < 32) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) partials[k][t] = 0.0f;
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    float acc[NT];
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const uint32_t weight = *(weights2 + pair);
+        const float wa = f32_from_bf16((uint16_t) weight), wb = f32_from_bf16((uint16_t) (weight >> 16));
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            /*
+            DPCT1098: The '*' expression is used instead of the __ldg call.
+            These two expressions do not provide the exact same functionality.
+            Check the generated code for potential precision and/or performance
+            issues.
+            */
+            const sycl::float2 input =
+                *(reinterpret_cast<const sycl::float2 *>(x + (size_t)k * ldx) +
+                  pair);
+            /*
+            DPCT1013: The rounding mode could not be specified and the
+            generated code may have different accuracy than the original code.
+            Verify the correctness. SYCL math built-in function rounding mode is
+            aligned with OpenCL C 1.2 standard.
+            */
+            acc[k] = sycl::fma(wa, input.x(), acc[k]);
+            /*
+            DPCT1013: The rounding mode could not be specified and the
+            generated code may have different accuracy than the original code.
+            Verify the correctness. SYCL math built-in function rounding mode is
+            aligned with OpenCL C 1.2 standard.
+            */
+            acc[k] = sycl::fma(wb, input.y(), acc[k]);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = mmvf_warp_sum(acc[k]);
+    if constexpr (BLOCK_SIZE > 32) {
+        if ((t & 31) == 0)
+#pragma unroll
+            for (int k = 0; k < NT; ++k) partials[k][t / 32] = acc[k];
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+        if (t < 32)
+#pragma unroll
+            for (int k = 0; k < NT; ++k) acc[k] = mmvf_warp_sum(partials[k][t]);
+    }
+    if (t == 0)
+#pragma unroll
+        for (int k = 0; k < NT; ++k) y[(size_t) d * ldy_d + (size_t) k * ldy + row] = acc[k];
+}
+
+bool bf16_gemv_fp32_mmvf_multi3(const float* x, int64_t ldx, const uint16_t* const w[3], uint32_t live, float* y, int64_t ldy,
+                                int64_t ldy_d, int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
+    if (rows || live == 0u || n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
+        y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || n_in > 0x7fffffff)
+        return false;
+    for (int d = 0; d < 3; ++d)
+        if (((live >> d) & 1u) != 0u && w[d] == nullptr) return false;
+    const dpct::queue_ptr st = strata::q_of(stream);
+    const unsigned nb = (unsigned) (3 * n_out);
+    const uint16_t* w0 = w[0] != nullptr ? w[0] : (w[1] != nullptr ? w[1] : w[2]);   // (a dead dist's pointer is never read)
+    const uint16_t* w1 = w[1] != nullptr ? w[1] : w0;
+    const uint16_t* w2 = w[2] != nullptr ? w[2] : w0;
+    const int ni = (int) n_in, no = (int) n_out;
+#define STRATA_MMVF3_NT(B, NTV)                                                \
+    case NTV: {                                                                \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
+            sycl::ext::oneapi::experimental::use_root_sync};                   \
+                                                                               \
+        st->submit([&](sycl::handler &cgh) {                                   \
+            auto x_ct0 = x;                                                    \
+            auto ldx_ct1 = ldx;                                                \
+            auto w0_ct2 = w0;                                                  \
+            auto w1_ct3 = w1;                                                  \
+            auto w2_ct4 = w2;                                                  \
+            auto live_ct5 = live;                                              \
+            auto y_ct6 = y;                                                    \
+            auto ldy_ct7 = ldy;                                                \
+            auto ldy_d_ct8 = ldy_d;                                            \
+            auto ni_ct9 = ni;                                                  \
+            auto no_ct10 = no;                                                 \
+            auto n_tok_ct11 = n_tok;                                           \
+                                                                               \
+            cgh.parallel_for<dpct_kernel_name<                                 \
+                class bf16_f32_mmvf_multi3_kernel_386e8f,                      \
+                dpct_kernel_scalar<B>, dpct_kernel_scalar<NTV>>>(              \
+                sycl::nd_range<3>(sycl::range(1, 1, nb) *                      \
+                                      sycl::range(1, 1, B),                    \
+                                  sycl::range(1, 1, B)),                       \
+                exp_props,                                                     \
+                [=](sycl::nd_item<3> item_ct1)                                 \
+                    [[sycl::reqd_sub_group_size(32)]] {                        \
+                        bf16_f32_mmvf_multi3_kernel<B, NTV>(                   \
+                            x_ct0, ldx_ct1, w0_ct2, w1_ct3, w2_ct4, live_ct5,  \
+                            y_ct6, ldy_ct7, ldy_d_ct8, ni_ct9, no_ct10,        \
+                            n_tok_ct11);                                       \
+                    });                                                        \
+        });                                                                    \
+    } break
+#define STRATA_MMVF3_B(B) \
+    case B: switch (n_tok) { STRATA_MMVF3_NT(B, 1); STRATA_MMVF3_NT(B, 2); STRATA_MMVF3_NT(B, 3); STRATA_MMVF3_NT(B, 4); \
+                             STRATA_MMVF3_NT(B, 5); STRATA_MMVF3_NT(B, 6); STRATA_MMVF3_NT(B, 7); STRATA_MMVF3_NT(B, 8); } break
+    switch (mmvf_block_size(n_in)) {
+        STRATA_MMVF3_B(32); STRATA_MMVF3_B(64); STRATA_MMVF3_B(96); STRATA_MMVF3_B(128);
+        STRATA_MMVF3_B(160); STRATA_MMVF3_B(192); STRATA_MMVF3_B(224); STRATA_MMVF3_B(256);
+    }
+#undef STRATA_MMVF3_B
+#undef STRATA_MMVF3_NT
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    const dpct::err0 result = 0;
+    /*
+    DPCT1000: Error handling if-stmt was detected but could not be
+    rewritten.
+    */
+    if (result != 0)
+        /*
+        DPCT1009: SYCL reports errors using exceptions and does not use
+        error codes. Please replace the "get_error_string_dummy(...)" with a
+        real error-handling function.
+        */
+        /*
+        DPCT1001: The statement could not be removed.
+        */
+        throw std::runtime_error(
+            std::string("bf16_gemv_fp32_mmvf_multi3 launch: ") +
+            dpct::get_error_string_dummy(result));
+    return true;
 }
 
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,

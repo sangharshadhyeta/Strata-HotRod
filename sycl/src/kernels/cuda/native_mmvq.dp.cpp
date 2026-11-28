@@ -33,6 +33,13 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+<<<<<<< sycl
+||||||| base
+#include "strata/kernels/gfx_arch.hpp"
+=======
+#include "strata/kernels/gfx_arch.hpp"
+#include "strata/core/sm75_series.hpp"
+>>>>>>> ours-now
 #include "s26_tsum.dp.hpp"
 
 #include <algorithm>
@@ -1352,6 +1359,8 @@ struct SmallTraits<IQ4NLBlock, 4> {
 // llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster,
 // equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
 bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
+// B6 STRATA_B6_MMVQ_ROWS (lab, default 0 = off): see native_mmvq_set_b6_rows
+int g_b6_rows = [] { const char* v = std::getenv("STRATA_B6_MMVQ_ROWS"); return v ? std::atoi(v) : 0; }();
 
 // S26 STRATA_TSUM=1 (TS): warp 0's NCOLS x ROWS sums as one transposed butterfly (s26_tsum.cuh), bitwise the same
 static bool s26_tsum_on() {
@@ -1462,6 +1471,7 @@ native_mmvq_multi_kernel(const typename F::Block *__restrict__ w,
     }
 }
 
+<<<<<<< sycl
 // ---------------------------------------------------------------- SYCL port: row-blocked mmvq
 //
 // Measured on the B70 (mmvq_bench): the shared kernel above spends its time re-reading the activation - every
@@ -1490,6 +1500,163 @@ void native_mmvq_rowwarp_kernel(const typename F::Block* __restrict__ w, const Q
 #pragma unroll
             for (int j = 0; j < NCOLS; ++j) tmp[r][j] += F::dot(wv, a[j]);
         }
+||||||| base
+// Auto generated SYCL kernel wrapper used to migration kernel function pointer.
+template <typename F, int NCOLS, int NW, int ROWS, bool TS = false,
+          bool PAIR = false>
+void native_mmvq_multi_kernel_wrapper(
+    const typename F::Block *__restrict w, const Q81Block *x_, float *y_,
+    int n_in, int n_out, const typename F::Block *__restrict w2 = nullptr,
+    float *__restrict y2 = nullptr) {
+    sycl::queue queue = *dpct::kernel_launcher::_que;
+    unsigned int localMemSize = dpct::kernel_launcher::_local_mem_size;
+    sycl::nd_range<3> nr = dpct::kernel_launcher::_nr;
+
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+    dpct::has_capability_or_fail(queue.get_device(), {sycl::aspect::fp16});
+
+    queue.parallel_for<dpct_kernel_name<class native_mmvq_multi_kernel_>>(
+        nr, exp_props,
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+            native_mmvq_multi_kernel<F, NCOLS, NW, ROWS, TS, PAIR>(
+                w, x_, y_, n_in, n_out, w2, y2);
+        });
+}
+
+// MODEL-UPDATE: the dense Q8_0 projections of Unsloth's files (all of attention, SSM and the shared expert are Q8_0
+// there) take one row per block where that was measured faster - the same per-row sums and reduction as two rows per
+// block (each row its own partials), so every output is the same bits.  q8_gemv_bench, 2-4 columns:
+//   gfx1201 (R9700): n_in <= 4096 with n_out >= 4096 (qkv 2560->10240 73-79% -> 83-84% of the 644 GB/s, gate 2560->6144
+//     51-68% -> 76-78%, q 2560->12288 74-80% -> 85-86%); 6144->2560 is slower there (79% -> 55-59%) and keeps two rows.
+//   sm_86 (RTX A4000): every n_out >= 2048 (+1-4% at 2-4 columns, 6144->2560 at 6 columns 70% -> 76%).
+// Other cards keep two rows until measured (STRATA_NO_MMVQ_ROWS2=1 forces one row everywhere; =0 keeps two everywhere).
+int dev_class() try {     // 1 = gfx12, 2 = sm_86, 0 = the rest; per device
+    static int cls[16];   // 0 unknown, else class + 1
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 16) return 0;
+    if (cls[dev] == 0) {
+        int c = 0;
+#if defined(__HIPCC__)
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName)) c = 1;
+#else
+        int major = 0, minor = 0;
+        if (DPCT_CHECK_ERROR(
+                major = dpct::get_device(dev).get_major_version()) == 0 &&
+            DPCT_CHECK_ERROR(
+                minor = dpct::get_device(dev).get_minor_version()) == 0 &&
+            major == 8 && minor == 6)
+            c = 2;
+#endif
+        /*
+        DPCT1010: SYCL uses exceptions to report errors and does not use the
+        error codes. The cudaGetLastError function call was replaced with 0. You
+        need to rewrite this code.
+        */
+        (void)0;
+        cls[dev] = c + 1;
+    }
+    return cls[dev] - 1;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+template<typename F>
+bool q8_0_rows1(int n_in, int n_out) {
+    if constexpr (!std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
+        (void) n_in; (void) n_out;
+        return false;
+    } else {
+        static const int env = [] {
+            const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+            return v == nullptr || v[0] == '\0' ? -1 : v[0] != '0';
+        }();
+        if (env == 0) return false;
+        const int c = dev_class();
+        return (c == 1 && n_in <= 4096 && n_out >= 4096) || (c == 2 && n_out >= 2048);
+=======
+// Auto generated SYCL kernel wrapper used to migration kernel function pointer.
+template <typename F, int NCOLS, int NW, int ROWS, bool TS = false,
+          bool PAIR = false>
+void native_mmvq_multi_kernel_wrapper(
+    const typename F::Block *__restrict w, const Q81Block *x_, float *y_,
+    int n_in, int n_out, const typename F::Block *__restrict w2 = nullptr,
+    float *__restrict y2 = nullptr) {
+    sycl::queue queue = *dpct::kernel_launcher::_que;
+    unsigned int localMemSize = dpct::kernel_launcher::_local_mem_size;
+    sycl::nd_range<3> nr = dpct::kernel_launcher::_nr;
+
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+    dpct::has_capability_or_fail(queue.get_device(), {sycl::aspect::fp16});
+
+    queue.parallel_for<dpct_kernel_name<class native_mmvq_multi_kernel_>>(
+        nr, exp_props,
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+            native_mmvq_multi_kernel<F, NCOLS, NW, ROWS, TS, PAIR>(
+                w, x_, y_, n_in, n_out, w2, y2);
+        });
+}
+
+// MODEL-UPDATE: the dense Q8_0 projections of Unsloth's files (all of attention, SSM and the shared expert are Q8_0
+// there) take one row per block where that was measured faster - the same per-row sums and reduction as two rows per
+// block (each row its own partials), so every output is the same bits.  q8_gemv_bench, 2-4 columns:
+//   gfx1201 (R9700): n_in <= 4096 with n_out >= 4096 (qkv 2560->10240 73-79% -> 83-84% of the 644 GB/s, gate 2560->6144
+//     51-68% -> 76-78%, q 2560->12288 74-80% -> 85-86%); 6144->2560 is slower there (79% -> 55-59%) and keeps two rows.
+//   sm_86 (RTX A4000): every n_out >= 2048 (+1-4% at 2-4 columns, 6144->2560 at 6 columns 70% -> 76%).
+// Other cards keep two rows until measured (STRATA_NO_MMVQ_ROWS2=1 forces one row everywhere; =0 keeps two everywhere).
+int dev_class() try {     // 1 = gfx12, 2 = sm_86, 0 = the rest; per device
+    static int cls[16];   // 0 unknown, else class + 1
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 16) return 0;
+    if (cls[dev] == 0) {
+        int c = 0;
+#if defined(__HIPCC__)
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName)) c = 1;
+#else
+        int major = 0, minor = 0;
+        if (DPCT_CHECK_ERROR(
+                major = dpct::get_device(dev).get_major_version()) == 0 &&
+            DPCT_CHECK_ERROR(
+                minor = dpct::get_device(dev).get_minor_version()) == 0 &&
+            major == 8 && minor == 6)
+            c = 2;
+#endif
+        /*
+        DPCT1010: SYCL uses exceptions to report errors and does not use
+        the error codes. The cudaGetLastError function call was replaced with 0.
+        You need to rewrite this code.
+        */
+        (void)0;
+        cls[dev] = c + 1;
+    }
+    return cls[dev] - 1;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+template<typename F>
+bool q8_0_rows1(int n_in, int n_out) {
+    if constexpr (!std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
+        (void) n_in; (void) n_out;
+        return false;
+    } else {
+        static const int env = [] {
+            const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+            return v == nullptr || v[0] == '\0' ? -1 : v[0] != '0';
+        }();
+        if (env == 0) return false;
+        const int c = dev_class();
+        return (c == 1 && n_in <= 4096 && n_out >= 4096) || (c == 2 && n_out >= 2048);
+>>>>>>> ours-now
     }
     auto sg = item.get_sub_group();
 #pragma unroll
@@ -1503,6 +1670,7 @@ void native_mmvq_rowwarp_kernel(const typename F::Block* __restrict__ w, const Q
         }
 }
 
+<<<<<<< sycl
 // ---------------------------------------------------------------- SYCL port: Q6_K with 16-byte loads
 //
 // bw probe on the B70: 4-byte loads per lane stream at 395 GB/s, 16-byte at 596; the shared kernel above does
@@ -1519,6 +1687,354 @@ __dpct_inline__ sycl::int4 ld_i4_a4(const int* p) {
     sycl::int4 v;
     v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p));
     return v;
+||||||| base
+template <typename F, int NCOLS>
+void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
+                    int n_out, dpct::queue_ptr s) {
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if (!g_multi_exact) {
+        constexpr int NW = NCOLS <= 4 ? 4 : 2;
+        const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
+        launch_pdl(
+            native_mmvq_multi_kernel_wrapper<F, NCOLS, NW, 2, false, false>,
+            dpct::dim3(blocks), dpct::dim3(WARP, NW), 0, s, w, x, y, n_in,
+            n_out, (const typename F::Block *)nullptr, (float *)nullptr);
+        return;
+    }
+    const dpct::dim3 threads(WARP, WARPS);
+    // the PAIR arguments, unused here (launch_pdl passes every parameter)
+    const typename F::Block* const no_w2 = nullptr;
+    float* const no_y2 = nullptr;
+    // #783 PR-h (stuchapin909): two rows per block for every K, not only small K - each row keeps its own partial sums and
+    // reduction, so a row's result does not depend on its neighbour; STRATA_NO_MMVQ_ROWS2=1 keeps one row for large K
+    static const bool rows1 = [] {
+        const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if ((rows1 || q8_0_rows1<F>(n_in, n_out)) && n_in / F::DIV >= F::BPI) {
+        if (s26_tsum_on()) launch_pdl(
+            native_mmvq_multi_kernel_wrapper<F, NCOLS, WARPS, 1, true, false>,
+            dpct::dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out,
+            no_w2, no_y2);
+        else launch_pdl(
+            native_mmvq_multi_kernel_wrapper<F, NCOLS, WARPS, 1, false, false>,
+            dpct::dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out,
+            no_w2, no_y2);
+        return;
+    }
+    constexpr int ROWS = 2;
+    const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
+    if (s26_tsum_on()) launch_pdl(
+        native_mmvq_multi_kernel_wrapper<F, NCOLS, WARPS, ROWS, true, false>,
+        dpct::dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
+    else launch_pdl(
+        native_mmvq_multi_kernel_wrapper<F, NCOLS, WARPS, ROWS, false, false>,
+        dpct::dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
+=======
+// ---- B6 STRATA_B6_MMVQ_ROWS (lab, opt-in): the exact multi-column layout with each column's activation fragment
+// loaded ONCE per weight block and reused across ROWS rows of the block (the default kernel reloads it for every row
+// it applies it to, and the K-quant scales once per column).  A thread keeps the same blocks (kbx = tid / T, stride
+// BPI with WARPS warps), each (row, column) sum adds the same per-block values in the same order, and the cross-warp
+// and warp reductions are the default kernel's: every output is bitwise the default exact layout's, so bitwise a
+// single-column call.  Only the formats with a B6X below; the others keep the default kernel.
+template<typename F> struct B6X { static constexpr bool ok = false; };
+template<> struct B6X<Q6KTraits> {
+    static constexpr bool ok = true;
+    struct X { int u[2]; float d8[2]; };
+    struct W { int vl, vh, sc[2]; float d; };
+    static X xload(const Q81Block* x, int iqs) {
+        X r;
+        const int off = 4 * (iqs / 16) + (iqs % 16) / 8;   // Q6KTraits::load's bq8_offset
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            r.u[i] = reinterpret_cast<const int*>(x[off + 2 * i].qs)[iqs % 8];
+            r.d8[i] = x[off + 2 * i].ds[0];
+        }
+        return r;
+    }
+    static W wload(const Q6KBlock* __restrict__ w, int iqs) {
+        const Q6KTraits::W t = Q6KTraits::load(w, iqs);
+        W r;
+        r.vl = t.vl;
+        r.vh = t.vh;
+        r.sc[0] = t.scales[0];
+        r.sc[1] = t.scales[4];
+        r.d = t.d;
+        return r;
+    }
+    static float dot(const W& w, const X& x) {   // q6_q8_dot_impl, the scales already in registers
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int vil = (w.vl >> (4 * i)) & 0x0f0f0f0f;
+            const int vih = ((w.vh >> (4 * i)) << 4) & 0x30303030;
+            const int vi = dpct::vectorized_binary<sycl::char4>(
+                vil | vih, 0x20202020, dpct::sub_sat());
+            sumf += x.d8[i] * (STRATA_DP4A(vi, x.u[i], 0) * w.sc[i]);
+        }
+        return w.d * sumf;
+    }
+};
+template<typename T, int KIND> struct B6XK {   // Q4_K (KIND 4) and Q5_K (KIND 5): the same activation fragment
+    static constexpr bool ok = true;
+    struct X { int u[4]; float d8[2]; };
+    using W = typename T::W;
+    static X xload(const Q81Block* bq8, int iqs) {
+        X r;
+        const int off = 2 * ((iqs / 2) / 4);   // the traits' bq8_offset
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const Q81Block* bq8i = bq8 + off + i;
+            r.d8[i] = bq8i->ds[0];
+            const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + ((iqs / 2) % 4);
+            r.u[2 * i] = q8[0];
+            r.u[2 * i + 1] = q8[4];
+        }
+        return r;
+    }
+    static W wload(const typename T::Block* __restrict__ w, int iqs) { return T::load(w, iqs); }
+    static float dot(const W& w, const X& x) {
+        const uint8_t* sc = reinterpret_cast<const uint8_t*>(w.aux);
+        if constexpr (KIND == 4) return q4_q8_dot_impl(w.v, x.u, sc, sc + 2, w.dm, x.d8);
+        else return q5_q8_dot_impl(w.vl, w.vh, x.u, sc, sc + 2, w.dm, x.d8);
+    }
+};
+template<> struct B6X<Q4KTraits> : B6XK<Q4KTraits, 4> {};
+template<> struct B6X<Q5KTraits> : B6XK<Q5KTraits, 5> {};
+template<> struct B6X<IQ4XSTraits> {
+    static constexpr bool ok = true;
+    struct X { int u0[4], u1[4]; float dx; };
+    using W = IQ4XSTraits::W;
+    static X xload(const Q81Block* x, int iqs) {
+        X r;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            r.u0[j] = reinterpret_cast<const int*>(x[iqs / 4].qs)[j];
+            r.u1[j] = reinterpret_cast<const int*>(x[iqs / 4].qs)[j + 4];
+        }
+        r.dx = x[iqs / 4].ds[0];
+        return r;
+    }
+    static W wload(const IQ4XSBlock *__restrict__ w, int iqs,
+                   int8_t *iq4nl_values) {
+        return IQ4XSTraits::load(w, iqs, iq4nl_values);
+    }
+    static float dot(const W& w, const X& x) {   // IQ4XSTraits::apply
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumi = STRATA_DP4A(w.v[j].x(), x.u0[j], sumi);
+            sumi = STRATA_DP4A(w.v[j].y(), x.u1[j], sumi);
+        }
+        sumi *= w.ls - 32;
+        const float d = w.dw * x.dx;
+        return d * sumi;
+    }
+};
+
+template <typename F, int NCOLS, int ROWS>
+/*
+DPCT1110: The total declared local variable size in device function
+b6_mmvq_rows_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+b6_mmvq_rows_kernel(const typename F::Block *__restrict__ w,
+                    const Q81Block *__restrict__ x, float *__restrict__ y,
+                    int n_in, int n_out) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    using XB = B6X<F>;
+    const int tid =
+        WARP * int(item_ct1.get_local_id(1)) + int(item_ct1.get_local_id(2));
+    const int row0 = ROWS * int(item_ct1.get_group(2));
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    const int kqs = F::kqs(tid);
+    float tmp[NCOLS][ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+        const int kby = kbx * F::KBY;
+        typename XB::X xv[NCOLS];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) xv[j] = XB::xload(x + std::size_t(j) * x_stride + kby, kqs);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                /*
+                DPCT1084: The function call "B6XK::wload" has multiple
+                migration results in different template instantiations that
+                could not be unified. You may need to adjust the code.
+                */
+                const typename XB::W wv = XB::wload(
+                    w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) tmp[j][i] += XB::dot(wv, xv[j]);
+            }
+        }
+    }
+    auto &partial = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[WARPS - 1][NCOLS][ROWS][WARP]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    if (item_ct1.get_local_id(1) > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i)
+                partial[item_ct1.get_local_id(1) - 1][j][i]
+                       [item_ct1.get_local_id(2)] = tmp[j][i];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (item_ct1.get_local_id(1) > 0) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] +=
+                partial[l][j][i][item_ct1.get_local_id(2)];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (item_ct1.get_local_id(2) == i && row0 + i < n_out)
+                y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
+// the B6 launch for a format that has a B6X: true when it ran.  g_b6_rows: 1 = 2 rows per block (the fastest on both
+// cards in b6_mmvq_bench), else 2 / 4 / 8 rows.
+template <typename F, int NCOLS>
+bool b6_launch(const typename F::Block *w, const Q81Block *x, float *y,
+               int n_in, int n_out, dpct::queue_ptr s) {
+    if constexpr (!B6X<F>::ok) {
+        return false;
+    } else {
+        if (g_b6_rows <= 0 || !g_multi_exact || s26_tsum_on() || n_in / F::DIV < 1) return false;
+        const int rows = g_b6_rows == 1 ? 2 : g_b6_rows;
+        const dpct::dim3 threads(WARP, WARPS);
+        if (rows == 2)
+            /*
+            DPCT1049: The work-group size passed to the SYCL kernel may
+            exceed the limit. To get the device limit, query
+            info::device::max_work_group_size. Adjust the work-group size if
+            needed.
+            */
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->parallel_for<dpct_kernel_name<class b6_mmvq_rows_kernel_e25b18,
+                                             F, dpct_kernel_scalar<NCOLS>,
+                                             dpct_kernel_scalar<2>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, unsigned((n_out + 1) / 2)) *
+                                      threads,
+                                  threads),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        b6_mmvq_rows_kernel<F, NCOLS, 2>(w, x, y, n_in, n_out);
+                    });
+        } else if (rows == 8)
+            /*
+            DPCT1049: The work-group size passed to the SYCL kernel may
+            exceed the limit. To get the device limit, query
+            info::device::max_work_group_size. Adjust the work-group size if
+            needed.
+            */
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->parallel_for<dpct_kernel_name<class b6_mmvq_rows_kernel_60504f,
+                                             F, dpct_kernel_scalar<NCOLS>,
+                                             dpct_kernel_scalar<8>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, unsigned((n_out + 7) / 8)) *
+                                      threads,
+                                  threads),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        b6_mmvq_rows_kernel<F, NCOLS, 8>(w, x, y, n_in, n_out);
+                    });
+        } else
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may
+        exceed the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if
+        needed.
+        */
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->parallel_for<dpct_kernel_name<class b6_mmvq_rows_kernel_ad5b9c,
+                                             F, dpct_kernel_scalar<NCOLS>,
+                                             dpct_kernel_scalar<4>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, unsigned((n_out + 3) / 4)) *
+                                      threads,
+                                  threads),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        b6_mmvq_rows_kernel<F, NCOLS, 4>(w, x, y, n_in, n_out);
+                    });
+        }
+        return true;
+    }
+}
+
+template <typename F, int NCOLS>
+void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
+                    int n_out, dpct::queue_ptr s) {
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if (b6_launch<F, NCOLS>(w, x, y, n_in, n_out, s)) return;   // STRATA_B6_MMVQ_ROWS
+    if (!g_multi_exact) {
+        constexpr int NW = NCOLS <= 4 ? 4 : 2;
+        const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
+        launch_pdl(
+            native_mmvq_multi_kernel_wrapper<F, NCOLS, NW, 2, false, false>,
+            dpct::dim3(blocks), dpct::dim3(WARP, NW), 0, s, w, x, y, n_in,
+            n_out, (const typename F::Block *)nullptr, (float *)nullptr);
+        return;
+    }
+    const dpct::dim3 threads(WARP, WARPS);
+    // the PAIR arguments, unused here (launch_pdl passes every parameter)
+    const typename F::Block* const no_w2 = nullptr;
+    float* const no_y2 = nullptr;
+    // #783 PR-h (stuchapin909): two rows per block for every K, not only small K - each row keeps its own partial sums and
+    // reduction, so a row's result does not depend on its neighbour; STRATA_NO_MMVQ_ROWS2=1 keeps one row for large K
+    static const bool rows1 = [] {
+        const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if ((rows1 || q8_0_rows1<F>(n_in, n_out)) && n_in / F::DIV >= F::BPI) {
+        if (s26_tsum_on()) launch_pdl(
+            native_mmvq_multi_kernel_wrapper<F, NCOLS, WARPS, 1, true, false>,
+            dpct::dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out,
+            no_w2, no_y2);
+        else launch_pdl(
+            native_mmvq_multi_kernel_wrapper<F, NCOLS, WARPS, 1, false, false>,
+            dpct::dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out,
+            no_w2, no_y2);
+        return;
+    }
+    constexpr int ROWS = 2;
+    const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
+    if (s26_tsum_on()) launch_pdl(
+        native_mmvq_multi_kernel_wrapper<F, NCOLS, WARPS, ROWS, true, false>,
+        dpct::dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
+    else launch_pdl(
+        native_mmvq_multi_kernel_wrapper<F, NCOLS, WARPS, ROWS, false, false>,
+        dpct::dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
+>>>>>>> ours-now
 }
 // Q6_K: per-byte (v - 32) of four 6-bit values (bytes 0..63): no byte can saturate, so this is the saturating char4 subtract's
 // result exactly, in four integer ops (SWAR: no borrow crosses a byte) instead of the per-byte vector builtin.
@@ -1550,6 +2066,7 @@ inline bool q6k_a2() {   // STRATA_MMVQ_A2=0 turns the aligned-load path off
     return v;
 }
 
+<<<<<<< sycl
 template <int NCOLS, int RPW, int SG = WARP, int BS = (int) sizeof(Q6KBlock), bool A2 = false>   // BS: block stride
 void native_mmvq_q6k_wide_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
                                  float* __restrict__ y, int n_in, int n_out) {
@@ -1597,6 +2114,63 @@ void native_mmvq_q6k_wide_kernel(const Q6KBlock* __restrict__ w, const Q81Block*
                 u1[j] = reinterpret_cast<const sycl::int4*>(xb[2].qs)[u_int4];
             }
             ds0[j] = xb[0].ds[0]; ds1[j] = xb[2].ds[0];
+||||||| base
+#if !defined(__HIPCC__)   // CUDA only: the HIP paths keep native_mmvq's kernels
+// ============================ ncols = 2..4 from interleaved activations (fork F4, Eddoursul) ============================
+//
+// `native_quantize_q8_1_il` also writes the columns interleaved (native_mmvq.hpp), so one load reads the same int of
+// every column. A warp takes R rows and walks their blocks in the chunks of the exact layout above - its lane l's chunk
+// m is what thread 32 (m % 4) + l does in iteration m / 4 - with a sum per virtual warp, added in warp order before the
+// xor tree; each weight block is decoded once (the traits' `load`) and every column takes the single-column dot's own
+// expression (the same *_q8_dot_impl calls), so each value is bitwise the multi-column kernel's. K-quants read the
+// block-major copy; IQ4_XS, whose lanes read the same int of consecutive blocks, the position-major one.
+struct IlIQ4XS {
+    using F = IQ4XSTraits;
+    static constexpr bool PM = true;
+    template <int NC, class X>
+    /*
+    DPCT1110: The total declared local variable size in device function apply
+    exceeds 128 bytes and may cause high register pressure. Consult with your
+    hardware vendor to find the total register size available and adjust the
+    code, or use smaller sub-group size to avoid high register pressure.
+    */
+    static void apply(const F::W &r, const X &x, int kby, int iqs,
+                      float (&out)[NC]) {
+        const int b = kby + iqs / 4;
+        int u0[4][NC], u1[4][NC];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            x.u(b, j, u0[j]);
+            x.u(b, j + 4, u1[j]);
+=======
+#if !defined(__HIPCC__)   // CUDA only: the HIP paths keep native_mmvq's kernels
+// ============================ ncols = 2..4 from interleaved activations (fork F4, Eddoursul) ============================
+//
+// `native_quantize_q8_1_il` also writes the columns interleaved (native_mmvq.hpp), so one load reads the same int of
+// every column. A warp takes R rows and walks their blocks in the chunks of the exact layout above - its lane l's chunk
+// m is what thread 32 (m % 4) + l does in iteration m / 4 - with a sum per virtual warp, added in warp order before the
+// xor tree; each weight block is decoded once (the traits' `load`) and every column takes the single-column dot's own
+// expression (the same *_q8_dot_impl calls), so each value is bitwise the multi-column kernel's. K-quants read the
+// block-major copy; IQ4_XS, whose lanes read the same int of consecutive blocks, the position-major one.
+struct IlIQ4XS {
+    using F = IQ4XSTraits;
+    static constexpr bool PM = true;
+    template <int NC, class X>
+    /*
+    DPCT1110: The total declared local variable size in device function
+    apply exceeds 128 bytes and may cause high register pressure. Consult with
+    your hardware vendor to find the total register size available and adjust
+    the code, or use smaller sub-group size to avoid high register pressure.
+    */
+    static void apply(const F::W &r, const X &x, int kby, int iqs,
+                      float (&out)[NC]) {
+        const int b = kby + iqs / 4;
+        int u0[4][NC], u1[4][NC];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            x.u(b, j, u0[j]);
+            x.u(b, j + 4, u1[j]);
+>>>>>>> ours-now
         }
 #pragma unroll
         for (int r = 0; r < RPW; ++r) {
@@ -1619,7 +2193,41 @@ void native_mmvq_q6k_wide_kernel(const Q6KBlock* __restrict__ w, const Q81Block*
             }
         }
     }
+<<<<<<< sycl
     auto sg = item.get_sub_group();
+||||||| base
+};
+struct IlQ4K {
+    using F = Q4KTraits;
+    static constexpr bool PM = false;
+    template <int NC, class X>
+    /*
+    DPCT1110: The total declared local variable size in device function apply
+    exceeds 128 bytes and may cause high register pressure. Consult with your
+    hardware vendor to find the total register size available and adjust the
+    code, or use smaller sub-group size to avoid high register pressure.
+    */
+    static void apply(const F::W &r, const X &x, int kby, int iqs,
+                      float (&out)[NC]) {
+        int u[4][NC];
+        float d8[2][NC];
+=======
+};
+struct IlQ4K {
+    using F = Q4KTraits;
+    static constexpr bool PM = false;
+    template <int NC, class X>
+    /*
+    DPCT1110: The total declared local variable size in device function
+    apply exceeds 128 bytes and may cause high register pressure. Consult with
+    your hardware vendor to find the total register size available and adjust
+    the code, or use smaller sub-group size to avoid high register pressure.
+    */
+    static void apply(const F::W &r, const X &x, int kby, int iqs,
+                      float (&out)[NC]) {
+        int u[4][NC];
+        float d8[2][NC];
+>>>>>>> ours-now
 #pragma unroll
     for (int r = 0; r < RPW; ++r)
 #pragma unroll
@@ -1698,7 +2306,41 @@ void native_mmvq_q6k_pf_kernel(const Q6KBlock* __restrict__ w, const Q81Block* _
             }
         }
     }
+<<<<<<< sycl
     auto sg = item.get_sub_group();
+||||||| base
+};
+struct IlQ5K {
+    using F = Q5KTraits;
+    static constexpr bool PM = false;
+    template <int NC, class X>
+    /*
+    DPCT1110: The total declared local variable size in device function apply
+    exceeds 128 bytes and may cause high register pressure. Consult with your
+    hardware vendor to find the total register size available and adjust the
+    code, or use smaller sub-group size to avoid high register pressure.
+    */
+    static void apply(const F::W &r, const X &x, int kby, int iqs,
+                      float (&out)[NC]) {
+        int u[4][NC];
+        float d8[2][NC];
+=======
+};
+struct IlQ5K {
+    using F = Q5KTraits;
+    static constexpr bool PM = false;
+    template <int NC, class X>
+    /*
+    DPCT1110: The total declared local variable size in device function
+    apply exceeds 128 bytes and may cause high register pressure. Consult with
+    your hardware vendor to find the total register size available and adjust
+    the code, or use smaller sub-group size to avoid high register pressure.
+    */
+    static void apply(const F::W &r, const X &x, int kby, int iqs,
+                      float (&out)[NC]) {
+        int u[4][NC];
+        float d8[2][NC];
+>>>>>>> ours-now
 #pragma unroll
     for (int j = 0; j < NCOLS; ++j) {
         float v = acc[j];
@@ -1851,6 +2493,7 @@ struct WideQ4K {
                v.dc * (r.dh * (float) dp4a4(r.hi, v.uc, 0) - r.mh * (float) dp4a4(ones, v.uc, 0));
     }
 };
+<<<<<<< sycl
 struct WideQ5K {
     using Block = Q5KBlock;
     using W = WideQ4K::W;
@@ -1877,6 +2520,41 @@ struct WideQ5K {
 __dpct_inline__ uint32_t iq4_lut4(uint32_t q4) {   // four nibbles -> four codebook bytes, codebook in registers
     constexpr uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu, t2 = 0x26190D01u, t3 = 0x71594535u;
     uint32_t r = 0;
+||||||| base
+// Q3_K (143-dense): the Q2_0 pack's dense projections are mostly Q3_K, which only had the exact layout's kernel. The
+// dot is q3_q8_dot_impl, the multi-column kernel's own call, on the same four blocks' ints and scales.
+struct IlQ3K {
+    using F = Q3KTraits;
+    static constexpr bool PM = false;
+    template <int NC, class X>
+    /*
+    DPCT1110: The total declared local variable size in device function apply
+    exceeds 128 bytes and may cause high register pressure. Consult with your
+    hardware vendor to find the total register size available and adjust the
+    code, or use smaller sub-group size to avoid high register pressure.
+    */
+    static void apply(const F::W &r, const X &x, int kby, int iqs,
+                      float (&out)[NC]) {
+        int u[4][NC];
+        float d8[4][NC];
+=======
+// Q3_K (143-dense): the Q2_0 pack's dense projections are mostly Q3_K, which only had the exact layout's kernel. The
+// dot is q3_q8_dot_impl, the multi-column kernel's own call, on the same four blocks' ints and scales.
+struct IlQ3K {
+    using F = Q3KTraits;
+    static constexpr bool PM = false;
+    template <int NC, class X>
+    /*
+    DPCT1110: The total declared local variable size in device function
+    apply exceeds 128 bytes and may cause high register pressure. Consult with
+    your hardware vendor to find the total register size available and adjust
+    the code, or use smaller sub-group size to avoid high register pressure.
+    */
+    static void apply(const F::W &r, const X &x, int kby, int iqs,
+                      float (&out)[NC]) {
+        int u[4][NC];
+        float d8[4][NC];
+>>>>>>> ours-now
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint32_t n = (q4 >> (8 * i)) & 0xF;
@@ -2142,6 +2820,7 @@ inline int rowwarp_rpw() {   // STRATA_MMVQ_RPW: 0 = the shared kernel, 1/2/4 = 
     return v;
 }
 
+<<<<<<< sycl
 template <typename F, int NCOLS>
 void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
                     int n_out, dpct::queue_ptr s) {
@@ -2163,6 +2842,35 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
             exp_props,
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
                 native_mmvq_multi_kernel<F, NCOLS, NW, ROWS>(w, x, y, n_in, n_out);
+||||||| base
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_mmvq_il_kernel_75474b, I,
+                    dpct_kernel_scalar<1>, dpct_kernel_scalar<R>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                          sycl::range(1, 1, 4 * WARP),
+                                      sycl::range(1, 1, 4 * WARP)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_mmvq_il_kernel<I, 1, R>(
+                                w, static_cast<const int *>(x_il), nullptr, y,
+                                n_in, n_out, iq4nl_values_ptr_ct1);
+                        });
+=======
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_mmvq_il_kernel_86e8fa, I,
+                    dpct_kernel_scalar<1>, dpct_kernel_scalar<R>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                          sycl::range(1, 1, 4 * WARP),
+                                      sycl::range(1, 1, 4 * WARP)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_mmvq_il_kernel<I, 1, R>(
+                                w, static_cast<const int *>(x_il), nullptr, y,
+                                n_in, n_out, iq4nl_values_ptr_ct1);
+                        });
+>>>>>>> ours-now
             });
         return;
     }
@@ -2185,6 +2893,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
         }
         return;
     }
+<<<<<<< sycl
     const dpct::dim3 threads(WARP, WARPS);
     // #783 PR-h (stuchapin909): two rows per block for every K, not only small K - each row keeps its own partial sums and
     // reduction, so a row's result does not depend on its neighbour; STRATA_NO_MMVQ_ROWS2=1 keeps one row for large K
@@ -2239,8 +2948,148 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
                 native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>(w, x, y, n_in, n_out);
             });
     }
+||||||| base
+    const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
+    const int* xq = I::PM ? parts.pm : parts.bm;
+    const float* xd = parts.d;
+    switch (ncols) {
+#define STRATA_IL_CASE(N)                                                      \
+    case N: {                                                                  \
+        iq4nl_values.init(*s);                                                 \
+                                                                               \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
+            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});   \
+                                                                               \
+        s->submit([&](sycl::handler &cgh) {                                    \
+            auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();                \
+                                                                               \
+            auto w_ct0 = w;                                                    \
+            auto xq_ct1 = xq;                                                  \
+            auto xd_ct2 = xd;                                                  \
+            auto y_ct3 = y;                                                    \
+            auto n_in_ct4 = n_in;                                              \
+            auto n_out_ct5 = n_out;                                            \
+                                                                               \
+            cgh.parallel_for<dpct_kernel_name<                                 \
+                class native_mmvq_il_kernel_3e2dbf, I, dpct_kernel_scalar<N>,  \
+                dpct_kernel_scalar<R>>>(                                       \
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) *                  \
+                                      sycl::range(1, 1, 4 * WARP),             \
+                                  sycl::range(1, 1, 4 * WARP)),                \
+                exp_props,                                                     \
+                [=](sycl::nd_item<3> item_ct1)                                 \
+                    [[sycl::reqd_sub_group_size(32)]] {                        \
+                        native_mmvq_il_kernel<I, N, R>(                        \
+                            w_ct0, xq_ct1, xd_ct2, y_ct3, n_in_ct4, n_out_ct5, \
+                            iq4nl_values_ptr_ct1);                             \
+                    });                                                        \
+        });                                                                    \
+    } break;
+        STRATA_IL_CASE(2) STRATA_IL_CASE(3) STRATA_IL_CASE(4)
+#undef STRATA_IL_CASE
+        default: throw std::invalid_argument("native_mmvq_il requires 1 <= ncols <= 4");
+    }
 }
 
+template <typename I>
+void launch_il_rows(int r, const void *weights, const void *x_il, float *y,
+                    int n_in, int n_out, int ncols, dpct::queue_ptr s) {
+    switch (r) {
+    case 1: launch_il<I, 1>(weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 4: launch_il<I, 4>(weights, x_il, y, n_in, n_out, ncols, s); break;
+    default: launch_il<I, 2>(weights, x_il, y, n_in, n_out, ncols, s); break;
+    }
+}
+
+// The interleaved copy (native_mmvq.hpp) of columns already quantized into plain q8_1 blocks, whoever wrote them (the
+// quantizer, a fused norm): the same bytes, one int of a block a thread.
+__dpct_inline__ void native_q8_1_interleave_kernel(
+    const Q81Block *__restrict__ y, int *__restrict__ bm, int *__restrict__ pm,
+    float *__restrict__ dl, int nb, int n_total, int cp) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int i =
+        int(item_ct1.get_group(2)) * 256 + int(item_ct1.get_local_id(2));
+    if (i >= n_total) return;
+    const int c = i / (nb * 8), r = i - c * nb * 8, b = r / 8, p = r % 8;
+    const Q81Block& blk = y[std::size_t(c) * nb + b];
+    const int q = reinterpret_cast<const int*>(blk.qs)[p];
+    bm[(std::size_t(b) * 8 + p) * cp + c] = q;
+    pm[(std::size_t(p) * nb + b) * cp + c] = q;
+    if (p == 0) dl[std::size_t(b) * cp + c] = blk.ds[0];
+=======
+    const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
+    const int* xq = I::PM ? parts.pm : parts.bm;
+    const float* xd = parts.d;
+    switch (ncols) {
+#define STRATA_IL_CASE(N)                                                      \
+    case N: {                                                                  \
+        iq4nl_values.init(*s);                                                 \
+                                                                               \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
+            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});   \
+                                                                               \
+        s->submit([&](sycl::handler &cgh) {                                    \
+            auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();                \
+                                                                               \
+            auto w_ct0 = w;                                                    \
+            auto xq_ct1 = xq;                                                  \
+            auto xd_ct2 = xd;                                                  \
+            auto y_ct3 = y;                                                    \
+            auto n_in_ct4 = n_in;                                              \
+            auto n_out_ct5 = n_out;                                            \
+                                                                               \
+            cgh.parallel_for<dpct_kernel_name<                                 \
+                class native_mmvq_il_kernel_3abece, I, dpct_kernel_scalar<N>,  \
+                dpct_kernel_scalar<R>>>(                                       \
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) *                  \
+                                      sycl::range(1, 1, 4 * WARP),             \
+                                  sycl::range(1, 1, 4 * WARP)),                \
+                exp_props,                                                     \
+                [=](sycl::nd_item<3> item_ct1)                                 \
+                    [[sycl::reqd_sub_group_size(32)]] {                        \
+                        native_mmvq_il_kernel<I, N, R>(                        \
+                            w_ct0, xq_ct1, xd_ct2, y_ct3, n_in_ct4, n_out_ct5, \
+                            iq4nl_values_ptr_ct1);                             \
+                    });                                                        \
+        });                                                                    \
+    } break;
+        STRATA_IL_CASE(2) STRATA_IL_CASE(3) STRATA_IL_CASE(4)
+#undef STRATA_IL_CASE
+        default: throw std::invalid_argument("native_mmvq_il requires 1 <= ncols <= 4");
+    }
+}
+
+template <typename I>
+void launch_il_rows(int r, const void *weights, const void *x_il, float *y,
+                    int n_in, int n_out, int ncols, dpct::queue_ptr s) {
+    switch (r) {
+    case 1: launch_il<I, 1>(weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 4: launch_il<I, 4>(weights, x_il, y, n_in, n_out, ncols, s); break;
+    default: launch_il<I, 2>(weights, x_il, y, n_in, n_out, ncols, s); break;
+    }
+}
+
+// The interleaved copy (native_mmvq.hpp) of columns already quantized into plain q8_1 blocks, whoever wrote them (the
+// quantizer, a fused norm): the same bytes, one int of a block a thread.
+__dpct_inline__ void native_q8_1_interleave_kernel(
+    const Q81Block *__restrict__ y, int *__restrict__ bm, int *__restrict__ pm,
+    float *__restrict__ dl, int nb, int n_total, int cp) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int i =
+        int(item_ct1.get_group(2)) * 256 + int(item_ct1.get_local_id(2));
+    if (i >= n_total) return;
+    const int c = i / (nb * 8), r = i - c * nb * 8, b = r / 8, p = r % 8;
+    const Q81Block& blk = y[std::size_t(c) * nb + b];
+    const int q = reinterpret_cast<const int*>(blk.qs)[p];
+    bm[(std::size_t(b) * 8 + p) * cp + c] = q;
+    pm[(std::size_t(p) * nb + b) * cp + c] = q;
+    if (p == 0) dl[std::size_t(b) * cp + c] = blk.ds[0];
+>>>>>>> ours-now
+}
+
+<<<<<<< sycl
 template<typename F>
 void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                   void* stream) {
@@ -2256,6 +3105,54 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
         default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= 8");
     }
 }
+||||||| base
+#endif  // !__HIPCC__
+=======
+// native_quantize_q8_1_kernel and native_q8_1_interleave_kernel in one launch: the same q8_1 blocks, and the
+// interleaved copy's ints and scales (an int is four codes, gathered from lanes 4p..4p+3 with two shuffles).
+__dpct_inline__ void
+native_quantize_q8_1_il_kernel(const float *__restrict__ x,
+                               Q81Block *__restrict__ y, int *__restrict__ bm,
+                               int *__restrict__ pm, float *__restrict__ dl,
+                               int n_in, int n_total, int cp) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int i = int(item_ct1.get_group(2)) * QUANT_THREADS +
+                  int(item_ct1.get_local_id(2));
+    if (i >= n_total) return;   // n_total is a multiple of 32: only whole warps return
+    const float xi = x[i];
+    const float amax = warp_max(sycl::fabs(xi));
+    const float sum = warp_sum(xi);
+    const float d = q8_1_finite(amax / 127.0f);
+    const int8_t q = q8_1_quant(xi, d, amax);
+    y[i / Q8K].qs[i % Q8K] = q;
+    const auto ds = q8_1_ds(d, sum);
+    if (i % Q8K == 0) y[i / Q8K].ds = ds;
+    const int lane = int(item_ct1.get_local_id(2)) & 31;
+    unsigned v = unsigned(uint8_t(q)) << (8 * (lane & 3));
+    /*
+    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    v |= dpct::experimental::permute_sub_group_by_xor(
+        0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v, 1);
+    /*
+    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    v |= dpct::experimental::permute_sub_group_by_xor(
+        0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v, 2);
+    const int nb = n_in / Q8K, c = i / n_in, b = (i - c * n_in) / Q8K, pp = lane >> 2;
+    if ((lane & 3) == 0) {
+        bm[(std::size_t(b) * 8 + pp) * cp + c] = int(v);
+        pm[(std::size_t(pp) * nb + b) * cp + c] = int(v);
+    }
+    if (lane == 0) dl[std::size_t(b) * cp + c] = ds[0];
+}
+
+#endif  // !__HIPCC__
+>>>>>>> ours-now
 
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
@@ -2403,7 +3300,13 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
 
                 cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                     class native_small_mmvq_kernel_95f41f, Weight,
+||||||| base
+                    class native_small_mmvq_kernel_ac4f20, Weight,
+=======
+                    class native_small_mmvq_kernel_12f8db, Weight,
+>>>>>>> ours-now
                     dpct_kernel_scalar<Qi>, dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads,
                                       threads),
@@ -2430,7 +3333,13 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
 
             cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                 class native_small_mmvq_kernel_d00fb9, Weight,
+||||||| base
+                class native_small_mmvq_kernel_36c849, Weight,
+=======
+                class native_small_mmvq_kernel_90b7ee, Weight,
+>>>>>>> ours-now
                 dpct_kernel_scalar<Qi>, dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                                   threads),
@@ -2596,7 +3505,13 @@ void q8_packed_launch(const Q8Packed &w, const Q81Block *x, float *y,
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
+<<<<<<< sycl
         s->parallel_for<dpct_kernel_name<class native_q8_0_packed_kernel_851f07,
+||||||| base
+        s->parallel_for<dpct_kernel_name<class native_q8_0_packed_kernel_13ca1a,
+=======
+        s->parallel_for<dpct_kernel_name<class native_q8_0_packed_kernel_de5949,
+>>>>>>> ours-now
                                          dpct_kernel_scalar<NCOLS>,
                                          dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
@@ -2617,7 +3532,13 @@ DPCT1050: The template argument of the dpct_kernel_name could not be
 deduced. You need to update this code.
 */
             parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class native_q8_0_packed_kernel_56c826,
+||||||| base
+                dpct_kernel_name<class native_q8_0_packed_kernel_67f8fd,
+=======
+                dpct_kernel_name<class native_q8_0_packed_kernel_c831d4,
+>>>>>>> ours-now
                                  dpct_kernel_scalar<NCOLS>,
                                  dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
@@ -2800,7 +3721,13 @@ void q6_packed_launch(const Q6Packed &w, const Q81Block *x, float *y,
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
+<<<<<<< sycl
         s->parallel_for<dpct_kernel_name<class native_q6_k_packed_kernel_ee650b,
+||||||| base
+        s->parallel_for<dpct_kernel_name<class native_q6_k_packed_kernel_fccac0,
+=======
+        s->parallel_for<dpct_kernel_name<class native_q6_k_packed_kernel_16751d,
+>>>>>>> ours-now
                                          dpct_kernel_scalar<NCOLS>,
                                          dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
@@ -2821,7 +3748,13 @@ DPCT1050: The template argument of the dpct_kernel_name could not be
 deduced. You need to update this code.
 */
             parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class native_q6_k_packed_kernel_ca2554,
+||||||| base
+                dpct_kernel_name<class native_q6_k_packed_kernel_86b53d,
+=======
+                dpct_kernel_name<class native_q6_k_packed_kernel_b95c16,
+>>>>>>> ours-now
                                  dpct_kernel_scalar<NCOLS>,
                                  dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
@@ -3189,9 +4122,9 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
         ; return false;
     }
     /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
+    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
+    in the original code the source host memory is pageable memory. If the
+    memory is not pageable, call wait() on event return by memcpy API to ensure
     synchronization behavior.
     */
     if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(dev, packed.data(),
@@ -3349,6 +4282,8 @@ void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* 
     }
 }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
+void native_mmvq_set_b6_rows(int mode) { g_b6_rows = mode; }
+int native_mmvq_b6_rows() { return g_b6_rows; }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
     validate_shape(n_in, ncols);
@@ -3449,7 +4384,13 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class native_q5_k_mmvq_kernel_b1d5a2,
+||||||| base
+                dpct_kernel_name<class native_q5_k_mmvq_kernel_ebfb87,
+=======
+                dpct_kernel_name<class native_q5_k_mmvq_kernel_636cc0,
+>>>>>>> ours-now
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -3468,7 +4409,13 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
+<<<<<<< sycl
         s->parallel_for<dpct_kernel_name<class native_q5_k_mmvq_kernel_938b09,
+||||||| base
+        s->parallel_for<dpct_kernel_name<class native_q5_k_mmvq_kernel_f8b774,
+=======
+        s->parallel_for<dpct_kernel_name<class native_q5_k_mmvq_kernel_9a1a03,
+>>>>>>> ours-now
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -3494,6 +4441,97 @@ void native_q5_k_f32(const void* weights, const float* x, void* scratch_q8_1,
     native_q5_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+namespace {
+// Turing: Q2_0 one to four columns with one warp per RPW rows.  The exact layout gives each row four warps, a chunk of
+// a 64-weight block per thread and a cross-warp reduction; at the engine's 2560 inputs (40 blocks a row) 48 of the 128
+// threads have no chunk and the reduction is most of the time (QSA attn_q 2560x12288 at 3 columns: 80 us, 110 GB/s on
+// an RTX 2080 Ti).  Here lane l runs the chunks of the exact kernel's threads l, 32+l, 64+l and 96+l in their loop
+// order, adds the four sums as warp 0 adds the other warps' partials, then the same warp_sum: every output is bit for
+// bit native_q2_0_mmvq_kernel's (one column) and launch_multi's exact layout (two to four).  80 -> 31 us at three
+// columns, 37 -> 25 us at one.  STRATA_Q2_WARP=0 keeps the old kernels; =1 takes this one on any CUDA card.
+constexpr int kQ20WarpRows = 4;
+template <int NCOLS>
+/*
+DPCT1110: The total declared local variable size in device function
+q2_0_warp_rows_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void q2_0_warp_rows_kernel(const Q20Block *__restrict__ w,
+                                           const Q81Block *__restrict__ x,
+                                           float *__restrict__ y, int n_in,
+                                           int n_out) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    using F = Q20Traits;
+    constexpr int RPW = kQ20WarpRows;
+    static_assert(F::T == 2 && F::BPI == WARPS * WARP / 2, "the lanes play the exact layout's threads");
+    const int lane = int(item_ct1.get_local_id(2)) & (WARP - 1);
+    const int row0 = (int(item_ct1.get_group(2)) * WARPS +
+                      int(item_ct1.get_local_id(2)) / WARP) *
+                     RPW;
+    if (row0 >= n_out) return;
+    const int bpr = n_in / F::DIV, x_stride = n_in / Q8K;
+    float acc[NCOLS][RPW];
+#pragma unroll
+    for (int v = 0; v < WARPS; ++v) {   // the exact kernel's thread WARP * v + lane
+        const int tid = WARP * v + lane;
+        const int kqs = F::kqs(tid);
+        float tmp[NCOLS][RPW] = {};
+        for (int kbx = tid / F::T; kbx < bpr; kbx += F::BPI) {
+            const int kby = kbx * F::KBY;
+#pragma unroll
+            for (int i = 0; i < RPW; ++i) {
+                if (row0 + i < n_out) {
+                    const F::W wv = F::load(w + std::size_t(row0 + i) * bpr + kbx, kqs);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < RPW; ++i) acc[j][i] = v == 0 ? tmp[j][i] : acc[j][i] + tmp[j][i];
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            const float sum = warp_sum(acc[j][i]);
+            if (lane == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = sum;
+        }
+}
+bool q2_0_warp_rows_on() try {
+    static int on[16] = {};   // by device ordinal: 0 unknown, 1 yes, -1 no
+    static const int env = [] { const char* v = std::getenv("STRATA_Q2_WARP"); return v ? (v[0] == '0' ? 0 : 1) : -1; }();
+    if (env >= 0) return env == 1;
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 16) return false;
+    if (on[dev] == 0) {
+        int maj = 0, mnr = 0;
+        const bool ok =
+            DPCT_CHECK_ERROR(maj = dpct::get_device(dev).get_major_version()) ==
+                0 &&
+            DPCT_CHECK_ERROR(mnr = dpct::get_device(dev).get_minor_version()) ==
+                0;
+        /*
+        DPCT1010: SYCL uses exceptions to report errors and does not use
+        the error codes. The cudaGetLastError function call was replaced with 0.
+        You need to rewrite this code.
+        */
+        if (!ok) 0;
+        on[dev] = ok && strata::sm75_default(maj, mnr) ? 1 : -1;   // Turing only, with STRATA_SM75_PERF=1
+    }
+    return on[dev] > 0;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+}  // namespace
+
 void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, 64);
@@ -3503,6 +4541,80 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     STRATA_WAVE_MMVQ(Q20Traits)
+#if !defined(__HIPCC__)
+    // one column always (bitwise the single-column kernel); two to four only where the exact layout is the one in use
+    if (ncols <= 4 && (ncols == 1 || g_multi_exact) && q2_0_warp_rows_on()) {
+        const auto* w = static_cast<const Q20Block*>(weights);
+        const auto* x = static_cast<const Q81Block*>(x_q8_1);
+        const auto s = strata::q_of(stream);
+        const int warps = (n_out + kQ20WarpRows - 1) / kQ20WarpRows;
+        const unsigned blocks = unsigned((warps + WARPS - 1) / WARPS);
+        switch (ncols) {
+        case 1: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_c7de00,
+                                             dpct_kernel_scalar<1>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                      sycl::range(1, 1, WARPS * WARP),
+                                  sycl::range(1, 1, WARPS * WARP)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        q2_0_warp_rows_kernel<1>(w, x, y, n_in, n_out);
+                    });
+        } break;
+        case 2: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_76dac9,
+                                             dpct_kernel_scalar<2>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                      sycl::range(1, 1, WARPS * WARP),
+                                  sycl::range(1, 1, WARPS * WARP)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        q2_0_warp_rows_kernel<2>(w, x, y, n_in, n_out);
+                    });
+        } break;
+        case 3: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_293ed5,
+                                             dpct_kernel_scalar<3>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                      sycl::range(1, 1, WARPS * WARP),
+                                  sycl::range(1, 1, WARPS * WARP)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        q2_0_warp_rows_kernel<3>(w, x, y, n_in, n_out);
+                    });
+        } break;
+        default: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_c08cb5,
+                                             dpct_kernel_scalar<4>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+                                      sycl::range(1, 1, WARPS * WARP),
+                                  sycl::range(1, 1, WARPS * WARP)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        q2_0_warp_rows_kernel<4>(w, x, y, n_in, n_out);
+                    });
+        } break;
+        }
+        launch_check();
+        return;
+    }
+#endif
     if (ncols > 1) {
         launch_multi<Q20Traits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -3524,7 +4636,13 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             s->parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class native_q2_0_mmvq_kernel_dec305,
+||||||| base
+                dpct_kernel_name<class native_q2_0_mmvq_kernel_e613f2,
+=======
+                dpct_kernel_name<class native_q2_0_mmvq_kernel_daf95f,
+>>>>>>> ours-now
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -3542,7 +4660,13 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
         s->parallel_for<dpct_kernel_name<class native_q2_0_mmvq_kernel_ef5f5c,
+||||||| base
+        s->parallel_for<dpct_kernel_name<class native_q2_0_mmvq_kernel_372bc7,
+=======
+        s->parallel_for<dpct_kernel_name<class native_q2_0_mmvq_kernel_9f5680,
+>>>>>>> ours-now
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -3597,7 +4721,13 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             s->parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class native_q3_k_mmvq_kernel_208be9,
+||||||| base
+                dpct_kernel_name<class native_q3_k_mmvq_kernel_33b82f,
+=======
+                dpct_kernel_name<class native_q3_k_mmvq_kernel_7019d8,
+>>>>>>> ours-now
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -3615,7 +4745,13 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
         s->parallel_for<dpct_kernel_name<class native_q3_k_mmvq_kernel_926817,
+||||||| base
+        s->parallel_for<dpct_kernel_name<class native_q3_k_mmvq_kernel_5b264d,
+=======
+        s->parallel_for<dpct_kernel_name<class native_q3_k_mmvq_kernel_af7273,
+>>>>>>> ours-now
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -3676,7 +4812,13 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
 
                 cgh.parallel_for<
+<<<<<<< sycl
                     dpct_kernel_name<class native_iq4_xs_mmvq_kernel_22a688,
+||||||| base
+                    dpct_kernel_name<class native_iq4_xs_mmvq_kernel_8d688d,
+=======
+                    dpct_kernel_name<class native_iq4_xs_mmvq_kernel_e7e91c,
+>>>>>>> ours-now
                                      dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads,
                                       threads),
@@ -3703,7 +4845,13 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
 
             cgh.parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class native_iq4_xs_mmvq_kernel_3ba00d,
+||||||| base
+                dpct_kernel_name<class native_iq4_xs_mmvq_kernel_bb09f1,
+=======
+                dpct_kernel_name<class native_iq4_xs_mmvq_kernel_c37d32,
+>>>>>>> ours-now
                                  dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                                   threads),
@@ -3763,7 +4911,13 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class native_q4_k_mmvq_kernel_da128d,
+||||||| base
+                dpct_kernel_name<class native_q4_k_mmvq_kernel_9a6fd4,
+=======
+                dpct_kernel_name<class native_q4_k_mmvq_kernel_329539,
+>>>>>>> ours-now
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -3782,7 +4936,13 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
+<<<<<<< sycl
         s->parallel_for<dpct_kernel_name<class native_q4_k_mmvq_kernel_b29f4f,
+||||||| base
+        s->parallel_for<dpct_kernel_name<class native_q4_k_mmvq_kernel_5822b8,
+=======
+        s->parallel_for<dpct_kernel_name<class native_q4_k_mmvq_kernel_d60ab1,
+>>>>>>> ours-now
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -3868,7 +5028,13 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             s->parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class native_q6_k_mmvq_kernel_4d887f,
+||||||| base
+                dpct_kernel_name<class native_q6_k_mmvq_kernel_af312f,
+=======
+                dpct_kernel_name<class native_q6_k_mmvq_kernel_ba3028,
+>>>>>>> ours-now
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -3886,7 +5052,13 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
         s->parallel_for<dpct_kernel_name<class native_q6_k_mmvq_kernel_19484e,
+||||||| base
+        s->parallel_for<dpct_kernel_name<class native_q6_k_mmvq_kernel_96ca42,
+=======
+        s->parallel_for<dpct_kernel_name<class native_q6_k_mmvq_kernel_b97210,
+>>>>>>> ours-now
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -3949,7 +5121,13 @@ void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<
+<<<<<<< sycl
             class native_mmvq_multi_kernel_ab153b, F, dpct_kernel_scalar<NCOLS>,
+||||||| base
+            class native_mmvq_multi_kernel_323c2f, F, dpct_kernel_scalar<NCOLS>,
+=======
+            class native_mmvq_multi_kernel_706375, F, dpct_kernel_scalar<NCOLS>,
+>>>>>>> ours-now
             dpct_kernel_scalar<WARPS>, dpct_kernel_scalar<1>,
             dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(2 * n_out)) * threads,
@@ -3971,7 +5149,13 @@ void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<
+<<<<<<< sycl
             class native_mmvq_multi_kernel_50d9c5, F, dpct_kernel_scalar<NCOLS>,
+||||||| base
+            class native_mmvq_multi_kernel_8c96b9, F, dpct_kernel_scalar<NCOLS>,
+=======
+            class native_mmvq_multi_kernel_78dbb6, F, dpct_kernel_scalar<NCOLS>,
+>>>>>>> ours-now
             dpct_kernel_scalar<WARPS>, dpct_kernel_scalar<1>,
             dpct_kernel_scalar<false>, dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(2 * n_out)) * threads,
@@ -4087,4 +5271,666 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
 }
 
+<<<<<<< sycl
+||||||| base
+#if !defined(__HIPCC__)
+std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
+    validate_shape(n_in, ncols);
+    return std::size_t(n_in / Q8K) * std::size_t(native_q8_1_il_cp(ncols)) * (16 * sizeof(int) + sizeof(float));
+}
+
+void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    if (ncols < 2 || ncols > 4) throw std::invalid_argument("native_q8_1_interleave requires 2 <= ncols <= 4");
+    validate_pointer(x_q8_1);
+    validate_pointer(x_il);
+    validate_stream(stream);
+    const int nb = n_in / Q8K, cp = native_q8_1_il_cp(ncols);
+    const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
+    const int n_total = nb * 8 * ncols;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        ((sycl::queue *)(strata::q_of(stream)))
+            ->parallel_for<
+                dpct_kernel_name<class native_q8_1_interleave_kernel_48daf5>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, 1, unsigned((n_total + 255) / 256)) *
+                        sycl::range(1, 1, 256),
+                    sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    native_q8_1_interleave_kernel(
+                        static_cast<const Q81Block *>(x_q8_1),
+                        const_cast<int *>(parts.bm),
+                        const_cast<int *>(parts.pm),
+                        const_cast<float *>(parts.d), nb, n_total, cp);
+                });
+    }
+    launch_check();
+}
+
+namespace {
+// Rows a warp at 2-4 columns ([ncols - 2]) by the matrix's row count, in classes: below 2048 (the keys' 512), 4096 (the
+// output projections' 2560), 8192 (the gate projection's 6144), 12288 (qkv's 10240), and more (the queries' 12288, the
+// head's 248K); 0: native_mmvq's kernels. The fork tuned its table on an RTX 3090. This one is read off
+// mmvq_il_parity --bench on an RTX 3060 (sm_86) and an RTX 5070 (sm_120) together: per cell the rows count (1/2/4) whose
+// worse card still takes at least 3% off native_mmvq's time, else 0; classes without a measured shape take their
+// neighbour's value. Every choice is bitwise the same output, so the table is only speed.
+struct IlRows { int type; uint8_t r[3][5]; };
+constexpr IlRows kIlRowsShared[] = {   // sm_86 + sm_120, and the fallback for every other sm_80+ card
+    {23, {{0, 0, 0, 0, 0}, {0, 0, 2, 4, 4}, {0, 1, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q4_K
+    {13, {{0, 0, 1, 1, 1}, {0, 4, 1, 1, 1}, {0, 1, 1, 1, 2}}},   // Q5_K
+    {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
+};
+// Per-architecture tables (P10).  A card whose compute capability (major * 10 + minor) is listed here uses its own table;
+// every other sm_80+ card uses kIlRowsShared.  sm_89 (Ada) has none yet: nobody measured it (we have no such card), so
+// it takes the shared table, which sits between the measured sm_86 and sm_120.  To add one, run
+// `mmvq_il_parity --bench --emit-table` on the card (docs/MMVQ_IL_TABLE.md), paste the printed block as a
+// `constexpr IlRows kIlRows_89[]` and add {89, kIlRows_89, sizeof(kIlRows_89) / sizeof(IlRows)} below.  Each choice
+// is bitwise the same output, so a table is only speed.  Without a rebuild: STRATA_MMVQ_IL_ROWS (see il_env_rows).
+// Volta (sm_70): read off mmvq_il_parity --bench on a V100-SXM2-32GB (two runs, mean), the same rule - per cell the
+// rows count whose every measured shape takes at least 3% off native_mmvq's time (e.g. the Q5_K head at 3 columns
+// 1094 -> 821 us, Q6_K 12288 rows 68.9 -> 47.9 us), else 0; unmeasured classes take a neighbour's value (PR 1401)
+constexpr IlRows kIlRows_70[] = {
+    {23, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 4, 2, 2, 2}}},   // IQ4_XS
+    {12, {{0, 2, 2, 4, 4}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q4_K
+    {13, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 1, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 1, 1, 1, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 4, 2}}},   // Q6_K
+};
+// Pascal (sm_60), read off mmvq_il_parity --bench --emit-table on a Tesla P100-PCIE-16GB (three runs, identical
+// tables), the same 3% rule.  Pascal has no dp4a (strata_dp4a: four vmad), so the kernels are compute-bound and more rows a
+// warp (weights and activations reused across rows) win 15-35% on the large shapes.  Bitwise equal to native_mmvq.
+constexpr IlRows kIlRows_60[] = {
+    {23, {{0, 4, 4, 4, 4}, {2, 4, 2, 4, 4}, {1, 1, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 4, 4, 4, 4}, {0, 2, 2, 2, 2}, {0, 0, 0, 4, 4}}},   // Q4_K
+    {13, {{0, 2, 2, 2, 2}, {0, 4, 2, 2, 4}, {0, 2, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 2, 2, 2, 4}, {0, 0, 0, 4, 4}, {0, 0, 0, 4, 4}}},   // Q6_K
+};
+// Pascal with dp4a (sm_61), read off mmvq_il_parity --bench --emit-table on a Tesla P40 (three runs: a cell is non-zero
+// only where every run picked a rows count that takes at least 3% off native_mmvq's time; where the runs disagreed on
+// the count, the one that won twice).  E.g. IQ4_XS 2560x10240 at 2 columns 112 -> 65 us, Q6_K 12288x2560 at 4
+// columns 189 -> 127 us, the Q5_K head at 3 columns 2545 -> 1766 us.  Bitwise equal to native_mmvq.
+constexpr IlRows kIlRows_61[] = {
+    {23, {{2, 4, 4, 4, 4}, {4, 4, 4, 4, 4}, {2, 2, 2, 2, 2}}},   // IQ4_XS
+    {12, {{2, 0, 4, 4, 4}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // Q4_K
+    {13, {{2, 0, 4, 4, 4}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 0, 2, 2, 2}, {0, 4, 4, 4, 4}, {2, 4, 2, 2, 2}}},   // Q6_K
+    {11, {{2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {1, 1, 1, 1, 1}}},   // Q3_K
+};
+// RTX 30-series (sm_86), 143-dense: read off mmvq_il_parity --bench --emit-table on an RTX A4000 with the engine's real
+// shapes (the output projections have 6144 inputs, not 4096), per cell the rows count whose worst measured shape is under
+// 0.97 of native_mmvq's time. The four older rows are the shared table's; Q3_K (the Q2_0 pack's main dense type) is new.
+constexpr IlRows kIlRows_86[] = {
+    {23, {{0, 0, 0, 0, 0}, {0, 0, 2, 4, 4}, {0, 1, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q4_K
+    {13, {{0, 0, 1, 1, 1}, {0, 4, 1, 1, 1}, {0, 1, 1, 1, 2}}},   // Q5_K
+    {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
+    {11, {{1, 2, 2, 2, 2}, {1, 1, 1, 2, 2}, {1, 1, 1, 1, 1}}},   // Q3_K (two runs; 2560x10240 at 4 columns 120 -> 70 us)
+};
+// One column: rows a warp by n_out class, 0 = native_mmvq's single-column kernels (STRATA_MMVQ_IL_T1=0 turns this off).
+struct Il1Rows { int type; uint8_t r[5]; };
+constexpr Il1Rows kIl1Rows_86[] = {
+    {11, {0, 1, 1, 1, 1}},   // Q3_K: 2560x10240 60 -> 43 us, 6144x2560 30 -> 26 us on the A4000
+};
+// Tesla P40 (sm_61), the same three runs: IQ4_XS 2560x10240 102 -> 58 us, the Q5_K head 1754 -> 1507 us
+constexpr Il1Rows kIl1Rows_61[] = {
+    {23, {2, 2, 4, 4, 4}},   // IQ4_XS
+    {13, {0, 0, 0, 2, 2}},   // Q5_K
+    {11, {0, 0, 2, 2, 2}},   // Q3_K
+};
+struct Il1Arch { int cc; const Il1Rows* t; size_t n; };
+constexpr Il1Arch kIl1Arch[] = {
+    {61, kIl1Rows_61, sizeof(kIl1Rows_61) / sizeof(Il1Rows)},
+    {86, kIl1Rows_86, sizeof(kIl1Rows_86) / sizeof(Il1Rows)},
+};
+bool il_env_on(const char* name) {
+    const char* v = std::getenv(name);
+    return v == nullptr || v[0] != '0';
+}
+bool il_t1_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_T1"); return on; }
+bool il_q3k_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_Q3K"); return on; }
+struct IlArch { int cc; const IlRows* t; size_t n; };
+constexpr IlArch kIlArch[] = {
+    {60, kIlRows_60, sizeof(kIlRows_60) / sizeof(IlRows)},   // Pascal GP100: measured on a Tesla P100
+    {61, kIlRows_61, sizeof(kIlRows_61) / sizeof(IlRows)},   // Pascal with dp4a: measured on a Tesla P40
+    {70, kIlRows_70, sizeof(kIlRows_70) / sizeof(IlRows)},   // Volta: PR 1401, measured on a V100-SXM2
+    {86, kIlRows_86, sizeof(kIlRows_86) / sizeof(IlRows)},   // 143-dense: RTX A4000 with the real shapes (Q3_K added)
+};
+// STRATA_MMVQ_IL_ROWS="type:ncols:r0,r1,r2,r3,r4;..." overrides single rows of the table for every card (type = ggml
+// type 23/12/13/14, ncols 2-4, r* = rows a warp 0/1/2/4 for the five n_out classes).  Parsed once.
+struct IlEnvRow { int type, ncols; uint8_t r[5]; };
+const std::vector<IlEnvRow>& il_env_rows() {
+    static const std::vector<IlEnvRow> v = [] {
+        std::vector<IlEnvRow> out;
+        const char* e = std::getenv("STRATA_MMVQ_IL_ROWS");
+        if (!e) return out;
+        std::string str(e);
+        size_t pos = 0;
+        while (pos < str.size()) {
+            size_t end = str.find(';', pos);
+            if (end == std::string::npos) end = str.size();
+            int t = 0, n = 0, r[5] = {0, 0, 0, 0, 0}, used = 0;
+            if (std::sscanf(str.substr(pos, end - pos).c_str(), "%d:%d:%d,%d,%d,%d,%d%n", &t, &n, &r[0], &r[1], &r[2], &r[3],
+                            &r[4], &used) >= 7 && n >= 1 && n <= 4) {
+                IlEnvRow x{t, n, {}};
+                bool ok = true;
+#pragma unroll
+                for (int i = 0; i < 5; ++i) {
+                    ok = ok &&
+                         (r[i] == 0 || r[i] == 1 || r[i] == 2 || r[i] == 4);
+                    x.r[i] = (uint8_t)r[i];
+                }
+                if (ok) out.push_back(x);
+                else std::fprintf(stderr, "strata: STRATA_MMVQ_IL_ROWS: rows must be 0/1/2/4 - entry ignored\n");
+            } else {
+                std::fprintf(stderr, "strata: STRATA_MMVQ_IL_ROWS: cannot read '%s' (type:ncols:r0,r1,r2,r3,r4) - ignored\n",
+                             str.substr(pos, end - pos).c_str());
+            }
+            pos = end + 1;
+        }
+        return out;
+    }();
+    return v;
+}
+}  // namespace
+// The rows a warp for a card of compute capability `cc` (major * 10 + minor); 0: native_mmvq's kernels.  Pure, so a test
+// can check every architecture's table without that card.
+int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
+    if (ncols < 1 || ncols > 4) return 0;
+    const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
+    for (const IlEnvRow& e : il_env_rows())
+        if (e.type == type && e.ncols == ncols) return e.r[cls];
+    if (ncols == 1) {   // 143-dense: one column (the plain q8_1 blocks, no interleaved copy); STRATA_MMVQ_IL_T1=0 turns it off
+        if (!il_t1_on()) return 0;
+        for (const Il1Arch& a : kIl1Arch)
+            if (a.cc == cc)
+                for (size_t i = 0; i < a.n; ++i)
+                    if (a.t[i].type == type) return a.t[i].r[cls];
+        return 0;
+    }
+    if (type == 11 && !il_q3k_on()) return 0;   // STRATA_MMVQ_IL_Q3K=0: Q3_K keeps native_mmvq's kernels
+    const IlRows* t = kIlRowsShared;
+    size_t n = sizeof(kIlRowsShared) / sizeof(IlRows);
+    for (const IlArch& a : kIlArch)
+        if (a.cc == cc && a.t != nullptr) { t = a.t; n = a.n; }
+    for (size_t i = 0; i < n; ++i)
+        if (t[i].type == type) return t[i].r[ncols - 2][cls];
+    return 0;
+}
+namespace {
+int il_cc() try {
+    static int cc[16] = {};   // by device ordinal, 0 unknown
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 16) return 0;
+    if (cc[dev] == 0) {
+        int maj = 0, mnr = 0;
+        if (DPCT_CHECK_ERROR(maj = dpct::get_device(dev).get_major_version()) !=
+                0 ||
+            /*
+            DPCT1026: The call to cudaGetLastError was removed because this
+            functionality is redundant in SYCL.
+            */
+            DPCT_CHECK_ERROR(mnr = dpct::get_device(dev).get_minor_version()) !=
+                0) {
+            ; return 0;
+        }
+        cc[dev] = maj * 10 + mnr;
+    }
+    return cc[dev];
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+int il_rows(int type, int ncols, int n_out) { return native_mmvq_il_rows_for(il_cc(), type, ncols, n_out); }
+int g_tune_rows = 0;   // native_mmvq_il_tune (tests, benchmarks): rows a warp for every shape (0: the table)
+}  // namespace
+void native_mmvq_il_tune(int rows) { g_tune_rows = rows; }
+
+namespace {
+// sm_80 and newer (measured on sm_86 and sm_120), Volta (sm_70) and Pascal (sm_60, sm_61), each with its own table
+// above; Turing keeps native_mmvq's kernels unchanged
+// Volta (PR 1401): opt-in with STRATA_SM70_TABLE=1 until the author confirms on a V100 with the final code
+bool sm70_opt_in() { const char* v = std::getenv("STRATA_SM70_TABLE"); return v != nullptr && std::atoi(v) != 0; }
+// Pascal (sm_60, GP100): the same interleaved kernels (bitwise equal to native_mmvq's, mmvq_il_parity), its own table
+// kIlRows_60.  STRATA_SM60_TABLE=0 keeps native_mmvq's kernels on a P100; any other value (or unset) uses the table.
+bool sm60_table_on() { const char* v = std::getenv("STRATA_SM60_TABLE"); return v == nullptr || std::atoi(v) != 0; }
+// Pascal (sm_61: Tesla P40 / P4, GTX 10 series; native dp4a): the same interleaved kernels (bitwise equal to
+// native_mmvq's, mmvq_il_parity), its own table kIlRows_61.  STRATA_SM61_TABLE=0 keeps native_mmvq's kernels.
+bool sm61_table_on() { const char* v = std::getenv("STRATA_SM61_TABLE"); return v == nullptr || std::atoi(v) != 0; }
+bool il_arch_ok() try {
+    static int ok[16] = {};   // 0 unknown, 1 yes, -1 no, by device ordinal
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 16) return false;
+    if (ok[dev] == 0) {
+        int major = 0;
+        int minor = 0;
+        minor = dpct::get_device(dev).get_minor_version();
+        ok[dev] =
+            (DPCT_CHECK_ERROR(
+                 major = dpct::get_device(dev).get_major_version()) == 0 &&
+             (major >= 8 || (major == 7 && minor == 0 && sm70_opt_in()) ||
+              (major == 6 && minor == 0 && sm60_table_on()) ||
+              (major == 6 && minor == 1 && sm61_table_on())))
+                ? 1
+                : -1;
+    }
+    return ok[dev] > 0;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+}  // namespace
+
+bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
+    if (ncols < 1 || ncols > 4 || !g_multi_exact || !il_arch_ok()) return false;
+    return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
+           (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11);
+}
+
+void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void* x_il, float* y, int n_in,
+                    int n_out, int ncols, void* stream) {
+    if (!native_mmvq_il_supported(ggml_type, ncols, n_out)) {
+        native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        return;
+    }
+    const int r = g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out);
+    validate_shape(n_in, ncols, QK);
+    validate_pointer(weights);
+    if (ncols == 1) x_il = x_q8_1;   // one column: the plain blocks, no interleaved copy
+    validate_pointer(x_il);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto s = strata::q_of(stream);
+    switch (ggml_type) {
+    case 23: launch_il_rows<IlIQ4XS>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 12: launch_il_rows<IlQ4K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 13: launch_il_rows<IlQ5K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 14: launch_il_rows<IlQ6K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 11: launch_il_rows<IlQ3K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    }
+    launch_check();
+}
+
+#else  // HIP: no interleaved path
+std::size_t native_q8_1_il_bytes(int n_in, int ncols) { return native_q8_1_bytes(n_in, ncols) * 2; }
+void native_q8_1_interleave(const void*, void*, int, int, void*) {
+    throw std::invalid_argument("native_q8_1_interleave is CUDA only");
+}
+bool native_mmvq_il_supported(int, int, int) { return false; }
+int native_mmvq_il_rows_for(int, int, int, int) { return 0; }
+void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void*, float* y, int n_in, int n_out,
+                    int ncols, void* stream) {
+    native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+void native_mmvq_il_tune(int) {}
+#endif  // !__HIPCC__
+
+=======
+#if !defined(__HIPCC__)
+std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
+    validate_shape(n_in, ncols);
+    return std::size_t(n_in / Q8K) * std::size_t(native_q8_1_il_cp(ncols)) * (16 * sizeof(int) + sizeof(float));
+}
+
+void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    if (ncols < 2 || ncols > 4) throw std::invalid_argument("native_quantize_q8_1_il requires 2 <= ncols <= 4");
+    validate_pointer(x);
+    validate_pointer(x_q8_1);
+    validate_pointer(x_il);
+    validate_stream(stream);
+    const int cp = native_q8_1_il_cp(ncols);
+    const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
+    const int n_total = n_in * ncols;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            ((sycl::queue *)(strata::q_of(stream)))
+                ->get_device(),
+            {sycl::aspect::fp16});
+
+        ((sycl::queue *)(strata::q_of(stream)))
+            ->parallel_for<
+                dpct_kernel_name<class native_quantize_q8_1_il_kernel_b29322>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, 1,
+                                unsigned((n_total + QUANT_THREADS - 1) /
+                                         QUANT_THREADS)) *
+                        sycl::range(1, 1, QUANT_THREADS),
+                    sycl::range(1, 1, QUANT_THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_quantize_q8_1_il_kernel(
+                            x, static_cast<Q81Block *>(x_q8_1),
+                            const_cast<int *>(parts.bm),
+                            const_cast<int *>(parts.pm),
+                            const_cast<float *>(parts.d), n_in, n_total, cp);
+                    });
+    }
+    launch_check();
+}
+
+void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    if (ncols < 2 || ncols > 4) throw std::invalid_argument("native_q8_1_interleave requires 2 <= ncols <= 4");
+    validate_pointer(x_q8_1);
+    validate_pointer(x_il);
+    validate_stream(stream);
+    const int nb = n_in / Q8K, cp = native_q8_1_il_cp(ncols);
+    const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
+    const int n_total = nb * 8 * ncols;
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        ((sycl::queue *)(strata::q_of(stream)))
+            ->parallel_for<
+                dpct_kernel_name<class native_q8_1_interleave_kernel_8e6363>>(
+                sycl::nd_range<3>(
+                    sycl::range(1, 1, unsigned((n_total + 255) / 256)) *
+                        sycl::range(1, 1, 256),
+                    sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    native_q8_1_interleave_kernel(
+                        static_cast<const Q81Block *>(x_q8_1),
+                        const_cast<int *>(parts.bm),
+                        const_cast<int *>(parts.pm),
+                        const_cast<float *>(parts.d), nb, n_total, cp);
+                });
+    }
+    launch_check();
+}
+
+namespace {
+// Rows a warp at 2-4 columns ([ncols - 2]) by the matrix's row count, in classes: below 2048 (the keys' 512), 4096 (the
+// output projections' 2560), 8192 (the gate projection's 6144), 12288 (qkv's 10240), and more (the queries' 12288, the
+// head's 248K); 0: native_mmvq's kernels. The fork tuned its table on an RTX 3090. This one is read off
+// mmvq_il_parity --bench on an RTX 3060 (sm_86) and an RTX 5070 (sm_120) together: per cell the rows count (1/2/4) whose
+// worse card still takes at least 3% off native_mmvq's time, else 0; classes without a measured shape take their
+// neighbour's value. Every choice is bitwise the same output, so the table is only speed.
+struct IlRows { int type; uint8_t r[3][5]; };
+constexpr IlRows kIlRowsShared[] = {   // sm_86 + sm_120, and the fallback for every other sm_80+ card
+    {23, {{0, 0, 0, 0, 0}, {0, 0, 2, 4, 4}, {0, 1, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q4_K
+    {13, {{0, 0, 1, 1, 1}, {0, 4, 1, 1, 1}, {0, 1, 1, 1, 2}}},   // Q5_K
+    {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
+};
+// Per-architecture tables (P10).  A card whose compute capability (major * 10 + minor) is listed here uses its own table;
+// every other sm_80+ card uses kIlRowsShared.  sm_89 (Ada) has none yet: nobody measured it (we have no such card), so
+// it takes the shared table, which sits between the measured sm_86 and sm_120.  To add one, run
+// `mmvq_il_parity --bench --emit-table` on the card (docs/MMVQ_IL_TABLE.md), paste the printed block as a
+// `constexpr IlRows kIlRows_89[]` and add {89, kIlRows_89, sizeof(kIlRows_89) / sizeof(IlRows)} below.  Each choice
+// is bitwise the same output, so a table is only speed.  Without a rebuild: STRATA_MMVQ_IL_ROWS (see il_env_rows).
+// Volta (sm_70): read off mmvq_il_parity --bench on a V100-SXM2-32GB (two runs, mean), the same rule - per cell the
+// rows count whose every measured shape takes at least 3% off native_mmvq's time (e.g. the Q5_K head at 3 columns
+// 1094 -> 821 us, Q6_K 12288 rows 68.9 -> 47.9 us), else 0; unmeasured classes take a neighbour's value (PR 1401)
+constexpr IlRows kIlRows_70[] = {
+    {23, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 4, 2, 2, 2}}},   // IQ4_XS
+    {12, {{0, 2, 2, 4, 4}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q4_K
+    {13, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 1, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 1, 1, 1, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 4, 2}}},   // Q6_K
+};
+// Pascal (sm_60), read off mmvq_il_parity --bench --emit-table on a Tesla P100-PCIE-16GB (three runs, identical
+// tables), the same 3% rule.  Pascal has no dp4a (strata_dp4a: four vmad), so the kernels are compute-bound and more rows a
+// warp (weights and activations reused across rows) win 15-35% on the large shapes.  Bitwise equal to native_mmvq.
+constexpr IlRows kIlRows_60[] = {
+    {23, {{0, 4, 4, 4, 4}, {2, 4, 2, 4, 4}, {1, 1, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 4, 4, 4, 4}, {0, 2, 2, 2, 2}, {0, 0, 0, 4, 4}}},   // Q4_K
+    {13, {{0, 2, 2, 2, 2}, {0, 4, 2, 2, 4}, {0, 2, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 2, 2, 2, 4}, {0, 0, 0, 4, 4}, {0, 0, 0, 4, 4}}},   // Q6_K
+};
+// Pascal with dp4a (sm_61), read off mmvq_il_parity --bench --emit-table on a Tesla P40 (three runs: a cell is non-zero
+// only where every run picked a rows count that takes at least 3% off native_mmvq's time; where the runs disagreed on
+// the count, the one that won twice).  E.g. IQ4_XS 2560x10240 at 2 columns 112 -> 65 us, Q6_K 12288x2560 at 4
+// columns 189 -> 127 us, the Q5_K head at 3 columns 2545 -> 1766 us.  Bitwise equal to native_mmvq.
+constexpr IlRows kIlRows_61[] = {
+    {23, {{2, 4, 4, 4, 4}, {4, 4, 4, 4, 4}, {2, 2, 2, 2, 2}}},   // IQ4_XS
+    {12, {{2, 0, 4, 4, 4}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // Q4_K
+    {13, {{2, 0, 4, 4, 4}, {2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 0, 2, 2, 2}, {0, 4, 4, 4, 4}, {2, 4, 2, 2, 2}}},   // Q6_K
+    {11, {{2, 2, 2, 2, 2}, {2, 2, 2, 2, 2}, {1, 1, 1, 1, 1}}},   // Q3_K
+};
+// RTX 30-series (sm_86), 143-dense: read off mmvq_il_parity --bench --emit-table on an RTX A4000 with the engine's real
+// shapes (the output projections have 6144 inputs, not 4096), per cell the rows count whose worst measured shape is under
+// 0.97 of native_mmvq's time. The four older rows are the shared table's; Q3_K (the Q2_0 pack's main dense type) is new.
+constexpr IlRows kIlRows_86[] = {
+    {23, {{0, 0, 0, 0, 0}, {0, 0, 2, 4, 4}, {0, 1, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q4_K
+    {13, {{0, 0, 1, 1, 1}, {0, 4, 1, 1, 1}, {0, 1, 1, 1, 2}}},   // Q5_K
+    {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
+    {11, {{1, 2, 2, 2, 2}, {1, 1, 1, 2, 2}, {1, 1, 1, 1, 1}}},   // Q3_K (two runs; 2560x10240 at 4 columns 120 -> 70 us)
+};
+// Turing (sm_75): read off mmvq_il_parity --bench --emit-table on an RTX 2080 Ti 22 GB (SM 1650 MHz), the same 3% rule.
+// The plain multi-column kernels are bound by dp4a throughput on Turing from 2 columns on (IQ4_XS 2560x10240 at 4
+// columns 81.1 -> 37.4 us, the Q5_K head 1671 -> 1045 us); bitwise equal to native_mmvq.  No one-column table here:
+// the engine's dedicated single-column kernels (native_q3_k_mmvq) sum in another order, and the gain was 0.5%.
+constexpr IlRows kIlRows_75[] = {
+    {23, {{2, 2, 2, 2, 2}, {2, 2, 4, 2, 4}, {2, 2, 2, 2, 2}}},   // IQ4_XS
+    {12, {{0, 4, 2, 4, 4}, {1, 2, 2, 2, 2}, {1, 2, 2, 2, 2}}},   // Q4_K
+    {13, {{0, 4, 2, 2, 4}, {1, 4, 2, 2, 2}, {1, 1, 2, 2, 2}}},   // Q5_K
+    {14, {{0, 0, 1, 2, 1}, {0, 2, 2, 4, 4}, {0, 4, 4, 4, 4}}},   // Q6_K
+    {11, {{1, 2, 4, 4, 4}, {1, 2, 4, 4, 4}, {1, 2, 2, 2, 2}}},   // Q3_K
+};
+// One column: rows a warp by n_out class, 0 = native_mmvq's single-column kernels (STRATA_MMVQ_IL_T1=0 turns this off).
+struct Il1Rows { int type; uint8_t r[5]; };
+constexpr Il1Rows kIl1Rows_86[] = {
+    {11, {0, 1, 1, 1, 1}},   // Q3_K: 2560x10240 60 -> 43 us, 6144x2560 30 -> 26 us on the A4000
+};
+// Tesla P40 (sm_61), the same three runs: IQ4_XS 2560x10240 102 -> 58 us, the Q5_K head 1754 -> 1507 us
+constexpr Il1Rows kIl1Rows_61[] = {
+    {23, {2, 2, 4, 4, 4}},   // IQ4_XS
+    {13, {0, 0, 0, 2, 2}},   // Q5_K
+    {11, {0, 0, 2, 2, 2}},   // Q3_K
+};
+struct Il1Arch { int cc; const Il1Rows* t; size_t n; };
+constexpr Il1Arch kIl1Arch[] = {
+    {61, kIl1Rows_61, sizeof(kIl1Rows_61) / sizeof(Il1Rows)},
+    {86, kIl1Rows_86, sizeof(kIl1Rows_86) / sizeof(Il1Rows)},
+};
+bool il_env_on(const char* name) {
+    const char* v = std::getenv(name);
+    return v == nullptr || v[0] != '0';
+}
+bool il_t1_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_T1"); return on; }
+bool il_q3k_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_Q3K"); return on; }
+struct IlArch { int cc; const IlRows* t; size_t n; };
+constexpr IlArch kIlArch[] = {
+    {60, kIlRows_60, sizeof(kIlRows_60) / sizeof(IlRows)},   // Pascal GP100: measured on a Tesla P100
+    {61, kIlRows_61, sizeof(kIlRows_61) / sizeof(IlRows)},   // Pascal with dp4a: measured on a Tesla P40
+    {75, kIlRows_75, sizeof(kIlRows_75) / sizeof(IlRows)},   // Turing: measured on an RTX 2080 Ti
+    {70, kIlRows_70, sizeof(kIlRows_70) / sizeof(IlRows)},   // Volta: PR 1401, measured on a V100-SXM2
+    {86, kIlRows_86, sizeof(kIlRows_86) / sizeof(IlRows)},   // 143-dense: RTX A4000 with the real shapes (Q3_K added)
+};
+// STRATA_MMVQ_IL_ROWS="type:ncols:r0,r1,r2,r3,r4;..." overrides single rows of the table for every card (type = ggml
+// type 23/12/13/14, ncols 2-4, r* = rows a warp 0/1/2/4 for the five n_out classes).  Parsed once.
+struct IlEnvRow { int type, ncols; uint8_t r[5]; };
+const std::vector<IlEnvRow>& il_env_rows() {
+    static const std::vector<IlEnvRow> v = [] {
+        std::vector<IlEnvRow> out;
+        const char* e = std::getenv("STRATA_MMVQ_IL_ROWS");
+        if (!e) return out;
+        std::string str(e);
+        size_t pos = 0;
+        while (pos < str.size()) {
+            size_t end = str.find(';', pos);
+            if (end == std::string::npos) end = str.size();
+            int t = 0, n = 0, r[5] = {0, 0, 0, 0, 0}, used = 0;
+            if (std::sscanf(str.substr(pos, end - pos).c_str(), "%d:%d:%d,%d,%d,%d,%d%n", &t, &n, &r[0], &r[1], &r[2], &r[3],
+                            &r[4], &used) >= 7 && n >= 1 && n <= 4) {
+                IlEnvRow x{t, n, {}};
+                bool ok = true;
+#pragma unroll
+                for (int i = 0; i < 5; ++i) {
+                    ok = ok &&
+                         (r[i] == 0 || r[i] == 1 || r[i] == 2 || r[i] == 4);
+                    x.r[i] = (uint8_t)r[i];
+                }
+                if (ok) out.push_back(x);
+                else std::fprintf(stderr, "strata: STRATA_MMVQ_IL_ROWS: rows must be 0/1/2/4 - entry ignored\n");
+            } else {
+                std::fprintf(stderr, "strata: STRATA_MMVQ_IL_ROWS: cannot read '%s' (type:ncols:r0,r1,r2,r3,r4) - ignored\n",
+                             str.substr(pos, end - pos).c_str());
+            }
+            pos = end + 1;
+        }
+        return out;
+    }();
+    return v;
+}
+}  // namespace
+// The rows a warp for a card of compute capability `cc` (major * 10 + minor); 0: native_mmvq's kernels.  Pure, so a test
+// can check every architecture's table without that card.
+int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
+    if (ncols < 1 || ncols > 4) return 0;
+    const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
+    for (const IlEnvRow& e : il_env_rows())
+        if (e.type == type && e.ncols == ncols) return e.r[cls];
+    if (ncols == 1) {   // 143-dense: one column (the plain q8_1 blocks, no interleaved copy); STRATA_MMVQ_IL_T1=0 turns it off
+        if (!il_t1_on()) return 0;
+        for (const Il1Arch& a : kIl1Arch)
+            if (a.cc == cc)
+                for (size_t i = 0; i < a.n; ++i)
+                    if (a.t[i].type == type) return a.t[i].r[cls];
+        return 0;
+    }
+    if (type == 11 && !il_q3k_on()) return 0;   // STRATA_MMVQ_IL_Q3K=0: Q3_K keeps native_mmvq's kernels
+    const IlRows* t = kIlRowsShared;
+    size_t n = sizeof(kIlRowsShared) / sizeof(IlRows);
+    for (const IlArch& a : kIlArch)
+        if (a.cc == cc && a.t != nullptr) { t = a.t; n = a.n; }
+    for (size_t i = 0; i < n; ++i)
+        if (t[i].type == type) return t[i].r[ncols - 2][cls];
+    return 0;
+}
+namespace {
+int il_cc() try {
+    static int cc[16] = {};   // by device ordinal, 0 unknown
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 16) return 0;
+    if (cc[dev] == 0) {
+        int maj = 0, mnr = 0;
+        if (DPCT_CHECK_ERROR(maj = dpct::get_device(dev).get_major_version()) !=
+                0 ||
+            /*
+            DPCT1026: The call to cudaGetLastError was removed because this
+            functionality is redundant in SYCL.
+            */
+            DPCT_CHECK_ERROR(mnr = dpct::get_device(dev).get_minor_version()) !=
+                0) {
+            ; return 0;
+        }
+        cc[dev] = maj * 10 + mnr;
+    }
+    return cc[dev];
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+int il_rows(int type, int ncols, int n_out) { return native_mmvq_il_rows_for(il_cc(), type, ncols, n_out); }
+int g_tune_rows = 0;   // native_mmvq_il_tune (tests, benchmarks): rows a warp for every shape (0: the table)
+}  // namespace
+void native_mmvq_il_tune(int rows) { g_tune_rows = rows; }
+
+namespace {
+// sm_80 and newer (measured on sm_86 and sm_120), Volta (sm_70) and Pascal (sm_60, sm_61), each with its own table
+// above; Turing keeps native_mmvq's kernels unless STRATA_SM75_PERF=1 (kIlRows_75)
+// Volta (PR 1401): opt-in with STRATA_SM70_TABLE=1 until the author confirms on a V100 with the final code
+bool sm70_opt_in() { const char* v = std::getenv("STRATA_SM70_TABLE"); return v != nullptr && std::atoi(v) != 0; }
+// Pascal (sm_60, GP100): the same interleaved kernels (bitwise equal to native_mmvq's, mmvq_il_parity), its own table
+// kIlRows_60.  STRATA_SM60_TABLE=0 keeps native_mmvq's kernels on a P100; any other value (or unset) uses the table.
+// STRATA_SM75_IL=0 / 1 forces the table off / on; unset it follows STRATA_SM75_PERF=1 (Turing only)
+bool sm75_il_on(int major, int minor) { return strata::sm75_switch("STRATA_SM75_IL", major, minor); }
+bool sm60_table_on() { const char* v = std::getenv("STRATA_SM60_TABLE"); return v == nullptr || std::atoi(v) != 0; }
+// Pascal (sm_61: Tesla P40 / P4, GTX 10 series; native dp4a): the same interleaved kernels (bitwise equal to
+// native_mmvq's, mmvq_il_parity), its own table kIlRows_61.  STRATA_SM61_TABLE=0 keeps native_mmvq's kernels.
+bool sm61_table_on() { const char* v = std::getenv("STRATA_SM61_TABLE"); return v == nullptr || std::atoi(v) != 0; }
+bool il_arch_ok() try {
+    static int ok[16] = {};   // 0 unknown, 1 yes, -1 no, by device ordinal
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 16) return false;
+    if (ok[dev] == 0) {
+        int major = 0;
+        int minor = 0;
+        minor = dpct::get_device(dev).get_minor_version();
+        ok[dev] =
+            (DPCT_CHECK_ERROR(
+                 major = dpct::get_device(dev).get_major_version()) == 0 &&
+             (major >= 8 || (major == 7 && minor == 0 && sm70_opt_in()) ||
+              (major == 7 && minor == 5 && sm75_il_on(major, minor)) ||
+              (major == 6 && minor == 0 && sm60_table_on()) ||
+              (major == 6 && minor == 1 && sm61_table_on())))
+                ? 1
+                : -1;
+    }
+    return ok[dev] > 0;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+}  // namespace
+
+bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
+    if (ncols < 1 || ncols > 4 || !g_multi_exact || !il_arch_ok()) return false;
+    return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
+           (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11);
+}
+
+void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void* x_il, float* y, int n_in,
+                    int n_out, int ncols, void* stream) {
+    if (!native_mmvq_il_supported(ggml_type, ncols, n_out)) {
+        native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        return;
+    }
+    const int r = g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out);
+    validate_shape(n_in, ncols, QK);
+    validate_pointer(weights);
+    if (ncols == 1) x_il = x_q8_1;   // one column: the plain blocks, no interleaved copy
+    validate_pointer(x_il);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto s = strata::q_of(stream);
+    switch (ggml_type) {
+    case 23: launch_il_rows<IlIQ4XS>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 12: launch_il_rows<IlQ4K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 13: launch_il_rows<IlQ5K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 14: launch_il_rows<IlQ6K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 11: launch_il_rows<IlQ3K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    }
+    launch_check();
+}
+
+#else  // HIP: no interleaved path
+std::size_t native_q8_1_il_bytes(int n_in, int ncols) { return native_q8_1_bytes(n_in, ncols) * 2; }
+void native_quantize_q8_1_il(const float*, void*, void*, int, int, void*) {
+    throw std::invalid_argument("native_quantize_q8_1_il is CUDA only");
+}
+void native_q8_1_interleave(const void*, void*, int, int, void*) {
+    throw std::invalid_argument("native_q8_1_interleave is CUDA only");
+}
+bool native_mmvq_il_supported(int, int, int) { return false; }
+int native_mmvq_il_rows_for(int, int, int, int) { return 0; }
+void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void*, float* y, int n_in, int n_out,
+                    int ncols, void* stream) {
+    native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+void native_mmvq_il_tune(int) {}
+#endif  // !__HIPCC__
+
+>>>>>>> ours-now
 } // namespace strata::kernels

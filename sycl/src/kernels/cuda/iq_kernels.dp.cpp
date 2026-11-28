@@ -10,7 +10,14 @@
 #include "strata/sycl_math.hpp"
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+<<<<<<< sycl
 #include "strata/kernels/iq_dequant_expert.hpp"
+||||||| base
+#include "strata/kernels/gfx_arch.hpp"
+=======
+#include "strata/core/sm75_series.hpp"
+#include "strata/kernels/gfx_arch.hpp"
+>>>>>>> ours-now
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "s26_tsum.dp.hpp"
@@ -907,6 +914,16 @@ template<> struct Split<16> {   // IQ2_XXS
         const float d = r.dw * bq8_1[iqs / 2].ds[0];
         return d * sumi;
     }
+    // `apply` with the q8_1 block already in registers: u = its 8 words, d8 = __low2float(ds).  Same operations in
+    // the same order (the EXPDEC kernels, see expdec below).
+    static float apply_u(const W& r, const int (&u)[8], float d8) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], u[j], sumi);
+        sumi = sumi * r.ls / 8;
+        const float d = r.dw * d8;
+        return d * sumi;
+    }
 };
 // IQ2_XS and IQ2_S share the apply: two half sums, two 4-bit scales
 struct SplitLs2 {
@@ -919,6 +936,16 @@ struct SplitLs2 {
         for (int j = 4; j < 8; ++j) sumi1 = ggml_cuda_dp4a(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi1);
         const int sumi = (sumi0 * r.ls0 + sumi1 * r.ls1 + (sumi0 + sumi1) / 2) / 4;
         const float d = r.dw * bq8_1[iqs / 2].ds[0];
+        return d * sumi;
+    }
+    static float apply_u(const W& r, const int (&u)[8], float d8) {
+        int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) sumi0 = ggml_cuda_dp4a(r.g[j], u[j], sumi0);
+#pragma unroll
+        for (int j = 4; j < 8; ++j) sumi1 = ggml_cuda_dp4a(r.g[j], u[j], sumi1);
+        const int sumi = (sumi0 * r.ls0 + sumi1 * r.ls1 + (sumi0 + sumi1) / 2) / 4;
+        const float d = r.dw * d8;
         return d * sumi;
     }
 };
@@ -995,17 +1022,20 @@ template<> inline constexpr bool kSplit<18> = true;
 template<> struct Split<18> {   // IQ3_XXS
     struct W { int g[8]; int ls; float dw; };
     template<bool STAGE_GRID = false>
-    static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+    static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
         const sycl::int2 q3_packed =
             sycl::int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
         const uint8_t* q3 = (const uint8_t*) &q3_packed;
         const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+        const uint32_t* grid_lut;   // the same 256 words either way (expdec stages them)
+        if constexpr (STAGE_GRID) grid_lut = s_grid;
+        else grid_lut = iq3xxs_grid;
         W r;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const sycl::int2 grid_pos =
-                sycl::int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+                sycl::int2(grid_lut[q3[l0 + 0]], grid_lut[q3[l0 + 1]]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
             const int signs0 = dpct::vectorized_binary<sycl::uchar4>(
                 signs & 0x08040201, 0, std::not_equal_to<>());
@@ -1029,12 +1059,20 @@ template<> struct Split<18> {   // IQ3_XXS
         const float d = r.dw * bq8_1[iqs / 2].ds[0];
         return d * sumi;
     }
+    static float apply_u(const W& r, const int (&u)[8], float d8) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], u[j], sumi);
+        sumi = (r.ls * sumi + sumi / 2) / 2;
+        const float d = r.dw * d8;
+        return d * sumi;
+    }
 };
 template<> inline constexpr bool kSplit<21> = true;
 template<> struct Split<21> {   // IQ3_S
     struct W { int g[8]; int ls; float dw; };
     template<bool STAGE_GRID = false>
-    static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+    static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
         const sycl::int2 qs_packed = sycl::int2(get_int_b2(bq3->qs, iqs + 0),
                                                 get_int_b2(bq3->qs, iqs + 1));
@@ -1042,12 +1080,15 @@ template<> struct Split<21> {   // IQ3_S
         const int qh = bq3->qh[iqs / 2];
         const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
         const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
+        const uint32_t* grid_lut;   // the same 512 words either way (expdec stages them)
+        if constexpr (STAGE_GRID) grid_lut = s_grid;
+        else grid_lut = iq3s_grid;
         W r;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const sycl::int2 grid_pos =
-                sycl::int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-                           iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+                sycl::int2(grid_lut[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+                           grid_lut[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
             const int signs0 = dpct::vectorized_binary<sycl::uchar4>(
                 ((signs_packed_8[l0 / 2] & 0x03) << 7) |
                     ((signs_packed_8[l0 / 2] & 0x0C) << 21),
@@ -1072,6 +1113,14 @@ template<> struct Split<21> {   // IQ3_S
         for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi);
         sumi *= r.ls;
         const float d = r.dw * bq8_1[iqs / 2].ds[0];
+        return d * sumi;
+    }
+    static float apply_u(const W& r, const int (&u)[8], float d8) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], u[j], sumi);
+        sumi *= r.ls;
+        const float d = r.dw * d8;
         return d * sumi;
     }
 };
@@ -1147,6 +1196,16 @@ template<> struct Split<20> {   // IQ4_NL
         const float d = r.dw * bq8_1->ds[0];
         return d * sumi;
     }
+    // `apply` with the block's words in registers: p0 = words iqs, iqs + 1; p1 = words iqs + 4, iqs + 5; d8 = __low2float(ds)
+    static float apply_u(const W &r, sycl::int2 p0, sycl::int2 p1, float d8) {
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a(r.v[0].x(), p0.x(), sumi);
+        sumi = ggml_cuda_dp4a(r.v[0].y(), p1.x(), sumi);
+        sumi = ggml_cuda_dp4a(r.v[1].x(), p0.y(), sumi);
+        sumi = ggml_cuda_dp4a(r.v[1].y(), p1.y(), sumi);
+        const float d = r.dw * d8;
+        return d * sumi;
+    }
 };
 template<> inline constexpr bool kSplit<23> = true;
 template<> struct Split<23> {   // IQ4_XS
@@ -1208,6 +1267,16 @@ template<> struct Split<42> {   // Q2_0
             sumi = ggml_cuda_dp4a(v, r.qy[j], sumi);
         }
         const float d8 = bq8_1_chunk->ds[0];
+        return r.d2 * d8 * sumi;
+    }
+    // `apply` with the q8_1 block (2 kbx + iqs) in registers: u = its 8 words, d8 = __low2float(ds)
+    static float apply_u(const W& r, const int (&u)[8], float d8) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumi = ggml_cuda_dp4a(u[j * 2 + 0], r.qx[j], sumi);
+            sumi = ggml_cuda_dp4a(u[j * 2 + 1], r.qy[j], sumi);
+        }
         return r.d2 * d8 * sumi;
     }
 };
@@ -2463,6 +2532,556 @@ __dpct_inline__ void native_down_multi_kernel(
     }
 }
 
+// ---------------------------------------------------------------- EXPDEC (STRATA_EXPDEC=1): the group's activations
+// in shared memory, R rows per lane
+//
+// native_gu_multi_kernel / native_down_multi_kernel decode each weight part once and apply it to every entry of the
+// group, but the gate/up apply re-reads the entry's q8_1 block from global memory with 9 scattered 4-byte loads
+// (36-byte blocks: a warp's load touches 32 sectors), so an entry costs about 60% of a whole expert (nsys, 2080 Ti,
+// L02 at 131k: ~2.6 us per expert and ~1.6 us per entry and layer) although it reads nothing from DRAM.  Here a
+// block stages its group's entries (ED_NC at a time, as the default) in shared memory laid out so that a call's
+// words are two 16-byte loads (gate/up, Q2_0 down: the block's two halves in separate planes, conflict-free) or two
+// 8-byte loads (IQ4_NL down), the fp16 block scale already a float; every lane computes R rows at once, so the
+// activation words are loaded once per R rows; the IQ3_XXS / IQ3_S codebooks are staged too (IQ2_* already were),
+// and a block takes `rb` rows (auto: the most that keep ~STRATA_EXPDEC_MINBLK blocks in flight) instead of 16.
+// Each (row, entry) sum is the default kernel's sum tree (row_dot_80_sub16 / row_dot_40_sub8 / row_dot_20_sub16: the
+// same lane does the same calls in the same order with the same operations, `apply_u` = `apply` on the block's
+// words), so the output is bitwise the same (expdec_bench checks it; docs/EXPERTDEC.md).
+#ifndef STRATA_EXPDEC_MINB
+#define STRATA_EXPDEC_MINB 4   // gate/up __launch_bounds__ min blocks per SM by default (STRATA_EXPDEC_MINB at runtime): 4 = up to 64
+                               // registers, as the default kernels (bench: equal on the 2080 Ti, 0.87-0.95 on the 3060); 2 = up to 128
+#endif
+constexpr int ED_NC = GRP_NC;   // entries staged at once
+constexpr int ED_XB = 80;       // q8_1 blocks of a gate/up row (n_embd 2560)
+constexpr int ED_HB = 20;       // q8_1 blocks of a down row (n_ff 640)
+
+// the codebook of a gate/up format in shared memory: words, and the copy (every thread of the block; sync after)
+template<int TG> struct EdGrid;
+template<> struct EdGrid<16> { static constexpr int words = 512;
+    static void copy(uint32_t *s, int tid) {
+        const sycl::uint2 *src = (const sycl::uint2 *)iq2xxs_grid;
+        sycl::uint2 *dst = (sycl::uint2 *)s;
+#pragma unroll
+    for (int i = tid; i < 256; i += 256) dst[i] = src[i]; } };
+template<> struct EdGrid<17> { static constexpr int words = 1024;
+    static void copy(uint32_t *s, int tid) {
+        const sycl::uint2 *src = (const sycl::uint2 *)iq2xs_grid;
+        sycl::uint2 *dst = (sycl::uint2 *)s;
+#pragma unroll
+    for (int i = tid; i < 512; i += 256) dst[i] = src[i]; } };
+template<> struct EdGrid<22> { static constexpr int words = 2048;
+    static void copy(uint32_t *s, int tid) {
+        const sycl::uint2 *src = (const sycl::uint2 *)iq2s_grid;
+        sycl::uint2 *dst = (sycl::uint2 *)s;
+#pragma unroll
+    for (int i = tid; i < 1024; i += 256) dst[i] = src[i]; } };
+template<> struct EdGrid<18> { static constexpr int words = 256;
+    static void copy(uint32_t* s, int tid) {
+#pragma unroll
+    for (int i = tid; i < 256; i += 256) s[i] = iq3xxs_grid[i]; } };
+template<> struct EdGrid<21> { static constexpr int words = 512;
+    static void copy(uint32_t* s, int tid) {
+#pragma unroll
+    for (int i = tid; i < 512; i += 256) s[i] = iq3s_grid[i]; } };
+
+// One entry's q8_1 row (XB blocks of 36 bytes, 4-byte aligned) into shared memory as entry c: the 8 words of block k
+// in planes (HALVES: s_u[(2 c + h) XB + k] = words 4h..4h+3, two 16-byte loads per call, conflict-free over 16
+// consecutive k; else s_u[(c XB + k) 2 + h], the block's 32 bytes together, for the IQ4_NL pairs) and the fp16 scale
+// as s_ds[c XB + k] = __low2float(ds), the value `apply` computes.  All 256 threads.
+template <int XB, bool HALVES>
+__dpct_inline__ void
+ed_stage_entry(sycl::int4 *__restrict__ s_u, float *__restrict__ s_ds, int c,
+               const block_q8_1 *__restrict__ src, int tid) {
+    int* su = (int*) s_u;
+    const int* w32 = (const int*) src;
+    for (int w = tid; w < XB * 9; w += 256) {
+        const int k = w / 9, j = w - k * 9;
+        const int v = w32[w];
+        if (j == 0) {
+            const sycl::half2 h = *reinterpret_cast<const sycl::half2 *>(&v);
+            s_ds[c * XB + k] = h[0];
+        } else {
+            const int q = j - 1;
+            if constexpr (HALVES) su[((c * 2 + (q >> 2)) * XB + k) * 4 + (q & 3)] = v;
+            else su[(c * XB + k) * 8 + q] = v;
+        }
+    }
+}
+template <int XB>
+__dpct_inline__ void ed_load_u(const sycl::int4 *__restrict__ s_u, int c, int k,
+                               int (&u)[8]) {
+    const sycl::int4 a = s_u[(c * 2 + 0) * XB + k],
+                     b = s_u[(c * 2 + 1) * XB + k];
+    u[0] = a.x(); u[1] = a.y(); u[2] = a.z(); u[3] = a.w();
+    u[4] = b.x(); u[5] = b.y(); u[6] = b.z(); u[7] = b.w();
+}
+
+// R gate/up rows against the NC staged entries, lane t of a 16-lane sub-warp: row_dot_80_sub16's tree (calls t,
+// t+32, t+64 into s; t+16, t+48 into s16; s = (s + (s16)); xor 8-4-2-1), every call's weight part decoded once
+// per row and the entry's block loaded once per NC x R products.
+template <int TG, int R, int NC>
+/*
+DPCT1110: The total declared local variable size in device function
+ed_gu_rows exceeds 128 bytes and may cause high register pressure. Consult with
+your hardware vendor to find the total register size available and adjust the
+code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+ed_gu_rows(const uint8_t *const *wr, const sycl::int4 *__restrict__ s_u,
+           const float *__restrict__ s_ds, const uint32_t *__restrict__ s_grid,
+           int t, float (&s)[R][NC]) {
+    using F = Fmt<TG>;
+    using S = Split<TG>;
+    float s16[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) { s[r][c] = 0.0f; s16[r][c] = 0.0f; }
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int k = t + 32 * j;
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[R];
+#pragma unroll
+        /*
+        DPCT1084: The function call "Split::load" has multiple migration
+        results in different template instantiations that could not be unified.
+        You may need to adjust the code.
+        */
+        for (int r = 0; r < R; ++r)
+            w[r] = S::template load<true>(wr[r], kbx, iqs, s_grid);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            int u[8];
+            ed_load_u<ED_XB>(s_u, c, k, u);
+            const float d8 = s_ds[c * ED_XB + k];
+#pragma unroll
+            for (int r = 0; r < R; ++r) s[r][c] += S::apply_u(w[r], u, d8);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int k = t + 16 + 32 * j;
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[R];
+#pragma unroll
+        /*
+        DPCT1084: The function call "Split::load" has multiple migration
+        results in different template instantiations that could not be unified.
+        You may need to adjust the code.
+        */
+        for (int r = 0; r < R; ++r)
+            w[r] = S::template load<true>(wr[r], kbx, iqs, s_grid);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            int u[8];
+            ed_load_u<ED_XB>(s_u, c, k, u);
+            const float d8 = s_ds[c * ED_XB + k];
+#pragma unroll
+            for (int r = 0; r < R; ++r) s16[r][c] += S::apply_u(w[r], u, d8);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            /*
+            DPCT1013: The rounding mode could not be specified and the
+            generated code may have different accuracy than the original code.
+            Verify the correctness. SYCL math built-in function rounding mode is
+            aligned with OpenCL C 1.2 standard.
+            */
+            s[r][c] = s[r][c] + s16[r][c];
+#pragma unroll
+            /*
+            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
+            feature masked sub_group function which may not be supported by all
+            compilers or runtimes. You may need to adjust the code.
+            */
+            for (int o = 8; o > 0; o >>= 1) s[r][c] +=
+                dpct::experimental::permute_sub_group_by_xor(
+                    0xffffffffu,
+                    sycl::ext::oneapi::this_work_item::get_sub_group(), s[r][c],
+                    o);
+        }
+}
+
+// gate/up: 16 sub-warps of 16 lanes, R rows each = 16 R rows per pass, `rb` rows per block (a multiple of 16 R; 2 n_ff
+// is one too, so a pass is whole or absent for the entire block).  Group stride as native_gu_multi_kernel.
+template <int TG, int R, int MINB>
+/*
+DPCT1110: The total declared local variable size in device function
+expdec_gu_kernel exceeds 128 bytes and may cause high register pressure. Consult
+with your hardware vendor to find the total register size available and adjust
+the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void expdec_gu_kernel(
+    const unsigned long long *__restrict__ grp_ptr,
+    const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+    const int32_t *__restrict__ ent_tok, const block_q8_1 *__restrict__ xq,
+    NativeExpertLayout L, float *__restrict__ gate, float *__restrict__ up,
+    int rb) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int ng = *n_groups;
+    if (item_ct1.get_group(1) >= ng) return;
+    auto &s_u = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        sycl::int4[ED_NC * 2 * ED_XB]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_ds = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[ED_NC * ED_XB]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_grid_buf = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        uint32_t[EdGrid<TG>::words]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int tid = item_ct1.get_local_id(2);
+    /*
+    DPCT1084: The function call "EdGrid::copy" has multiple migration
+    results in different template instantiations that could not be unified. You
+    may need to adjust the code.
+    */
+    EdGrid<TG>::copy(s_grid_buf, tid); // visible after the staging's __syncthreads
+    const int sw = tid >> 4, t = tid & 15;
+    const int nrow = 2 * (int) L.n_ff, n_ff = (int) L.n_ff;
+    const int row_base = item_ct1.get_group(2) * rb;
+    for (int g = item_ct1.get_group(1); g < ng;
+         g += item_ct1.get_group_range(1)) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += ED_NC) {
+            const int n = sycl::min(ED_NC, e1 - e);
+            /*
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
+            */
+            /*
+            DPCT1065: Consider replacing sycl::nd_item::barrier() with
+            sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+            better performance if there is no access to global memory.
+            */
+            item_ct1.barrier();
+#pragma unroll
+            for (int c = 0; c < n; ++c) ed_stage_entry<ED_XB, true>(
+                s_u, s_ds, c, xq + (size_t)ent_tok[e + c] * ED_XB, tid);
+            /*
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
+            */
+            /*
+            DPCT1065: Consider replacing sycl::nd_item::barrier() with
+            sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+            better performance if there is no access to global memory.
+            */
+            item_ct1.barrier();
+            for (int p = 0; p * 16 * R < rb; ++p) {
+                const int row0 = row_base + p * 16 * R + sw * R;
+                if (row0 >= nrow) break;   // uniform over the block
+                const bool is_up = row0 >= n_ff;
+                const int r0 = is_up ? row0 - n_ff : row0;
+                const uint8_t* wr[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) wr[r] = blob + (is_up ? L.up_off : 0) + (size_t) (r0 + r) * L.gu_row;
+                float* dst = is_up ? up : gate;
+                auto run = [&](auto nc) {
+                    constexpr int NC = decltype(nc)::value;
+                    float s[R][NC];
+                    ed_gu_rows<TG, R, NC>(wr, s_u, s_ds, s_grid_buf, t, s);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+                        if (t == c)
+#pragma unroll
+                            for (int r = 0; r < R; ++r) dst[(size_t) (e + c) * n_ff + r0 + r] = s[r][c];
+                };
+                switch (n) {
+                    case 1: run(std::integral_constant<int, 1>{});
+                        break;
+                    case 2: run(std::integral_constant<int, 2>{});
+                        break;
+                    case 3: run(std::integral_constant<int, 3>{});
+                        break;
+                    default: run(std::integral_constant<int, 4>{});
+                        break;
+                }
+            }
+        }
+    }
+}
+
+// R IQ4_NL down rows, lane t of an 8-lane sub-warp: row_dot_40_sub8's tree.  s_p: the block's 8 words together
+// (ed_stage_entry<ED_HB, false>), read as the int2 pairs (iqs, iqs + 1) and (iqs + 4, iqs + 5).
+template <int R, int NC>
+/*
+DPCT1110: The total declared local variable size in device function
+ed_d20_rows exceeds 128 bytes and may cause high register pressure. Consult with
+your hardware vendor to find the total register size available and adjust the
+code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void ed_d20_rows(const uint8_t *const *wr,
+                                 const sycl::int2 *__restrict__ s_p,
+                                 const float *__restrict__ s_ds, int t,
+                                 float (&s)[R][NC]) {
+    using F = Fmt<20>;
+    using S = Split<20>;
+    auto term = [&](int k, int r, int c, const typename S::W& w) -> float {
+        const int kbx = k / F::ipb, par = k & 1;
+        const sycl::int2 p0 = s_p[(c * ED_HB + kbx) * 4 + par],
+                         p1 = s_p[(c * ED_HB + kbx) * 4 + 2 + par];
+        return S::apply_u(w, p0, p1, s_ds[c * ED_HB + kbx]);
+    };
+    auto loadw = [&](int k, typename S::W (&w)[R]) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            w[r] = S::load(wr[r], kbx, iqs);
+    };
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s[r][c] = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {   // k = t, t + 32
+        const int k = t + 32 * j;
+        typename S::W w[R];
+        loadw(k, w);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+#pragma unroll
+            for (int r = 0; r < R; ++r) s[r][c] += term(k, r, c, w[r]);
+    }
+    {
+        const int k = t + 16;
+        typename S::W w[R];
+        loadw(k, w);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                float s16 = 0.0f;
+                s16 += term(k, r, c, w[r]);
+                /*
+                DPCT1013: The rounding mode could not be specified and the
+                generated code may have different accuracy than the original
+                code. Verify the correctness. SYCL math built-in function
+                rounding mode is aligned with OpenCL C 1.2 standard.
+                */
+                s[r][c] = s[r][c] + s16;
+            }
+    }
+    float s8[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s8[r][c] = 0.0f;
+    {
+        const int k = t + 8;
+        typename S::W w[R];
+        loadw(k, w);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+#pragma unroll
+            for (int r = 0; r < R; ++r) s8[r][c] += term(k, r, c, w[r]);
+    }
+    {
+        const int k = t + 24;
+        typename S::W w[R];
+        loadw(k, w);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                float s24 = 0.0f;
+                s24 += term(k, r, c, w[r]);
+                /*
+                DPCT1013: The rounding mode could not be specified and the
+                generated code may have different accuracy than the original
+                code. Verify the correctness. SYCL math built-in function
+                rounding mode is aligned with OpenCL C 1.2 standard.
+                */
+                s[r][c] = s[r][c] + s8[r][c] + s24;
+            }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+#pragma unroll
+            /*
+            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
+            feature masked sub_group function which may not be supported by all
+            compilers or runtimes. You may need to adjust the code.
+            */
+            for (int o = 4; o > 0; o >>= 1) s[r][c] +=
+                dpct::experimental::permute_sub_group_by_xor(
+                    0xffffffffu,
+                    sycl::ext::oneapi::this_work_item::get_sub_group(), s[r][c],
+                    o);
+}
+
+// R Q2_0 down rows, lane t of a 16-lane sub-warp: row_dot_20_sub16's tree (call t; call t + 16 for t < 4 into s16).
+template <int R, int NC>
+/*
+DPCT1110: The total declared local variable size in device function
+ed_d42_rows exceeds 128 bytes and may cause high register pressure. Consult with
+your hardware vendor to find the total register size available and adjust the
+code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+ed_d42_rows(const uint8_t *const *wr, const sycl::int4 *__restrict__ s_u,
+            const float *__restrict__ s_ds, int t, float (&s)[R][NC]) {
+    using F = Fmt<42>;
+    using S = Split<42>;
+    {
+        const int k = t, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) w[r] = S::load(wr[r], kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            int u[8];
+            ed_load_u<ED_HB>(s_u, c, k, u);
+            const float d8 = s_ds[c * ED_HB + k];
+#pragma unroll
+            for (int r = 0; r < R; ++r) { s[r][c] = 0.0f; s[r][c] += S::apply_u(w[r], u, d8); }
+        }
+    }
+    float s16[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s16[r][c] = 0.0f;
+    if (t < 4) {
+        const int k = t + 16, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) w[r] = S::load(wr[r], kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            int u[8];
+            ed_load_u<ED_HB>(s_u, c, k, u);
+            const float d8 = s_ds[c * ED_HB + k];
+#pragma unroll
+            for (int r = 0; r < R; ++r) s16[r][c] += S::apply_u(w[r], u, d8);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            /*
+            DPCT1013: The rounding mode could not be specified and the
+            generated code may have different accuracy than the original code.
+            Verify the correctness. SYCL math built-in function rounding mode is
+            aligned with OpenCL C 1.2 standard.
+            */
+            s[r][c] = s[r][c] + s16[r][c];
+#pragma unroll
+            /*
+            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
+            feature masked sub_group function which may not be supported by all
+            compilers or runtimes. You may need to adjust the code.
+            */
+            for (int o = 8; o > 0; o >>= 1) s[r][c] +=
+                dpct::experimental::permute_sub_group_by_xor(
+                    0xffffffffu,
+                    sycl::ext::oneapi::this_work_item::get_sub_group(), s[r][c],
+                    o);
+        }
+}
+
+// down (IQ4_NL: 32 sub-warps of 8 lanes; Q2_0: 16 of 16), R rows per lane, `rb` rows per block (a multiple of the
+// rows per pass; n_embd too).  The entries' h rows are contiguous in hq (entry e at e * ED_HB).
+template <int TD, int R>
+/*
+DPCT1110: The total declared local variable size in device function
+expdec_down_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+expdec_down_kernel(const unsigned long long *__restrict__ grp_ptr,
+                   const int32_t *__restrict__ grp_start,
+                   const int32_t *__restrict__ n_groups,
+                   const int32_t *__restrict__ ent_dst,
+                   const block_q8_1 *__restrict__ hq, NativeExpertLayout L,
+                   float *__restrict__ out, int rb) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int ng = *n_groups;
+    if (item_ct1.get_group(1) >= ng) return;
+    constexpr int LANES = TD == 20 ? 8 : 16;
+    constexpr int RPP = (256 / LANES) * R;   // rows per pass
+    auto &s_u = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        sycl::int4[ED_NC * 2 * ED_HB]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_ds = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[ED_NC * ED_HB]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int tid = item_ct1.get_local_id(2);
+    const int sw = tid / LANES, t = tid % LANES;
+    const int nrow = (int) L.n_embd;
+    const int row_base = item_ct1.get_group(2) * rb;
+    for (int g = item_ct1.get_group(1); g < ng;
+         g += item_ct1.get_group_range(1)) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g] + L.down_off;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += ED_NC) {
+            const int n = sycl::min(ED_NC, e1 - e);
+            /*
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
+            */
+            /*
+            DPCT1065: Consider replacing sycl::nd_item::barrier() with
+            sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+            better performance if there is no access to global memory.
+            */
+            item_ct1.barrier();
+#pragma unroll
+            for (int c = 0; c < n; ++c) ed_stage_entry<ED_HB, TD == 42>(
+                s_u, s_ds, c, hq + (size_t)(e + c) * ED_HB, tid);
+            /*
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
+            */
+            /*
+            DPCT1065: Consider replacing sycl::nd_item::barrier() with
+            sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+            better performance if there is no access to global memory.
+            */
+            item_ct1.barrier();
+            for (int p = 0; p * RPP < rb; ++p) {
+                const int row0 = row_base + p * RPP + sw * R;
+                if (row0 >= nrow) break;   // uniform over the block
+                const uint8_t* wr[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) wr[r] = blob + (size_t) (row0 + r) * L.d_row;
+                auto run = [&](auto nc) {
+                    constexpr int NC = decltype(nc)::value;
+                    float s[R][NC];
+                    if constexpr (TD == 20) ed_d20_rows<R, NC>(
+                        wr, (const sycl::int2 *)s_u, s_ds, t, s);
+                    else ed_d42_rows<R, NC>(wr, s_u, s_ds, t, s);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+                        if (t == c) {
+                            const size_t o = (size_t) ent_dst[e + c] * L.n_embd + row0;
+#pragma unroll
+                            for (int r = 0; r < R; ++r) out[o + r] = s[r][c];
+                        }
+                };
+                switch (n) {
+                    case 1: run(std::integral_constant<int, 1>{});
+                        break;
+                    case 2: run(std::integral_constant<int, 2>{});
+                        break;
+                    case 3: run(std::integral_constant<int, 3>{});
+                        break;
+                    default: run(std::integral_constant<int, 4>{});
+                        break;
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
 // value i of a q8_1 row set (the warp holds block i / 32, lane = i % 32)
 __dpct_inline__ void q8_1_store(const float xi, block_q8_1 *__restrict__ y,
@@ -2740,7 +3359,35 @@ inline void dq_q2_0(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     for (int j = 0; j < 8; ++j) {
         const int i = part * 8 + j;
         const int code = (x[b].qs[i / 4] >> ((i % 4) * 2)) & 3;
+<<<<<<< sycl
         v[j] = d * (float) (code - 1);
+||||||| base
+#if defined(__HIPCC__) && ((defined(__gfx1012__) && HIP_VERSION_MAJOR < 7) || defined(__gfx1151__) || \
+    defined(__gfx1200__) || defined(__gfx1201__))
+        // HIP 5.7 on RDNA1, the HIP compiler on gfx1151 (PR #895, ROCm 7.13) and on RDNA4 gfx1200/gfx1201 (ROCm
+        // 7.10, #1474) fold the half path's negative scale times +0 to +0. Preserve the scale's sign, as the FP32/CPU paths do.
+        if constexpr (std::is_same_v<dst_t, __half>) {
+            if (code == 1) {
+                yy[b * 64 + i] = __ushort_as_half(__half_as_ushort(x[b].d) & 0x8000u);
+                continue;
+            }
+        }
+#endif
+        yy[b * 64 + i] = cvt<dst_t>(d * (float) (code - 1));
+=======
+#if defined(__HIPCC__)
+        // HIP compilers fold the half path's negative scale times +0 to +0 (HIP 5.7 on gfx1012, gfx1151 on ROCm
+        // 7.13 - PR #895, gfx1200/gfx1201 on ROCm 7.10 - #1474); the gating arch list only ever chased the newest
+        // report (#1540).  Preserve the scale's sign, as the FP32/CPU paths do: value-identical where the fold never happens.
+        if constexpr (std::is_same_v<dst_t, __half>) {
+            if (code == 1) {
+                yy[b * 64 + i] = __ushort_as_half(__half_as_ushort(x[b].d) & 0x8000u);
+                continue;
+            }
+        }
+#endif
+        yy[b * 64 + i] = cvt<dst_t>(d * (float) (code - 1));
+>>>>>>> ours-now
     }
     store_run<dst_t, 8>(yy + b * 64 + part * 8, v);
 }
@@ -2976,6 +3623,65 @@ __dpct_inline__ void dequant_gu_kernel(
                             item_ct1.get_local_id(2));
 }
 
+// latent-experts branch: NVFP4 -> f16 with one thread per 16-value sub-block.  The generic path above runs one 32-thread block per 256 values and decodes the
+// sub-block's scale again for every value; nsys-timed on a 13.5K-token prompt, expert dequant was 29% of the prompt path.  Here a thread decodes its
+// scale once, reads the sub-block's 8 code bytes as two 4-byte words (a block is 36 bytes: 4-byte aligned), and writes its 16 values as two 16-byte
+// stores.  The scale (the tail: s_gate / s_up / s_down) is folded in before the one f16 rounding (the generic path rounds twice).
+__dpct_inline__ void nvfp4_sub_to_f16(const block_nvfp4 *__restrict__ b, int s,
+                                      float tail, sycl::half *__restrict__ dst,
+                                      const int8_t *kvalues_fp4) {
+    const float sc = ue4m3_to_f32_half(b->d[s]) * tail;
+    const uint8_t* q = b->qs + s * 8;
+    const uint32_t w0 = *(const uint32_t*) q, w1 = *(const uint32_t*) (q + 4);
+    sycl::half v[16];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t byte_ = ((j < 4 ? w0 : w1) >> (8 * (j & 3))) & 0xFFu;
+        v[j] = sycl::vec<float, 1>((float)kvalues_fp4[byte_ & 0xF] * sc)
+                   .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+        v[j + 8] =
+            sycl::vec<float, 1>((float)kvalues_fp4[byte_ >> 4] * sc)
+                .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+    }
+    *(sycl::uint4 *)dst = *(const sycl::uint4 *)&v[0];
+    *(sycl::uint4 *)(dst + 8) = *(const sycl::uint4 *)&v[8];
+}
+__dpct_inline__ void
+nvfp4_dequant_sub_kernel(const block_nvfp4 *__restrict__ src, int64_t n_sub,
+                         sycl::half *__restrict__ dst,
+                         const float *__restrict__ scale,
+                         const int8_t *kvalues_fp4) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t t =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (t >= n_sub) return;
+    nvfp4_sub_to_f16(src + (t >> 2), (int)(t & 3),
+                     scale != nullptr ? *scale : 1.0f, dst + t * 16,
+                     kvalues_fp4);
+}
+// gate/up of one expert: the two matrices' sub-blocks -> the interleaved rows 2r + parity (as dequant_gu_kernel)
+__dpct_inline__ void nvfp4_dequant_gu_kernel(
+    const block_nvfp4 *__restrict__ gate, const block_nvfp4 *__restrict__ up,
+    int64_t n_sub, int64_t n_embd, sycl::half *__restrict__ y,
+    const float *__restrict__ tail, const int8_t *kvalues_fp4) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t t =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (t >= n_sub) return;
+    const int parity = item_ct1.get_group(1);
+    const int64_t per_row16 = n_embd / 16;
+    const int64_t r = t / per_row16, c16 = t % per_row16;
+    nvfp4_sub_to_f16((parity ? up : gate) + (t >> 2), (int)(t & 3),
+                     tail != nullptr ? (parity ? tail[1] : tail[0]) : 1.0f,
+                     y + (2 * r + parity) * n_embd + c16 * 16, kvalues_fp4);
+}
+static bool nvfp4_fast_dq() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DQ_NVFP4_FAST"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
@@ -3054,7 +3760,13 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                 class mmvq_multi_kernel_8df6c9, dpct_kernel_scalar<TY>,
+||||||| base
+                class mmvq_multi_kernel_a160cb, dpct_kernel_scalar<TY>,
+=======
+                class mmvq_multi_kernel_4d61c8, dpct_kernel_scalar<TY>,
+>>>>>>> ours-now
                 dpct_kernel_scalar<1>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3078,7 +3790,13 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                 class mmvq_multi_kernel_9c43f2, dpct_kernel_scalar<TY>,
+||||||| base
+                class mmvq_multi_kernel_787c0c, dpct_kernel_scalar<TY>,
+=======
+                class mmvq_multi_kernel_4cc7dc, dpct_kernel_scalar<TY>,
+>>>>>>> ours-now
                 dpct_kernel_scalar<2>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3102,7 +3820,13 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                 class mmvq_multi_kernel_f8d14a, dpct_kernel_scalar<TY>,
+||||||| base
+                class mmvq_multi_kernel_afc13b, dpct_kernel_scalar<TY>,
+=======
+                class mmvq_multi_kernel_a8ae5b, dpct_kernel_scalar<TY>,
+>>>>>>> ours-now
                 dpct_kernel_scalar<3>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3126,7 +3850,13 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                 class mmvq_multi_kernel_88cd9a, dpct_kernel_scalar<TY>,
+||||||| base
+                class mmvq_multi_kernel_43e16d, dpct_kernel_scalar<TY>,
+=======
+                class mmvq_multi_kernel_42a9a0, dpct_kernel_scalar<TY>,
+>>>>>>> ours-now
                 dpct_kernel_scalar<4>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3150,7 +3880,13 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                 class mmvq_multi_kernel_d55b02, dpct_kernel_scalar<TY>,
+||||||| base
+                class mmvq_multi_kernel_a6b556, dpct_kernel_scalar<TY>,
+=======
+                class mmvq_multi_kernel_cc4971, dpct_kernel_scalar<TY>,
+>>>>>>> ours-now
                 dpct_kernel_scalar<5>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3174,7 +3910,13 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                 class mmvq_multi_kernel_3404b2, dpct_kernel_scalar<TY>,
+||||||| base
+                class mmvq_multi_kernel_65865a, dpct_kernel_scalar<TY>,
+=======
+                class mmvq_multi_kernel_bf1311, dpct_kernel_scalar<TY>,
+>>>>>>> ours-now
                 dpct_kernel_scalar<6>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3200,7 +3942,13 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
             s->submit([&](sycl::handler &cgh) {
 
                 cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                     class mmvq_multi_kernel_1f7e16, dpct_kernel_scalar<TY>,
+||||||| base
+                    class mmvq_multi_kernel_2def0c, dpct_kernel_scalar<TY>,
+=======
+                    class mmvq_multi_kernel_3cff98, dpct_kernel_scalar<TY>,
+>>>>>>> ours-now
                     dpct_kernel_scalar<1>, dpct_kernel_scalar<STAGE_GRID>,
                     dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3225,7 +3973,13 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
             s->submit([&](sycl::handler &cgh) {
 
                 cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                     class mmvq_multi_kernel_95b544, dpct_kernel_scalar<TY>,
+||||||| base
+                    class mmvq_multi_kernel_f8c4bf, dpct_kernel_scalar<TY>,
+=======
+                    class mmvq_multi_kernel_886005, dpct_kernel_scalar<TY>,
+>>>>>>> ours-now
                     dpct_kernel_scalar<8>, dpct_kernel_scalar<STAGE_GRID>,
                     dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3256,7 +4010,13 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
 
         s->submit([&](sycl::handler &cgh) {
 
+<<<<<<< sycl
             cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_c04bb8,
+||||||| base
+            cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_6582ba,
+=======
+            cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_8bd4fa,
+>>>>>>> ours-now
                                               dpct_kernel_scalar<TY>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
                 [=](sycl::nd_item<3> item_ct1)
@@ -3277,7 +4037,13 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
 
         s->submit([&](sycl::handler &cgh) {
 
+<<<<<<< sycl
             cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_18057f,
+||||||| base
+            cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_6e56ca,
+=======
+            cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_713119,
+>>>>>>> ours-now
                                               dpct_kernel_scalar<TY>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
                 [=](sycl::nd_item<3> item_ct1)
@@ -3476,9 +4242,8 @@ auto &s_grid = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         int off[GRP_NC];
         if constexpr (LX) {
             /*
-            DPCT1118: SYCL group functions and algorithms must be
-            encountered in converged control flow. You may need to adjust the
-            code.
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
             */
             /*
             DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -3596,9 +4361,8 @@ auto &s_h = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         int off[GRP_NC];
         if constexpr (LX) {
             /*
-            DPCT1118: SYCL group functions and algorithms must be
-            encountered in converged control flow. You may need to adjust the
-            code.
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
             */
             /*
             DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -3611,9 +4375,8 @@ auto &s_h = *sycl::ext::oneapi::group_local_memory_for_overwrite<
                 memcpy(&s_h[c * S26_HMAX + j], &hq[(size_t) (e + c) * hb + j], sizeof(s_h[0]));
             }
             /*
-            DPCT1118: SYCL group functions and algorithms must be
-            encountered in converged control flow. You may need to adjust the
-            code.
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
             */
             /*
             DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -3800,7 +4563,13 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
         s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_a7b554>>(
+||||||| base
+        s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_d83dc3>>(
+=======
+        s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_449250>>(
+>>>>>>> ours-now
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -3829,7 +4598,13 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class quantize_q8_1_kernel_6b0f01>>(
+||||||| base
+                dpct_kernel_name<class quantize_q8_1_kernel_787836>>(
+=======
+                dpct_kernel_name<class quantize_q8_1_kernel_891386>>(
+>>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -4037,9 +4812,8 @@ __dpct_inline__ void s27_gu_kernel(
         int off[GRP_NC];
         if constexpr (LX) {
             /*
-            DPCT1118: SYCL group functions and algorithms must be
-            encountered in converged control flow. You may need to adjust the
-            code.
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
             */
             /*
             DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -4056,9 +4830,8 @@ __dpct_inline__ void s27_gu_kernel(
                 off[c] = sycl::min(c, n - 1) * S26_XMAX;
             xbase = s_x;
             /*
-            DPCT1118: SYCL group functions and algorithms must be
-            encountered in converged control flow. You may need to adjust the
-            code.
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
             */
             /*
             DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -4152,9 +4925,8 @@ __dpct_inline__ void s27_down_kernel(
         int off[GRP_NC];
         if constexpr (LX) {
             /*
-            DPCT1118: SYCL group functions and algorithms must be
-            encountered in converged control flow. You may need to adjust the
-            code.
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
             */
             /*
             DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -4167,9 +4939,8 @@ __dpct_inline__ void s27_down_kernel(
                 memcpy(&s_h[c * S26_HMAX + j], &hq[(size_t) (e + c) * hb + j], sizeof(s_h[0]));
             }
             /*
-            DPCT1118: SYCL group functions and algorithms must be
-            encountered in converged control flow. You may need to adjust the
-            code.
+            DPCT1118: SYCL group functions and algorithms must be encountered
+            in converged control flow. You may need to adjust the code.
             */
             /*
             DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -4258,7 +5029,13 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
         s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_a7f255>>(
+||||||| base
+        s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_d2dc7d>>(
+=======
+        s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_e607b0>>(
+>>>>>>> ours-now
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -4296,8 +5073,283 @@ void s27_launch_ts(bool ts, const NativeExpertLayout &L, int64_t cap_groups,
     else s27_launch<TG, TD, true, 4, 4, false>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
 }
 
+<<<<<<< sycl
 #endif
+||||||| base
+template <int TG>
+void launch_gu(dpct::dim3 grid, dpct::queue_ptr s,
+               const unsigned long long *grp_ptr, const int32_t *grp_start,
+               const int32_t *n_groups, const int32_t *ent_tok,
+               const block_q8_1 *X, const NativeExpertLayout &L, float *gate,
+               float *up) {
+    if constexpr (!kSplit<TG>) {
 
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        s->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for<dpct_kernel_name<class native_gu_kernel_ba173f,
+                                              dpct_kernel_scalar<TG>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_gu_kernel<TG>(grp_ptr, grp_start, n_groups,
+                                             ent_tok, X, L, gate, up);
+                    });
+        });
+    } else if (g_old_kernels) {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        s->submit([&](sycl::handler &cgh) {
+=======
+// ---- EXPDEC launch: knobs, shapes, rows per block
+int env_int_or(const char* name, int dflt) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' ? std::atoi(v) : dflt;
+}
+int g_expdec = env_on("STRATA_EXPDEC") ? 1 : 0;
+int g_expdec_r = env_int_or("STRATA_EXPDEC_R", 1);          // gate/up rows per lane: 1, 2 (bench: R=1 wins on the 2080 Ti)
+int g_expdec_dr = env_int_or("STRATA_EXPDEC_DR", 4);        // down rows per lane: 1, 2, 4 (Q2_0: R=4 wins on both cards)
+int g_expdec_minb = env_int_or("STRATA_EXPDEC_MINB", STRATA_EXPDEC_MINB);   // gate/up __launch_bounds__ min blocks: 2 (<= 128 regs) or 4 (<= 64)
+int g_expdec_d20 = env_int_or("STRATA_EXPDEC_D20", 0);      // 1: EXPDEC also for the IQ4_NL down (bench: no gain, default kernel)
+// 1: EXPDEC for the down too (Q2_0; IQ4_NL with _D20).  Default 0: in the engine (nsys of a 131k decode) the Q2_0 down
+// with EXPDEC was ~10% slower than the default kernel although the bench alone had it at 0.78, so by default EXPDEC
+// takes the gate/up only (-20/-23% at T >= 2 on an RTX 2080 Ti in the engine).
+int g_expdec_down = env_int_or("STRATA_EXPDEC_DOWN", 0);
+int g_expdec_rb = env_int_or("STRATA_EXPDEC_RB", 0);        // gate/up rows per block (0 = auto)
+int g_expdec_drb = env_int_or("STRATA_EXPDEC_DRB", 0);      // down rows per block (0 = auto)
+int g_expdec_minblk = env_int_or("STRATA_EXPDEC_MINBLK", 800);   // auto: the most rows per block that keep this many blocks
+int expdec_r() { return g_expdec_r == 2 ? 2 : 1; }
+int expdec_dr() { return g_expdec_dr == 1 || g_expdec_dr == 2 ? g_expdec_dr : 4; }
+
+bool expdec_gu_ok(const NativeExpertLayout& L) {
+    const bool fmt = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22;
+    return fmt && L.n_embd == 32 * ED_XB && L.n_ff % 64 == 0 && L.n_ff > 0;
+}
+bool expdec_down_ok(const NativeExpertLayout& L) {
+    return g_expdec_down && ((L.d_type == 20 && g_expdec_d20) || L.d_type == 42) && L.n_ff == 32 * ED_HB && L.n_embd % 128 == 0 &&
+           L.n_embd > 0;
+}
+// rows per block: `knob` rounded up to the rows per pass, or (0) doubled from one pass while ceil(nrow / rb) x
+// cap_groups blocks stay >= g_expdec_minblk (cap_groups: the launch's group rows; every block row g >= n_groups returns)
+int expdec_rows_per_block(int nrow, int rpp, int64_t cap_groups, int knob) {
+    if (knob > 0) {
+        int rb = (knob + rpp - 1) / rpp * rpp;
+        return rb > nrow ? nrow : rb;
+    }
+    int rb = rpp;
+    const int64_t cap = cap_groups > 0 ? cap_groups : 1;
+    while (rb * 2 <= nrow && ((int64_t) ((nrow + 2 * rb - 1) / (2 * rb))) * cap >= g_expdec_minblk) rb *= 2;
+    return rb;
+}
+
+template <int TG, int R, int MINB>
+void expdec_gu_r(int64_t gy, int64_t cap_groups, dpct::queue_ptr s,
+                 const unsigned long long *grp_ptr, const int32_t *grp_start,
+                 const int32_t *n_groups, const int32_t *ent_tok,
+                 const block_q8_1 *X, const NativeExpertLayout &L, float *gate,
+                 float *up) {
+    const int nrow = 2 * (int) L.n_ff;
+    const int rb = expdec_rows_per_block(nrow, 16 * R, cap_groups, g_expdec_rb);
+    const dpct::dim3 grid((unsigned)((nrow + rb - 1) / rb), (unsigned)gy);
+    {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+        s->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for<dpct_kernel_name<
+                class expdec_gu_kernel_641ff5, dpct_kernel_scalar<TG>,
+                dpct_kernel_scalar<R>, dpct_kernel_scalar<MINB>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        expdec_gu_kernel<TG, R, MINB>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, gate,
+                            up, rb);
+                    });
+        });
+    }
+}
+template <int TG>
+void expdec_gu_t(int64_t gy, int64_t cap_groups, dpct::queue_ptr s,
+                 const unsigned long long *grp_ptr, const int32_t *grp_start,
+                 const int32_t *n_groups, const int32_t *ent_tok,
+                 const block_q8_1 *X, const NativeExpertLayout &L, float *gate,
+                 float *up) {
+    const bool b4 = g_expdec_minb >= 4;
+    if (expdec_r() == 2) {
+        if (b4) expdec_gu_r<TG, 2, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else expdec_gu_r<TG, 2, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    } else {
+        if (b4) expdec_gu_r<TG, 1, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else expdec_gu_r<TG, 1, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    }
+}
+// One line on stderr per (role, format, taken or not), the first time STRATA_EXPDEC=1 meets it: the proof in the
+// engine's log that the EXPDEC kernels are the ones launched (or captured into the window's graph), with the
+// choices in force.
+void expdec_note(const NativeExpertLayout &L, bool gu, bool taken,
+                 dpct::queue_ptr s, int64_t gy, int64_t cap_groups) {
+    static bool seen[2][64][2] = {};
+    const int ty = gu ? L.gu_type : L.d_type;
+    if (ty < 0 || ty >= 64 || seen[gu ? 0 : 1][ty][taken ? 1 : 0]) return;
+    seen[gu ? 0 : 1][ty][taken ? 1 : 0] = true;
+    sycl::ext::oneapi::experimental::queue_state cs =
+        sycl::ext::oneapi::experimental::queue_state::executing;
+    cs = s->ext_oneapi_get_state();
+    int dev = -1;
+    dev = dpct::get_current_device_id();
+    if (!taken) {
+        std::fprintf(stderr, "strata expdec: CUDA%d %s type %d (n_embd %lld, n_ff %lld) not covered: the default kernel runs\n", dev,
+                     gu ? "gate/up" : "down", ty, (long long) L.n_embd, (long long) L.n_ff);
+        return;
+    }
+    if (gu) {
+        const int R = expdec_r(), rb = expdec_rows_per_block(2 * (int) L.n_ff, 16 * R, cap_groups, g_expdec_rb);
+        std::fprintf(
+            stderr,
+            "strata expdec: CUDA%d gate/up type %d: expdec_gu_kernel R %d MINB "
+            "%d, %d rows per block, grid %d x %lld "
+            "(cap %lld groups)%s\n",
+            dev, ty, R, g_expdec_minb >= 4 ? 4 : 2, rb,
+            (2 * (int)L.n_ff + rb - 1) / rb, (long long)gy,
+            (long long)cap_groups,
+            cs != sycl::ext::oneapi::experimental::queue_state::executing
+                ? ", captured into a graph"
+                : "");
+    } else {
+        const int R = expdec_dr(), lanes = ty == 20 ? 8 : 16;
+        const int rb = expdec_rows_per_block((int) L.n_embd, (256 / lanes) * R, cap_groups, g_expdec_drb);
+        std::fprintf(
+            stderr,
+            "strata expdec: CUDA%d down type %d: expdec_down_kernel R %d, %d "
+            "rows per block, grid %d x %lld "
+            "(cap %lld groups)%s\n",
+            dev, ty, R, rb, ((int)L.n_embd + rb - 1) / rb, (long long)gy,
+            (long long)cap_groups,
+            cs != sycl::ext::oneapi::experimental::queue_state::executing
+                ? ", captured into a graph"
+                : "");
+    }
+}
+
+// false: EXPDEC is off or does not take this layout (the caller launches the default kernels)
+bool expdec_gu(const NativeExpertLayout &L, int64_t gy, int64_t cap_groups,
+               dpct::queue_ptr s, const unsigned long long *grp_ptr,
+               const int32_t *grp_start, const int32_t *n_groups,
+               const int32_t *ent_tok, const block_q8_1 *X, float *gate,
+               float *up) {
+    if (!g_expdec || g_old_kernels) return false;
+    if (!expdec_gu_ok(L)) { expdec_note(L, true, false, s, gy, cap_groups); return false; }
+    expdec_note(L, true, true, s, gy, cap_groups);
+    switch (L.gu_type) {
+        case 16: expdec_gu_t<16>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 17: expdec_gu_t<17>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 18: expdec_gu_t<18>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 21: expdec_gu_t<21>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        default: expdec_gu_t<22>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+    }
+    return true;
+}
+template <int TD, int R>
+void expdec_down_r(int64_t gy, int64_t cap_groups, dpct::queue_ptr s,
+                   const unsigned long long *grp_ptr, const int32_t *grp_start,
+                   const int32_t *n_groups, const int32_t *ent_dst,
+                   const block_q8_1 *hq, const NativeExpertLayout &L,
+                   float *out) {
+    constexpr int LANES = TD == 20 ? 8 : 16;
+    const int nrow = (int) L.n_embd;
+    const int rb = expdec_rows_per_block(nrow, (256 / LANES) * R, cap_groups, g_expdec_drb);
+    const dpct::dim3 grid((unsigned)((nrow + rb - 1) / rb), (unsigned)gy);
+    {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+        s->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for<dpct_kernel_name<class expdec_down_kernel_a6d243,
+                                              dpct_kernel_scalar<TD>,
+                                              dpct_kernel_scalar<R>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        expdec_down_kernel<TD, R>(grp_ptr, grp_start, n_groups,
+                                                  ent_dst, hq, L, out, rb);
+                    });
+        });
+    }
+}
+template <int TD>
+void expdec_down_t(int64_t gy, int64_t cap_groups, dpct::queue_ptr s,
+                   const unsigned long long *grp_ptr, const int32_t *grp_start,
+                   const int32_t *n_groups, const int32_t *ent_dst,
+                   const block_q8_1 *hq, const NativeExpertLayout &L,
+                   float *out) {
+    switch (expdec_dr()) {
+        case 1: expdec_down_r<TD, 1>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 2: expdec_down_r<TD, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        default: expdec_down_r<TD, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+    }
+}
+bool expdec_down(const NativeExpertLayout &L, int64_t gy, int64_t cap_groups,
+                 dpct::queue_ptr s, const unsigned long long *grp_ptr,
+                 const int32_t *grp_start, const int32_t *n_groups,
+                 const int32_t *ent_dst, const block_q8_1 *hq, float *out) {
+    if (!g_expdec || g_old_kernels) return false;
+    if (!expdec_down_ok(L)) { expdec_note(L, false, false, s, gy, cap_groups); return false; }
+    expdec_note(L, false, true, s, gy, cap_groups);
+    if (L.d_type == 20) expdec_down_t<20>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else expdec_down_t<42>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    return true;
+}
+
+template <int TG>
+void launch_gu(dpct::dim3 grid, dpct::queue_ptr s,
+               const unsigned long long *grp_ptr, const int32_t *grp_start,
+               const int32_t *n_groups, const int32_t *ent_tok,
+               const block_q8_1 *X, const NativeExpertLayout &L, float *gate,
+               float *up) {
+    if constexpr (!kSplit<TG>) {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        s->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for<dpct_kernel_name<class native_gu_kernel_5aff08,
+                                              dpct_kernel_scalar<TG>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_gu_kernel<TG>(grp_ptr, grp_start, n_groups,
+                                             ent_tok, X, L, gate, up);
+                    });
+        });
+    } else if (g_old_kernels) {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        s->submit([&](sycl::handler &cgh) {
+>>>>>>> ours-now
+
+<<<<<<< sycl
 // SYCL port: lanes per row of the port's grouped expert kernels at run time (STRATA_GU_LANES / STRATA_DOWN_LANES:
 // 4, 8, 16 or 32; default STRATA_EXPERT_LANES), 256 / lanes rows per work-group. Gate/up rows are 80 dot calls
 // (2560 wide), the IQ4_NL down rows 40 (640 wide), so the best split can differ by role.
@@ -4323,7 +5375,31 @@ void launch_gu_port(unsigned groups, dpct::queue_ptr s, const unsigned long long
         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
             native_gu_kernel<TG, LN, KM>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+||||||| base
+            cgh.parallel_for<dpct_kernel_name<class native_gu_kernel_2b5ee0,
+                                              dpct_kernel_scalar<TG>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_gu_kernel<TG>(grp_ptr, grp_start, n_groups,
+                                             ent_tok, X, L, gate, up);
+                    });
+=======
+            cgh.parallel_for<dpct_kernel_name<class native_gu_kernel_40d111,
+                                              dpct_kernel_scalar<TG>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_gu_kernel<TG>(grp_ptr, grp_start, n_groups,
+                                             ent_tok, X, L, gate, up);
+                    });
+>>>>>>> ours-now
         });
+<<<<<<< sycl
 }
 // STRATA_KQ_SPLIT=0 (or native_expert_set_kq_split(false)): the K-quant / Q5_1 / Q8_0 lane kernels without the
 // multi-entry split (one weight read per entry, as before); the outputs are the same bits either way
@@ -4346,8 +5422,272 @@ void launch_gu_lanes(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long lon
         case 16: gu_port_km<TG, 16>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 32: gu_port_km<TG, 32>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         default: gu_port_km<TG, 8>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+||||||| base
+    } else if constexpr (kStageIqGrid<TG>) {
+        if (!g_stage_grid) {
+            if (g_no_sub16_gu) {
+
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                s->submit([&](sycl::handler &cgh) {
+
+                    cgh.parallel_for<dpct_kernel_name<
+                        class native_gu_multi_kernel_9af59a,
+                        dpct_kernel_scalar<TG>, dpct_kernel_scalar<false>,
+                        dpct_kernel_scalar<false>>>(
+                        sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                          sycl::range(1, 1, 256)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                native_gu_multi_kernel<TG, false, false>(
+                                    grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                    gate, up);
+                            });
+                });
+            } else {
+
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                s->submit([&](sycl::handler &cgh) {
+
+                    cgh.parallel_for<dpct_kernel_name<
+                        class native_gu_multi_kernel_be3a48,
+                        dpct_kernel_scalar<TG>, dpct_kernel_scalar<false>,
+                        dpct_kernel_scalar<true>>>(
+                        sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                          sycl::range(1, 1, 256)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                native_gu_multi_kernel<TG, false, true>(
+                                    grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                    gate, up);
+                            });
+                });
+            }
+            return;
+        }
+        if (g_no_sub16_gu) {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_gu_multi_kernel_fbd4c1, dpct_kernel_scalar<TG>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<false>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_gu_multi_kernel<TG, true, false>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            });
+        } else {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_gu_multi_kernel_ece268, dpct_kernel_scalar<TG>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_gu_multi_kernel<TG, true, true>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            });
+        }
+    } else {
+        if (g_no_sub16_gu) {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_gu_multi_kernel_b42aae, dpct_kernel_scalar<TG>,
+                    dpct_kernel_scalar<false>, dpct_kernel_scalar<false>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_gu_multi_kernel<TG, false, false>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            });
+        } else {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_gu_multi_kernel_b3479d, dpct_kernel_scalar<TG>,
+                    dpct_kernel_scalar<false>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_gu_multi_kernel<TG, false, true>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            });
+        }
+=======
+    } else if constexpr (kStageIqGrid<TG>) {
+        if (!g_stage_grid) {
+            if (g_no_sub16_gu) {
+
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                s->submit([&](sycl::handler &cgh) {
+
+                    cgh.parallel_for<dpct_kernel_name<
+                        class native_gu_multi_kernel_990887,
+                        dpct_kernel_scalar<TG>, dpct_kernel_scalar<false>,
+                        dpct_kernel_scalar<false>>>(
+                        sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                          sycl::range(1, 1, 256)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                native_gu_multi_kernel<TG, false, false>(
+                                    grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                    gate, up);
+                            });
+                });
+            } else {
+
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                s->submit([&](sycl::handler &cgh) {
+
+                    cgh.parallel_for<dpct_kernel_name<
+                        class native_gu_multi_kernel_e561b8,
+                        dpct_kernel_scalar<TG>, dpct_kernel_scalar<false>,
+                        dpct_kernel_scalar<true>>>(
+                        sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                          sycl::range(1, 1, 256)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                native_gu_multi_kernel<TG, false, true>(
+                                    grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                    gate, up);
+                            });
+                });
+            }
+            return;
+        }
+        if (g_no_sub16_gu) {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_gu_multi_kernel_40e115, dpct_kernel_scalar<TG>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<false>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_gu_multi_kernel<TG, true, false>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            });
+        } else {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_gu_multi_kernel_aa1487, dpct_kernel_scalar<TG>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_gu_multi_kernel<TG, true, true>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            });
+        }
+    } else {
+        if (g_no_sub16_gu) {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_gu_multi_kernel_a79af0, dpct_kernel_scalar<TG>,
+                    dpct_kernel_scalar<false>, dpct_kernel_scalar<false>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_gu_multi_kernel<TG, false, false>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            });
+        } else {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class native_gu_multi_kernel_399a30, dpct_kernel_scalar<TG>,
+                    dpct_kernel_scalar<false>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            native_gu_multi_kernel<TG, false, true>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            });
+        }
+>>>>>>> ours-now
     }
 }
+<<<<<<< sycl
 template <int TD, int LN, bool KM = true>
 void launch_down_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                       const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq,
@@ -4359,6 +5699,93 @@ void launch_down_port(unsigned groups, dpct::queue_ptr s, const unsigned long lo
         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
             native_down_kernel<TD, LN, KM>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+||||||| base
+
+template <int TD>
+void launch_down(dpct::dim3 grid, dpct::queue_ptr s,
+                 const unsigned long long *grp_ptr, const int32_t *grp_start,
+                 const int32_t *n_groups, const int32_t *ent_dst,
+                 const block_q8_1 *hq, const NativeExpertLayout &L,
+                 float *out) {
+    if constexpr (!kSplit<TD>) {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        s->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for<dpct_kernel_name<class native_down_kernel_b2e288,
+                                              dpct_kernel_scalar<TD>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_down_kernel<TD>(grp_ptr, grp_start, n_groups,
+                                               ent_dst, hq, L, out);
+                    });
+        });
+    } else if (g_old_kernels) {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        s->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for<dpct_kernel_name<class native_down_kernel_572ed1,
+                                              dpct_kernel_scalar<TD>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_down_kernel<TD>(grp_ptr, grp_start, n_groups,
+                                               ent_dst, hq, L, out);
+                    });
+=======
+
+template <int TD>
+void launch_down(dpct::dim3 grid, dpct::queue_ptr s,
+                 const unsigned long long *grp_ptr, const int32_t *grp_start,
+                 const int32_t *n_groups, const int32_t *ent_dst,
+                 const block_q8_1 *hq, const NativeExpertLayout &L,
+                 float *out) {
+    if constexpr (!kSplit<TD>) {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        s->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for<dpct_kernel_name<class native_down_kernel_94651f,
+                                              dpct_kernel_scalar<TD>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_down_kernel<TD>(grp_ptr, grp_start, n_groups,
+                                               ent_dst, hq, L, out);
+                    });
+        });
+    } else if (g_old_kernels) {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        s->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for<dpct_kernel_name<class native_down_kernel_237fc8,
+                                              dpct_kernel_scalar<TD>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_down_kernel<TD>(grp_ptr, grp_start, n_groups,
+                                               ent_dst, hq, L, out);
+                    });
+>>>>>>> ours-now
         });
 }
 template <int TD, int LN>
@@ -4382,6 +5809,7 @@ void launch_down_lanes(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long l
     }
 }
 
+<<<<<<< sycl
 // STRATA_EXPERT_SPLIT=1 (opt-in): upstream's multi-entry kernels, one warp per row, GU_ROWS rows a group, launched with
 // their own grid.  The sub-warp variants (SUB16 / SUB_DOWN) are not launched here: they are bitwise equal to the
 // generic path and need their own row counts; the port's lane kernels are the default for every format.
@@ -4396,6 +5824,33 @@ void launch_gu_multi(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long lon
         sycl::nd_range<3>(sycl::range<3>(1, g[1], g[2] * 256), sycl::range<3>(1, 1, 256)), exp_props,
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
             native_gu_multi_kernel<TG, STAGE_GRID, false>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+||||||| base
+            cgh.parallel_for<dpct_kernel_name<
+                class native_down_multi_kernel_d5db17, dpct_kernel_scalar<TD>,
+                dpct_kernel_scalar<false>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_down_multi_kernel<TD, false>(
+                            grp_ptr, grp_start, n_groups, ent_dst, hq, L, out,
+                            kvalues_fp4_ptr_ct1);
+                    });
+=======
+            cgh.parallel_for<dpct_kernel_name<
+                class native_down_multi_kernel_44c4e1, dpct_kernel_scalar<TD>,
+                dpct_kernel_scalar<false>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_down_multi_kernel<TD, false>(
+                            grp_ptr, grp_start, n_groups, ent_dst, hq, L, out,
+                            kvalues_fp4_ptr_ct1);
+                    });
+>>>>>>> ours-now
         });
 }
 
@@ -4420,6 +5875,7 @@ void launch_gu(dpct::dim3 grid, dpct::queue_ptr s,
     }
 }
 
+<<<<<<< sycl
 template <int TD>
 void launch_down_multi(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long long *grp_ptr,
                        const int32_t *grp_start, const int32_t *n_groups, const int32_t *ent_dst,
@@ -4430,6 +5886,33 @@ void launch_down_multi(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long l
         sycl::nd_range<3>(sycl::range<3>(1, grid.y, gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
             native_down_multi_kernel<TD, false>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+||||||| base
+            cgh.parallel_for<dpct_kernel_name<
+                class native_down_multi_kernel_c9221a, dpct_kernel_scalar<TD>,
+                dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_down_multi_kernel<TD, true>(
+                            grp_ptr, grp_start, n_groups, ent_dst, hq, L, out,
+                            kvalues_fp4_ptr_ct1);
+                    });
+=======
+            cgh.parallel_for<dpct_kernel_name<
+                class native_down_multi_kernel_b38eee, dpct_kernel_scalar<TD>,
+                dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        native_down_multi_kernel<TD, true>(
+                            grp_ptr, grp_start, n_groups, ent_dst, hq, L, out,
+                            kvalues_fp4_ptr_ct1);
+                    });
+>>>>>>> ours-now
         });
 }
 
@@ -4490,7 +5973,13 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
+<<<<<<< sycl
             ->parallel_for<dpct_kernel_name<class quantize_q8_1_kernel_422964>>(
+||||||| base
+            ->parallel_for<dpct_kernel_name<class quantize_q8_1_kernel_2a3537>>(
+=======
+            ->parallel_for<dpct_kernel_name<class quantize_q8_1_kernel_d38fc5>>(
+>>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((n + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -4605,8 +6094,15 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
+<<<<<<< sycl
     // scale: NVFP4's s_down (CUDA only; the SYCL port has no NVFP4 experts, so it is never given here)
     if (n % 256 != 0 || !is_iq(t) || scale != nullptr) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+||||||| base
+    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+=======
+    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (t == 40 && nvfp4_fast_dq())
+>>>>>>> ours-now
     {
 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
@@ -4618,8 +6114,39 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
 
+                auto n_ct1 = n / 16;
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class nvfp4_dequant_sub_kernel_71585d>>(
+                    sycl::nd_range<3>(
+                        sycl::range(1, 1, (unsigned)((n / 16 + 255) / 256)) *
+                            sycl::range(1, 1, 256),
+                        sycl::range(1, 1, 256)),
+                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        nvfp4_dequant_sub_kernel((const block_nvfp4 *)src,
+                                                 n_ct1, (sycl::half *)dst,
+                                                 scale, kvalues_fp4_ptr_ct1);
+                    });
+            });
+    } else {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp16});
+
+        strata::q_of(stream)
+            ->submit([&](sycl::handler &cgh) {
+
                 cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                     class dequant_flat_kernel_c7cec2, sycl::half>>(
+||||||| base
+                    class dequant_flat_kernel_5d43f5, sycl::half>>(
+=======
+                    class dequant_flat_kernel_5543bb, sycl::half>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(n / 256)) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -4690,7 +6217,13 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
             ->submit([&](sycl::handler &cgh) {
 
                 cgh.parallel_for<
+<<<<<<< sycl
                     dpct_kernel_name<class dequant_flat_kernel_9052bc, float>>(
+||||||| base
+                    dpct_kernel_name<class dequant_flat_kernel_4e87e3, float>>(
+=======
+                    dpct_kernel_name<class dequant_flat_kernel_a69719, float>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(n / 256)) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -4709,7 +6242,36 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     // (tail: NVFP4's per-expert scales, CUDA only - never given on SYCL)
     if (n_embd % 256 != 0 || !is_iq(t) || tail != nullptr) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
+    if (t == 40 && n_embd % 64 == 0 && nvfp4_fast_dq())
     {
+
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp16});
+
+        strata::q_of(stream)
+            ->submit([&](sycl::handler &cgh) {
+
+                auto n_ff_n_embd_ct2 = n_ff * (n_embd / 16);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class nvfp4_dequant_gu_kernel_8db5fb>>(
+                    sycl::nd_range<3>(
+                        sycl::range(
+                            1, 2,
+                            (unsigned)((n_ff * (n_embd / 16) + 255) / 256)) *
+                            sycl::range(1, 1, 256),
+                        sycl::range(1, 1, 256)),
+                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        nvfp4_dequant_gu_kernel(
+                            (const block_nvfp4 *)gate, (const block_nvfp4 *)up,
+                            n_ff_n_embd_ct2, n_embd, (sycl::half *)dst, tail,
+                            kvalues_fp4_ptr_ct1);
+                    });
+            });
+    } else {
 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
@@ -5344,11 +6906,99 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
 
 int g_exp_mode = -1;   // native_expert_set_mode (the bench); -1 = STRATA_EXP_MODE, default 7
 int exp_mode() {
+<<<<<<< sycl
     static const int m = [] { const char* v = std::getenv("STRATA_EXP_MODE"); return v ? std::atoi(v) : 7; }();
     return g_exp_mode >= 0 ? g_exp_mode : m;
+||||||| base
+    static const int m = [] { const char* v = std::getenv("STRATA_EXP_MODE"); return v ? std::atoi(v) : -1; }();
+    if (g_exp_mode >= 0) return g_exp_mode;
+    if (m >= 0) return m;
+#if defined(STRATA_HIP_GFX906)
+    return kExpModeDefault;
+#else
+    // Volta (sm_70): mode 8, the grid and the group's activations in shared memory with SwiGLU + q8_1 fused
+    // (V100-SXM2, a verify window's VRAM call: 227 -> 159 us); every other CUDA card keeps the CUDA layout
+    static int per_dev[64];   // 0 unknown, else mode + 1
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 64) return kExpModeDefault;
+    if (!per_dev[dev]) {
+        int major = 0, minor = 0;
+        major = dpct::get_device(dev).get_major_version();
+        minor = dpct::get_device(dev).get_minor_version();
+        const char* sm70 = std::getenv("STRATA_SM70_TABLE");   // PR 1401: Volta's mode 8 is opt-in until confirmed on a V100
+        // Pascal GP100 (sm_60): mode 8 too, on by default (Tesla P100: bitwise equal on the model's layers, the down
+        // projection 116 -> 94 us and IQ3_S gate/up 360 -> 229 us in a 28-group VRAM call); STRATA_SM60_TABLE=0 keeps the CUDA layout
+        const char* sm60 = std::getenv("STRATA_SM60_TABLE");
+        const bool p100 = major == 6 && minor == 0 && (sm60 == nullptr || std::atoi(sm60) != 0);
+        // Pascal with dp4a (sm_61): mode 8 as well, on by default (Tesla P40, native_expert_bench on the IQ3_S pack's
+        // layers, an 18-group call at 2 tokens: IQ3_S 390 -> 255 us, IQ3_XXS 345 -> 252 us, IQ2_S 290 -> 238 us,
+        // IQ4_XS 328 -> 261 us, bitwise equal); STRATA_SM61_TABLE=0 keeps the CUDA layout
+        const char* sm61 = std::getenv("STRATA_SM61_TABLE");
+        const bool p40 = major == 6 && minor == 1 && (sm61 == nullptr || std::atoi(sm61) != 0);
+        per_dev[dev] = 1 + ((major == 7 && minor == 0 && sm70 != nullptr && std::atoi(sm70) != 0) || p100 || p40 ? 8 : kExpModeDefault);
+    }
+    return per_dev[dev] - 1;
+#endif
+=======
+    static const int m = [] { const char* v = std::getenv("STRATA_EXP_MODE"); return v ? std::atoi(v) : -1; }();
+    if (g_exp_mode >= 0) return g_exp_mode;
+    if (m >= 0) return m;
+#if defined(STRATA_HIP_GFX906)
+    return kExpModeDefault;
+#else
+    // Volta (sm_70): mode 8, the grid and the group's activations in shared memory with SwiGLU + q8_1 fused
+    // (V100-SXM2, a verify window's VRAM call: 227 -> 159 us); every other CUDA card keeps the CUDA layout
+    static int per_dev[64];   // 0 unknown, else mode + 1
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 64) return kExpModeDefault;
+    if (!per_dev[dev]) {
+        int major = 0, minor = 0;
+        major = dpct::get_device(dev).get_major_version();
+        minor = dpct::get_device(dev).get_minor_version();
+        const char* sm70 = std::getenv("STRATA_SM70_TABLE");   // PR 1401: Volta's mode 8 is opt-in until confirmed on a V100
+        // Pascal GP100 (sm_60): mode 8 too, on by default (Tesla P100: bitwise equal on the model's layers, the down
+        // projection 116 -> 94 us and IQ3_S gate/up 360 -> 229 us in a 28-group VRAM call); STRATA_SM60_TABLE=0 keeps the CUDA layout
+        const char* sm60 = std::getenv("STRATA_SM60_TABLE");
+        const bool p100 = major == 6 && minor == 0 && (sm60 == nullptr || std::atoi(sm60) != 0);
+        // Pascal with dp4a (sm_61): mode 8 as well, on by default (Tesla P40, native_expert_bench on the IQ3_S pack's
+        // layers, an 18-group call at 2 tokens: IQ3_S 390 -> 255 us, IQ3_XXS 345 -> 252 us, IQ2_S 290 -> 238 us,
+        // IQ4_XS 328 -> 261 us, bitwise equal); STRATA_SM61_TABLE=0 keeps the CUDA layout
+        const char* sm61 = std::getenv("STRATA_SM61_TABLE");
+        const bool p40 = major == 6 && minor == 1 && (sm61 == nullptr || std::atoi(sm61) != 0);
+        // Turing (sm_75): mode 4 (native_expert_bench, real Q2_0 rows of Flash-Next, bitwise equal to mode 0 on an RTX
+        // 2080 Ti: 10 experts x 1 entry 47.3 -> 41.4 us, 30 x 1 120.2 -> 100.2 us); the down projection keeps the CUDA
+        // layout in windows of 4+ tokens (sm75_down_em below).  STRATA_SM75_EXP=0 keeps the CUDA layout.
+        // (off unless STRATA_SM75_PERF=1; STRATA_SM75_EXP=0 / 1 forces it off / on)
+        const bool turing = strata::sm75_switch("STRATA_SM75_EXP", major, minor);
+        per_dev[dev] = 1 + ((major == 7 && minor == 0 && sm70 != nullptr && std::atoi(sm70) != 0) || p100 || p40 ? 8 : turing ? 4 : kExpModeDefault);
+    }
+    return per_dev[dev] - 1;
+#endif
+>>>>>>> ours-now
 }
 #endif
 int g_exp_phase = 0;   // the bench: 0 all, 1 gate/up + swiglu + quantize only, 2 down only
+#if STRATA_EXP_LAYOUTS && !defined(__HIPCC__)
+// The down projection's mode on Turing's default: mode 4 is slower than the CUDA layout once groups have 3+ entries
+// (12 x 3: 36.5 -> 40.8 us, 16 x 4: 56.9 -> 68.9) - windows of 4+ tokens (cap_groups > 30) keep mode 0 there.
+int sm75_down_em(int em0, int64_t cap_groups) try {
+    if (em0 != 4 || g_exp_mode >= 0 || std::getenv("STRATA_EXP_MODE") != nullptr || cap_groups <= 30) return em0;
+    int dev = 0, major = 0, minor = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0) return em0;
+    major = dpct::get_device(dev).get_major_version();
+    minor = dpct::get_device(dev).get_minor_version();
+    return strata::is_sm75(major, minor) ? 0 : em0;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+#else
+int sm75_down_em(int em0, int64_t) { return em0; }
+#endif
 
 void native_expert_set_mode(int mode, int phase) {
 #if defined(STRATA_HIP_GFX906)
@@ -5364,6 +7014,36 @@ bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+
+void native_expert_set_expdec(int on) { g_expdec = on ? 1 : 0; }
+int native_expert_expdec() { return g_expdec; }
+void native_expert_set_expdec_params(const NativeExpertExpdecParams& p) {
+    if (p.gu_rows_per_lane > 0) g_expdec_r = p.gu_rows_per_lane;
+    if (p.down_rows_per_lane > 0) g_expdec_dr = p.down_rows_per_lane;
+    if (p.gu_min_blocks_per_sm > 0) g_expdec_minb = p.gu_min_blocks_per_sm;
+    if (p.down_iq4_nl >= 0) g_expdec_d20 = p.down_iq4_nl;
+    if (p.down >= 0) g_expdec_down = p.down;
+    if (p.gu_rows_per_block >= 0) g_expdec_rb = p.gu_rows_per_block;
+    if (p.down_rows_per_block >= 0) g_expdec_drb = p.down_rows_per_block;
+    if (p.min_blocks > 0) g_expdec_minblk = p.min_blocks;
+}
+NativeExpertExpdecParams native_expert_expdec_params() {
+    NativeExpertExpdecParams p;
+    p.gu_rows_per_lane = expdec_r();
+    p.down_rows_per_lane = expdec_dr();
+    p.gu_min_blocks_per_sm = g_expdec_minb >= 4 ? 4 : 2;
+    p.down_iq4_nl = g_expdec_d20 ? 1 : 0;
+    p.down = g_expdec_down ? 1 : 0;
+    p.gu_rows_per_block = g_expdec_rb;
+    p.down_rows_per_block = g_expdec_drb;
+    p.min_blocks = g_expdec_minblk;
+    return p;
+}
+bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& down) {
+    gu = expdec_gu_ok(L);
+    down = expdec_down_ok(L);
+    return gu || down;
+}
 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
@@ -5386,7 +7066,105 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             std::fprintf(stderr, "note: STRATA_EXPERT_V2 / STRATA_EXPERT_V2K are AMD-only experiments, ignored on SYCL\n");
         return true;
     }();
+<<<<<<< sycl
     (void) v2_note;
+||||||| base
+    if (v2k && (L.gu_type == 12 || L.gu_type == 13) && (L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 &&
+        L.n_ff == 640) {
+        static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+        const long long nh = (long long) cap_entries * L.n_ff;
+#define STRATA_V2K(G, D) s27_launch_ts<G, D>(ts, L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh)
+        if (L.gu_type == 12 && L.d_type == 7) STRATA_V2K(12, 7);
+        else if (L.gu_type == 12) STRATA_V2K(12, 8);
+        else if (L.d_type == 7) STRATA_V2K(13, 7);
+        else STRATA_V2K(13, 8);
+#undef STRATA_V2K
+        check("native_expert_grouped (v2k)");
+        return;
+    }
+=======
+    // Qwen3.6-35B-A3B (n_embd 2048, n_ff 512, Q4_K / Q5_K gate+up, Q5_K down): the same kernels, the geometry only sizes the grid
+    const bool q36geo = L.n_embd == 2048 && L.n_ff == 512 && L.d_type == 13;
+    if (v2k && (L.gu_type == 12 || L.gu_type == 13) &&
+        (((L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 && L.n_ff == 640) || q36geo)) {
+        static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+        const long long nh = (long long) cap_entries * L.n_ff;
+#define STRATA_V2K(G, D) s27_launch_ts<G, D>(ts, L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh)
+        if (q36geo) {
+            // the gate/up of the V2K path (4 rows per warp, the chunk's activations in LDS) + SwiGLU/q8_1, and the old down kernel:
+            // for n_ff 512 the new down kernel measured slower (15.1 vs 13.4 us per layer on gfx1201, R9700)
+            const dpct::dim3 ggu((unsigned)(2 * L.n_ff / (GU_ROWS * 4)),
+                                 (unsigned)cap_groups);
+            if (L.gu_type == 12) {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+                dpct::has_capability_or_fail(s->get_device(),
+                                             {sycl::aspect::fp16});
+
+                s->parallel_for<dpct_kernel_name<
+                    class s27_gu_kernel_7906c8, dpct_kernel_scalar<12>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<4>,
+                    dpct_kernel_scalar<false>>>(
+                    sycl::nd_range<3>(ggu * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            s27_gu_kernel<12, true, 4, false>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            } else {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+                dpct::has_capability_or_fail(s->get_device(),
+                                             {sycl::aspect::fp16});
+
+                s->parallel_for<dpct_kernel_name<
+                    class s27_gu_kernel_7906c8, dpct_kernel_scalar<13>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<4>,
+                    dpct_kernel_scalar<false>>>(
+                    sycl::nd_range<3>(ggu * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            s27_gu_kernel<13, true, 4, false>(
+                                grp_ptr, grp_start, n_groups, ent_tok, X, L,
+                                gate, up);
+                        });
+            }
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+                dpct::has_capability_or_fail(s->get_device(),
+                                             {sycl::aspect::fp16});
+
+                s->parallel_for<
+                    dpct_kernel_name<class s26_swiglu_q8_1_kernel_7cfbc7>>(
+                    sycl::nd_range<3>(
+                        sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
+                            sycl::range(1, 1, 256),
+                        sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            s26_swiglu_q8_1_kernel(gate, up, h, hq, nh);
+                        });
+            }
+            const dpct::dim3 gd((unsigned)((L.n_embd + 7) / 8),
+                                (unsigned)cap_groups);
+            launch_down<13>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        }
+        else if (L.gu_type == 12 && L.d_type == 7) STRATA_V2K(12, 7);
+        else if (L.gu_type == 12) STRATA_V2K(12, 8);
+        else if (L.d_type == 7) STRATA_V2K(13, 7);
+        else STRATA_V2K(13, 8);
+#undef STRATA_V2K
+        check("native_expert_grouped (v2k)");
+        return;
+    }
+>>>>>>> ours-now
     const bool v1 = g_grouped_v1;
     // #363: a verify window's PCIe call usually has no group: `grid_groups` block rows stride over the groups instead
     // of one row per possible group (the results do not depend on it)
@@ -5403,10 +7181,284 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
+<<<<<<< sycl
             case 18: native_gu_fused_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 21: native_gu_fused_kernel<21><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 23: native_gu_fused_kernel<23><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             default: native_gu_fused_kernel<22><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+||||||| base
+        case 16: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_e5645a,
+                                     dpct_kernel_scalar<16>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<16>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+        case 18: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_87ef5f,
+                                     dpct_kernel_scalar<18>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<18>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+        case 21: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_8be8ca,
+                                     dpct_kernel_scalar<21>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<21>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+        case 23: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_c71df4,
+                                     dpct_kernel_scalar<23>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<23>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+        default: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_87040d,
+                                     dpct_kernel_scalar<22>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<22>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+=======
+        case 16: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_d4b833,
+                                     dpct_kernel_scalar<16>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<16>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+        case 18: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_abdf6e,
+                                     dpct_kernel_scalar<18>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<18>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+        case 21: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_73a4e5,
+                                     dpct_kernel_scalar<21>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<21>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+        case 23: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_ff6b27,
+                                     dpct_kernel_scalar<23>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<23>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+        default: {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_gu_fused_kernel_29193f,
+                                     dpct_kernel_scalar<22>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_gu_fused_kernel<22>(
+                            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } break;
+>>>>>>> ours-now
         }
         check("native_expert_grouped/gu fused");
     }
@@ -5420,18 +7472,1150 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         const dim3 gl((unsigned) ((2 * L.n_ff + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
+<<<<<<< sycl
             case 18: if (em0 >= 7) native_gu_lds_kernel<18, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<18, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<18, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 21: if (em0 >= 7) native_gu_lds_kernel<21, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<21, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<21, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             case 23: if (em0 >= 7) native_gu_lds_kernel<23, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<23, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
             default: if (em0 >= 7) native_gu_lds_kernel<22, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<22, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<22, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+||||||| base
+                case 16: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_4f2f57,
+                            dpct_kernel_scalar<16>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<16, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else if (em0 == 6) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_f59480,
+                            dpct_kernel_scalar<16>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<16, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_175845,
+                            dpct_kernel_scalar<16>, dpct_kernel_scalar<0>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<16, 0>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+                case 18: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_439a0f,
+                            dpct_kernel_scalar<18>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<18, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else if (em0 == 6) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_165597,
+                            dpct_kernel_scalar<18>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<18, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_d27d73,
+                            dpct_kernel_scalar<18>, dpct_kernel_scalar<0>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<18, 0>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+                case 21: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_3cbed5,
+                            dpct_kernel_scalar<21>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<21, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else if (em0 == 6) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_7b188d,
+                            dpct_kernel_scalar<21>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<21, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_49923d,
+                            dpct_kernel_scalar<21>, dpct_kernel_scalar<0>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<21, 0>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+                case 23: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_cfea25,
+                            dpct_kernel_scalar<23>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<23, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_15aa82,
+                            dpct_kernel_scalar<23>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<23, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+                default: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_9156ca,
+                            dpct_kernel_scalar<22>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<22, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else if (em0 == 6) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_21d666,
+                            dpct_kernel_scalar<22>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<22, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_99ed78,
+                            dpct_kernel_scalar<22>, dpct_kernel_scalar<0>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<22, 0>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+=======
+                case 16: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_37cdcf,
+                            dpct_kernel_scalar<16>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<16, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else if (em0 == 6) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_de8a4b,
+                            dpct_kernel_scalar<16>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<16, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_692ffb,
+                            dpct_kernel_scalar<16>, dpct_kernel_scalar<0>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<16, 0>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+                case 18: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_bc05a5,
+                            dpct_kernel_scalar<18>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<18, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else if (em0 == 6) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_a87b06,
+                            dpct_kernel_scalar<18>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<18, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_b148d3,
+                            dpct_kernel_scalar<18>, dpct_kernel_scalar<0>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<18, 0>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+                case 21: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_54d49b,
+                            dpct_kernel_scalar<21>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<21, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else if (em0 == 6) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_b8b10a,
+                            dpct_kernel_scalar<21>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<21, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_20e953,
+                            dpct_kernel_scalar<21>, dpct_kernel_scalar<0>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<21, 0>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+                case 23: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_6bef35,
+                            dpct_kernel_scalar<23>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<23, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_fdc1fe,
+                            dpct_kernel_scalar<23>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<23, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+                default: if (em0 >= 7) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_1a3835,
+                            dpct_kernel_scalar<22>, dpct_kernel_scalar<1>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<22, 1, true>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else if (em0 == 6) {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_ba79c5,
+                            dpct_kernel_scalar<22>, dpct_kernel_scalar<1>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<22, 1>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    s->submit([&](sycl::handler &cgh) {
+
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(sh), cgh);
+
+                        /*
+                        DPCT1050: The template argument of the
+                        dpct_kernel_name could not be deduced. You need to
+                        update this code.
+                        */
+                        cgh.parallel_for<dpct_kernel_name<
+                            class native_gu_lds_kernel_1a2542,
+                            dpct_kernel_scalar<22>, dpct_kernel_scalar<0>,
+                            dpct_placeholder /*Fix the type mannually*/>>(
+                            sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                              sycl::range(1, 1, 256)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    native_gu_lds_kernel<22, 0>(
+                                        grp_ptr, grp_start, n_groups, ent_tok,
+                                        X, L, gate, up,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } break;
+>>>>>>> ours-now
         }
     } else {
+<<<<<<< sycl
     const int em = exp_mode() >= 5 ? 2 : exp_mode();
     const dim3 ggu_amd((unsigned) ((2 * L.n_ff + (em == 1 ? 3 : em == 4 ? 31 : 15)) / (em == 1 ? 4 : em == 4 ? 32 : 16)), (unsigned) cap_groups);
 #define STRATA_GU_AMD(T) \
     case T: if (em == 1) native_gu_amd_kernel<T, 1><<<ggu_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
             else if (em == 4) native_gu_amd_kernel<T, 4><<<ggu_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
             else native_gu_amd_kernel<T, 2><<<ggu_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+||||||| base
+    const int em = em0 >= 5 ? kExpFallback : em0;
+    const dpct::dim3 ggu_amd((unsigned)((2 * L.n_ff + (em == 1   ? 3
+                                                       : em == 4 ? 31
+                                                                 : 15)) /
+                                        (em == 1   ? 4
+                                         : em == 4 ? 32
+                                                   : 16)),
+                             (unsigned)cap_groups);
+#define STRATA_GU_AMD(T)                                                       \
+        case T: if (em == 1) {                                                 \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_tok_ct3 = ent_tok;                                    \
+                auto X_ct4 = X;                                                \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto gate_ct6 = gate;                                          \
+                auto up_ct7 = up;                                              \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_gu_amd_kernel_c49b21, dpct_kernel_scalar<T>,  \
+                    dpct_kernel_scalar<1>>>(                                   \
+                    sycl::nd_range<3>(ggu_amd * sycl::range(1, 1, 256),        \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_gu_amd_kernel<T, 1>(                        \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_tok_ct3, X_ct4, L_ct5, gate_ct6, up_ct7,   \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } else if (em == 4) {                                                  \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_tok_ct3 = ent_tok;                                    \
+                auto X_ct4 = X;                                                \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto gate_ct6 = gate;                                          \
+                auto up_ct7 = up;                                              \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_gu_amd_kernel_9e0075, dpct_kernel_scalar<T>,  \
+                    dpct_kernel_scalar<4>>>(                                   \
+                    sycl::nd_range<3>(ggu_amd * sycl::range(1, 1, 256),        \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_gu_amd_kernel<T, 4>(                        \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_tok_ct3, X_ct4, L_ct5, gate_ct6, up_ct7,   \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } else {                                                               \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_tok_ct3 = ent_tok;                                    \
+                auto X_ct4 = X;                                                \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto gate_ct6 = gate;                                          \
+                auto up_ct7 = up;                                              \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_gu_amd_kernel_c07fbb, dpct_kernel_scalar<T>,  \
+                    dpct_kernel_scalar<2>>>(                                   \
+                    sycl::nd_range<3>(ggu_amd * sycl::range(1, 1, 256),        \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_gu_amd_kernel<T, 2>(                        \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_tok_ct3, X_ct4, L_ct5, gate_ct6, up_ct7,   \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } break;
+=======
+    const int em = em0 >= 5 ? kExpFallback : em0;
+    const dpct::dim3 ggu_amd((unsigned)((2 * L.n_ff + (em == 1   ? 3
+                                                       : em == 4 ? 31
+                                                                 : 15)) /
+                                        (em == 1   ? 4
+                                         : em == 4 ? 32
+                                                   : 16)),
+                             (unsigned)cap_groups);
+#define STRATA_GU_AMD(T)                                                       \
+        case T: if (em == 1) {                                                 \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_tok_ct3 = ent_tok;                                    \
+                auto X_ct4 = X;                                                \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto gate_ct6 = gate;                                          \
+                auto up_ct7 = up;                                              \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_gu_amd_kernel_f3baa5, dpct_kernel_scalar<T>,  \
+                    dpct_kernel_scalar<1>>>(                                   \
+                    sycl::nd_range<3>(ggu_amd * sycl::range(1, 1, 256),        \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_gu_amd_kernel<T, 1>(                        \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_tok_ct3, X_ct4, L_ct5, gate_ct6, up_ct7,   \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } else if (em == 4) {                                                  \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_tok_ct3 = ent_tok;                                    \
+                auto X_ct4 = X;                                                \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto gate_ct6 = gate;                                          \
+                auto up_ct7 = up;                                              \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_gu_amd_kernel_c3f2cf, dpct_kernel_scalar<T>,  \
+                    dpct_kernel_scalar<4>>>(                                   \
+                    sycl::nd_range<3>(ggu_amd * sycl::range(1, 1, 256),        \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_gu_amd_kernel<T, 4>(                        \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_tok_ct3, X_ct4, L_ct5, gate_ct6, up_ct7,   \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } else {                                                               \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_tok_ct3 = ent_tok;                                    \
+                auto X_ct4 = X;                                                \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto gate_ct6 = gate;                                          \
+                auto up_ct7 = up;                                              \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_gu_amd_kernel_503e2a, dpct_kernel_scalar<T>,  \
+                    dpct_kernel_scalar<2>>>(                                   \
+                    sycl::nd_range<3>(ggu_amd * sycl::range(1, 1, 256),        \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_gu_amd_kernel<T, 2>(                        \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_tok_ct3, X_ct4, L_ct5, gate_ct6, up_ct7,   \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } break;
+>>>>>>> ours-now
     // the AMD layouts cover the IQ packs' gate/up types; Unsloth's Q4_K / Q5_K take the CUDA layout below
     const bool amd_gu = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
                         L.gu_type == 23 || L.gu_type == 29 || L.gu_type == 42;
@@ -5443,6 +8627,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_GU_AMD
 #endif
+    if (!expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up))   // STRATA_EXPDEC=1
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         STRATA_GU_FMTS(STRATA_GU)
@@ -5484,7 +8669,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                                              {sycl::aspect::fp16});
 
                 s->parallel_for<
+<<<<<<< sycl
                     dpct_kernel_name<class quantize_q8_1_kernel_f68c59>>(
+||||||| base
+                    dpct_kernel_name<class quantize_q8_1_kernel_f7e38e>>(
+=======
+                    dpct_kernel_name<class quantize_q8_1_kernel_168d9b>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(
                         sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                             sycl::range(1, 1, 256),
@@ -5518,21 +8709,360 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dpct::dim3 gd((unsigned)((L.n_embd + d_rows - 1) / d_rows),
                         (unsigned)gy);
+<<<<<<< sycl
 #if defined(STRATA_HIP_GFX906)
     if ((em0 == 7 || em0 == 8) && (L.d_type == 20 || L.d_type == 42)) {
         const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
         if (L.d_type == 20) native_down_lds_kernel<20><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         else native_down_lds_kernel<42><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+||||||| base
+#if STRATA_EXP_LAYOUTS
+    if ((em0 == 7 || em0 == 8) && (L.d_type == 20 || L.d_type == 42)) {
+        const dpct::dim3 gl((unsigned)((L.n_embd + LDS_RB - 1) / LDS_RB),
+                            (unsigned)cap_groups);
+        /*
+        DPCT1083: The size of local memory in the migrated code may be
+        different from the original code. Check that the allocated memory size
+        in the migrated code is correct.
+        */
+        const size_t sh =
+            (size_t)LDS_NT * (size_t)(L.n_ff / 32) * sizeof(block_q8_1);
+        if (L.d_type == 20) {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_down_lds_kernel_63c9e9,
+                                     dpct_kernel_scalar<20>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_down_lds_kernel<20>(
+                            grp_ptr, grp_start, n_groups, ent_dst, hq, L, out,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_down_lds_kernel_4011b7,
+                                     dpct_kernel_scalar<42>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_down_lds_kernel<42>(
+                            grp_ptr, grp_start, n_groups, ent_dst, hq, L, out,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        }
+=======
+#if STRATA_EXP_LAYOUTS
+    const int em0d = sm75_down_em(em0, cap_groups);
+    if ((em0d == 7 || em0d == 8) && (L.d_type == 20 || L.d_type == 42)) {
+        const dpct::dim3 gl((unsigned)((L.n_embd + LDS_RB - 1) / LDS_RB),
+                            (unsigned)cap_groups);
+        /*
+        DPCT1083: The size of local memory in the migrated code may be
+        different from the original code. Check that the allocated memory size
+        in the migrated code is correct.
+        */
+        const size_t sh =
+            (size_t)LDS_NT * (size_t)(L.n_ff / 32) * sizeof(block_q8_1);
+        if (L.d_type == 20) {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_down_lds_kernel_dbd795,
+                                     dpct_kernel_scalar<20>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_down_lds_kernel<20>(
+                            grp_ptr, grp_start, n_groups, ent_dst, hq, L, out,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else {
+
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            s->submit([&](sycl::handler &cgh) {
+
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sh), cgh);
+
+                cgh.parallel_for<
+                    dpct_kernel_name<class native_down_lds_kernel_70397c,
+                                     dpct_kernel_scalar<42>>>(
+                    sycl::nd_range<3>(gl * sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        native_down_lds_kernel<42>(
+                            grp_ptr, grp_start, n_groups, ent_dst, hq, L, out,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        }
+>>>>>>> ours-now
         check("native_expert_grouped/down");
         return;
     }
+<<<<<<< sycl
     const int em = exp_mode() >= 5 ? 2 : exp_mode();
     const dim3 gd_amd((unsigned) ((L.n_embd + (em == 1 ? 3 : em == 4 ? 31 : 15)) / (em == 1 ? 4 : em == 4 ? 32 : 16)), (unsigned) cap_groups);
 #define STRATA_D_AMD(T) \
     case T: if (em == 1) native_down_amd_kernel<T, 1><<<gd_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
             else if (em == 4) native_down_amd_kernel<T, 4><<<gd_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
             else native_down_amd_kernel<T, 2><<<gd_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+||||||| base
+    const int em = em0 >= 5 ? kExpFallback : em0;
+    const dpct::dim3 gd_amd((unsigned)((L.n_embd + (em == 1   ? 3
+                                                    : em == 4 ? 31
+                                                              : 15)) /
+                                       (em == 1   ? 4
+                                        : em == 4 ? 32
+                                                  : 16)),
+                            (unsigned)cap_groups);
+#define STRATA_D_AMD(T)                                                        \
+        case T: if (em == 1) {                                                 \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_dst_ct3 = ent_dst;                                    \
+                const block_q8_1 *hq_ct4 = hq;                                 \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto out_ct6 = out;                                            \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_down_amd_kernel_ebba55,                       \
+                    dpct_kernel_scalar<T>, dpct_kernel_scalar<1>>>(            \
+                    sycl::nd_range<3>(gd_amd * sycl::range(1, 1, 256),         \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_down_amd_kernel<T, 1>(                      \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_dst_ct3, hq_ct4, L_ct5, out_ct6,           \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } else if (em == 4) {                                                  \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_dst_ct3 = ent_dst;                                    \
+                const block_q8_1 *hq_ct4 = hq;                                 \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto out_ct6 = out;                                            \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_down_amd_kernel_a0405f,                       \
+                    dpct_kernel_scalar<T>, dpct_kernel_scalar<4>>>(            \
+                    sycl::nd_range<3>(gd_amd * sycl::range(1, 1, 256),         \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_down_amd_kernel<T, 4>(                      \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_dst_ct3, hq_ct4, L_ct5, out_ct6,           \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } else {                                                               \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_dst_ct3 = ent_dst;                                    \
+                const block_q8_1 *hq_ct4 = hq;                                 \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto out_ct6 = out;                                            \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_down_amd_kernel_db8e63,                       \
+                    dpct_kernel_scalar<T>, dpct_kernel_scalar<2>>>(            \
+                    sycl::nd_range<3>(gd_amd * sycl::range(1, 1, 256),         \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_down_amd_kernel<T, 2>(                      \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_dst_ct3, hq_ct4, L_ct5, out_ct6,           \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } break;
+=======
+    const int em = em0d >= 5 ? kExpFallback : em0d;
+    const dpct::dim3 gd_amd((unsigned)((L.n_embd + (em == 1   ? 3
+                                                    : em == 4 ? 31
+                                                              : 15)) /
+                                       (em == 1   ? 4
+                                        : em == 4 ? 32
+                                                  : 16)),
+                            (unsigned)cap_groups);
+#define STRATA_D_AMD(T)                                                        \
+        case T: if (em == 1) {                                                 \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_dst_ct3 = ent_dst;                                    \
+                const block_q8_1 *hq_ct4 = hq;                                 \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto out_ct6 = out;                                            \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_down_amd_kernel_59671a,                       \
+                    dpct_kernel_scalar<T>, dpct_kernel_scalar<1>>>(            \
+                    sycl::nd_range<3>(gd_amd * sycl::range(1, 1, 256),         \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_down_amd_kernel<T, 1>(                      \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_dst_ct3, hq_ct4, L_ct5, out_ct6,           \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } else if (em == 4) {                                                  \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_dst_ct3 = ent_dst;                                    \
+                const block_q8_1 *hq_ct4 = hq;                                 \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto out_ct6 = out;                                            \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_down_amd_kernel_5bcc45,                       \
+                    dpct_kernel_scalar<T>, dpct_kernel_scalar<4>>>(            \
+                    sycl::nd_range<3>(gd_amd * sycl::range(1, 1, 256),         \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_down_amd_kernel<T, 4>(                      \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_dst_ct3, hq_ct4, L_ct5, out_ct6,           \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } else {                                                               \
+            iq2xxs_grid.init(*s);                                              \
+                                                                               \
+            auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+                sycl::ext::oneapi::experimental::use_root_sync};               \
+                                                                               \
+            s->submit([&](sycl::handler &cgh) {                                \
+                auto iq2xxs_grid_ptr_ct1 = iq2xxs_grid;              \
+                                                                               \
+                auto grp_ptr_ct0 = grp_ptr;                                    \
+                auto grp_start_ct1 = grp_start;                                \
+                auto n_groups_ct2 = n_groups;                                  \
+                auto ent_dst_ct3 = ent_dst;                                    \
+                const block_q8_1 *hq_ct4 = hq;                                 \
+                NativeExpertLayout L_ct5 = L;                                  \
+                auto out_ct6 = out;                                            \
+                                                                               \
+                cgh.parallel_for<dpct_kernel_name<                             \
+                    class native_down_amd_kernel_67225f,                       \
+                    dpct_kernel_scalar<T>, dpct_kernel_scalar<2>>>(            \
+                    sycl::nd_range<3>(gd_amd * sycl::range(1, 1, 256),         \
+                                      sycl::range(1, 1, 256)),                 \
+                    exp_props,                                                 \
+                    [=](sycl::nd_item<3> item_ct1)                             \
+                        [[sycl::reqd_sub_group_size(32)]] {                    \
+                            native_down_amd_kernel<T, 2>(                      \
+                                grp_ptr_ct0, grp_start_ct1, n_groups_ct2,      \
+                                ent_dst_ct3, hq_ct4, L_ct5, out_ct6,           \
+                                iq2xxs_grid_ptr_ct1);                          \
+                        });                                                    \
+            });                                                                \
+        } break;
+>>>>>>> ours-now
     // the AMD layouts cover the IQ packs' down types; the others (Unsloth's Q4_K / Q5_K / Q5_1 / Q8_0) take the
     // CUDA layout below
     if ((em == 1 || em == 2 || em == 4) && (L.d_type == 20 || L.d_type == 23 || L.d_type == 42)) {
@@ -5542,6 +9072,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_D_AMD
 #endif
+    if (!expdec_down(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out))   // STRATA_EXPDEC=1
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         STRATA_D_FMTS(STRATA_DOWN)

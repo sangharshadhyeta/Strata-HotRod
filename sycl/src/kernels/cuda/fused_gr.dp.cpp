@@ -9,11 +9,22 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/emulate.hpp"
+<<<<<<< sycl
+||||||| base
+#include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
+#include "strata/core/geometry.hpp"
+=======
+#include "strata/core/sm75_series.hpp"
+#include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
+#include "strata/core/geometry.hpp"
+>>>>>>> ours-now
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <atomic>
+#include <type_traits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,6 +90,59 @@ __dpct_inline__ float dot8(const sycl::uint4 w, const float *x) {
     return acc;
 }
 
+// STRATA_HC_Q8: a weight chunk of 8 values in one uint4 register either way - bf16 (4 words), or Q8 (8 int8 codes in
+// .x/.y and the chunk's 32-value block scale in .z), so the kernels keep their register budget.
+__dpct_inline__ float dot8q(const uint32_t a, const uint32_t b,
+                            const float *x) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        acc = sycl::fma((float)(int8_t)(a >> (8 * i)), (float)(x[i]), acc);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        acc = sycl::fma((float)(int8_t)(b >> (8 * i)), (float)(x[4 + i]), acc);
+    return acc;
+}
+/// STRATA_HC_REQ8: the chunk at element `e` (a multiple of 8) of a matrix - bf16 `wb`, or (Q8 and `sq` non-null)
+/// int8 codes with scales `sq`, packed into the same uint4 register as 8 int8 codes in .x/.y and the 32-value block's
+/// scale in .z.  Q8 is a template parameter: the BF16 instantiations compile exactly as before.
+template <bool Q8>
+__dpct_inline__ sycl::uint4 ldw(const uint16_t *wb, const float *sq, size_t e) {
+    if constexpr (Q8) {
+        if (sq != nullptr) {
+            /*
+            DPCT1098: The '*' expression is used instead of the __ldg call.
+            These two expressions do not provide the exact same functionality.
+            Check the generated code for potential precision and/or performance
+            issues.
+            */
+            const sycl::uint2 v = *(reinterpret_cast<const int8_t *>(wb) + e);
+            /*
+            DPCT1098: The '*' expression is used instead of the __ldg call.
+            These two expressions do not provide the exact same functionality.
+            Check the generated code for potential precision and/or performance
+            issues.
+            */
+            return sycl::uint4(
+                v.x(), v.y(), sycl::bit_cast<unsigned int>(*(sq + e / 32)), 0u);
+        }
+    }
+    /*
+    DPCT1098: The '*' expression is used instead of the __ldg call. These
+    two expressions do not provide the exact same functionality. Check the
+    generated code for potential precision and/or performance issues.
+    */
+    return *(wb + e);
+}
+template <bool Q8>
+__dpct_inline__ float dotw(const bool q8, const sycl::uint4 w, const float *x) {
+    if constexpr (Q8) {
+        if (q8) return sycl::bit_cast<float>(w.z()) * dot8q(w.x(), w.y(), x);
+    }
+    return dot8(w, x);
+}
+
+template <bool Q8 = false>
 /*
 DPCT1110: The total declared local variable size in device function
 gr_down_kernel exceeds 128 bytes and may cause high register pressure. Consult
@@ -157,13 +221,23 @@ auto &xn = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[D]>(
     const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
     const int row = inject_block ? warp : item_ct1.get_group(2) * WARPS + warp;
     if (inject_block && (a.w_inject == nullptr || warp >= HC)) return;
+<<<<<<< sycl
     const uint16_t* wrow = (inject_block ? a.w_inject : a.w_down) + (size_t) row * D;
     const sycl::uint4 *w4 = reinterpret_cast<const sycl::uint4 *>(wrow);
     // SYCL port: the multi kernel's order - per-tile partial sums for the split rows (gr_parity: bit-identical),
     // the inject rows still one accumulation over the whole row (their block is not split there)
+||||||| base
+    const uint16_t* wrow = (inject_block ? a.w_inject : a.w_down) + (size_t) row * D;
+    const sycl::uint4 *w4 = reinterpret_cast<const sycl::uint4 *>(wrow);
+=======
+    const uint16_t* wmat = inject_block ? a.w_inject : a.w_down;
+    const float* sq = (Q8 && !inject_block) ? a.s_down : nullptr;   // the inject rows stay bf16
+    const bool q8 = Q8 && !inject_block;
+>>>>>>> ours-now
     float acc = 0.0f;
     if (inject_block) {
 #pragma unroll 4
+<<<<<<< sycl
         for (int j = lane; j < D / 8; j += 32) acc += dot8(*(w4 + j), xn + j * 8);
         acc = warp_sum(acc);
     } else {
@@ -174,6 +248,18 @@ auto &xn = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[D]>(
             acc += warp_sum(part);
         }
     }
+||||||| base
+    /*
+    DPCT1098: The '*' expression is used instead of the __ldg call. These
+    two expressions do not provide the exact same functionality. Check the
+    generated code for potential precision and/or performance issues.
+    */
+    for (int j = lane; j < D / 8; j += 32) acc += dot8(*(w4 + j), xn + j * 8);
+    acc = warp_sum(acc);
+=======
+    for (int j = lane; j < D / 8; j += 32) acc += dotw<Q8>(q8, ldw<Q8>(wmat, sq, (size_t) row * D + (size_t) j * 8), xn + j * 8);
+    acc = warp_sum(acc);
+>>>>>>> ours-now
     if (lane != 0) return;
     if (inject_block) {
         a.inject_out[row] = acc;
@@ -183,7 +269,7 @@ auto &xn = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[D]>(
     }
 }
 
-__dpct_inline__ void gr_up_kernel(FusedGrArgs a) {
+template <bool Q8 = false> __dpct_inline__ void gr_up_kernel(FusedGrArgs a) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[LR]>(
     sycl::ext::oneapi::this_work_item::get_work_group<3>());
@@ -203,21 +289,10 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[LR]>(
     // 128 rows (4 streams x 32 columns), 16 per warp: 320 bf16 = 40 chunks of 8.
     for (int r = warp; r < HC * UP_COLS; r += WARPS) {
         const int c = r / UP_COLS, dd = r - c * UP_COLS, i = c * N + d0 + dd;
-        const sycl::uint4 *w4 =
-            reinterpret_cast<const sycl::uint4 *>(a.w_up + (size_t)i * LR);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
-        float acc = dot8(*(w4 + lane), lo + lane * 8);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
-        if (lane < LR / 8 - 32) acc +=
-            dot8(*(w4 + 32 + lane), lo + (32 + lane) * 8);
+        const bool q8 = Q8;
+        float acc = dotw<Q8>(q8, ldw<Q8>(a.w_up, a.s_up, (size_t) i * LR + (size_t) lane * 8), lo + lane * 8);
+        if (lane < LR / 8 - 32)
+            acc += dotw<Q8>(q8, ldw<Q8>(a.w_up, a.s_up, (size_t) i * LR + (size_t) (32 + lane) * 8), lo + (32 + lane) * 8);
         acc = warp_sum(acc);
         if (lane == 0) {
             float rv = a.R[i];
@@ -411,7 +486,7 @@ bool gr_norm_split() {   // default; STRATA_GR_NORM_SPLIT=0: one work-group per 
 // which fits all eight tokens in one 40 KiB launch and stages 160 chunks of 8 (5 per lane, half the registers held
 // for the weight prefetch); smaller tiles raise how many blocks share an SM (the 41-block grid), e.g. three blocks
 // of four tokens instead of one on sm_75.
-template <int TILEV, int MAX_T = kFusedGrMaxT>
+template <int TILEV, int MAX_T = kFusedGrMaxT, bool Q8 = false>
 /*
 DPCT1110: The total declared local variable size in device function
 gr_down_multi_kernel exceeds 128 bytes and may cause high register pressure.
@@ -429,8 +504,10 @@ __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
     const int split = inject_block ? 0 : gid % DOWN_SPLIT, rb = inject_block ? 0 : gid / DOWN_SPLIT;
     const int row = inject_block ? warp : rb * WARPS + warp;
     const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
-    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
-    const sycl::uint4 *w4 = reinterpret_cast<const sycl::uint4 *>(wrow);
+    const uint16_t* wmat = inject_block ? m.a[0].w_inject : m.a[0].w_down;
+    const float* sq = (Q8 && !inject_block) ? m.a[0].s_down : nullptr;   // the inject rows stay bf16
+    const bool q8 = Q8 && !inject_block;
+    const size_t row0 = (size_t) (active ? row : 0) * D;
     float acc[MAX_T];
 #pragma unroll
     for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
@@ -438,14 +515,7 @@ __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
         sycl::uint4 wv[TQ];
         if (active) {
 #pragma unroll
-            /*
-            DPCT1098: The '*' expression is used instead of the __ldg call.
-            These two expressions do not provide the exact same functionality.
-            Check the generated code for potential precision and/or performance
-            issues.
-            */
-            for (int q = 0; q < TQ; ++q)
-                wv[q] = *(w4 + base / 8 + lane + 32 * q);
+            for (int q = 0; q < TQ; ++q) wv[q] = ldw<Q8>(wmat, sq, row0 + (size_t) base + (size_t) (lane + 32 * q) * 8);
         }
         /*
         DPCT1118: SYCL group functions and algorithms must be encountered in
@@ -479,7 +549,7 @@ __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
             const int j = lane + 32 * q;
 #pragma unroll
             for (int k = 0; k < MAX_T; ++k)
-                if (k < T) acc[k] += dot8(wv[q], tile + k * TILEV + j * 8);
+                if (k < T) acc[k] += dotw<Q8>(q8, wv[q], tile + k * TILEV + j * 8);
         }
     }
     if (!active) return;
@@ -498,12 +568,42 @@ __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
     }
 }
 
+<<<<<<< sycl
 // SYCL port: gr_down_multi_kernel without the shared-memory tile. The tiled kernel stages T x 2560 floats per
 // work-group (60 KB at T = 6) for 8 rows (40 KB of weights): the copy outweighs the weights and the SLM caps the
 // B70 at ~2 groups per Xe core (unitrace: 64 us per call, ~100 GB/s). Here each lane reads its 8 xn floats per
 // token straight from global memory (T x 40 KB in all, L1/L2-resident, shared by every group). Same per-lane
 // order of the sums, so the outputs are bitwise the tiled kernel's.
 __dpct_inline__ void gr_down_multi_direct_kernel(GrMulti m) {
+||||||| base
+constexpr int UPM_COLS = 16;                      // columns per block (x 4 streams = 64 rows, 8 per warp)
+constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
+
+// `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
+// sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_multi_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_up_multi_kernel(GrMulti m) {
+=======
+constexpr int UPM_COLS = 16;                      // columns per block (x 4 streams = 64 rows, 8 per warp)
+constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
+
+// `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
+// sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, bool Q8 = false>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_multi_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_up_multi_kernel(GrMulti m) {
+>>>>>>> ours-now
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     const int T = m.T;
@@ -517,10 +617,98 @@ __dpct_inline__ void gr_down_multi_direct_kernel(GrMulti m) {
     const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(wrow);
     float acc[kFusedGrMaxT];
 #pragma unroll
+<<<<<<< sycl
     for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
     for (int base = inject_block ? 0 : split * TILE; base < D; base += inject_block ? TILE : TILE * DOWN_SPLIT) {
         sycl::uint4 wv[TQ];
+||||||| base
+    for (int i = t; i < T * LR; i += THREADS)
+        lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const sycl::uint4 *w4 =
+            reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const Bf16x8 wa = unpack8(*(w4 + lane));
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const Bf16x8 wb = unpack8(lane < LR / 8 - 32 ? *(w4 + 32 + lane)
+                                                     : sycl::uint4(0, 0, 0, 0));
+        // the epilogue inputs of this lane's token, fetched while the dots run
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            rsc = a.rs[c];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+=======
+    for (int i = t; i < T * LR; i += THREADS)
+        lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        sycl::uint4 qa = sycl::uint4(0, 0, 0, 0), qb = sycl::uint4(0, 0, 0, 0);
+        Bf16x8 wa{}, wb{};
+        if constexpr (Q8) {
+            qa = ldw<true>(m.a[0].w_up, m.a[0].s_up, (size_t) i * LR + (size_t) lane * 8);
+            if (lane < LR / 8 - 32) qb = ldw<true>(m.a[0].w_up, m.a[0].s_up, (size_t) i * LR + (size_t) (32 + lane) * 8);
+        } else {
+            const sycl::uint4 *w4 = reinterpret_cast<const sycl::uint4 *>(
+                m.a[0].w_up + (size_t)i * LR);
+            /*
+            DPCT1098: The '*' expression is used instead of the __ldg call.
+            These two expressions do not provide the exact same functionality.
+            Check the generated code for potential precision and/or performance
+            issues.
+            */
+            wa = unpack8(*(w4 + lane));
+            /*
+            DPCT1098: The '*' expression is used instead of the __ldg call.
+            These two expressions do not provide the exact same functionality.
+            Check the generated code for potential precision and/or performance
+            issues.
+            */
+            wb = unpack8(lane < LR / 8 - 32 ? *(w4 + 32 + lane)
+                                            : sycl::uint4(0, 0, 0, 0));
+        }
+        // the epilogue inputs of this lane's token, fetched while the dots run
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            rsc = a.rs[c];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+>>>>>>> ours-now
 #pragma unroll
+<<<<<<< sycl
         for (int q = 0; q < TQ; ++q) wv[q] = *(w4 + base / 8 + lane + 32 * q);
 #pragma unroll
         for (int q = 0; q < TQ; ++q) {
@@ -533,6 +721,27 @@ __dpct_inline__ void gr_down_multi_direct_kernel(GrMulti m) {
                     const float xv[8] = {a0.x(), a0.y(), a0.z(), a0.w(), a1.x(), a1.y(), a1.z(), a1.w()};
                     acc[k] += dot8(wv[q], xv);
                 }
+||||||| base
+        for (int k = 0; k < MAX_T; ++k) {
+            if (!EXACT_T && k >= T) break;
+            float acc = dot8u_ptr(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8u_ptr(wb, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+=======
+        for (int k = 0; k < MAX_T; ++k) {
+            if (!EXACT_T && k >= T) break;
+            float acc;
+            if constexpr (Q8) {
+                acc = dotw<true>(true, qa, lo[k] + lane * 8);
+                if (lane < LR / 8 - 32) acc += dotw<true>(true, qb, lo[k] + (32 + lane) * 8);
+            } else {
+                acc = dot8u_ptr(wa, lo[k] + lane * 8);
+                if (lane < LR / 8 - 32) acc += dot8u_ptr(wb, lo[k] + (32 + lane) * 8);
+            }
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+>>>>>>> ours-now
         }
     }
     float s[kFusedGrMaxT];
@@ -667,10 +876,177 @@ bool gr_down_direct() {   // default; STRATA_GR_DOWN_DIRECT=0: the tiled kernel 
     return v;
 }
 
+<<<<<<< sycl
 constexpr int UPM_COLS = 16;                      // columns per block (x 4 streams = 64 rows, 8 per warp)
 constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
 constexpr int UPM_COLS_MORE = 8;                  // gr_more_groups: 8 columns (32 rows, 4 per warp)
 constexpr int UPM_BLOCKS_MORE = N / UPM_COLS_MORE;   // 320
+||||||| base
+=======
+// Turing (sm_75): gr_up_multi_kernel's rows, sums and epilogue with the latency taken out of the warp's chain.  A warp's
+// 8 rows of w_up are all loaded before any dot (was: one row's load after the previous row's epilogue: ~9k of the
+// warp's ~22k cycles were waits on memory, ncu on an RTX 2080 Ti); a token's 8 activations per lane are read from
+// shared memory once for the 8 rows; and the 8 rows' xor reductions run interleaved (8 independent shuffles per stage
+// instead of one chain of 5 per row).  A row's last 8 chunks (lanes 0-7 of gr_up_multi_kernel) are held 4 rows to a
+// uint4 - lane 8 i + j holds chunk 32 + j of row i - and their dot is shuffled to lane j before it is added, so lane j
+// still sums its two dots in gr_up_multi_kernel's order.  Every row's lane sums, xor tree and epilogue are
+// gr_up_multi_kernel's: the same bits.  STRATA_GR_UP75=0 keeps gr_up_multi_kernel.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up75_kernel exceeds 128 bytes and may cause high register pressure. Consult
+with your hardware vendor to find the total register size available and adjust
+the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_up75_kernel(GrMulti m) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int RPW =
+        HC * UPM_COLS /
+        WARPS; // 8 rows per warp: row r = warp + WARPS i -> stream i / 2
+    static_assert(RPW == 8 && UPM_COLS == 2 * WARPS && HC == 4 && LR / 8 - 32 == 8, "geometry");
+    auto &lo =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[MAX_T][LR]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[MAX_T][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const int d0 = item_ct1.get_group(2) * UPM_COLS;
+    const int tj = lane & 7, ti = lane >> 3;       // tail: chunk 32 + tj of row 4 b + ti
+    float mine[RPW];
+#pragma unroll
+    for (int i = 0; i < RPW; ++i) mine[i] = 0.0f;
+#pragma unroll
+    for (int bt = 0; bt < 2; ++bt) {               // two batches of 4 rows: 4 loads in flight, registers for 4 blocks
+        sycl::uint4 wa[4], wt;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r = 4 * bt + i, c = r >> 1, dd = warp + WARPS * (r & 1), row = c * N + d0 + dd;
+            /*
+            DPCT1098: The '*' expression is used instead of the __ldg call.
+            These two expressions do not provide the exact same functionality.
+            Check the generated code for potential precision and/or performance
+            issues.
+            */
+            wa[i] = *(reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up +
+                                                            (size_t)row * LR) +
+                      lane);
+        }
+        {
+            const int r = 4 * bt + ti, c = r >> 1, dd = warp + WARPS * (r & 1), row = c * N + d0 + dd;
+            /*
+            DPCT1098: The '*' expression is used instead of the __ldg call.
+            These two expressions do not provide the exact same functionality.
+            Check the generated code for potential precision and/or performance
+            issues.
+            */
+            wt = *(reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up +
+                                                         (size_t)row * LR) +
+                   32 + tj);
+        }
+        if (bt == 0) {
+#pragma unroll
+            for (int i = t; i < T * LR; i += THREADS)
+                lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+            /*
+            DPCT1118: SYCL group functions and algorithms must be
+            encountered in converged control flow. You may need to adjust the
+            code.
+            */
+            /*
+            DPCT1065: Consider replacing sycl::nd_item::barrier() with
+            sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
+            better performance if there is no access to global memory.
+            */
+            item_ct1.barrier();
+        }
+#pragma unroll 1
+        for (int k = 0; k < T; ++k) {
+            const sycl::float4 *la =
+                reinterpret_cast<const sycl::float4 *>(lo[k] + lane * 8);
+            const sycl::float4 *lb =
+                reinterpret_cast<const sycl::float4 *>(lo[k] + (32 + tj) * 8);
+            const float tb = dot8u(unpack8(wt), lb[0], lb[1]);
+            const sycl::float4 x0 = la[0], x1 = la[1];
+            float p[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                /*
+                DPCT1108: '__shfl_sync' was migrated with the experimental
+                feature masked sub_group function which may not be supported by
+                all compilers or runtimes. You may need to adjust the code.
+                */
+                const float b = dpct::experimental::select_from_sub_group(
+                    0xffffffffu,
+                    sycl::ext::oneapi::this_work_item::get_sub_group(), tb,
+                    i * 8 + tj);
+                float acc = dot8u(unpack8(wa[i]), x0, x1);
+                if (lane < 8) acc += b;
+                p[i] = acc;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+                /*
+                DPCT1108: '__shfl_xor_sync' was migrated with the
+                experimental feature masked sub_group function which may not be
+                supported by all compilers or runtimes. You may need to adjust
+                the code.
+                */
+                for (int i = 0; i < 4; ++i) p[i] +=
+                    dpct::experimental::permute_sub_group_by_xor(
+                        0xffffffffu,
+                        sycl::ext::oneapi::this_work_item::get_sub_group(),
+                        p[i], o);
+            }
+            if (lane == k) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) mine[4 * bt + i] = p[i];
+            }
+        }
+    }
+    if (lane < T) {
+        const FusedGrArgs& a = m.a[lane];
+        const bool apply = a.apply;
+        float rv[RPW], wn[RPW], bo[RPW];
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            const int c = i >> 1, dd = warp + WARPS * (i & 1), row = c * N + d0 + dd;
+            rv[i] = a.R[row];
+            wn[i] = a.w_norm[row];
+            bo[i] = apply ? a.bo_prev[d0 + dd] : 0.0f;
+        }
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            const int c = i >> 1, dd = warp + WARPS * (i & 1), row = c * N + d0 + dd;
+            float x0 = rv[i];
+            if (apply) {
+                x0 = sycl::fma(bo[i],
+                               2.0f * sigmoidf_(a.inj_prev[c] / (float)HC), x0);
+                a.R_out[row] = x0;
+            }
+            const float x = x0 * wn[i] * a.rs[c];
+            g[lane][c][dd] = x * sigmoidf_(mine[i]);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE, as gr_up_multi_kernel
+}
+
+>>>>>>> ours-now
 
 // `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
 // sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
@@ -1289,36 +1665,26 @@ __dpct_inline__ void cp_async_wait0() {
 #endif
 }
 
-// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
-__dpct_inline__ float dot8v(const sycl::uint4 w, const sycl::float4 x0,
-                            const sycl::float4 x1) {
-    float acc = 0.0f;
-    acc = sycl::fma(sycl::bit_cast<float>(w.x() << 16), (float)(x0.x()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.x() & 0xffff0000u), (float)(x0.y()),
-                    acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.y() << 16), (float)(x0.z()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.y() & 0xffff0000u), (float)(x0.w()),
-                    acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.z() << 16), (float)(x1.x()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.z() & 0xffff0000u), (float)(x1.y()),
-                    acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.w() << 16), (float)(x1.z()), acc);
-    acc = sycl::fma(sycl::bit_cast<float>(w.w() & 0xffff0000u), (float)(x1.w()),
-                    acc);
-    return acc;
-}
-
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
+// `nt` is the block's thread count (WPC * 32): the tile is copied by whichever threads the block has.
 __dpct_inline__ void stage_htile(const GrMulti &m, int T, int h,
-                                 sycl::float4 *buf, int t) {
-    for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
+                                 sycl::float4 *buf, int t, int nt, int k0 = 0) {
+    for (int i = t; i < T * (H_TILE / 4); i += nt) {
         const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
-        const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
+        const float* src = m.xn + (size_t) (k0 + k) * D + (size_t) h * H_TILE + (size_t) s4 * 4;
         cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
     }
 }
 
+<<<<<<< sycl
 template <int MAX_T = kFusedGrMaxT>
+||||||| base
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+=======
+// WPC warps per block (STRATA_GR_DOWN_WPC): one warp per output row as always, so the grid is LR / WPC row blocks
+// plus ceil(HC / WPC) inject blocks (41 / 81 / 162 at WPC 8 / 4 / 2).  The activation tile is per block, not per warp.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, int WPC = WARPS>
+>>>>>>> ours-now
 /*
 DPCT1110: The total declared local variable size in device function
 gr_down_staged_kernel exceeds 128 bytes and may cause high register pressure.
@@ -1328,11 +1694,29 @@ adjust the code, or use smaller sub-group size to avoid high register pressure.
 __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto hbuf = (sycl::float4 *)dpct_local; // 2 buffers x [T][2][160] float4
+    constexpr int NT = WPC * 32;                        // threads per block
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+<<<<<<< sycl
     const int T = m.T;
     const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
     const int row = inject_block ? warp : item_ct1.get_group(2) * WARPS + warp;
     const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+||||||| base
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
+    const int row = inject_block ? warp : item_ct1.get_group(2) * WARPS + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+=======
+    const int T = EXACT_T ? MAX_T : m.T;
+    // sm_75: a launch of EXACT_T groups of MAX_T tokens, one per blockIdx.y (gridDim.y 1: the whole launch); every
+    // (row, token) is summed by one warp exactly as before - only more blocks share the card (#down-tg)
+    const int k0 = EXACT_T ? (int)item_ct1.get_group(1) * MAX_T : 0;
+    const bool inject_block = item_ct1.get_group(2) >= LR / WPC;
+    const int row = inject_block
+                        ? (item_ct1.get_group(2) - LR / WPC) * WPC + warp
+                        : item_ct1.get_group(2) * WPC + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || row >= HC));
+>>>>>>> ours-now
     const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
     const sycl::uint4 *w4 = reinterpret_cast<const sycl::uint4 *>(wrow);
     const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
@@ -1349,9 +1733,9 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
         */
         for (int q = 0; q < HQ; ++q) wv[q] = *(w4 + lane + 32 * q);
     }
-    stage_htile(m, T, 0, hbuf, t);
+    stage_htile(m, T, 0, hbuf, t, NT, k0);
     cp_async_commit();
-    stage_htile(m, T, 1, hbuf + buf_f4, t);
+    stage_htile(m, T, 1, hbuf + buf_f4, t, NT, k0);
     cp_async_commit();
 #pragma unroll 1
     for (int h = 0; h < N_HTILES; ++h) {
@@ -1402,7 +1786,7 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
         better performance if there is no access to global memory.
         */
         item_ct1.barrier(); // every warp is done with buffer h & 1
-        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, NT, k0);
         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
         if (h + 1 < N_HTILES) {
 #pragma unroll
@@ -1418,14 +1802,116 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
     for (int k = 0; k < MAX_T; ++k) {
         if (k >= T || lane != k) continue;
         if (inject_block) {
-            m.a[k].inject_out[row] = s[k];
+            m.a[k0 + k].inject_out[row] = s[k];
         } else {
             const float x = s[k] / (float) HC;
-            m.a[k].lo[row] = x / (1.0f + sycl::native::exp(-x));
+            m.a[k0 + k].lo[row] = x / (1.0f + sycl::native::exp(-x));
         }
     }
 }
 
+<<<<<<< sycl
+||||||| base
+// Auto generated SYCL kernel wrapper used to migration kernel function pointer.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+void gr_down_staged_kernel_wrapper(GrMulti m) {
+    sycl::queue queue = *dpct::kernel_launcher::_que;
+    unsigned int localMemSize = dpct::kernel_launcher::_local_mem_size;
+    sycl::nd_range<3> nr = dpct::kernel_launcher::_nr;
+
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+
+    queue.submit([&](sycl::handler &cgh) {
+        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+            sycl::range(localMemSize), cgh);
+
+        cgh.parallel_for<dpct_kernel_name<class gr_down_staged_kernel_>>(
+            nr, exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_down_staged_kernel<MAX_T, EXACT_T>(
+                    m, dpct_local_acc_ct1
+                           .get_multi_ptr<sycl::access::decorated::no>()
+                           .get());
+            });
+    });
+}
+
+// the current device is Volta (sm_70): the fast norm/up is its default
+bool cur_dev_volta() try {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 64) return false;
+    if (!per_dev[dev]) {
+        int major = 0, minor = 0;
+        major = dpct::get_device(dev).get_major_version();
+        minor = dpct::get_device(dev).get_minor_version();
+        per_dev[dev] = major == 7 && minor == 0 ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#endif
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+=======
+// Auto generated SYCL kernel wrapper used to migration kernel function pointer.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, int WPC = WARPS>
+void gr_down_staged_kernel_wrapper(GrMulti m) {
+    sycl::queue queue = *dpct::kernel_launcher::_que;
+    unsigned int localMemSize = dpct::kernel_launcher::_local_mem_size;
+    sycl::nd_range<3> nr = dpct::kernel_launcher::_nr;
+
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+
+    queue.submit([&](sycl::handler &cgh) {
+        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+            sycl::range(localMemSize), cgh);
+
+        cgh.parallel_for<dpct_kernel_name<class gr_down_staged_kernel_>>(
+            nr, exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_down_staged_kernel<MAX_T, EXACT_T, WPC>(
+                    m, dpct_local_acc_ct1
+                           .get_multi_ptr<sycl::access::decorated::no>()
+                           .get());
+            });
+    });
+}
+
+// the current device is Volta (sm_70): the fast norm/up is its default
+bool cur_dev_volta() try {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 64) return false;
+    if (!per_dev[dev]) {
+        int major = 0, minor = 0;
+        major = dpct::get_device(dev).get_major_version();
+        minor = dpct::get_device(dev).get_minor_version();
+        per_dev[dev] = major == 7 && minor == 0 ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#endif
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+>>>>>>> ours-now
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
 // stages n_tok * TILEV floats (1280 on sm_75, 2560 elsewhere), staged two tiles of n_tok * H_TILE.  The shared-memory
 // opt-in is set here once per device (a per-DEVICE setting: a layer split runs these kernels on two cards).
@@ -1472,18 +1958,102 @@ int down_chunk(bool staged, int* tile_out) {
             DPCT1026: The call to cudaFuncSetAttribute was removed because
             SYCL currently does not support corresponding setting.
             */
+            /*
+            DPCT1026: The call to cudaFuncSetAttribute was removed because
+            SYCL currently does not support corresponding setting.
+            */
+            /*
+            DPCT1026: The call to cudaFuncSetAttribute was removed because
+            SYCL currently does not support corresponding setting.
+            */
         } else {
             /*
             DPCT1026: The call to cudaFuncSetAttribute was removed because
             SYCL currently does not support corresponding setting.
             */
+            /*
+            DPCT1026: The call to cudaFuncSetAttribute was removed because
+            SYCL currently does not support corresponding setting.
+            */
+            /*
+            DPCT1026: The call to cudaFuncSetAttribute was removed because
+            SYCL currently does not support corresponding setting.
+            */
         }
+<<<<<<< sycl
         int want_staged = (int) (2 * kFusedGrMaxT * H_TILE * sizeof(float));
         if (optin > 0 && want_staged > optin) want_staged = optin;
         /*
         DPCT1026: The call to cudaFuncSetAttribute was removed because SYCL
         currently does not support corresponding setting.
         */
+||||||| base
+        auto set_staged_attr = [&](auto kernel, int max_t) {
+            int ws = (int) (2 * max_t * H_TILE * sizeof(float));
+            if (optin > 0 && ws > optin) ws = optin;
+            if (ws > 48 * 1024)
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                ;
+            /*
+            DPCT1026: The call to cudaFuncSetAttribute was removed because
+            SYCL currently does not support corresponding setting.
+            */
+        };
+        set_staged_attr(gr_down_staged_kernel_wrapper<1, true>, 1);
+        set_staged_attr(gr_down_staged_kernel_wrapper<2, true>, 2);
+        set_staged_attr(gr_down_staged_kernel_wrapper<3, true>, 3);
+        set_staged_attr(gr_down_staged_kernel_wrapper<4, true>, 4);
+        set_staged_attr(gr_down_staged_kernel_wrapper<5, true>, 5);
+        set_staged_attr(gr_down_staged_kernel_wrapper<6, true>, 6);
+        set_staged_attr(gr_down_staged_kernel_wrapper<4, false>, 4);
+        set_staged_attr(gr_down_staged_kernel_wrapper<kFusedGrMaxT, false>,
+                        kFusedGrMaxT);
+=======
+        auto set_staged_attr = [&](auto kernel, int max_t) {
+            int ws = (int) (2 * max_t * H_TILE * sizeof(float));
+            if (optin > 0 && ws > optin) ws = optin;
+            if (ws > 48 * 1024)
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                ;
+            /*
+            DPCT1026: The call to cudaFuncSetAttribute was removed because
+            SYCL currently does not support corresponding setting.
+            */
+        };
+        set_staged_attr(gr_down_staged_kernel_wrapper<1, true>, 1);
+        set_staged_attr(gr_down_staged_kernel_wrapper<2, true>, 2);
+        set_staged_attr(gr_down_staged_kernel_wrapper<3, true>, 3);
+        set_staged_attr(gr_down_staged_kernel_wrapper<4, true>, 4);
+        set_staged_attr(gr_down_staged_kernel_wrapper<5, true>, 5);
+        set_staged_attr(gr_down_staged_kernel_wrapper<6, true>, 6);
+        set_staged_attr(gr_down_staged_kernel_wrapper<4, false>, 4);
+        set_staged_attr(gr_down_staged_kernel_wrapper<kFusedGrMaxT, false>,
+                        kFusedGrMaxT);
+        set_staged_attr(gr_down_staged_kernel_wrapper<1, true, 4>, 1);
+        set_staged_attr(gr_down_staged_kernel_wrapper<2, true, 4>, 2);
+        set_staged_attr(gr_down_staged_kernel_wrapper<3, true, 4>, 3);
+        set_staged_attr(gr_down_staged_kernel_wrapper<4, true, 4>, 4);
+        set_staged_attr(gr_down_staged_kernel_wrapper<5, true, 4>, 5);
+        set_staged_attr(gr_down_staged_kernel_wrapper<6, true, 4>, 6);
+        set_staged_attr(gr_down_staged_kernel_wrapper<4, false, 4>, 4);
+        set_staged_attr(gr_down_staged_kernel_wrapper<kFusedGrMaxT, false, 4>,
+                        kFusedGrMaxT);
+        set_staged_attr(gr_down_staged_kernel_wrapper<1, true, 2>, 1);
+        set_staged_attr(gr_down_staged_kernel_wrapper<2, true, 2>, 2);
+        set_staged_attr(gr_down_staged_kernel_wrapper<3, true, 2>, 3);
+        set_staged_attr(gr_down_staged_kernel_wrapper<4, true, 2>, 4);
+        set_staged_attr(gr_down_staged_kernel_wrapper<5, true, 2>, 5);
+        set_staged_attr(gr_down_staged_kernel_wrapper<6, true, 2>, 6);
+        set_staged_attr(gr_down_staged_kernel_wrapper<4, false, 2>, 4);
+        set_staged_attr(gr_down_staged_kernel_wrapper<kFusedGrMaxT, false, 2>,
+                        kFusedGrMaxT);
+>>>>>>> ours-now
         /*
         DPCT1026: The call to cudaGetLastError was removed because this
         functionality is redundant in SYCL.
@@ -1518,15 +2088,578 @@ int down_chunk(bool staged, int* tile_out) {
 // many tokens as fit the card, the up projection; the profile's stamps after the norm and after the down projection.
 // kHcPlain is the default read exactly as before (never main's opt-in STRATA_GR_V3 path, which fused_gr_read_multi
 // takes first).
+<<<<<<< sycl
 void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                   unsigned long long *stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
     if (variant >= kHcSplit) {
+||||||| base
+#if STRATA_GR_FAST_BUILD
+__dpct_inline__ void
+gr_norm_fast_kernel(GrMulti m); // below, with the AMD fast path
+__dpct_inline__ void gr_up_fast_kernel(GrMulti m);
+}  // namespace
+static bool gr_fast();
+namespace {
+#endif
+// STRATA_GR_DOWN_MAX4=1 (opt-in): launches of up to 4 tokens hold 4 tokens' sums per thread instead of kFusedGrMaxT (the
+// same bits; checked bitwise on the 5070 for 0.1.40). Default off: a 10-pair interleaved decode A/B on the RTX 5070 (Q2_0,
+// default config) did not show the +2.8-3.5% of bench #832 (medians 0.97-0.99 of the off arm).
+bool gr_down_max4() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GR_DOWN_MAX4");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// the split norm with registers (gr_norm_split_fast_kernel): gfx12 only until another arch is measured;
+// STRATA_GR_NORM_FAST=0 / 1 forces it off / on
+bool norm_fast_on() {
+#if defined(__HIPCC__)
+    static const int env = [] { const char* e = std::getenv("STRATA_GR_NORM_FAST"); return e != nullptr ? (std::atoi(e) != 0 ? 1 : 0) : -1; }();
+    if (env >= 0) return env != 0;
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        cudaDeviceProp p;
+        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#else
+    return false;
+#endif
+}
+
+// STRATA_QFUSE_HC_LOCAL=0 puts the atomic-tail up kernel back under STRATA_QFUSE_HC (default: the 32-column kernel)
+bool qfuse_hc_local() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_QFUSE_HC_LOCAL"); return e == nullptr || std::atoi(e) != 0; }();
+    return on;
+}
+void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                  unsigned long long *stamp_buf, int stamp_i0) {
+    const int n_tok = m.T;
+#if STRATA_GR_FAST_BUILD
+    // gfx906: the latency-hidden norm/up (STRATA_GR_FAST=0: off) - the same sums in the same order as the kernels
+    // they replace (gr_parity checks the multi-token read against single-token calls bitwise)
+    const bool fast = gr_fast();
+    if (variant >= kHcSplit) {
+        if (norm_fast_on()) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<
+                dpct_kernel_name<class gr_norm_split_fast_kernel_7c7f5c>>(
+                sycl::nd_range<3>(sycl::range(1, HC, (unsigned)n_tok) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_norm_split_fast_kernel(m);
+                    });
+        } else {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<
+                dpct_kernel_name<class gr_norm_split_kernel_200589>>(
+                sycl::nd_range<3>(sycl::range(1, HC, (unsigned)n_tok) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_norm_split_kernel(m);
+                    });
+        }
+    } else if (fast) {
+=======
+#if STRATA_GR_FAST_BUILD
+__dpct_inline__ void
+gr_norm_fast_kernel(GrMulti m); // below, with the AMD fast path
+__dpct_inline__ void gr_up_fast_kernel(GrMulti m);
+}  // namespace
+static bool gr_fast();
+namespace {
+#endif
+// STRATA_GR_DOWN_MAX4=1 (opt-in): launches of up to 4 tokens hold 4 tokens' sums per thread instead of kFusedGrMaxT (the
+// same bits; checked bitwise on the 5070 for 0.1.40). Default off: a 10-pair interleaved decode A/B on the RTX 5070 (Q2_0,
+// default config) did not show the +2.8-3.5% of bench #832 (medians 0.97-0.99 of the off arm).
+bool gr_down_max4() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GR_DOWN_MAX4");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// STRATA_GR_DOWN_WPC=8 (default: the launch as it was), 4 or 2: warps per block of the staged down kernel. One warp
+// still sums one row, so the bits are the same; only the grid (41 / 81 / 162 blocks) and the warps sharing a tile change.
+int down_wpc() {
+    static const int wpc = [] {
+        const char* v = std::getenv("STRATA_GR_DOWN_WPC");
+        const int w = v != nullptr ? std::atoi(v) : WARPS;
+        return w == 2 || w == 4 || w == 8 ? w : WARPS;
+    }();
+    return wpc;
+}
+
+// the split norm with registers (gr_norm_split_fast_kernel): gfx12 only until another arch is measured;
+// STRATA_GR_NORM_FAST=0 / 1 forces it off / on
+bool norm_fast_on() {
+#if defined(__HIPCC__)
+    static const int env = [] { const char* e = std::getenv("STRATA_GR_NORM_FAST"); return e != nullptr ? (std::atoi(e) != 0 ? 1 : 0) : -1; }();
+    if (env >= 0) return env != 0;
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        cudaDeviceProp p;
+        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#else
+    return false;
+#endif
+}
+
+// STRATA_QFUSE_HC_LOCAL=0 puts the atomic-tail up kernel back under STRATA_QFUSE_HC (default: the 32-column kernel)
+bool qfuse_hc_local() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_QFUSE_HC_LOCAL"); return e == nullptr || std::atoi(e) != 0; }();
+    return on;
+}
+// Turing: gr_up75_kernel for 3+ tokens (bitwise gr_up_multi_kernel; fused_gr_bench cold on an RTX 2080 Ti, up incl. a
+// stamp: T 3 27.3 -> 24.6 us, T 4 33.2 -> 28.7, T 6 46.6 -> 36.6); STRATA_GR_UP75=0 / 1 forces it off / on
+bool up75_on() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const int env = [] { const char* v = std::getenv("STRATA_GR_UP75"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
+    if (env >= 0) return env != 0;
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 64) return false;
+    if (!per_dev[dev]) {
+        int major = 0, minor = 0;
+        major = dpct::get_device(dev).get_major_version();
+        minor = dpct::get_device(dev).get_minor_version();
+        per_dev[dev] = strata::sm75_default(major, minor) ? 2 : 1;   // Turing, STRATA_SM75_PERF=1
+    }
+    return per_dev[dev] == 2;
+#endif
+}
+// sm_75: the staged down kernel's tokens per block (gridDim.y = ct / tg), 0 = one block row for all of them.
+// STRATA_GR_DOWN_TG=n forces n where it divides the launch (0 = off).
+int down_tg(int ct) {
+#if defined(__HIPCC__)
+    (void) ct;
+    return 0;
+#else
+    static const int env = [] { const char* v = std::getenv("STRATA_GR_DOWN_TG"); return v ? std::atoi(v) : -1; }();
+    if (ct < 2) return 0;
+    if (env >= 0) return env > 0 && env <= 3 && ct % env == 0 ? env : 0;
+    // fused_gr_bench cold on an RTX 2080 Ti (down incl. a stamp): T 4 29.1 -> 27.3 us, T 6 38.5 -> 32.2 with pairs;
+    // one token per block is slower at every T (the weights are read from L2 once per group)
+    static int per_dev[64];   // 0 unknown, 1 no, 2 sm_75
+    int dev = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
+        dev >= 64) return 0;
+    if (!per_dev[dev]) {
+        int major = 0, minor = 0;
+        major = dpct::get_device(dev).get_major_version();
+        minor = dpct::get_device(dev).get_minor_version();
+        per_dev[dev] = strata::sm75_default(major, minor) ? 2 : 1;   // Turing, STRATA_SM75_PERF=1
+    }
+    return per_dev[dev] == 2 && (ct == 4 || ct == 6) ? 2 : 0;
+#endif
+}
+// The staged down launch of ct tokens with WPC warps per block (gr_down_staged_kernel<..., WPC>); tg > 0 cuts the
+// tokens into tg-token block rows along gridDim.y, as launch_multi always did.
+template <int WPC>
+void launch_down_staged(const GrMulti &c, int ct, size_t per_tok, int tg,
+                        bool exact_t, bool max4, size_t smem,
+                        dpct::queue_ptr st) {
+    constexpr int NT = WPC * 32;                                          // threads per block
+    constexpr unsigned NB = (unsigned) (LR / WPC + (HC + WPC - 1) / WPC); // the row blocks, then the inject blocks
+    if (exact_t && tg > 0 && tg < ct) {
+        const dpct::dim3 grid(NB, (unsigned)(ct / tg));
+        const size_t sm_g = (size_t) tg * per_tok;
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        if (tg == 1) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm_g), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<1, true, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        else if (tg == 2) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm_g), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<2>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<2, true, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        else {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm_g), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<3>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(grid * sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<3, true, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+    } else
+    /*
+    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
+    limit. To get the device limit, query info::device::max_work_group_size.
+    Adjust the work-group size if needed.
+    */
+        if (exact_t && ct == 1) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(smem), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, NB) *
+                                          sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<1, true, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        else if (exact_t && ct == 2) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(smem), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<2>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, NB) *
+                                          sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<2, true, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        else if (exact_t && ct == 3) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(smem), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<3>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, NB) *
+                                          sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<3, true, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        else if (exact_t && ct == 4) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(smem), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<4>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, NB) *
+                                          sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<4, true, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        else if (exact_t && ct == 5) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(smem), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<5>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, NB) *
+                                          sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<5, true, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        else if (exact_t && ct == 6) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(smem), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<6>,
+                    dpct_kernel_scalar<true>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, NB) *
+                                          sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<6, true, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        else if (max4) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(smem), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428, dpct_kernel_scalar<4>,
+                    dpct_kernel_scalar<false>, dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, NB) *
+                                          sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<4, false, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+        /*
+        DPCT1049: The work-group size passed to the SYCL kernel may exceed
+        the limit. To get the device limit, query
+        info::device::max_work_group_size. Adjust the work-group size if needed.
+        */
+        else {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(smem), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_staged_kernel_41b428,
+                    dpct_kernel_scalar<kFusedGrMaxT>, dpct_kernel_scalar<false>,
+                    dpct_kernel_scalar<WPC>>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, NB) *
+                                          sycl::range(1, 1, NT),
+                                      sycl::range(1, 1, NT)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_staged_kernel<kFusedGrMaxT, false, WPC>(
+                            c, dpct_local_acc_ct1
+                                   .get_multi_ptr<sycl::access::decorated::no>()
+                                   .get());
+                    });
+            });
+        }
+}
+
+void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                  unsigned long long *stamp_buf, int stamp_i0) {
+    const int n_tok = m.T;
+    const bool q8w = m.a[0].s_down != nullptr;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
+#if STRATA_GR_FAST_BUILD
+    // gfx906: the latency-hidden norm/up (STRATA_GR_FAST=0: off) - the same sums in the same order as the kernels
+    // they replace (gr_parity checks the multi-token read against single-token calls bitwise)
+    const bool fast = gr_fast();
+    if (variant >= kHcSplit) {
+        if (norm_fast_on()) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<
+                dpct_kernel_name<class gr_norm_split_fast_kernel_83f674>>(
+                sycl::nd_range<3>(sycl::range(1, HC, (unsigned)n_tok) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_norm_split_fast_kernel(m);
+                    });
+        } else {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<
+                dpct_kernel_name<class gr_norm_split_kernel_200589>>(
+                sycl::nd_range<3>(sycl::range(1, HC, (unsigned)n_tok) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_norm_split_kernel(m);
+                    });
+        }
+    } else if (fast) {
+>>>>>>> ours-now
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
         st->parallel_for<dpct_kernel_name<class gr_norm_split_kernel_200589>>(
             sycl::nd_range<3>(sycl::range(1, HC, (unsigned)n_tok) *
+||||||| base
+        st->parallel_for<dpct_kernel_name<class gr_norm_fast_kernel_3dd0b2>>(
+            sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
+=======
+        st->parallel_for<dpct_kernel_name<class gr_norm_fast_kernel_990368>>(
+            sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
+>>>>>>> ours-now
                                   sycl::range(1, 1, THREADS),
                               sycl::range(1, 1, THREADS)),
             exp_props,
@@ -1537,7 +2670,13 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
         st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_2f4d93>>(
+||||||| base
+        st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_9d64ff>>(
+=======
+        st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_89dcab>>(
+>>>>>>> ours-now
             sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
                                   sycl::range(1, 1, THREADS),
                               sycl::range(1, 1, THREADS)),
@@ -1547,7 +2686,8 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
             });
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
-    const bool staged = variant >= kHcStaged;
+    // STRATA_HC_Q8: the staged down kernel reads bf16 only, so Q8 weights take split's down kernel (the plain one)
+    const bool staged = variant >= kHcStaged && m.a[0].s_down == nullptr;
     int tv = 2560;
     const int chunk_tok = down_chunk(staged, &tv);
     /*
@@ -1574,7 +2714,12 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
         static const bool max4_on = [] { const char* v = std::getenv("STRATA_GR_DOWN_MAX4"); return v && std::atoi(v) != 0; }();
         const bool max4 = max4_on && ct <= 4;
         if (staged) {
+<<<<<<< sycl
             if (max4) {
+||||||| base
+            // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
+            // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
+            if (exact_t && ct == 1) {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{
                     sycl::ext::oneapi::experimental::use_root_sync};
 
@@ -1582,23 +2727,93 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                         sycl::range(smem), cgh);
 
-                    cgh.parallel_for<
-                        dpct_kernel_name<class gr_down_staged_kernel_41b428,
-                                         dpct_kernel_scalar<4>>>(
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_staged_kernel_41b428,
+                        dpct_kernel_scalar<1>, dpct_kernel_scalar<true>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
                                           sycl::range(1, 1, THREADS)),
                         exp_props,
                         [=](sycl::nd_item<3> item_ct1)
                             [[sycl::reqd_sub_group_size(32)]] {
-                                gr_down_staged_kernel<4>(
+                                gr_down_staged_kernel<1, true>(
                                     c, dpct_local_acc_ct1
                                            .get_multi_ptr<
                                                sycl::access::decorated::no>()
                                            .get());
                             });
                 });
-            } else {
+            } else if (exact_t && ct == 2) {
+=======
+            // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
+            // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
+            const int tg = down_tg(ct);
+            const int wpc = down_wpc();   // STRATA_GR_DOWN_WPC: 8 (default), 4 or 2 warps per block
+            if (wpc == 4) launch_down_staged<4>(c, ct, per_tok, tg, exact_t, max4, smem, st);
+            else if (wpc == 2) launch_down_staged<2>(c, ct, per_tok, tg, exact_t, max4, smem, st);
+            else launch_down_staged<WARPS>(c, ct, per_tok, tg, exact_t, max4, smem, st);
+        } else if (tv == 1280) {
+            if (q8w) {   // STRATA_HC_REQ8
+                if (max4) {
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    st->submit([&](sycl::handler &cgh) {
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(smem), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class gr_down_multi_kernel_59dfa0,
+                            dpct_kernel_scalar<1280>, dpct_kernel_scalar<4>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(
+                                sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                    sycl::range(1, 1, THREADS),
+                                sycl::range(1, 1, THREADS)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    gr_down_multi_kernel<1280, 4, true>(
+                                        c,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    st->submit([&](sycl::handler &cgh) {
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(smem), cgh);
+
+                        cgh.parallel_for<
+                            dpct_kernel_name<class gr_down_multi_kernel_78b800,
+                                             dpct_kernel_scalar<1280>,
+                                             dpct_kernel_scalar<kFusedGrMaxT>,
+                                             dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(
+                                sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                    sycl::range(1, 1, THREADS),
+                                sycl::range(1, 1, THREADS)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    gr_down_multi_kernel<1280, kFusedGrMaxT,
+                                                         true>(
+                                        c,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                }
+            } else if (max4) {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{
                     sycl::ext::oneapi::experimental::use_root_sync};
 
@@ -1611,33 +2826,9 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     could not be deduced. You need to update this code.
                     */
                     cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_staged_kernel_41b428>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                              sycl::range(1, 1, THREADS),
-                                          sycl::range(1, 1, THREADS)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                gr_down_staged_kernel(
-                                    c, dpct_local_acc_ct1
-                                           .get_multi_ptr<
-                                               sycl::access::decorated::no>()
-                                           .get());
-                            });
-                });
-            }
-        } else if (tv == 1280) {
-            if (max4) {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                st->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                        sycl::range(smem), cgh);
-
-                    cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_4a9670,
-                        dpct_kernel_scalar<1280>, dpct_kernel_scalar<4>>>(
+                        class gr_down_multi_kernel_82646e,
+                        dpct_kernel_scalar<1280>, dpct_kernel_scalar<4>,
+                        dpct_placeholder /*Fix the type mannually*/>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
                                           sycl::range(1, 1, THREADS)),
@@ -1652,6 +2843,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                             });
                 });
             } else {
+>>>>>>> ours-now
                 auto exp_props = sycl::ext::oneapi::experimental::properties{
                     sycl::ext::oneapi::experimental::use_root_sync};
 
@@ -1659,6 +2851,257 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                         sycl::range(smem), cgh);
 
+<<<<<<< sycl
+                    cgh.parallel_for<
+                        dpct_kernel_name<class gr_down_staged_kernel_41b428,
+                                         dpct_kernel_scalar<4>>>(
+||||||| base
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_staged_kernel_41b428,
+                        dpct_kernel_scalar<2>, dpct_kernel_scalar<true>>>(
+=======
+                    /*
+                    DPCT1050: The template argument of the dpct_kernel_name
+                    could not be deduced. You need to update this code.
+                    */
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_multi_kernel_2b1d86,
+                        dpct_kernel_scalar<1280>,
+                        dpct_placeholder /*Fix the type mannually*/, dpct_kernel_scalar<1280>>>(
+>>>>>>> ours-now
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+<<<<<<< sycl
+                                gr_down_staged_kernel<4>(
+||||||| base
+                                gr_down_staged_kernel<2, true>(
+=======
+                                gr_down_multi_kernel<1280>(
+>>>>>>> ours-now
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+<<<<<<< sycl
+            } else {
+||||||| base
+            } else if (exact_t && ct == 3) {
+=======
+            }
+        } else {
+            if (q8w) {   // STRATA_HC_REQ8
+                if (max4) {
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    st->submit([&](sycl::handler &cgh) {
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(smem), cgh);
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class gr_down_multi_kernel_7a2a18,
+                            dpct_kernel_scalar<2560>, dpct_kernel_scalar<4>,
+                            dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(
+                                sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                    sycl::range(1, 1, THREADS),
+                                sycl::range(1, 1, THREADS)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    gr_down_multi_kernel<2560, 4, true>(
+                                        c,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                } else {
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+
+                    st->submit([&](sycl::handler &cgh) {
+                        sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                            sycl::range(smem), cgh);
+
+                        cgh.parallel_for<
+                            dpct_kernel_name<class gr_down_multi_kernel_2158d7,
+                                             dpct_kernel_scalar<2560>,
+                                             dpct_kernel_scalar<kFusedGrMaxT>,
+                                             dpct_kernel_scalar<true>>>(
+                            sycl::nd_range<3>(
+                                sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                    sycl::range(1, 1, THREADS),
+                                sycl::range(1, 1, THREADS)),
+                            exp_props,
+                            [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    gr_down_multi_kernel<2560, kFusedGrMaxT,
+                                                         true>(
+                                        c,
+                                        dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+                                });
+                    });
+                }
+            } else if (max4) {
+>>>>>>> ours-now
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                st->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range(smem), cgh);
+
+                    /*
+                    DPCT1050: The template argument of the dpct_kernel_name
+                    could not be deduced. You need to update this code.
+                    */
+                    cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
+                        class gr_down_staged_kernel_41b428>>(
+||||||| base
+                        class gr_down_staged_kernel_41b428,
+                        dpct_kernel_scalar<3>, dpct_kernel_scalar<true>>>(
+=======
+                        class gr_down_multi_kernel_ad98a3,
+                        dpct_kernel_scalar<2560>, dpct_kernel_scalar<4>,
+                        dpct_placeholder /*Fix the type mannually*/>>(
+>>>>>>> ours-now
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+<<<<<<< sycl
+                                gr_down_staged_kernel(
+||||||| base
+                                gr_down_staged_kernel<3, true>(
+=======
+                                gr_down_multi_kernel<2560, 4>(
+>>>>>>> ours-now
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+<<<<<<< sycl
+            }
+        } else if (tv == 1280) {
+            if (max4) {
+||||||| base
+            } else if (exact_t && ct == 4) {
+=======
+            } else {
+>>>>>>> ours-now
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                st->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range(smem), cgh);
+
+                    /*
+                    DPCT1050: The template argument of the dpct_kernel_name
+                    could not be deduced. You need to update this code.
+                    */
+                    cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
+                        class gr_down_multi_kernel_4a9670,
+                        dpct_kernel_scalar<1280>, dpct_kernel_scalar<4>>>(
+||||||| base
+                        class gr_down_staged_kernel_41b428,
+                        dpct_kernel_scalar<4>, dpct_kernel_scalar<true>>>(
+=======
+                        class gr_down_multi_kernel_5651bc,
+                        dpct_kernel_scalar<2560>,
+                        dpct_placeholder /*Fix the type mannually*/, dpct_kernel_scalar<2560>>>(
+>>>>>>> ours-now
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+<<<<<<< sycl
+                                gr_down_multi_kernel<1280, 4>(
+||||||| base
+                                gr_down_staged_kernel<4, true>(
+=======
+                                gr_down_multi_kernel<2560>(
+>>>>>>> ours-now
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+<<<<<<< sycl
+            } else {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+||||||| base
+            } else if (exact_t && ct == 5) {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+=======
+            }
+        }
+    }
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+#if STRATA_GR_FAST_BUILD
+    if (fast && !q8w) {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+>>>>>>> ours-now
+
+        st->parallel_for<dpct_kernel_name<class gr_up_fast_kernel_ec286a>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_fast_kernel(m);
+            });
+    } else
+#endif
+#if !STRATA_GR_FAST_BUILD
+        if (!q8w && m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {
+        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+            case 1: gr_up_q32_kernel<1, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 2: gr_up_q32_kernel<2, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 3: gr_up_q32_kernel<3, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 4: gr_up_q32_kernel<4, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 5: gr_up_q32_kernel<5, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 6: gr_up_q32_kernel<6, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            default: gr_up_q32_kernel<kFusedGrMaxT, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+        }
+        return;
+    }
+#endif
+    if (q8w) {   // STRATA_HC_REQ8: the up kernel on int8 rows
+        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+        case 1: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+<<<<<<< sycl
                     /*
                     DPCT1050: The template argument of the dpct_kernel_name
                     could not be deduced. You need to update this code.
@@ -1688,9 +3131,317 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                 st->submit([&](sycl::handler &cgh) {
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                         sycl::range(smem), cgh);
+||||||| base
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_staged_kernel_41b428,
+                        dpct_kernel_scalar<5>, dpct_kernel_scalar<true>>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gr_down_staged_kernel<5, true>(
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+            } else if (exact_t && ct == 6) {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
 
+                st->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range(smem), cgh);
+=======
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_multi_kernel_70aa8b, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_multi_kernel<1, true, true>(m);
+                    });
+        } break;
+        case 2: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+>>>>>>> ours-now
+
+<<<<<<< sycl
                     cgh.parallel_for<dpct_kernel_name<
                         class gr_down_multi_kernel_2d8885,
+                        dpct_kernel_scalar<2560>, dpct_kernel_scalar<4>>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gr_down_multi_kernel<2560, 4>(
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+            } else {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+||||||| base
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_staged_kernel_41b428,
+                        dpct_kernel_scalar<6>, dpct_kernel_scalar<true>>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gr_down_staged_kernel<6, true>(
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+            } else if (max4) {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+=======
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_multi_kernel_84edb5, dpct_kernel_scalar<2>,
+                dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_multi_kernel<2, true, true>(m);
+                    });
+        } break;
+        case 3: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+>>>>>>> ours-now
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_multi_kernel_135a5c, dpct_kernel_scalar<3>,
+                dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_multi_kernel<3, true, true>(m);
+                    });
+        } break;
+        case 4: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+<<<<<<< sycl
+                    /*
+                    DPCT1050: The template argument of the dpct_kernel_name
+                    could not be deduced. You need to update this code.
+                    */
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_multi_kernel_df2ead,
+                        dpct_kernel_scalar<2560>, dpct_kernel_scalar<2560>>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gr_down_multi_kernel<2560>(
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+            }
+        }
+    }
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    launch_gr_up_multi(st, m);   // STRATA_GR_UP_COLS (16 default, 8, 4): the same bits
+}
+||||||| base
+                    /*
+                    DPCT1050: The template argument of the dpct_kernel_name
+                    could not be deduced. You need to update this code.
+                    */
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_staged_kernel_41b428,
+                        dpct_kernel_scalar<4>,
+                        dpct_placeholder /*Fix the type mannually*/>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gr_down_staged_kernel<4>(
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+            } else {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                st->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range(smem), cgh);
+=======
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_multi_kernel_68bd65, dpct_kernel_scalar<4>,
+                dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_multi_kernel<4, true, true>(m);
+                    });
+        } break;
+        case 5: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_multi_kernel_acc34b, dpct_kernel_scalar<5>,
+                dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_multi_kernel<5, true, true>(m);
+                    });
+        } break;
+        case 6: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+>>>>>>> ours-now
+
+<<<<<<< sycl
+/// STRATA_HC_SPLIT: unset or 2 = the newest the check accepts (staged), 1 = at most split, 0 = the plain read
+int env_variant() {
+    const char* e = std::getenv("STRATA_HC_SPLIT");
+    if (e == nullptr || e[0] == '\0') return kHcStaged;
+    if (e[0] == '0') return kHcPlain;
+    if (e[0] == '1') return kHcSplit;
+    return kHcStaged;
+||||||| base
+                    /*
+                    DPCT1050: The template argument of the dpct_kernel_name
+                    could not be deduced. You need to update this code.
+                    */
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_staged_kernel_41b428,
+                        dpct_placeholder /*Fix the type mannually*/>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gr_down_staged_kernel(
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+            }
+        } else if (tv == 1280) {
+            if (max4) {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                st->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range(smem), cgh);
+
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_multi_kernel_a8e561,
+                        dpct_kernel_scalar<1280>, dpct_kernel_scalar<4>>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gr_down_multi_kernel<1280, 4>(
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+            } else {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                st->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range(smem), cgh);
+
+                    /*
+                    DPCT1050: The template argument of the dpct_kernel_name
+                    could not be deduced. You need to update this code.
+                    */
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_multi_kernel_3e94fa,
+                        dpct_kernel_scalar<1280>, dpct_kernel_scalar<1280>>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                              sycl::range(1, 1, THREADS),
+                                          sycl::range(1, 1, THREADS)),
+                        exp_props,
+                        [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                gr_down_multi_kernel<1280>(
+                                    c, dpct_local_acc_ct1
+                                           .get_multi_ptr<
+                                               sycl::access::decorated::no>()
+                                           .get());
+                            });
+                });
+            }
+        } else {
+            if (max4) {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+
+                st->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range(smem), cgh);
+
+                    cgh.parallel_for<dpct_kernel_name<
+                        class gr_down_multi_kernel_1ecd02,
                         dpct_kernel_scalar<2560>, dpct_kernel_scalar<4>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
@@ -1718,7 +3469,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     could not be deduced. You need to update this code.
                     */
                     cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_df2ead,
+                        class gr_down_multi_kernel_1df2f4,
                         dpct_kernel_scalar<2560>, dpct_kernel_scalar<2560>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
@@ -1737,7 +3488,150 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
-    launch_gr_up_multi(st, m);   // STRATA_GR_UP_COLS (16 default, 8, 4): the same bits
+#if STRATA_GR_FAST_BUILD
+    if (fast) {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<dpct_kernel_name<class gr_up_fast_kernel_8efc6a>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_fast_kernel(m);
+            });
+    } else
+#endif
+#if !STRATA_GR_FAST_BUILD
+        if (m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {
+        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+            case 1: gr_up_q32_kernel<1, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 2: gr_up_q32_kernel<2, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 3: gr_up_q32_kernel<3, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 4: gr_up_q32_kernel<4, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 5: gr_up_q32_kernel<5, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            case 6: gr_up_q32_kernel<6, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+            default: gr_up_q32_kernel<kFusedGrMaxT, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
+        }
+        return;
+    }
+#endif
+    switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+    case 1: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_up_multi_kernel_ceedee,
+                             dpct_kernel_scalar<1>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_multi_kernel<1, true>(m);
+            });
+    } break;
+    case 2: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_up_multi_kernel_df1c4a,
+                             dpct_kernel_scalar<2>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_multi_kernel<2, true>(m);
+            });
+    } break;
+    case 3: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_up_multi_kernel_773423,
+                             dpct_kernel_scalar<3>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_multi_kernel<3, true>(m);
+            });
+    } break;
+    case 4: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_up_multi_kernel_4dd8e5,
+                             dpct_kernel_scalar<4>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_multi_kernel<4, true>(m);
+            });
+    } break;
+    case 5: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_up_multi_kernel_6ce9a2,
+                             dpct_kernel_scalar<5>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_multi_kernel<5, true>(m);
+            });
+    } break;
+    case 6: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_up_multi_kernel_b70661,
+                             dpct_kernel_scalar<6>, dpct_kernel_scalar<true>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_multi_kernel<6, true>(m);
+            });
+    } break;
+    default: {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<dpct_kernel_name<class gr_up_multi_kernel_b6eff6,
+                                          dpct_kernel_scalar<kFusedGrMaxT>,
+                                          dpct_kernel_scalar<false>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_multi_kernel<kFusedGrMaxT, false>(m);
+            });
+    } break;
+    }
 }
 
 /// STRATA_HC_SPLIT: unset or 2 = the newest the check accepts (staged), 1 = at most split, 0 = the plain read
@@ -1751,6 +3645,2582 @@ int env_variant() {
 
 // per device: the variant `fused_gr_check` chose (0 = not checked yet)
 std::atomic<int> g_variant[64];
+
+
+#if STRATA_GR_FAST_BUILD
+// ---- AMD fast path (STRATA_GR_FAST, default 1; 0 = the old kernels): the same arithmetic per value in the same order, latency
+// hidden.  gr_norm: one block per token (as before) but a thread's 10 float4 of R / bo / w_norm are loaded
+// before any is used, and xn stays in registers until rs is known (was: store, then re-read the 40 KB).
+// gr_up: a warp's 8 rows of w_up and their epilogue inputs are loaded before the dots (was: one row's load chain
+// after another).
+constexpr int NQ = D / (THREADS * 4);   // 10 float4 per thread
+static_assert(D % (THREADS * 4) == 0, "whole float4 per thread");
+/*
+DPCT1110: The total declared local variable size in device function
+gr_norm_fast_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_norm_fast_kernel(GrMulti m) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &part =
+    *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS][HC]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_rs =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[HC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const FusedGrArgs &a = m.a[item_ct1.get_group(2)];
+    float *xn = m.xn + (size_t)item_ct1.get_group(2) * D;
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    float gw[HC];
+#pragma unroll
+    for (int c = 0; c < HC; ++c) gw[c] = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    sycl::float4 r[NQ], g[NQ];
+#pragma unroll
+    for (int k = 0; k < NQ; ++k) {
+        const int i = t * 4 + k * THREADS * 4;
+        r[k] = *reinterpret_cast<const sycl::float4 *>(a.R + i);
+        g[k] = *reinterpret_cast<const sycl::float4 *>(a.w_norm + i);
+    }
+    if (a.apply) {
+#pragma unroll
+        for (int k = 0; k < NQ; ++k) {
+            const int i = t * 4 + k * THREADS * 4, c = i / N, d = i - c * N;
+            const sycl::float4 b =
+                *reinterpret_cast<const sycl::float4 *>(a.bo_prev + d);
+            r[k].x() = sycl::fma((float)(b.x()), gw[c], r[k].x());
+                r[k].y() = sycl::fma((float)(b.y()), gw[c], r[k].y());
+            r[k].z() = sycl::fma((float)(b.z()), gw[c], r[k].z());
+                r[k].w() = sycl::fma((float)(b.w()), gw[c], r[k].w());
+        }
+    }
+    float ss[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int k = 0; k < NQ; ++k) {
+        const int i = t * 4 + k * THREADS * 4, c = i / N;
+        const float sq = r[k].x() * r[k].x() + r[k].y() * r[k].y() +
+                         r[k].z() * r[k].z() + r[k].w() * r[k].w();
+#pragma unroll
+        for (int cc = 0; cc < HC; ++cc) if (cc == c) ss[cc] += sq;
+        r[k] = sycl::float4(r[k].x() * g[k].x(), r[k].y() * g[k].y(),
+                            r[k].z() * g[k].z(), r[k].w() * g[k].w());
+    }
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const float v = warp_sum(ss[c]);
+        if (lane == 0) part[warp][c] = v;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (t < HC) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) s += part[w][t];
+        s_rs[t] = sycl::rsqrt(s / (float)N + a.eps);
+        a.rs[t] = s_rs[t];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+#pragma unroll
+    for (int k = 0; k < NQ; ++k) {
+        const int i = t * 4 + k * THREADS * 4;
+        const float sr = s_rs[i / N];
+        *reinterpret_cast<sycl::float4 *>(xn + i) = sycl::float4(
+            r[k].x() * sr, r[k].y() * sr, r[k].z() * sr, r[k].w() * sr);
+    }
+}
+// gr_up: 8 lanes per row instead of a 32-lane warp.  Lane j holds the old lanes j, j+8, j+16, j+24 (and chunk
+// 32+j, the old lane j's second chunk): the xor tree's stages 16 and 8 are its own adds (a + b == b + a), stages
+// 4, 2, 1 are shuffles inside the 8 - the same tree, bitwise the same sum, 3 shuffles a token instead of 5 and no
+// idle lanes on the tail chunks.  A block's 64 rows are 2 passes of 32 groups, their weights loaded up front.
+__dpct_inline__ float xor8(float v) {
+#pragma unroll
+#if defined(__HIPCC__)
+    for (int o = 4; o > 0; o >>= 1) v += __shfl_xor(v, o, 64);
+#else
+    /*
+    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    for (int o = 4; o > 0; o >>= 1) v +=
+        dpct::experimental::permute_sub_group_by_xor(
+            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
+            o);
+#endif
+    return v;
+}
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_fast_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_up_fast_kernel(GrMulti m) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+    float[kFusedGrMaxT][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[kFusedGrMaxT][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), j = t & 7, grp = t >> 3;
+    const int T = m.T;
+    const int d0 = item_ct1.get_group(2) * UPM_COLS;
+    static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "geometry");
+    sycl::uint4 w[2][5];
+    float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, rsc[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
+    const bool apply = j < T && m.a[j < T ? j : 0].apply;
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const sycl::uint4 *w4 =
+            reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
+#pragma unroll
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        for (int q = 0; q < 4; ++q) w[p][q] = *(w4 + j + 8 * q);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        w[p][4] = *(w4 + 32 + j);
+        if (j < T) {
+            const FusedGrArgs& a = m.a[j];
+            rv[p] = a.R[i];
+            wn[p] = a.w_norm[i];
+            rsc[p] = a.rs[c];
+            if (apply) { bo[p] = a.bo_prev[d0 + dd]; ip[p] = a.inj_prev[c]; }
+        }
+    }
+#pragma unroll
+    for (int i = t; i < T * LR; i += THREADS)
+        lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            const float* l = lo[k];
+            const float p0 = dot8(w[p][0], l + j * 8) + dot8(w[p][4], l + (32 + j) * 8);   // old lane j
+            const float p1 = dot8(w[p][1], l + (j + 8) * 8);                               // old lane j + 8
+            const float p2 = dot8(w[p][2], l + (j + 16) * 8);                              // old lane j + 16
+            const float p3 = dot8(w[p][3], l + (j + 24) * 8);                              // old lane j + 24
+            const float s = xor8((p0 + p2) + (p1 + p3));   // stage 16: (j, j+16), (j+8, j+24); stage 8; then 4, 2, 1
+            if (j == k) mine = s;
+        }
+        if (j < T) {
+            float x0 = rv[p];
+            if (apply) {
+                x0 = sycl::fma(bo[p], 2.0f * sigmoidf_(ip[p] / (float)HC), x0);
+                m.a[j].R_out[i] = x0;
+            }
+            const float x = x0 * wn[p] * rsc[p];
+            g[j][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE, as gr_up_multi_kernel
+}
+#endif
+
+#if defined(STRATA_HIP_GFX906)
+// ---- AMD: `gr_down_multi` split along K.  The CUDA kernel is one warp per row of w_down (320 + 4 rows), 41
+// blocks: on a 60-CU gfx906 that left most of the card idle and read the 6.5 MB matrix at ~100 GB/s.  Here a block
+// is 8 wavefronts = 8 rows of one K-slice of 2048 (the slice of every token's xn staged in LDS once), 41 x 5
+// blocks, and a second kernel adds the 5 slice sums in a fixed order and runs the epilogue.  A token's result does
+// not depend on how many tokens share the window (each column is reduced on its own).
+constexpr int GS_SL = 2048;                   // K per slice
+constexpr int GS_S = D / GS_SL;               // 5 slices
+constexpr int GS_ROWS = LR + HC;              // 324: the down rows, then the inject rows
+constexpr int GS_WAVES = 8;
+static_assert(D % GS_SL == 0 && GS_SL == 64 * 8 * 4, "a lane takes 4 chunks of 8 per slice");
+// the slice sums: a module-scope device array is per device by construction, and needs no allocation during a
+// graph capture
+__device__ float g_gr_part[GS_S * kFusedGrMaxT * GS_ROWS];
+__global__ void __launch_bounds__(GS_WAVES * 64) gr_down_split_kernel(GrMulti m) {
+    float* part = g_gr_part;
+    extern __shared__ __align__(16) float tile[];   // [T][GS_SL]
+    const int t = threadIdx.x, lane = t & 63, wave = t >> 6;
+    const int T = m.T, sl = blockIdx.y;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int row = inject_block ? wave : blockIdx.x * GS_WAVES + wave;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || wave >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow) + sl * (GS_SL / 8);
+    uint4 wv[4];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) wv[q] = __ldg(w4 + lane + 64 * q);
+    }
+    const float4* src4 = reinterpret_cast<const float4*>(m.xn);
+    float4* tile4 = reinterpret_cast<float4*>(tile);
+    for (int i = t; i < T * (GS_SL / 4); i += GS_WAVES * 64) {
+        const int k = i / (GS_SL / 4), off = i - k * (GS_SL / 4);
+        tile4[i] = src4[((size_t) k * D + (size_t) sl * GS_SL) / 4 + off];
+    }
+    __syncthreads();
+    if (!active) return;
+    float acc[kFusedGrMaxT];
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int j = lane + 64 * q;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k)
+            if (k < T) acc[k] += dot8(wv[q], tile + k * GS_SL + j * 8);
+    }
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) {
+        if (k >= T) break;
+        float v = acc[k];
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+        if (lane == 0) part[((size_t) sl * kFusedGrMaxT + k) * GS_ROWS + (inject_block ? LR + row : row)] = v;
+    }
+}
+__global__ void gr_down_finish_kernel(GrMulti m) {
+    const float* part = g_gr_part;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = i / GS_ROWS, r = i - k * GS_ROWS;
+    if (k >= m.T) return;
+    const bool inject = r >= LR;
+    if (inject && m.a[0].w_inject == nullptr) return;
+    float s = 0.0f;
+#pragma unroll
+    for (int sl = 0; sl < GS_S; ++sl) s += part[((size_t) sl * kFusedGrMaxT + k) * GS_ROWS + r];
+    if (inject) {
+        m.a[k].inject_out[r - LR] = s;
+    } else {
+        const float x = s / (float) HC;
+        m.a[k].lo[r] = x / (1.0f + __expf(-x));
+    }
+}
+
+#endif
+
+// ================================ S23 experiment (STRATA_HC_Q8=1): the read with the GGUF's Q8_0 projections ======
+// The pack holds the hyper-connection projections as BF16 (iq_pack.py --compat-bf16 rounds the GGUF's Q8_0 values to
+// BF16: 1.20 GiB per verify step); this read takes the Q8_0 bytes as stored (0.65 GiB - and the GGUF's own values,
+// not a rounding of them).  The layout is the stream split of the v3 read above, at 4 chunks per stream: `down` runs
+// on (10 groups of 32 rows + the inject rows) x 16 chunks of 640 columns = 176 blocks, each staging its chunk of
+// R' * w_norm (unscaled) for the T tokens and writing the chunk's partial dots and sums of squares; `up` sums them
+// per stream in a fixed order, applies rs, SwiGLU-free silu, and runs the default epilogue.  Another summation order
+// and other weights than the default read: an output-changing step (measured, quality-checked).
+constexpr int Q8B = 34;                             // Q8_0 block: fp16 d + 32 int8
+constexpr int Q8_RPW = 4;                           // down rows per warp
+constexpr int Q8_RG = LR / (WARPS * Q8_RPW);        // 10 row groups (+1: the inject rows)
+constexpr int Q8_KC = 640, Q8_NKC = D / Q8_KC;      // 16 chunks, 4 per stream
+constexpr int Q8_CPS = N / Q8_KC;                   // chunks per stream
+constexpr int Q8_SPB = Q8_KC / 128;                 // 5 steps of 4 Q8_0 blocks (8 lanes x 4 values each)
+__dpct_inline__ uint32_t q8_ld16(const uint8_t *p) {
+    return *(const uint16_t *)p;
+}
+__dpct_inline__ float q8_half(uint32_t h) {
+    return sycl::vec<sycl::half, 1>(
+               sycl::bit_cast<sycl::half, unsigned short>((unsigned short)h))
+        .convert<float, sycl::rounding_mode::automatic>()[0];
+}
+__dpct_inline__ sycl::float4 q8_four(uint32_t q, float d) {
+    return sycl::float4(
+        d * (float)(int8_t)(q & 255u), d * (float)(int8_t)((q >> 8) & 255u),
+        d * (float)(int8_t)((q >> 16) & 255u), d * (float)(int8_t)(q >> 24));
+}
+
+template <int T>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_down_q8_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_down_q8_kernel(GrMulti m, float *__restrict__ part,
+                                       float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &xs =
+    *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][Q8_KC]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &red =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS][T]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int rg = item_ct1.get_group(2), kc = item_ct1.get_group(1),
+              c = kc / Q8_CPS;
+    const bool inj = rg == Q8_RG;
+    // S25: the inject rows are F32 in the GGUF with BF16-exact values, so by default they are read as the pack's BF16
+    // (exact); a Q8_0 copy (STRATA_HC_Q8_INJECT=1) is the other option
+    const bool inj_bf16 = inj && m.a[0].q8_inject == nullptr;
+    const int nrows = inj ? (((m.a[0].q8_inject != nullptr || m.a[0].w_inject != nullptr) && warp < HC) ? 1 : 0) : Q8_RPW;
+    const int row0 = inj ? warp : (rg * WARPS + warp) * Q8_RPW;
+    const uint8_t* wb = inj ? m.a[0].q8_inject : m.a[0].q8_down;
+    const int sub = lane & 7, bl = lane >> 3;       // lanes 8b..8b+7: one Q8_0 block, 4 values each
+    uint32_t q[Q8_RPW][Q8_SPB];
+    float dq[Q8_RPW][Q8_SPB];
+#pragma unroll
+    for (int r = 0; r < Q8_RPW; ++r) {
+        if (r >= nrows || inj_bf16) break;
+        const uint8_t* row = wb + (size_t) (row0 + r) * (D / 32) * Q8B + (size_t) kc * (Q8_KC / 32) * Q8B;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const uint8_t* blk = row + (4 * s + bl) * Q8B;
+            dq[r][s] = q8_half(q8_ld16(blk));
+            q[r][s] = q8_ld16(blk + 2 + 4 * sub) | q8_ld16(blk + 4 + 4 * sub) << 16;
+        }
+    }
+    float ssp[T];
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        ssp[k] = 0.0f;
+        const FusedGrArgs& a = m.a[k];
+        const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+        for (int i = t; i < Q8_KC / 4; i += THREADS) {
+            const int col = kc * Q8_KC + 4 * i;
+            sycl::float4 r = *reinterpret_cast<const sycl::float4 *>(a.R + col);
+            if (a.apply) {
+                const sycl::float4 b = *reinterpret_cast<const sycl::float4 *>(
+                    a.bo_prev + (col - c * N));
+                r.x() = sycl::fma((float)(b.x()), (float)gw, r.x());
+                    r.y() = sycl::fma((float)(b.y()), (float)gw, r.y());
+                r.z() = sycl::fma((float)(b.z()), (float)gw, r.z());
+                    r.w() = sycl::fma((float)(b.w()), (float)gw, r.w());
+            }
+            const sycl::float4 g =
+                *reinterpret_cast<const sycl::float4 *>(a.w_norm + col);
+            ssp[k] +=
+                r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+            *reinterpret_cast<sycl::float4 *>(&xs[k][4 * i]) = sycl::float4(
+                r.x() * g.x(), r.y() * g.y(), r.z() * g.z(), r.w() * g.w());
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        const float v = warp_sum(ssp[k]);
+        if (lane == 0) red[warp][k] = v;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (rg == 0 && t < T) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) s += red[w][t];
+        ssg[t * Q8_NKC + kc] = s;
+    }
+    if (nrows == 0) return;
+#pragma unroll
+    for (int r = 0; r < Q8_RPW; ++r) {
+        if (r >= nrows) break;
+        float acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const int v = 32 * (4 * s + bl) + 4 * sub;
+            sycl::float4 w;
+            if (inj_bf16) {
+                const sycl::uint2 b = *reinterpret_cast<const sycl::uint2 *>(
+                    m.a[0].w_inject + (size_t)row0 * D + (size_t)kc * Q8_KC +
+                    v);
+                w = sycl::float4(sycl::bit_cast<float>(b.x() << 16),
+                                 sycl::bit_cast<float>(b.x() & 0xffff0000u),
+                                 sycl::bit_cast<float>(b.y() << 16),
+                                 sycl::bit_cast<float>(b.y() & 0xffff0000u));
+            } else {
+                w = q8_four(q[r][s], dq[r][s]);
+            }
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                const sycl::float4 x =
+                    *reinterpret_cast<const sycl::float4 *>(&xs[k][v]);
+                acc[k] = sycl::fma(w.x(), (float)(x.x()), acc[k]);
+                    acc[k] = sycl::fma(w.y(), (float)(x.y()), acc[k]);
+                acc[k] = sycl::fma(w.z(), (float)(x.z()), acc[k]);
+                    acc[k] = sycl::fma(w.w(), (float)(x.w()), acc[k]);
+            }
+        }
+        const int prow = inj ? LR + warp : row0 + r;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float v = warp_sum(acc[k]);
+            if (lane == 0) part[((size_t) k * Q8_NKC + kc) * PR + prow] = v;
+        }
+    }
+}
+
+template <int T>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_q8_kernel exceeds 128 bytes and may cause high register pressure. Consult
+with your hardware vendor to find the total register size available and adjust
+the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_up_q8_kernel(GrMulti m, const float *__restrict__ part,
+                                     const float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &rsS =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[T][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int d0 = item_ct1.get_group(2) * UPM_COLS;
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        const float r = sycl::rsqrt(ss / (float)N + m.a[k].eps);
+        rsS[k][c] = r;
+        if (item_ct1.get_group(2) == 0) m.a[k].rs[c] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * PR; i += THREADS) {
+        const int k = i / PR, r = i - k * PR;
+        if (r >= LR && (item_ct1.get_group(2) != 0 ||
+                        m.a[k].w_inject == nullptr)) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+            sum = sycl::fma(rsS[k][c], p, sum);
+        }
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            lo[k][r] = x / (1.0f + sycl::native::exp(-x));
+        } else {
+            m.a[k].inject_out[r - LR] = sum;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    constexpr int RPW8 = HC * UPM_COLS / WARPS;     // 8 rows per warp
+#pragma unroll 1
+    for (int qq = 0; qq < RPW8; ++qq) {
+        const int r = warp + qq * WARPS;
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+        sycl::float4 w[3];
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {   // lane: values 4 lane + 128 s (the third step: lanes 0-15)
+            const int v = 4 * lane + 128 * s;
+            if (v < LR) {
+                const uint8_t* blk = row + (v >> 5) * Q8B;
+                w[s] = q8_four(q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16, q8_half(q8_ld16(blk)));
+            } else {
+                w[s] = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const sycl::float4 x =
+                        *reinterpret_cast<const sycl::float4 *>(&lo[k][v]);
+                    acc = sycl::fma(w[s].x(), (float)(x.x()), acc);
+                        acc = sycl::fma(w[s].y(), (float)(x.y()), acc);
+                    acc = sycl::fma(w[s].z(), (float)(x.z()), acc);
+                        acc = sycl::fma(w[s].w(), (float)(x.w()), acc);
+                }
+            }
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsS[lane][c];
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
+}
+
+
+// STRATA_HC_Q8 on HIP gfx12: gr_up_q8_kernel with 32 columns / 512 threads a block, so a block owns a whole q8_1 group
+// (STRATA_QFUSE_HC: no counter, no fence; the same arithmetic per value as gr_up_q8_kernel)
+template <int T>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_q8_q32_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+void gr_up_q8_q32_kernel(GrMulti m, const float *__restrict__ part,
+                         const float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &rsS =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[T][HC][Q32_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int d0 = item_ct1.get_group(2) * Q32_COLS;
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        const float r = sycl::rsqrt(ss / (float)N + m.a[k].eps);
+        rsS[k][c] = r;
+        if (item_ct1.get_group(2) == 0) m.a[k].rs[c] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * PR; i += Q32_THREADS) {
+        const int k = i / PR, r = i - k * PR;
+        if (r >= LR && (item_ct1.get_group(2) != 0 ||
+                        m.a[k].w_inject == nullptr)) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+            sum = fmaf(rsS[k][c], p, sum);
+        }
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            lo[k][r] = x / (1.0f + sycl::native::exp(-x));
+        } else {
+            m.a[k].inject_out[r - LR] = sum;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    constexpr int RPW8 = HC * Q32_COLS / Q32_WARPS;     // 8 rows per warp
+#pragma unroll 1
+    for (int qq = 0; qq < RPW8; ++qq) {
+        const int r = warp + qq * Q32_WARPS;
+        const int c = r / Q32_COLS, dd = r - c * Q32_COLS, i = c * N + d0 + dd;
+        const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+        sycl::float4 w[3];
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {   // lane: values 4 lane + 128 s (the third step: lanes 0-15)
+            const int v = 4 * lane + 128 * s;
+            if (v < LR) {
+                const uint8_t* blk = row + (v >> 5) * Q8B;
+                w[s] = q8_four(q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16, q8_half(q8_ld16(blk)));
+            } else {
+                w[s] = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const sycl::float4 x =
+                        *reinterpret_cast<const sycl::float4 *>(&lo[k][v]);
+                    acc = sycl::fma(w[s].x(), (float)(x.x()), acc);
+                        acc = sycl::fma(w[s].y(), (float)(x.y()), acc);
+                    acc = sycl::fma(w[s].z(), (float)(x.z()), acc);
+                        acc = sycl::fma(w[s].w(), (float)(x.w()), acc);
+                }
+            }
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsS[lane][c];
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * Q32_COLS; i += Q32_THREADS) {
+        const int k = i / Q32_COLS, col = i - k * Q32_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // the block owns the whole q8_1 group (32 columns): quantize it here (gr_up_q32_kernel's tail), no counter, no fence
+    if (m.a[0].q8_mixed != nullptr && warp < T) {
+        const float xi = m.a[warp].mixed[d0 + lane];
+        float amax = sycl::fabs(xi), sum = xi;
+#pragma unroll
+        /*
+        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
+        feature masked sub_group function which may not be supported by all
+        compilers or runtimes. You may need to adjust the code.
+        */
+        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(
+            amax,
+            dpct::experimental::permute_sub_group_by_xor(
+                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+                amax, o));
+#pragma unroll
+        /*
+        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
+        feature masked sub_group function which may not be supported by all
+        compilers or runtimes. You may need to adjust the code.
+        */
+        for (int o = 16; o > 0; o >>= 1) sum +=
+            dpct::experimental::permute_sub_group_by_xor(
+                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+                sum, o);
+        const float d = q8_1_finite(amax / 127.0f);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + d0 / 32;
+        y->qs[lane] = q;
+        if (lane == 0) y->ds = q8_1_ds(d, sum);
+    }
+}
+
+
+
+// S26 STRATA_TSUM=1: gr_down_q8_kernel / gr_up_q8_kernel with each row's T per-token warp sums (and the sums of
+// squares) as one transposed butterfly (s26_tsum.cuh): bitwise the same values (S26 ws4 harness, every output equal,
+// T 1-4: 1.00 / 1.03 / 1.03 / 1.15x per read). PF (all rows' weights in registers before the part / lo phase) was
+// slower (0.92-1.03x) and is off.
+using s26ts::tsum;
+using s26ts::tsum_token;
+using s26ts::tsum_lane;
+using s26ts::pow2_ceil;
+// gr_down_q8_kernel / gr_up_q8_kernel with every per-token warp sum done as one transposed butterfly per row (tsum)
+template <int T, int RPW = Q8_RPW>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_down_q8_fast_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_down_q8_fast_kernel(GrMulti m, float *__restrict__ part,
+                                            float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int P = pow2_ceil(T);
+    constexpr int RG_ = LR / (WARPS * RPW);
+    auto &xs =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][Q8_KC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &red =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS][T]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int rg = item_ct1.get_group(2), kc = item_ct1.get_group(1),
+              c = kc / Q8_CPS;
+    const bool inj = rg == RG_;
+    const bool inj_bf16 = inj && m.a[0].q8_inject == nullptr;
+    const int nrows = inj ? (((m.a[0].q8_inject != nullptr || m.a[0].w_inject != nullptr) && warp < HC) ? 1 : 0) : RPW;
+    const int row0 = inj ? warp : (rg * WARPS + warp) * RPW;
+    const uint8_t* wb = inj ? m.a[0].q8_inject : m.a[0].q8_down;
+    const int sub = lane & 7, bl = lane >> 3;
+    const int tk = tsum_token<P>(lane);
+    const bool owner = lane == tsum_lane<P>(tk) && tk < T;
+    uint32_t q[RPW][Q8_SPB];
+    float dq[RPW][Q8_SPB];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        if (r >= nrows || inj_bf16) break;
+        const uint8_t* row = wb + (size_t) (row0 + r) * (D / 32) * Q8B + (size_t) kc * (Q8_KC / 32) * Q8B;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const uint8_t* blk = row + (4 * s + bl) * Q8B;
+            dq[r][s] = q8_half(q8_ld16(blk));
+            q[r][s] = q8_ld16(blk + 2 + 4 * sub) | q8_ld16(blk + 4 + 4 * sub) << 16;
+        }
+    }
+    float ssp[P];
+#pragma unroll
+    for (int k = 0; k < P; ++k) ssp[k] = 0.0f;
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        const FusedGrArgs& a = m.a[k];
+        const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+        for (int i = t; i < Q8_KC / 4; i += THREADS) {
+            const int col = kc * Q8_KC + 4 * i;
+            sycl::float4 r = *reinterpret_cast<const sycl::float4 *>(a.R + col);
+            if (a.apply) {
+                const sycl::float4 b = *reinterpret_cast<const sycl::float4 *>(
+                    a.bo_prev + (col - c * N));
+                r.x() = sycl::fma((float)(b.x()), (float)gw, r.x());
+                    r.y() = sycl::fma((float)(b.y()), (float)gw, r.y());
+                r.z() = sycl::fma((float)(b.z()), (float)gw, r.z());
+                    r.w() = sycl::fma((float)(b.w()), (float)gw, r.w());
+            }
+            const sycl::float4 g =
+                *reinterpret_cast<const sycl::float4 *>(a.w_norm + col);
+            ssp[k] +=
+                r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+            *reinterpret_cast<sycl::float4 *>(&xs[k][4 * i]) = sycl::float4(
+                r.x() * g.x(), r.y() * g.y(), r.z() * g.z(), r.w() * g.w());
+        }
+    }
+    {
+        const float v = tsum<P>(ssp, lane);
+        if (owner) red[warp][tk] = v;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (rg == 0 && t < T) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) s += red[w][t];
+        ssg[t * Q8_NKC + kc] = s;
+    }
+    if (nrows == 0) return;
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        if (r >= nrows) break;
+        float acc[P];
+#pragma unroll
+        for (int k = 0; k < P; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const int v = 32 * (4 * s + bl) + 4 * sub;
+            sycl::float4 w;
+            if (inj_bf16) {
+                const sycl::uint2 b = *reinterpret_cast<const sycl::uint2 *>(
+                    m.a[0].w_inject + (size_t)row0 * D + (size_t)kc * Q8_KC +
+                    v);
+                w = sycl::float4(sycl::bit_cast<float>(b.x() << 16),
+                                 sycl::bit_cast<float>(b.x() & 0xffff0000u),
+                                 sycl::bit_cast<float>(b.y() << 16),
+                                 sycl::bit_cast<float>(b.y() & 0xffff0000u));
+            } else {
+                w = q8_four(q[r][s], dq[r][s]);
+            }
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                const sycl::float4 x =
+                    *reinterpret_cast<const sycl::float4 *>(&xs[k][v]);
+                acc[k] = sycl::fma(w.x(), (float)(x.x()), acc[k]);
+                    acc[k] = sycl::fma(w.y(), (float)(x.y()), acc[k]);
+                acc[k] = sycl::fma(w.z(), (float)(x.z()), acc[k]);
+                    acc[k] = sycl::fma(w.w(), (float)(x.w()), acc[k]);
+            }
+        }
+        const int prow = inj ? LR + warp : row0 + r;
+        const float v = tsum<P>(acc, lane);
+        if (owner) part[((size_t) tk * Q8_NKC + kc) * PR + prow] = v;
+    }
+}
+
+template <int T, bool PF = false>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_q8_fast_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_up_q8_fast_kernel(GrMulti m,
+                                          const float *__restrict__ part,
+                                          const float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int P = pow2_ceil(T);
+    constexpr int RPW8 = HC * UPM_COLS / WARPS;
+    auto &lo =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][LR]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &rsS =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[T][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int d0 = item_ct1.get_group(2) * UPM_COLS;
+    const int tk = tsum_token<P>(lane);
+    const bool owner = lane == tsum_lane<P>(tk) && tk < T;
+    // PF: every row's weights in registers before the part / lo phase (its latency hides the weight read)
+    uint32_t pq[PF ? RPW8 : 1][3];
+    float pd[PF ? RPW8 : 1][3];
+    if constexpr (PF) {
+#pragma unroll
+        for (int qq = 0; qq < RPW8; ++qq) {
+            const int r = warp + qq * WARPS;
+            const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+            const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const uint8_t* blk = row + (v >> 5) * Q8B;
+                    pq[qq][s] = q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16;
+                    pd[qq][s] = q8_half(q8_ld16(blk));
+                } else {
+                    pq[qq][s] = 0u; pd[qq][s] = 0.0f;
+                }
+            }
+        }
+    }
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        const float r = sycl::rsqrt(ss / (float)N + m.a[k].eps);
+        rsS[k][c] = r;
+        if (item_ct1.get_group(2) == 0) m.a[k].rs[c] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * PR; i += THREADS) {
+        const int k = i / PR, r = i - k * PR;
+        if (r >= LR && (item_ct1.get_group(2) != 0 ||
+                        m.a[k].w_inject == nullptr)) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+            sum = sycl::fma(rsS[k][c], p, sum);
+        }
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            lo[k][r] = x / (1.0f + sycl::native::exp(-x));
+        } else {
+            m.a[k].inject_out[r - LR] = sum;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+#pragma unroll(PF ? RPW8 : 2)
+    for (int qq = 0; qq < RPW8; ++qq) {
+        const int r = warp + qq * WARPS;
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+        sycl::float4 w[3];
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {
+            const int v = 4 * lane + 128 * s;
+            if (PF) {
+                w[s] = v < LR ? q8_four(pq[PF ? qq : 0][s], pd[PF ? qq : 0][s])
+                              : sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            } else if (v < LR) {
+                const uint8_t* blk = row + (v >> 5) * Q8B;
+                w[s] = q8_four(q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16, q8_half(q8_ld16(blk)));
+            } else {
+                w[s] = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (owner) {
+            const FusedGrArgs& a = m.a[tk];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float acc[P];
+#pragma unroll
+        for (int k = 0; k < P; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const sycl::float4 x =
+                        *reinterpret_cast<const sycl::float4 *>(&lo[k][v]);
+                    acc[k] = sycl::fma(w[s].x(), (float)(x.x()), acc[k]);
+                        acc[k] = sycl::fma(w[s].y(), (float)(x.y()), acc[k]);
+                    acc[k] = sycl::fma(w[s].z(), (float)(x.z()), acc[k]);
+                        acc[k] = sycl::fma(w[s].w(), (float)(x.w()), acc[k]);
+                }
+            }
+        }
+        const float mine = tsum<P>(acc, lane);
+        if (owner) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                m.a[tk].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsS[tk][c];
+            g[tk][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
+=======
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_multi_kernel_a08052, dpct_kernel_scalar<6>,
+                dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_multi_kernel<6, true, true>(m);
+                    });
+        } break;
+        default: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->parallel_for<dpct_kernel_name<class gr_up_multi_kernel_6dce32,
+                                              dpct_kernel_scalar<kFusedGrMaxT>,
+                                              dpct_kernel_scalar<false>,
+                                              dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_multi_kernel<kFusedGrMaxT, false, true>(m);
+                    });
+        } break;
+        }
+    } else if (n_tok >= 3 && up75_on()) {   // T 1-2: gr_up_multi_kernel is as fast or faster (fused_gr_bench, cold)
+        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+        case 1: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->parallel_for<dpct_kernel_name<class gr_up75_kernel_98a5d3,
+                                              dpct_kernel_scalar<1>,
+                                              dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up75_kernel<1, true>(m);
+                    });
+        } break;
+        case 2: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->parallel_for<dpct_kernel_name<class gr_up75_kernel_9d0f1f,
+                                              dpct_kernel_scalar<2>,
+                                              dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up75_kernel<2, true>(m);
+                    });
+        } break;
+        case 3: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->parallel_for<dpct_kernel_name<class gr_up75_kernel_73b353,
+                                              dpct_kernel_scalar<3>,
+                                              dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up75_kernel<3, true>(m);
+                    });
+        } break;
+        case 4: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->parallel_for<dpct_kernel_name<class gr_up75_kernel_df7c08,
+                                              dpct_kernel_scalar<4>,
+                                              dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up75_kernel<4, true>(m);
+                    });
+        } break;
+        case 5: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->parallel_for<dpct_kernel_name<class gr_up75_kernel_7cc4e3,
+                                              dpct_kernel_scalar<5>,
+                                              dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up75_kernel<5, true>(m);
+                    });
+        } break;
+        case 6: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->parallel_for<dpct_kernel_name<class gr_up75_kernel_d227ec,
+                                              dpct_kernel_scalar<6>,
+                                              dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up75_kernel<6, true>(m);
+                    });
+        } break;
+        default: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->parallel_for<dpct_kernel_name<class gr_up75_kernel_4a25e8,
+                                              dpct_kernel_scalar<kFusedGrMaxT>,
+                                              dpct_kernel_scalar<false>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up75_kernel<kFusedGrMaxT, false>(m);
+                    });
+        } break;
+        }
+    } else
+    switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+        case 1: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_multi_kernel_917b8a, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<true>,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_multi_kernel<1, true>(m);
+                        });
+        } break;
+        case 2: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_multi_kernel_ea1cb6, dpct_kernel_scalar<2>,
+                    dpct_kernel_scalar<true>,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_multi_kernel<2, true>(m);
+                        });
+        } break;
+        case 3: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_multi_kernel_ff7140, dpct_kernel_scalar<3>,
+                    dpct_kernel_scalar<true>,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_multi_kernel<3, true>(m);
+                        });
+        } break;
+        case 4: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_multi_kernel_f32e47, dpct_kernel_scalar<4>,
+                    dpct_kernel_scalar<true>,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_multi_kernel<4, true>(m);
+                        });
+        } break;
+        case 5: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_multi_kernel_37342d, dpct_kernel_scalar<5>,
+                    dpct_kernel_scalar<true>,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_multi_kernel<5, true>(m);
+                        });
+        } break;
+        case 6: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_multi_kernel_8c9736, dpct_kernel_scalar<6>,
+                    dpct_kernel_scalar<true>,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_multi_kernel<6, true>(m);
+                        });
+        } break;
+        default: {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(st->get_device(),
+                                         {sycl::aspect::fp16});
+
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_multi_kernel_1df4d8,
+                    dpct_kernel_scalar<kFusedGrMaxT>, dpct_kernel_scalar<false>,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_multi_kernel<kFusedGrMaxT, false>(m);
+                        });
+        } break;
+    }
+}
+
+/// STRATA_HC_SPLIT: unset or 2 = the newest the check accepts (staged), 1 = at most split, 0 = the plain read
+int env_variant() {
+    const char* e = std::getenv("STRATA_HC_SPLIT");
+    if (e == nullptr || e[0] == '\0') return kHcStaged;
+    if (e[0] == '0') return kHcPlain;
+    if (e[0] == '1') return kHcSplit;
+    return kHcStaged;
+}
+
+// per device: the variant `fused_gr_check` chose (0 = not checked yet)
+std::atomic<int> g_variant[64];
+
+
+#if STRATA_GR_FAST_BUILD
+// ---- AMD fast path (STRATA_GR_FAST, default 1; 0 = the old kernels): the same arithmetic per value in the same order, latency
+// hidden.  gr_norm: one block per token (as before) but a thread's 10 float4 of R / bo / w_norm are loaded
+// before any is used, and xn stays in registers until rs is known (was: store, then re-read the 40 KB).
+// gr_up: a warp's 8 rows of w_up and their epilogue inputs are loaded before the dots (was: one row's load chain
+// after another).
+constexpr int NQ = D / (THREADS * 4);   // 10 float4 per thread
+static_assert(D % (THREADS * 4) == 0, "whole float4 per thread");
+/*
+DPCT1110: The total declared local variable size in device function
+gr_norm_fast_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_norm_fast_kernel(GrMulti m) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &part =
+    *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS][HC]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_rs =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[HC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const FusedGrArgs &a = m.a[item_ct1.get_group(2)];
+    float *xn = m.xn + (size_t)item_ct1.get_group(2) * D;
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    float gw[HC];
+#pragma unroll
+    for (int c = 0; c < HC; ++c) gw[c] = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    sycl::float4 r[NQ], g[NQ];
+#pragma unroll
+    for (int k = 0; k < NQ; ++k) {
+        const int i = t * 4 + k * THREADS * 4;
+        r[k] = *reinterpret_cast<const sycl::float4 *>(a.R + i);
+        g[k] = *reinterpret_cast<const sycl::float4 *>(a.w_norm + i);
+    }
+    if (a.apply) {
+#pragma unroll
+        for (int k = 0; k < NQ; ++k) {
+            const int i = t * 4 + k * THREADS * 4, c = i / N, d = i - c * N;
+            const sycl::float4 b =
+                *reinterpret_cast<const sycl::float4 *>(a.bo_prev + d);
+            r[k].x() = sycl::fma((float)(b.x()), gw[c], r[k].x());
+                r[k].y() = sycl::fma((float)(b.y()), gw[c], r[k].y());
+            r[k].z() = sycl::fma((float)(b.z()), gw[c], r[k].z());
+                r[k].w() = sycl::fma((float)(b.w()), gw[c], r[k].w());
+        }
+    }
+    float ss[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int k = 0; k < NQ; ++k) {
+        const int i = t * 4 + k * THREADS * 4, c = i / N;
+        const float sq = r[k].x() * r[k].x() + r[k].y() * r[k].y() +
+                         r[k].z() * r[k].z() + r[k].w() * r[k].w();
+#pragma unroll
+        for (int cc = 0; cc < HC; ++cc) if (cc == c) ss[cc] += sq;
+        r[k] = sycl::float4(r[k].x() * g[k].x(), r[k].y() * g[k].y(),
+                            r[k].z() * g[k].z(), r[k].w() * g[k].w());
+    }
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const float v = warp_sum(ss[c]);
+        if (lane == 0) part[warp][c] = v;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (t < HC) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) s += part[w][t];
+        s_rs[t] = sycl::rsqrt(s / (float)N + a.eps);
+        a.rs[t] = s_rs[t];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+#pragma unroll
+    for (int k = 0; k < NQ; ++k) {
+        const int i = t * 4 + k * THREADS * 4;
+        const float sr = s_rs[i / N];
+        *reinterpret_cast<sycl::float4 *>(xn + i) = sycl::float4(
+            r[k].x() * sr, r[k].y() * sr, r[k].z() * sr, r[k].w() * sr);
+    }
+}
+// gr_up: 8 lanes per row instead of a 32-lane warp.  Lane j holds the old lanes j, j+8, j+16, j+24 (and chunk
+// 32+j, the old lane j's second chunk): the xor tree's stages 16 and 8 are its own adds (a + b == b + a), stages
+// 4, 2, 1 are shuffles inside the 8 - the same tree, bitwise the same sum, 3 shuffles a token instead of 5 and no
+// idle lanes on the tail chunks.  A block's 64 rows are 2 passes of 32 groups, their weights loaded up front.
+__dpct_inline__ float xor8(float v) {
+#pragma unroll
+#if defined(__HIPCC__)
+    for (int o = 4; o > 0; o >>= 1) v += __shfl_xor(v, o, 64);
+#else
+    /*
+    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    for (int o = 4; o > 0; o >>= 1) v +=
+        dpct::experimental::permute_sub_group_by_xor(
+            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
+            o);
+#endif
+    return v;
+}
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_fast_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_up_fast_kernel(GrMulti m) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+    float[kFusedGrMaxT][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[kFusedGrMaxT][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), j = t & 7, grp = t >> 3;
+    const int T = m.T;
+    const int d0 = item_ct1.get_group(2) * UPM_COLS;
+    static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "geometry");
+    sycl::uint4 w[2][5];
+    float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, rsc[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
+    const bool apply = j < T && m.a[j < T ? j : 0].apply;
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const sycl::uint4 *w4 =
+            reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
+#pragma unroll
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        for (int q = 0; q < 4; ++q) w[p][q] = *(w4 + j + 8 * q);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        w[p][4] = *(w4 + 32 + j);
+        if (j < T) {
+            const FusedGrArgs& a = m.a[j];
+            rv[p] = a.R[i];
+            wn[p] = a.w_norm[i];
+            rsc[p] = a.rs[c];
+            if (apply) { bo[p] = a.bo_prev[d0 + dd]; ip[p] = a.inj_prev[c]; }
+        }
+    }
+#pragma unroll
+    for (int i = t; i < T * LR; i += THREADS)
+        lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            const float* l = lo[k];
+            const float p0 = dot8(w[p][0], l + j * 8) + dot8(w[p][4], l + (32 + j) * 8);   // old lane j
+            const float p1 = dot8(w[p][1], l + (j + 8) * 8);                               // old lane j + 8
+            const float p2 = dot8(w[p][2], l + (j + 16) * 8);                              // old lane j + 16
+            const float p3 = dot8(w[p][3], l + (j + 24) * 8);                              // old lane j + 24
+            const float s = xor8((p0 + p2) + (p1 + p3));   // stage 16: (j, j+16), (j+8, j+24); stage 8; then 4, 2, 1
+            if (j == k) mine = s;
+        }
+        if (j < T) {
+            float x0 = rv[p];
+            if (apply) {
+                x0 = sycl::fma(bo[p], 2.0f * sigmoidf_(ip[p] / (float)HC), x0);
+                m.a[j].R_out[i] = x0;
+            }
+            const float x = x0 * wn[p] * rsc[p];
+            g[j][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE, as gr_up_multi_kernel
+}
+#endif
+
+#if defined(STRATA_HIP_GFX906)
+// ---- AMD: `gr_down_multi` split along K.  The CUDA kernel is one warp per row of w_down (320 + 4 rows), 41
+// blocks: on a 60-CU gfx906 that left most of the card idle and read the 6.5 MB matrix at ~100 GB/s.  Here a block
+// is 8 wavefronts = 8 rows of one K-slice of 2048 (the slice of every token's xn staged in LDS once), 41 x 5
+// blocks, and a second kernel adds the 5 slice sums in a fixed order and runs the epilogue.  A token's result does
+// not depend on how many tokens share the window (each column is reduced on its own).
+constexpr int GS_SL = 2048;                   // K per slice
+constexpr int GS_S = D / GS_SL;               // 5 slices
+constexpr int GS_ROWS = LR + HC;              // 324: the down rows, then the inject rows
+constexpr int GS_WAVES = 8;
+static_assert(D % GS_SL == 0 && GS_SL == 64 * 8 * 4, "a lane takes 4 chunks of 8 per slice");
+// the slice sums: a module-scope device array is per device by construction, and needs no allocation during a
+// graph capture
+__device__ float g_gr_part[GS_S * kFusedGrMaxT * GS_ROWS];
+__global__ void __launch_bounds__(GS_WAVES * 64) gr_down_split_kernel(GrMulti m) {
+    float* part = g_gr_part;
+    extern __shared__ __align__(16) float tile[];   // [T][GS_SL]
+    const int t = threadIdx.x, lane = t & 63, wave = t >> 6;
+    const int T = m.T, sl = blockIdx.y;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int row = inject_block ? wave : blockIdx.x * GS_WAVES + wave;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || wave >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow) + sl * (GS_SL / 8);
+    uint4 wv[4];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) wv[q] = __ldg(w4 + lane + 64 * q);
+    }
+    const float4* src4 = reinterpret_cast<const float4*>(m.xn);
+    float4* tile4 = reinterpret_cast<float4*>(tile);
+    for (int i = t; i < T * (GS_SL / 4); i += GS_WAVES * 64) {
+        const int k = i / (GS_SL / 4), off = i - k * (GS_SL / 4);
+        tile4[i] = src4[((size_t) k * D + (size_t) sl * GS_SL) / 4 + off];
+    }
+    __syncthreads();
+    if (!active) return;
+    float acc[kFusedGrMaxT];
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int j = lane + 64 * q;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k)
+            if (k < T) acc[k] += dot8(wv[q], tile + k * GS_SL + j * 8);
+    }
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) {
+        if (k >= T) break;
+        float v = acc[k];
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+        if (lane == 0) part[((size_t) sl * kFusedGrMaxT + k) * GS_ROWS + (inject_block ? LR + row : row)] = v;
+    }
+}
+__global__ void gr_down_finish_kernel(GrMulti m) {
+    const float* part = g_gr_part;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = i / GS_ROWS, r = i - k * GS_ROWS;
+    if (k >= m.T) return;
+    const bool inject = r >= LR;
+    if (inject && m.a[0].w_inject == nullptr) return;
+    float s = 0.0f;
+#pragma unroll
+    for (int sl = 0; sl < GS_S; ++sl) s += part[((size_t) sl * kFusedGrMaxT + k) * GS_ROWS + r];
+    if (inject) {
+        m.a[k].inject_out[r - LR] = s;
+    } else {
+        const float x = s / (float) HC;
+        m.a[k].lo[r] = x / (1.0f + __expf(-x));
+    }
+}
+
+#endif
+
+// ================================ S23 experiment (STRATA_HC_Q8=1): the read with the GGUF's Q8_0 projections ======
+// The pack holds the hyper-connection projections as BF16 (iq_pack.py --compat-bf16 rounds the GGUF's Q8_0 values to
+// BF16: 1.20 GiB per verify step); this read takes the Q8_0 bytes as stored (0.65 GiB - and the GGUF's own values,
+// not a rounding of them).  The layout is the stream split of the v3 read above, at 4 chunks per stream: `down` runs
+// on (10 groups of 32 rows + the inject rows) x 16 chunks of 640 columns = 176 blocks, each staging its chunk of
+// R' * w_norm (unscaled) for the T tokens and writing the chunk's partial dots and sums of squares; `up` sums them
+// per stream in a fixed order, applies rs, SwiGLU-free silu, and runs the default epilogue.  Another summation order
+// and other weights than the default read: an output-changing step (measured, quality-checked).
+constexpr int Q8B = 34;                             // Q8_0 block: fp16 d + 32 int8
+constexpr int Q8_RPW = 4;                           // down rows per warp
+constexpr int Q8_RG = LR / (WARPS * Q8_RPW);        // 10 row groups (+1: the inject rows)
+constexpr int Q8_KC = 640, Q8_NKC = D / Q8_KC;      // 16 chunks, 4 per stream
+constexpr int Q8_CPS = N / Q8_KC;                   // chunks per stream
+constexpr int Q8_SPB = Q8_KC / 128;                 // 5 steps of 4 Q8_0 blocks (8 lanes x 4 values each)
+__dpct_inline__ uint32_t q8_ld16(const uint8_t *p) {
+    return *(const uint16_t *)p;
+}
+__dpct_inline__ float q8_half(uint32_t h) {
+    return sycl::vec<sycl::half, 1>(
+               sycl::bit_cast<sycl::half, unsigned short>((unsigned short)h))
+        .convert<float, sycl::rounding_mode::automatic>()[0];
+}
+__dpct_inline__ sycl::float4 q8_four(uint32_t q, float d) {
+    return sycl::float4(
+        d * (float)(int8_t)(q & 255u), d * (float)(int8_t)((q >> 8) & 255u),
+        d * (float)(int8_t)((q >> 16) & 255u), d * (float)(int8_t)(q >> 24));
+}
+
+template <int T>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_down_q8_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_down_q8_kernel(GrMulti m, float *__restrict__ part,
+                                       float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &xs =
+    *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][Q8_KC]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &red =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS][T]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int rg = item_ct1.get_group(2), kc = item_ct1.get_group(1),
+              c = kc / Q8_CPS;
+    const bool inj = rg == Q8_RG;
+    // S25: the inject rows are F32 in the GGUF with BF16-exact values, so by default they are read as the pack's BF16
+    // (exact); a Q8_0 copy (STRATA_HC_Q8_INJECT=1) is the other option
+    const bool inj_bf16 = inj && m.a[0].q8_inject == nullptr;
+    const int nrows = inj ? (((m.a[0].q8_inject != nullptr || m.a[0].w_inject != nullptr) && warp < HC) ? 1 : 0) : Q8_RPW;
+    const int row0 = inj ? warp : (rg * WARPS + warp) * Q8_RPW;
+    const uint8_t* wb = inj ? m.a[0].q8_inject : m.a[0].q8_down;
+    const int sub = lane & 7, bl = lane >> 3;       // lanes 8b..8b+7: one Q8_0 block, 4 values each
+    uint32_t q[Q8_RPW][Q8_SPB];
+    float dq[Q8_RPW][Q8_SPB];
+#pragma unroll
+    for (int r = 0; r < Q8_RPW; ++r) {
+        if (r >= nrows || inj_bf16) break;
+        const uint8_t* row = wb + (size_t) (row0 + r) * (D / 32) * Q8B + (size_t) kc * (Q8_KC / 32) * Q8B;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const uint8_t* blk = row + (4 * s + bl) * Q8B;
+            dq[r][s] = q8_half(q8_ld16(blk));
+            q[r][s] = q8_ld16(blk + 2 + 4 * sub) | q8_ld16(blk + 4 + 4 * sub) << 16;
+        }
+    }
+    float ssp[T];
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        ssp[k] = 0.0f;
+        const FusedGrArgs& a = m.a[k];
+        const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+        for (int i = t; i < Q8_KC / 4; i += THREADS) {
+            const int col = kc * Q8_KC + 4 * i;
+            sycl::float4 r = *reinterpret_cast<const sycl::float4 *>(a.R + col);
+            if (a.apply) {
+                const sycl::float4 b = *reinterpret_cast<const sycl::float4 *>(
+                    a.bo_prev + (col - c * N));
+                r.x() = sycl::fma((float)(b.x()), (float)gw, r.x());
+                    r.y() = sycl::fma((float)(b.y()), (float)gw, r.y());
+                r.z() = sycl::fma((float)(b.z()), (float)gw, r.z());
+                    r.w() = sycl::fma((float)(b.w()), (float)gw, r.w());
+            }
+            const sycl::float4 g =
+                *reinterpret_cast<const sycl::float4 *>(a.w_norm + col);
+            ssp[k] +=
+                r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+            *reinterpret_cast<sycl::float4 *>(&xs[k][4 * i]) = sycl::float4(
+                r.x() * g.x(), r.y() * g.y(), r.z() * g.z(), r.w() * g.w());
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        const float v = warp_sum(ssp[k]);
+        if (lane == 0) red[warp][k] = v;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (rg == 0 && t < T) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) s += red[w][t];
+        ssg[t * Q8_NKC + kc] = s;
+    }
+    if (nrows == 0) return;
+#pragma unroll
+    for (int r = 0; r < Q8_RPW; ++r) {
+        if (r >= nrows) break;
+        float acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const int v = 32 * (4 * s + bl) + 4 * sub;
+            sycl::float4 w;
+            if (inj_bf16) {
+                const sycl::uint2 b = *reinterpret_cast<const sycl::uint2 *>(
+                    m.a[0].w_inject + (size_t)row0 * D + (size_t)kc * Q8_KC +
+                    v);
+                w = sycl::float4(sycl::bit_cast<float>(b.x() << 16),
+                                 sycl::bit_cast<float>(b.x() & 0xffff0000u),
+                                 sycl::bit_cast<float>(b.y() << 16),
+                                 sycl::bit_cast<float>(b.y() & 0xffff0000u));
+            } else {
+                w = q8_four(q[r][s], dq[r][s]);
+            }
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                const sycl::float4 x =
+                    *reinterpret_cast<const sycl::float4 *>(&xs[k][v]);
+                acc[k] = sycl::fma(w.x(), (float)(x.x()), acc[k]);
+                    acc[k] = sycl::fma(w.y(), (float)(x.y()), acc[k]);
+                acc[k] = sycl::fma(w.z(), (float)(x.z()), acc[k]);
+                    acc[k] = sycl::fma(w.w(), (float)(x.w()), acc[k]);
+            }
+        }
+        const int prow = inj ? LR + warp : row0 + r;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float v = warp_sum(acc[k]);
+            if (lane == 0) part[((size_t) k * Q8_NKC + kc) * PR + prow] = v;
+        }
+    }
+}
+
+template <int T>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_q8_kernel exceeds 128 bytes and may cause high register pressure. Consult
+with your hardware vendor to find the total register size available and adjust
+the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_up_q8_kernel(GrMulti m, const float *__restrict__ part,
+                                     const float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &rsS =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[T][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int d0 = item_ct1.get_group(2) * UPM_COLS;
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        const float r = sycl::rsqrt(ss / (float)N + m.a[k].eps);
+        rsS[k][c] = r;
+        if (item_ct1.get_group(2) == 0) m.a[k].rs[c] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * PR; i += THREADS) {
+        const int k = i / PR, r = i - k * PR;
+        if (r >= LR && (item_ct1.get_group(2) != 0 ||
+                        m.a[k].w_inject == nullptr)) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+            sum = sycl::fma(rsS[k][c], p, sum);
+        }
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            lo[k][r] = x / (1.0f + sycl::native::exp(-x));
+        } else {
+            m.a[k].inject_out[r - LR] = sum;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    constexpr int RPW8 = HC * UPM_COLS / WARPS;     // 8 rows per warp
+#pragma unroll 1
+    for (int qq = 0; qq < RPW8; ++qq) {
+        const int r = warp + qq * WARPS;
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+        sycl::float4 w[3];
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {   // lane: values 4 lane + 128 s (the third step: lanes 0-15)
+            const int v = 4 * lane + 128 * s;
+            if (v < LR) {
+                const uint8_t* blk = row + (v >> 5) * Q8B;
+                w[s] = q8_four(q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16, q8_half(q8_ld16(blk)));
+            } else {
+                w[s] = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const sycl::float4 x =
+                        *reinterpret_cast<const sycl::float4 *>(&lo[k][v]);
+                    acc = sycl::fma(w[s].x(), (float)(x.x()), acc);
+                        acc = sycl::fma(w[s].y(), (float)(x.y()), acc);
+                    acc = sycl::fma(w[s].z(), (float)(x.z()), acc);
+                        acc = sycl::fma(w[s].w(), (float)(x.w()), acc);
+                }
+            }
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsS[lane][c];
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
+}
+
+
+// STRATA_HC_Q8 on HIP gfx12: gr_up_q8_kernel with 32 columns / 512 threads a block, so a block owns a whole q8_1 group
+// (STRATA_QFUSE_HC: no counter, no fence; the same arithmetic per value as gr_up_q8_kernel)
+template <int T>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_q8_q32_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+void gr_up_q8_q32_kernel(GrMulti m, const float *__restrict__ part,
+                         const float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &rsS =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[T][HC][Q32_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int d0 = item_ct1.get_group(2) * Q32_COLS;
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        const float r = sycl::rsqrt(ss / (float)N + m.a[k].eps);
+        rsS[k][c] = r;
+        if (item_ct1.get_group(2) == 0) m.a[k].rs[c] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * PR; i += Q32_THREADS) {
+        const int k = i / PR, r = i - k * PR;
+        if (r >= LR && (item_ct1.get_group(2) != 0 ||
+                        m.a[k].w_inject == nullptr)) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+            sum = fmaf(rsS[k][c], p, sum);
+        }
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            lo[k][r] = x / (1.0f + sycl::native::exp(-x));
+        } else {
+            m.a[k].inject_out[r - LR] = sum;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    constexpr int RPW8 = HC * Q32_COLS / Q32_WARPS;     // 8 rows per warp
+#pragma unroll 1
+    for (int qq = 0; qq < RPW8; ++qq) {
+        const int r = warp + qq * Q32_WARPS;
+        const int c = r / Q32_COLS, dd = r - c * Q32_COLS, i = c * N + d0 + dd;
+        const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+        sycl::float4 w[3];
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {   // lane: values 4 lane + 128 s (the third step: lanes 0-15)
+            const int v = 4 * lane + 128 * s;
+            if (v < LR) {
+                const uint8_t* blk = row + (v >> 5) * Q8B;
+                w[s] = q8_four(q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16, q8_half(q8_ld16(blk)));
+            } else {
+                w[s] = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const sycl::float4 x =
+                        *reinterpret_cast<const sycl::float4 *>(&lo[k][v]);
+                    acc = sycl::fma(w[s].x(), (float)(x.x()), acc);
+                        acc = sycl::fma(w[s].y(), (float)(x.y()), acc);
+                    acc = sycl::fma(w[s].z(), (float)(x.z()), acc);
+                        acc = sycl::fma(w[s].w(), (float)(x.w()), acc);
+                }
+            }
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsS[lane][c];
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * Q32_COLS; i += Q32_THREADS) {
+        const int k = i / Q32_COLS, col = i - k * Q32_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // the block owns the whole q8_1 group (32 columns): quantize it here (gr_up_q32_kernel's tail), no counter, no fence
+    if (m.a[0].q8_mixed != nullptr && warp < T) {
+        const float xi = m.a[warp].mixed[d0 + lane];
+        float amax = sycl::fabs(xi), sum = xi;
+#pragma unroll
+        /*
+        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
+        feature masked sub_group function which may not be supported by all
+        compilers or runtimes. You may need to adjust the code.
+        */
+        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(
+            amax,
+            dpct::experimental::permute_sub_group_by_xor(
+                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+                amax, o));
+#pragma unroll
+        /*
+        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
+        feature masked sub_group function which may not be supported by all
+        compilers or runtimes. You may need to adjust the code.
+        */
+        for (int o = 16; o > 0; o >>= 1) sum +=
+            dpct::experimental::permute_sub_group_by_xor(
+                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+                sum, o);
+        const float d = q8_1_finite(amax / 127.0f);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + d0 / 32;
+        y->qs[lane] = q;
+        if (lane == 0) y->ds = q8_1_ds(d, sum);
+    }
+}
+
+
+
+// S26 STRATA_TSUM=1: gr_down_q8_kernel / gr_up_q8_kernel with each row's T per-token warp sums (and the sums of
+// squares) as one transposed butterfly (s26_tsum.cuh): bitwise the same values (S26 ws4 harness, every output equal,
+// T 1-4: 1.00 / 1.03 / 1.03 / 1.15x per read). PF (all rows' weights in registers before the part / lo phase) was
+// slower (0.92-1.03x) and is off.
+using s26ts::tsum;
+using s26ts::tsum_token;
+using s26ts::tsum_lane;
+using s26ts::pow2_ceil;
+// gr_down_q8_kernel / gr_up_q8_kernel with every per-token warp sum done as one transposed butterfly per row (tsum)
+template <int T, int RPW = Q8_RPW>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_down_q8_fast_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_down_q8_fast_kernel(GrMulti m, float *__restrict__ part,
+                                            float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int P = pow2_ceil(T);
+    constexpr int RG_ = LR / (WARPS * RPW);
+    auto &xs =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][Q8_KC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &red =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS][T]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int rg = item_ct1.get_group(2), kc = item_ct1.get_group(1),
+              c = kc / Q8_CPS;
+    const bool inj = rg == RG_;
+    const bool inj_bf16 = inj && m.a[0].q8_inject == nullptr;
+    const int nrows = inj ? (((m.a[0].q8_inject != nullptr || m.a[0].w_inject != nullptr) && warp < HC) ? 1 : 0) : RPW;
+    const int row0 = inj ? warp : (rg * WARPS + warp) * RPW;
+    const uint8_t* wb = inj ? m.a[0].q8_inject : m.a[0].q8_down;
+    const int sub = lane & 7, bl = lane >> 3;
+    const int tk = tsum_token<P>(lane);
+    const bool owner = lane == tsum_lane<P>(tk) && tk < T;
+    uint32_t q[RPW][Q8_SPB];
+    float dq[RPW][Q8_SPB];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        if (r >= nrows || inj_bf16) break;
+        const uint8_t* row = wb + (size_t) (row0 + r) * (D / 32) * Q8B + (size_t) kc * (Q8_KC / 32) * Q8B;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const uint8_t* blk = row + (4 * s + bl) * Q8B;
+            dq[r][s] = q8_half(q8_ld16(blk));
+            q[r][s] = q8_ld16(blk + 2 + 4 * sub) | q8_ld16(blk + 4 + 4 * sub) << 16;
+        }
+    }
+    float ssp[P];
+#pragma unroll
+    for (int k = 0; k < P; ++k) ssp[k] = 0.0f;
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        const FusedGrArgs& a = m.a[k];
+        const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+        for (int i = t; i < Q8_KC / 4; i += THREADS) {
+            const int col = kc * Q8_KC + 4 * i;
+            sycl::float4 r = *reinterpret_cast<const sycl::float4 *>(a.R + col);
+            if (a.apply) {
+                const sycl::float4 b = *reinterpret_cast<const sycl::float4 *>(
+                    a.bo_prev + (col - c * N));
+                r.x() = sycl::fma((float)(b.x()), (float)gw, r.x());
+                    r.y() = sycl::fma((float)(b.y()), (float)gw, r.y());
+                r.z() = sycl::fma((float)(b.z()), (float)gw, r.z());
+                    r.w() = sycl::fma((float)(b.w()), (float)gw, r.w());
+            }
+            const sycl::float4 g =
+                *reinterpret_cast<const sycl::float4 *>(a.w_norm + col);
+            ssp[k] +=
+                r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+            *reinterpret_cast<sycl::float4 *>(&xs[k][4 * i]) = sycl::float4(
+                r.x() * g.x(), r.y() * g.y(), r.z() * g.z(), r.w() * g.w());
+        }
+    }
+    {
+        const float v = tsum<P>(ssp, lane);
+        if (owner) red[warp][tk] = v;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (rg == 0 && t < T) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) s += red[w][t];
+        ssg[t * Q8_NKC + kc] = s;
+    }
+    if (nrows == 0) return;
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        if (r >= nrows) break;
+        float acc[P];
+#pragma unroll
+        for (int k = 0; k < P; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const int v = 32 * (4 * s + bl) + 4 * sub;
+            sycl::float4 w;
+            if (inj_bf16) {
+                const sycl::uint2 b = *reinterpret_cast<const sycl::uint2 *>(
+                    m.a[0].w_inject + (size_t)row0 * D + (size_t)kc * Q8_KC +
+                    v);
+                w = sycl::float4(sycl::bit_cast<float>(b.x() << 16),
+                                 sycl::bit_cast<float>(b.x() & 0xffff0000u),
+                                 sycl::bit_cast<float>(b.y() << 16),
+                                 sycl::bit_cast<float>(b.y() & 0xffff0000u));
+            } else {
+                w = q8_four(q[r][s], dq[r][s]);
+            }
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                const sycl::float4 x =
+                    *reinterpret_cast<const sycl::float4 *>(&xs[k][v]);
+                acc[k] = sycl::fma(w.x(), (float)(x.x()), acc[k]);
+                    acc[k] = sycl::fma(w.y(), (float)(x.y()), acc[k]);
+                acc[k] = sycl::fma(w.z(), (float)(x.z()), acc[k]);
+                    acc[k] = sycl::fma(w.w(), (float)(x.w()), acc[k]);
+            }
+        }
+        const int prow = inj ? LR + warp : row0 + r;
+        const float v = tsum<P>(acc, lane);
+        if (owner) part[((size_t) tk * Q8_NKC + kc) * PR + prow] = v;
+    }
+}
+
+template <int T, bool PF = false>
+/*
+DPCT1110: The total declared local variable size in device function
+gr_up_q8_fast_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gr_up_q8_fast_kernel(GrMulti m,
+                                          const float *__restrict__ part,
+                                          const float *__restrict__ ssg) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int P = pow2_ceil(T);
+    constexpr int RPW8 = HC * UPM_COLS / WARPS;
+    auto &lo =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][LR]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &rsS =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[T][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int d0 = item_ct1.get_group(2) * UPM_COLS;
+    const int tk = tsum_token<P>(lane);
+    const bool owner = lane == tsum_lane<P>(tk) && tk < T;
+    // PF: every row's weights in registers before the part / lo phase (its latency hides the weight read)
+    uint32_t pq[PF ? RPW8 : 1][3];
+    float pd[PF ? RPW8 : 1][3];
+    if constexpr (PF) {
+#pragma unroll
+        for (int qq = 0; qq < RPW8; ++qq) {
+            const int r = warp + qq * WARPS;
+            const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+            const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const uint8_t* blk = row + (v >> 5) * Q8B;
+                    pq[qq][s] = q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16;
+                    pd[qq][s] = q8_half(q8_ld16(blk));
+                } else {
+                    pq[qq][s] = 0u; pd[qq][s] = 0.0f;
+                }
+            }
+        }
+    }
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        const float r = sycl::rsqrt(ss / (float)N + m.a[k].eps);
+        rsS[k][c] = r;
+        if (item_ct1.get_group(2) == 0) m.a[k].rs[c] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * PR; i += THREADS) {
+        const int k = i / PR, r = i - k * PR;
+        if (r >= LR && (item_ct1.get_group(2) != 0 ||
+                        m.a[k].w_inject == nullptr)) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+            sum = sycl::fma(rsS[k][c], p, sum);
+        }
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            lo[k][r] = x / (1.0f + sycl::native::exp(-x));
+        } else {
+            m.a[k].inject_out[r - LR] = sum;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+#pragma unroll(PF ? RPW8 : 2)
+    for (int qq = 0; qq < RPW8; ++qq) {
+        const int r = warp + qq * WARPS;
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+        sycl::float4 w[3];
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {
+            const int v = 4 * lane + 128 * s;
+            if (PF) {
+                w[s] = v < LR ? q8_four(pq[PF ? qq : 0][s], pd[PF ? qq : 0][s])
+                              : sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            } else if (v < LR) {
+                const uint8_t* blk = row + (v >> 5) * Q8B;
+                w[s] = q8_four(q8_ld16(blk + 2 + (v & 31)) | q8_ld16(blk + 4 + (v & 31)) << 16, q8_half(q8_ld16(blk)));
+            } else {
+                w[s] = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (owner) {
+            const FusedGrArgs& a = m.a[tk];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float acc[P];
+#pragma unroll
+        for (int k = 0; k < P; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const sycl::float4 x =
+                        *reinterpret_cast<const sycl::float4 *>(&lo[k][v]);
+                    acc[k] = sycl::fma(w[s].x(), (float)(x.x()), acc[k]);
+                        acc[k] = sycl::fma(w[s].y(), (float)(x.y()), acc[k]);
+                    acc[k] = sycl::fma(w[s].z(), (float)(x.z()), acc[k]);
+                        acc[k] = sycl::fma(w[s].w(), (float)(x.w()), acc[k]);
+                }
+            }
+        }
+        const float mine = tsum<P>(acc, lane);
+        if (owner) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                m.a[tk].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsS[tk][c];
+            g[tk][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
+>>>>>>> ours-now
+}
+
+<<<<<<< sycl
+// per device: the variant `fused_gr_check` chose (0 = not checked yet)
+std::atomic<int> g_variant[64];
+||||||| base
+template <int T>
+void launch_q8_t(const GrMulti &m, float *part, float *ssg, dpct::queue_ptr st,
+                 unsigned long long *stamp_buf, int stamp_i0) {
+    static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+    if (ts) {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_down_q8_fast_kernel_9e37bd,
+                             dpct_kernel_scalar<T>, dpct_kernel_scalar<4>>>(
+            sycl::nd_range<3>(sycl::range(1, Q8_NKC, LR / (WARPS * 4) + 1) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_down_q8_fast_kernel<T, 4>(m, part, ssg);
+            });
+    } else {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->parallel_for<dpct_kernel_name<class gr_down_q8_kernel_4d1573,
+                                          dpct_kernel_scalar<T>>>(
+            sycl::nd_range<3>(sycl::range(1, Q8_NKC, Q8_RG + 1) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_down_q8_kernel<T>(m, part, ssg);
+            });
+    }
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+#if !STRATA_GR_FAST_BUILD
+    if (m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {   // HIP (not gfx906): the block owns a q8_1 group
+        gr_up_q8_q32_kernel<T><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+        return;
+    }
+#endif
+    if (ts) {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_up_q8_fast_kernel_692c85,
+                             dpct_kernel_scalar<T>, dpct_kernel_scalar<false>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_q8_fast_kernel<T, false>(m, part, ssg);
+            });
+    } else {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<dpct_kernel_name<class gr_up_q8_kernel_8e6020,
+                                          dpct_kernel_scalar<T>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_q8_kernel<T>(m, part, ssg);
+            });
+    }
+}
+void launch_q8(const GrMulti &m, float *scratch, dpct::queue_ptr st,
+               unsigned long long *stamp_buf, int stamp_i0) {
+    float* part = scratch;
+    float* ssg = scratch + (size_t) m.T * Q8_NKC * PR;
+    switch (m.T) {
+        case 1: launch_q8_t<1>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 2: launch_q8_t<2>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 3: launch_q8_t<3>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 4: launch_q8_t<4>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 5: launch_q8_t<5>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 6: launch_q8_t<6>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 7: launch_q8_t<7>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        default: launch_q8_t<8>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+    }
+}
+=======
+template <int T>
+void launch_q8_t(const GrMulti &m, float *part, float *ssg, dpct::queue_ptr st,
+                 unsigned long long *stamp_buf, int stamp_i0) {
+    static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+    if (ts) {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_down_q8_fast_kernel_d23852,
+                             dpct_kernel_scalar<T>, dpct_kernel_scalar<4>>>(
+            sycl::nd_range<3>(sycl::range(1, Q8_NKC, LR / (WARPS * 4) + 1) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_down_q8_fast_kernel<T, 4>(m, part, ssg);
+            });
+    } else {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        st->parallel_for<dpct_kernel_name<class gr_down_q8_kernel_cc82eb,
+                                          dpct_kernel_scalar<T>>>(
+            sycl::nd_range<3>(sycl::range(1, Q8_NKC, Q8_RG + 1) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_down_q8_kernel<T>(m, part, ssg);
+            });
+    }
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+#if !STRATA_GR_FAST_BUILD
+    if (m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {   // HIP (not gfx906): the block owns a q8_1 group
+        gr_up_q8_q32_kernel<T><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+        return;
+    }
+#endif
+    if (ts) {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<
+            dpct_kernel_name<class gr_up_q8_fast_kernel_a62dda,
+                             dpct_kernel_scalar<T>, dpct_kernel_scalar<false>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_q8_fast_kernel<T, false>(m, part, ssg);
+            });
+    } else {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+
+        st->parallel_for<dpct_kernel_name<class gr_up_q8_kernel_d39da9,
+                                          dpct_kernel_scalar<T>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_q8_kernel<T>(m, part, ssg);
+            });
+    }
+}
+void launch_q8(const GrMulti &m, float *scratch, dpct::queue_ptr st,
+               unsigned long long *stamp_buf, int stamp_i0) {
+    float* part = scratch;
+    float* ssg = scratch + (size_t) m.T * Q8_NKC * PR;
+    switch (m.T) {
+        case 1: launch_q8_t<1>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 2: launch_q8_t<2>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 3: launch_q8_t<3>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 4: launch_q8_t<4>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 5: launch_q8_t<5>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 6: launch_q8_t<6>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 7: launch_q8_t<7>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        default: launch_q8_t<8>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+    }
+}
+>>>>>>> ours-now
 
 }  // namespace
 
@@ -1787,6 +6257,32 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     dpct::queue_ptr st = strata::q_of(stream);
+<<<<<<< sycl
+||||||| base
+    if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
+        launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1
+        /*
+        DPCT1010: SYCL uses exceptions to report errors and does not use the
+        error codes. The cudaGetLastError function call was replaced with 0. You
+        need to rewrite this code.
+        */
+        const dpct::err0 eq = 0;
+
+        return q8;
+    }
+=======
+    if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
+        launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1
+        /*
+        DPCT1010: SYCL uses exceptions to report errors and does not use
+        the error codes. The cudaGetLastError function call was replaced with 0.
+        You need to rewrite this code.
+        */
+        const dpct::err0 eq = 0;
+
+        return q8;
+    }
+>>>>>>> ours-now
     // STRATA_GR_V3=1: the two-kernel read above (another summation order - opt-in)
     static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
     static int split3[64] = {};   // per device: 0 = not decided yet, 1 / 2 = column halves S, -1 = does not fit
@@ -1795,12 +6291,127 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         dev3 = dpct::get_current_device_id();
         if (dev3 >= 0 && dev3 < 64 && split3[dev3] == 0) {
             int optin = 0;
+<<<<<<< sycl
             // SYCL port: the device's local memory is the limit (no per-kernel opt-in to raise)
             optin = (int) dpct::get_device(dev3).get_local_mem_size();
             const int limit = optin > 0 ? optin : 48 * 1024;
             const int need1 = (int) (kFusedGrMaxT * N * sizeof(float)), need2 = need1 / 2;
             int split = -1;
             if (need1 <= limit &&
+||||||| base
+            /*
+            DPCT1019: local_mem_size in SYCL is not a complete equivalent of
+            cudaDevAttrMaxSharedMemoryPerBlockOptin in CUDA. You may need to
+            adjust the code.
+            */
+            optin = dpct::get_device(dev3).get_local_mem_size();
+            const int limit = optin > 0 ? optin : 48 * 1024;
+            const int need1 = (int) (kFusedGrMaxT * N * sizeof(float)), need6 = (int) (6 * N * sizeof(float)),
+                      need5 = (int) (5 * N * sizeof(float)), need2 = need1 / 2;
+            int split = -1;
+            if (need1 <= limit &&
+                /*
+                DPCT1027: The call to cudaFuncSetAttribute was replaced with
+                0 because SYCL currently does not support corresponding setting.
+                */
+                0 == 0 &&
+                /*
+                DPCT1027: The call to cudaFuncSetAttribute was replaced with
+                0 because SYCL currently does not support corresponding setting.
+                */
+                0 == 0 &&
+                /*
+                DPCT1027: The call to cudaFuncSetAttribute was replaced with
+                0 because SYCL currently does not support corresponding setting.
+                */
+                0 == 0) {
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+=======
+            /*
+            DPCT1019: local_mem_size in SYCL is not a complete equivalent
+            of cudaDevAttrMaxSharedMemoryPerBlockOptin in CUDA. You may need to
+            adjust the code.
+            */
+            optin = dpct::get_device(dev3).get_local_mem_size();
+            const int limit = optin > 0 ? optin : 48 * 1024;
+            const int need1 = (int) (kFusedGrMaxT * N * sizeof(float)), need6 = (int) (6 * N * sizeof(float)),
+                      need5 = (int) (5 * N * sizeof(float)), need2 = need1 / 2;
+            int split = -1;
+            if (need1 <= limit &&
+                /*
+                DPCT1027: The call to cudaFuncSetAttribute was replaced
+                with 0 because SYCL currently does not support corresponding
+                setting.
+                */
+                0 == 0 &&
+                /*
+                DPCT1027: The call to cudaFuncSetAttribute was replaced
+                with 0 because SYCL currently does not support corresponding
+                setting.
+                */
+                0 == 0 &&
+                /*
+                DPCT1027: The call to cudaFuncSetAttribute was replaced
+                with 0 because SYCL currently does not support corresponding
+                setting.
+                */
+                0 == 0) {
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+                /*
+                DPCT1026: The call to cudaFuncSetAttribute was removed
+                because SYCL currently does not support corresponding setting.
+                */
+>>>>>>> ours-now
                 /*
                 DPCT1027: The call to cudaFuncSetAttribute was replaced with
                 0 because SYCL currently does not support corresponding setting.
@@ -1820,7 +6431,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             split3[dev3] = split;
         }
     }
-    const int split = v3 && dev3 >= 0 && dev3 < 64 ? split3[dev3] : -1;
+    const int split = v3 && dev3 >= 0 && dev3 < 64 && a[0].s_down == nullptr && a[0].s_up == nullptr ? split3[dev3] : -1;
     if (split > 0) {   // 2 kernels; scratch = partials + sums of squares
         float* part = xn_scratch;
         float* ssg = xn_scratch + (size_t) n_tok * HC * 2 * PR;   // room for S = 2
@@ -1840,7 +6451,17 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                     sycl::range(sm), cgh);
 
                 cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                     class gr_down_v3_kernel_c14ff7, dpct_kernel_scalar<2>>>(
+||||||| base
+                    class gr_down_v3_kernel_99e6cd, dpct_kernel_scalar<2>,
+                    dpct_placeholder /*Fix the type mannually*/,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+=======
+                    class gr_down_v3_kernel_76cc8f, dpct_kernel_scalar<2>,
+                    dpct_placeholder /*Fix the type mannually*/,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, HC * 2, LR / WARPS + 1) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -1854,6 +6475,298 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                                 .get());
                     });
             });
+<<<<<<< sycl
+||||||| base
+        } else if (n_tok == 1) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_bebe6b, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<1>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 1, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 2) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_d3d487, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<2>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 2, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 3) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_efa6b9, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<3>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 3, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 4) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_7d52b3, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<4>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 4, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 5) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_d587d9, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<5>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 5, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 6) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_a012a7, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<6>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 6, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+=======
+        } else if (n_tok == 1) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_ed2761, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<1>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 1, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 2) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_d8eff8, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<2>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 2, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 3) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_cf2b2a, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<3>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 3, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 4) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_c6cd12, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<4>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 4, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 5) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_b43c23, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<5>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 5, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+        } else if (n_tok == 6) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->submit([&](sycl::handler &cgh) {
+                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                    sycl::range(sm), cgh);
+
+                cgh.parallel_for<dpct_kernel_name<
+                    class gr_down_v3_kernel_c670aa, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<6>, dpct_kernel_scalar<true>>>(
+                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                        32)]] {
+                        gr_down_v3_kernel<1, 6, true>(
+                            m, part, ssg,
+                            dpct_local_acc_ct1
+                                .get_multi_ptr<sycl::access::decorated::no>()
+                                .get());
+                    });
+            });
+>>>>>>> ours-now
         } else {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
@@ -1863,7 +6776,17 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                     sycl::range(sm), cgh);
 
                 cgh.parallel_for<dpct_kernel_name<
+<<<<<<< sycl
                     class gr_down_v3_kernel_88bc89, dpct_kernel_scalar<1>>>(
+||||||| base
+                    class gr_down_v3_kernel_21ddca, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<kFusedGrMaxT>,
+                    dpct_kernel_scalar<false>>>(
+=======
+                    class gr_down_v3_kernel_9bc251, dpct_kernel_scalar<1>,
+                    dpct_kernel_scalar<kFusedGrMaxT>,
+                    dpct_kernel_scalar<false>>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -1883,8 +6806,58 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
             st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_6e945c,
                                               dpct_kernel_scalar<2>>>(
+||||||| base
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_v3_kernel_a9c15b, dpct_kernel_scalar<2>,
+                    dpct_placeholder /*Fix the type mannually*/,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_v3_kernel<2>(m, part, ssg);
+                        });
+        } else if (n_tok == 1) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_b0cfe4, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<1>, dpct_kernel_scalar<true>>>(
+=======
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_v3_kernel_329fbd, dpct_kernel_scalar<2>,
+                    dpct_placeholder /*Fix the type mannually*/,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_v3_kernel<2>(m, part, ssg);
+                        });
+        } else if (n_tok == 1) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_edbe96, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<1>, dpct_kernel_scalar<true>>>(
+>>>>>>> ours-now
                 sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -1897,8 +6870,18 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
             st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_716779,
                                               dpct_kernel_scalar<1>>>(
+||||||| base
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_a882d1, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<2>, dpct_kernel_scalar<true>>>(
+=======
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_947751, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<2>, dpct_kernel_scalar<true>>>(
+>>>>>>> ours-now
                 sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -1915,13 +6898,46 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         */
         const dpct::err0 e3 = 0;
 
+<<<<<<< sycl
         return false;   // SYCL port: never writes the q8_1 images (STRATA_QFUSE is not supported here)
     }
     m.part = down_partials(st);
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
+||||||| base
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_6f1b77, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<3>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_v3_kernel<1, 3, true>(m, part, ssg);
+                    });
+        } else if (n_tok == 4) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+=======
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_6ea4be, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<3>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_v3_kernel<1, 3, true>(m, part, ssg);
+                    });
+        } else if (n_tok == 4) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+>>>>>>> ours-now
 
+<<<<<<< sycl
         if (gr_norm_split())
             st->parallel_for<dpct_kernel_name<class gr_norm_split_k>>(
                 sycl::nd_range<3>(sycl::range(1, 1, n_tok * HC) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
@@ -1970,12 +6986,68 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                     nr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
                     [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
                         gr_down_sliced_kernel(m, tl.get_multi_ptr<sycl::access::decorated::no>().get());
+||||||| base
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_ca7f8a, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<4>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_v3_kernel<1, 4, true>(m, part, ssg);
+=======
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_3c1daa, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<4>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_v3_kernel<1, 4, true>(m, part, ssg);
+>>>>>>> ours-now
                     });
+<<<<<<< sycl
             else
                 cgh.parallel_for<dpct_kernel_name<class gr_down_sliced_k>>(
                     nr, [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
                         gr_down_sliced_kernel(m, tl.get_multi_ptr<sycl::access::decorated::no>().get());
+||||||| base
+        } else if (n_tok == 5) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_b47220, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<5>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_v3_kernel<1, 5, true>(m, part, ssg);
+=======
+        } else if (n_tok == 5) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_d5279f, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<5>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_v3_kernel<1, 5, true>(m, part, ssg);
+>>>>>>> ours-now
                     });
+<<<<<<< sycl
         });
         const unsigned nred = unsigned((n_tok * GRS_ROWS + 127) / 128);
         st->parallel_for<dpct_kernel_name<class gr_down_reduce_k>>(
@@ -1995,6 +7067,25 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             cgh.parallel_for<
                 dpct_kernel_name<class gr_down_multi_kernel_7f5820, dpct_kernel_scalar<TILE>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS * DOWN_SPLIT + 1) *
+||||||| base
+        } else if (n_tok == 6) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_7581a4, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<6>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+=======
+        } else if (n_tok == 6) {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_c430dd, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<6>, dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+>>>>>>> ours-now
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
                 exp_props,
@@ -2016,6 +7107,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             c.part = m.part;
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
+<<<<<<< sycl
             st->submit([&](sycl::handler &cgh) {
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                     sycl::range((size_t)ct * TILE * sizeof(float)), cgh);
@@ -2033,14 +7125,111 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                                        .get());
                         });
             });
+||||||| base
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_b91153, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<kFusedGrMaxT>, dpct_kernel_scalar<false>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_v3_kernel<1, kFusedGrMaxT, false>(m, part, ssg);
+                    });
+=======
+
+            st->parallel_for<dpct_kernel_name<
+                class gr_up_v3_kernel_27bb62, dpct_kernel_scalar<1>,
+                dpct_kernel_scalar<kFusedGrMaxT>, dpct_kernel_scalar<false>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_v3_kernel<1, kFusedGrMaxT, false>(m, part, ssg);
+                    });
+>>>>>>> ours-now
         }
+<<<<<<< sycl
+||||||| base
+        /*
+        DPCT1010: SYCL uses exceptions to report errors and does not use the
+        error codes. The cudaGetLastError function call was replaced with 0. You
+        need to rewrite this code.
+        */
+        const dpct::err0 e3 = 0;
+
+        return false;   // the v3 read: no q8_1 (the caller quantizes)
+=======
+        /*
+        DPCT1010: SYCL uses exceptions to report errors and does not use
+        the error codes. The cudaGetLastError function call was replaced with 0.
+        You need to rewrite this code.
+        */
+        const dpct::err0 e3 = 0;
+
+        return false;   // the v3 read: no q8_1 (the caller quantizes)
+>>>>>>> ours-now
     }
+<<<<<<< sycl
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
     if (gr_more_groups(st)) {
         if (gr_large_grf(st)) launch_gr_up_more<true>(st, m);
         else launch_gr_up_more<false>(st, m);
     } else {
         launch_gr_up_multi(st, m, gr_large_grf(st));   // STRATA_GR_UP_COLS (16 default, 8, 4): the same bits; Arc A-series: large GRF
+||||||| base
+#if defined(STRATA_HIP_GFX906)
+    // gfx906, opt-in STRATA_GR_SPLIT=1: the latency-hidden norm/up (STRATA_GR_FAST) with the K-split down (~3% faster
+    // per verify window).  Its fixed-order finish sums the K slices in another order than the single-token
+    // fused_gr_read, so the multi-token read is then no longer bitwise equal to T single-token calls (gr_parity's
+    // contract); off by default for that reason.
+    static const bool split_on = std::getenv("STRATA_GR_SPLIT") && std::string(std::getenv("STRATA_GR_SPLIT")) == "1";
+    if (split_on) {
+        const bool fast = gr_fast();
+        if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
+        else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
+        gr_down_split_kernel<<<dim3(DOWN_BLOCKS + 1, GS_S), GS_WAVES * 64, (size_t) n_tok * GS_SL * sizeof(float), st>>>(
+            m);
+        gr_down_finish_kernel<<<(unsigned) ((n_tok * GS_ROWS + 255) / 256), 256, 0, st>>>(m);
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+        if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        else gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+        return false;   // the gfx906 STRATA_GR_SPLIT read: no q8_1 (the caller quantizes), like the v3 path above
+=======
+#if defined(STRATA_HIP_GFX906)
+    // gfx906, opt-in STRATA_GR_SPLIT=1: the latency-hidden norm/up (STRATA_GR_FAST) with the K-split down (~3% faster
+    // per verify window).  Its fixed-order finish sums the K slices in another order than the single-token
+    // fused_gr_read, so the multi-token read is then no longer bitwise equal to T single-token calls (gr_parity's
+    // contract); off by default for that reason.
+    static const bool split_on = std::getenv("STRATA_GR_SPLIT") && std::string(std::getenv("STRATA_GR_SPLIT")) == "1";
+    if (split_on && a[0].s_down == nullptr) {   // its K-split down reads bf16 rows (not STRATA_HC_REQ8)
+        const bool fast = gr_fast();
+        if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
+        else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
+        gr_down_split_kernel<<<dim3(DOWN_BLOCKS + 1, GS_S), GS_WAVES * 64, (size_t) n_tok * GS_SL * sizeof(float), st>>>(
+            m);
+        gr_down_finish_kernel<<<(unsigned) ((n_tok * GS_ROWS + 255) / 256), 256, 0, st>>>(m);
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+        if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        else gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+        return false;   // the gfx906 STRATA_GR_SPLIT read: no q8_1 (the caller quantizes), like the v3 path above
+>>>>>>> ours-now
     }
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
@@ -2048,11 +7237,181 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     need to rewrite this code.
     */
     const dpct::err0 e = 0;
+<<<<<<< sycl
     return false;   // SYCL port: the q8_1 images (S26 STRATA_QFUSE) and the Q8_0 reads (S23 STRATA_HC_Q8) are not built; the caller quantizes
+||||||| base
+
+    return q8;
 }
 
+// STRATA_HC_Q8 on a bf16 pack: one warp a Q8_0 block, ggml's reference rounding (d = amax / 127 as fp16, q = round(x * (1 / d)))
+__dpct_inline__ void gr_quantize_q8_0_kernel(const uint16_t *__restrict__ w,
+                                             uint8_t *__restrict__ out,
+                                             int64_t nb) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t b =
+        (int64_t)item_ct1.get_group(2) * 8 + (item_ct1.get_local_id(2) >> 5);
+    const int lane = item_ct1.get_local_id(2) & 31;
+    if (b >= nb) return;
+    const float v = sycl::bit_cast<float>((uint32_t)w[b * 32 + lane] << 16);
+    float amax = sycl::fabs(v);
+#pragma unroll
+    /*
+    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(
+        amax, dpct::experimental::permute_sub_group_by_xor(
+                  0xffffffffu,
+                  sycl::ext::oneapi::this_work_item::get_sub_group(), amax, o));
+    const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint8_t* o = out + b * 34;
+    if (lane == 0) {
+        const unsigned short h = sycl::bit_cast<unsigned short, sycl::half>(
+            sycl::vec<float, 1>(d)
+                .convert<sycl::half, sycl::rounding_mode::rte>()[0]);
+        o[0] = (uint8_t) (h & 255u);
+        o[1] = (uint8_t) (h >> 8);
+    }
+    o[2 + lane] = (uint8_t)(int8_t)sycl::rint(sycl::round(v * id));
+}
+
+__dpct_inline__ void gr_dequant_q8_0_kernel(const uint8_t *__restrict__ q8,
+                                            uint16_t *__restrict__ out,
+                                            int64_t nb) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t b =
+        (int64_t)item_ct1.get_group(2) * 8 + (item_ct1.get_local_id(2) >> 5);
+    const int lane = item_ct1.get_local_id(2) & 31;
+    if (b >= nb) return;
+    const uint8_t* p = q8 + b * 34;
+    const float d =
+        sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(
+                                     (unsigned short)(p[0] | (p[1] << 8))))
+            .convert<float, sycl::rounding_mode::automatic>()[0];
+    out[b * 32 + lane] = bf16_from_f32(d * (float) (int8_t) p[2 + lane]);
+}
+
+void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+
+    strata::q_of(stream)
+        ->parallel_for<dpct_kernel_name<class gr_dequant_q8_0_kernel_e72377>>(
+            sycl::nd_range<3>(
+                sycl::range(1, 1, (unsigned)((n_blocks + 7) / 8)) *
+                    sycl::range(1, 1, 256),
+                sycl::range(1, 1, 256)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                gr_dequant_q8_0_kernel(q8, bf16, n_blocks);
+            });
+=======
+
+    return q8;
+}
+
+// STRATA_HC_Q8 on a bf16 pack: one warp a Q8_0 block, ggml's reference rounding (d = amax / 127 as fp16, q = round(x * (1 / d)))
+__dpct_inline__ void gr_quantize_q8_0_kernel(const uint16_t *__restrict__ w,
+                                             uint8_t *__restrict__ out,
+                                             int64_t nb) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t b =
+        (int64_t)item_ct1.get_group(2) * 8 + (item_ct1.get_local_id(2) >> 5);
+    const int lane = item_ct1.get_local_id(2) & 31;
+    if (b >= nb) return;
+    const float v = sycl::bit_cast<float>((uint32_t)w[b * 32 + lane] << 16);
+    float amax = sycl::fabs(v);
+#pragma unroll
+    /*
+    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
+    masked sub_group function which may not be supported by all compilers or
+    runtimes. You may need to adjust the code.
+    */
+    for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(
+        amax, dpct::experimental::permute_sub_group_by_xor(
+                  0xffffffffu,
+                  sycl::ext::oneapi::this_work_item::get_sub_group(), amax, o));
+    const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint8_t* o = out + b * 34;
+    if (lane == 0) {
+        const unsigned short h = sycl::bit_cast<unsigned short, sycl::half>(
+            sycl::vec<float, 1>(d)
+                .convert<sycl::half, sycl::rounding_mode::rte>()[0]);
+        o[0] = (uint8_t) (h & 255u);
+        o[1] = (uint8_t) (h >> 8);
+    }
+    o[2 + lane] = (uint8_t)(int8_t)sycl::rint(sycl::round(v * id));
+}
+
+__dpct_inline__ void gr_dequant_q8_0_kernel(const uint8_t *__restrict__ q8,
+                                            uint16_t *__restrict__ out,
+                                            int64_t nb) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t b =
+        (int64_t)item_ct1.get_group(2) * 8 + (item_ct1.get_local_id(2) >> 5);
+    const int lane = item_ct1.get_local_id(2) & 31;
+    if (b >= nb) return;
+    const uint8_t* p = q8 + b * 34;
+    const float d =
+        sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(
+                                     (unsigned short)(p[0] | (p[1] << 8))))
+            .convert<float, sycl::rounding_mode::automatic>()[0];
+    out[b * 32 + lane] = bf16_from_f32(d * (float) (int8_t) p[2 + lane]);
+}
+
+void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+
+    strata::q_of(stream)
+        ->parallel_for<dpct_kernel_name<class gr_dequant_q8_0_kernel_a0eddf>>(
+            sycl::nd_range<3>(
+                sycl::range(1, 1, (unsigned)((n_blocks + 7) / 8)) *
+                    sycl::range(1, 1, 256),
+                sycl::range(1, 1, 256)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                gr_dequant_q8_0_kernel(q8, bf16, n_blocks);
+            });
+>>>>>>> ours-now
+}
+
+<<<<<<< sycl
 // the bench only (AMD latency-hidden kernels): nothing to switch on the SYCL port
 void fused_gr_set_fast(int) {}
+||||||| base
+void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+
+    strata::q_of(stream)
+        ->parallel_for<dpct_kernel_name<class gr_quantize_q8_0_kernel_4828c3>>(
+            sycl::nd_range<3>(
+                sycl::range(1, 1, (unsigned)((n_blocks + 7) / 8)) *
+                    sycl::range(1, 1, 256),
+                sycl::range(1, 1, 256)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_quantize_q8_0_kernel(bf16, out, n_blocks);
+            });
+}
+=======
+void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+
+    strata::q_of(stream)
+        ->parallel_for<dpct_kernel_name<class gr_quantize_q8_0_kernel_32a3e6>>(
+            sycl::nd_range<3>(
+                sycl::range(1, 1, (unsigned)((n_blocks + 7) / 8)) *
+                    sycl::range(1, 1, 256),
+                sycl::range(1, 1, 256)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_quantize_q8_0_kernel(bf16, out, n_blocks);
+            });
+}
+>>>>>>> ours-now
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
     return n_embd == N && hc == HC && hc_lr == LR;
@@ -2066,6 +7425,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         std::exit(1);
     }
     dpct::queue_ptr st = strata::q_of(stream);
+<<<<<<< sycl
     // SYCL port: the multi-token read's sliced down kernel and per-(token, stream) norm sum in their own orders, so a
     // window's token would differ in its last bits from this kernel's. The header promises "every token's outputs
     // are bitwise fused_gr_read(a[t])" (gr_parity checks it): with those paths on, the single read IS the multi read
@@ -2086,28 +7446,84 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class gr_down_kernel_a5fa71>>(
-            sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_down_kernel(a);
-            });
-    }
+||||||| base
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
+=======
+    if (a.s_down != nullptr) {   // STRATA_HC_REQ8
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+>>>>>>> ours-now
 
-        st->parallel_for<dpct_kernel_name<class gr_up_kernel_fe3258>>(
-            sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_up_kernel(a);
-            });
+            st->parallel_for<dpct_kernel_name<class gr_down_kernel_a5fa71,
+                                              dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_down_kernel<true>(a);
+                    });
+        }
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->parallel_for<dpct_kernel_name<class gr_up_kernel_fe3258,
+                                              dpct_kernel_scalar<true>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
+                                      sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        gr_up_kernel<true>(a);
+                    });
+        }
+    } else {
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_down_kernel_a5fa71,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_down_kernel(a);
+                        });
+        }
+        {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            st->/*
+  DPCT1050: The template argument of the dpct_kernel_name could not be
+  deduced. You need to update this code.
+  */
+                parallel_for<dpct_kernel_name<
+                    class gr_up_kernel_fe3258,
+                    dpct_placeholder /*Fix the type mannually*/>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
+                                          sycl::range(1, 1, THREADS),
+                                      sycl::range(1, 1, THREADS)),
+                    exp_props,
+                    [=](sycl::nd_item<3> item_ct1)
+                        [[sycl::reqd_sub_group_size(32)]] {
+                            gr_up_kernel(a);
+                        });
+        }
     }
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
@@ -2392,5 +7808,479 @@ void fused_gr_check() {
                                    "for the earlier ones)" : "");
 }
 
+
+namespace {
+__dpct_inline__ void hc_q8_bf16_kernel(const int8_t *__restrict__ q,
+                                       const float *__restrict__ sc,
+                                       uint16_t *__restrict__ out,
+                                       long long n) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const long long i =
+        (long long)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= n) return;
+    const float v = sc[i / 32] * (float) q[i];
+    uint32_t b = sycl::bit_cast<unsigned int>(v);
+    b += 0x7fffu + ((b >> 16) & 1u);                  // round to nearest even (the values are finite)
+    out[i] = (uint16_t) (b >> 16);
+}
+}  // namespace
+
+void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long long n, void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+
+    strata::q_of(stream)
+        ->parallel_for<dpct_kernel_name<class hc_q8_bf16_kernel_1fa426>>(
+            sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((n + 255) / 256)) *
+                                  sycl::range(1, 1, 256),
+                              sycl::range(1, 1, 256)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                hc_q8_bf16_kernel((const int8_t *)codes, scales, out, n);
+            });
+}
+
+// ===================================== the read as ONE persistent kernel (opt-in STRATA_HC_PERSIST=1, HIP) ==============
+// 80 blocks that must all be resident (a start-up run per T decides; larger T keep the default read) and two grid
+// barriers on an atomic counter.  Block b: (A) stages R' * w_norm for columns [128 b, 128 b + 128) (one stream) and writes
+// that slice's sum of squares and the UNSCALED partial dots of the 320 down + 4 inject rows (the v3 identity
+// w . xn = sum_c rs[c] (w[:, c] . x'[c])); barrier; (B) rs per stream, then rows (k, r) = b + 80 j reduced to lo / inject;
+// barrier; (C) the up projection read straight from VRAM, a thread pair per row, the epilogue as gr_up_kernel.
+// ANOTHER SUMMATION ORDER than the default read (not bitwise; the init check bounds the difference).  Only the verifier's hyper-connection reads use it: they run on one stream per card (both pipeline
+// verifiers share it), so two of these kernels never wait on each other; the drafter's reads keep the default kernels.
+#if defined(__HIPCC__)
+namespace {
+namespace hcp {
+// Measured on gfx1030 (bench/results/2026-10-12-hc-persist-gfx1030): the gain over the three-kernel read is (1) the down
+// projection split by column slices over all 80 blocks (the default read runs 41 blocks staging the activations through
+// LDS) and (2) one launch with two grid barriers instead of three launches and the gaps between them.  Prefetching the
+// up weights (into registers or by touching them into L2 / Infinity Cache) and the epilogue inputs measured no gain on
+// gfx1030 and is gone: the 13 MB are read once from VRAM whichever way.
+constexpr int NB = 80, SL = D / NB, SPS = N / SL, UPC = N / NB, NR = LR + HC;
+static_assert(UPC * HC * 2 == THREADS, "a thread pair per up row");
+struct PArgs {
+    FusedGrArgs a[kFusedGrMaxT];
+    float* part;        // [T][NR][NB]
+    float* ssp;         // [T][NB]
+    unsigned* bar;      // [0] count, [32] generation, [48] abort (a barrier that timed out)
+    unsigned long long timeout_ticks;   // s_memrealtime ticks (100 MHz) a barrier waits before it aborts the read
+    double* partd;      // STRATA_HC_PERSIST=3 (a reference only): the partial dots and sums of squares in double
+    double* sspd;
+};
+// Returns false when the read was aborted: a block waited longer than `ticks` (the 80 blocks were not all resident - the
+// start-up check finds that out by running every T with a short timeout) or another block aborted.  Then every block
+// leaves the kernel; the outputs are not written completely and bar[48] stays set until the host clears the words.
+__device__ __forceinline__ bool grid_sync(unsigned* bar, unsigned long long ticks) {
+#if defined(__GFX11__) || defined(__GFX12__)
+    // gfx11 and gfx12 have no s_memrealtime (clang: "needs target feature s-memrealtime"), so no barrier clock: this read is not
+    // offered there (fused_gr_persist_init refuses it; an R9700 measured it neutral to 1% slower in #2226), and a launch that gets
+    // here anyway aborts at once instead of waiting for a barrier it cannot time.
+    (void) ticks;
+    if (threadIdx.x == 0) __hip_atomic_store(&bar[48], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    return false;
+#else
+    __shared__ int s_abort;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int ab = 0;
+        const unsigned gen = __hip_atomic_load(&bar[32], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        const unsigned arrived = __hip_atomic_fetch_add(&bar[0], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        if (arrived == NB - 1) {
+            __hip_atomic_store(&bar[0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_fetch_add(&bar[32], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        } else {
+            const unsigned long long t0 = __builtin_amdgcn_s_memrealtime();
+            while (__hip_atomic_load(&bar[32], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == gen) {
+                if (__hip_atomic_load(&bar[48], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0u) { ab = 1; break; }
+                if (__builtin_amdgcn_s_memrealtime() - t0 > ticks) {
+                    __hip_atomic_store(&bar[48], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    ab = 1;
+                    break;
+                }
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+        if (__hip_atomic_load(&bar[48], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0u) ab = 1;
+        s_abort = ab;
+    }
+    __syncthreads();
+    __threadfence();
+    return s_abort == 0;
+#endif
+}
+// STRATA_HC_PERSIST=3 (a reference only, slow): every dot and sum accumulated in double
+__device__ __forceinline__ double dot8d(const uint4 w, const float* x) {
+    double acc = 0.0;
+    const unsigned u[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        acc += (double) __uint_as_float(u[q] << 16) * (double) x[2 * q];
+        acc += (double) __uint_as_float(u[q] & 0xffff0000u) * (double) x[2 * q + 1];
+    }
+    return acc;
+}
+template <int T, bool DP = false>
+__global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
+    using A = typename std::conditional<DP, double, float>::type;
+    __shared__ __align__(16) float xs[T][SL];
+    __shared__ __align__(16) float lo[T][LR];
+    __shared__ float s_rs[T][HC];
+    __shared__ float g[T][HC][UPC];
+    const int tid = threadIdx.x, lane = tid & 31, b = blockIdx.x;
+    const FusedGrArgs& a0 = f.a[0];
+    // (A) block b: columns [128 b, 128 b + 128) of D (one stream): R' * w_norm into LDS, the slice's sum of squares, and
+    // the UNSCALED partial dots of the 320 down + 4 inject rows (w . xn = sum_c rs[c] (w[:, c] . x'[c]))
+    const int c_b = b / SPS, col0 = b * SL;
+    if (tid < T * (SL / 4)) {
+        const int k = tid / (SL / 4), o4 = tid - k * (SL / 4);
+        const FusedGrArgs& a = f.a[k];
+        const int i = col0 + o4 * 4, d = i - c_b * N;
+        float4 r = *reinterpret_cast<const float4*>(a.R + i);
+        if (a.apply) {
+            const float gw = 2.0f * sigmoidf_(a.inj_prev[c_b] / (float) HC);
+            const float4 bo = *reinterpret_cast<const float4*>(a.bo_prev + d);
+            r.x = fmaf(bo.x, gw, r.x); r.y = fmaf(bo.y, gw, r.y); r.z = fmaf(bo.z, gw, r.z); r.w = fmaf(bo.w, gw, r.w);
+        }
+        const float4 gn = *reinterpret_cast<const float4*>(a.w_norm + i);
+        if constexpr (DP) {
+            double ss = (double) r.x * r.x + (double) r.y * r.y + (double) r.z * r.z + (double) r.w * r.w;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor(ss, o);
+            if (lane == 0) f.sspd[k * NB + b] = ss;
+        } else {
+            const float ss = warp_sum(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);   // warp k = token k
+            if (lane == 0) f.ssp[k * NB + b] = ss;
+        }
+        *reinterpret_cast<float4*>(&xs[k][o4 * 4]) = make_float4(r.x * gn.x, r.y * gn.y, r.z * gn.z, r.w * gn.w);
+    }
+    __syncthreads();
+    const int hw = tid >> 4, hl = tid & 15;
+    const bool inj = a0.w_inject != nullptr;
+    const int nrows = inj ? NR : LR;
+#pragma unroll 3
+    for (int r = hw; r < nrows; r += 16) {
+        const uint16_t* wrow = r < LR ? a0.w_down + (size_t) r * D : a0.w_inject + (size_t) (r - LR) * D;
+        const uint4 w = __ldg(reinterpret_cast<const uint4*>(wrow + col0) + hl);
+        A acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            A v;
+            if constexpr (DP) v = dot8d(w, &xs[k][hl * 8]); else v = dot8(w, &xs[k][hl * 8]);
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) v += __shfl_xor(v, o);
+            acc[k] = v;
+        }
+#pragma unroll
+        for (int k = 0; k < T; ++k)
+            if (hl == k) {
+                if constexpr (DP) f.partd[((size_t) k * NR + r) * NB + b] = acc[k];
+                else f.part[((size_t) k * NR + r) * NB + b] = (float) acc[k];
+            }
+    }
+    if (!grid_sync(f.bar, f.timeout_ticks)) return;
+    // (B) rs per stream (every block), then rows (k, r) = b + 80 j reduced to lo / inject by the blocks in turn
+    if (tid < T * HC) {
+        const int k = tid / HC, c = tid - k * HC;
+        float rr;
+        if constexpr (DP) {
+            double sd = 0.0;
+            for (int j = 0; j < SPS; ++j) sd += f.sspd[k * NB + c * SPS + j];
+            rr = (float) (1.0 / sqrt(sd / (double) N + (double) f.a[k].eps));
+        } else {
+            float s = 0.0f;
+            for (int j = 0; j < SPS; ++j) s += f.ssp[k * NB + c * SPS + j];
+            rr = rsqrtf(s / (float) N + f.a[k].eps);
+        }
+        s_rs[k][c] = rr;
+        if (b == 0) f.a[k].rs[c] = rr;
+    }
+    __syncthreads();
+    for (int idx = b + NB * tid; idx < T * nrows; idx += NB * THREADS) {
+        const int k = idx / nrows, r = idx - k * nrows;
+        A sum = 0;
+        if constexpr (DP) {
+            const double* p1 = f.partd + ((size_t) k * NR + r) * NB;
+            for (int c = 0; c < HC; ++c) {
+                double p = 0.0;
+                for (int j = 0; j < SPS; ++j) p += p1[c * SPS + j];
+                sum += (double) s_rs[k][c] * p;
+            }
+        } else {
+            const float4* p4 = reinterpret_cast<const float4*>(f.part + ((size_t) k * NR + r) * NB);
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                float p = 0.0f;
+#pragma unroll
+                for (int j = 0; j < SPS / 4; ++j) {
+                    const float4 v = p4[c * (SPS / 4) + j];
+                    p += (v.x + v.y) + (v.z + v.w);
+                }
+                sum = fmaf(s_rs[k][c], p, sum);
+            }
+        }
+        if (r < LR) {
+            const A x = sum / (A) HC;
+            f.a[k].lo[r] = (float) (x / ((A) 1 + (DP ? (A) exp((double) -x) : (A) __expf((float) -x))));
+        } else {
+            f.a[k].inject_out[r - LR] = (float) sum;
+        }
+    }
+    if (!grid_sync(f.bar, f.timeout_ticks)) return;
+    for (int idx = tid; idx < T * LR; idx += THREADS) {
+        const int k = idx / LR, r = idx - k * LR;
+        lo[k][r] = f.a[k].lo[r];
+    }
+    __syncthreads();
+    // (C) the up projection, a thread pair per row (block b: columns 32 b .. 32 b + 31 of all four streams), then the
+    // epilogue as gr_up_kernel
+    {
+        const int d0 = b * UPC;
+        const int ur = tid >> 1, uh = tid & 1, uc = ur / UPC, udd = ur - uc * UPC, ui = uc * N + d0 + udd;
+        const uint4* w4u = reinterpret_cast<const uint4*>(a0.w_up + (size_t) ui * LR) + uh * 20;
+        A v[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) v[k] = 0;
+#pragma unroll 1
+        for (int j0 = 0; j0 < 20; j0 += 5) {   // five chunks a batch (all twenty at once costs registers)
+            uint4 w[5];
+#pragma unroll
+            for (int q = 0; q < 5; ++q) w[q] = __ldg(w4u + j0 + q);
+#pragma unroll
+            for (int q = 0; q < 5; ++q)
+#pragma unroll
+                for (int k = 0; k < T; ++k) {
+                    if constexpr (DP) v[k] += dot8d(w[q], &lo[k][uh * 160] + (j0 + q) * 8);
+                    else v[k] += dot8(w[q], &lo[k][uh * 160] + (j0 + q) * 8);
+                }
+        }
+        float acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[k] = (float) (v[k] + __shfl_xor(v[k], 1));
+        if (uh == 0) {
+            const float wn = a0.w_norm[ui];
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                const FusedGrArgs& a = f.a[k];
+                float rv = a.R[ui];
+                if (a.apply) {
+                    rv = fmaf(a.bo_prev[d0 + udd], 2.0f * sigmoidf_(a.inj_prev[uc] / (float) HC), rv);
+                    a.R_out[ui] = rv;
+                }
+                g[k][uc][udd] = rv * wn * s_rs[k][uc] * sigmoidf_(acc[k]);
+            }
+        }
+    }
+    __syncthreads();
+    for (int idx = tid; idx < T * UPC; idx += THREADS) {
+        const int k = idx / UPC, col = idx - k * UPC;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        f.a[k].mixed[b * UPC + col] = s / (float) HC;
+    }
+}
+struct DevState {
+    float* part = nullptr;
+    float* ssp = nullptr;
+    double* partd = nullptr;
+    double* sspd = nullptr;
+    unsigned* bar = nullptr;
+    int max_t = 0;      // 0: off on this card
+    bool tried = false;
+};
+DevState g_dev[64];
+using KFn = void (*)(PArgs);
+template <bool DP>
+KFn kernel_t(int T) {
+    switch (T) {
+        case 1: return persist_kernel<1, DP>;
+        case 2: return persist_kernel<2, DP>;
+        case 3: return persist_kernel<3, DP>;
+        case 4: return persist_kernel<4, DP>;
+        case 5: return persist_kernel<5, DP>;
+        case 6: return persist_kernel<6, DP>;
+        case 7: return persist_kernel<7, DP>;
+        case 8: return persist_kernel<8, DP>;
+    }
+    return nullptr;
+}
+bool dp_on() {
+    static const bool dp = [] { const char* v = std::getenv("STRATA_HC_PERSIST"); return v != nullptr && std::atoi(v) == 3; }();
+    return dp;
+}
+KFn kernel_for(int T) { return dp_on() ? kernel_t<true>(T) : kernel_t<false>(T); }
+// s_memrealtime runs at 100 MHz on RDNA: a barrier gives up after 2 s in a read (never in a working run; it only turns a
+// hang into a wrong read) and after 50 ms in the start-up check (where a timeout means "not resident here")
+constexpr unsigned long long kTicksRun = 200000000ULL, kTicksCheck = 5000000ULL;
+void launch(const FusedGrArgs* a, int n_tok, const DevState& st, cudaStream_t s, unsigned long long ticks) {
+    PArgs f;
+    for (int t = 0; t < n_tok; ++t) f.a[t] = a[t];
+    f.part = st.part; f.ssp = st.ssp; f.bar = st.bar; f.partd = st.partd; f.sspd = st.sspd; f.timeout_ticks = ticks;
+    kernel_for(n_tok)<<<NB, THREADS, 0, s>>>(f);
+}
+bool env_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_PERSIST"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+}  // namespace hcp
+}  // namespace
+
+void fused_gr_persist_init() {
+    if (!hcp::env_on()) return;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64 || hcp::g_dev[dev].tried) return;
+    hcp::DevState& st = hcp::g_dev[dev];
+    st.tried = true;
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, dev);
+    if (prop.warpSize != 32) {
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: the kernel is written for 32-lane waves "
+                             "(this card runs %d)\n", dev, prop.warpSize);
+        return;
+    }
+    if (strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName) || strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName)) {
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: gfx11 / gfx12 have no s_memrealtime for the barrier "
+                             "timeout (written and measured for gfx1030; an R9700 saw no gain from it, #2226)\n", dev);
+        return;
+    }
+    const int mp = prop.multiProcessorCount;   // only for the confirmation line (WGPs on RDNA)
+    bool ok = cudaMalloc((void**) &st.part, (size_t) kFusedGrMaxT * hcp::NR * hcp::NB * sizeof(float)) == cudaSuccess &&
+              cudaMalloc((void**) &st.ssp, (size_t) kFusedGrMaxT * hcp::NB * sizeof(float)) == cudaSuccess &&
+              cudaMalloc((void**) &st.bar, 64 * sizeof(unsigned)) == cudaSuccess &&
+              cudaMalloc((void**) &st.partd, (size_t) kFusedGrMaxT * hcp::NR * hcp::NB * sizeof(double)) == cudaSuccess &&
+              cudaMalloc((void**) &st.sspd, (size_t) kFusedGrMaxT * hcp::NB * sizeof(double)) == cudaSuccess &&
+              cudaMemset(st.bar, 0, 64 * sizeof(unsigned)) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: workspace allocation failed\n", dev);
+        return;
+    }
+    // the check: random weights and inputs with the pending write and the inject rows, against the default read; the
+    // persistent read sums in another order, so it is bounded, not bitwise.  Every T is RUN with a 50 ms barrier timeout; a
+    // timeout means "not resident here" and larger T keep the default read.  No occupancy API in front of it: it promised
+    // more than the card holds on 30 WGPs under HSA_CU_MASK (a hang without the timeout) and less than it holds with
+    // the HIP 7.1 runtime (1 block per WGP on 40 WGPs, which turned the read off although it runs resident).
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto bf = [](float x) { uint32_t u; std::memcpy(&u, &x, 4); return (uint16_t) ((u + 0x7fff + ((u >> 16) & 1)) >> 16); };
+    const int TM = kFusedGrMaxT;
+    std::vector<float> R((size_t) TM * D), bo((size_t) TM * N), inj((size_t) TM * HC), wn(D);
+    for (auto& x : R) x = nd(rng);
+    for (auto& x : bo) x = 0.5f * nd(rng);
+    for (auto& x : inj) x = nd(rng);
+    for (auto& x : wn) x = 1.0f + 0.3f * nd(rng);
+    std::vector<uint16_t> wd((size_t) LR * D), wu((size_t) D * LR), wi((size_t) HC * D);
+    for (auto& x : wd) x = bf(0.02f * nd(rng));
+    for (auto& x : wu) x = bf(0.05f * nd(rng));
+    for (auto& x : wi) x = bf(0.02f * nd(rng));
+    float *dR, *dbo, *dinj, *dwn, *dxn, *dlo, *drs, *dio, *dmix;
+    uint16_t *dwd, *dwu, *dwi;
+    cudaMalloc((void**) &dR, R.size() * 4); cudaMalloc((void**) &dbo, bo.size() * 4);
+    cudaMalloc((void**) &dinj, inj.size() * 4); cudaMalloc((void**) &dwn, wn.size() * 4);
+    cudaMalloc((void**) &dxn, (size_t) TM * D * 4); cudaMalloc((void**) &dlo, (size_t) TM * LR * 4);
+    cudaMalloc((void**) &drs, (size_t) TM * HC * 4); cudaMalloc((void**) &dio, (size_t) TM * HC * 4);
+    cudaMalloc((void**) &dmix, (size_t) TM * N * 4);
+    cudaMalloc((void**) &dwd, wd.size() * 2); cudaMalloc((void**) &dwu, wu.size() * 2); cudaMalloc((void**) &dwi, wi.size() * 2);
+    cudaMemcpy(dbo, bo.data(), bo.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dinj, inj.data(), inj.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dwn, wn.data(), wn.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dwd, wd.data(), wd.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(dwu, wu.data(), wu.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(dwi, wi.data(), wi.size() * 2, cudaMemcpyHostToDevice);
+    double worst = 0.0;
+    int bad_t = 0, timeouts = 0;
+    // 0: the read agrees with the default read; 1: a barrier timed out (not resident); 2: wrong or a device error
+    auto check = [&](int T) -> int {
+        FusedGrArgs a[kFusedGrMaxT];
+        for (int t = 0; t < T; ++t) {
+            a[t] = FusedGrArgs{};
+            a[t].R = dR + (size_t) t * D; a[t].R_out = dR + (size_t) t * D; a[t].apply = true;
+            a[t].bo_prev = dbo + (size_t) t * N; a[t].inj_prev = dinj + (size_t) t * HC;
+            a[t].w_norm = dwn; a[t].w_down = dwd; a[t].w_up = dwu; a[t].w_inject = dwi; a[t].eps = 1e-6f;
+            a[t].lo = dlo + (size_t) t * LR; a[t].rs = drs + (size_t) t * HC;
+            a[t].inject_out = dio + (size_t) t * HC; a[t].mixed = dmix + (size_t) t * N;
+        }
+        std::vector<float> out[2];
+        for (int which = 0; which < 2; ++which) {
+            cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
+            cudaMemset(dmix, 0xff, (size_t) TM * N * 4);
+            cudaMemset(dio, 0xff, (size_t) TM * HC * 4);
+            cudaDeviceSynchronize();
+            if (which == 0) fused_gr_read_multi(a, T, dxn, nullptr);
+            else hcp::launch(a, T, st, nullptr, hcp::kTicksCheck);
+            if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); return 2; }
+            if (which == 1) {
+                unsigned abort_word = 0;
+                cudaMemcpy(&abort_word, st.bar + 48, sizeof abort_word, cudaMemcpyDeviceToHost);
+                if (abort_word != 0u) {
+                    cudaMemset(st.bar, 0, 64 * sizeof(unsigned));
+                    cudaDeviceSynchronize();
+                    return 1;
+                }
+            }
+            out[which].resize((size_t) T * (N + HC + D));
+            cudaMemcpy(out[which].data(), dmix, (size_t) T * N * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(out[which].data() + (size_t) T * N, dio, (size_t) T * HC * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(out[which].data() + (size_t) T * (N + HC), dR, (size_t) T * D * 4, cudaMemcpyDeviceToHost);
+        }
+        double mref = 0.0, md = 0.0;
+        bool finite = true;
+        for (size_t i = 0; i < out[0].size(); ++i) {
+            finite = finite && std::isfinite(out[1][i]);
+            mref = std::fmax(mref, std::fabs((double) out[0][i]));
+            md = std::fmax(md, std::fabs((double) out[1][i] - out[0][i]));
+        }
+        const double rel = md / (mref > 0 ? mref : 1.0);
+        worst = std::fmax(worst, rel);
+        return finite && rel < 1e-4 ? 0 : 2;
+    };
+    int max_t = 0;
+    for (int T = 1; T <= kFusedGrMaxT && ok; ++T) {
+        const int r = check(T);
+        if (r == 1) ++timeouts; else if (r == 2) { bad_t = T; ok = false; }
+        if (r != 0) break;
+        max_t = T;
+    }
+    cudaFree(dR); cudaFree(dbo); cudaFree(dinj); cudaFree(dwn); cudaFree(dxn); cudaFree(dlo); cudaFree(drs);
+    cudaFree(dio); cudaFree(dmix); cudaFree(dwd); cudaFree(dwu); cudaFree(dwi);
+    cudaMemset(st.bar, 0, 64 * sizeof(unsigned));
+    cudaDeviceSynchronize();
+    cudaGetLastError();
+    if (!ok) {
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: the check failed at %d tokens "
+                             "(max relative difference %.3g)\n", dev, bad_t, worst);
+        return;
+    }
+    if (max_t == 0) {
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: 80 blocks are not resident at once on %d "
+                             "multiprocessors (the check timed out)\n", dev, mp);
+        return;
+    }
+    st.max_t = max_t;
+    std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1: the verifier's hyper-connection read runs as one "
+                         "persistent kernel (80 blocks on %d multiprocessors, up to %d tokens; %d token counts timed out in "
+                         "the check; checked against the default read, max relative difference %.2g)\n", dev, mp, max_t,
+                 timeouts, worst);
+}
+
+bool fused_gr_read_persist(const FusedGrArgs* a, int n_tok, void* stream) {
+    if (!hcp::env_on() || n_tok < 1) return false;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    const hcp::DevState& st = hcp::g_dev[dev];
+    if (n_tok > st.max_t) return false;
+    if (a[0].q8_down != nullptr || a[0].q8_up != nullptr) return false;    // STRATA_HC_Q8: the default read
+    for (int t = 0; t < n_tok; ++t)
+        if (a[t].q8_mixed != nullptr) return false;                         // STRATA_QFUSE: the default read
+    hcp::launch(a, n_tok, st, (cudaStream_t) stream, hcp::kTicksRun);
+    return true;
+}
+#else
+void fused_gr_persist_init() {}
+bool fused_gr_read_persist(const FusedGrArgs*, int, void*) { return false; }
+#endif
 
 }  // namespace strata::kernels

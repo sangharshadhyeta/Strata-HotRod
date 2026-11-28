@@ -527,17 +527,17 @@ __dpct_inline__ float row_dot_cpu_order(const uint8_t *codes,
         const int hi = dot4(codes + b * 16 + 8 + lane,
                            (const int8_t*) (xq + (size_t) (2 * b + 1) * 34 + 2) + lane * 4);
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         acc = sycl::fma(d * xs[2 * b], (float)lo, acc);
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         acc = sycl::fma(d * xs[2 * b + 1], (float)hi, acc);
         if (lane == 0)
@@ -683,17 +683,17 @@ __dpct_inline__ void cpu_order_quantize_kernel(const float *x, uint8_t *blocks,
     int sum = 0;
     for (int j = 0; j < 32; ++j) {
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         const float t = xb[j] * inv;
         /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
+        DPCT1013: The rounding mode could not be specified and the
+        generated code may have different accuracy than the original code.
+        Verify the correctness. SYCL math built-in function rounding mode is
+        aligned with OpenCL C 1.2 standard.
         */
         int v = (int) (t + (t >= 0.0f ? 0.5f : -0.5f));   // SYCL port: dpct dropped the parentheses (it rounded every value to 0)
         v = v < -127 ? -127 : (v > 127 ? 127 : v);
@@ -911,7 +911,13 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_792534>>(
+||||||| base
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_a2fb6f>>(
+=======
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_6d6eaa>>(
+>>>>>>> ours-now
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -1068,7 +1074,13 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_5aa9a9>>(
+||||||| base
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_a11cc2>>(
+=======
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_b6ee6d>>(
+>>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((pairs + THREADS - 1) / THREADS)) *
@@ -1133,7 +1145,13 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_a0c31a>>(
+||||||| base
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_f0d9b2>>(
+=======
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_5bf1a0>>(
+>>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((pairs + THREADS - 1) / THREADS)) *
@@ -1552,6 +1570,68 @@ auto &e_s = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[128]>(
         ent_tok[at] = i / k_per_tok;
     }
 }
+
+// STRATA_MTP_ZC: group_resident_kernel with the blob addresses from a pointer table (ptr_tab[e]: a slot, or the pinned RAM copy of e).
+__dpct_inline__ void
+group_ptr_kernel(const int32_t *__restrict__ ids, int n, int k_per_tok,
+                 const unsigned long long *__restrict__ ptr_tab,
+                 unsigned long long *__restrict__ grp_ptr,
+                 int32_t *__restrict__ grp_start, int32_t *__restrict__ counts,
+                 int32_t *__restrict__ ent_dst, int32_t *__restrict__ ent_tok) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &e_s = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[128]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &first_s =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int[128]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &size_s =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int[128]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &gidx_s =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int[128]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &gstart_s =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int[129]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int i = item_ct1.get_local_id(2);
+    const int e = i < n ? ids[i] : -1;
+    e_s[i] = e;
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    int first = i, rank = 0, size = 0;
+    if (i < n) {
+#pragma unroll
+        for (int j = 0; j < i; ++j)
+            if (e_s[j] == e) { if (first == i) first = j; ++rank; }
+        if (first == i)
+#pragma unroll
+            for (int j = i; j < n; ++j) size += e_s[j] == e;
+    }
+    first_s[i] = first;
+    size_s[i] = (i < n && first == i) ? size : 0;
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    if (i == 0) {
+        int gi = 0, acc = 0;
+#pragma unroll
+        for (int j = 0; j < n; ++j)
+            if (first_s[j] == j) {
+                gidx_s[j] = gi;
+                gstart_s[gi] = acc;
+                grp_ptr[gi] = ptr_tab[e_s[j]];
+                grp_start[gi] = acc;
+                acc += size_s[j];
+                ++gi;
+            }
+        grp_start[gi] = acc;
+        counts[0] = gi;
+        counts[1] = acc;
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    if (i < n) {
+        const int at = gstart_s[gidx_s[first]] + rank;
+        ent_dst[at] = i;
+        ent_tok[at] = i / k_per_tok;
+    }
+}
 }  // namespace
 
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
@@ -1574,6 +1654,25 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
                 });
     }
     check("moe_group_resident", stream);
+}
+
+void moe_group_ptr(const int32_t* ids, int n, int k_per_tok, const unsigned long long* ptr_tab, unsigned long long* grp_ptr,
+                   int32_t* grp_start, int32_t* counts, int32_t* ent_dst, int32_t* ent_tok, void* stream) {
+    if (n < 1 || n > 128) { std::fprintf(stderr, "moe_group_ptr: n must be 1..128\n"); std::exit(1); }
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class group_ptr_kernel_e4d1d3>>(
+                sycl::nd_range<3>(sycl::range(1, 1, 128),
+                                  sycl::range(1, 1, 128)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    group_ptr_kernel(ids, n, k_per_tok, ptr_tab, grp_ptr,
+                                     grp_start, counts, ent_dst, ent_tok);
+                });
+    }
+    check("moe_group_ptr", stream);
 }
 
 void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
@@ -1659,7 +1758,13 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
+<<<<<<< sycl
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_90849f>>(
+||||||| base
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_12f01a>>(
+=======
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_39194e>>(
+>>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((pairs + THREADS - 1) / THREADS)) *
@@ -1777,7 +1882,13 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cs->parallel_for<
+<<<<<<< sycl
             dpct_kernel_name<class cpu_order_projection_kernel_2fbdd9,
+||||||| base
+            dpct_kernel_name<class cpu_order_projection_kernel_dac900,
+=======
+            dpct_kernel_name<class cpu_order_projection_kernel_b8b107,
+>>>>>>> ours-now
                              dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(
                 sycl::range(1, 1,
@@ -1853,7 +1964,13 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cs->parallel_for<
+<<<<<<< sycl
             dpct_kernel_name<class cpu_order_projection_kernel_2e007a,
+||||||| base
+            dpct_kernel_name<class cpu_order_projection_kernel_9d9e9d,
+=======
+            dpct_kernel_name<class cpu_order_projection_kernel_3cfac5,
+>>>>>>> ours-now
                              dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(
                 sycl::range(1, 1,

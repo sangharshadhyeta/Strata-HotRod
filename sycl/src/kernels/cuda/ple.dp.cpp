@@ -61,6 +61,8 @@ history_advance_kernel(float *__restrict__ history,
 __dpct_inline__ uint16_t bf16_bits(float f) {
     uint32_t i;
     memcpy(&i, &f, 4);
+    // a NaN stays a quiet NaN, as in bf16_bits.hpp: the rounding add would carry it into -0 or inf (upstream #2955)
+    if ((i & 0x7FFFFFFFu) > 0x7F800000u) return (uint16_t) ((i >> 16) | 64u);
     i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
     return (uint16_t) (i >> 16);
 }
@@ -440,7 +442,13 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
+<<<<<<< sycl
                 cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_e2f600>>(
+||||||| base
+                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_1eac11>>(
+=======
+                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_474396>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -461,7 +469,13 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
+<<<<<<< sycl
                 cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_92a6ef>>(
+||||||| base
+                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_447996>>(
+=======
+                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_c1a893>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -569,7 +583,13 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
+<<<<<<< sycl
                 cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_dda9b4>>(
+||||||| base
+                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_f94762>>(
+=======
+                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_bad8f0>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),

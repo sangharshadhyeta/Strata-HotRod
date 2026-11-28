@@ -197,7 +197,8 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ parts,
                                         const float *__restrict__ weights,
                                         const float *__restrict__ shared,
                                         float *__restrict__ y, int n_embd,
-                                        int k, int has_shared) {
+                                        int k, int has_shared,
+                                        MoeLearnTap tap) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int j = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
                   item_ct1.get_local_id(2);
@@ -205,9 +206,13 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ parts,
     // Accumulate in DOUBLE, in the reference's own order (`for i in range(k): out[t] += w[t,i] * g[0]`).
     // f32 would be defensible for ten terms, but the reference is float64 and this is one line.
     double acc = 0.0;
-#pragma unroll
-    for (int e = 0; e < k; ++e) acc +=
-        (double)weights[e] * (double)parts[(size_t)e * n_embd + j];
+    // STRATA_STANDIN_LEARN: the tap's row is this call's one row (row 0), its raw parts copied before their weights
+    const int ys_r = lrn_ys_rank(tap, 0), ye_r = lrn_ye_rank(tap, 0);
+    for (int e = 0; e < k; ++e) {
+        const float p = parts[(size_t) e * n_embd + j];
+        lrn_put(tap, ys_r, ye_r, 0, e, n_embd, j, p);
+        acc += (double) weights[e] * (double) p;
+    }
     // The SHARED output is added PLAIN - not router-weighted, not renormalised against the routed sum.
     if (has_shared) acc += (double) shared[j];
     y[j] = (float) acc;
@@ -338,7 +343,13 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             cs->parallel_for<
+<<<<<<< sycl
                 dpct_kernel_name<class native_swiglu_kernel_c4e755>>(
+||||||| base
+                dpct_kernel_name<class native_swiglu_kernel_b9fcad>>(
+=======
+                dpct_kernel_name<class native_swiglu_kernel_8f70e2>>(
+>>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((n + THREADS - 1) / THREADS)) *
                         sycl::range(1, 1, THREADS),
@@ -352,9 +363,9 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     if (gate_deferred) {   // the caller computed g (raw) with the router and scales `out` in the combine
         /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use the
-        error codes. The cudaGetLastError function call was replaced with 0. You
-        need to rewrite this code.
+        DPCT1010: SYCL uses exceptions to report errors and does not use
+        the error codes. The cudaGetLastError function call was replaced with 0.
+        You need to rewrite this code.
         */
         const dpct::err0 e = 0;
         /*
@@ -414,7 +425,13 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                     auto g_t_ct2 = g + t;
 
                     cgh.parallel_for<
+<<<<<<< sycl
                         dpct_kernel_name<class scalar_gate_kernel_76bc5d>>(
+||||||| base
+                        dpct_kernel_name<class scalar_gate_kernel_9b510d>>(
+=======
+                        dpct_kernel_name<class scalar_gate_kernel_7da98c>>(
+>>>>>>> ours-now
                         sycl::nd_range<3>(sycl::range(1, 1, 256),
                                           sycl::range(1, 1, 256)),
                         exp_props,
@@ -554,7 +571,13 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
 
             strata::q_of(stream)
                 ->parallel_for<
+<<<<<<< sycl
                     dpct_kernel_name<class native_swiglu_kernel_75dcdc>>(
+||||||| base
+                    dpct_kernel_name<class native_swiglu_kernel_b33e17>>(
+=======
+                    dpct_kernel_name<class native_swiglu_kernel_f35a8f>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, g_ff) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -620,7 +643,13 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
 
             strata::q_of(stream)
                 ->parallel_for<
+<<<<<<< sycl
                     dpct_kernel_name<class scalar_gate_kernel_82de77>>(
+||||||| base
+                    dpct_kernel_name<class scalar_gate_kernel_b187b5>>(
+=======
+                    dpct_kernel_name<class scalar_gate_kernel_ae8b19>>(
+>>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
                     exp_props,
@@ -657,7 +686,8 @@ catch (sycl::exception const &exc) {
 }
 
 void moe_combine(const float *parts, const float *weights, const float *shared,
-                 float *y, int64_t n_embd, int64_t k, void *stream) try {
+                 float *y, int64_t n_embd, int64_t k, void *stream,
+                 const MoeLearnTap *tap) try {
     if (n_embd <= 0 || k <= 0) return;
     // k > 64 is refused rather than truncated: silently summing the first 64 of a longer list would be a
     // wrong answer that looks like a right one, and no geometry in this artifact comes close to it.
@@ -676,6 +706,8 @@ void moe_combine(const float *parts, const float *weights, const float *shared,
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
                 int shared_nullptr_ct6 = shared != nullptr;
+                MoeLearnTap tap_tap_MoeLearnTap_ct7 =
+                    tap ? *tap : MoeLearnTap{};
 
                 cgh.parallel_for<
                     dpct_kernel_name<class moe_combine_kernel_c03916>>(
@@ -683,9 +715,9 @@ void moe_combine(const float *parts, const float *weights, const float *shared,
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        moe_combine_kernel(parts, weights, shared, y,
-                                           (int)n_embd, (int)k,
-                                           shared_nullptr_ct6);
+                        moe_combine_kernel(
+                            parts, weights, shared, y, (int)n_embd, (int)k,
+                            shared_nullptr_ct6, tap_tap_MoeLearnTap_ct7);
                     });
             });
     }

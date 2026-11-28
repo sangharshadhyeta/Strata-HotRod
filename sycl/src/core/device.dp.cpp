@@ -109,6 +109,13 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// STRATA_PRIMARY_DEVICE: see the declaration in device.hpp.  0 = upstream's behavior (the runtime's first
+// visible device).  Set once, before any context exists, by generate.cpp's STRATA_PRIMARY_DEVICE handling.
+static int g_primary_device = 0;
+
+void set_primary_device(int ordinal) { g_primary_device = ordinal; }
+int primary_device() { return g_primary_device; }
+
 bool device_summary(int ordinal, std::string &name, std::string &detail) try {
     dpct::device_info p{};
     if (ordinal < 0 || ordinal >= device_count() ||
@@ -445,8 +452,8 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
                 });
             }
             /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
+            DPCT1010: SYCL uses exceptions to report errors and does not use
+            the error codes. The cudaGetLastError function call was replaced
             with 0. You need to rewrite this code.
             */
             check(0, "poison_kernel");

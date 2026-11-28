@@ -135,7 +135,8 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
     auto &warp_sums =
         *sycl::ext::oneapi::group_local_memory_for_overwrite<int[32]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    const int epoch = m.ctl[0] + 1;
+    int epoch = (int) ((unsigned) m.ctl[0] + 1u);   // unsigned: no signed overflow after 2^31 calls
+    if (epoch == -1) epoch = 0;                       // -1 is the stamp of a slot no call has used (kv_stream_reset)
     if (item_ct1.get_local_id(2) == 0) { s_nmiss = 0; s_lookups = 0; }
     /*
     DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -160,9 +161,10 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
                        dpct::atomic_compare_exchange_strong<
                            sycl::access::address_space::generic_space>(
                            &m.page_table[b], -1, -2) == -1) {
-                m.miss_block[dpct::atomic_fetch_add<
-                    sycl::access::address_space::generic_space>(&s_nmiss, 1)] =
-                    b;
+                const int at = dpct::atomic_fetch_add<
+                    sycl::access::address_space::generic_space>(&s_nmiss, 1);
+                if (at < (int) m.n_slots) m.miss_block[at] = b;   // the list holds n_slots: a miss beyond it is un-claimed
+                else m.page_table[b] = -1;                        // (stays out of VRAM: flagged as overflow below, never written past the list)
             }
         }
     }
@@ -178,7 +180,7 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
     item_ct1.barrier();
     // 2. one victim per miss: a clock sweep from the hand. A slot this call uses (stamp == epoch) is never taken;
     //    a referenced one loses its bit as the hand passes it and is taken on the next pass.
-    const int need = s_nmiss, n = (int) m.n_slots;
+    const int n = (int) m.n_slots, need = s_nmiss < n ? s_nmiss : n;   // never more than the list holds
     int hand = m.ctl[1], got = 0;
     for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
         const int j = (int)(((long long)hand + item_ct1.get_local_id(2)) % n);
@@ -248,7 +250,7 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
         m.ctl[0] = epoch;
         m.ctl[1] = hand;
         m.ctl[2] = placed;
-        if (placed < need) m.ctl[3] = 1;
+        if (placed < need || s_nmiss > n) m.ctl[3] = 1;
         unsigned long long* c = reinterpret_cast<unsigned long long*>(m.ctl + 4);
         c[0] += (unsigned long long) placed;
         c[1] += (unsigned long long) s_lookups;
@@ -349,6 +351,16 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
         std::fprintf(stderr, "kv_stream: %lld slots is fewer than the resolve block (%d): the clock sweep would take a "
                              "slot twice\n", (long long) m.n_slots, RT);
         std::exit(1);
+    }
+    // the worst case of one call: every row's selection is `cap` cells over distinct blocks (+2 for the edges); more than
+    // n_slots of them cannot all be resident at once: said once (the kernel stays in bounds and flags the overflow; the cells
+    // that did not fit are masked) - today at most 8 rows x 514 blocks = 4,112 against at least 5,120 slots
+    static bool said_worst = false;
+    if (!said_worst && n_q * (cap / s.page_size + 2) > m.n_slots) {
+        said_worst = true;
+        std::fprintf(stderr, "kv_stream: WARNING: %lld rows of up to %lld cells can need %lld blocks at once, more than the %lld "
+                             "slots: some selected context may be left out (the overflow flag counts it)\n",
+                     (long long) n_q, (long long) cap, (long long) (n_q * (cap / s.page_size + 2)), (long long) m.n_slots);
     }
     /*
     DPCT1049: The work-group size passed to the SYCL kernel may exceed the
@@ -479,6 +491,24 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+void kv_stream_clear_overflow(
+    const KvStreamMap &m) try { // ctl[3] is sticky: cleared once reported, so
+                                // the next report is that request's own
+    /*
+    DPCT1010: SYCL uses exceptions to report errors and does not use the
+    error codes. The cudaGetLastError function call was replaced with 0. You
+    need to rewrite this code.
+    */
+    if (m.ctl != nullptr &&
+        DPCT_CHECK_ERROR(dpct::get_in_order_queue()
+                             .memset(m.ctl + 3, 0, sizeof(int32_t))
+                             .wait()) != 0)(void) 0;
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
 KvStreamCounters kv_stream_counters(const KvStreamMap &m) try {
     int32_t c[kKvCtlInts] = {};
     KvStreamCounters r;

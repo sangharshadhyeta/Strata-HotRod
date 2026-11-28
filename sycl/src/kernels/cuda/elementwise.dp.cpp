@@ -666,12 +666,20 @@ __dpct_inline__ void doorbell_publish_kernel(const float *__restrict__ x,
 __dpct_inline__ void doorbell_publish_res_kernel(
     const float *__restrict__ x, const int32_t *__restrict__ ids,
     const int32_t *__restrict__ d_res, int n_expert, int n, int k, float *x_out,
+<<<<<<< sycl
     int32_t *ids_out, uint32_t *seq, bool full, bool plain, bool pair) {
     // full (STRATA_DOORBELL_CHECK=1): the payload is published whole and the checksum covers x and the ids (this
     // variant publishes no weights). Otherwise d_res/n_expert decide whether x is copied, as before the checksum:
     // when every routed expert is resident the host never reads x, and an uncached copy of it costs the A750 ~10%
     // of decode.
+||||||| base
+    int32_t *ids_out, uint32_t *seq) {
+=======
+    int32_t *ids_out, uint32_t *seq, const float *__restrict__ w,
+    float *w_out) {
+>>>>>>> ours-now
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+<<<<<<< sycl
     if (!full) {
         int any_miss = 0;
         if ((int) item_ct1.get_local_id(2) < k) {
@@ -701,6 +709,91 @@ __dpct_inline__ void doorbell_publish_res_kernel(
     }
     const uint32_t sum = sycl::reduce_over_group(item_ct1.get_group(), part, sycl::plus<uint32_t>());
     sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+||||||| base
+    int any_miss = 0;
+    if ((int)item_ct1.get_local_id(2) < k) {
+        const int32_t id = ids[item_ct1.get_local_id(2)];
+        ids_out[item_ct1.get_local_id(2)] = id;
+        if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) any_miss = 1;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    if ((item_ct1.barrier(),
+         sycl::any_of_group(
+             sycl::ext::oneapi::this_work_item::get_work_group<3>(),
+             any_miss))) {
+#pragma unroll
+        for (int i = item_ct1.get_local_id(2); i < n;
+             i += item_ct1.get_local_range(2)) x_out[i] = x[i];
+        /*
+        DPCT1078: Consider replacing memory_order::acq_rel with
+        memory_order::seq_cst for correctness if strong memory order
+        restrictions are needed.
+        */
+        sycl::atomic_fence(sycl::memory_order::acq_rel,
+                           sycl::memory_scope::system);
+    } else if ((int)item_ct1.get_local_id(2) < k) {
+        /*
+        DPCT1078: Consider replacing memory_order::acq_rel with
+        memory_order::seq_cst for correctness if strong memory order
+        restrictions are needed.
+        */
+        sycl::atomic_fence(sycl::memory_order::acq_rel,
+                           sycl::memory_scope::system);
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+=======
+    int any_miss = 0;
+    if ((int)item_ct1.get_local_id(2) < k) {
+        const int32_t id = ids[item_ct1.get_local_id(2)];
+        ids_out[item_ct1.get_local_id(2)] = id;
+        if (w_out != nullptr) w_out[item_ct1.get_local_id(2)] =
+            w[item_ct1.get_local_id(
+                2)]; // the routing weights too: STRATA_TAIL_WEIGHT and the live
+                     // thresholds read them on the host
+        if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) any_miss = 1;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    if ((item_ct1.barrier(),
+         sycl::any_of_group(
+             sycl::ext::oneapi::this_work_item::get_work_group<3>(),
+             any_miss))) {
+#pragma unroll
+        for (int i = item_ct1.get_local_id(2); i < n;
+             i += item_ct1.get_local_range(2)) x_out[i] = x[i];
+        /*
+        DPCT1078: Consider replacing memory_order::acq_rel with
+        memory_order::seq_cst for correctness if strong memory order
+        restrictions are needed.
+        */
+        sycl::atomic_fence(sycl::memory_order::acq_rel,
+                           sycl::memory_scope::system);
+    } else if ((int)item_ct1.get_local_id(2) < k) {
+        /*
+        DPCT1078: Consider replacing memory_order::acq_rel with
+        memory_order::seq_cst for correctness if strong memory order
+        restrictions are needed.
+        */
+        sycl::atomic_fence(sycl::memory_order::acq_rel,
+                           sycl::memory_scope::system);
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+>>>>>>> ours-now
     item_ct1.barrier();
     if (i == 0) {
         const uint32_t next = strata::sys_load(seq) + 1u;
@@ -788,7 +881,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 }
 
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
-                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
+                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream, const float* weights, float* weights_out) {
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
     static const bool full = [] { const char* v = std::getenv("STRATA_DOORBELL_CHECK"); return v != nullptr && v[0] == '1'; }();
     const bool fl = full;
@@ -810,7 +903,14 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
                                   sycl::range(1, 1, 1024)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     doorbell_publish_res_kernel(x, ids, d_res, n_expert, (int)n,
+<<<<<<< sycl
                                                 (int)k, x_out, ids_out, d_seq, fl, plain, pair);
+||||||| base
+                                                (int)k, x_out, ids_out, d_seq);
+=======
+                                                (int)k, x_out, ids_out, d_seq,
+                                                weights, weights_out);
+>>>>>>> ours-now
                 });
     }
     check_launch("doorbell_publish_res");
