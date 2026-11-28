@@ -13,6 +13,9 @@
 #define cublasDestroy hipblasDestroy
 #define cublasSetStream hipblasSetStream
 #define cublasGemmEx hipblasGemmEx
+#define cublasSgemm hipblasSgemm                              // the Qwen3.6 engine's FP32 prompt products
+#define cublasSgemmStridedBatched hipblasSgemmStridedBatched
+#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx    // (the Qwen3.6 prompt attention, FP16)
 #define CUBLAS_OP_N HIPBLAS_OP_N
 #define CUBLAS_OP_T HIPBLAS_OP_T
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT

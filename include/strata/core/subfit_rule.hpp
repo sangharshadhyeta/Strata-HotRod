@@ -14,6 +14,7 @@
 #pragma once
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
+#include <cuda_runtime.h>   // __forceinline__ (HIP: through hip_compat)
 #define STRATA_SUBFIT_HD __host__ __device__ __forceinline__
 #else
 #define STRATA_SUBFIT_HD inline

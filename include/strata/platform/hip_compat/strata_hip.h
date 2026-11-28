@@ -51,6 +51,17 @@
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventBlockingSync hipEventBlockingSync
 #define cudaEventDefault hipEventDefault
+// the names the shared look-ahead / stand-in / DMA code uses (as in hip_compat/cuda_runtime.h)
+#define cudaErrorInvalidValue hipErrorInvalidValue
+#define cudaHostGetFlags hipHostGetFlags
+#define cudaErrorUnknown hipErrorUnknown
+#define cudaErrorNotSupported hipErrorNotSupported
+#define cudaFuncGetAttributes hipFuncGetAttributes
+#define cudaFuncAttributes hipFuncAttributes
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
+#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
+#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
+#define cudaStreamLegacy hipStreamLegacy
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaHostAllocPortable hipHostMallocPortable
 #define cudaHostAllocMapped hipHostMallocMapped
