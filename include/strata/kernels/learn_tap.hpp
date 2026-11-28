@@ -53,3 +53,31 @@ __device__ inline void lrn_put4(const strata::kernels::MoeLearnTap& t, int ys_ra
     }
 }
 #endif
+#if defined(STRATA_GPU_SYCL) && defined(SYCL_LANGUAGE_VERSION) && !defined(__CUDACC__) && !defined(__HIPCC__)
+// The SYCL engine's device side: the same functions (sycl::float4 has accessor methods)
+#include <sycl/sycl.hpp>
+inline int lrn_ys_rank(const strata::kernels::MoeLearnTap& t, int row) {
+    if (t.rec == nullptr || t.gate[0] != 1) return -1;
+    return t.rec[row * 4] == t.layer ? t.rec[row * 4 + 1] : -1;
+}
+inline int lrn_ye_rank(const strata::kernels::MoeLearnTap& t, int row) {
+    if (t.rec == nullptr || !t.row0 || row != 0 || t.gate[0] != 2 || t.gate[1] != t.layer) return -1;
+    return t.gate[2];
+}
+inline void lrn_put(const strata::kernels::MoeLearnTap& t, int ys_rank, int ye_rank, int row, int rank, int64_t n_embd,
+                    int64_t col, float v) {
+    if (rank == ys_rank) t.ys[int64_t(row) * n_embd + col] = v;
+    if (rank == ye_rank) t.ye[col] = v;
+}
+inline void lrn_put4(const strata::kernels::MoeLearnTap& t, int ys_rank, int ye_rank, int row, int rank, int64_t n_embd,
+                     int64_t c4, sycl::float4 v) {
+    if (rank == ys_rank) {
+        float* d = t.ys + int64_t(row) * n_embd + c4 * 4;
+        d[0] = v.x(); d[1] = v.y(); d[2] = v.z(); d[3] = v.w();
+    }
+    if (rank == ye_rank) {
+        float* d = t.ye + c4 * 4;
+        d[0] = v.x(); d[1] = v.y(); d[2] = v.z(); d[3] = v.w();
+    }
+}
+#endif

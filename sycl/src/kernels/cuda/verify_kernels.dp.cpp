@@ -82,7 +82,7 @@ auto &part =
     }
     float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
     float y = sum / (1.0f + sycl::native::exp(-sum));
-    if ((int)item_ct1.get_group(2) < qk_heads) {
+    if ((int) bx < qk_heads) {
         float sq = y * y;
         /*
 DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature masked
@@ -110,6 +110,17 @@ may need to adjust the code.
         y *= sycl::rsqrt(ss + eps);
     }
     h[(size_t) t * C + c] = y;
+}
+
+__dpct_inline__ void gdn_conv_l2_multi_kernel(float *hist,
+                                              const float *__restrict__ qkv,
+                                              const float *__restrict__ w,
+                                              float *__restrict__ h, int C,
+                                              int qk_heads, float eps,
+                                              int t_begin, bool commit) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    gdn_conv_l2_body(item_ct1.get_group(2), item_ct1.get_group(1), hist, qkv, w,
+                     h, C, qk_heads, eps, t_begin, commit);
 }
 
 __dpct_inline__ void
@@ -225,23 +236,142 @@ __dpct_inline__ void gdn_ab_multi_kernel(
     }
 }
 
+template <int MAX_T = kVerifyMaxT, bool EXACT_T = false>
+__dpct_inline__ void gdn_ab_multi_kernel(
+    const float *__restrict__ x, const uint16_t *__restrict__ wa,
+    const uint16_t *__restrict__ wb, const float *__restrict__ dt,
+    const float *__restrict__ ssm_a, float *__restrict__ gate,
+    float *__restrict__ beta, int n, int h_v, int T) {
+    gdn_ab_body<MAX_T, EXACT_T>(
+        sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_group(2), x, wa,
+        wb, dt, ssm_a, gate, beta, n, h_v, T);
+}
+
+// 143-amdk (STRATA_FUSE_CONVAB): the conv + L2 norm and the a/b projections in ONE launch.  They read different inputs (the qkv
+// projection and the layer input) and write different outputs, so they only share a node: blocks [0, conv) run the conv body,
+// the following blocks (token row 0 only) the a/b body, each exactly as its own kernel.
+template <int MAX_T, bool EXACT_T>
+__dpct_inline__ void gdn_conv_ab_kernel(
+    int conv_blocks, float *hist, const float *__restrict__ qkv,
+    const float *__restrict__ w, float *__restrict__ h, int C, int qk_heads,
+    float eps, int t_begin, bool commit, const float *__restrict__ x,
+    const uint16_t *__restrict__ wa, const uint16_t *__restrict__ wb,
+    const float *__restrict__ dt, const float *__restrict__ ssm_a,
+    float *__restrict__ gate, float *__restrict__ beta, int n, int h_v, int T) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int ab_blocks =
+        (2 * h_v + 1) / 2; // the a/b blocks first: their dot chain is the
+                           // longer one, so it starts with the first wave
+    if ((int)item_ct1.get_group(2) >= ab_blocks) {
+        /*
+        DPCT1118: SYCL group functions and algorithms must be encountered in
+        converged control flow. You may need to adjust the code.
+        */
+        gdn_conv_l2_body((int)item_ct1.get_group(2) - ab_blocks,
+                         (int)item_ct1.get_group(1), hist, qkv, w, h, C,
+                         qk_heads, eps, t_begin, commit);
+    } else if (item_ct1.get_group(1) == 0 && item_ct1.get_local_id(2) < 64) {
+        gdn_ab_body<MAX_T, EXACT_T>((int)item_ct1.get_group(2), x, wa, wb, dt,
+                                    ssm_a, gate, beta, n, h_v, T);
+    }
+}
+
 // State-only commit kernel: each head's 128 independent state columns are split across 4 blocks of 32 columns
 // (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
-/*
-DPCT1110: The total declared local variable size in device function
-gdn_step_commit_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
+// DBG (STRATA_DBG_GDN=1, #937): a window count the launch never allowed (n_keep is read from device memory; n_max is the
+// rows the window holds) is reported and the commit skipped, where the fault would be a memory-aperture violation
+__dpct_inline__ void gdn_step_commit_body(float *__restrict__ state,
+                                          const float *__restrict__ hbuf, int C,
+                                          const float *__restrict__ gate,
+                                          const float *__restrict__ beta,
+                                          int h_k, int h_v, int n);
+
+template <bool DBG>
 __dpct_inline__ void gdn_step_commit_kernel(
     float *__restrict__ state, const float *__restrict__ hbuf, int C,
     const float *__restrict__ gate, const float *__restrict__ beta, int h_k,
-    int h_v, const int32_t *__restrict__ n_keep) {
+    int h_v, const int32_t *__restrict__ n_keep, int n_max,
+    const sycl::stream &stream_ct1) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int n = *n_keep;
     if (n <= 0) return;
-    auto &sk = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[S]>(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    if (DBG && n > n_max) {
+        if (item_ct1.get_group(2) == 0 && item_ct1.get_group(1) == 0 &&
+            item_ct1.get_local_id(2) == 0 && item_ct1.get_local_id(1) == 0)
+            /*
+            DPCT1015: Output needs adjustment.
+            */
+            stream_ct1 << "strata DBG: gdn_step_commit: n_keep %d is past the "
+                          "window's %d rows: commit skipped (#937)\n";
+        return;
+    }
+    gdn_step_commit_body(state, hbuf, C, gate, beta, h_k, h_v, n);
+}
+
+// engine-latency: gdn_step_commit_kernel for every GDN layer of the commit in one launch (blockIdx.z = the layer); each
+// layer's blocks run gdn_step_commit_body on that layer's state and rows, exactly as its own launch did
+__dpct_inline__ void gdn_step_commit_layers_kernel(
+    float *__restrict__ state, long long state_stride,
+    const float *__restrict__ hbuf, long long h_stride, int C,
+    const float *__restrict__ gate, const float *__restrict__ beta,
+    long long gb_stride, int h_k, int h_v, const int32_t *__restrict__ n_keep) {
+    const int n = *n_keep;
+    if (n <= 0) return;
+    const long long z =
+        sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_group(0);
+    gdn_step_commit_body(state + z * state_stride, hbuf + z * h_stride, C, gate + z * gb_stride, beta + z * gb_stride, h_k,
+                         h_v, n);
+}
+
+// engine-latency: gdn_conv_commit_kernel for every GDN layer in one launch (blockIdx.y = the layer)
+__dpct_inline__ void
+gdn_conv_commit_layers_kernel(float *__restrict__ hist0, long long hist_stride,
+                              const float *__restrict__ qkv0,
+                              long long qkv_stride, int C,
+                              const int32_t *__restrict__ n_keep) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int c = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                  item_ct1.get_local_id(2);
+    if (c >= C) return;
+    const int n = *n_keep;
+    if (n <= 0) return;
+    float *hist = hist0 + (long long)item_ct1.get_group(1) * hist_stride;
+    const float *qkv = qkv0 + (long long)item_ct1.get_group(1) * qkv_stride;
+    float seq[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int src = n + j;          // the last three of [hist(3) | x_0..x_{n-1}]
+        seq[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
+    }
+    hist[c * 3] = seq[0];
+    hist[c * 3 + 1] = seq[1];
+    hist[c * 3 + 2] = seq[2];
+}
+
+/*
+DPCT1110: The total declared local variable size in device function
+gdn_step_commit_body exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void gdn_step_commit_body(float *__restrict__ state,
+                                          const float *__restrict__ hbuf, int C,
+                                          const float *__restrict__ gate,
+                                          const float *__restrict__ beta,
+                                          int h_k, int h_v, int n) {
+    /*
+    DPCT1115: The sycl::ext::oneapi::group_local_memory_for_overwrite is
+    used to allocate group-local memory at the none kernel functor scope of a
+    work-group data parallel kernel. You may need to adjust the code.
+    */
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &sk = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[S]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    /*
+    DPCT1115: The sycl::ext::oneapi::group_local_memory_for_overwrite is
+    used to allocate group-local memory at the none kernel functor scope of a
+    work-group data parallel kernel. You may need to adjust the code.
+    */
     auto &red =
         *sycl::ext::oneapi::group_local_memory_for_overwrite<float[RG][32]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
@@ -2506,20 +2636,47 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         return !e || e[0] != '0';
     }();
     if (commit_split && n_keep != nullptr && t_out_begin >= n_tok) {
-        {
+        static const bool dbg = [] { const char* e = std::getenv("STRATA_DBG_GDN"); return e && e[0] == '1'; }();
+        if (dbg) {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             strata::q_of(stream)
-                ->parallel_for<
-                    dpct_kernel_name<class gdn_step_commit_kernel_5d9da7>>(
-                    sycl::nd_range<3>(sycl::range(1, 4u, (unsigned)h_v) *
-                                          sycl::range(1, RG, 32),
-                                      sycl::range(1, RG, 32)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        gdn_step_commit_kernel(state, h, conv_channels, gate,
-                                               beta, h_k, h_v, n_keep);
-                    });
+                ->submit([&](sycl::handler &cgh) {
+                    sycl::stream stream_ct1(64 * 1024, 80, cgh);
+
+                    cgh.parallel_for<
+                        dpct_kernel_name<class gdn_step_commit_kernel_5d9da7,
+                                         dpct_kernel_scalar<true>>>(
+                        sycl::nd_range<3>(sycl::range(1, 4u, (unsigned)h_v) *
+                                              sycl::range(1, RG, 32),
+                                          sycl::range(1, RG, 32)),
+                        exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            gdn_step_commit_kernel<true>(
+                                state, h, conv_channels, gate, beta, h_k, h_v,
+                                n_keep, n_tok, stream_ct1);
+                        });
+                });
+        } else {
+            auto exp_props = sycl::ext::oneapi::experimental::properties{
+                sycl::ext::oneapi::experimental::use_root_sync};
+
+            strata::q_of(stream)
+                ->submit([&](sycl::handler &cgh) {
+                    sycl::stream stream_ct1(64 * 1024, 80, cgh);
+
+                    cgh.parallel_for<
+                        dpct_kernel_name<class gdn_step_commit_kernel_5d9da7,
+                                         dpct_kernel_scalar<false>>>(
+                        sycl::nd_range<3>(sycl::range(1, 4u, (unsigned)h_v) *
+                                              sycl::range(1, RG, 32),
+                                          sycl::range(1, RG, 32)),
+                        exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            gdn_step_commit_kernel<false>(
+                                state, h, conv_channels, gate, beta, h_k, h_v,
+                                n_keep, n_tok, stream_ct1);
+                        });
+                });
         }
         check("gdn_step_commit");
         return;
@@ -2535,6 +2692,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         if (all_out) {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(
+                strata::q_of(stream)->get_device(),
+                {sycl::aspect::fp16});
 
             strata::q_of(stream)
                 ->parallel_for<dpct_kernel_name<
@@ -2556,6 +2716,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         else {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
+            dpct::has_capability_or_fail(
+                strata::q_of(stream)->get_device(),
+                {sycl::aspect::fp16});
 
             strata::q_of(stream)
                 ->parallel_for<dpct_kernel_name<
@@ -2578,6 +2741,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         */
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp16});
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<
@@ -2598,6 +2764,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         */
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
+        dpct::has_capability_or_fail(
+            strata::q_of(stream)->get_device(),
+            {sycl::aspect::fp16});
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<

@@ -254,6 +254,7 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     dpct::queue_ptr st = strata::q_of(stream);
+    const bool vec = false;   // the vectorised stores are the Turing (cc 7.5) form only; Xe keeps the plain kernel
 #define STRATA_DQ(TY)                                                          \
     if (vec) {                                                                 \
         auto exp_props = sycl::ext::oneapi::experimental::properties{          \

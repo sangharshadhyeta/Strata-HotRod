@@ -5,6 +5,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "s26_tsum.dp.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/pdl.hpp"
 
 #include <cstdlib>
 #include <limits>

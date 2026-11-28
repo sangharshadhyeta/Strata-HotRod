@@ -22,6 +22,8 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/moe_fused.hpp"
+#include "strata/kernels/gfx_arch.hpp"
+#include "strata/core/emulate.hpp"
 
 #include <algorithm>
 #include <cstdio>

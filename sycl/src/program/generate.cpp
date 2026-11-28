@@ -32,6 +32,8 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // the
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/gguf_expert_source.hpp"       // SYCL engine: --stream-experts (the GGUF-read expert source)
+#include "strata/kernels/resident_plan_mirror.hpp"  // SYCL engine: the pinned host mirror in the device-built verify plan
 #include "strata/core/latent_tab.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
@@ -2688,6 +2690,22 @@ static void recheck_prefetch(strata::core::ExpertSource* src, const std::vector<
     }
 }
 
+// SYCL engine, #1980: a start-up refusal ends the process here instead of returning from main.  Returning ran main's
+// destructors (the stages' caches, queues and Level Zero objects) in an order the UR loader did not survive: 2x Arc Pro
+// B60, every REFUSED start segfaulted in libur_loader after its message, and a trimmed one also left an xe page fault
+// (bcs CAT error) on the second card that hung the next start.  The device work queued so far finishes first; nothing is
+// freed.
+[[noreturn]] static void refuse_exit(int code) {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    try {
+        for (unsigned int d = 0; d < dpct::device_count(); ++d) dpct::get_device(d).queues_wait_and_throw();
+    } catch (...) {
+    }
+    std::fflush(stderr);
+    std::_Exit(code);
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -3110,7 +3128,7 @@ int main(int argc, char** argv) {
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
-        else if (a == "--stream-experts") { o.stream_experts = true; o.mmap_experts = true; }   // SYCL engine: see Options
+        else if (a == "--stream-experts") o.stream_experts = true;   // SYCL engine: the GGUF stream path (step 9)
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
@@ -4037,16 +4055,21 @@ int main(int argc, char** argv) {
     // with STRATA_PIN_SEGS=1: 39.7 vs 36.5 tok/s (+9%), no copy failures.
     // SYCL engine, Arc on the xe driver (Arc Pro B60/B65/B70, B580): the GPU page-faults when a kernel reads ordinary
     // (pageable) host memory, and the card times the job out (a B70: Timedout job, Fault response -EINVAL).  The experts
-    // outside the VRAM cache are in pageable memory here (no pinned mirror in this build), so the PCIe share defaults to 0
-    // (the CPU computes those misses) and an explicit --pcie-frac is kept with a warning.
-    if (strata::intel_gpu_driver() == "xe") {
-        if (!(o.pcie_frac >= 0.0)) {
+    // outside the VRAM cache are in pageable memory without --stream-experts, so the PCIe share defaults to 0 (the CPU
+    // computes those misses) and an explicit --pcie-frac is kept with a warning.  With --stream-experts the GPU reads the
+    // pinned host mirror instead (steps 9-10), so the rule does not apply - as in the old copy.  `pcie_given` is the old
+    // copy's `pcie_explicit` (set before the probe above).
+    if (strata::intel_gpu_driver() == "xe" && !o.stream_experts) {
+        if (!pcie_given) {
             o.pcie_frac = 0.0;
-            std::fprintf(stderr, "strata generate: xe driver: the GPU faults on pageable host memory, so --pcie-frac defaults "
-                                 "to 0 here (the CPU computes the experts outside VRAM)\n");
+            std::fprintf(stderr, "strata generate: xe driver without --stream-experts: the GPU faults on pageable host "
+                                 "memory, so --pcie-frac defaults to 0 here (the CPU computes the experts outside VRAM). "
+                                 "Use --stream-experts, as setup configures it, to let the GPU read a pinned mirror\n");
         } else if (o.pcie_frac > 0.0) {
-            std::fprintf(stderr, "strata generate: WARNING: --pcie-frac %.2f on the xe driver makes the GPU read pageable host "
-                                 "memory; that page-faulted and hung an Arc Pro B70 (Timedout job, device lost)\n", o.pcie_frac);
+            std::fprintf(stderr, "strata generate: WARNING: --pcie-frac %.2f on the xe driver without --stream-experts "
+                                 "makes the GPU read pageable host memory; that page-faulted and hung an Arc Pro B70 "
+                                 "(Timedout job, device lost). Use --stream-experts, as setup configures it, or "
+                                 "--pcie-frac 0\n", o.pcie_frac);
         }
     }
     auto pcie_balance = [&]() {
@@ -5455,6 +5478,33 @@ int main(int argc, char** argv) {
         bool gate_on = true;   // off only when no placement can start (below): then the best one is kept and a warning said
         int64_t min_stage_layers = 1;   // #1616: 3 in the second pass below, when the first pick has a one- or two-layer stage
         std::vector<int64_t> stage_floors;   // #2644: each stage's share of the room, in the share pass below (empty: off)
+        // #1440 (SYCL engine, old copy 3681-3712): of the placements within STRATA_SPLIT_HEADROOM_TOL (default 0.2%) of the
+        // best predicted time, the one whose tightest card keeps the most VRAM beyond all its layers' experts
+        // (split_rules::pick_with_headroom).  On by default (a full xe card moves buffers to system memory instead of
+        // failing); STRATA_SPLIT_HEADROOM=0 keeps the first best, as before.  The candidates are the placements the search
+        // priced and the startability gate allows; the pick is made after the search (see below).
+        static const bool split_headroom = [] {
+            const char* v = std::getenv("STRATA_SPLIT_HEADROOM");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        const double headroom_tol =
+            std::getenv("STRATA_SPLIT_HEADROOM_TOL") ? std::atof(std::getenv("STRATA_SPLIT_HEADROOM_TOL")) : 0.002;
+        std::vector<int64_t> need_prefix((size_t) g.n_layers + 1, 0);
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            need_prefix[(size_t) l + 1] = need_prefix[(size_t) l] + (int64_t) g.n_expert * cost(l);
+        // a range's session, and a later stage's weights, as stage_left prices them (stage 0 is the only range from 0)
+        auto range_session = [&](int64_t lb, int64_t le) -> int64_t {
+            return (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) +
+                   (lb == 0 ? 0 : (int64_t) carve_bytes(lb, le));
+        };
+        std::vector<strata::program::split_rules::Placement> scored;
+        std::vector<double> scored_mass;
+        std::vector<int64_t> scored_held;
+        auto score = [&](const std::vector<int64_t>& cuts, double ms, double hm, int64_t held) {
+            scored.push_back({cuts, ms, strata::program::split_rules::min_spare(cuts, g.n_layers, cap, need_prefix, range_session)});
+            scored_mass.push_back(hm);
+            scored_held.push_back(held);
+        };
         // #1428: 2 and 3 GPUs - every placement priced, kept (a few hundred) so the near-tie warning below can name the
         // best placement that is really a different one (not the neighbour one layer over)
         std::vector<std::pair<double, std::vector<int64_t>>> priced;
@@ -5468,6 +5518,7 @@ int main(int argc, char** argv) {
             const double ms = predict(at, hm, held);
             ++tried;
             if (ns <= 3) priced.emplace_back(ms, at);
+            if (split_headroom && (!gate_on || can_start(parts_of(at)))) score(at, ms, hm, held);   // #1440: a candidate for the pick
             const double mx = stage_max(at);
             if (ms < best_ms - tie_eps || (ms <= best_ms + tie_eps && mx < best_max - tie_eps)) {
                 // feasibility gate: mirrors the serve path (`fits_one` + own_fits) for the 512-token last resort;
@@ -5492,6 +5543,9 @@ int main(int argc, char** argv) {
         };
         auto search = [&]() {
         priced.clear();
+        scored.clear();
+        scored_mass.clear();
+        scored_held.clear();
         if (ns == 2) {
             for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
             // a model with fewer than three layers enumerates nothing: keep the proportional guess rather than
@@ -5686,6 +5740,28 @@ int main(int argc, char** argv) {
         if (!carve_ok) {   // `carve_bytes` reports through `err`; it is called from the search, which cannot return
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        // #1440 (SYCL engine, old copy 3805-3826): the headroom pick among the placements the search priced
+        if (split_headroom && scored.size() > 1) {
+            const size_t first = strata::program::split_rules::fastest(scored);
+            const size_t pick = strata::program::split_rules::pick_with_headroom(scored, headroom_tol);
+            if (pick != first && scored[first].cuts == best) {
+                auto fmt_k = [](const std::vector<int64_t>& v) {
+                    std::string s;
+                    for (const int64_t k : v) s += (s.empty() ? "" : ",") + std::to_string(k);
+                    return s;
+                };
+                std::fprintf(stderr, "strata generate: layer split auto: K=%s instead of K=%s (predicted %.1f vs %.1f ms): its "
+                                     "tightest card keeps %.2f GiB beyond all its layers' experts, against %.2f GiB "
+                                     "(#1440: a full card can page to system memory); STRATA_SPLIT_HEADROOM=0 keeps K=%s\n",
+                             fmt_k(scored[pick].cuts).c_str(), fmt_k(best).c_str(), scored[pick].ms, best_ms,
+                             (double) scored[pick].min_spare / 1073741824.0,
+                             (double) scored[first].min_spare / 1073741824.0, fmt_k(best).c_str());
+                best = scored[pick].cuts;
+                best_ms = scored[pick].ms;
+                best_mass = scored_mass[pick];
+                best_held = scored_held[pick];
+            }
         }
         split_at = best;
         std::string ks;
@@ -6325,8 +6401,24 @@ int main(int argc, char** argv) {
                      (double) floor_kept / 1073741824.0, learned_note.c_str());
     }
     strata::core::ArenaExpertSource arena_src;
+    strata::core::GgufExpertSource gguf_src;
     strata::core::ExpertSource* srcp = nullptr;
-    if (o.mmap_experts) {
+    if (o.stream_experts && !o.mmap_experts) {
+        // SYCL engine: a card that holds every expert needs no host copy of them, and a 23 GiB machine cannot hold one.
+        // The profile fill reads each blob once from the shard; the experts no slot holds are the pinned host mirror's
+        // (below), and a prompt's lent slots are refilled from here.
+        if (!native_pack || o.native_preset.empty()) {
+            std::fprintf(stderr, "strata generate: --stream-experts needs a native (IQ) pack and --native SHARD1\n");
+            return 2;
+        }
+        if (!gguf_src.open(o.native_preset, g.n_layers, g.n_expert, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: experts streamed from the GGUF on demand (--stream-experts): no host "
+                             "arena; every expert must fit the VRAM cache\n");
+        srcp = &gguf_src;
+    } else if (o.mmap_experts) {
         // FileExpertSource maps the pack's experts.bin: a canonical pack has it; a native (IQ) pack has it when
         // built with `tools/iq_pack.py --experts-bin` (the per-layer blob sizes of its layout, PR #121).  The low-RAM
         // mode: the experts come from the file through the OS cache instead of a pinned copy in RAM, for a PC whose
@@ -7118,6 +7210,94 @@ int main(int argc, char** argv) {
         }
     }
 
+    // SYCL engine, plan item 2: the experts that did not fit VRAM, mirrored once in pinned host memory the GPU reads
+    // over PCIe (--stream-experts has no host copy otherwise: each routed miss was an SSD read). The share of misses
+    // the GPU takes is --pcie-frac; STRATA_MIRROR_MIB caps the mirror (default: MemAvailable less 4 GiB), 0 = off.
+    unsigned long long* mirror_table_d = nullptr;   // [n_layers][n_expert] device-readable mirror addresses (0 = none)
+    int64_t unmirrored_misses = 0;
+    if (o.stream_experts && srcp == &gguf_src && o.expert_cache > 0) {
+        // #1054, #1440: with a layer split the mirror holds only the first GPU's layers. The pinned memory belongs to
+        // this GPU's context, and the later stages' caches do not exist yet (every later-stage expert would count as a
+        // miss: 20 GiB of RAM for experts the other card then holds, or one 39 GiB pinned allocation that fails).
+        const int64_t mirror_end = multi_gpu && !split_at.empty() ? split_at[0] : g.n_layers;
+        std::vector<std::pair<int64_t, int64_t>> miss;
+        size_t n_true_miss = 0;   // the experts no slot holds; what follows them in `miss` are the lend candidates (below)
+        for (const auto& pr : profile)   // the profile's order: the most-routed misses first, if the cap is reached
+            if (pr.first < mirror_end && xcache.slot_of(pr.first, pr.second) == strata::core::kNotResident)
+                miss.push_back({pr.first, pr.second});
+        for (int64_t l = 0; l < mirror_end; ++l)                     // pairs the profile does not list at all
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                if (xcache.slot_of(l, e) == strata::core::kNotResident &&
+                    std::find(miss.begin(), miss.end(), std::pair<int64_t, int64_t>{l, e}) == miss.end())
+                    miss.push_back({l, e});
+        n_true_miss = miss.size();
+        // 0.1.43: the experts in the last slots - the ones a prompt's loan takes (Prefill::relayout lends the TAIL of the
+        // cache) - are mirrored too, after the real misses (the cap drops them first).  A lent expert is streamed during
+        // the prompt and put back after it; from the GGUF that was a pread at ~2.3 GB/s per expert, from the pinned mirror
+        // it is a DMA.  Their mirror entries are never read by a decode window: it only looks at a mirror address for an
+        // expert that has no slot.
+        // STRATA_LEND_MIRROR=0 turns it off; =N: the last N slots (default 10% of the cache with a loan, at most 1,200).
+        if (!o.no_prefill_borrow && o.prefill_chunk > 0 && !multi_gpu) {
+            const char* lm = std::getenv("STRATA_LEND_MIRROR");
+            const int64_t want_tail = lm ? std::atoll(lm) : std::min<int64_t>(xcache.slots() / 10, 1200);
+            if (want_tail > 0) {
+                const int64_t first_tail = xcache.slots() - std::min<int64_t>(want_tail, xcache.slots());
+                for (int64_t l = 0; l < mirror_end; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        if (const int64_t sl = xcache.slot_of(l, e); sl != strata::core::kNotResident && sl >= first_tail)
+                            miss.push_back({l, e});
+            }
+        }
+        uint64_t avail = 0;
+        if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+            char key[64]; unsigned long long kb = 0;
+            while (std::fscanf(f, "%63s %llu kB", key, &kb) == 2)
+                if (std::strcmp(key, "MemAvailable:") == 0) { avail = kb << 10; break; }
+            std::fclose(f);
+        }
+        const char* mv = std::getenv("STRATA_MIRROR_MIB");
+        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        if (!miss.empty() && cap > 0) {
+            const auto tm = Clock::now();
+            const int64_t got = gguf_src.mirror(miss, cap, 8, err);
+            if (got < 0) {
+                std::fprintf(stderr, "strata generate: mirroring the experts missing from VRAM: %s (they stay on the SSD)\n",
+                             err.c_str());
+                err.clear();
+            } else {
+                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu in the prompt loan's slots) "
+                                     "mirrored in pinned host memory (%.2f GiB, %.1f s); the GPU reads them over PCIe\n",
+                             (long long) got, n_true_miss, miss.size() - n_true_miss,
+                             (double) gguf_src.mirrored_bytes() / 1073741824.0,
+                             std::chrono::duration<double>(Clock::now() - tm).count());
+                // the device-built verify plan's view of it: each (layer, expert) -> its mirror address, 0 = none
+                std::vector<unsigned long long> tab((size_t) (g.n_layers * g.n_expert), 0ull);
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        if (gguf_src.pinned(l, e))
+                            tab[(size_t) (l * g.n_expert + e)] = (unsigned long long) gguf_src.device_alias(l, e);
+                mirror_table_d = sycl::malloc_device<unsigned long long>(tab.size(), dpct::get_in_order_queue());
+                dpct::get_in_order_queue().memcpy(mirror_table_d, tab.data(), tab.size() * sizeof(unsigned long long)).wait();
+            }
+        }
+        unmirrored_misses = (int64_t) n_true_miss - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.begin() + (ptrdiff_t) n_true_miss,
+            [&](const std::pair<int64_t, int64_t>& pr) { return gguf_src.pinned(pr.first, pr.second); }) : 0);
+        const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        if (unmirrored_misses > 0 && no_host) {
+            std::fprintf(stderr, "strata generate: REFUSED: %lld experts are neither in VRAM nor mirrored; with STRATA_VERIFY_NO_HOST "
+                                 "the device plan cannot run them and generation would lack a safe host fallback - raise "
+                                 "STRATA_MIRROR_MIB or the free RAM, or lower --max-context\n", (long long) unmirrored_misses);
+            refuse_exit(2);
+        }
+        // The same rule after the start: the mirror holds the start's misses only, so an expert an adaptive swap moves
+        // out of VRAM would be in neither, and the device plan would wait for a host that never serves it.
+        if (!miss.empty() && no_host && o.adapt_every > 0 && o.adapt_swaps > 0) {
+            std::fprintf(stderr, "strata generate: adaptive swaps off: with STRATA_VERIFY_NO_HOST an expert they move out of "
+                                 "VRAM would be neither there nor mirrored\n");
+            o.adapt_every = 0;
+        }
+    }
+
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -7189,6 +7369,29 @@ int main(int argc, char** argv) {
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
+    // #1980 (SYCL engine): the host mirror covers the first stage only. A later stage whose cache does not hold all of its
+    // layers' experts has no mirror entry for the rest, and with STRATA_VERIFY_NO_HOST no host answers for them: the device
+    // plan reads a bad address and the card is lost at the first verify window (2x Arc Pro B60, xe CAT fault). Refuse at
+    // the start with the same message, and say how to get a complete load.
+    {
+        const bool no_host_split = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        int64_t later_misses = 0;
+        for (auto& stp : stages) {
+            const GpuStage& st = *stp;
+            later_misses += std::max<int64_t>(0, (st.le - st.lb) * g.n_expert - (int64_t) st.cache.slots());
+        }
+        if (later_misses > 0 && no_host_split) {
+            std::fprintf(stderr, "strata generate: REFUSED: %lld experts of the later layer-split stages are neither in VRAM nor mirrored "
+                                 "(the host mirror covers the first stage only); with STRATA_VERIFY_NO_HOST the device plan cannot run them "
+                                 "and the card is lost at the first verify window - set STRATA_STAGE_TRIM=1 (with --layer-split N) to free "
+                                 "each card's duplicate dense weights, lower --max-context or --vram-reserve-mib, or unset "
+                                 "STRATA_VERIFY_NO_HOST\n", (long long) later_misses);
+            refuse_exit(2);
+        }
+        if (later_misses > 0)
+            std::fprintf(stderr, "strata generate: layer split: %lld experts of the later stages are not in VRAM (served by the host)\n",
+                         (long long) later_misses);
+    }
 
     // ---- LAYER 2: exact startability probe on the live free figures.  Every session, cache and batch slot is
     // carved by now, so `cudaMemGetInfo` reads what serve's own_fits (5855-5869) will read.  Run serve's own
@@ -9548,6 +9751,8 @@ int main(int argc, char** argv) {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        // SYCL engine: the pinned host mirror's entries in the device-built plan (no usage counts on this path)
+        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, nullptr, (long long) (g.n_layers * g.n_expert));
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
         // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
         if (use_mtp && stages.empty() && thits.d_res != nullptr && std::getenv("STRATA_ROUTE_RESIDENT") != nullptr &&
@@ -18632,7 +18837,10 @@ int main(int argc, char** argv) {
 #if defined(STRATA_GPU_SYCL)
         // SYCL engine: the requests are done and their output written; leave without unwinding the GPU objects (the OS
         // reclaims them).  Their destructors ran against a Level Zero runtime already shutting down and aborted (exit 139).
-        try { dpct::get_current_device().queues_wait_and_throw(); } catch (const std::exception&) {}
+        try {
+            dpct::get_current_device().queues_wait_and_throw();
+            gguf_src.close();   // SYCL engine: release the direct-access USM host mirror before exit (the old copy did)
+        } catch (const std::exception&) {}
         std::fflush(stdout);
         std::fflush(stderr);
         std::_Exit(0);
@@ -19058,7 +19266,14 @@ int main(int argc, char** argv) {
         mem_mark("the head and the prompt path");
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
+        int32_t* usage_dev = nullptr;   // STRATA_USAGE_DUMP=PATH: the device plan counts every routed expert (measurement)
+        const char* usage_dump = std::getenv("STRATA_USAGE_DUMP");
+        if (mirror_table_d && usage_dump && *usage_dump) {
+            usage_dev = sycl::malloc_device<int32_t>((size_t) (g.n_layers * g.n_expert), dpct::get_in_order_queue());
+            dpct::get_in_order_queue().memset(usage_dev, 0, (size_t) (g.n_layers * g.n_expert) * 4).wait();
+        }
         vh.d_res = thits.d_res;
+        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, usage_dev, (long long) (g.n_layers * g.n_expert));
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -19482,6 +19697,11 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            if (std::getenv("STRATA_DBG_DRAFT") != nullptr) {   // the window the drafter built and what the target said
+                std::fprintf(stderr, "draftdbg: window"); for (int i = 0; i < T; ++i) std::fprintf(stderr, " %d", (int) window[(size_t) i]);
+                std::fprintf(stderr, " | target"); for (int i = 0; i < T; ++i) std::fprintf(stderr, " %d", (int) outv[(size_t) i]);
+                std::fprintf(stderr, " | accepted %d\n", a);
+            }
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -19588,6 +19808,24 @@ int main(int argc, char** argv) {
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
                         drive.d.ms_run / rounds);
+        if (usage_dev != nullptr) {   // STRATA_USAGE_DUMP: the window's routing as make_profile.py reads it (layer, k=1, id, weight)
+            std::vector<int32_t> uh((size_t) (g.n_layers * g.n_expert));
+            dpct::get_in_order_queue().memcpy(uh.data(), usage_dev, uh.size() * 4).wait();
+            if (FILE* uf = std::fopen(usage_dump, "wb")) {
+                int64_t total = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        for (int32_t c = 0; c < uh[(size_t) (l * g.n_expert + e)]; ++c, ++total) {
+                            const int32_t hdr[3] = {(int32_t) l, 1, (int32_t) e};
+                            const float wgt[2] = {0.0f, 0.0f};
+                            std::fwrite(hdr, 4, 3, uf);
+                            std::fwrite(wgt, 4, 1, uf);   // (layer, k) + k ids + k weights: 8 + 8 bytes
+                        }
+                std::fclose(uf);
+                std::printf("%-24s %s (%lld routed entries counted on the device)\n", "usage dumped", usage_dump,
+                            (long long) total);
+            }
+        }
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);

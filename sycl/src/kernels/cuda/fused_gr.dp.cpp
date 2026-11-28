@@ -12,6 +12,10 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/core/sm75_series.hpp"
+#include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
+#include "strata/kernels/gfx_arch.hpp"
+#include "s26_tsum.dp.hpp"
 
 #include <atomic>
 #include <type_traits>

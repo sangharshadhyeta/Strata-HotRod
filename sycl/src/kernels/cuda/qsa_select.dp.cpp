@@ -3152,7 +3152,6 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
         return true;
     }
 #else
-    return false;   // SYCL: the tensor-core / tiled scorers are not ported; the caller takes the older kernel
     {   // sm_80 or newer (TF32 MMA); an older card keeps the warp kernel
         static int cc_major[64] = {};
         int dev = 0;
@@ -3176,7 +3175,8 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
             }
             // STRATA_QSA_WARP=1|select (an A/B arm): the pre-sm_80 kernels on any card, as RTX 20 runs them
             const char* w = std::getenv("STRATA_QSA_WARP");
-            cc_major[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "select")) ? 7 : strata::cc_major_of(major);
+            (void) w; (void) major;
+            cc_major[dev] = 7;   // SYCL port: no TF32 MMA - the pre-sm_80 branch (the warp kernel, or STRATA_SELECT_SIMT's tiled one)
         }
         if (cc_major[dev] < 8) {
             // no TF32 tensor cores: the FP32 tiled kernel, opt-in (STRATA_SELECT_SIMT=1): its sum order differs from the
@@ -3984,7 +3984,7 @@ bool qsa_block_topk_split(const float *scores, const int32_t *steps, int64_t nq,
         dev >= 64) {
         ; return false;
     }
-    if (hist_ptr[dev] == nullptr && *(&hist_ptr[dev]) = g_sp_hist.get_ptr()) != 0) {
+    if (hist_ptr[dev] == nullptr && (hist_ptr[dev] = g_sp_hist.get_ptr()) == nullptr) {   // (cudaGetSymbolAddress)
         /*
         DPCT1026: The call to cudaGetLastError was removed because this
         functionality is redundant in SYCL.

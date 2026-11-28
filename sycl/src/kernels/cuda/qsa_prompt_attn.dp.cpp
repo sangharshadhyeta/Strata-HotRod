@@ -12,6 +12,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/core/sm75_series.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -972,13 +973,13 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
 #if !STRATA_PA_SM80
     // Turing (no cp.async): the warp's next pieces wait in registers and are stored into their stage after this
     // chunk's p.v (store_stage) - the same bytes in the same places as the cp.async pipeline
-    uint4 rk[4], rv[4];
+    sycl::uint4 rk[4], rv[4];
     auto store_stage = [&](int st) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int idx = lane + 32 * j, cell = idx >> 2, pc = idx & 3;
-            *reinterpret_cast<uint4*>(&S.kv[st][warp][0][0][0] + swz(cell, pc * 16)) = rk[j];
-            *reinterpret_cast<uint4*>(&S.kv[st][warp][1][0][0] + swz(cell, pc * 16)) = rv[j];
+            *reinterpret_cast<sycl::uint4*>(&S.kv[st][warp][0][0][0] + swz(cell, pc * 16)) = rk[j];
+            *reinterpret_cast<sycl::uint4*>(&S.kv[st][warp][1][0][0] + swz(cell, pc * 16)) = rv[j];
         }
     };
 #endif
@@ -1005,8 +1006,8 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
             cp_async16(&S.kv[st][warp][1][0][0] + swz(cell, pc * 16), p.v_q + off, ok);
 #else
             (void) st;
-            rk[j] = ok ? __ldg(reinterpret_cast<const uint4*>(p.k_q + off)) : make_uint4(0, 0, 0, 0);
-            rv[j] = ok ? __ldg(reinterpret_cast<const uint4*>(p.v_q + off)) : make_uint4(0, 0, 0, 0);
+            rk[j] = ok ? *reinterpret_cast<const sycl::uint4*>(p.k_q + off) : sycl::uint4(0, 0, 0, 0);
+            rv[j] = ok ? *reinterpret_cast<const sycl::uint4*>(p.v_q + off) : sycl::uint4(0, 0, 0, 0);
 #endif
         }
         /*
@@ -1081,7 +1082,7 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
             S.part[warp][gid + 8][c] = tg[2] * s0;
             S.part[warp][gid + 8][c + 1] = tg[3] * s1;
 #else
-            __syncwarp();   // every lane has read the group's cells: their 512 bytes take its partials
+            sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());   // every lane has read the group's cells: their 512 bytes take its partials
             float* pp = reinterpret_cast<float*>(&S.kv[0][warp][0][0][0]) + nt * 128;
             pp[gid * 8 + 2 * tig] = tg[0] * s0;
             pp[gid * 8 + 2 * tig + 1] = tg[1] * s1;

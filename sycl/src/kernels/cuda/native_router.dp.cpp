@@ -659,6 +659,7 @@ void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weig
         ->parallel_for<dpct_kernel_name<class route_256_multi>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<256>(logits, ids, weights); });
+}
 // STRATA_ROUTE_RESIDENT (EXPERIMENTAL, opt-in, changes the output): residency-biased routing for 512 x 10.
 // After the top-10: for the ranks lo..hi a non-resident expert is replaced by the best resident expert not already
 // picked when its logit is within `margin` of the replaced one; the weights are then the softmax of the selected
@@ -3495,7 +3496,7 @@ la_now() { // the GPU's clock (ns), for the timing only
     /*
     DPCT1053: Migration of device assembly code is not supported.
     */
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    now = 0;   // SYCL port: no %globaltimer on Intel; the learner's kernel timing reads 0 (its work is unaffected)
     return now;
 }
 

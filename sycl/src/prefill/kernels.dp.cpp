@@ -8,6 +8,7 @@
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
+#include "strata/core/emulate.hpp"
 
 #include <algorithm>
 
@@ -4111,10 +4112,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 #else
     (void) variant;   // the quad recurrence kernels are AMD-only
 #endif
-    // variant 6 = the Xe sub-group recurrence + the unchanged norm kernel (gdn_recurrence: gdn_xe_on)
-    const bool xe = T > 0 && !serial && variant == 6;
-    if (xe && !gdn_xe_device(stream)) throw std::runtime_error("GDN Xe variant requires an Intel GPU with 16-lane sub-groups");
-    if (!xe && (serial || T <= 0 || variant == 2)) {
+    if (serial || T <= 0 || variant == 2) {
         /*
         DPCT1049: The work-group size passed to the SYCL kernel may exceed
         the limit. To get the device limit, query

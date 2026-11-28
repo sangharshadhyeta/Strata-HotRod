@@ -27,6 +27,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/emulate.hpp"
+#include "strata/core/spec_prob.hpp"
 
 #include <cmath>
 #include <cstdio>

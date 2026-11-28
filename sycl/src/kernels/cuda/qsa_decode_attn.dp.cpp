@@ -747,7 +747,7 @@ __dpct_inline__ float load_v1(const QsaAttnPools &p, long long row, int d) {
     }
 }
 
-template <int KV_MODE>
+template <int KV_MODE, int NC_ = 2, bool DPP_ = false>
 /*
 DPCT1110: The total declared local variable size in device function
 attn_chunk_kernel_pre75 exceeds 128 bytes and may cause high register pressure.

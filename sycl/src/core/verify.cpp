@@ -4751,8 +4751,22 @@ bool Verifier::handoff_failed(std::string& err) const {
 
 bool Verifier::chain_overlap() const {
     // SYCL engine: the overlapped split prelaunches the next stage's window through HostGraphLaunch (CUDA's graph
-    // launch on a helper thread), which this backend does not have: the stages of a split run one after the other
-    return false;
+    // launch on a helper thread).  The compat layer runs it (cudaGraphLaunch on a dpct graph), but two things are not
+    // measured on Intel: Arc A-series (Alchemist) has no host-visible USM atomics for the hand-off flags, and the hand-off
+    // wait's timeout is inert here (no device clock), so a stuck hand-off hangs instead of failing the window.  Opt-in:
+    // STRATA_SYCL_SPLIT_OVERLAP=1 (refused on Alchemist); otherwise the stages of a split run one after the other.
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SYCL_SPLIT_OVERLAP");
+        if (v == nullptr || v[0] != '1') return false;
+        if (strata::intel_gpu_gen(dpct::get_current_device()) == strata::IntelGpuGen::Alchemist) {
+            std::fprintf(stderr, "strata: STRATA_SYCL_SPLIT_OVERLAP=1 refused on Arc A-series (no host-visible USM atomics)\n");
+            return false;
+        }
+        std::fprintf(stderr, "strata: STRATA_SYCL_SPLIT_OVERLAP=1: the overlapped layer split (EXPERIMENTAL on SYCL; the "
+                             "hand-off wait has no timeout on this backend)\n");
+        return true;
+    }();
+    if (!on) return false;
     return next_ != nullptr && hflag_out_h_ != nullptr && hflag_out_d_ != nullptr && hcount_d_ != nullptr &&
            next_->hflag_in_h_ == hflag_out_h_ && next_->device_ != device_ && !next_->ple_stage();
 }
