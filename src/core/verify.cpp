@@ -4894,7 +4894,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) {
+#if defined(STRATA_USE_HIP)
+            // upstream 53f59c064 (#5718): on RDNA4 under Linux memory pressure a layer can take past 20 s
+            static const int wait_s = [] {
+                const char* e = std::getenv("STRATA_VERIFY_TIMEOUT_S");
+                const int s = e != nullptr && *e != '\0' ? std::atoi(e) : 30;
+                return s > 0 ? s : 30;
+            }();
+#else
+            constexpr int wait_s = 20;
+#endif
+            if (now - a > std::chrono::seconds(wait_s)) {
                 // #267: the caller ends the engine; no spin kernel may outlive it
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
                 trace_ev("TIMEOUT", k, l, (int64_t) (launch_o ? launch_o->query() : cudaStreamQuery(cs_)));

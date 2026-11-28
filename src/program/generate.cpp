@@ -2706,6 +2706,21 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    // upstream 53f59c064 (#5162 #5649 #5718 #6127): ROCm's dynamic queue assignment can put the prompt's copy streams on
+    // the compute queue after a decode request (prompt speed -10..25%) and can stall blocked queues.  Set before the first
+    // HIP call; STRATA_HIP_DYNAMIC_QUEUES=1 or an explicit DEBUG_HIP_DYNAMIC_QUEUES keeps the runtime's behaviour.
+    if (std::getenv("DEBUG_HIP_DYNAMIC_QUEUES") == nullptr) {
+        const char* dyn = std::getenv("STRATA_HIP_DYNAMIC_QUEUES");
+        if (!(dyn != nullptr && dyn[0] == '1')) {
+#if defined(_WIN32)
+            _putenv_s("DEBUG_HIP_DYNAMIC_QUEUES", "0");
+#else
+            setenv("DEBUG_HIP_DYNAMIC_QUEUES", "0", 0);
+#endif
+        }
+    }
+#endif
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
     // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
     // pages in place (a GPU userptr), and keeps them - so every expert the VRAM fill copied from the mapped

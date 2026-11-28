@@ -359,6 +359,12 @@ __global__ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
 // Q3_K's 110-byte stride gives alternate blocks only two-byte alignment.
 // Preserve the pinned helper's pair of 16-bit loads and little-endian combine.
 __device__ __forceinline__ int load_int_b2(const void* ptr, int i32) {
+#if defined(__HIPCC__) && (defined(__gfx1200__) || defined(__gfx1201__))
+    // upstream 53f59c064: on RDNA4 a memcpy keeps the 2-byte alignment and loads directly (part of its gfx1200 NaN fix)
+    int hip_value;
+    __builtin_memcpy(&hip_value, static_cast<const uint16_t*>(ptr) + 2 * i32, sizeof(int));
+    return hip_value;
+#endif
     const auto* x = static_cast<const uint16_t*>(ptr);
     int value = x[2 * i32] << 0;
     value |= x[2 * i32 + 1] << 16;
@@ -650,6 +656,23 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
     }
     return d * sumf;
 }
+
+#if defined(__HIPCC__)
+// q6_q8_dot_impl with the two scales already in registers: the same expression in the same order (upstream 53f59c064)
+__device__ __forceinline__ float q6_q8_dot_sc(int vl, int vh, const int* __restrict__ u, int sc0, int sc1, float d,
+                                              const float* __restrict__ d8) {
+    float sumf = 0.0f;
+    const int scs[2] = {sc0, sc1};
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        const int vi = __vsubss4(vil | vih, 0x20202020);
+        sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * scs[i]);
+    }
+    return d * sumf;
+}
+#endif
 
 __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
                                           const Q81Block* __restrict__ x, int iqs) {
@@ -974,7 +997,11 @@ struct Q6KTraits {
     using Block = Q6KBlock;
     static constexpr int DIV = 256, T = 32, KBY = 8, BPI = WARPS * WARP / 32;
     __device__ static int kqs(int tid) { return tid % 32; }
+#if defined(__HIPCC__)
+    struct W { int vl, vh, sc0, sc1; float d; int bq8_offset; };
+#else
     struct W { int vl, vh; float d; const int8_t* scales; int bq8_offset; };
+#endif
     __device__ static W load(const Block* __restrict__ w, int iqs) {
         W r;
         r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
@@ -982,7 +1009,12 @@ struct Q6KTraits {
         const int vh_shift = 2 * ((iqs % 16) / 8);
         r.vl = load_int_b2(w->ql, iqs);
         r.vh = load_int_b2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
+#if defined(__HIPCC__)
+        r.sc0 = w->scales[scale_offset];
+        r.sc1 = w->scales[scale_offset + 4];
+#else
         r.scales = w->scales + scale_offset;
+#endif
         r.d = w->d;
         return r;
     }
@@ -994,7 +1026,11 @@ struct Q6KTraits {
             u[i] = reinterpret_cast<const int*>(x[r.bq8_offset + 2 * i].qs)[iqs % 8];
             d8[i] = __low2float(x[r.bq8_offset + 2 * i].ds);
         }
+#if defined(__HIPCC__)
+        return q6_q8_dot_sc(r.vl, r.vh, u, r.sc0, r.sc1, r.d, d8);
+#else
         return q6_q8_dot_impl(r.vl, r.vh, u, r.scales, r.d, d8);
+#endif
     }
 };
 struct IQ4XSTraits {
@@ -1332,8 +1368,13 @@ template<> struct B6X<Q6KTraits> {
         W r;
         r.vl = t.vl;
         r.vh = t.vh;
+#if defined(__HIPCC__)
+        r.sc[0] = t.sc0;
+        r.sc[1] = t.sc1;
+#else
         r.sc[0] = t.scales[0];
         r.sc[1] = t.scales[4];
+#endif
         r.d = t.d;
         return r;
     }
