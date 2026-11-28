@@ -343,13 +343,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             cs->parallel_for<
-<<<<<<< sycl
                 dpct_kernel_name<class native_swiglu_kernel_c4e755>>(
-||||||| base
-                dpct_kernel_name<class native_swiglu_kernel_b9fcad>>(
-=======
-                dpct_kernel_name<class native_swiglu_kernel_8f70e2>>(
->>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((n + THREADS - 1) / THREADS)) *
                         sycl::range(1, 1, THREADS),
@@ -425,13 +419,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                     auto g_t_ct2 = g + t;
 
                     cgh.parallel_for<
-<<<<<<< sycl
                         dpct_kernel_name<class scalar_gate_kernel_76bc5d>>(
-||||||| base
-                        dpct_kernel_name<class scalar_gate_kernel_9b510d>>(
-=======
-                        dpct_kernel_name<class scalar_gate_kernel_7da98c>>(
->>>>>>> ours-now
                         sycl::nd_range<3>(sycl::range(1, 1, 256),
                                           sycl::range(1, 1, 256)),
                         exp_props,
@@ -571,13 +559,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
 
             strata::q_of(stream)
                 ->parallel_for<
-<<<<<<< sycl
                     dpct_kernel_name<class native_swiglu_kernel_75dcdc>>(
-||||||| base
-                    dpct_kernel_name<class native_swiglu_kernel_b33e17>>(
-=======
-                    dpct_kernel_name<class native_swiglu_kernel_f35a8f>>(
->>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, g_ff) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -643,13 +625,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
 
             strata::q_of(stream)
                 ->parallel_for<
-<<<<<<< sycl
                     dpct_kernel_name<class scalar_gate_kernel_82de77>>(
-||||||| base
-                    dpct_kernel_name<class scalar_gate_kernel_b187b5>>(
-=======
-                    dpct_kernel_name<class scalar_gate_kernel_ae8b19>>(
->>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
                     exp_props,

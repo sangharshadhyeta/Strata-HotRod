@@ -1,23 +1,21 @@
 // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
-#include "strata/core/geometry.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
-<<<<<<< sycl
-||||||| base
-#include "strata/core/geometry.hpp"
-=======
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/geometry.hpp"
->>>>>>> ours-now
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#if defined(STRATA_HIP_GFX906)
+#include "strata/kernels/gfx_arch.hpp"
+#endif
 
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 
 namespace strata::kernels {
@@ -116,85 +114,6 @@ __dpct_inline__ void load8(const QsaAttnPools &p, bool value, long long row,
     } else load8_q4(p, value, row, d0, out);
 }
 
-<<<<<<< sycl
-template <int KV_MODE, bool LANE_CELL = false>
-||||||| base
-// Exact-intent score reduce-scatter: the same butterfly pairs as twelve warp_sum calls,
-// with 16 shuffle exchanges instead of 60. Used only by the opt-in gfx906 INT8
-// query-swizzled specialization; softmax, value accumulation and merge are unchanged.
-__dpct_inline__ float reduce12_gfx906(const float (&part)[16], int lane) {
-    float r8[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const bool hi = (lane & 16) != 0;
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
-        r8[i] =
-            (hi ? part[i + 8] : part[i]) +
-            dpct::experimental::permute_sub_group_by_xor(
-                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-                hi ? part[i] : part[i + 8], 16);
-    }
-    float r4[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const bool hi = (lane & 8) != 0;
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
-        r4[i] =
-            (hi ? r8[i + 4] : r8[i]) +
-            dpct::experimental::permute_sub_group_by_xor(
-                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-                hi ? r8[i] : r8[i + 4], 8);
-    }
-    float r2[2];
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const bool hi = (lane & 4) != 0;
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
-        r2[i] =
-            (hi ? r4[i + 2] : r4[i]) +
-            dpct::experimental::permute_sub_group_by_xor(
-                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-                hi ? r4[i] : r4[i + 2], 4);
-    }
-    const bool hi2 = (lane & 2) != 0;
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    const float r1 =
-        (hi2 ? r2[1] : r2[0]) +
-        dpct::experimental::permute_sub_group_by_xor(
-            0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
-            hi2 ? r2[0] : r2[1], 2);
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    return r1 + dpct::experimental::permute_sub_group_by_xor(
-                    0xffffffffu,
-                    sycl::ext::oneapi::this_work_item::get_sub_group(), r1, 1);
-}
-__dpct_inline__ int reduce12_head_of_lane(int lane) {
-    return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
-}
-
-template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false,
-          bool REDUCE12 = false>
-=======
 // Exact-intent score reduce-scatter: the same butterfly pairs as twelve warp_sum calls,
 // with 16 shuffle exchanges instead of 60. Used only by the opt-in gfx906 INT8
 // query-swizzled specialization; softmax, value accumulation and merge are unchanged.
@@ -272,7 +191,6 @@ __dpct_inline__ int reduce12_head_of_lane(int lane) {
 // (the body is a device function so the batch window's rows kernel below can run it over each query's own pools without
 // the default kernel's signature, or the function-pointer types the pre-sm_75 / HIP selections build, changing)
 template <int KV_MODE, bool LANE_CELL, bool QUERY_SWIZZLE, bool REDUCE12>
->>>>>>> ours-now
 /*
 DPCT1110: The total declared local variable size in device function
 attn_chunk_body exceeds 128 bytes and may cause high register pressure. Consult
@@ -724,44 +642,6 @@ catch (sycl::exception const &exc) {
 
 // PR #540 (sskver): the same attention with fewer shuffles and less shared-memory traffic, bit for bit the kernel
 // above (same operands, same order); +7% prompt speed on a V100, where this kernel reads every prompt chunk.  It
-<<<<<<< sycl
-// uses more registers (80 vs 38 on sm_70), so it runs on cards below sm_75 only, and exists only in the experimental
-// build (-DSTRATA_EXPERIMENTAL_SM60=ON): the ready-made engine keeps exactly the kernel above.
-#if defined(STRATA_EXPERIMENTAL_SM60)
-||||||| base
-// uses more registers (80 vs 38 on sm_70), so on CUDA it runs on cards below sm_75 only, and exists only in the
-// experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON).  HIP: built for wave32 cards (not the gfx906 wave64 backend) and
-// run on gfx103x (RDNA2), with 8 cells per step and the butterfly's lane exchanges in registers (DPP / permlanex16)
-// instead of ds_bpermute: there the score loop is bound by the LDS pipe (the q reads and ds_bpermute share it), not by
-// occupancy - 8 cells per step at 7 waves/SIMD beat 1 cell at 9.  Every other card keeps exactly the kernel above.
-#if defined(STRATA_EXPERIMENTAL_SM60) || (defined(__HIPCC__) && !defined(STRATA_HIP_GFX906))
-#define STRATA_ATTN_PRE75_BUILT 1
-#endif
-#if defined(STRATA_ATTN_PRE75_BUILT)
-// A butterfly step's lane exchange, `M` = 1, 2, 4, 8 or 16.  DPP (HIP, wave32): in registers - DPP row_xmask within a
-// 16-lane row, v_permlanex16 across the two rows - instead of ds_bpermute; the same value moves, so every sum is
-// unchanged bit for bit.
-template <bool DPP, int M> __device__ __forceinline__ float shfl_x(float v) {
-#if defined(__HIPCC__)
-    if constexpr (DPP) {
-        const int x = __float_as_int(v);
-        if constexpr (M == 16) return __int_as_float(__builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xfedcba98, false, false));
-        else return __int_as_float(__builtin_amdgcn_mov_dpp(x, 0x160 | M, 0xF, 0xF, false));   // row_xmask:M
-    }
-#endif
-    return __shfl_xor_sync(0xffffffffu, v, M);
-}
-// warp_sum / warp_max with the same pairing order (xor 16, 8, 4, 2, 1)
-template <bool DPP> __device__ __forceinline__ float warp_sum_x(float v) {
-    v += shfl_x<DPP, 16>(v); v += shfl_x<DPP, 8>(v); v += shfl_x<DPP, 4>(v); v += shfl_x<DPP, 2>(v); v += shfl_x<DPP, 1>(v);
-    return v;
-}
-template <bool DPP> __device__ __forceinline__ float warp_max_x(float v) {
-    v = fmaxf(v, shfl_x<DPP, 16>(v)); v = fmaxf(v, shfl_x<DPP, 8>(v)); v = fmaxf(v, shfl_x<DPP, 4>(v));
-    v = fmaxf(v, shfl_x<DPP, 2>(v)); v = fmaxf(v, shfl_x<DPP, 1>(v));
-    return v;
-}
-=======
 // uses more registers (80 vs 38 on sm_70), so on CUDA it runs on cards below sm_75 only, and exists only in the
 // experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON).  HIP: built for wave32 cards (not the gfx906 wave64 backend) and
 // run on gfx103x (RDNA2), with 8 cells per step and the butterfly's lane exchanges in registers (DPP / permlanex16)
@@ -805,39 +685,32 @@ template <bool DPP> __dpct_inline__ float warp_max_x(float v) {
     v = sycl::fmax(v, shfl_x<DPP, 2>(v)); v = sycl::fmax(v, shfl_x<DPP, 1>(v));
     return v;
 }
->>>>>>> ours-now
 // The 12 heads' lane sums (`part[12..15]` zero), reduce-scattered with warp_sum's pairing order (xor 16, 8, 4, 2, 1):
 // every output adds the same two operands at every level, so each sum is bit for bit warp_sum's (float add commutes),
 // for 16 shuffles instead of 12 x 5.  Lane l ends holding head head_of_lane(l); lanes l and l^1 agree.
-<<<<<<< sycl
-__device__ __forceinline__ float reduce12(const float (&part)[16], int lane) {
-||||||| base
-template <bool DPP> __device__ __forceinline__ float reduce12(const float (&part)[16], int lane) {
-=======
 template <bool DPP>
 __dpct_inline__ float reduce12(const float (&part)[16], int lane) {
->>>>>>> ours-now
     float r8[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const bool hi = (lane & 16) != 0;
-        r8[i] = (hi ? part[i + 8] : part[i]) + __shfl_xor_sync(0xffffffffu, hi ? part[i] : part[i + 8], 16);
+        r8[i] = (hi ? part[i + 8] : part[i]) + shfl_x<DPP, 16>(hi ? part[i] : part[i + 8]);
     }
     float r4[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const bool hi = (lane & 8) != 0;
-        r4[i] = (hi ? r8[i + 4] : r8[i]) + __shfl_xor_sync(0xffffffffu, hi ? r8[i] : r8[i + 4], 8);
+        r4[i] = (hi ? r8[i + 4] : r8[i]) + shfl_x<DPP, 8>(hi ? r8[i] : r8[i + 4]);
     }
     float r2[2];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
         const bool hi = (lane & 4) != 0;
-        r2[i] = (hi ? r4[i + 2] : r4[i]) + __shfl_xor_sync(0xffffffffu, hi ? r4[i] : r4[i + 2], 4);
+        r2[i] = (hi ? r4[i + 2] : r4[i]) + shfl_x<DPP, 4>(hi ? r4[i] : r4[i + 2]);
     }
     const bool hi2 = (lane & 2) != 0;
-    const float r1 = (hi2 ? r2[1] : r2[0]) + __shfl_xor_sync(0xffffffffu, hi2 ? r2[0] : r2[1], 2);
-    return r1 + __shfl_xor_sync(0xffffffffu, r1, 1);
+    const float r1 = (hi2 ? r2[1] : r2[0]) + shfl_x<DPP, 2>(hi2 ? r2[0] : r2[1]);
+    return r1 + shfl_x<DPP, 1>(r1);
 }
 __dpct_inline__ int head_of_lane(int lane) {
     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
@@ -874,24 +747,7 @@ __dpct_inline__ float load_v1(const QsaAttnPools &p, long long row, int d) {
     }
 }
 
-<<<<<<< sycl
 template <int KV_MODE>
-__global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* __restrict__ q, QsaAttnPools p,
-                                                             const int32_t* __restrict__ ids,
-                                                             const int32_t* __restrict__ step, int n_kv_heads,
-                                                             int page_size, float scale, float* __restrict__ part_acc,
-                                                             float* __restrict__ part_m, float* __restrict__ part_l,
-                                                             int n_chunks, int cap = 0, long long scratch_stride = 0) {
-||||||| base
-template <int KV_MODE, int NC_ = 2, bool DPP_ = false>
-__global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* __restrict__ q, QsaAttnPools p,
-                                                             const int32_t* __restrict__ ids,
-                                                             const int32_t* __restrict__ step, int n_kv_heads,
-                                                             int page_size, float scale, float* __restrict__ part_acc,
-                                                             float* __restrict__ part_m, float* __restrict__ part_l,
-                                                             int n_chunks, int cap = 0, long long scratch_stride = 0) {
-=======
-template <int KV_MODE, int NC_ = 2, bool DPP_ = false>
 /*
 DPCT1110: The total declared local variable size in device function
 attn_chunk_kernel_pre75 exceeds 128 bytes and may cause high register pressure.
@@ -906,7 +762,6 @@ void attn_chunk_kernel_pre75(const float *__restrict__ q, QsaAttnPools p,
                              float *__restrict__ part_m,
                              float *__restrict__ part_l, int n_chunks,
                              int cap = 0, long long scratch_stride = 0) {
->>>>>>> ours-now
     // batched form: query blockIdx.z, with its own q row, selection, step and scratch
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     q += (size_t)item_ct1.get_group(0) * (size_t)(n_kv_heads * G) * HD;
@@ -1044,15 +899,6 @@ void attn_chunk_kernel_pre75(const float *__restrict__ q, QsaAttnPools p,
     // per-head chunk max and exp-sum: warp w handles heads w and w+8.
     for (int h = warp; h < G; h += WARPS) {
         const float a = sp[h][lane], b = sp[h][lane + 32];
-<<<<<<< sycl
-        const float m = warp_max(fmaxf(a, b));
-        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
-        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
-||||||| base
-        const float m = warp_max_x<DPP_>(fmaxf(a, b));
-        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
-        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
-=======
         const float m = warp_max_x<DPP_>(sycl::fmax(a, b));
         const float ea = (lane < n_here && srow[lane] >= 0)
                              ? sycl::native::exp(a - m)
@@ -1060,10 +906,9 @@ void attn_chunk_kernel_pre75(const float *__restrict__ q, QsaAttnPools p,
         const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0)
                              ? sycl::native::exp(b - m)
                              : 0.0f;
->>>>>>> ours-now
         spt[lane][h] = ea;
         spt[lane + 32][h] = eb;
-        const float l = warp_sum(ea + eb);
+        const float l = warp_sum_x<DPP_>(ea + eb);
         if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
     }
     /*
@@ -1148,43 +993,6 @@ __dpct_inline__ void attn_merge_kernel(const float *__restrict__ part_acc,
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
-<<<<<<< sycl
-#if defined(STRATA_EXPERIMENTAL_SM60)
-// the current device is below sm_75 (per device: a layer split can mix cards); STRATA_ATTN_PRE75=0 turns PR #540's
-// kernel off (A/B)
-||||||| base
-#if defined(STRATA_HIP_GFX906)
-// The compat backend can target other architectures. Check the calling thread's current device,
-// caching only its last ordinal so a layer split or another thread cannot reuse the wrong answer.
-bool query_swizzle_gfx906_device() {
-    static thread_local int cached_device = -1;
-    static thread_local bool cached_supported = false;
-    int device = -1;
-    if (hipGetDevice(&device) != hipSuccess || device < 0) {
-        cached_device = -1;
-        cached_supported = false;
-        (void) hipGetLastError();
-        return false;
-    }
-    if (device != cached_device) {
-        cached_device = -1;
-        cached_supported = false;
-        hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
-            (void) hipGetLastError();
-            return false;
-        }
-        cached_supported = gfx_arch_is(prop.gcnArchName, "gfx906") && prop.warpSize == 64;
-        cached_device = device;
-    }
-    return cached_supported;
-}
-#endif
-
-#if defined(STRATA_ATTN_PRE75_BUILT)
-// CUDA: the current device is below sm_75; HIP: it is gfx103x (per device: a layer split can mix cards).
-// STRATA_ATTN_PRE75=0 turns PR #540's kernel off (A/B); on HIP =1 also runs it on another wave32 card.
-=======
 // attn_merge_kernel's arithmetic in the same chunk order, with two changes that leave every output bit as it was
 // (the Daily's 3effa9d5, from Hardin22; qsa_merge_daily_parity compares the two kernels on the same partials, all four
 // KV formats):
@@ -1335,11 +1143,10 @@ bool query_swizzle_gfx906_device() {
 // CUDA: the current device is below sm_75 (experimental build) or STRATA_ATTN_DAILY=1 (any card); HIP: it is gfx103x
 // (per device: a layer split can mix cards).
 // STRATA_ATTN_PRE75=0 turns PR #540's kernel off (A/B); on HIP =1 also runs it on another wave32 card.
->>>>>>> ours-now
 bool pre75_attn() {
-    static const bool off = [] {
+    static const int env = [] {
         const char* e = std::getenv("STRATA_ATTN_PRE75");
-        return e != nullptr && e[0] == '0';
+        return e == nullptr ? -1 : e[0] == '0' ? 0 : e[0] == '1' ? 1 : -1;
     }();
     if (env == 0) return false;
 #if !defined(__HIPCC__) && !defined(STRATA_EXPERIMENTAL_SM60)
@@ -1350,13 +1157,15 @@ bool pre75_attn() {
 #endif
     static int cc[64] = {};
     int dev = 0;
-<<<<<<< sycl
-    if (off) return false;
-||||||| base
-    if (env == 0) return false;
-=======
->>>>>>> ours-now
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+#if defined(__HIPCC__)
+    if (cc[dev] == 0) {   // 2: gfx103x, 1: another card
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+        cc[dev] = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ? 2 : 1;
+    }
+    return env == 1 || cc[dev] == 2;
+#else
     if (cc[dev] == 0) {
         int major = 0, minor = 0;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
@@ -1367,23 +1176,9 @@ bool pre75_attn() {
         cc[dev] = 10 * major + minor;
     }
     return cc[dev] < 75;
-<<<<<<< sycl
-||||||| base
-#endif
-=======
 #endif
 #endif  // ready-made CUDA engine
->>>>>>> ours-now
 }
-<<<<<<< sycl
-#define STRATA_ATTN_CHUNK(M) (pre75_attn() ? attn_chunk_kernel_pre75<M> : attn_chunk_kernel<M>)
-||||||| base
-#if defined(__HIPCC__)
-#define STRATA_ATTN_CHUNK(M) (pre75_attn() ? attn_chunk_kernel_pre75<M, 8, true> : attn_chunk_kernel<M>)
-#else
-#define STRATA_ATTN_CHUNK(M) (pre75_attn() ? attn_chunk_kernel_pre75<M> : attn_chunk_kernel<M>)
-#endif
-=======
 // `PRE` picks PR #540's kernel; the environment's choice is STRATA_ATTN_CHUNK.
 #if defined(__HIPCC__)
 #define STRATA_ATTN_CHUNK_SEL(M, PRE) ((PRE) ? attn_chunk_kernel_pre75<M, 8, true> : attn_chunk_kernel<M>)
@@ -1391,7 +1186,6 @@ bool pre75_attn() {
 #define STRATA_ATTN_CHUNK_SEL(M, PRE) ((PRE) ? attn_chunk_kernel_pre75<M> : attn_chunk_kernel<M>)
 #endif
 #define STRATA_ATTN_CHUNK(M) STRATA_ATTN_CHUNK_SEL(M, pre75_attn())
->>>>>>> ours-now
 #else
 #define STRATA_ATTN_CHUNK_SEL(M, PRE) attn_chunk_kernel<M>
 #define STRATA_ATTN_CHUNK(M) attn_chunk_kernel<M>
@@ -1476,24 +1270,6 @@ void launch_chunks_batch(const float *q, const QsaAttnPools &pools,
     const bool pre = kernel < 0 ? pre75_attn() : kernel == 1;
 #endif
     // S25: STRATA_ATTN_LANECELL=1 - the score phase one cell per thread (bit-identical scores, no shuffle reductions)
-<<<<<<< sycl
-    static const bool lane_cell = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
-||||||| base
-    static const bool lane_cell = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
-#if defined(STRATA_HIP_GFX906)
-    static const bool query_swizzle = [] {
-        const char* v = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE"); return v && v[0] == '1';
-    }();
-    const bool use_query_swizzle = query_swizzle && !lane_cell && kv_mode == 1 && query_swizzle_gfx906_device();
-    static const bool query_swizzle_trace = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE_TRACE") != nullptr;
-    static thread_local bool query_swizzle_said = false;
-    if (query_swizzle_trace && !query_swizzle_said) {
-        query_swizzle_said = true;
-        std::fprintf(stderr, "strata attn-query-swizzle: active=%d nq=%lld cap=%lld kv_mode=%d lane_cell=%d\n",
-                     use_query_swizzle, (long long) n_q, (long long) cap, kv_mode, lane_cell);
-    }
-#endif
-=======
     const bool lane_cell = kernel < 0 && lane_cell_attn();
 #if defined(STRATA_HIP_GFX906)
     static const bool query_swizzle = [] {
@@ -1509,81 +1285,12 @@ void launch_chunks_batch(const float *q, const QsaAttnPools &pools,
                      use_query_swizzle, (long long) n_q, (long long) cap, kv_mode, lane_cell);
     }
 #endif
->>>>>>> ours-now
 #define STRATA_ATTN_LC(M)                                                      \
     {                                                                          \
         auto exp_props = sycl::ext::oneapi::experimental::properties{          \
             sycl::ext::oneapi::experimental::use_root_sync};                   \
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});  \
                                                                                \
-<<<<<<< sycl
-        st->submit([&](sycl::handler &cgh) {                                   \
-            auto q_ct0 = q;                                                    \
-            QsaAttnPools pools_ct1 = pools;                                    \
-            auto ids_ct2 = ids;                                                \
-            auto steps_ct3 = steps;                                            \
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;                           \
-            auto s_page_size_ct5 = (int)s.page_size;                           \
-            auto scale_ct6 = scale;                                            \
-            auto part_acc_ct7 = part_acc;                                      \
-            auto part_m_ct8 = part_m;                                          \
-            auto part_l_ct9 = part_l;                                          \
-            auto n_chunks_ct10 = n_chunks;                                     \
-            auto cap_ct11 = (int)cap;                                          \
-            auto stride_ct12 = stride;                                         \
-                                                                               \
-            cgh.parallel_for<dpct_kernel_name<class attn_chunk_kernel_6e87d5,  \
-                                              dpct_kernel_scalar<M>,           \
-                                              dpct_kernel_scalar<true>>>(      \
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),           \
-                                  sycl::range(1, 1, THREADS)),                 \
-                exp_props,                                                     \
-                [=](sycl::nd_item<3> item_ct1)                                 \
-                    [[sycl::reqd_sub_group_size(32)]] {                        \
-                        attn_chunk_kernel<M, true>(                            \
-                            q_ct0, pools_ct1, ids_ct2, steps_ct3,              \
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,       \
-                            part_acc_ct7, part_m_ct8, part_l_ct9,              \
-                            n_chunks_ct10, cap_ct11, stride_ct12);             \
-                    });                                                        \
-        });                                                                    \
-    }
-||||||| base
-  st->submit(\
-    [&](sycl::handler &cgh) {\
-      auto q_ct0 = q;\
-      QsaAttnPools pools_ct1 = pools;\
-      auto ids_ct2 = ids;\
-      auto steps_ct3 = steps;\
-      auto s_n_head_kv_ct4 = (int) s.n_head_kv;\
-      auto s_page_size_ct5 = (int) s.page_size;\
-      auto scale_ct6 = scale;\
-      auto part_acc_ct7 = part_acc;\
-      auto part_m_ct8 = part_m;\
-      auto part_l_ct9 = part_l;\
-      auto n_chunks_ct10 = n_chunks;\
-      auto cap_ct11 = (int) cap;\
-      auto stride_ct12 = stride;\
-\
-      /*
-      DPCT1050: The template argument of the dpct_kernel_name could not be deduced. You need to update this code.
-      */
-    cgh.parallel_for<dpct_kernel_name<
-        class attn_chunk_kernel_3b1b83, dpct_kernel_scalar<M>,
-        dpct_kernel_scalar<true>, dpct_placeholder /*Fix the type mannually*/,
-        dpct_placeholder /*Fix the type mannually*/>>(
-        sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                          sycl::range(1, 1, THREADS)),
-        exp_props,
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-            attn_chunk_kernel<M, true>(
-                q_ct0, pools_ct1, ids_ct2, steps_ct3, s_n_head_kv_ct4,
-                s_page_size_ct5, scale_ct6, part_acc_ct7, part_m_ct8,
-                part_l_ct9, n_chunks_ct10, cap_ct11, stride_ct12);
-        });
-    });
-}
-=======
   st->submit(\
     [&](sycl::handler &cgh) {\
       auto q_ct0 = q;\
@@ -1618,49 +1325,13 @@ void launch_chunks_batch(const float *q, const QsaAttnPools &pools,
         });
     });
 }
->>>>>>> ours-now
     if (lane_cell) {
-        if (kv_mode == 3) { STRATA_ATTN_LC(3); }
-        else if (kv_mode == 2) { STRATA_ATTN_LC(2); }
-        else if (kv_mode == 1) { STRATA_ATTN_LC(1); }
-        else { STRATA_ATTN_LC(0); }
+        if (kv_mode == 3) STRATA_ATTN_LC(3);
+        else if (kv_mode == 2) STRATA_ATTN_LC(2);
+        else if (kv_mode == 1) STRATA_ATTN_LC(1);
+        else STRATA_ATTN_LC(0);
     } else
 #undef STRATA_ATTN_LC
-<<<<<<< sycl
-    if (kv_mode == 3)
-||||||| base
-#if defined(STRATA_HIP_GFX906)
-    // Opt-in INT8 batched attention: prefill, verification and MTP (including n_q=1).
-    // Other pool formats and lane-cell scoring keep their paths; qsa_decode_attn_step is unchanged.
-    // A k8v4 model's MTP drafter uses INT8 pools and can therefore take this path.
-    if (use_query_swizzle) {
-        // use_query_swizzle already requires INT8, warp scoring, and the calling
-        // thread's current device to be exactly gfx906 with a 64-lane wavefront.
-        static const bool reduce12 = [] {
-            const char* v = std::getenv("STRATA_GFX906_ATTN_REDUCE12");
-            return v && v[0] == '1' && v[1] == '\0';
-        }();
-        if (reduce12) {
-            attn_chunk_kernel<1, false, true, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
-                (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
-            static const bool trace = [] {
-                const char* v = std::getenv("STRATA_GFX906_ATTN_REDUCE12_TRACE");
-                return v && v[0] == '1' && v[1] == '\0';
-            }();
-            static thread_local bool said = false;
-            if (trace && !said) {
-                said = true;
-                std::fprintf(stderr, "strata attn-reduce12: selected=1 query_swizzle=1 kv_mode=1 nq=%lld cap=%lld\n",
-                             (long long) n_q, (long long) cap);
-            }
-        } else {
-            attn_chunk_kernel<1, false, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
-                (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
-        }
-    } else
-#endif
-    if (kv_mode == 3)
-=======
 #if defined(STRATA_HIP_GFX906)
     // Opt-in INT8 batched attention: prefill, verification and MTP (including n_q=1).
     // Other pool formats and lane-cell scoring keep their paths; qsa_decode_attn_step is unchanged.
@@ -1693,71 +1364,11 @@ void launch_chunks_batch(const float *q, const QsaAttnPools &pools,
 #endif
 #if !defined(__HIPCC__)
     if (kernel < 0 && kv_mode == 1 && attn_v3_on())   // (the parity harness names its kernel: never the environment)
->>>>>>> ours-now
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
-<<<<<<< sycl
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_dfacfc,
-                                          dpct_kernel_scalar<3>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<3>(q, pools, ids, steps, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, (int)cap, stride);
-            });
-    } else if (kv_mode == 2)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-||||||| base
-        st->submit([&](sycl::handler &cgh) {
-            auto q_ct0 = q;
-            QsaAttnPools pools_ct1 = pools;
-            auto ids_ct2 = ids;
-            auto steps_ct3 = steps;
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;
-            auto s_page_size_ct5 = (int)s.page_size;
-            auto scale_ct6 = scale;
-            auto part_acc_ct7 = part_acc;
-            auto part_m_ct8 = part_m;
-            auto part_l_ct9 = part_l;
-            auto n_chunks_ct10 = n_chunks;
-            auto cap_ct11 = (int)cap;
-            auto stride_ct12 = stride;
-
-            /*
-            DPCT1050: The template argument of the dpct_kernel_name could
-            not be deduced. You need to update this code.
-            */
-            cgh.parallel_for<dpct_kernel_name<
-                class attn_chunk_kernel_bc0f58, dpct_kernel_scalar<M>,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        attn_chunk_kernel<M>(
-                            q_ct0, pools_ct1, ids_ct2, steps_ct3,
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,
-                            part_acc_ct7, part_m_ct8, part_l_ct9, n_chunks_ct10,
-                            cap_ct11, stride_ct12);
-                    });
-        });
-    } else if (kv_mode == 2)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-=======
         st->parallel_for<
             dpct_kernel_name<class attn_chunk_q8_v3_kernel_a3014f>>(
             sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
@@ -1796,67 +1407,7 @@ void launch_chunks_batch(const float *q, const QsaAttnPools &pools,
                                       part_acc, part_m, part_l, n_chunks,
                                       (int)cap, stride);
 }
->>>>>>> ours-now
 
-<<<<<<< sycl
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_b0d448,
-                                          dpct_kernel_scalar<2>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<2>(q, pools, ids, steps, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, (int)cap, stride);
-            });
-    } else if (kv_mode == 1)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-||||||| base
-        st->submit([&](sycl::handler &cgh) {
-            auto q_ct0 = q;
-            QsaAttnPools pools_ct1 = pools;
-            auto ids_ct2 = ids;
-            auto steps_ct3 = steps;
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;
-            auto s_page_size_ct5 = (int)s.page_size;
-            auto scale_ct6 = scale;
-            auto part_acc_ct7 = part_acc;
-            auto part_m_ct8 = part_m;
-            auto part_l_ct9 = part_l;
-            auto n_chunks_ct10 = n_chunks;
-            auto cap_ct11 = (int)cap;
-            auto stride_ct12 = stride;
-
-            /*
-            DPCT1050: The template argument of the dpct_kernel_name could
-            not be deduced. You need to update this code.
-            */
-            cgh.parallel_for<dpct_kernel_name<
-                class attn_chunk_kernel_ce1895, dpct_kernel_scalar<M>,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        attn_chunk_kernel<M>(
-                            q_ct0, pools_ct1, ids_ct2, steps_ct3,
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,
-                            part_acc_ct7, part_m_ct8, part_l_ct9, n_chunks_ct10,
-                            cap_ct11, stride_ct12);
-                    });
-        });
-    } else if (kv_mode == 1)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-=======
 // qsa_decode_attn_batch's merge pass over the partials launch_chunks_batch wrote; `v2` names the merge kernel
 void launch_merge_batch(const int32_t *steps, int64_t cap, const QsaShapes &s,
                         const float *scratch, float *attn, int64_t n_q, int v2,
@@ -1870,57 +1421,7 @@ void launch_merge_batch(const int32_t *steps, int64_t cap, const QsaShapes &s,
 }
 
 }  // namespace
->>>>>>> ours-now
 
-<<<<<<< sycl
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_2ad0a4,
-                                          dpct_kernel_scalar<1>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<1>(q, pools, ids, steps, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, (int)cap, stride);
-            });
-||||||| base
-        st->submit([&](sycl::handler &cgh) {
-            auto q_ct0 = q;
-            QsaAttnPools pools_ct1 = pools;
-            auto ids_ct2 = ids;
-            auto steps_ct3 = steps;
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;
-            auto s_page_size_ct5 = (int)s.page_size;
-            auto scale_ct6 = scale;
-            auto part_acc_ct7 = part_acc;
-            auto part_m_ct8 = part_m;
-            auto part_l_ct9 = part_l;
-            auto n_chunks_ct10 = n_chunks;
-            auto cap_ct11 = (int)cap;
-            auto stride_ct12 = stride;
-
-            /*
-            DPCT1050: The template argument of the dpct_kernel_name could
-            not be deduced. You need to update this code.
-            */
-            cgh.parallel_for<dpct_kernel_name<
-                class attn_chunk_kernel_ea3187, dpct_kernel_scalar<M>,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        attn_chunk_kernel<M>(
-                            q_ct0, pools_ct1, ids_ct2, steps_ct3,
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,
-                            part_acc_ct7, part_m_ct8, part_l_ct9, n_chunks_ct10,
-                            cap_ct11, stride_ct12);
-                    });
-        });
-=======
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return;
@@ -2018,80 +1519,12 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
         else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, true);
         else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, true);
         else STRATA_ATTN_SLOTS(0, true);
->>>>>>> ours-now
     } else {
-<<<<<<< sycl
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_5c04f7,
-                                          dpct_kernel_scalar<0>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<0>(q, pools, ids, steps, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, (int)cap, stride);
-            });
-||||||| base
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->submit([&](sycl::handler &cgh) {
-            auto q_ct0 = q;
-            QsaAttnPools pools_ct1 = pools;
-            auto ids_ct2 = ids;
-            auto steps_ct3 = steps;
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;
-            auto s_page_size_ct5 = (int)s.page_size;
-            auto scale_ct6 = scale;
-            auto part_acc_ct7 = part_acc;
-            auto part_m_ct8 = part_m;
-            auto part_l_ct9 = part_l;
-            auto n_chunks_ct10 = n_chunks;
-            auto cap_ct11 = (int)cap;
-            auto stride_ct12 = stride;
-
-            /*
-            DPCT1050: The template argument of the dpct_kernel_name could
-            not be deduced. You need to update this code.
-            */
-            cgh.parallel_for<dpct_kernel_name<
-                class attn_chunk_kernel_13f7c1, dpct_kernel_scalar<M>,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        attn_chunk_kernel<M>(
-                            q_ct0, pools_ct1, ids_ct2, steps_ct3,
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,
-                            part_acc_ct7, part_m_ct8, part_l_ct9, n_chunks_ct10,
-                            cap_ct11, stride_ct12);
-                    });
-        });
-=======
         if (kv_mode == 3) STRATA_ATTN_SLOTS(3, false);
         else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, false);
         else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, false);
         else STRATA_ATTN_SLOTS(0, false);
->>>>>>> ours-now
     }
-<<<<<<< sycl
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-||||||| base
-{
-    auto exp_props = sycl::ext::oneapi::experimental::properties{
-        sycl::ext::oneapi::experimental::use_root_sync};
-=======
 #undef STRATA_ATTN_SLOTS
     launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
                  (unsigned) n_q, st);
@@ -2101,29 +1534,7 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
     need to rewrite this code.
     */
     const dpct::err0 e = 0;
->>>>>>> ours-now
 
-<<<<<<< sycl
-        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_338175>>(
-            sycl::nd_range<3>(
-                sycl::range(1, (unsigned)n_q, (unsigned)s.n_head) *
-                    sycl::range(1, 1, HD),
-                sycl::range(1, 1, HD)),
-            exp_props, [=](sycl::nd_item<3> item_ct1) {
-                attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn,
-                                  stride);
-            });
-    }
-||||||| base
-    st->parallel_for<dpct_kernel_name<class attn_merge_kernel_51d363>>(
-        sycl::nd_range<3>(sycl::range(1, (unsigned)n_q, (unsigned)s.n_head) *
-                              sycl::range(1, 1, HD),
-                          sycl::range(1, 1, HD)),
-        exp_props, [=](sycl::nd_item<3> item_ct1) {
-            attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn, stride);
-        });
-}
-=======
     return true;
 }
 
@@ -2207,7 +1618,6 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
 #undef STRATA_ATTN_ROWS
     launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
                  (unsigned) n_q, st);
->>>>>>> ours-now
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
     error codes. The cudaGetLastError function call was replaced with 0. You
@@ -2243,240 +1653,13 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const float scale = 1.0f / sqrtf((float) HD);
     const dpct::dim3 grid((unsigned)n_chunks, (unsigned)s.n_head_kv);
     dpct::queue_ptr st = strata::q_of(stream);
-<<<<<<< sycl
-    if (kv_mode == 3)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_f262e6,
-                                          dpct_kernel_scalar<3>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<3>(q, pools, ids, step, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, 0, 0);
-            });
-    } else if (kv_mode == 2)
-||||||| base
-    if (kv_mode == 3)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->submit([&](sycl::handler &cgh) {
-            auto q_ct0 = q;
-            QsaAttnPools pools_ct1 = pools;
-            auto ids_ct2 = ids;
-            auto step_ct3 = step;
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;
-            auto s_page_size_ct5 = (int)s.page_size;
-            auto scale_ct6 = scale;
-            auto part_acc_ct7 = part_acc;
-            auto part_m_ct8 = part_m;
-            auto part_l_ct9 = part_l;
-            auto n_chunks_ct10 = n_chunks;
-            auto ct11 = 0;
-            long long ct12 = 0;
-
-            /*
-            DPCT1050: The template argument of the dpct_kernel_name could
-            not be deduced. You need to update this code.
-            */
-            cgh.parallel_for<dpct_kernel_name<
-                class attn_chunk_kernel_1c21d0, dpct_kernel_scalar<M>,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        attn_chunk_kernel<M>(
-                            q_ct0, pools_ct1, ids_ct2, step_ct3,
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,
-                            part_acc_ct7, part_m_ct8, part_l_ct9, n_chunks_ct10,
-                            ct11, ct12);
-                    });
-        });
-    } else if (kv_mode == 2)
-=======
 #if !defined(__HIPCC__)
     if (kv_mode == 1 && attn_v3_on())
->>>>>>> ours-now
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
-<<<<<<< sycl
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_4fd923,
-                                          dpct_kernel_scalar<2>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<2>(q, pools, ids, step, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, 0, 0);
-            });
-    } else if (kv_mode == 1)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_f6855e,
-                                          dpct_kernel_scalar<1>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<1>(q, pools, ids, step, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, 0, 0);
-            });
-    } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_7c8e09,
-                                          dpct_kernel_scalar<0>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<0>(q, pools, ids, step, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, 0, 0);
-            });
-||||||| base
-        st->submit([&](sycl::handler &cgh) {
-            auto q_ct0 = q;
-            QsaAttnPools pools_ct1 = pools;
-            auto ids_ct2 = ids;
-            auto step_ct3 = step;
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;
-            auto s_page_size_ct5 = (int)s.page_size;
-            auto scale_ct6 = scale;
-            auto part_acc_ct7 = part_acc;
-            auto part_m_ct8 = part_m;
-            auto part_l_ct9 = part_l;
-            auto n_chunks_ct10 = n_chunks;
-            auto ct11 = 0;
-            long long ct12 = 0;
-
-            /*
-            DPCT1050: The template argument of the dpct_kernel_name could
-            not be deduced. You need to update this code.
-            */
-            cgh.parallel_for<dpct_kernel_name<
-                class attn_chunk_kernel_312b8c, dpct_kernel_scalar<M>,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        attn_chunk_kernel<M>(
-                            q_ct0, pools_ct1, ids_ct2, step_ct3,
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,
-                            part_acc_ct7, part_m_ct8, part_l_ct9, n_chunks_ct10,
-                            ct11, ct12);
-                    });
-        });
-    } else if (kv_mode == 1)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->submit([&](sycl::handler &cgh) {
-            auto q_ct0 = q;
-            QsaAttnPools pools_ct1 = pools;
-            auto ids_ct2 = ids;
-            auto step_ct3 = step;
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;
-            auto s_page_size_ct5 = (int)s.page_size;
-            auto scale_ct6 = scale;
-            auto part_acc_ct7 = part_acc;
-            auto part_m_ct8 = part_m;
-            auto part_l_ct9 = part_l;
-            auto n_chunks_ct10 = n_chunks;
-            auto ct11 = 0;
-            long long ct12 = 0;
-
-            /*
-            DPCT1050: The template argument of the dpct_kernel_name could
-            not be deduced. You need to update this code.
-            */
-            cgh.parallel_for<dpct_kernel_name<
-                class attn_chunk_kernel_f61170, dpct_kernel_scalar<M>,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        attn_chunk_kernel<M>(
-                            q_ct0, pools_ct1, ids_ct2, step_ct3,
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,
-                            part_acc_ct7, part_m_ct8, part_l_ct9, n_chunks_ct10,
-                            ct11, ct12);
-                    });
-        });
-    } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->submit([&](sycl::handler &cgh) {
-            auto q_ct0 = q;
-            QsaAttnPools pools_ct1 = pools;
-            auto ids_ct2 = ids;
-            auto step_ct3 = step;
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;
-            auto s_page_size_ct5 = (int)s.page_size;
-            auto scale_ct6 = scale;
-            auto part_acc_ct7 = part_acc;
-            auto part_m_ct8 = part_m;
-            auto part_l_ct9 = part_l;
-            auto n_chunks_ct10 = n_chunks;
-            auto ct11 = 0;
-            long long ct12 = 0;
-
-            /*
-            DPCT1050: The template argument of the dpct_kernel_name could
-            not be deduced. You need to update this code.
-            */
-            cgh.parallel_for<dpct_kernel_name<
-                class attn_chunk_kernel_42ccce, dpct_kernel_scalar<M>,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/,
-                dpct_placeholder /*Fix the type mannually*/>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        attn_chunk_kernel<M>(
-                            q_ct0, pools_ct1, ids_ct2, step_ct3,
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,
-                            part_acc_ct7, part_m_ct8, part_l_ct9, n_chunks_ct10,
-                            ct11, ct12);
-                    });
-        });
-=======
         st->parallel_for<
             dpct_kernel_name<class attn_chunk_q8_v3_kernel_7f76e1>>(
             sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
@@ -2528,7 +1711,6 @@ void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, cons
         !q || !ids || !steps || !pools.page_table || (daily_chunk != 0 && daily_chunk != 1)) {
         std::fprintf(stderr, "qsa_decode_attn_chunks_only: unsupported geometry or missing buffers\n");
         std::exit(1);
->>>>>>> ours-now
     }
     launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q,
                         strata::q_of(stream), daily_chunk);
@@ -2540,30 +1722,12 @@ void qsa_decode_attn_chunks_only(const float* q, const QsaAttnPools& pools, cons
     const dpct::err0 e = 0;
 }
 
-<<<<<<< sycl
-        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_c055e7>>(
-            sycl::nd_range<3>(sycl::range(1, 1, (unsigned)s.n_head) *
-                                  sycl::range(1, 1, HD),
-                              sycl::range(1, 1, HD)),
-            exp_props, [=](sycl::nd_item<3> item_ct1) {
-                attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn, 0);
-            });
-||||||| base
-        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_44c8d7>>(
-            sycl::nd_range<3>(sycl::range(1, 1, (unsigned)s.n_head) *
-                                  sycl::range(1, 1, HD),
-                              sycl::range(1, 1, HD)),
-            exp_props, [=](sycl::nd_item<3> item_ct1) {
-                attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn, 0);
-            });
-=======
 void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
                                 float* attn, int64_t n_q, int v2, void* stream) {
     if (n_q <= 0 || n_q > 65535 || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch ||
         (v2 != 0 && v2 != 1) || !steps || !attn) {
         std::fprintf(stderr, "qsa_decode_attn_merge_only: unsupported geometry or missing buffers\n");
         std::exit(1);
->>>>>>> ours-now
     }
     launch_merge_batch(steps, cap, s, scratch, attn, n_q, v2,
                        strata::q_of(stream));

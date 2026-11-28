@@ -350,13 +350,7 @@ the work-group size if needed.
             auto ldy_aux_ct10 = ldy_aux;                                       \
                                                                                \
             cgh.parallel_for<dpct_kernel_name<                                 \
-<<<<<<< sycl
                 class bf16_f32_mmvf_rows_kernel_7c05e5, dpct_kernel_scalar<B>, \
-||||||| base
-                class bf16_f32_mmvf_rows_kernel_56ae49, dpct_kernel_scalar<B>, \
-=======
-                class bf16_f32_mmvf_rows_kernel_fc65f4, dpct_kernel_scalar<B>, \
->>>>>>> ours-now
                 dpct_kernel_scalar<4>, dpct_kernel_scalar<RPB>,                \
                 dpct_kernel_scalar<TSV>, dpct_kernel_scalar<true>>>(           \
                 sycl::nd_range<3>(sycl::range(1, 1, nb + 1) *                  \
@@ -389,13 +383,7 @@ the work-group size if needed.
             auto ldy_aux_ct10 = ldy_aux;                                       \
                                                                                \
             cgh.parallel_for<dpct_kernel_name<                                 \
-<<<<<<< sycl
                 class bf16_f32_mmvf_rows_kernel_681929, dpct_kernel_scalar<B>, \
-||||||| base
-                class bf16_f32_mmvf_rows_kernel_7e6aff, dpct_kernel_scalar<B>, \
-=======
-                class bf16_f32_mmvf_rows_kernel_365d6f, dpct_kernel_scalar<B>, \
->>>>>>> ours-now
                 dpct_kernel_scalar<8>, dpct_kernel_scalar<RPB>,                \
                 dpct_kernel_scalar<TSV>, dpct_kernel_scalar<true>>>(           \
                 sycl::nd_range<3>(sycl::range(1, 1, nb + 1) *                  \
@@ -430,13 +418,7 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
                 parallel_for<dpct_kernel_name<
-<<<<<<< sycl
                     class bf16_f32_mmvf_rows_kernel_ff3610,
-||||||| base
-                    class bf16_f32_mmvf_rows_kernel_6d83ee,
-=======
-                    class bf16_f32_mmvf_rows_kernel_314cd0,
->>>>>>> ours-now
                     dpct_kernel_scalar<B>, dpct_kernel_scalar<4>,
                     dpct_kernel_scalar<RPB>, dpct_kernel_scalar<true>,
                     dpct_kernel_scalar<false>>>(
@@ -464,13 +446,7 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
                 parallel_for<dpct_kernel_name<
-<<<<<<< sycl
                     class bf16_f32_mmvf_rows_kernel_1b1bb5,
-||||||| base
-                    class bf16_f32_mmvf_rows_kernel_2280fa,
-=======
-                    class bf16_f32_mmvf_rows_kernel_a358b6,
->>>>>>> ours-now
                     dpct_kernel_scalar<B>, dpct_kernel_scalar<8>,
                     dpct_kernel_scalar<RPB>, dpct_kernel_scalar<true>,
                     dpct_kernel_scalar<false>>>(
@@ -500,13 +476,7 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
             parallel_for<dpct_kernel_name<
-<<<<<<< sycl
                 class bf16_f32_mmvf_rows_kernel_7ff80d, dpct_kernel_scalar<B>,
-||||||| base
-                class bf16_f32_mmvf_rows_kernel_d3b190, dpct_kernel_scalar<B>,
-=======
-                class bf16_f32_mmvf_rows_kernel_b14ccb, dpct_kernel_scalar<B>,
->>>>>>> ours-now
                 dpct_kernel_scalar<4>, dpct_kernel_scalar<RPB>,
                 dpct_kernel_scalar<false>,
                 dpct_kernel_scalar<false>>>(
@@ -533,13 +503,7 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
             parallel_for<dpct_kernel_name<
-<<<<<<< sycl
                 class bf16_f32_mmvf_rows_kernel_13db68, dpct_kernel_scalar<B>,
-||||||| base
-                class bf16_f32_mmvf_rows_kernel_65d63c, dpct_kernel_scalar<B>,
-=======
-                class bf16_f32_mmvf_rows_kernel_f36886, dpct_kernel_scalar<B>,
->>>>>>> ours-now
                 dpct_kernel_scalar<8>, dpct_kernel_scalar<RPB>,
                 dpct_kernel_scalar<false>,
                 dpct_kernel_scalar<false>>>(

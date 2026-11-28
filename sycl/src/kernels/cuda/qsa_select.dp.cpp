@@ -1,17 +1,11 @@
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
-#include "strata/core/geometry.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/emulate.hpp"
-<<<<<<< sycl
-||||||| base
-#include "strata/core/geometry.hpp"
-=======
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/geometry.hpp"
->>>>>>> ours-now
 #include <cstdlib>
 #include <cstring>
 #include "strata/kernels/qsa_select.hpp"
@@ -662,108 +656,6 @@ __dpct_inline__ void block_scores_tail_kernel(const float *__restrict__ dead,
     }
 }
 
-<<<<<<< sycl
-||||||| base
-// ---- the block scores as an FP32 tiled GEMM for CUDA cards without TF32 tensor cores (below sm_80): rows (query,
-// indexer head) x columns (blocks), K = 128 through shared memory, 2 queries x 4 heads x 4 blocks per thread, relu per
-// head summed in registers.  The warp kernel spends 5 shuffles per 4 products and reached ~1 TFLOPS on an RTX 2080
-// Ti; this one ~6.9 (256 queries: 4.5x at 4K, 6.8x at 120K-250K).  FP32 like the warp kernel in another summation
-// order, so not bitwise (as the tensor-core scorer).  Blocks < n_bid only; the tail block is block_scores_tail_kernel's.
-constexpr int SM_QT = 32, SM_NB = 64, SM_KC = 32, SM_QS = SM_QT * IDX_HEADS + 4, SM_KS = SM_NB + 4;
-/*
-DPCT1110: The total declared local variable size in device function
-block_scores_simt_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
-__dpct_inline__ void block_scores_simt_kernel(const float *__restrict__ pooled,
-                                              const float *__restrict__ q_idx,
-                                              const int32_t *__restrict__ steps,
-                                              int64_t nq, int64_t max_blocks,
-                                              int64_t reach,
-                                              float *__restrict__ out) {
-    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-auto &Qs =
-    *sycl::ext::oneapi::group_local_memory_for_overwrite<float[SM_KC][SM_QS]>(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    auto &Ks = *sycl::ext::oneapi::group_local_memory_for_overwrite<
-        float[SM_KC][SM_KS]>(
-        sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    const int64_t q0 = (int64_t)item_ct1.get_group(1) * SM_QT,
-                  b0 = (int64_t)item_ct1.get_group(2) * SM_NB;
-    const int64_t qlast = (q0 + SM_QT < nq ? q0 + SM_QT : nq) - 1;
-    if (b0 >= steps[qlast * kStepCount + kStepNBid]) return;   // n_bid rises with the position
-    const int tid = item_ct1.get_local_id(2), tx = tid & 15, ty = tid >> 4;
-    float acc[8][4] = {};
-    for (int kc = 0; kc < IDX_DIM; kc += SM_KC) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {   // the query rows: 128 x 8 float4
-            const int idx = tid + i * 256, r = idx >> 3, k4 = idx & 7;
-            sycl::float4 v = sycl::float4(0.f, 0.f, 0.f, 0.f);
-            if (q0 + (r >> 2) < nq)
-                v = *reinterpret_cast<const sycl::float4 *>(
-                    q_idx + (q0 * IDX_HEADS + r) * IDX_DIM + kc + k4 * 4);
-            Qs[k4 * 4 + 0][r] = v.x(); Qs[k4 * 4 + 1][r] = v.y();
-                Qs[k4 * 4 + 2][r] = v.z(); Qs[k4 * 4 + 3][r] = v.w();
-        }
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {   // the pooled keys: 64 x 8 float4
-            const int idx = tid + i * 256, c = idx >> 3, k4 = idx & 7;
-            sycl::float4 v = sycl::float4(0.f, 0.f, 0.f, 0.f);
-            if (b0 + c < reach) v = *reinterpret_cast<const sycl::float4 *>(
-                pooled + (b0 + c) * IDX_DIM + kc + k4 * 4);
-            Ks[k4 * 4 + 0][c] = v.x(); Ks[k4 * 4 + 1][c] = v.y();
-                Ks[k4 * 4 + 2][c] = v.z(); Ks[k4 * 4 + 3][c] = v.w();
-        }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        item_ct1.barrier(sycl::access::fence_space::local_space);
-#pragma unroll 8
-        for (int k = 0; k < SM_KC; ++k) {
-            const sycl::float4 qa =
-                *reinterpret_cast<const sycl::float4 *>(&Qs[k][ty * 8]);
-            const sycl::float4 qb =
-                *reinterpret_cast<const sycl::float4 *>(&Qs[k][ty * 8 + 4]);
-            const sycl::float4 kv =
-                *reinterpret_cast<const sycl::float4 *>(&Ks[k][tx * 4]);
-            const float qr[8] = {qa.x(), qa.y(), qa.z(), qa.w(),
-                                 qb.x(), qb.y(), qb.z(), qb.w()},
-                        kr[4] = {kv.x(), kv.y(), kv.z(), kv.w()};
-#pragma unroll
-            for (int i = 0; i < 8; ++i)
-#pragma unroll
-                for (int j = 0; j < 4; ++j) acc[i][j] =
-                    sycl::fma((float)(qr[i]), (float)(kr[j]), acc[i][j]);
-        }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        item_ct1.barrier(sycl::access::fence_space::local_space);
-    }
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const int64_t q = q0 + ty * 2 + i;
-        if (q >= nq) continue;
-        const int64_t n_bid = steps[q * kStepCount + kStepNBid];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int64_t b = b0 + tx * 4 + j;
-            if (b >= n_bid || b >= max_blocks) continue;
-            float sc = 0.0f;
-#pragma unroll
-            for (int h = 0; h < IDX_HEADS; ++h) {
-                const float d = acc[i * 4 + h][j];
-                sc += d > 0.0f ? d : 0.0f;
-            }
-            out[q * max_blocks + b] = sc;
-        }
-    }
-}
-
-=======
 // ---- the block scores as an FP32 tiled GEMM for cards without a matrix-core scorer (CUDA below sm_80; HIP, opt-in):
 // rows (query, indexer head) x columns (blocks), K = 128 through shared memory, 2 queries x 4 heads x TN blocks per
 // thread, relu per head summed in registers.  The warp kernel spends 5 shuffles per 4 products and reached ~1 TFLOPS
@@ -1069,7 +961,6 @@ __dpct_inline__ void block_scores_simt2_kernel(
     }
 }
 
->>>>>>> ours-now
 // ---- the same top-k with each query's keys read once: 1,024 threads hold up to TK_PER consecutive blocks' keys in
 // registers (contexts up to 4 * 1024 * TK_PER cells), per-warp histograms, block-wide scans. The selection rule is
 // block_topk_kernel's (radix threshold, ties to the lowest index, cells ascending): identical ids.
@@ -1226,17 +1117,6 @@ auto &hist =
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
-<<<<<<< sycl
-        item_ct1.barrier();
-        if (t == 0) {
-            int cum = above, d = 255;
-||||||| base
-        (item_ct1.get_local_range(2) < TK_T)
-            ? item_ct1.barrier(sycl::access::fence_space::local_space)
-            : item_ct1.barrier();
-        if (t == 0) {
-            int cum = above, d = 255;
-=======
         item_ct1.barrier();
         // the digit: the first bin from the top where the count above reaches `width` (bin 0 when none of 255..1
         // does).  Threads 0-255 (warps 0-7) prefix-sum the 256 bins in descending order instead of one thread
@@ -1245,7 +1125,6 @@ auto &hist =
         if (t < 256) {
             v = hist[0][255 - t];
             x = v;
->>>>>>> ours-now
 #pragma unroll
             for (int o = 1; o < 32; o <<= 1) {
                 /*
@@ -3112,18 +2991,8 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     */
 }
 
-<<<<<<< sycl
-bool qsa_block_scores_tc(const float *pooled, const float *dead,
-                         const float *q_idx, const int32_t *steps, int64_t nq,
-                         int64_t max_blocks, const QsaShapes &s, float *scores,
-                         void *stream, int64_t active_blocks) try {
-||||||| base
-bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
-                         int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
-=======
 bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
->>>>>>> ours-now
     if (nq <= 0) return true;
     if (nq > 4 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
     dpct::queue_ptr st = strata::q_of(stream);
@@ -3243,8 +3112,10 @@ void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const i
     */
 }
 
-bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
-                         int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
+bool qsa_block_scores_tc(const float *pooled, const float *dead,
+                         const float *q_idx, const int32_t *steps, int64_t nq,
+                         int64_t max_blocks, const QsaShapes &s, float *scores,
+                         void *stream, int64_t active_blocks) try {
     if (nq <= 0) return true;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535 * TC_QT) return false;
 #if defined(__HIPCC__)
@@ -3281,6 +3152,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
         return true;
     }
 #else
+    return false;   // SYCL: the tensor-core / tiled scorers are not ported; the caller takes the older kernel
     {   // sm_80 or newer (TF32 MMA); an older card keeps the warp kernel
         static int cc_major[64] = {};
         int dev = 0;
@@ -3306,68 +3178,6 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
             const char* w = std::getenv("STRATA_QSA_WARP");
             cc_major[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "select")) ? 7 : strata::cc_major_of(major);
         }
-<<<<<<< sycl
-        (void) cc_major[dev];
-        return false;   // SYCL: the tensor-core kernel is not ported yet; the caller takes the older kernel
-||||||| base
-        if (cc_major[dev] < 8) {
-            // no TF32 tensor cores: the FP32 tiled kernel, opt-in (STRATA_SELECT_SIMT=1): its sum order differs from the
-            // warp kernel's, so the default stays the caller's warp kernel and the output bytes stay the same
-            static const bool simt = [] {
-                const char* v = std::getenv("STRATA_SELECT_SIMT");
-                return v != nullptr && v[0] == '1';
-            }();
-            if (!simt) return false;
-            const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
-            const dpct::dim3 grid((unsigned)((reach + SM_NB - 1) / SM_NB),
-                                  (unsigned)((nq + SM_QT - 1) / SM_QT));
-            if (grid.y > 65535) return false;
-            {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                strata::q_of(stream)
-                    ->parallel_for<dpct_kernel_name<
-                        class block_scores_simt_kernel_a29081>>(
-                        sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                          sycl::range(1, 1, 256)),
-                        exp_props, [=](sycl::nd_item<3> item_ct1) {
-                            block_scores_simt_kernel(pooled, q_idx, steps, nq,
-                                                     max_blocks, reach, scores);
-                        });
-            }
-            {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                strata::q_of(stream)
-                    ->parallel_for<dpct_kernel_name<
-                        class block_scores_tail_kernel_70dfaa>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
-                                              sycl::range(1, 1, 32),
-                                          sycl::range(1, 1, 32)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                block_scores_tail_kernel(dead, q_idx, steps,
-                                                         max_blocks, scores);
-                            });
-            }
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            const dpct::err0 e = 0;
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-
-            return true;
-        }
-=======
         if (cc_major[dev] < 8) {
             // no TF32 tensor cores: the FP32 tiled kernel, opt-in (STRATA_SELECT_SIMT=1): its sum order differs from the
             // warp kernel's, so the default stays the caller's warp kernel and the output bytes stay the same
@@ -3463,7 +3273,6 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                                      reach, scores, strata::q_of(stream),
                                      false);
         }
->>>>>>> ours-now
     }
     static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs it on several)
     int adev = 0;
@@ -3545,6 +3354,11 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
 
     return true;
 #endif
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
 }
 
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
@@ -4635,36 +4449,6 @@ auto &s_key =
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
-<<<<<<< sycl
-
-    return true;
-#endif
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
-                        const QsaShapes& s, int32_t* ids, void* stream) {
-    if (nq <= 0) return;
-    if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s)) {
-        std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
-        std::exit(1);
-||||||| base
-
-    return true;
-#endif
-}
-
-void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
-                        const QsaShapes& s, int32_t* ids, void* stream) {
-    if (nq <= 0) return;
-    if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s)) {
-        std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
-        std::exit(1);
-=======
     item_ct1.barrier();
     for (int kk = 2; kk <= n2; kk <<= 1) {
         for (int j = kk >> 1; j > 0; j >>= 1) {
@@ -4691,7 +4475,6 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
             */
             item_ct1.barrier();
         }
->>>>>>> ours-now
     }
     // 5. the emit: cells above thr, and the first eq_budget cells at thr, in block order
     constexpr int PER = TS_CAP / TK_T;              // candidates per thread, consecutive
@@ -4950,13 +4733,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-<<<<<<< sycl
-            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_6ae5f0,
-||||||| base
-            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_528ff6,
-=======
             ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_97b37d,
->>>>>>> ours-now
                                             dpct_kernel_scalar<TK_PER>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                       sycl::range(1, 1, TK_T),
@@ -4978,13 +4755,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-<<<<<<< sycl
-            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_10a848,
-||||||| base
-            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_ca1706,
-=======
             ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_cdd089,
->>>>>>> ours-now
                                             dpct_kernel_scalar<TK_PER_MAX>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                       sycl::range(1, 1, TK_T),

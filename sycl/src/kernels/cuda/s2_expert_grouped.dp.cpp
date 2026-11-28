@@ -911,13 +911,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-<<<<<<< sycl
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_792534>>(
-||||||| base
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_a2fb6f>>(
-=======
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_6d6eaa>>(
->>>>>>> ours-now
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -1074,13 +1068,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-<<<<<<< sycl
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_5aa9a9>>(
-||||||| base
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_a11cc2>>(
-=======
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_b6ee6d>>(
->>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((pairs + THREADS - 1) / THREADS)) *
@@ -1145,13 +1133,7 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-<<<<<<< sycl
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_a0c31a>>(
-||||||| base
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_f0d9b2>>(
-=======
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_5bf1a0>>(
->>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((pairs + THREADS - 1) / THREADS)) *
@@ -1758,13 +1740,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-<<<<<<< sycl
             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_90849f>>(
-||||||| base
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_12f01a>>(
-=======
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_39194e>>(
->>>>>>> ours-now
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((pairs + THREADS - 1) / THREADS)) *
@@ -1882,13 +1858,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cs->parallel_for<
-<<<<<<< sycl
             dpct_kernel_name<class cpu_order_projection_kernel_2fbdd9,
-||||||| base
-            dpct_kernel_name<class cpu_order_projection_kernel_dac900,
-=======
-            dpct_kernel_name<class cpu_order_projection_kernel_b8b107,
->>>>>>> ours-now
                              dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(
                 sycl::range(1, 1,
@@ -1964,13 +1934,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cs->parallel_for<
-<<<<<<< sycl
             dpct_kernel_name<class cpu_order_projection_kernel_2e007a,
-||||||| base
-            dpct_kernel_name<class cpu_order_projection_kernel_9d9e9d,
-=======
-            dpct_kernel_name<class cpu_order_projection_kernel_3cfac5,
->>>>>>> ours-now
                              dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(
                 sycl::range(1, 1,

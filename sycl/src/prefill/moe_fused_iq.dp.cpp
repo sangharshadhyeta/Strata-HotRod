@@ -24,18 +24,12 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
-<<<<<<< sycl
-||||||| base
-#include "strata/kernels/gfx_arch.hpp"
-=======
-#include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/emulate.hpp"
 
 #if defined(__HIPCC__)
 #include "moe_f16_common.cuh"
 #include "moe_f16_kq.hpp"
 #endif
->>>>>>> ours-now
 
 #include "ggml.h"
 
@@ -972,34 +966,17 @@ __dpct_inline__ void native_kernel(
 // A work item = NW_ROWS weight rows x a 64-row tile; 8 waves: 4 along the weight rows (32 each) x 2 along the tile
 // (32 each), each 2 x 2 WMMA tiles.  Gate/up: local row r is feature r / 2, its gate (r even) or up (r odd) row, so a
 // lane pair l, l + 16 holds gate and up of one feature.
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+// gfx12 (RDNA4: gfx1200 / gfx1201, wave32) has the same instruction with another layout (checked on gfx1201, R9700):
+// A lane l holds A[l % 16][8 (l / 16) + j], B lane l B[8 (l / 16) + j][l % 16] (j = 0..7: 8 int8, two VGPRs, no
+// replication), C/D lane l holds D[8 (l / 16) + i][l % 16].  A WMMA still contracts 16 k; lane half hi supplies k
+// 8 hi .. 8 hi + 7 of them, so a 16-value k-step is still one WMMA (the K16 scales stay per WMMA).  NW_DROW is the
+// D row of a lane's element i; on gfx12 a lane's 8 rows are consecutive, so a feature's gate (even local row) and up
+// (odd) sit in one lane (elements 2j, 2j + 1) and the SwiGLU needs no cross-lane exchange.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
 #define STRATA_NAT_W11 1
 #else
 #define STRATA_NAT_W11 0
 #endif
-<<<<<<< sycl
-||||||| base
-#if defined(__gfx1200__) || defined(__gfx1201__)
-#define STRATA_NAT_W12 1
-#else
-#define STRATA_NAT_W12 0
-#endif
-#define STRATA_NAT_WMMA (STRATA_NAT_W11 || STRATA_NAT_W12)
-#if STRATA_NAT_W12
-#define NW_DROW(i, hi) (8 * (hi) + (i))
-#else
-#define NW_DROW(i, hi) (2 * (i) + (hi))
-#endif
-// The VGPR cap of the occupancy variant (amdgpu_waves_per_eu).  8 was measured against ROCm 7's clang; clang 22 (ROCm 7.10)
-// computes wrong results with it (#1180: gfx1100, every run), so there the cap is off.  -DSTRATA_W_LB=N sets it.
-#if defined(STRATA_W_LB)
-constexpr int NW_LB = STRATA_W_LB;
-#elif defined(__clang_major__) && __clang_major__ >= 22
-constexpr int NW_LB = 1;
-#else
-constexpr int NW_LB = 8;
-#endif
-=======
 #if defined(__gfx1200__) || defined(__gfx1201__)
 #define STRATA_NAT_W12 1
 #else
@@ -1038,21 +1015,32 @@ constexpr bool nw_capped(int wt) {
     return false;
 #endif
 }
->>>>>>> ours-now
 typedef int nw_i4 __attribute__((ext_vector_type(4)));
+typedef int nw_i2 __attribute__((ext_vector_type(2)));
 typedef int nw_i8 __attribute__((ext_vector_type(8)));
 constexpr int NW_ROWS = 128;
 constexpr int NW_THREADS = 256;
 
-__device__ __forceinline__ nw_i8 nw_wmma(nw_i4 a, nw_i4 b, nw_i8 c) {
+// one A / B fragment: gfx11 16 int8 per lane (uint4), gfx12 8 (uint2)
+#if STRATA_NAT_W12
+typedef uint2 nw_frag;
+typedef nw_i2 nw_ab;
+__device__ __forceinline__ nw_ab nw_v(uint2 v) { return nw_ab{(int) v.x, (int) v.y}; }
+#else
+typedef uint4 nw_frag;
+typedef nw_i4 nw_ab;
+__device__ __forceinline__ nw_ab nw_v(uint4 v) { return nw_ab{(int) v.x, (int) v.y, (int) v.z, (int) v.w}; }
+#endif
+__device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
 #if STRATA_NAT_W11
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+#elif STRATA_NAT_W12
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
 #else
     __builtin_trap();
     return c;
 #endif
 }
-__device__ __forceinline__ nw_i4 nw_u4(uint4 v) { return nw_i4{(int) v.x, (int) v.y, (int) v.z, (int) v.w}; }
 
 // W (X1): ALIAS = the H tile lives on the weight buffers (one extra barrier); LB > 0 = amdgpu_waves_per_eu(LB) (VGPR cap)
 // where nw_capped(WT) says the cap applies.
@@ -1401,13 +1389,7 @@ unsigned blocks(int64_t n, int per) { return (unsigned) ((n + per - 1) / per); }
 // per device: whether every kernel here runs (sm_80+, device code in this build, fits), and their occupancy
 struct DevInfo {
     bool done = false, ok = false;
-<<<<<<< sycl
-||||||| base
-    bool w12 = false;   // gfx12 (RDNA4): the native kernels only - the Q2_0 pack's (moe_fused.cu) are not ported there
-=======
-    bool w12 = false;   // gfx12 (RDNA4): the native kernels only - the Q2_0 pack's (moe_fused.cu) are not ported there
     bool t75 = false;   // Turing (STRATA_PF_FUSED_SM75): the Q2_0 / Q2_0 layers only (what was set up and checked there)
->>>>>>> ours-now
     int sms = 0, occ = 1;
 };
 std::mutex g_mu;
@@ -1613,13 +1595,7 @@ void launch(int ww, unsigned grid, const Batch &b, const NativeGeom &g,
                         sycl::range(smem_bytes(T, 4, host_astages())), cgh);
 
                     cgh.parallel_for<dpct_kernel_name<
-<<<<<<< sycl
-                        class native_kernel_6643fb, dpct_kernel_scalar<T>,
-||||||| base
-                        class native_kernel_be123d, dpct_kernel_scalar<T>,
-=======
                         class native_kernel_dd9f78, dpct_kernel_scalar<T>,
->>>>>>> ours-now
                         dpct_kernel_scalar<GU>, dpct_kernel_scalar<4>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                               sycl::range(1, 1, THREADS),
@@ -1668,13 +1644,7 @@ void launch(int ww, unsigned grid, const Batch &b, const NativeGeom &g,
                         sycl::range(smem_bytes(T, 2, host_astages())), cgh);
 
                     cgh.parallel_for<dpct_kernel_name<
-<<<<<<< sycl
-                        class native_kernel_e6c346, dpct_kernel_scalar<T>,
-||||||| base
-                        class native_kernel_a3d37e, dpct_kernel_scalar<T>,
-=======
                         class native_kernel_d860c4, dpct_kernel_scalar<T>,
->>>>>>> ours-now
                         dpct_kernel_scalar<GU>, dpct_kernel_scalar<2>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                               sycl::range(1, 1, THREADS),
@@ -1719,26 +1689,6 @@ bool native_supported(int gu_type, int d_type) {
         const char* v = std::getenv("STRATA_PF_FUSED_NATIVE");
         return v != nullptr && v[0] == '0';
     }();
-<<<<<<< sycl
-    return !off && requested() && gu_covered(gu_type) && d_covered(d_type) && dev_info().ok;   // opt-in (=1)
-||||||| base
-    // gfx12: fused::available() (the Q2_0 pack's expert_w11_kernel, not ported) stays false, so requested() does too; the
-    // same opt-in (STRATA_PF_FUSED=1) is read here.  Every other device: requested() as before.
-    // unset: on by default on gfx12 for IQ3_S and IQ3_XXS gate/up only (R9700: prompt +13..+20%, first-token KL against the FP16 prompt
-    // path equal to MMQ's within noise, 96 prompts each); STRATA_PF_FUSED=0 turns it off, =1 keeps the opt-in for every covered format
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_PF_FUSED");
-        return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0);
-    }();
-    if (off || env == 0 || !gu_covered(gu_type) || !d_covered(d_type)) return false;
-#if !defined(__HIPCC__)
-    if (env < 0) return false;   // the default is gfx12 (HIP) only
-#endif
-    if (env < 0 && gu_type != T_IQ3_S && gu_type != T_IQ3_XXS) return false;   // default: only these two
-    const DevInfo& d = dev_info();
-    if (env < 0) return d.ok && d.w12;
-    return d.ok && (requested() || d.w12);
-=======
     // gfx12: fused::available() (the Q2_0 pack's expert_w11_kernel, not ported) stays false, so requested() does too; the
     // same opt-in (STRATA_PF_FUSED=1) is read here.  Every other device: requested() as before.
     // unset: on by default on gfx12 for IQ3_S and IQ3_XXS gate/up only (R9700: prompt +13..+20%, first-token KL against the FP16 prompt
@@ -1757,7 +1707,6 @@ bool native_supported(int gu_type, int d_type) {
     if (d.t75 && (gu_type != T_Q2_0 || d_type != T_Q2_0)) return false;
     if (env < 0) return d.w12;
     return requested() || d.w12;
->>>>>>> ours-now
 }
 
 void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
@@ -1816,14 +1765,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (2560 / NW_ROWS), (int64_t) d.sms * (occ_d ? 4 : wgp_blocks(d.occ)));
         const uint8_t* xa8 = (const uint8_t*) xa;
         uint8_t* ha8 = (uint8_t*) ha;
-<<<<<<< sycl
 #define STRATA_NW_GU(T) do { if (occ_gu) native_w11_kernel<T, true, true, 8><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
-        switch (g.gu_type) {
-||||||| base
-#define STRATA_NW_GU(T) do { if (occ_gu) native_w11_kernel<T, true, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
-        switch (g.gu_type) {
-=======
-#define STRATA_NW_GU(T) do { if (occ_gu) native_w11_kernel<T, true, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
         // STRATA_PF_F16=1: gfx11's F16 matrix cores - the K-quants' kernels (moe_f16_kq.cu) and native_f16_kernel for
         // f16_gu / f16_d (gfx12's WMMA layout differs, so it keeps the int8 kernels)
         const bool f16 = !d.w12 && f16::requested();
@@ -1847,7 +1789,6 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 #undef STRATA_F16_GU
         }
         else switch (g.gu_type) {
->>>>>>> ours-now
             case T_IQ2_XXS: STRATA_NW_GU(T_IQ2_XXS); break;
             case T_IQ2_XS: STRATA_NW_GU(T_IQ2_XS); break;
             case T_IQ2_S: STRATA_NW_GU(T_IQ2_S); break;
@@ -1858,14 +1799,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             default: STRATA_NW_GU(T_IQ4_XS); break;
         }
 #undef STRATA_NW_GU
-<<<<<<< sycl
 #define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, 8><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
-        if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
-||||||| base
-#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
-        if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
-=======
-#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
         if (f16 && f16kq::covers_down(g.d_type)) f16kq::down(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, ha8, dm, s);
         else if (f16 && f16_d(g.d_type)) {
             if (g.d_type == T_Q2_0) STRATA_F16_LAUNCH(T_Q2_0, false, f16::D_NFB, ha8, nullptr, dm);
@@ -1873,7 +1807,6 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             else STRATA_F16_LAUNCH(T_IQ4_NL, false, f16::D_NFB, ha8, nullptr, dm);
         }
         else if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
->>>>>>> ours-now
         else if (g.d_type == T_Q5_1) STRATA_NW_D(T_Q5_1);
         else if (g.d_type == T_Q8_0) STRATA_NW_D(T_Q8_0);
         else STRATA_NW_D(T_IQ4_NL);
