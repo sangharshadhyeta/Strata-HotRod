@@ -63,6 +63,130 @@ st = st.replace("struct Stager {\n", "struct Stager {\n"
                 "    static constexpr int kMaxBatch = 32;\n    int batch = 1;\n", 1)
 s = s[:a] + st + s[b:]
 
+# 3b. (ported) the stager's batched source reads, and "a failed read stops the request, not the engine".  Our file: a failed
+#     copy_blobs sets `failed` (wait() answers null, the launcher's copy check returns an error) and every job of the run is
+#     still marked ready.  The SYCL Stager instead zero-filled the buffer on a failed GGUF read (silent: the request went on
+#     with zeros as expert weights) and called std::abort() on a failed copy_blob.  Both now set `failed` the same way.
+#     Batching: STRATA_STAGER_BATCH (default 1 = one job per claim, as the SYCL engine always ran).  A run of k <= kRing jobs
+#     has distinct buffers; each job waits for its own buffer, its reads are one copy_blobs call, and only the host reads
+#     change - every DMA is still queued per job by the launcher (issued_one).  GGUF jobs (gsrc) are never batched.
+sub("""    // (ours: batched source reads; the SYCL engine reads one job at a time, so these only keep the API)
+    static constexpr int kMaxBatch = 32;
+    int batch = 1;
+""", """    // pp-opt, ported: the jobs one thread claims at once and reads as one copy_blobs call (a FileExpertSource over native
+    // shards merges neighbouring blobs into one request).  STRATA_STAGER_BATCH, read where the stager is set up; 1 (the default
+    // in the SYCL build) is one job per claim, as the SYCL engine always ran.  Only the host reads are batched: each job's DMA is still queued by the launching
+    // thread, one job at a time (issued_one), so the DMAs in flight are the same as with batch 1.  A GGUF job (gsrc) is never
+    // batched: its source has no copy_blobs, and the base one goes through blob(), which writes a ring shared by all threads.
+    static constexpr int kMaxBatch = 32;
+    int batch = 1;
+""")
+sub("""        buf.assign((size_t) kRing, nullptr);
+        pinned.assign((size_t) kRing, 0);
+""", """        batch = std::min(batch, kRing);   // a run's buffers are distinct only when batch <= kRing (the caller sets batch)
+        buf.assign((size_t) kRing, nullptr);
+        pinned.assign((size_t) kRing, 0);
+""")
+# The caller (shared init code, also the CUDA build's) defaults batch to 8 for file-backed sources.  The SYCL stager
+# never batched before this port, so its default stays 1; STRATA_STAGER_BATCH still sets it (the same env, read by the caller).
+sub("""            const int want = bv ? std::atoi(bv) : files ? 8 : 1;
+""", """            const int want = bv ? std::atoi(bv) : 1;   // SYCL: 1 by default (the CUDA default of 8 is not measured here)
+""")
+sub("""                active.fetch_add(1, std::memory_order_acq_rel);
+                const int j = claim(seen);
+                if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
+                const int b = j % kRing;
+                if (j >= kRing)   // job j - kRing's DMA from this buffer is queued
+                    while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
+                // and done (#385) - for a generation's first kRing jobs that is the previous generation's last DMA from
+                // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP)
+                while (!buffer_free(b)) std::this_thread::yield();
+                const Job& jb = jobs[(size_t) j];
+                if (jb.gsrc != nullptr) {
+                    if (!jb.gsrc->read_into(jb.l, jb.e, buf[b], jb.bytes)) {
+                        std::fprintf(stderr, "prefill: reading expert %d of layer %d from the GGUF failed\\n", jb.e, jb.l);
+                        std::memset(buf[b], 0, jb.bytes);
+                    }
+                } else if (jb.from == nullptr) {
+                    std::memcpy(buf[b], jb.src, jb.bytes);
+                } else if (!jb.from->copy_blob(jb.l, jb.e, buf[b])) {
+                    std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\\n", jb.e, jb.l);
+                    std::abort();
+                }
+                ready[(size_t) j].store(1, std::memory_order_release);
+                active.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        }
+    }
+    int claim(uint32_t g) {
+        uint64_t cur = head.load(std::memory_order_acquire);
+        for (;;) {
+            if ((uint32_t) (cur >> 32) != g) return -1;
+            const int n = (int) ((cur >> 16) & 0xffff), j = (int) (cur & 0xffff);
+            if (j >= n) return -1;
+            if (head.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) return j;
+        }
+    }
+""", """                active.fetch_add(1, std::memory_order_acq_rel);
+                // pp-opt, ported: a run of up to `batch` consecutive jobs (batch <= kRing: the run's buffers are distinct, and
+                // the earliest unfinished run never waits for a buffer of its own)
+                int k = 1;
+                const int j = claim(seen, batch, k);
+                if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
+                for (int i = j; i < j + k; ++i) {
+                    if (i >= kRing)   // job i - kRing's DMA from this buffer is queued
+                        while (issued.load(std::memory_order_acquire) <= i - kRing) std::this_thread::yield();
+                    // and done (#385) - for a generation's first kRing jobs that is the previous generation's last DMA from
+                    // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP)
+                    while (!buffer_free(i % kRing)) std::this_thread::yield();
+                }
+                // The run's reads.  A failed read or copy sets `failed` (wait() answers null from then on, and the launcher's
+                // copy check ends the request).  Every job of the run is marked ready below on every path, so no waiter hangs,
+                // and this thread never exits or aborts the engine.
+                int32_t rl[kMaxBatch], re[kMaxBatch];
+                uint8_t* rd[kMaxBatch];
+                size_t nr = 0;
+                core::ExpertSource* from = nullptr;   // every source job of a layer names the same source (the run's m.src)
+                for (int i = j; i < j + k; ++i) {
+                    const Job& jb = jobs[(size_t) i];
+                    if (jb.gsrc != nullptr) {   // --stream-experts: this thread reads it from the GGUF (one read, never batched)
+                        if (!jb.gsrc->read_into(jb.l, jb.e, buf[i % kRing], jb.bytes)) {
+                            std::fprintf(stderr, "prefill: reading expert %d of layer %d from the GGUF failed (the request stops)\\n",
+                                         jb.e, jb.l);
+                            failed.store(true, std::memory_order_release);
+                        }
+                    } else if (jb.from == nullptr) {
+                        std::memcpy(buf[i % kRing], jb.src, jb.bytes);
+                    } else {
+                        from = jb.from;
+                        rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
+                    }
+                }
+                bool copy_ok = true;
+                if (nr == 1) copy_ok = from->copy_blob(rl[0], re[0], rd[0]);   // one job: the call the SYCL stager always made
+                else if (nr > 1) copy_ok = from->copy_blobs(rl, re, rd, nr);
+                if (!copy_ok) {
+                    std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d, %zu in its run (the request stops)\\n",
+                                 re[0], rl[0], nr);
+                    failed.store(true, std::memory_order_release);
+                }
+                for (int i = j; i < j + k; ++i) ready[(size_t) i].store(1, std::memory_order_release);
+                active.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        }
+    }
+    int claim(uint32_t g, int want, int& k) {
+        uint64_t cur = head.load(std::memory_order_acquire);
+        for (;;) {
+            if ((uint32_t) (cur >> 32) != g) return -1;
+            const int n = (int) ((cur >> 16) & 0xffff), j = (int) (cur & 0xffff);
+            if (j >= n) return -1;
+            k = std::min(want, n - j);
+            if (head.compare_exchange_weak(cur, cur + (uint64_t) k, std::memory_order_acq_rel, std::memory_order_acquire)) return j;
+        }
+    }
+""")
+
 # 4. Impl: the XMX=1 dequant group, the PLE sequence numbers
 sub("    uint16_t* dq_gu[DQ] = {};\n    uint16_t* dq_d[DQ] = {};",
     "    uint16_t* dq_gu[strata::prefill::xmx::kMaxGroup > DQ ? strata::prefill::xmx::kMaxGroup : DQ] = {};   // A770: STRATA_PF_XMX=1 (dq_slots)\n"

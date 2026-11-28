@@ -453,5 +453,12 @@ sub("    const bool hc_q8 = hc_req8_env && !multi_gpu;\n",
     "                             \"engine yet - the BF16 projections are used\\n\");\n"
     "    const bool hc_q8 = false;\n")
 
+# (review) pin by need registers host ranges with the GPU driver, which this backend cannot do: ignored, with a message
+sub("""        if (const char* pn = std::getenv("STRATA_PIN_BY_NEED"); pn != nullptr && pn[0] != '\\0' && pn[0] != '0') {
+""", """        if (const char* pn = std::getenv("STRATA_PIN_BY_NEED"); pn != nullptr && pn[0] != '\\0' && pn[0] != '0')
+            std::fprintf(stderr, "strata generate: STRATA_PIN_BY_NEED: no host registration on the SYCL engine - ignored\\n");
+        if (const char* pn = nullptr; pn != nullptr) {
+""")
+
 open(f"{W}/sycl/src/program/generate.cpp", "w").write(s)
 print("generate.cpp rebuilt:", s.count("\n"), "lines")

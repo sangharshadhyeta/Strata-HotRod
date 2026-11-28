@@ -5,6 +5,7 @@
 #include "strata/sycl_queue.hpp"
 #include "strata/sycl_doorbell.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
@@ -540,6 +541,13 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
                     });
             });
     }
+}
+void copy_rows_from_mapped_after(const uint32_t* flag, uint32_t value, float* dst, const float* src, int64_t rows,
+                                 int64_t width, const int32_t* hit_rows, const int32_t* count, void* stream) {
+    if (rows <= 0) return;
+    // SYCL port: not folded into one kernel - the backend's wait (its per-device spin bound), then the rows copy
+    wait_flag_ge(flag, value, stream);
+    copy_rows_from_mapped(dst, src, rows, width, hit_rows, count, stream);
 }
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;

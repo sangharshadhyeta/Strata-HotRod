@@ -510,6 +510,29 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// SYCL port: ordinary host memory cannot be registered for kernels here (sycl_compat cudaHostRegister), so pin by
+// need registers nothing: no ranges, no device aliases; the arena is kept resident.  generate.cpp ignores
+// STRATA_PIN_BY_NEED on this build, so the command line does not reach this.
+PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uint64_t, uint64_t>>&, uint64_t,
+                         const std::string& shared_file, uint64_t shared_pack_hash)
+    : capacity(bytes) {
+    by_need = true;
+    if (bytes == 0) return;
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    if (base == nullptr) return;
+    if (mapping_base == nullptr) {
+        mapping_base = base;
+        mapping_bytes = bytes;
+    }
+    note = "pin by need: not available on the SYCL engine, nothing registered; " + note;
+    const char* env = std::getenv("STRATA_ARENA_LOCK");
+    if (backing != PageBacking::LargePages && (env == nullptr || std::string(env) != "0")) {
+        const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
+        locked_bytes = lr.locked_bytes;
+        note = lr.note + "; " + note;
+    }
+}
+
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, Deferred)
     : capacity(bytes), bounds_(bounds) {
     if (bytes == 0 || bounds.size() < 2) return;
@@ -746,6 +769,12 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
                               const std::atomic<int>* ready) {
+    return load_experts_ranges(path, dst, layer_off, layer_bytes, threads, chunk, ready, nullptr);
+}
+
+LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
+                              const std::atomic<int>* ready, const PadMap* pad) {
     LoadStats st;
     const uint64_t layers = (uint64_t) layer_off.size();
     st.layers = layers;
@@ -814,7 +843,17 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
                     return;
                 }
                 const auto t_copy = std::chrono::steady_clock::now();
-                std::memcpy(dst + off + pos, buf.data(), (size_t) n);
+                if (pad == nullptr) {
+                    std::memcpy(dst + off + pos, buf.data(), (size_t) n);
+                } else {   // the padded layout: a chunk may span blobs, each lands at its own page-aligned start
+                    const uint64_t B = pad->blob[(size_t) L], S = pad->stride[(size_t) L];
+                    for (uint64_t q = 0; q < n;) {
+                        const uint64_t p = pos + q, bi = p / B, in = p % B;
+                        const uint64_t m = std::min<uint64_t>(n - q, B - in);
+                        std::memcpy(dst + pad->dst_off[(size_t) L] + bi * S + in, buf.data() + q, (size_t) m);
+                        q += m;
+                    }
+                }
                 h = fnv1a64(buf.data(), n, h);
                 copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - t_copy).count();
