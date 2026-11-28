@@ -82,3 +82,13 @@ Next:
    eager replay, STRATA_WINDOW_SYNC, warm(), the debug ladders, the 256-expert router, chain_overlap off.
 2. S3 with SYCLomatic (/home/intel/syclomatic/x/bin/dpct, 21.0.0): re-migrate the changed .cu files (tools/migrate.sh)
    and 3-way merge onto the .dp.cpp copies (tools/merge_upstream.py), then the new .cu files.
+
+## S3 in progress (28 Nov night): kernel merge done, 222 conflicts to resolve by hand
+
+SYCLomatic 21 (/home/intel/syclomatic) re-migrated the 36 changed/new .cu at the base and at HEAD (CUDA 12.8 headers in
+/home/intel/cuda-headers); both normalised (DPCT numbers, fixups.py, hashes mapped to the copies'); merged onto the
+copies (tools/s3_merge2.py, outputs in /home/Projects/sycl-s3).  Left (`git grep -c '<<<<<<< sycl' sycl/src`):
+fused_gr 46, iq_kernels 33, native_mmvq 31, qsa_decode_attn 22, prefill/kernels 13, verify_kernels 12, native_moe 8,
+qsa_select 8, moe_fused_iq 8, native_bf16 6, s2_expert_grouped 6, gemm 5, sampler 4, shared_expert 4, native_router 3,
+elementwise 3, ple 3, moe_fused 3, dequant_bf16 2, qsa_prompt_attn 2.  They are real: the SYCL side holds Intel fixes
+(e.g. native_router: route_multi hung an A750, so one block per token).  Then build, link, fix what the link names.
