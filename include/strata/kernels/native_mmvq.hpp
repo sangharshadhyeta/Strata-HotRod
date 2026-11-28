@@ -152,6 +152,19 @@ void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in,
 void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols, void* stream);
 // True when native_mmvq_il runs its own kernel for this call (IQ4_XS, Q4_K, Q5_K, Q6_K, 2-4 columns, the exact layout).
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out);
+#if defined(STRATA_GPU_SYCL)
+// SYCL engine only (its .dp.cpp kernels):
+void native_mmvq_set_q6k_wide(bool on);   // the 16-byte-load Q6_K kernel (default on)
+void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                                void* stream);   // experiment: Q6_K blocks at a 224-byte stride
+/// Planar Q6_K: the blocks' parts re-laid so a lane reads aligned 16-byte loads (same bytes, outputs bitwise equal).
+/// adopt converts a GGUF-layout matrix (the old allocation is freed; the returned pointer replaces it); gather takes rows
+/// of a planar matrix as a new planar one (nullptr: `planar` is not one).
+bool native_q6_k_planar_enabled();
+bool native_q6_k_is_planar(const void* weights);
+void* native_q6_k_planar_adopt(void* weights, int n_in, int n_out, const char* what);
+void* native_q6_k_planar_gather(const void* planar, int n_in, const int32_t* rows_dev, int64_t n_sel, const char* what);
+#endif
 // native_mmvq for 2..4 columns whose copy native_q8_1_interleave wrote, bitwise native_mmvq's output: kernels in which a
 // warp takes 1, 2 or 4 rows and reads the columns from the interleaved copy; native_mmvq (x_q8_1) when not supported.
 void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void* x_il, float* y, int n_in,

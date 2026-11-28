@@ -703,6 +703,25 @@ private:
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
+#if defined(STRATA_GPU_SYCL)
+public:
+    /// SYCL engine: capture every window graph now (one per window size) instead of on first use, so the first
+    /// request does not pay for them (a 2,400-node graph takes tens of ms to finalize on this backend).
+    bool warm(std::string& err);
+private:
+    // STRATA_VERIFY_STEPPED=1 (opt-in; Arc A-series / DG2): DG2 has no usm_atomic_host_allocations, so a running kernel
+    // does not see the host's flag stores.  Stepped mode records the window as one graph per segment between host serves
+    // and serves each layer group's CPU experts at a queue boundary.  step_hook_ after a group's doorbell publish (a
+    // serve point), step_hook2_ after its VRAM expert groups (a split point).
+    std::function<bool(int64_t, int)> step_hook_;
+    std::function<bool(int64_t, int)> step_hook2_;
+    std::vector<cudaGraphExec_t> seg_[9];
+    std::vector<std::pair<int64_t, int>> seg_at_[9];   ///< the (layer, group) after segment i; the last has none
+    std::vector<char> seg_kind_[9];                    ///< 1: a serve point, 0: a split point
+    bool capture_segments(int T, std::string& err);
+    float* dbgR_ = nullptr;   ///< STRATA_VERIFY_DEBUG: R (token 0) after every layer, n_layers x n_embd
+    float* dbgM_ = nullptr;   ///< STRATA_VERIFY_DEBUG: mixed_ (token 0) after every layer
+#endif
     /// The one-token self-commit for a window of T tokens: the window advances its own state (see verify.cpp).
     bool window_self_commits(int T) const;
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
@@ -754,8 +773,13 @@ private:
     int64_t last_pos0_ = 0;
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
+#if defined(STRATA_GPU_SYCL)
+    cudaStream_t cs_ = &dpct::get_in_order_queue();   // never null on SYCL: the SYCL-written paths use cs_-> directly
+    cudaStream_t sh_cs_ = &dpct::get_in_order_queue();
+#else
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
+#endif
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     cudaEvent_t ev_q8_ = nullptr;   // STRATA_VERIFY_QDEDUP with the forked shared stream: cs's q8_1 of the MoE input, waited on by sh_cs_
     // STRATA_PCIE_EARLY (pcie mode 2, the missed experts fetched by a copy kernel): the fetch runs on pf_cs_, forked from cs once the

@@ -50,6 +50,10 @@ constexpr bool fused_router_experts(int64_t n_expert) {
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
+#if defined(STRATA_GPU_SYCL)
+/// SYCL engine: the same for 256 experts as well as 512; logits [n, n_expert].
+void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert, void* stream);
+#endif
 /// STRATA_ROUTER_FUSED=1 (opt-in, read once): the router GEMV (`x` [n_tok][n_in] with row stride ldx, `w` the bf16 [512][n_in]) and the
 /// 512 x 10 top-10 in ONE launch.  Writes the logits [n_tok][512] (bit-identical to bf16_gemv_fp32_mmvf_multi), ids and weights (as
 /// native_router_top10_multi).  Needs native_router_fused_init() before any graph capture; `supported` is false until then.

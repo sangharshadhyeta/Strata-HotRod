@@ -7,6 +7,8 @@
 #include "strata/core/sm75_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/kernels/route_prior.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/core/standin_pool.hpp"
 #include "strata/core/subfit_samples.hpp"
 #include "strata/core/subfit_shadow.hpp"
@@ -2036,7 +2038,7 @@ std::string Verifier::standin_learn_report() {
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
-                    const NativeHead* head, int max_t, std::string& err) {
+                    const NativeHead* head, int max_t, std::string& err) try {
     g_diag_verifier.store(this);
     if (strata::kernels::native_router_fused_on()) strata::kernels::native_router_fused_init();   // STRATA_ROUTER_FUSED: its counter, before any capture
     if (route_resident_cfg().margin > 0.0f && route_resident_cfg().count)
@@ -3160,6 +3162,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
                     !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
                     return false;
+                auto norm_rope_on = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos,
+                                        cudaStream_t sx) {
+                    if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, sx);
+                    else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, sx);
+                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, sx);
+                    else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, sx);
+                };
                 // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope in one launch, bit-identical to the pair
                 // (rope_parity check 6); STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes
                 const bool fuse_nr = native_qsa_enabled() && native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
@@ -3169,10 +3178,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                  rope_scaling(), pos, cs);
                         return;
                     }
-                    if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, cs);
-                    else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, cs);
-                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, cs);
-                    else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, cs);
+                    norm_rope_on(data, norm, rows, cols, pos, cs);
                 };
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
@@ -4028,6 +4034,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else
                     wait_flag_ge(m_flagA_, ring, cs);              // the pool published this group's GPU plan
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+                }
             }
             if (!stage_mark(cs, kStPlan, err)) return false;   // plan-wait: the GPU plan's flag and its copy
             stamp(l, 19, grp);
@@ -4086,6 +4093,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
+                else if (fuse_rows)   // the wait folded into the copy's blocks
+                    copy_rows_from_mapped_after(m_flag_, ring, parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                                                p_dst, p_counts + 1, cs);
                 else if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
                     copy_rows_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
                                           p_dst, p_counts + 1, cs);
@@ -4774,7 +4784,7 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
 }
 
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
-                   std::string& err) {
+                   std::string& err) try {
 #if defined(STRATA_GPU_METAL)
     (void) pool;
     (void) user;
@@ -7131,7 +7141,7 @@ void Verifier::release_slots() {
     for (int64_t& p : last_pos_b_) p = 0;
 }
 
-bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
+bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) try {
     cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
     if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
@@ -7197,7 +7207,7 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
+bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) try {
     if (batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
     cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
     if (cex != nullptr) return true;
@@ -7857,7 +7867,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
     return 1;
 }
 
-int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) try {
     if (!b_running_) return 1;
     // set_external_serve: another thread serves the doorbells (batch_serve) and this one only checks for a window that
     // will not finish, as below: its graph ended (or failed) with a layer still to ring, or no layer rang for 20 s.
@@ -8366,7 +8376,7 @@ void Verifier::draft_trace_write(int T, const int32_t* tokens, int64_t pos0, con
     std::fflush(d.f);
 }
 
-bool Verifier::pl_commit_async(int n_keep, std::string& err) {
+bool Verifier::pl_commit_async(int n_keep, std::string& err) try {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }

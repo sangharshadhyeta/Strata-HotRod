@@ -177,6 +177,16 @@ public:
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
         return true;
     }
+#if defined(STRATA_GPU_SYCL)
+    /// SYCL engine: capture the round, step and prompt graphs at load rather than on first use (see Verifier::warm)
+    bool warm(std::string& err) {
+        for (int T = 1; T <= max_t_; ++T)
+            if (!capture_round(T, false, err) || !capture_prefill(T, err)) return false;
+        for (int j = 1; j < std::min(max_t_ - 1, max_drafts_); ++j)
+            if (!capture_step(j, false, err)) return false;
+        return true;
+    }
+#endif
 
 private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);

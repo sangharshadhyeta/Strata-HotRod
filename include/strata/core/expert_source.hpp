@@ -1194,6 +1194,15 @@ private:
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
+#if defined(STRATA_GPU_SYCL)
+public:
+    /// The blob read from the model file(s) only, never from the RAM copy or an exchange buffer (STRATA_CHECK_SWAPS).
+    bool copy_blob_from_file(int64_t layer, int64_t expert, uint8_t* dst) const {
+        return base_ != nullptr && dst != nullptr && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_ &&
+               copy_from_files(layer, expert, dst);
+    }
+private:
+#endif
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
