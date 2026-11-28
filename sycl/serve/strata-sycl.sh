@@ -25,7 +25,8 @@ for a in "$@"; do args+=" $(printf '%q' "$a")"; done
 declare -A setting=([STRATA_VERIFY_DEVICE_PLAN]=1 [STRATA_VERIFY_NO_HOST]=1 [STRATA_STAGER_THREADS]=12)
 while IFS= read -r k; do
     case "$k" in
-        STRATA_SYCL_*) ;;                                 # this script's own settings
+        # this script's own settings; every other STRATA_SYCL_* name is an engine switch and goes in
+        STRATA_SYCL_ROOT|STRATA_SYCL_IMAGE|STRATA_SYCL_BIN|STRATA_SYCL_NAME) ;;
         STRATA_*|ONEAPI_*|UR_*|IGC_*|SYCL_*|ZES_*|NEOReadDebugKeys|OverrideDefaultFP64Settings) setting[$k]=${!k} ;;
     esac
 done < <(compgen -e)

@@ -498,7 +498,7 @@ sub("""        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avai
                             if (!listed[(size_t) (l * g.n_expert + e)]) miss.push_back({l, e});
                 } else {
                     std::fprintf(stderr, "strata generate: learning needs every expert mirrored in RAM (%.1f GiB, %.1f GiB "
-                                         "allowed): only the misses are mirrored\\\\n", (double) need / 1073741824.0,
+                                         "allowed): only the misses are mirrored\\n", (double) need / 1073741824.0,
                                  (double) cap / 1073741824.0);
                 }
             }
@@ -510,9 +510,18 @@ sub("""        if (!miss.empty() && no_host && o.adapt_every > 0 && o.adapt_swap
             for (int64_t e = 0; all_mirrored && e < g.n_expert; ++e) all_mirrored = gguf_src.pinned(l, e);
         if (no_host && all_mirrored && learn_counted && o.adapt_every > 0 && o.adapt_swaps > 0)
             std::fprintf(stderr, "strata generate: learning on: every expert is mirrored, so the adaptive tier may move any "
-                                 "of them; its usage counts come from the device\\\\n");
+                                 "of them; its usage counts come from the device\\n");
         if (!miss.empty() && no_host && !(all_mirrored && learn_counted) && o.adapt_every > 0 && o.adapt_swaps > 0) {""")
-sub("""(+ %zu in the prompt loan's slots) \"""", """(+ %zu that are in VRAM now) \"""")
+sub("""                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu in the prompt loan's slots) "
+                                     "mirrored in pinned host memory (%.2f GiB, %.1f s); the GPU reads them over PCIe\\n",
+                             (long long) got, n_true_miss, miss.size() - n_true_miss,
+                             (double) gguf_src.mirrored_bytes() / 1073741824.0,
+                             std::chrono::duration<double>(Clock::now() - tm).count());
+""", """                std::fprintf(stderr, "strata generate: %lld experts mirrored in pinned host memory (%.2f GiB, %.1f s), of "
+                                     "%zu missing from VRAM and %zu that are in VRAM now; the GPU reads them over PCIe\\n",
+                             (long long) got, (double) gguf_src.mirrored_bytes() / 1073741824.0,
+                             std::chrono::duration<double>(Clock::now() - tm).count(), n_true_miss, miss.size() - n_true_miss);
+""")
 
 open(f"{W}/sycl/src/program/generate.cpp", "w").write(s)
 print("generate.cpp rebuilt:", s.count("\n"), "lines")

@@ -7281,7 +7281,7 @@ int main(int argc, char** argv) {
                             if (!listed[(size_t) (l * g.n_expert + e)]) miss.push_back({l, e});
                 } else {
                     std::fprintf(stderr, "strata generate: learning needs every expert mirrored in RAM (%.1f GiB, %.1f GiB "
-                                         "allowed): only the misses are mirrored\\n", (double) need / 1073741824.0,
+                                         "allowed): only the misses are mirrored\n", (double) need / 1073741824.0,
                                  (double) cap / 1073741824.0);
                 }
             }
@@ -7294,11 +7294,10 @@ int main(int argc, char** argv) {
                              err.c_str());
                 err.clear();
             } else {
-                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu that are in VRAM now) "
-                                     "mirrored in pinned host memory (%.2f GiB, %.1f s); the GPU reads them over PCIe\n",
-                             (long long) got, n_true_miss, miss.size() - n_true_miss,
-                             (double) gguf_src.mirrored_bytes() / 1073741824.0,
-                             std::chrono::duration<double>(Clock::now() - tm).count());
+                std::fprintf(stderr, "strata generate: %lld experts mirrored in pinned host memory (%.2f GiB, %.1f s), of "
+                                     "%zu missing from VRAM and %zu that are in VRAM now; the GPU reads them over PCIe\n",
+                             (long long) got, (double) gguf_src.mirrored_bytes() / 1073741824.0,
+                             std::chrono::duration<double>(Clock::now() - tm).count(), n_true_miss, miss.size() - n_true_miss);
                 // the device-built verify plan's view of it: each (layer, expert) -> its mirror address, 0 = none
                 std::vector<unsigned long long> tab((size_t) (g.n_layers * g.n_expert), 0ull);
                 for (int64_t l = 0; l < g.n_layers; ++l)
@@ -7325,7 +7324,7 @@ int main(int argc, char** argv) {
             for (int64_t e = 0; all_mirrored && e < g.n_expert; ++e) all_mirrored = gguf_src.pinned(l, e);
         if (no_host && all_mirrored && learn_counted && o.adapt_every > 0 && o.adapt_swaps > 0)
             std::fprintf(stderr, "strata generate: learning on: every expert is mirrored, so the adaptive tier may move any "
-                                 "of them; its usage counts come from the device\\n");
+                                 "of them; its usage counts come from the device\n");
         if (!miss.empty() && no_host && !(all_mirrored && learn_counted) && o.adapt_every > 0 && o.adapt_swaps > 0) {
             std::fprintf(stderr, "strata generate: adaptive swaps off: with STRATA_VERIFY_NO_HOST an expert they move out of "
                                  "VRAM would be neither there nor mirrored\n");
