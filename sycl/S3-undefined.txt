@@ -2,10 +2,6 @@ strata::core::load_experts_ranges
 strata::core::PinnedArena::PinnedArena
 strata::core::primary_device
 strata::core::set_primary_device
-strata::core::Verifier::evict_batch_graph
-strata::core::Verifier::nan_guard_on
-strata::core::Verifier::note_nonfinite
-strata::core::Verifier::set_logit_bias
 strata::kernels::bf16_gemv_fp32_mmvf_multi3
 strata::kernels::copy_rows_from_mapped_after
 strata::kernels::copy_rows_strided
