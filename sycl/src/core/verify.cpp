@@ -2,6 +2,8 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/kernels/native_gr_postops.hpp"
+#include "strata/kernels/native_ple_postops.hpp"
 #include "strata/sycl_queue.hpp"
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/sm75_series.hpp"

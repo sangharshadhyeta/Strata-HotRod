@@ -24,6 +24,20 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/core/logit_bias.hpp"
+#include "strata/platform/memory.hpp"
+#include "strata/kernels/gfx_arch.hpp"
+#include "strata/core/session_save_reclaim.hpp"
+#include "strata/kernels/gfx_arch.hpp"
+#include "strata/platform/aux_cpus.hpp"
+#include "strata/prefill/moe_mmq.hpp"
+#include "strata/program/batch_read.hpp"
+#include "strata/prefill/share_rules.hpp"
+#include "strata/platform/host_limits.hpp"
+#include "strata/program/split_ring.hpp"
+#include "strata/program/draft_kv_plan.hpp"
+#include "strata/program/batch_groups.hpp"
+#include "strata/qwen35/engine.hpp"
 #include "strata/sycl_queue.hpp"
 #include "strata/sycl_doorbell.hpp"
 #include "strata/core/arch_defaults.hpp"
@@ -538,7 +552,7 @@ struct SwapHome {
 };
 template <class Swap, class Locate>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
-                          int64_t n_expert, const std::vector<float>& usage, std::vector<Swap>& swaps, Locate locate) {
+                          int64_t n_expert, const std::vector<float>& usage, std::vector<Swap>& swaps, Locate locate) try {
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; bool victim; };
     std::vector<Staged> staged;
