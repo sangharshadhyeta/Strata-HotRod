@@ -49,6 +49,14 @@ bool hc_q8_env() {
     // STRATA_GFX12_DEFAULTS=0, off elsewhere
     static const bool on = [] {
         const char* v = std::getenv("STRATA_HC_Q8");
+#if defined(STRATA_GPU_SYCL)
+        // the SYCL engine's fused_gr has no Q8_0 read: the bf16 read, also for a file that stores these as Q8_0
+        // (generate.cpp switches STRATA_HC_Q8 on by itself for such a file)
+        if (v != nullptr && v[0] == '1')
+            std::fprintf(stderr, "strata: STRATA_HC_Q8: no Q8_0 hyper-connection read in the SYCL engine yet; "
+                                 "the bf16 read is used\n");
+        return false;
+#endif
         if (v != nullptr && v[0] == '1') return true;
         if (v != nullptr && v[0] != '\0' && std::strcmp(v, "auto") != 0) return false;
 #if defined(STRATA_USE_HIP)

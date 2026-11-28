@@ -446,5 +446,12 @@ sub("        try { dpct::get_current_device().queues_wait_and_throw(); } catch (
     "            gguf_src.close();   // SYCL engine: release the direct-access USM host mirror before exit (the old copy did)\n"
     "        } catch (const std::exception&) {}\n")
 
+# (review) no Q8 hyper-connection read in the SYCL fused_gr yet: STRATA_HC_REQ8 is refused here, with a message
+sub("    const bool hc_q8 = hc_req8_env && !multi_gpu;\n",
+    "    if (hc_req8_env)\n"
+    "        std::fprintf(stderr, \"strata generate: STRATA_HC_REQ8: no int8 hyper-connection read in the SYCL \"\n"
+    "                             \"engine yet - the BF16 projections are used\\n\");\n"
+    "    const bool hc_q8 = false;\n")
+
 open(f"{W}/sycl/src/program/generate.cpp", "w").write(s)
 print("generate.cpp rebuilt:", s.count("\n"), "lines")

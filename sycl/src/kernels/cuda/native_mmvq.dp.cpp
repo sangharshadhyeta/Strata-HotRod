@@ -2276,6 +2276,10 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
 struct IlIQ4XS {
     using F = IQ4XSTraits;
     static constexpr bool PM = true;
+    using W = F::W;
+    static W wload(const F::Block *__restrict__ w, int iqs, int8_t *tbl) {
+        return F::load(w, iqs, tbl);
+    }
     template <int NC, class X>
     /*
     DPCT1110: The total declared local variable size in device function
@@ -2311,6 +2315,10 @@ struct IlIQ4XS {
 struct IlQ4K {
     using F = Q4KTraits;
     static constexpr bool PM = false;
+    using W = F::W;
+    static W wload(const F::Block *__restrict__ w, int iqs, int8_t *) {
+        return F::load(w, iqs);
+    }
     template <int NC, class X>
     /*
     DPCT1110: The total declared local variable size in device function
@@ -2341,6 +2349,10 @@ struct IlQ4K {
 struct IlQ5K {
     using F = Q5KTraits;
     static constexpr bool PM = false;
+    using W = F::W;
+    static W wload(const F::Block *__restrict__ w, int iqs, int8_t *) {
+        return F::load(w, iqs);
+    }
     template <int NC, class X>
     /*
     DPCT1110: The total declared local variable size in device function
@@ -2373,6 +2385,10 @@ struct IlQ5K {
 struct IlQ3K {
     using F = Q3KTraits;
     static constexpr bool PM = false;
+    using W = F::W;
+    static W wload(const F::Block *__restrict__ w, int iqs, int8_t *) {
+        return F::load(w, iqs);
+    }
     template <int NC, class X>
     /*
     DPCT1110: The total declared local variable size in device function
@@ -2418,8 +2434,22 @@ struct IlQ3K {
 struct IlQ6K {
     using F = Q6KTraits;
     static constexpr bool PM = false;
+    // The CUDA Q6_K fields (vl, vh, scales, d) that q6_q8_dot_impl takes: the SYCL Q6KTraits::W holds the pre-unpacked
+    // values instead, so this path loads its own W and the dot is the CUDA kernel's call, unchanged.
+    struct W { int vl, vh; float d; const int8_t *scales; int bq8_offset; };
+    static W wload(const Q6KBlock *__restrict__ w, int iqs, int8_t *) {
+        W r;
+        r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+        const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+        const int vh_shift = 2 * ((iqs % 16) / 8);
+        r.vl = load_int_b2(w->ql, iqs);
+        r.vh = load_int_b2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
+        r.scales = w->scales + scale_offset;
+        r.d = w->d;
+        return r;
+    }
     template <int NC, class X>
-    static void apply(const F::W& r, const X& x, int kby, int iqs, float (&out)[NC]) {
+    static void apply(const W& r, const X& x, int kby, int iqs, float (&out)[NC]) {
         int u[2][NC];
         float d8[2][NC];
 #pragma unroll
@@ -2485,9 +2515,9 @@ native_mmvq_il_kernel(const typename I::F::Block *__restrict__ w,
                         instantiations that could not be unified. You may need
                         to adjust the code.
                         */
-                        const typename F::W wv =
-                            F::load(w + std::size_t(row) * bpr + kbx, kqs,
-                                    iq4nl_values);
+                        const typename I::W wv =
+                            I::wload(w + std::size_t(row) * bpr + kbx, kqs,
+                                     iq4nl_values);
                         float o[NC];
                         I::template apply<NC>(wv, x, kbx * F::KBY, kqs, o);
 #pragma unroll

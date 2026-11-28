@@ -858,7 +858,7 @@ void attn_chunk_kernel_pre75(const float *__restrict__ q, QsaAttnPools p,
             for (int j = 0; j < NC; ++j) {
 #pragma unroll
                 for (int h = G; h < 16; ++h) pp[j][h] = 0.0f;
-                const float sj = reduce12(pp[j], lane);
+                const float sj = reduce12<DPP_>(pp[j], lane);
                 if ((lane & 1) == 0 && hd < G) sp[hd][cc[j]] = sj * scale;
             }
         } else {
@@ -885,7 +885,7 @@ void attn_chunk_kernel_pre75(const float *__restrict__ q, QsaAttnPools p,
                 }
 #pragma unroll
                 for (int h = G; h < 16; ++h) part[h] = 0.0f;
-                const float s = reduce12(part, lane);
+                const float s = reduce12<DPP_>(part, lane);
                 if ((lane & 1) == 0 && hd < G) sp[hd][c] = s * scale;
             }
         }
@@ -1248,6 +1248,54 @@ void launch_merge(int v2, const float *part_acc, const float *part_m,
     }
 }
 
+// One default chunk-kernel submission for one KV format.  The chunk kernels are device functions that read their own
+// work-item, so they run inside a parallel_for with the explicit sub-group size, as the other launches do; dpct's
+// kernel_launcher only calls the function on the host.  `pre` (uniform per launch) picks PR #540's kernel
+// (attn_chunk_kernel_pre75) over attn_chunk_kernel, as STRATA_ATTN_CHUNK_SEL does on CUDA.  STEPS, CAP and STRIDE
+// are the call's own step record, cap and scratch stride.
+#define STRATA_ATTN_CHUNK_SUBMIT(M, KNAME, STEPS, CAP, STRIDE)                 \
+    {                                                                          \
+        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
+            sycl::ext::oneapi::experimental::use_root_sync};                   \
+        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});  \
+        st->submit([&](sycl::handler &cgh) {                                   \
+            auto q_ct0 = q;                                                    \
+            QsaAttnPools pools_ct1 = pools;                                    \
+            auto ids_ct2 = ids;                                                \
+            auto steps_ct3 = (STEPS);                                          \
+            auto s_n_head_kv_ct4 = (int)s.n_head_kv;                           \
+            auto s_page_size_ct5 = (int)s.page_size;                           \
+            auto scale_ct6 = scale;                                            \
+            auto part_acc_ct7 = part_acc;                                      \
+            auto part_m_ct8 = part_m;                                          \
+            auto part_l_ct9 = part_l;                                          \
+            auto n_chunks_ct10 = n_chunks;                                     \
+            auto cap_ct11 = (int)(CAP);                                        \
+            auto stride_ct12 = (long long)(STRIDE);                            \
+            const bool pre_ct13 = pre;                                         \
+            cgh.parallel_for<dpct_kernel_name<class KNAME,                     \
+                                              dpct_kernel_scalar<M>>>(         \
+                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),           \
+                                  sycl::range(1, 1, THREADS)),                 \
+                exp_props,                                                     \
+                [=](sycl::nd_item<3> item_ct1)                                 \
+                    [[sycl::reqd_sub_group_size(32)]] {                        \
+                        if (pre_ct13)                                          \
+                            attn_chunk_kernel_pre75<M>(                        \
+                                q_ct0, pools_ct1, ids_ct2, steps_ct3,          \
+                                s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,   \
+                                part_acc_ct7, part_m_ct8, part_l_ct9,          \
+                                n_chunks_ct10, cap_ct11, stride_ct12);         \
+                        else                                                   \
+                            attn_chunk_kernel<M>(                              \
+                                q_ct0, pools_ct1, ids_ct2, steps_ct3,          \
+                                s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,   \
+                                part_acc_ct7, part_m_ct8, part_l_ct9,          \
+                                n_chunks_ct10, cap_ct11, stride_ct12);         \
+                    });                                                        \
+        });                                                                    \
+    }
+
 // qsa_decode_attn_batch's chunk pass: `n_q` queries' partials into `scratch` (one stride each).  `kernel` < 0 is the
 // environment's choice (lane cell, gfx906 swizzle, STRATA_ATTN_DAILY / PR #540); 0 is attn_chunk_kernel and 1 PR #540's
 // kernel where it is built (the parity harness: never the environment).
@@ -1307,29 +1355,25 @@ void launch_chunks_batch(const float *q, const QsaAttnPools &pools,
       auto cap_ct11 = (int) cap;\
       auto stride_ct12 = stride;\
 \
-      /*
-      DPCT1050: The template argument of the dpct_kernel_name could not be deduced. You need to update this code.
-      */
-    cgh.parallel_for<dpct_kernel_name<
-        class attn_chunk_kernel_3a99f0, dpct_kernel_scalar<M>,
-        dpct_kernel_scalar<true>, dpct_placeholder /*Fix the type mannually*/,
-        dpct_placeholder /*Fix the type mannually*/>>(
-        sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                          sycl::range(1, 1, THREADS)),
-        exp_props,
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-            attn_chunk_kernel<M, true>(
-                q_ct0, pools_ct1, ids_ct2, steps_ct3, s_n_head_kv_ct4,
-                s_page_size_ct5, scale_ct6, part_acc_ct7, part_m_ct8,
-                part_l_ct9, n_chunks_ct10, cap_ct11, stride_ct12);
-        });
-    });
-}
+      cgh.parallel_for<dpct_kernel_name<                                     \
+          class attn_chunk_kernel_3a99f0, dpct_kernel_scalar<M>,             \
+          dpct_kernel_scalar<true>>>(                                        \
+          sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),               \
+                            sycl::range(1, 1, THREADS)),                     \
+          exp_props,                                                         \
+          [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { \
+              attn_chunk_kernel<M, true>(                                    \
+                  q_ct0, pools_ct1, ids_ct2, steps_ct3, s_n_head_kv_ct4,     \
+                  s_page_size_ct5, scale_ct6, part_acc_ct7, part_m_ct8,      \
+                  part_l_ct9, n_chunks_ct10, cap_ct11, stride_ct12);         \
+          });                                                                \
+    });                                                                      \
+    }
     if (lane_cell) {
-        if (kv_mode == 3) STRATA_ATTN_LC(3);
-        else if (kv_mode == 2) STRATA_ATTN_LC(2);
-        else if (kv_mode == 1) STRATA_ATTN_LC(1);
-        else STRATA_ATTN_LC(0);
+        if (kv_mode == 3) { STRATA_ATTN_LC(3); }
+        else if (kv_mode == 2) { STRATA_ATTN_LC(2); }
+        else if (kv_mode == 1) { STRATA_ATTN_LC(1); }
+        else { STRATA_ATTN_LC(0); }
     } else
 #undef STRATA_ATTN_LC
 #if defined(STRATA_HIP_GFX906)
@@ -1382,30 +1426,10 @@ void launch_chunks_batch(const float *q, const QsaAttnPools &pools,
             });
     } else
 #endif
-        if (kv_mode == 3)
-        dpct::kernel_launcher::launch(STRATA_ATTN_CHUNK_SEL(3, pre), grid,
-                                      THREADS, 0, st, q, pools, ids, steps,
-                                      (int)s.n_head_kv, (int)s.page_size, scale,
-                                      part_acc, part_m, part_l, n_chunks,
-                                      (int)cap, stride);
-    else if (kv_mode == 2)
-        dpct::kernel_launcher::launch(STRATA_ATTN_CHUNK_SEL(2, pre), grid,
-                                      THREADS, 0, st, q, pools, ids, steps,
-                                      (int)s.n_head_kv, (int)s.page_size, scale,
-                                      part_acc, part_m, part_l, n_chunks,
-                                      (int)cap, stride);
-    else if (kv_mode == 1)
-        dpct::kernel_launcher::launch(STRATA_ATTN_CHUNK_SEL(1, pre), grid,
-                                      THREADS, 0, st, q, pools, ids, steps,
-                                      (int)s.n_head_kv, (int)s.page_size, scale,
-                                      part_acc, part_m, part_l, n_chunks,
-                                      (int)cap, stride);
-    else
-        dpct::kernel_launcher::launch(STRATA_ATTN_CHUNK_SEL(0, pre), grid,
-                                      THREADS, 0, st, q, pools, ids, steps,
-                                      (int)s.n_head_kv, (int)s.page_size, scale,
-                                      part_acc, part_m, part_l, n_chunks,
-                                      (int)cap, stride);
+    if (kv_mode == 3) { STRATA_ATTN_CHUNK_SUBMIT(3, attn_chunk_kernel_dfacfc, steps, cap, stride); }
+    else if (kv_mode == 2) { STRATA_ATTN_CHUNK_SUBMIT(2, attn_chunk_kernel_dfacfc, steps, cap, stride); }
+    else if (kv_mode == 1) { STRATA_ATTN_CHUNK_SUBMIT(1, attn_chunk_kernel_dfacfc, steps, cap, stride); }
+    else { STRATA_ATTN_CHUNK_SUBMIT(0, attn_chunk_kernel_dfacfc, steps, cap, stride); }
 }
 
 // qsa_decode_attn_batch's merge pass over the partials launch_chunks_batch wrote; `v2` names the merge kernel
@@ -1515,15 +1539,15 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
         });                                                                    \
     }
     if (lane_cell) {
-        if (kv_mode == 3) STRATA_ATTN_SLOTS(3, true);
-        else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, true);
-        else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, true);
-        else STRATA_ATTN_SLOTS(0, true);
+        if (kv_mode == 3) { STRATA_ATTN_SLOTS(3, true); }
+        else if (kv_mode == 2) { STRATA_ATTN_SLOTS(2, true); }
+        else if (kv_mode == 1) { STRATA_ATTN_SLOTS(1, true); }
+        else { STRATA_ATTN_SLOTS(0, true); }
     } else {
-        if (kv_mode == 3) STRATA_ATTN_SLOTS(3, false);
-        else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, false);
-        else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, false);
-        else STRATA_ATTN_SLOTS(0, false);
+        if (kv_mode == 3) { STRATA_ATTN_SLOTS(3, false); }
+        else if (kv_mode == 2) { STRATA_ATTN_SLOTS(2, false); }
+        else if (kv_mode == 1) { STRATA_ATTN_SLOTS(1, false); }
+        else { STRATA_ATTN_SLOTS(0, false); }
     }
 #undef STRATA_ATTN_SLOTS
     launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
@@ -1611,10 +1635,10 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
                     });                                                        \
         });                                                                    \
     }
-    if (kv_mode == 3) STRATA_ATTN_ROWS(3);
-    else if (kv_mode == 2) STRATA_ATTN_ROWS(2);
-    else if (kv_mode == 1) STRATA_ATTN_ROWS(1);
-    else STRATA_ATTN_ROWS(0);
+    if (kv_mode == 3) { STRATA_ATTN_ROWS(3); }
+    else if (kv_mode == 2) { STRATA_ATTN_ROWS(2); }
+    else if (kv_mode == 1) { STRATA_ATTN_ROWS(1); }
+    else { STRATA_ATTN_ROWS(0); }
 #undef STRATA_ATTN_ROWS
     launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
                  (unsigned) n_q, st);
@@ -1652,6 +1676,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
     const float scale = 1.0f / sqrtf((float) HD);
     const dpct::dim3 grid((unsigned)n_chunks, (unsigned)s.n_head_kv);
+    const bool pre = pre75_attn();   // the chunk kernel STRATA_ATTN_CHUNK(M) would pick
     dpct::queue_ptr st = strata::q_of(stream);
 #if !defined(__HIPCC__)
     if (kv_mode == 1 && attn_v3_on())
@@ -1672,26 +1697,10 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
             });
     } else
 #endif
-        if (kv_mode == 3)
-        dpct::kernel_launcher::launch(STRATA_ATTN_CHUNK(3), grid, THREADS, 0,
-                                      st, q, pools, ids, step, (int)s.n_head_kv,
-                                      (int)s.page_size, scale, part_acc, part_m,
-                                      part_l, n_chunks, 0, 0);
-    else if (kv_mode == 2)
-        dpct::kernel_launcher::launch(STRATA_ATTN_CHUNK(2), grid, THREADS, 0,
-                                      st, q, pools, ids, step, (int)s.n_head_kv,
-                                      (int)s.page_size, scale, part_acc, part_m,
-                                      part_l, n_chunks, 0, 0);
-    else if (kv_mode == 1)
-        dpct::kernel_launcher::launch(STRATA_ATTN_CHUNK(1), grid, THREADS, 0,
-                                      st, q, pools, ids, step, (int)s.n_head_kv,
-                                      (int)s.page_size, scale, part_acc, part_m,
-                                      part_l, n_chunks, 0, 0);
-    else
-        dpct::kernel_launcher::launch(STRATA_ATTN_CHUNK(0), grid, THREADS, 0,
-                                      st, q, pools, ids, step, (int)s.n_head_kv,
-                                      (int)s.page_size, scale, part_acc, part_m,
-                                      part_l, n_chunks, 0, 0);
+        if (kv_mode == 3) { STRATA_ATTN_CHUNK_SUBMIT(3, attn_chunk_kernel_9d4b1e, step, 0, 0); }
+    else if (kv_mode == 2) { STRATA_ATTN_CHUNK_SUBMIT(2, attn_chunk_kernel_9d4b1e, step, 0, 0); }
+    else if (kv_mode == 1) { STRATA_ATTN_CHUNK_SUBMIT(1, attn_chunk_kernel_9d4b1e, step, 0, 0); }
+    else { STRATA_ATTN_CHUNK_SUBMIT(0, attn_chunk_kernel_9d4b1e, step, 0, 0); }
     launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st);
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the

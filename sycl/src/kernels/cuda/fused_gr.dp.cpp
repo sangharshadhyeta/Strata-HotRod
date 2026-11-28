@@ -111,7 +111,8 @@ __dpct_inline__ sycl::uint4 ldw(const uint16_t *wb, const float *sq, size_t e) {
             Check the generated code for potential precision and/or performance
             issues.
             */
-            const sycl::uint2 v = *(reinterpret_cast<const int8_t *>(wb) + e);
+            const sycl::uint2 v = *reinterpret_cast<const sycl::uint2 *>(
+                reinterpret_cast<const int8_t *>(wb) + e);
             /*
             DPCT1098: The '*' expression is used instead of the __ldg call.
             These two expressions do not provide the exact same functionality.
@@ -127,7 +128,7 @@ __dpct_inline__ sycl::uint4 ldw(const uint16_t *wb, const float *sq, size_t e) {
     two expressions do not provide the exact same functionality. Check the
     generated code for potential precision and/or performance issues.
     */
-    return *(wb + e);
+    return *reinterpret_cast<const sycl::uint4 *>(wb + e);
 }
 template <bool Q8>
 __dpct_inline__ float dotw(const bool q8, const sycl::uint4 w, const float *x) {
@@ -216,20 +217,22 @@ auto &xn = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[D]>(
     const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
     const int row = inject_block ? warp : item_ct1.get_group(2) * WARPS + warp;
     if (inject_block && (a.w_inject == nullptr || warp >= HC)) return;
-    const uint16_t* wrow = (inject_block ? a.w_inject : a.w_down) + (size_t) row * D;
-    const sycl::uint4 *w4 = reinterpret_cast<const sycl::uint4 *>(wrow);
+    const uint16_t* wmat = inject_block ? a.w_inject : a.w_down;
+    const float* sq = (Q8 && !inject_block) ? a.s_down : nullptr;   // the inject rows stay bf16
+    const bool q8 = Q8 && !inject_block;
+    const size_t row0 = (size_t) row * D;
     // SYCL port: the multi kernel's order - per-tile partial sums for the split rows (gr_parity: bit-identical),
     // the inject rows still one accumulation over the whole row (their block is not split there)
     float acc = 0.0f;
     if (inject_block) {
 #pragma unroll 4
-        for (int j = lane; j < D / 8; j += 32) acc += dot8(*(w4 + j), xn + j * 8);
+        for (int j = lane; j < D / 8; j += 32) acc += dotw<Q8>(q8, ldw<Q8>(wmat, sq, row0 + (size_t) j * 8), xn + j * 8);
         acc = warp_sum(acc);
     } else {
         for (int sp = 0; sp < DOWN_SPLIT; ++sp) {
             float part = 0.0f;
 #pragma unroll 5
-            for (int j = lane + sp * (TILE / 8); j < (sp + 1) * (TILE / 8); j += 32) part += dot8(*(w4 + j), xn + j * 8);
+            for (int j = lane + sp * (TILE / 8); j < (sp + 1) * (TILE / 8); j += 32) part += dotw<Q8>(q8, ldw<Q8>(wmat, sq, row0 + (size_t) j * 8), xn + j * 8);
             acc += warp_sum(part);
         }
     }
@@ -1332,13 +1335,32 @@ __dpct_inline__ void cp_async_wait0() {
 #endif
 }
 
+// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
+__dpct_inline__ float dot8v(const sycl::uint4 w, const sycl::float4 x0,
+                            const sycl::float4 x1) {
+    float acc = 0.0f;
+    acc = sycl::fma(sycl::bit_cast<float>(w.x() << 16), (float)(x0.x()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.x() & 0xffff0000u), (float)(x0.y()),
+                    acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.y() << 16), (float)(x0.z()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.y() & 0xffff0000u), (float)(x0.w()),
+                    acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.z() << 16), (float)(x1.x()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.z() & 0xffff0000u), (float)(x1.y()),
+                    acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.w() << 16), (float)(x1.z()), acc);
+    acc = sycl::fma(sycl::bit_cast<float>(w.w() & 0xffff0000u), (float)(x1.w()),
+                    acc);
+    return acc;
+}
+
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
-// `nt` is the block's thread count (WPC * 32): the tile is copied by whichever threads the block has.
+// `nt` is the block's thread count (the port's THREADS): the tile is copied by whichever threads the block has.
 __dpct_inline__ void stage_htile(const GrMulti &m, int T, int h,
-                                 sycl::float4 *buf, int t, int nt, int k0 = 0) {
+                                 sycl::float4 *buf, int t, int nt) {
     for (int i = t; i < T * (H_TILE / 4); i += nt) {
         const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
-        const float* src = m.xn + (size_t) (k0 + k) * D + (size_t) h * H_TILE + (size_t) s4 * 4;
+        const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
         cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
     }
 }
@@ -1353,7 +1375,7 @@ adjust the code, or use smaller sub-group size to avoid high register pressure.
 __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto hbuf = (sycl::float4 *)dpct_local; // 2 buffers x [T][2][160] float4
-    constexpr int NT = WPC * 32;                        // threads per block
+    constexpr int NT = THREADS;                         // threads per block (one warp per row, WARPS warps)
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     const int T = m.T;
     const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
@@ -1375,9 +1397,9 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
         */
         for (int q = 0; q < HQ; ++q) wv[q] = *(w4 + lane + 32 * q);
     }
-    stage_htile(m, T, 0, hbuf, t, NT, k0);
+    stage_htile(m, T, 0, hbuf, t, NT);
     cp_async_commit();
-    stage_htile(m, T, 1, hbuf + buf_f4, t, NT, k0);
+    stage_htile(m, T, 1, hbuf + buf_f4, t, NT);
     cp_async_commit();
 #pragma unroll 1
     for (int h = 0; h < N_HTILES; ++h) {
@@ -1428,7 +1450,7 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
         better performance if there is no access to global memory.
         */
         item_ct1.barrier(); // every warp is done with buffer h & 1
-        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, NT, k0);
+        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, NT);
         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
         if (h + 1 < N_HTILES) {
 #pragma unroll
@@ -1444,10 +1466,10 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
     for (int k = 0; k < MAX_T; ++k) {
         if (k >= T || lane != k) continue;
         if (inject_block) {
-            m.a[k0 + k].inject_out[row] = s[k];
+            m.a[k].inject_out[row] = s[k];
         } else {
             const float x = s[k] / (float) HC;
-            m.a[k0 + k].lo[row] = x / (1.0f + sycl::native::exp(-x));
+            m.a[k].lo[row] = x / (1.0f + sycl::native::exp(-x));
         }
     }
 }
@@ -1556,12 +1578,23 @@ int down_chunk(bool staged, int* tile_out) {
     return staged ? chunk_staged[dev] : chunk[dev];
 }
 
+// STRATA_HC_REQ8 (int8 projections: s_down / s_up) and STRATA_HC_Q8 (Q8_0 bytes: q8_down / q8_up) reads are not built
+// on the SYCL port: refuse them loudly rather than read int8 codes as bf16.
+void refuse_q8(const FusedGrArgs& a, const char* who) {
+    if (a.s_down || a.s_up || a.q8_down || a.q8_up) {
+        std::fprintf(stderr, "%s: the Q8 hyper-connection reads (STRATA_HC_REQ8 / STRATA_HC_Q8) are not built on the "
+                             "SYCL port; run without them\n", who);
+        std::exit(1);
+    }
+}
+
 // The multi read as `variant` (kHcPlain, kHcSplit or kHcStaged): the norm, the down projection in launches of as
 // many tokens as fit the card, the up projection; the profile's stamps after the norm and after the down projection.
 // kHcPlain is the default read exactly as before (never main's opt-in STRATA_GR_V3 path, which fused_gr_read_multi
 // takes first).
 void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                   unsigned long long *stamp_buf, int stamp_i0) {
+    for (int t = 0; t < m.T; ++t) refuse_q8(m.a[t], "launch_multi");
     const int n_tok = m.T;
     if (variant >= kHcSplit) {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
@@ -1589,8 +1622,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
             });
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
-    // STRATA_HC_Q8: the staged down kernel reads bf16 only, so Q8 weights take split's down kernel (the plain one)
-    const bool staged = variant >= kHcStaged && m.a[0].s_down == nullptr;
+    const bool staged = variant >= kHcStaged;
     int tv = 2560;
     const int chunk_tok = down_chunk(staged, &tv);
     /*
@@ -1678,10 +1710,6 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                         sycl::range(smem), cgh);
 
-                    /*
-                    DPCT1050: The template argument of the dpct_kernel_name
-                    could not be deduced. You need to update this code.
-                    */
                     cgh.parallel_for<dpct_kernel_name<
                         class gr_down_multi_kernel_b237a4,
                         dpct_kernel_scalar<1280>, dpct_kernel_scalar<4>>>(
@@ -1702,37 +1730,9 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                 auto exp_props = sycl::ext::oneapi::experimental::properties{
                     sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class gr_up_fast_kernel_b5c60d>>(
-            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_up_fast_kernel(m);
-            });
-    } else
-#endif
-#if !STRATA_GR_FAST_BUILD
-        if (!q8w && m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {
-        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
-            case 1: gr_up_q32_kernel<1, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-            case 2: gr_up_q32_kernel<2, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-            case 3: gr_up_q32_kernel<3, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-            case 4: gr_up_q32_kernel<4, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-            case 5: gr_up_q32_kernel<5, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-            case 6: gr_up_q32_kernel<6, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-            default: gr_up_q32_kernel<kFusedGrMaxT, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-        }
-        return;
-    }
-#endif
-    if (q8w) {   // STRATA_HC_REQ8: the up kernel on int8 rows
-        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
-        case 1: {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp16});
+                st->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range(smem), cgh);
 
                     /*
                     DPCT1050: The template argument of the dpct_kernel_name
@@ -1784,23 +1784,9 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                 auto exp_props = sycl::ext::oneapi::experimental::properties{
                     sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<
-                class gr_up_multi_kernel_44f5c9, dpct_kernel_scalar<3>,
-                dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_up_multi_kernel<3, true, true>(m);
-                    });
-        } break;
-        case 4: {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp16});
+                st->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                        sycl::range(smem), cgh);
 
                     /*
                     DPCT1050: The template argument of the dpct_kernel_name
@@ -1873,6 +1859,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             std::exit(1);
         }
     }
+    for (int t = 0; t < n_tok; ++t) refuse_q8(a[t], "fused_gr_read_multi");
     m.xn = xn_scratch;
     m.T = n_tok;
     dpct::queue_ptr st = strata::q_of(stream);
@@ -2235,6 +2222,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         std::fprintf(stderr, "fused_gr_read: invalid arguments\n");
         std::exit(1);
     }
+    refuse_q8(a, "fused_gr_read");
     dpct::queue_ptr st = strata::q_of(stream);
     // SYCL port: the multi-token read's sliced down kernel and per-(token, stream) norm sum in their own orders, so a
     // window's token would differ in its last bits from this kernel's. The header promises "every token's outputs
@@ -2257,73 +2245,27 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class gr_down_kernel_ac3b28,
-                                              dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_down_kernel<true>(a);
-                    });
-        }
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
+        st->parallel_for<dpct_kernel_name<class gr_down_kernel_a5fa71>>(
+            sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_down_kernel(a);
+            });
+    }
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class gr_up_kernel_252dd5,
-                                              dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_up_kernel<true>(a);
-                    });
-        }
-    } else {
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->/*
-  DPCT1050: The template argument of the dpct_kernel_name could not be
-  deduced. You need to update this code.
-  */
-                parallel_for<dpct_kernel_name<
-                    class gr_down_kernel_c60e1c,
-                    dpct_placeholder /*Fix the type mannually*/>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                          sycl::range(1, 1, THREADS),
-                                      sycl::range(1, 1, THREADS)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[sycl::reqd_sub_group_size(32)]] {
-                            gr_down_kernel(a);
-                        });
-        }
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->/*
-  DPCT1050: The template argument of the dpct_kernel_name could not be
-  deduced. You need to update this code.
-  */
-                parallel_for<dpct_kernel_name<
-                    class gr_up_kernel_b975ef,
-                    dpct_placeholder /*Fix the type mannually*/>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
-                                          sycl::range(1, 1, THREADS),
-                                      sycl::range(1, 1, THREADS)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[sycl::reqd_sub_group_size(32)]] {
-                            gr_up_kernel(a);
-                        });
-        }
+        st->parallel_for<dpct_kernel_name<class gr_up_kernel_fe3258>>(
+            sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
+                                  sycl::range(1, 1, THREADS),
+                              sycl::range(1, 1, THREADS)),
+            exp_props,
+            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                gr_up_kernel(a);
+            });
     }
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the

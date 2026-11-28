@@ -1504,7 +1504,7 @@ gdn_chunk_scan_kernel(float *__restrict__ state, const float *__restrict__ h,
         These two expressions do not provide the exact same functionality. Check
         the generated code for potential precision and/or performance issues.
         */
-        v4 = tt < n ? *(h + (c_t0 + tt) * C + 2 * HK * S + vh * S + c0 + vv)
+        v4 = tt < n ? *reinterpret_cast<const sycl::float4 *>(h + (c_t0 + tt) * C + 2 * HK * S + vh * S + c0 + vv)
                     : sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
         const float* g = gm + ((int64_t) ch * HV + vh) * GCH;
         /*
@@ -3304,7 +3304,7 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
     }
 }
 #endif
-#if !defined(__HIPCC__)
+#if !defined(__HIPCC__) && !defined(SYCL_LANGUAGE_VERSION)
 // S23 on CUDA (sm_80+; opt-in STRATA_HC_UPMIX=1, see hc_upmix in prefill.cpp): the hyper-connection read's up
 // projection (lo16 x w_up^T, BF16 in, FP32 accumulate over K = 320) with gr_mix_r as its epilogue, so `gated`
 // (T x 10240 FP32, 336 MB for an 8,192-token chunk) is neither written by the GEMM nor read back by the mix - gr_mix_r
@@ -3741,6 +3741,10 @@ bool gr_upmix(const uint16_t *lo16, const uint16_t *w_up, const float *R,
         lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
     check("gr_upmix");
     return true;
+#elif defined(SYCL_LANGUAGE_VERSION)
+    (void) lo16; (void) w_up; (void) R; (void) rs; (void) w_norm; (void) mixed; (void) mixed16; (void) mixed_h;
+    (void) T; (void) stream;
+    return false;   // SYCL port: STRATA_HC_UPMIX's kernel is CUDA inline PTX; the caller runs the default pair
 #else
     static int ok_dev[64] = {};   // per device: 0 not asked yet, 1 sm_80+, 2 no
     int dev = 0;
@@ -4112,7 +4116,10 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 #else
     (void) variant;   // the quad recurrence kernels are AMD-only
 #endif
-    if (serial || T <= 0 || variant == 2) {
+    // variant 6 = the Xe sub-group recurrence + the unchanged norm kernel (gdn_recurrence: gdn_xe_on)
+    const bool xe = T > 0 && !serial && variant == 6;
+    if (xe && !gdn_xe_device(stream)) throw std::runtime_error("GDN Xe variant requires an Intel GPU with 16-lane sub-groups");
+    if (!xe && (serial || T <= 0 || variant == 2)) {
         /*
         DPCT1049: The work-group size passed to the SYCL kernel may exceed
         the limit. To get the device limit, query

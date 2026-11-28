@@ -1032,13 +1032,6 @@ bool Gemm::rdna2_sgemm(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 }
 #endif
 
-bool Gemm::bf16_converts_x() const {
-#if defined(__HIPCC__) || defined(STRATA_EXPERIMENTAL_SM60)
-    return false;
-#else
-    return bf16_path() == 1;
-#endif
-}
 __dpct_inline__ void f16_to_bf16_kernel(const sycl::half *__restrict__ in,
                                         uint16_t *__restrict__ out, int64_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();

@@ -371,5 +371,10 @@ sub("""        } else if (stream_all) {
         } else if (stream_all) {
             issue_until((size_t) m.ring);""")
 
+# 14. (review) the debug dump's last residual row: with the short first chunk the chunks no longer start at multiples of C
+sub("""        const int64_t last = (n - 1) % C;
+""", """        const int64_t last = chunk_len(0) < std::min(C, n) ? (n - 1 - chunk_len(0)) % C : (n - 1) % C;
+""")
+
 open(f"{W}/sycl/src/prefill/prefill.cpp", "w").write(s)
 print("prefill.cpp rebuilt:", s.count("\n"), "lines")

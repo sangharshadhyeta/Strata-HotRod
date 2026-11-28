@@ -4375,7 +4375,10 @@ int main(int argc, char** argv) {
     if (hc_req8_env && multi_gpu)
         std::fprintf(stderr, "strata generate: WARNING: STRATA_HC_REQ8 does not support a layer split yet - the BF16 "
                              "projections are used\n");
-    const bool hc_q8 = hc_req8_env && !multi_gpu;
+    if (hc_req8_env)
+        std::fprintf(stderr, "strata generate: STRATA_HC_REQ8: no int8 hyper-connection read in the SYCL "
+                             "engine yet - the BF16 projections are used\n");
+    const bool hc_q8 = false;
     if (hc_q8) strata::core::WeightTable::hc_q8_names(g.n_layers, skip);
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {

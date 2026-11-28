@@ -3590,6 +3590,18 @@ __dpct_inline__ void dequant_gu_kernel(
                             item_ct1.get_local_id(2));
 }
 
+// NVFP4 (ModelOpt): 64 values = 4 sub-blocks of 16, one UE4M3 scale each, E2M1 codes split-half like Q4_0.
+// kvalues_fp4 holds the E2M1 values doubled (0, 1, 2, 3, 4, 6, 8, 12), so the scale is halved here - exactly
+// ggml's ggml_cuda_ue4m3_to_fp32, decoded in software so the GPU and ggml-cpu agree bit for bit (NaN -> 0).
+__dpct_inline__ float ue4m3_to_f32_half(uint8_t x) {
+    // The same value as ldexpf(1 + man/8, exp - 7) * 0.5 (ldexpf(man, -9) * 0.5 for exp 0), built from its bits: every
+    // such value is exact in FP32, so this is equal for all 256 inputs - without the ldexpf and the branches it cost
+    // in the decode experts' inner loop.  Normal: 2^(exp-8) * (1 + man/8) = exponent field exp + 119, mantissa man<<20.
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint32_t exp = (x >> 3) & 0xF, man = x & 0x7;
+    return exp == 0 ? (float) man * 0.0009765625f : sycl::bit_cast<float>(((exp + 119u) << 23) | (man << 20));
+}
+
 // latent-experts branch: NVFP4 -> f16 with one thread per 16-value sub-block.  The generic path above runs one 32-thread block per 256 values and decodes the
 // sub-block's scale again for every value; nsys-timed on a 13.5K-token prompt, expert dequant was 29% of the prompt path.  Here a thread decodes its
 // scale once, reads the sub-block's 8 code bytes as two 4-byte words (a block is 36 bytes: 4-byte aligned), and writes its 16 values as two 16-byte
@@ -5273,8 +5285,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
     // scale: NVFP4's s_down (CUDA only; the SYCL port has no NVFP4 experts, so it is never given here)
     if (n % 256 != 0 || !is_iq(t) || scale != nullptr) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
-    {
-
+    if (t == 40 && nvfp4_fast_dq()) {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(
@@ -5295,7 +5306,7 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
                         nvfp4_dequant_sub_kernel((const block_nvfp4 *)src,
                                                  n_ct1, (sycl::half *)dst,
-                                                 scale, kvalues_fp4_ptr_ct1);
+                                                 scale, kvalues_fp4);
                     });
             });
     } else {
@@ -5402,7 +5413,6 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     const int64_t per_row = n_embd / 256;
     if (t == 40 && n_embd % 64 == 0 && nvfp4_fast_dq())
     {
-
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(
@@ -5426,7 +5436,7 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
                         nvfp4_dequant_gu_kernel(
                             (const block_nvfp4 *)gate, (const block_nvfp4 *)up,
                             n_ff_n_embd_ct2, n_embd, (sycl::half *)dst, tail,
-                            kvalues_fp4_ptr_ct1);
+                            kvalues_fp4);
                     });
             });
     } else {
@@ -6103,6 +6113,154 @@ bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+
+// ---- EXPDEC launch: knobs, shapes, rows per block (the CUDA host code, launched through the queue)
+int env_int_or(const char* name, int dflt) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' ? std::atoi(v) : dflt;
+}
+int g_expdec = env_on("STRATA_EXPDEC") ? 1 : 0;
+int g_expdec_r = env_int_or("STRATA_EXPDEC_R", 1);          // gate/up rows per lane: 1, 2 (bench: R=1 wins on the 2080 Ti)
+int g_expdec_dr = env_int_or("STRATA_EXPDEC_DR", 4);        // down rows per lane: 1, 2, 4 (Q2_0: R=4 wins on both cards)
+int g_expdec_minb = env_int_or("STRATA_EXPDEC_MINB", STRATA_EXPDEC_MINB);   // gate/up __launch_bounds__ min blocks: 2 (<= 128 regs) or 4 (<= 64)
+int g_expdec_d20 = env_int_or("STRATA_EXPDEC_D20", 0);      // 1: EXPDEC also for the IQ4_NL down (bench: no gain, default kernel)
+// 1: EXPDEC for the down too (Q2_0; IQ4_NL with _D20).  Default 0: in the engine (nsys of a 131k decode) the Q2_0 down
+// with EXPDEC was ~10% slower than the default kernel although the bench alone had it at 0.78, so by default EXPDEC
+// takes the gate/up only (-20/-23% at T >= 2 on an RTX 2080 Ti in the engine).
+int g_expdec_down = env_int_or("STRATA_EXPDEC_DOWN", 0);
+int g_expdec_rb = env_int_or("STRATA_EXPDEC_RB", 0);        // gate/up rows per block (0 = auto)
+int g_expdec_drb = env_int_or("STRATA_EXPDEC_DRB", 0);      // down rows per block (0 = auto)
+int g_expdec_minblk = env_int_or("STRATA_EXPDEC_MINBLK", 800);   // auto: the most rows per block that keep this many blocks
+int expdec_r() { return g_expdec_r == 2 ? 2 : 1; }
+int expdec_dr() { return g_expdec_dr == 1 || g_expdec_dr == 2 ? g_expdec_dr : 4; }
+
+bool expdec_gu_ok(const NativeExpertLayout& L) {
+    const bool fmt = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22;
+    return fmt && L.n_embd == 32 * ED_XB && L.n_ff % 64 == 0 && L.n_ff > 0;
+}
+bool expdec_down_ok(const NativeExpertLayout& L) {
+    return g_expdec_down && ((L.d_type == 20 && g_expdec_d20) || L.d_type == 42) && L.n_ff == 32 * ED_HB && L.n_embd % 128 == 0 &&
+           L.n_embd > 0;
+}
+// rows per block: `knob` rounded up to the rows per pass, or (0) doubled from one pass while ceil(nrow / rb) x
+// cap_groups blocks stay >= g_expdec_minblk (cap_groups: the launch's group rows; every block row g >= n_groups returns)
+int expdec_rows_per_block(int nrow, int rpp, int64_t cap_groups, int knob) {
+    if (knob > 0) {
+        int rb = (knob + rpp - 1) / rpp * rpp;
+        return rb > nrow ? nrow : rb;
+    }
+    int rb = rpp;
+    const int64_t cap = cap_groups > 0 ? cap_groups : 1;
+    while (rb * 2 <= nrow && ((int64_t) ((nrow + 2 * rb - 1) / (2 * rb))) * cap >= g_expdec_minblk) rb *= 2;
+    return rb;
+}
+
+// Launch shape as the other kernels here: dim 2 = the row blocks, dim 1 = the groups (the kernels read get_group(2) as
+// the block's row base and stride the groups over get_group(1)).  No use_root_sync: the kernels have no grid-wide sync.
+template<int TG, int R, int MINB>
+void expdec_gu_r(int64_t gy, int64_t cap_groups, dpct::queue_ptr s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                 const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
+                 float* gate, float* up) {
+    const int nrow = 2 * (int) L.n_ff;
+    const int rb = expdec_rows_per_block(nrow, 16 * R, cap_groups, g_expdec_rb);
+    const size_t gx = (size_t) ((nrow + rb - 1) / rb);
+    s->parallel_for<dpct_kernel_name<class expdec_gu_kernel_b13e70, dpct_kernel_scalar<TG>, dpct_kernel_scalar<R>,
+                                     dpct_kernel_scalar<MINB>>>(
+        sycl::nd_range<3>(sycl::range<3>(1, (size_t) gy, gx * 256), sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            expdec_gu_kernel<TG, R, MINB>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb);
+        });
+}
+template<int TG>
+void expdec_gu_t(int64_t gy, int64_t cap_groups, dpct::queue_ptr s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                 const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
+                 float* gate, float* up) {
+    const bool b4 = g_expdec_minb >= 4;
+    if (expdec_r() == 2) {
+        if (b4) expdec_gu_r<TG, 2, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else expdec_gu_r<TG, 2, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    } else {
+        if (b4) expdec_gu_r<TG, 1, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else expdec_gu_r<TG, 1, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    }
+}
+// One line on stderr per (role, format, taken or not), the first time STRATA_EXPDEC=1 meets it: the proof in the
+// engine's log that the EXPDEC kernels are the ones launched (or captured into the window's graph), with the
+// choices in force.  The log keeps the CUDA wording (the port mirrors the CUDA host code line by line).
+void expdec_note(const NativeExpertLayout& L, bool gu, bool taken, dpct::queue_ptr s, int64_t gy, int64_t cap_groups) {
+    static bool seen[2][64][2] = {};
+    const int ty = gu ? L.gu_type : L.d_type;
+    if (ty < 0 || ty >= 64 || seen[gu ? 0 : 1][ty][taken ? 1 : 0]) return;
+    seen[gu ? 0 : 1][ty][taken ? 1 : 0] = true;
+    sycl::ext::oneapi::experimental::queue_state cs = s->ext_oneapi_get_state();
+    const int dev = (int) dpct::get_current_device_id();
+    const bool graph = cs != sycl::ext::oneapi::experimental::queue_state::executing;
+    if (!taken) {
+        std::fprintf(stderr, "strata expdec: CUDA%d %s type %d (n_embd %lld, n_ff %lld) not covered: the default kernel runs\n", dev,
+                     gu ? "gate/up" : "down", ty, (long long) L.n_embd, (long long) L.n_ff);
+        return;
+    }
+    if (gu) {
+        const int R = expdec_r(), rb = expdec_rows_per_block(2 * (int) L.n_ff, 16 * R, cap_groups, g_expdec_rb);
+        std::fprintf(stderr, "strata expdec: CUDA%d gate/up type %d: expdec_gu_kernel R %d MINB %d, %d rows per block, grid %d x %lld "
+                             "(cap %lld groups)%s\n", dev, ty, R, g_expdec_minb >= 4 ? 4 : 2, rb, (2 * (int) L.n_ff + rb - 1) / rb,
+                     (long long) gy, (long long) cap_groups, graph ? ", captured into a graph" : "");
+    } else {
+        const int R = expdec_dr(), lanes = ty == 20 ? 8 : 16;
+        const int rb = expdec_rows_per_block((int) L.n_embd, (256 / lanes) * R, cap_groups, g_expdec_drb);
+        std::fprintf(stderr, "strata expdec: CUDA%d down type %d: expdec_down_kernel R %d, %d rows per block, grid %d x %lld "
+                             "(cap %lld groups)%s\n", dev, ty, R, rb, ((int) L.n_embd + rb - 1) / rb, (long long) gy,
+                     (long long) cap_groups, graph ? ", captured into a graph" : "");
+    }
+}
+
+// false: EXPDEC is off or does not take this layout (the caller launches the default kernels)
+bool expdec_gu(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, dpct::queue_ptr s, const unsigned long long* grp_ptr,
+               const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, float* gate,
+               float* up) {
+    if (!g_expdec || g_old_kernels) return false;
+    if (!expdec_gu_ok(L)) { expdec_note(L, true, false, s, gy, cap_groups); return false; }
+    expdec_note(L, true, true, s, gy, cap_groups);
+    switch (L.gu_type) {
+        case 16: expdec_gu_t<16>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 17: expdec_gu_t<17>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 18: expdec_gu_t<18>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 21: expdec_gu_t<21>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        default: expdec_gu_t<22>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+    }
+    return true;
+}
+template<int TD, int R>
+void expdec_down_r(int64_t gy, int64_t cap_groups, dpct::queue_ptr s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                   const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out) {
+    constexpr int LANES = TD == 20 ? 8 : 16;
+    const int nrow = (int) L.n_embd;
+    const int rb = expdec_rows_per_block(nrow, (256 / LANES) * R, cap_groups, g_expdec_drb);
+    const size_t gx = (size_t) ((nrow + rb - 1) / rb);
+    s->parallel_for<dpct_kernel_name<class expdec_down_kernel_b13e70, dpct_kernel_scalar<TD>, dpct_kernel_scalar<R>>>(
+        sycl::nd_range<3>(sycl::range<3>(1, (size_t) gy, gx * 256), sycl::range<3>(1, 1, 256)),
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            expdec_down_kernel<TD, R>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rb);
+        });
+}
+template<int TD>
+void expdec_down_t(int64_t gy, int64_t cap_groups, dpct::queue_ptr s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                   const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out) {
+    switch (expdec_dr()) {
+        case 1: expdec_down_r<TD, 1>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 2: expdec_down_r<TD, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        default: expdec_down_r<TD, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+    }
+}
+bool expdec_down(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, dpct::queue_ptr s, const unsigned long long* grp_ptr,
+                 const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, float* out) {
+    if (!g_expdec || g_old_kernels) return false;
+    if (!expdec_down_ok(L)) { expdec_note(L, false, false, s, gy, cap_groups); return false; }
+    expdec_note(L, false, true, s, gy, cap_groups);
+    if (L.d_type == 20) expdec_down_t<20>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else expdec_down_t<42>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    return true;
+}
 
 void native_expert_set_expdec(int on) { g_expdec = on ? 1 : 0; }
 int native_expert_expdec() { return g_expdec; }

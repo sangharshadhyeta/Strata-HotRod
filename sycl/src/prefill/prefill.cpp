@@ -6145,7 +6145,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
             std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long) c, mx);
         };
-        const int64_t last = (n - 1) % C;
+        const int64_t last = chunk_len(0) < std::min(C, n) ? (n - 1 - chunk_len(0)) % C : (n - 1) % C;
         std::fprintf(stderr, "strata dbg: prompt end: last residual row");
         bad(m.R + last * D, D);
         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }
