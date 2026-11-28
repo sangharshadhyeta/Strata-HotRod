@@ -16,7 +16,8 @@
 #include <climits>
 #include <cmath>
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#include <cuda_runtime.h>   // __forceinline__ (HIP: through hip_compat)
 #define STRATA_LA_HD __host__ __device__ __forceinline__
 #else
 #define STRATA_LA_HD inline

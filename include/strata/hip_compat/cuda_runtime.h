@@ -29,11 +29,13 @@
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaDriverGetVersion hipDriverGetVersion
 #define cudaErrorNotReady hipErrorNotReady
+#define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorStreamCaptureUnsupported hipErrorStreamCaptureUnsupported
 #define cudaError_t hipError_t
 #define cudaEventCreate hipEventCreate
+#define cudaEventDefault hipEventDefault
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
 #define cudaEventDestroy hipEventDestroy
 #define cudaEventDisableTiming hipEventDisableTiming
@@ -64,6 +66,29 @@
 #define cudaGraphUpload hipGraphUpload
 #define cudaGraph_t hipGraph_t
 #define cudaHostAlloc hipHostMalloc
+#define cudaHostGetFlags hipHostGetFlags
+
+// Mapped 28 Nov 2026: names the engine's newer code uses (the AMD build of ratrod.v1.3 stopped on them); each has
+// the same meaning in HIP.
+#define cudaMemcpyKind hipMemcpyKind
+#define cudaErrorUnknown hipErrorUnknown
+#define cudaErrorNotSupported hipErrorNotSupported
+#define cudaFuncGetAttributes hipFuncGetAttributes
+#define cudaFuncAttributes hipFuncAttributes
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
+#define cudaGraphNode_t hipGraphNode_t
+#define cudaGraphNodeGetType hipGraphNodeGetType
+#define cudaGraphNodeType hipGraphNodeType
+#define cudaGraphNodeTypeKernel hipGraphNodeTypeKernel
+#define cudaGraphNodeTypeMemcpy hipGraphNodeTypeMemcpy
+#define cudaGraphNodeTypeMemset hipGraphNodeTypeMemset
+#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
+#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
+#define cudaKernelNodeParams hipKernelNodeParams
+#define cudaGraphKernelNodeGetParams hipGraphKernelNodeGetParams
+#define cudaStreamLegacy hipStreamLegacy
+#define cudaDeviceScheduleSpin hipDeviceScheduleSpin
+#define cudaDeviceMapHost hipDeviceMapHost
 #if HIP_VERSION_MAJOR < 7
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaHostAllocMapped hipHostMallocMapped
