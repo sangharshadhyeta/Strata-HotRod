@@ -442,13 +442,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
-<<<<<<< sycl
                 cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_e2f600>>(
-||||||| base
-                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_1eac11>>(
-=======
-                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_474396>>(
->>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -469,13 +463,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
-<<<<<<< sycl
                 cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_92a6ef>>(
-||||||| base
-                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_447996>>(
-=======
-                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_c1a893>>(
->>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -583,13 +571,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
-<<<<<<< sycl
                 cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_dda9b4>>(
-||||||| base
-                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_f94762>>(
-=======
-                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_bad8f0>>(
->>>>>>> ours-now
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),

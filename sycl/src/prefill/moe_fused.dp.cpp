@@ -22,13 +22,6 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/moe_fused.hpp"
-<<<<<<< sycl
-||||||| base
-#include "strata/kernels/gfx_arch.hpp"
-=======
-#include "strata/kernels/gfx_arch.hpp"
-#include "strata/core/emulate.hpp"
->>>>>>> ours-now
 
 #include <algorithm>
 #include <cstdio>
@@ -1127,13 +1120,7 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
             sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                 sycl::range(smem_bytes(true)), cgh);
 
-<<<<<<< sycl
             cgh.parallel_for<dpct_kernel_name<class expert_kernel_f38977,
-||||||| base
-            cgh.parallel_for<dpct_kernel_name<class expert_kernel_8e7b3d,
-=======
-            cgh.parallel_for<dpct_kernel_name<class expert_kernel_17bb82,
->>>>>>> ours-now
                                               dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, g_gu) *
                                       sycl::range(1, 1, THREADS),
@@ -1164,13 +1151,7 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
             sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                 sycl::range(smem_bytes(false)), cgh);
 
-<<<<<<< sycl
             cgh.parallel_for<dpct_kernel_name<class expert_kernel_e2d106,
-||||||| base
-            cgh.parallel_for<dpct_kernel_name<class expert_kernel_125ba3,
-=======
-            cgh.parallel_for<dpct_kernel_name<class expert_kernel_c61f0a,
->>>>>>> ours-now
                                               dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, g_d) *
                                       sycl::range(1, 1, THREADS),
