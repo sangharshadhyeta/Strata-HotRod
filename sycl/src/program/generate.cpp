@@ -7260,6 +7260,32 @@ int main(int argc, char** argv) {
         }
         const char* mv = std::getenv("STRATA_MIRROR_MIB");
         const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        const bool learn_counted = [] {   // the device counts what the router wants (route_want), read before each swap round
+            const char* rr = std::getenv("STRATA_ROUTE_RESIDENT");
+            const char* ct = std::getenv("STRATA_ROUTE_RESIDENT_COUNT");
+            return rr != nullptr && std::atof(rr) > 0.0 && ct != nullptr && std::atoi(ct) != 0;
+        }();
+        {
+            const char* nh = std::getenv("STRATA_VERIFY_NO_HOST");
+            const char* all = std::getenv("STRATA_SYCL_MIRROR_ALL");   // =0: keep the mirror to the misses (no learning)
+            if (nh != nullptr && *nh && std::strcmp(nh, "0") != 0 && learn_counted && !(all != nullptr && all[0] == '0') &&
+                !multi_gpu && o.adapt_every > 0 && o.adapt_swaps > 0) {
+                const auto& lay = strata::kernels::cpu::expert_layout();
+                uint64_t need = 0;
+                for (int64_t l = 0; l < mirror_end; ++l) need += (uint64_t) lay.blob_bytes(l) * (uint64_t) g.n_expert;
+                if (need + need / 50 <= cap) {
+                    std::vector<char> listed((size_t) (g.n_layers * g.n_expert), 0);
+                    for (const auto& pr : miss) listed[(size_t) (pr.first * g.n_expert + pr.second)] = 1;
+                    for (int64_t l = 0; l < mirror_end; ++l)
+                        for (int64_t e = 0; e < g.n_expert; ++e)
+                            if (!listed[(size_t) (l * g.n_expert + e)]) miss.push_back({l, e});
+                } else {
+                    std::fprintf(stderr, "strata generate: learning needs every expert mirrored in RAM (%.1f GiB, %.1f GiB "
+                                         "allowed): only the misses are mirrored\\n", (double) need / 1073741824.0,
+                                 (double) cap / 1073741824.0);
+                }
+            }
+        }
         if (!miss.empty() && cap > 0) {
             const auto tm = Clock::now();
             const int64_t got = gguf_src.mirror(miss, cap, 8, err);
@@ -7268,7 +7294,7 @@ int main(int argc, char** argv) {
                              err.c_str());
                 err.clear();
             } else {
-                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu in the prompt loan's slots) "
+                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu that are in VRAM now) "
                                      "mirrored in pinned host memory (%.2f GiB, %.1f s); the GPU reads them over PCIe\n",
                              (long long) got, n_true_miss, miss.size() - n_true_miss,
                              (double) gguf_src.mirrored_bytes() / 1073741824.0,
@@ -7294,7 +7320,13 @@ int main(int argc, char** argv) {
         }
         // The same rule after the start: the mirror holds the start's misses only, so an expert an adaptive swap moves
         // out of VRAM would be in neither, and the device plan would wait for a host that never serves it.
-        if (!miss.empty() && no_host && o.adapt_every > 0 && o.adapt_swaps > 0) {
+        bool all_mirrored = gguf_src.mirrored_bytes() > 0;
+        for (int64_t l = 0; all_mirrored && l < g.n_layers; ++l)
+            for (int64_t e = 0; all_mirrored && e < g.n_expert; ++e) all_mirrored = gguf_src.pinned(l, e);
+        if (no_host && all_mirrored && learn_counted && o.adapt_every > 0 && o.adapt_swaps > 0)
+            std::fprintf(stderr, "strata generate: learning on: every expert is mirrored, so the adaptive tier may move any "
+                                 "of them; its usage counts come from the device\\n");
+        if (!miss.empty() && no_host && !(all_mirrored && learn_counted) && o.adapt_every > 0 && o.adapt_swaps > 0) {
             std::fprintf(stderr, "strata generate: adaptive swaps off: with STRATA_VERIFY_NO_HOST an expert they move out of "
                                  "VRAM would be neither there nor mirrored\n");
             o.adapt_every = 0;
@@ -15468,6 +15500,12 @@ int main(int argc, char** argv) {
                             if (used[f]) continue;
                             std::pair<int32_t, int32_t>& pr = p.lent[free_q[f]];
                             if (slot_cap(pr.second) < nb) continue;
+                            // SYCL engine, STRATA_VERIFY_NO_HOST: the GPU runs a non-resident expert only from the pinned
+                            // mirror (the start's misses and the cache's last slots) and the host serves none. A pair may
+                            // give its slot away only if the expert it held has a mirror copy - else that expert is in
+                            // neither place (non-finite logits, issue #7).
+                            static const bool tail_no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+                            if (tail_no_host && mirror_table_d != nullptr && !gguf_src.pinned(pr.first / g.n_expert, pr.first % g.n_expert)) continue;
                             pr.first = (int32_t) j;   // refill_issue reads this index: the tail expert's blob goes into this slot
                             used[f] = 1;
                             ++tail_in_vram;

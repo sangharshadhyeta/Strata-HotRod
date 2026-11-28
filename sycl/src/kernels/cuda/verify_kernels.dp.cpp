@@ -297,18 +297,19 @@ __dpct_inline__ void gdn_step_commit_kernel(
     float *__restrict__ state, const float *__restrict__ hbuf, int C,
     const float *__restrict__ gate, const float *__restrict__ beta, int h_k,
     int h_v, const int32_t *__restrict__ n_keep, int n_max,
-    const sycl::stream &stream_ct1) {
+    // DBG only, else nullptr: a sycl::stream holds buffers, which a recorded command graph (the verify window's) rejects
+    const sycl::stream *stream_ct1) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int n = *n_keep;
     if (n <= 0) return;
     if (DBG && n > n_max) {
-        if (item_ct1.get_group(2) == 0 && item_ct1.get_group(1) == 0 &&
-            item_ct1.get_local_id(2) == 0 && item_ct1.get_local_id(1) == 0)
-            /*
-            DPCT1015: Output needs adjustment.
-            */
-            stream_ct1 << "strata DBG: gdn_step_commit: n_keep %d is past the "
-                          "window's %d rows: commit skipped (#937)\n";
+        if constexpr (DBG) {
+            if (item_ct1.get_group(2) == 0 && item_ct1.get_group(1) == 0 &&
+                item_ct1.get_local_id(2) == 0 && item_ct1.get_local_id(1) == 0)
+                *stream_ct1 << "strata DBG: gdn_step_commit: n_keep " << n
+                            << " is past the window's " << n_max
+                            << " rows: commit skipped (#937)\n";
+        }
         return;
     }
     gdn_step_commit_body(state, hbuf, C, gate, beta, h_k, h_v, n);
@@ -2660,7 +2661,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                         exp_props, [=](sycl::nd_item<3> item_ct1) {
                             gdn_step_commit_kernel<true>(
                                 state, h, conv_channels, gate, beta, h_k, h_v,
-                                n_keep, n_tok, stream_ct1);
+                                n_keep, n_tok, &stream_ct1);
                         });
                 });
         } else {
@@ -2669,8 +2670,6 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 
             strata::q_of(stream)
                 ->submit([&](sycl::handler &cgh) {
-                    sycl::stream stream_ct1(64 * 1024, 80, cgh);
-
                     cgh.parallel_for<
                         dpct_kernel_name<class gdn_step_commit_kernel_10409d,
                                          dpct_kernel_scalar<false>>>(
@@ -2680,7 +2679,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                         exp_props, [=](sycl::nd_item<3> item_ct1) {
                             gdn_step_commit_kernel<false>(
                                 state, h, conv_channels, gate, beta, h_k, h_v,
-                                n_keep, n_tok, stream_ct1);
+                                n_keep, n_tok, nullptr);
                         });
                 });
         }

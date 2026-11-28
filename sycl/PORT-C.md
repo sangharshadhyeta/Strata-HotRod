@@ -47,4 +47,32 @@ Known, not fixed (in the Intel copy before this work, read not run): `fused_gr_r
 with `STRATA_GR_DOWN_SLICED=0` and `STRATA_GR_DOWN_DIRECT=0` on a card whose local memory holds fewer than the window's
 tokens) writes its partials by the chunk's token index and reads them by the window's.
 
-Nothing has run on an Intel GPU.  Correct answers and speed are the testers' to establish (issue #7).
+The first run on an Intel card (an Arc Pro B50, issue #7) was of commit 352ce51c. It found three faults, fixed after
+it: the GDN commit kernel built a `sycl::stream` that a recorded graph rejects; the prompt-tail refill could move an
+expert with no mirror copy out of VRAM under `STRATA_VERIFY_NO_HOST` (non-finite logits); `strata-sycl.sh` dropped
+`=0` switches. The fixes have not run on an Intel card.
+
+Added after that run, also not yet run on an Intel card:
+
+- setup writes the stand-ins, quality swaps and learned look-ahead for Qwen3.8-Flash-Next IQ3_S
+  (`sycl/setup_intel.py`, `hotrod_intel`); `"STRATA_ROUTE_RESIDENT": "0"` turns the stand-ins off
+- learning under `STRATA_VERIFY_NO_HOST`: with device-side usage counts (`STRATA_ROUTE_RESIDENT_COUNT=1`) and RAM for a
+  mirror of every expert, the adaptive tier stays on; `STRATA_SYCL_MIRROR_ALL=0` gives the old behaviour
+- upstream PR #6566, the Battlemage prompt kernels for the GDN layers (`sycl/src/prefill/bmg_gdn_*`,
+  `STRATA_SYCL_GDN_PREFILL_REG_QK=0` for the previous recurrence kernel)
+
+## Contributing (pull requests against `sycl-c` are welcome)
+
+- `sycl/src/prefill/prefill.cpp` and `sycl/src/program/generate.cpp` are generated. Change the generator
+  (`sycl/tools/rebuild_prefill.py`, `rebuild_generate.py`), rerun it, and commit both.
+- The CUDA and HIP engines must not change behaviour: Intel-only code goes under `sycl/` or `STRATA_GPU_SYCL`.
+- One change per pull request, with the card, the model file, prompt and decode tokens/s before and after, and whether
+  the answers to a few checkable questions were right.
+
+Open work:
+
+- upstream PR #6567 (grouped and paired expert prompt paths): its window and grouped paths take IQ2_XXS, IQ2_S or
+  IQ1_M gate/up weights only, so IQ3_S files gain little; not ported
+- the rest of upstream's Intel prompt work since 16 Oct (this port starts there); stock Strata 0.2.20 read a 120K
+  prompt faster than this branch on the B50
+- measuring the stand-ins and the learning on Intel; the opt-in switches above

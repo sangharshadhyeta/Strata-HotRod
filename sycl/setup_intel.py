@@ -145,6 +145,18 @@ def split_likely_short(arena_gb: float, vram_gbs: list) -> bool:
     return arena_gb > 0 and total > 0 and arena_gb > SPLIT_SHORT_FRACTION * total
 
 
+def hotrod_intel(cfg: dict, model: str) -> None:
+    """Hot Rod's settings for Qwen3.8-Flash-Next IQ3_S on an Intel card: the stand-ins, quality swaps and learned
+    look-ahead setup writes for the CUDA engine (S.hotrod_default_env; setup runs Intel through its AMD path, which skips
+    them), and the device-side usage count the engine's learning needs here.  Not yet measured on an Intel card; a value
+    the config already has stays, and "STRATA_ROUTE_RESIDENT": "0" turns the stand-ins off."""
+    if str(cfg.get("model_name", "")) != "qwen3.8-flash-next-iq3_s":
+        return
+    env = cfg.setdefault("env", {})
+    for k, v in {**S.hotrod_default_env("qwen", model, False), "STRATA_ROUTE_RESIDENT_COUNT": "1"}.items():
+        env.setdefault(k, v)
+
+
 def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, driver: str = "xe",
             devid: str = "") -> dict:
     """setup's config (written for its HIP path) -> the SYCL port's: the container's paths, experts streamed from the
@@ -325,6 +337,7 @@ def install(argv) -> None:
             S.warn(f"{model} on this Arc computes the experts the card does not hold on the CPU (about {need} GB of "
                    f"weights; this PC has {real_ram:.0f} GB of RAM): the start will be slow or fail - a smaller model "
                    "(--model) fits better (docs/INTEL.md)")
+        hotrod_intel(cfg, model)
         Path(cfg_path).write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         script = write(model, cfg_path, port, open_browser)
         script.write_text(script.read_text().replace(str(ROOT / "serve" / "server.py"), str(SERVER)))

@@ -31,8 +31,9 @@ while IFS= read -r k; do
 done < <(compgen -e)
 envs=()
 for k in "${!setting[@]}"; do
-    # the engine tests the switches by presence: a value of 0 (or empty) means "not set", so it is not passed on
-    case "${setting[$k]}" in 0|"") ;; *) envs+=(-e "$k=${setting[$k]}") ;; esac
+    # as the CUDA engine gets them: a 0 is passed on (many switches are on by default and 0 turns them off; dropping it
+    # left them on, issue #7). An empty value means "not set".
+    case "${setting[$k]}" in "") ;; *) envs+=(-e "$k=${setting[$k]}") ;; esac
 done
 exec docker run --rm -i --name "$name" --device /dev/dri --oom-score-adj 1000 --stop-timeout 30 --no-healthcheck \
     --ulimit memlock=-1 \

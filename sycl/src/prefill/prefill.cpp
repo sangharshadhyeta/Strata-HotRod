@@ -55,6 +55,8 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "bmg_gdn_tiles.hpp"
+#include "bmg_gdn_residual.hpp"
 
 #include <cuda_runtime.h>
 
@@ -5715,8 +5717,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           T, m.cs, m.xn16_lo, ldx, xf16);
                     normed = true;
                 } else if (wnn) {
-                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
-                                     m.xn16_lo, ldx, xf16);
+                    const int64_t row_stride = ldx > 0 ? ldx : D;
+                    if (half == 0 && !core::is_qsa_layer(g, l) && !m.f16_io && !xf16 &&
+                        use_bmg_gdn_tiles(*strata::q_of(m.cs), T) && N == 2560 && HC == 4 && row_stride % 2 == 0 &&
+                        ((reinterpret_cast<uintptr_t>(m.R) | reinterpret_cast<uintptr_t>(m.bo) |
+                          reinterpret_cast<uintptr_t>(wnn->data)) & 7u) == 0 &&
+                        ((reinterpret_cast<uintptr_t>(m.xn16) | reinterpret_cast<uintptr_t>(m.xn16_lo)) & 3u) == 0) {
+                        bmg_gdn_residual::write_norm(*strata::q_of(m.cs), m.R, m.bo, m.inj, HC, (const float*) wnn->data,
+                                                     EPS, m.grs, m.xn16, m.xn16_lo, int(T), int(row_stride));
+                    } else {
+                        gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                         m.xn16_lo, ldx, xf16);
+                    }
                     normed = true;
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);

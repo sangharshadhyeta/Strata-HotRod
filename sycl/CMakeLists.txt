@@ -261,6 +261,22 @@ target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
 if(STRATA_SYCL_PARITY)
   enable_testing()
+  foreach(probe IN ITEMS bmg_gdn_tiles_parity bmg_gdn_residual_parity)
+    add_executable(${probe} src/prefill/${probe}.cpp)
+    target_link_libraries(${probe} PRIVATE strata_prefill)
+    add_test(NAME ${probe} COMMAND ${probe})
+    set_tests_properties(${probe} PROPERTIES SKIP_RETURN_CODE 77)
+  endforeach()
+  add_test(NAME bmg_gdn_auto_dispatch COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_GDN_CONV_SERIAL --unset=STRATA_GDN_CONVL2
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --auto)
+  add_test(NAME bmg_gdn_serial_override COMMAND ${CMAKE_COMMAND} -E env STRATA_GDN_CONV_SERIAL=1 STRATA_GDN_CONVL2=1
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --serial)
+  add_test(NAME bmg_gdn_fused_override COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_GDN_CONV_SERIAL STRATA_GDN_CONVL2=1
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --fused)
+  add_test(NAME bmg_gdn_separate_override COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_GDN_CONV_SERIAL STRATA_GDN_CONVL2=0
+    $<TARGET_FILE:bmg_gdn_tiles_parity> --separate)
+  set_tests_properties(bmg_gdn_auto_dispatch bmg_gdn_serial_override bmg_gdn_fused_override bmg_gdn_separate_override
+    PROPERTIES SKIP_RETURN_CODE 77)
   foreach(p IN ITEMS dequant_s2 s2_gemv shared_expert gr gdn s2_gemv_q8 sampler rope quantize_act router_top10
                      s_gemv elementwise bf16_gemv s_gemv_q8k qsa kv_q8 kv_stream kv_q4 cvec)
     strata_resolve(_src src/kernels/${p}_parity.cpp)

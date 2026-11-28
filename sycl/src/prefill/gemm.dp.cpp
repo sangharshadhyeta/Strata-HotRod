@@ -1,5 +1,6 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #define DPCT_PROFILING_ENABLED
+#include "bmg_gdn_tiles.hpp"
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
@@ -881,6 +882,86 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
 #endif
 }
 
+// The prompt path's ssm_alpha / ssm_beta projection (48 outputs, 2560 inputs, four tokens sharing the weights) on
+// Battlemage: upstream PR #6566.
+namespace strata_bf16_det {
+constexpr int kLanes = 16, kSgPerWg = 4, kOut = 4;
+inline float bf16lo(uint32_t u) { return sycl::bit_cast<float>(u << 16); }
+inline float bf16hi(uint32_t u) { return sycl::bit_cast<float>(u & 0xFFFF0000u); }
+void bmg_gdn_projection(sycl::queue& q, const uint16_t* x, int64_t ldx, const uint16_t* w,
+                    float* y, int64_t tokens, int64_t ldy) {
+    constexpr int Rows = 4, outputs = 48, inner = 2560;
+    const size_t subgroups = size_t(tokens / Rows) * (outputs / kOut);
+    q.parallel_for(sycl::nd_range<1>(subgroups * kLanes, kSgPerWg * kLanes),
+                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        const auto sg = it.get_sub_group();
+        const size_t group = it.get_group(0) * kSgPerWg + sg.get_group_linear_id();
+        const size_t token = group / (outputs / kOut) * Rows;
+        const int out = int(group % (outputs / kOut)) * kOut;
+        const int lane = sg.get_local_linear_id();
+        float sum[Rows][kOut] = {};
+        for (int k = lane; k < inner / 2; k += kLanes) {
+            uint32_t weights[kOut];
+#pragma unroll
+            for (int o = 0; o < kOut; ++o)
+                weights[o] = reinterpret_cast<const uint32_t*>(w + (out + o) * inner)[k];
+#pragma unroll
+            for (int r = 0; r < Rows; ++r) {
+                const auto input = reinterpret_cast<const uint32_t*>(x + (token + r) * ldx)[k];
+#pragma unroll
+                for (int o = 0; o < kOut; ++o) {
+                    sum[r][o] = sycl::fma(bf16lo(weights[o]), bf16lo(input), sum[r][o]);
+                    sum[r][o] = sycl::fma(bf16hi(weights[o]), bf16hi(input), sum[r][o]);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+#pragma unroll
+            for (int o = 0; o < kOut; ++o) {
+                const float value = sycl::reduce_over_group(sg, sum[r][o], sycl::plus<float>());
+                if (lane == 0) y[(token + r) * ldy + out + o] = value;
+            }
+        }
+    });
+}
+// upstream's fixed-order skinny bf16 GEMM: here only as the reference of bmg_gdn_tiles_parity
+void gemm(sycl::queue& q, const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
+                 int64_t ldy, float beta) {
+    const int64_t nblk = (N + kOut - 1) / kOut;
+    const int64_t total_sg = T * nblk;
+    const int64_t wgs = (total_sg + kSgPerWg - 1) / kSgPerWg;
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)(wgs * kSgPerWg * kLanes)), sycl::range<1>(kSgPerWg * kLanes)),
+                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int64_t id = (int64_t) it.get_group(0) * kSgPerWg + (int64_t) sg.get_group_linear_id();
+        if (id >= total_sg) return;   // (whole sub-group: uniform)
+        const int64_t t = id / nblk, n0 = (id % nblk) * kOut;
+        const uint32_t* xr = reinterpret_cast<const uint32_t*>(X + t * ldx);
+        const uint32_t* wr[kOut];
+        float acc[kOut];
+        for (int o = 0; o < kOut; ++o) { wr[o] = reinterpret_cast<const uint32_t*>(W + (n0 + (o < N - n0 ? o : 0)) * K); acc[o] = 0.0f; }
+        const int lane = (int) sg.get_local_linear_id();
+        for (int64_t k2 = lane; k2 < K / 2; k2 += kLanes) {
+            const uint32_t xv = xr[k2];
+            const float x0 = bf16lo(xv), x1 = bf16hi(xv);
+            for (int o = 0; o < kOut; ++o) {
+                const uint32_t wv = wr[o][k2];
+                acc[o] = sycl::fma(bf16lo(wv), x0, acc[o]);
+                acc[o] = sycl::fma(bf16hi(wv), x1, acc[o]);
+            }
+        }
+        for (int o = 0; o < kOut; ++o) {
+            const float s = sycl::reduce_over_group(sg, acc[o], sycl::plus<float>());
+            if (lane == 0 && n0 + o < N) {
+                float* y = Y + t * ldy + n0 + o;
+                *y = beta == 0.0f ? s : sycl::fma(beta, *y, s);
+            }
+        }
+    });
+}
+}  // namespace strata_bf16_det
+
 namespace {
 // oneMKL's GEMM reads the last, partial tile of an operand from the wrong place when it lies more than 4 GiB into its
 // allocation (Arc A770, oneMKL 2026.1: a BF16 B placed past 4 GiB of a 10.5 GiB allocation gave its last 21 columns
@@ -1075,6 +1156,16 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     }
 #endif
     const float alpha = 1.0f;
+    {   // Battlemage: the 48-output GDN projection of long chunks, four tokens per weight read (upstream PR #6566)
+        const int64_t xs = ldx ? ldx : K;
+        auto& queue = *strata::q_of(stream_);
+        if (N == 48 && K == 2560 && ldy == 96 && beta == 0.0f && T % 4 == 0 && (xs & 1) == 0 &&
+            (reinterpret_cast<uintptr_t>(X) & 3u) == 0 && (reinterpret_cast<uintptr_t>(W) & 3u) == 0 &&
+            strata::prefill::use_bmg_gdn_tiles(queue, T)) {
+            strata_bf16_det::bmg_gdn_projection(queue, X, xs, W, Y, T, ldy);
+            return;
+        }
+    }
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, X, W, Y, T, N, K, ldy,
                       beta, stream_, ldx)) {

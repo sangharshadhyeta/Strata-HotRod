@@ -881,3 +881,11 @@ gate identical in the 32K and the 128K configuration); every one has an off swit
 | decode | 23-25 tok/s; GPU 92% busy at 165 W, CPU idle |
 | prefill | 149 tok/s on a 2,701-token prompt; 424 tok/s on a 104,798-token prompt at 131k context |
 | quality | correct code on every test; matches the NVIDIA path token for token in spirit, not measured |
+
+## Prompt reading on Battlemage
+
+**Battlemage GDN prefill.** On Level Zero Battlemage, the 128-wide GDN recurrence with 16 key heads and 48 value heads pairs successive inputs from 128 tokens. From 512 rows, eligible GDN layers also share projection weights across four tokens, fuse convolution with Q/K normalization, and combine residual writeback with RMSNorm. The projection requires 48 outputs, 2,560 input columns, output stride 96 and a multiple of four rows. The residual uses aligned FP32 buffers and the supported four-stream BF16 layout. Other shapes retain their ordinary paths. Explicit `STRATA_GDN_CONV_SERIAL` and `STRATA_GDN_CONVL2` settings take precedence for convolution. The recurrence override below controls the recurrence only.
+
+| Setting | Applies | Effect |
+| --- | --- | --- |
+| `STRATA_SYCL_GDN_PREFILL_REG_QK` | Automatic on Level Zero Battlemage for the 128-wide, 16-key/48-value-head recurrence at 128 or more tokens | Load two consecutive inputs into subgroup registers and update the FP32 state in token order. Unset enables automatic selection. A value beginning with `1` requests the register kernel on supported inputs. Other explicit values, including `0`, an empty string, `on` and `true`, select the original column kernel. |

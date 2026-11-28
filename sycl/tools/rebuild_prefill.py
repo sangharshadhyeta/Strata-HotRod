@@ -503,5 +503,26 @@ sub("""        const int64_t last = (n - 1) % C;
 """, """        const int64_t last = chunk_len(0) < std::min(C, n) ? (n - 1 - chunk_len(0)) % C : (n - 1) % C;
 """)
 
+# 15. upstream PR #6566 (non-lookback layers on Battlemage): the residual write and RMS norm in one kernel
+sub('#include "strata/prefill/kernels.hpp"\n',
+    '#include "strata/prefill/kernels.hpp"\n#include "bmg_gdn_tiles.hpp"\n#include "bmg_gdn_residual.hpp"\n')
+sub("""                } else if (wnn) {
+                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                     m.xn16_lo, ldx, xf16);
+""", """                } else if (wnn) {
+                    const int64_t row_stride = ldx > 0 ? ldx : D;
+                    if (half == 0 && !core::is_qsa_layer(g, l) && !m.f16_io && !xf16 &&
+                        use_bmg_gdn_tiles(*strata::q_of(m.cs), T) && N == 2560 && HC == 4 && row_stride % 2 == 0 &&
+                        ((reinterpret_cast<uintptr_t>(m.R) | reinterpret_cast<uintptr_t>(m.bo) |
+                          reinterpret_cast<uintptr_t>(wnn->data)) & 7u) == 0 &&
+                        ((reinterpret_cast<uintptr_t>(m.xn16) | reinterpret_cast<uintptr_t>(m.xn16_lo)) & 3u) == 0) {
+                        bmg_gdn_residual::write_norm(*strata::q_of(m.cs), m.R, m.bo, m.inj, HC, (const float*) wnn->data,
+                                                     EPS, m.grs, m.xn16, m.xn16_lo, int(T), int(row_stride));
+                    } else {
+                        gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                         m.xn16_lo, ldx, xf16);
+                    }
+""")
+
 open(f"{W}/sycl/src/prefill/prefill.cpp", "w").write(s)
 print("prefill.cpp rebuilt:", s.count("\n"), "lines")
