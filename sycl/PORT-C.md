@@ -22,7 +22,7 @@ it is the testers' part (issue #7).
 
 ## State (28 Nov)
 
-Every file of the SYCL build passes the compiler front end (oneAPI 2026.2).  Link: see the newest commit message.
+The engine builds and links with oneAPI 2026.2.
 
 In the port: the engine's host features (stand-ins, look-ahead learner, K/V streaming, masking, RAM tier and
 read-ahead, the stand-in / sub-fit / latent / layer learners, MTP, prompt cache), `--stream-experts` with the pinned
@@ -31,14 +31,13 @@ host mirror (`STRATA_MIRROR_MIB`, `STRATA_LEND_MIRROR`), split headroom, refuse_
 (`STRATA_PREFILL_FIRST`, default 256 when the cache holds every expert), the setup timers.
 
 Opt-in on Intel until measured there: `STRATA_SYCL_SPLIT_OVERLAP=1` (the overlapped layer split; refused on Arc
-A-series, and its hand-off wait has no timeout), `STRATA_MMVQ_IL=1`, `STRATA_SELECT_SIMT=1|2`, `STRATA_EXPDEC=1`.
+A-series, and its hand-off wait has no timeout), `STRATA_MMVQ_IL=1`, `STRATA_SELECT_SIMT=1|2`, `STRATA_EXPDEC=1`, `STRATA_HC_Q8=1` and `STRATA_HC_REQ8=1` (the Q8
+hyper-connection reads), `STRATA_STAGER_BATCH=N` (batched prompt reads; 1 by default).
 
 Not in the port (the default path is used instead):
 
-- the Q8 hyper-connection read (`STRATA_HC_Q8`, which the engine switches on by itself for a Q8_0 file, and
-  `STRATA_HC_REQ8`): both stay on the BF16 read, with a message
-- the prompt stager's batched source reads (`copy_blobs`) and "a failed read stops the request, not the engine": the
-  SYCL stager (one job at a time) is kept
+- the Q8 read's automatic switch-on for a Q8_0 file: the BF16 read is the default (opt in, below)
+- the persistent hyper-connection kernel is an AMD-only path
 - NVIDIA hardware paths: the TF32 selection scorer, the mma prompt attention (the XMX port runs instead), PDL, the
   Turing / Pascal / Volta kernels, `STRATA_HC_UPMIX`, the fused GR read's QFUSE
 - GPU-clock timings: Intel has no device clock here, so the stage stamps use a host clock and the look-ahead learner's

@@ -446,12 +446,12 @@ sub("        try { dpct::get_current_device().queues_wait_and_throw(); } catch (
     "            gguf_src.close();   // SYCL engine: release the direct-access USM host mirror before exit (the old copy did)\n"
     "        } catch (const std::exception&) {}\n")
 
-# (review) no Q8 hyper-connection read in the SYCL fused_gr yet: STRATA_HC_REQ8 is refused here, with a message
-sub("    const bool hc_q8 = hc_req8_env && !multi_gpu;\n",
-    "    if (hc_req8_env)\n"
-    "        std::fprintf(stderr, \"strata generate: STRATA_HC_REQ8: no int8 hyper-connection read in the SYCL \"\n"
-    "                             \"engine yet - the BF16 projections are used\\n\");\n"
-    "    const bool hc_q8 = false;\n")
+# (review) the Q8_0 hyper-connection read is opt-in on SYCL: not switched on by itself for a Q8_0 file
+sub("#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)\n"
+    "        // CUDA, a file that carries",
+    "#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL) && \\\n"
+    "    !defined(STRATA_GPU_SYCL)\n"
+    "        // CUDA, a file that carries")
 
 # (review) pin by need registers host ranges with the GPU driver, which this backend cannot do: ignored, with a message
 sub("""        if (const char* pn = std::getenv("STRATA_PIN_BY_NEED"); pn != nullptr && pn[0] != '\\0' && pn[0] != '0') {

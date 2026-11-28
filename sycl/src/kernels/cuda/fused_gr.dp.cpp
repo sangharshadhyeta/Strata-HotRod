@@ -28,6 +28,7 @@
 #include <vector>
 
 namespace strata::kernels {
+static float* down_partials(sycl::queue* q);   // defined below (the multi read's partials buffer)
 namespace {
 
 constexpr int N = 2560;         // n_embd
@@ -229,6 +230,11 @@ auto &xn = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[D]>(
         for (int j = lane; j < D / 8; j += 32) acc += dotw<Q8>(q8, ldw<Q8>(wmat, sq, row0 + (size_t) j * 8), xn + j * 8);
         acc = warp_sum(acc);
     } else {
+        if constexpr (Q8) {   // STRATA_HC_REQ8: one chain over the row (CUDA's order, what the multi read's Q8 down sums too)
+#pragma unroll 4
+            for (int j = lane; j < D / 8; j += 32) acc += dotw<Q8>(q8, ldw<Q8>(wmat, sq, row0 + (size_t) j * 8), xn + j * 8);
+            acc = warp_sum(acc);
+        } else
         for (int sp = 0; sp < DOWN_SPLIT; ++sp) {
             float part = 0.0f;
 #pragma unroll 5
@@ -462,7 +468,7 @@ bool gr_norm_split() {   // default; STRATA_GR_NORM_SPLIT=0: one work-group per 
 // which fits all eight tokens in one 40 KiB launch and stages 160 chunks of 8 (5 per lane, half the registers held
 // for the weight prefetch); smaller tiles raise how many blocks share an SM (the 41-block grid), e.g. three blocks
 // of four tokens instead of one on sm_75.
-template <int TILEV, int MAX_T = kFusedGrMaxT, bool Q8 = false>
+template <int TILEV, int MAX_T = kFusedGrMaxT, bool Q8 = false, int SPLITS = DOWN_SPLIT>   // SPLITS 1: one chain per row (Q8)
 /*
 DPCT1110: The total declared local variable size in device function
 gr_down_multi_kernel exceeds 128 bytes and may cause high register pressure.
@@ -476,8 +482,8 @@ __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     const int T = m.T;
     const int gid = (int) item_ct1.get_group(2);
-    const bool inject_block = gid == DOWN_BLOCKS * DOWN_SPLIT;
-    const int split = inject_block ? 0 : gid % DOWN_SPLIT, rb = inject_block ? 0 : gid / DOWN_SPLIT;
+    const bool inject_block = gid == DOWN_BLOCKS * SPLITS;
+    const int split = inject_block ? 0 : gid % SPLITS, rb = inject_block ? 0 : gid / SPLITS;
     const int row = inject_block ? warp : rb * WARPS + warp;
     const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
     const uint16_t* wmat = inject_block ? m.a[0].w_inject : m.a[0].w_down;
@@ -487,7 +493,7 @@ __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
     float acc[MAX_T];
 #pragma unroll
     for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
-    for (int base = inject_block ? 0 : split * TILEV; base < D; base += inject_block ? TILEV : TILEV * DOWN_SPLIT) {
+    for (int base = inject_block ? 0 : split * TILEV; base < D; base += inject_block ? TILEV : TILEV * SPLITS) {
         sycl::uint4 wv[TQ];
         if (active) {
 #pragma unroll
@@ -727,7 +733,7 @@ Consult with your hardware vendor to find the total register size available and
 adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
 // COLS: columns per block (UPM_COLS, or UPM_COLS_MORE with LO_ONCE under gr_more_groups)
-template <int COLS = UPM_COLS, bool ILP = false, bool LO_ONCE = false>   // columns per block: 16 (the original), 8 or 4 - each row's dot, butterfly and the per-column
+template <int COLS = UPM_COLS, bool ILP = false, bool LO_ONCE = false, bool Q8 = false>   // Q8: int8 codes (STRATA_HC_REQ8); columns per block: 16 (the original), 8 or 4 - each row's dot, butterfly and the per-column
 __dpct_inline__ void gr_up_multi_kernel(GrMulti m) {   // stream sum unchanged, so the same bits; more blocks, fewer serial rows per warp
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
@@ -767,21 +773,11 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
     float* const pRout = GR_PICK(m, pk, R_out);
     for (int r = warp; r < HC * COLS; r += WARPS) {
         const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
-        const sycl::uint4 *w4 =
-            reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
-        const sycl::uint4 wa = *(w4 + lane);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
-        const sycl::uint4 wb =
-            lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
+        // ldw<false> is the plain 16-byte read of w_up's row i (the bf16 path's); ldw<true> the Q8 chunk (int8 codes + scale)
+        const sycl::uint4 wa = ldw<Q8>(m.a[0].w_up, m.a[0].s_up, (size_t) i * LR + (size_t) lane * 8);
+        const sycl::uint4 wb = lane < LR / 8 - 32
+            ? ldw<Q8>(m.a[0].w_up, m.a[0].s_up, (size_t) i * LR + (size_t) (32 + lane) * 8)
+            : sycl::uint4(0, 0, 0, 0);
         // the epilogue inputs of this lane's token, fetched while the dots run
         float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
         bool apply = false;
@@ -799,8 +795,8 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
             for (int k = 0; k < kFusedGrMaxT; ++k) {
                 float acc = 0.0f;
                 if (k < T) {
-                    acc = dot8(wa, lo[k] + lane * 8);
-                    if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+                    acc = dotw<Q8>(Q8, wa, lo[k] + lane * 8);
+                    if (lane < LR / 8 - 32) acc += dotw<Q8>(Q8, wb, lo[k] + (32 + lane) * 8);
                 }
                 accs[k] = acc;
             }
@@ -816,8 +812,8 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
 #pragma unroll
         for (int k = 0; k < kFusedGrMaxT; ++k) {
             if (k >= T) break;
-            float acc = dot8(wa, lo[k] + lane * 8);
-            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+            float acc = dotw<Q8>(Q8, wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dotw<Q8>(Q8, wb, lo[k] + (32 + lane) * 8);
             acc = warp_sum(acc);
             if (lane == k) mine = acc;
         }
@@ -1578,14 +1574,327 @@ int down_chunk(bool staged, int* tile_out) {
     return staged ? chunk_staged[dev] : chunk[dev];
 }
 
-// STRATA_HC_REQ8 (int8 projections: s_down / s_up) and STRATA_HC_Q8 (Q8_0 bytes: q8_down / q8_up) reads are not built
-// on the SYCL port: refuse them loudly rather than read int8 codes as bf16.
-void refuse_q8(const FusedGrArgs& a, const char* who) {
-    if (a.s_down || a.s_up || a.q8_down || a.q8_up) {
-        std::fprintf(stderr, "%s: the Q8 hyper-connection reads (STRATA_HC_REQ8 / STRATA_HC_Q8) are not built on the "
-                             "SYCL port; run without them\n", who);
-        std::exit(1);
+// The projections a read takes: bf16 (w_down / w_up), the int8 codes of STRATA_HC_REQ8 (w_down / w_up hold the codes,
+// s_down / s_up their fp32 scales per 32 values), or the GGUF's Q8_0 bytes of STRATA_HC_Q8 (q8_down / q8_up).  A
+// half-set pair or a mix is refused, and so is a kind the calling function does not build (gguf_ok false).
+enum class HcWeights { Bf16, Int8, Gguf };
+HcWeights hc_weights(const FusedGrArgs& a, const char* who, bool gguf_ok) {
+    const bool s = a.s_down != nullptr || a.s_up != nullptr;
+    const bool g = a.q8_down != nullptr || a.q8_up != nullptr;
+    if (!s && !g) return HcWeights::Bf16;
+    if (s && !g && a.s_down && a.s_up && a.w_down && a.w_up) return HcWeights::Int8;
+    if (g && !s && gguf_ok && a.q8_down && a.q8_up) return HcWeights::Gguf;
+    std::fprintf(stderr, "%s: the Q8 hyper-connection read (STRATA_HC_REQ8 / STRATA_HC_Q8) is not built for this call "
+                         "(it needs a whole pair of one kind%s); run without it\n", who,
+                 gguf_ok ? "" : ", and STRATA_HC_Q8 is only built in fused_gr_read_multi");
+    std::exit(1);
+}
+
+// STRATA_HC_Q8 (the GGUF's Q8_0 projections): the S23 read of src/kernels/cuda/fused_gr.cu (gr_down_q8_kernel and
+// gr_up_q8_kernel, the same arithmetic and order; the silu's native exp is this port's).  A Q8_0 block is 34 bytes (fp16
+// d, 32 int8).  `down` runs on (10 groups of 32 rows + the inject rows) x 16 chunks of 640 columns, each chunk writing
+// its partial dots at part[(k * Q8_NKC + kc) * PR + row] and its sums of squares at ssg[k * Q8_NKC + kc]; `up` sums the
+// 4 chunks of each stream in order.  No q8_1 images (the caller quantizes, as for the other reads here).
+constexpr int Q8B = 34;                          // Q8_0 block: fp16 d + 32 int8
+constexpr int Q8_RPW = 4;                        // down rows per warp
+constexpr int Q8_RG = LR / (WARPS * Q8_RPW);     // 10 row groups (+1: the inject rows)
+constexpr int Q8_KC = 640, Q8_NKC = D / Q8_KC;   // 16 chunks, 4 per stream
+constexpr int Q8_CPS = N / Q8_KC;                // chunks per stream
+constexpr int Q8_SPB = Q8_KC / 128;              // 5 steps of 4 Q8_0 blocks (8 lanes x 4 values each)
+__dpct_inline__ uint32_t q8_ld16(const uint8_t* p) { return *(const uint16_t*) p; }
+__dpct_inline__ float q8_half(uint32_t h) { return static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) h)); }
+__dpct_inline__ sycl::float4 q8_four(uint32_t q, float d) {
+    return sycl::float4(d * (float) (int8_t) (q & 255u), d * (float) (int8_t) ((q >> 8) & 255u),
+                        d * (float) (int8_t) ((q >> 16) & 255u), d * (float) (int8_t) (q >> 24));
+}
+
+template <int T>
+__dpct_inline__ void gr_down_q8_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto& xs = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][Q8_KC]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto& red = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS][T]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = (int) item.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int rg = (int) item.get_group(2), kc = (int) item.get_group(1), c = kc / Q8_CPS;
+    const bool inj = rg == Q8_RG;
+    // the inject rows are the pack's bf16 (exact) unless a Q8_0 copy is given (q8_inject)
+    const bool inj_bf16 = inj && m.a[0].q8_inject == nullptr;
+    const int nrows = inj ? (((m.a[0].q8_inject != nullptr || m.a[0].w_inject != nullptr) && warp < HC) ? 1 : 0) : Q8_RPW;
+    const int row0 = inj ? warp : (rg * WARPS + warp) * Q8_RPW;
+    const uint8_t* wb = inj ? m.a[0].q8_inject : m.a[0].q8_down;
+    const int sub = lane & 7, bl = lane >> 3;    // lanes 8b..8b+7: one Q8_0 block, 4 values each
+    uint32_t q[Q8_RPW][Q8_SPB];
+    float dq[Q8_RPW][Q8_SPB];
+#pragma unroll
+    for (int r = 0; r < Q8_RPW; ++r) {
+        if (r >= nrows || inj_bf16) break;
+        const uint8_t* row = wb + (size_t) (row0 + r) * (D / 32) * Q8B + (size_t) kc * (Q8_KC / 32) * Q8B;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const uint8_t* blk = row + (4 * s + bl) * Q8B;
+            dq[r][s] = q8_half(q8_ld16(blk));
+            q[r][s] = q8_ld16(blk + 2 + 4 * sub) | q8_ld16(blk + 4 + 4 * sub) << 16;
+        }
     }
+    // step 1: this chunk of R' * w_norm (unscaled) into xs, and the chunk's sums of squares of R'
+    float ssp[T];
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        ssp[k] = 0.0f;
+        const FusedGrArgs& a = m.a[k];
+        const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+        for (int i = t; i < Q8_KC / 4; i += THREADS) {
+            const int col = kc * Q8_KC + 4 * i;
+            sycl::float4 r = *reinterpret_cast<const sycl::float4*>(a.R + col);
+            if (a.apply) {
+                const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(a.bo_prev + (col - c * N));
+                r.x() = sycl::fma(b.x(), gw, r.x());
+                r.y() = sycl::fma(b.y(), gw, r.y());
+                r.z() = sycl::fma(b.z(), gw, r.z());
+                r.w() = sycl::fma(b.w(), gw, r.w());
+            }
+            const sycl::float4 g = *reinterpret_cast<const sycl::float4*>(a.w_norm + col);
+            ssp[k] += r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+            *reinterpret_cast<sycl::float4*>(&xs[k][4 * i]) =
+                sycl::float4(r.x() * g.x(), r.y() * g.y(), r.z() * g.z(), r.w() * g.w());
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        const float v = warp_sum(ssp[k]);
+        if (lane == 0) red[warp][k] = v;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (rg == 0 && t < T) {
+        float s = 0.0f;
+        for (int w = 0; w < WARPS; ++w) s += red[w][t];
+        ssg[t * Q8_NKC + kc] = s;
+    }
+    if (nrows == 0) return;
+    // step 2: this chunk's partial dots of the rows
+#pragma unroll
+    for (int r = 0; r < Q8_RPW; ++r) {
+        if (r >= nrows) break;
+        float acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const int v = 32 * (4 * s + bl) + 4 * sub;
+            sycl::float4 w;
+            if (inj_bf16) {
+                const sycl::uint2 b = *reinterpret_cast<const sycl::uint2*>(
+                    m.a[0].w_inject + (size_t) row0 * D + (size_t) kc * Q8_KC + v);
+                w = sycl::float4(sycl::bit_cast<float>(b.x() << 16), sycl::bit_cast<float>(b.x() & 0xffff0000u),
+                                 sycl::bit_cast<float>(b.y() << 16), sycl::bit_cast<float>(b.y() & 0xffff0000u));
+            } else {
+                w = q8_four(q[r][s], dq[r][s]);
+            }
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                const sycl::float4 x = *reinterpret_cast<const sycl::float4*>(&xs[k][v]);
+                acc[k] = sycl::fma(w.x(), x.x(), acc[k]);
+                acc[k] = sycl::fma(w.y(), x.y(), acc[k]);
+                acc[k] = sycl::fma(w.z(), x.z(), acc[k]);
+                acc[k] = sycl::fma(w.w(), x.w(), acc[k]);
+            }
+        }
+        const int prow = inj ? LR + warp : row0 + r;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float v = warp_sum(acc[k]);
+            if (lane == 0) part[((size_t) k * Q8_NKC + kc) * PR + prow] = v;
+        }
+    }
+}
+
+template <int T>
+__dpct_inline__ void gr_up_q8_kernel(GrMulti m, const float* __restrict__ part, const float* __restrict__ ssg) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto& lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][LR]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto& rsS = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto& g = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[T][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = (int) item.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int blk = (int) item.get_group(2);
+    const int d0 = blk * UPM_COLS;
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[k * Q8_NKC + c * Q8_CPS + j];
+        const float r = sycl::rsqrt(ss / (float) N + GR_PICK(m, k, eps));
+        rsS[k][c] = r;
+        if (blk == 0) GR_PICK(m, k, rs)[c] = r;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    // the streams' chunk partials summed in order, rs applied; silu into lo (and the inject rows, block 0)
+    for (int i = t; i < T * PR; i += THREADS) {
+        const int k = i / PR, r = i - k * PR;
+        if (r >= LR && (blk != 0 || GR_PICK(m, k, w_inject) == nullptr)) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
+            sum = sycl::fma(rsS[k][c], p, sum);
+        }
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            lo[k][r] = x / (1.0f + sycl::native::exp(-x));
+        } else {
+            GR_PICK(m, k, inject_out)[r - LR] = sum;
+        }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    constexpr int RPW8 = HC * UPM_COLS / WARPS;   // 8 rows per warp
+    const int pk = lane < T ? lane : 0;           // this lane's token, picked with compile-time indices
+#pragma unroll 1
+    for (int qq = 0; qq < RPW8; ++qq) {
+        const int r = warp + qq * WARPS;
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
+        sycl::float4 w[3];
+#pragma unroll
+        for (int s = 0; s < 3; ++s) {   // lane: values 4 lane + 128 s (the third step: lanes 0-15)
+            const int v = 4 * lane + 128 * s;
+            if (v < LR) {
+                const uint8_t* b = row + (v >> 5) * Q8B;
+                w[s] = q8_four(q8_ld16(b + 2 + (v & 31)) | q8_ld16(b + 4 + (v & 31)) << 16, q8_half(q8_ld16(b)));
+            } else {
+                w[s] = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            rv = GR_PICK(m, pk, R)[i];
+            wn = GR_PICK(m, pk, w_norm)[i];
+            apply = GR_PICK(m, pk, apply);
+            if (apply) {
+                bo = GR_PICK(m, pk, bo_prev)[d0 + dd];
+                ip = GR_PICK(m, pk, inj_prev)[c];
+            }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s = 0; s < 3; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const sycl::float4 x = *reinterpret_cast<const sycl::float4*>(&lo[k][v]);
+                    acc = sycl::fma(w[s].x(), x.x(), acc);
+                    acc = sycl::fma(w[s].y(), x.y(), acc);
+                    acc = sycl::fma(w[s].z(), x.z(), acc);
+                    acc = sycl::fma(w[s].w(), x.w(), acc);
+                }
+            }
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                GR_PICK(m, pk, R_out)[i] = rv;
+            }
+            const float x = rv * wn * rsS[lane][c];
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        GR_PICK(m, k, mixed)[d0 + col] = sum / (float) HC;
+    }
+}
+
+template <int T>
+void launch_gguf_t(const GrMulti& m, float* part, float* ssg, dpct::queue_ptr st, unsigned long long* stamp_buf,
+                   int stamp_i0) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+    st->parallel_for<dpct_kernel_name<class gr_down_q8_gguf_k_3b9e1d, dpct_kernel_scalar<T>>>(
+        sycl::nd_range<3>(sycl::range(1, Q8_NKC, Q8_RG + 1) * sycl::range(1, 1, THREADS),
+                          sycl::range(1, 1, THREADS)),
+        exp_props,
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_q8_kernel<T>(m, part, ssg); });
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    st->parallel_for<dpct_kernel_name<class gr_up_q8_gguf_k_3b9e1d, dpct_kernel_scalar<T>>>(
+        sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
+        exp_props,
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_up_q8_kernel<T>(m, part, ssg); });
+}
+// the GGUF read of m.T tokens: the scratch holds the chunk partials (T * Q8_NKC * PR floats) and the sums (T * Q8_NKC)
+void launch_gguf_multi(const GrMulti& m, float* scratch, dpct::queue_ptr st, unsigned long long* stamp_buf,
+                       int stamp_i0) {
+    float* part = scratch;
+    float* ssg = scratch + (size_t) m.T * Q8_NKC * PR;
+    switch (m.T) {
+        case 1: launch_gguf_t<1>(m, part, ssg, st, stamp_buf, stamp_i0); return;
+        case 2: launch_gguf_t<2>(m, part, ssg, st, stamp_buf, stamp_i0); return;
+        case 3: launch_gguf_t<3>(m, part, ssg, st, stamp_buf, stamp_i0); return;
+        case 4: launch_gguf_t<4>(m, part, ssg, st, stamp_buf, stamp_i0); return;
+        case 5: launch_gguf_t<5>(m, part, ssg, st, stamp_buf, stamp_i0); return;
+        case 6: launch_gguf_t<6>(m, part, ssg, st, stamp_buf, stamp_i0); return;
+        case 7: launch_gguf_t<7>(m, part, ssg, st, stamp_buf, stamp_i0); return;
+        default: launch_gguf_t<kFusedGrMaxT>(m, part, ssg, st, stamp_buf, stamp_i0); return;
+    }
+}
+
+// STRATA_HC_REQ8 (int8 codes) down of the multi read: gr_down_multi_kernel with ONE split, so each row is one chain over
+// the whole row (the CUDA order, and the single-token read's: bitwise the same per token).  Launches hold the tokens the
+// device's local memory fits (TILE floats each, as the tiled bf16 path); token k's partials land at part[k * LR] (the
+// split-0 slot that the up kernel sums, with m.nsplit 1).
+void launch_down_int8(dpct::queue_ptr st, const GrMulti& m) {
+    static int chunk[64] = {};   // tokens per launch on this card (0 = not computed yet)
+    const int dev = dpct::get_current_device_id();
+    if (dev >= 0 && dev < 64 && chunk[dev] == 0) {
+        const int optin = (int) dpct::get_device(dev).get_local_mem_size();
+        const int capacity = (optin > 0 ? optin : 48 * 1024) / (int) (TILE * sizeof(float));
+        chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
+    }
+    const int chunk_tok = (dev >= 0 && dev < 64) ? chunk[dev] : kFusedGrMaxT;
+    for (int c0 = 0; c0 < m.T; c0 += chunk_tok) {
+        const int ct = m.T - c0 < chunk_tok ? m.T - c0 : chunk_tok;
+        GrMulti c{};
+        c.xn = m.xn + (size_t) c0 * D;
+        c.T = ct;
+        c.part = m.part + (size_t) c0 * LR;
+        c.nsplit = 1;
+        for (int k = 0; k < ct; ++k) c.a[k] = m.a[c0 + k];
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        st->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<uint8_t, 1> tile_acc(sycl::range((size_t) ct * TILE * sizeof(float)), cgh);
+            cgh.parallel_for<dpct_kernel_name<class gr_down_multi_s8_k_3b9e1d, dpct_kernel_scalar<TILE>>>(
+                sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) * sycl::range(1, 1, THREADS),
+                                  sycl::range(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                    gr_down_multi_kernel<TILE, kFusedGrMaxT, true, 1>(
+                        c, tile_acc.get_multi_ptr<sycl::access::decorated::no>().get());
+                });
+        });
+    }
+}
+// STRATA_HC_REQ8 up of the multi read: gr_up_multi_kernel on the int8 rows, 16 columns a block (UPM_BLOCKS blocks)
+void launch_up_int8(dpct::queue_ptr st, const GrMulti& m) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+    st->parallel_for<dpct_kernel_name<class gr_up_multi_s8_k_3b9e1d>>(
+        sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
+        exp_props,
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_up_multi_kernel<UPM_COLS, false, false, true>(m); });
 }
 
 // The multi read as `variant` (kHcPlain, kHcSplit or kHcStaged): the norm, the down projection in launches of as
@@ -1594,7 +1903,13 @@ void refuse_q8(const FusedGrArgs& a, const char* who) {
 // takes first).
 void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                   unsigned long long *stamp_buf, int stamp_i0) {
-    for (int t = 0; t < m.T; ++t) refuse_q8(m.a[t], "launch_multi");
+    const HcWeights wkind = hc_weights(m.a[0], "launch_multi", false);
+    for (int t = 1; t < m.T; ++t)
+        if (hc_weights(m.a[t], "launch_multi", false) != wkind) {
+            std::fprintf(stderr, "launch_multi: the tokens' projections differ\n");
+            std::exit(1);
+        }
+    const bool q8w = wkind == HcWeights::Int8;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
     const int n_tok = m.T;
     if (variant >= kHcSplit) {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
@@ -1622,6 +1937,15 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
             });
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+    if (q8w) {   // STRATA_HC_REQ8: the int8 down and up (the bf16 staged and tiled paths below read bf16 only)
+        GrMulti mq = m;
+        mq.part = down_partials(st);
+        mq.nsplit = 1;
+        launch_down_int8(st, mq);
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+        launch_up_int8(st, mq);
+        return;
+    }
     const bool staged = variant >= kHcStaged;
     int tv = 2560;
     const int chunk_tok = down_chunk(staged, &tv);
@@ -1849,20 +2173,26 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         std::exit(1);
     }
     GrMulti m;
+    const HcWeights kind = hc_weights(a[0], "fused_gr_read_multi", true);
     for (int t = 0; t < n_tok; ++t) {
         m.a[t] = a[t];
         const FusedGrArgs& x = a[t];
-        if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
-            (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
-            x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
+        if (!x.R || !x.w_norm || !((x.w_down && x.w_up) || (x.q8_down && x.q8_up)) || !x.lo || !x.rs || !x.mixed ||
+            (x.w_inject && !x.inject_out) || (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) ||
+            x.w_down != a[0].w_down || x.w_up != a[0].w_up || x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm ||
+            x.q8_down != a[0].q8_down || x.q8_up != a[0].q8_up || x.q8_inject != a[0].q8_inject ||
+            x.s_down != a[0].s_down || x.s_up != a[0].s_up || hc_weights(x, "fused_gr_read_multi", true) != kind) {
             std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
             std::exit(1);
         }
     }
-    for (int t = 0; t < n_tok; ++t) refuse_q8(a[t], "fused_gr_read_multi");
     m.xn = xn_scratch;
     m.T = n_tok;
     dpct::queue_ptr st = strata::q_of(stream);
+    if (kind == HcWeights::Gguf) {   // STRATA_HC_Q8: the GGUF's Q8_0 projections (no q8_1 images: the caller quantizes)
+        launch_gguf_multi(m, xn_scratch, st, stamp_buf, stamp_i0);
+        return false;
+    }
     // STRATA_GR_V3=1: the two-kernel read above (another summation order - opt-in)
     static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
     static int split3[64] = {};   // per device: 0 = not decided yet, 1 / 2 = column halves S, -1 = does not fit
@@ -2029,7 +2359,10 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         attr[dev] = true;
     }
     const int chunk_tok = (dev >= 0 && dev < 64 && chunk[dev]) ? chunk[dev] : kFusedGrMaxT;
-    if (gr_down_sliced() && gr_more_groups(st)) {
+    if (kind == HcWeights::Int8) {   // STRATA_HC_REQ8: one split, the int8 codes (the CUDA order)
+        m.nsplit = 1;
+        launch_down_int8(st, m);
+    } else if (gr_down_sliced() && gr_more_groups(st)) {
         m.part2 = slice_partials(st);
         m.nsplit = 1;
         if (gr_large_grf(st)) launch_gr_down_more<true>(st, m);
@@ -2112,7 +2445,9 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
-    if (gr_more_groups(st)) {
+    if (kind == HcWeights::Int8) {
+        launch_up_int8(st, m);
+    } else if (gr_more_groups(st)) {
         if (gr_large_grf(st)) launch_gr_up_more<true>(st, m);
         else launch_gr_up_more<false>(st, m);
     } else {
@@ -2124,7 +2459,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     need to rewrite this code.
     */
     const dpct::err0 e = 0;
-    return false;   // SYCL port: the q8_1 images (S26 STRATA_QFUSE) and the Q8_0 reads (S23 STRATA_HC_Q8) are not built; the caller quantizes
+    return false;   // SYCL port: the q8_1 images (S26 STRATA_QFUSE) are not built; the caller quantizes
 }
 
 // the bench only (AMD latency-hidden kernels): nothing to switch on the SYCL port
@@ -2215,6 +2550,22 @@ bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
     return n_embd == N && hc == HC && hc_lr == LR;
 }
 
+// STRATA_HC_REQ8 single-token read: the plain down and up kernels with the int8 projections (gr_down_kernel<true>,
+// gr_up_kernel<true>), each one token: the same launch shapes as the bf16 pair below
+static void launch_single_int8(dpct::queue_ptr st, const FusedGrArgs& a) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+    st->parallel_for<dpct_kernel_name<class gr_down_kernel_s8_3b9e1d>>(
+        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) * sycl::range(1, 1, THREADS),
+                          sycl::range(1, 1, THREADS)),
+        exp_props,
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { gr_down_kernel<true>(a); });
+    st->parallel_for<dpct_kernel_name<class gr_up_kernel_s8_3b9e1d>>(
+        sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
+        exp_props,
+        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { gr_up_kernel<true>(a); });
+}
+
 void fused_gr_read(const FusedGrArgs& a, void* stream) {
     if (!a.R || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs || !a.mixed ||
         (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev || !a.R_out)) ||
@@ -2222,7 +2573,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         std::fprintf(stderr, "fused_gr_read: invalid arguments\n");
         std::exit(1);
     }
-    refuse_q8(a, "fused_gr_read");
+    const bool s8 = hc_weights(a, "fused_gr_read", false) == HcWeights::Int8;   // STRATA_HC_Q8 is not built for one token
     dpct::queue_ptr st = strata::q_of(stream);
     // SYCL port: the multi-token read's sliced down kernel and per-(token, stream) norm sum in their own orders, so a
     // window's token would differ in its last bits from this kernel's. The header promises "every token's outputs
@@ -2239,6 +2590,10 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
             scratch = p;
         }
         fused_gr_read_multi(&a, 1, scratch, stream);
+        return;
+    }
+    if (s8) {
+        launch_single_int8(st, a);
         return;
     }
     {
@@ -2516,7 +2871,10 @@ void fused_gr_check() {
     if (dev < 0 || dev >= 64 || g_variant[dev].load() > 0) return;
     // SYCL port: the port's own read (sliced down / split norm, STRATA_GR_DOWN_SLICED etc.) does not use upstream's
     // variants, and their self-test crashes on the B70 (0.1.32 merge, under investigation): opt-in only.
-    if (std::getenv("STRATA_HC_CHECK") == nullptr) {
+    if (std::getenv("STRATA_HC_CHECK") != nullptr)   // its split / staged launches no longer match the kernel here
+        std::fprintf(stderr, "strata hc: STRATA_HC_CHECK: the read self-test is not built for the SYCL engine - the "
+                             "plain read\n");
+    if (true) {
         g_variant[dev].store(kHcPlain);
         return;
     }

@@ -50,12 +50,11 @@ bool hc_q8_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_HC_Q8");
 #if defined(STRATA_GPU_SYCL)
-        // the SYCL engine's fused_gr has no Q8_0 read: the bf16 read, also for a file that stores these as Q8_0
-        // (generate.cpp switches STRATA_HC_Q8 on by itself for such a file)
+        // SYCL engine: the Q8_0 read is opt-in until it has run on an Intel GPU (STRATA_HC_Q8=1; the automatic
+        // switch-on for Q8_0 files is off in generate.cpp)
         if (v != nullptr && v[0] == '1')
-            std::fprintf(stderr, "strata: STRATA_HC_Q8: no Q8_0 hyper-connection read in the SYCL engine yet; "
-                                 "the bf16 read is used\n");
-        return false;
+            std::fprintf(stderr, "strata: STRATA_HC_Q8=1: the Q8_0 hyper-connection read (EXPERIMENTAL on SYCL)\n");
+        return v != nullptr && v[0] == '1';
 #endif
         if (v != nullptr && v[0] == '1') return true;
         if (v != nullptr && v[0] != '\0' && std::strcmp(v, "auto") != 0) return false;

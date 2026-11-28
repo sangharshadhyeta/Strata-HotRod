@@ -3654,7 +3654,8 @@ int main(int argc, char** argv) {
             if (!ple_only && !ple_present)
                 o.native_dense_gguf.push_back(o.ple_gguf);
         }
-#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL) && \
+    !defined(STRATA_GPU_SYCL)
         // CUDA, a file that carries the hyper-connection projections as Q8_0 (Unsloth's UD-* files): the Q8_0 read is on by default (upstream
         // Strata 567c46873, owner yes 2026-11-07, ported by hand).  The GSQ-RCO packs keep them BF16 and stay as they were.  STRATA_HC_Q8=0
         // turns it off; a value the user set is kept.  Before the first read of the switch (the dense load below).
@@ -4375,10 +4376,7 @@ int main(int argc, char** argv) {
     if (hc_req8_env && multi_gpu)
         std::fprintf(stderr, "strata generate: WARNING: STRATA_HC_REQ8 does not support a layer split yet - the BF16 "
                              "projections are used\n");
-    if (hc_req8_env)
-        std::fprintf(stderr, "strata generate: STRATA_HC_REQ8: no int8 hyper-connection read in the SYCL "
-                             "engine yet - the BF16 projections are used\n");
-    const bool hc_q8 = false;
+    const bool hc_q8 = hc_req8_env && !multi_gpu;
     if (hc_q8) strata::core::WeightTable::hc_q8_names(g.n_layers, skip);
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
