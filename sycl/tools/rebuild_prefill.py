@@ -1,10 +1,13 @@
 """rebuild_prefill.py: the SYCL engine's prefill.cpp = our real src/prefill/prefill.cpp + the Intel pieces of the SYCL
-copy (read from the committed copy, tmp/prefill_head.cpp).  Every step asserts its anchor; nothing is guessed."""
+copy (read from the commit that holds it: COPY below; needs that commit in the clone).  Every step asserts its anchor; nothing is guessed."""
+import os
 import re
+import subprocess
 
-W = "/home/Projects/Strata-sycl"
+W = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repository
+COPY = "e5c73c16e:sycl/src/prefill/prefill.cpp"   # the SYCL copy the Intel pieces are cut from
 s = open(f"{W}/src/prefill/prefill.cpp").read()
-H = open("/root/.claude/jobs/743230e4/tmp/prefill_head.cpp").read()
+H = subprocess.run(["git", "-C", W, "show", COPY], capture_output=True, text=True, check=True).stdout
 
 
 def sub(old, new, count=1):

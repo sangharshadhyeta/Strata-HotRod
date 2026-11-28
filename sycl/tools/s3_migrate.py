@@ -1,16 +1,15 @@
 """s3_migrate.py STEP: S3 of the SYCL port (sycl/PORT-C.md) - our .cu changes since the copies' base into sycl/.
   list     : the .cu files changed or added since fde1d795e
-  base     : a worktree at fde1d795e (/home/Projects/sycl-s3/base) and SYCLomatic over its changed .cu -> base_out
-  new      : SYCLomatic over the same .cu in Strata-sycl (HEAD) -> new_out
-  merge    : 3-way merge (merge_upstream.py's rule, .cu only) into Strata-sycl/sycl; new .cu get the dpct output as is
+  base     : a worktree at fde1d795e ($SYCL_S3_DIR/base) and SYCLomatic over its changed .cu -> base_out
+  new      : SYCLomatic over the same .cu in this checkout (HEAD) -> new_out
+  merge    : 3-way merge (merge_upstream.py's rule, .cu only) into sycl/; new .cu get the dpct output as is
 """
 import os, re, shutil, subprocess, sys
 
-W = "/home/Projects/Strata-sycl"
-OUT = "/home/Projects/sycl-s3"
+W = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repository
+OUT = os.environ.get("SYCL_S3_DIR", os.path.join(os.path.dirname(W), "sycl-s3"))   # work directory
 BASE = "fde1d795e"
-env = dict(os.environ, CUDA_HEADERS="/home/intel/cuda-headers/include",
-           PATH="/home/intel/syclomatic/x/bin:" + os.environ["PATH"])
+env = dict(os.environ)   # set CUDA_HEADERS (the CUDA include directory) and put SYCLomatic's dpct on PATH
 
 
 def git(*a, cwd=W):
@@ -70,8 +69,8 @@ elif step == "merge":
         ph, bh = hashes(open(pf).read()), hashes(bt)
         nt = pat.sub(lambda m: f"{m.group(1)}_{bh[m.group(1)]}" if m.group(1) in bh else m.group(0), nt)
         canon = lambda t: pat.sub(lambda m: f"{m.group(1)}_{ph[m.group(1)]}" if m.group(1) in ph else m.group(0), t)
-        open("/root/.claude/jobs/743230e4/tmp/_b", "w").write(canon(bt))
-        open("/root/.claude/jobs/743230e4/tmp/_n", "w").write(canon(nt))
+        open(f"{OUT}/_b", "w").write(canon(bt))
+        open(f"{OUT}/_n", "w").write(canon(nt))
         r = subprocess.run(["git", "merge-file", "--diff3", "-L", "sycl", "-L", "base", "-L", "ours-now", pf,
-                            "/root/.claude/jobs/743230e4/tmp/_b", "/root/.claude/jobs/743230e4/tmp/_n"]).returncode
+                            f"{OUT}/_b", f"{OUT}/_n"]).returncode
         print("MERGED" if r == 0 else f"CONFLICT {r}", rel)

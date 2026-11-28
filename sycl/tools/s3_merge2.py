@@ -3,8 +3,8 @@ SYCLomatic(HEAD) + fixups.py (same tool version, so formatting matches), ours = 
 New .cu (no copy) get SYCLomatic(HEAD) + fixups as they are.  Prints the conflict count per file."""
 import os, shutil, subprocess
 
-W = "/home/Projects/Strata-sycl"
-S3 = "/home/Projects/sycl-s3"
+W = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repository
+S3 = os.environ.get("SYCL_S3_DIR", os.path.join(os.path.dirname(W), "sycl-s3"))   # work directory
 for name in ("base", "new"):
     T = f"{S3}/{name}_fixed"
     shutil.rmtree(T, ignore_errors=True)

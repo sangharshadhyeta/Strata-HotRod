@@ -1,6 +1,8 @@
 """rebuild_generate.py: the SYCL engine's generate.cpp = our real src/program/generate.cpp + the Intel pieces of the SYCL
 copy.  Every step asserts its anchor."""
-W = "/home/Projects/Strata-sycl"
+import os
+
+W = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repository
 s = open(f"{W}/src/program/generate.cpp").read()
 
 
