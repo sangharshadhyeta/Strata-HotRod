@@ -6107,6 +6107,16 @@ void ls_report(size_t n_layers) {   // every 1024 windows, from the last layer: 
         std::fprintf(stderr, "  layers %2zu-%2zu: %9llu %8llu %8llu %8llu   (%4.1f%% / %4.1f%% / %4.1f%% / %4.1f%%)\n", lo, hi - 1, (unsigned long long) v[0], (unsigned long long) v[1],
                      (unsigned long long) v[2], (unsigned long long) v[3], 100.0 * v[0] / t, 100.0 * v[1] / t, 100.0 * v[2] / t, 100.0 * v[3] / t);
     }
+    // every layer, cumulative: two reports' difference is that stretch's, and the layer's kind (attention or not) is the reader's to apply
+    std::string line = "strata serve: layer stats by layer (cumulative; layer:VRAM/PCIe/CPU/skipped):";
+    for (size_t l = 0; l < n_layers && l < (size_t) kLayerMultCap; ++l) {
+        char one[96];
+        std::snprintf(one, sizeof one, " %zu:%llu/%llu/%llu/%llu", l, (unsigned long long) g_ls[l][0].load(std::memory_order_relaxed),
+                      (unsigned long long) g_ls[l][1].load(std::memory_order_relaxed), (unsigned long long) g_ls[l][2].load(std::memory_order_relaxed),
+                      (unsigned long long) g_ls[l][3].load(std::memory_order_relaxed));
+        line += one;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
 }
 
 // ---- STRATA_SLOT_SHARE=1 (opt-in): the VRAM slots follow the layers' non-skippable misses, as RATIOS.  A pick that is served from VRAM, or skipped (a low-weight miss the weight rule drops for free), does not
