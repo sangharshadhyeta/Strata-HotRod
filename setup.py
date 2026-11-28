@@ -2359,12 +2359,13 @@ def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool) -> 
     return env
 
 
-def hotrod_default_env(family: str, model: str, hip: bool) -> dict:
+def hotrod_default_env(family: str, model: str, intel: bool) -> dict:
     """Hot Rod: the run-config "env" this fork's measured setup ran with (Qwen3.8-Flash-Next IQ3_S on an RTX 3060, README):
     stand-ins for ranks 2-9 (an unlimited margin: a pick not on the card gets the best resident expert; ranks 0-1 stay
     exact), the quality-swap counting of the experts stand-ins replaced (SWAP2), and the elastic K/V starting at 4096
-    tokens.  Written for the CUDA IQ3_S config only; any other model's config is left as upstream writes it."""
-    if family != "qwen" or model != "IQ3_S" or hip:
+    tokens.  Written for the IQ3_S config on NVIDIA and AMD (measured on NVIDIA only); an Intel card's config and any
+    other model's is left as upstream writes it."""
+    if family != "qwen" or model != "IQ3_S" or intel:
         return {}
     # 20 Oct night: the rank 0-1 stand-in rule (STRATA_ROUTE_RAM_FLOOR) is not written: r01any leaked <|im_start|>user at 94K
     # tokens, and with rank 1 only a pi harness session gave broken answers on a cold card.  Ranks 0-1 stay exact.  Its keys stay
@@ -7191,7 +7192,8 @@ def main() -> int:
         cfg["env"] = uenv
     if la_model is not None:                           # --expert-predictor
         cfg.setdefault("env", {})["STRATA_LA_MODEL"] = str(la_model)
-    if (henv := hotrod_default_env(family, model, hip)):
+    # an Intel card comes through the AMD path too (sycl/setup_intel.py): its arch is its driver's name, an AMD one "gfx..."
+    if (henv := hotrod_default_env(family, model, hip and not str(gpu.get("arch") or "").startswith("gfx"))):
         cfg["env"] = {**(cfg.get("env") or {}), **henv}
         # no --pcie-frac: any --pcie-frac (0 included) turns STRATA_PCIE_BALANCE off, and the balance sets each layer's PCIe share from
         # measured costs. On the RTX 3060 PC (8 Nov, against --pcie-frac 0): 34.3 vs 31.5 tok/s at 60-120K prompts, 32.9 vs 32.2 at

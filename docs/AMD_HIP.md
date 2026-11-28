@@ -891,3 +891,12 @@ passes. Additional unpublished upstream fixture suites are not covered.
 The published performance table explicitly identifies the measured development
 snapshot; it must not be read as a benchmark of every subsequent rebase. Vision, long-context stress, broad answer-quality
 equivalence, other AMD cards, and mixed-vendor inference are not validated here.
+
+## Hot Rod settings on AMD
+
+For Qwen3.8-Flash-Next IQ3_S, `./setup.sh` writes the same speed settings as on NVIDIA into the config's `env`:
+stand-ins for ranks 3-9 (`STRATA_ROUTE_RESIDENT`, `_RANKS`, `_EDGE`), the quality swaps (`STRATA_SWAP2_MAX`, `_GAP`),
+the learned look-ahead (`STRATA_LA_LEARN`) and prompt chunks up to 16,384 tokens. They have been measured on NVIDIA
+only: stand-ins change answers slightly, so check answers as well as speed. `"STRATA_ROUTE_RESIDENT": "0"` in the
+config's `env` turns the stand-ins off.
+
