@@ -65,3 +65,20 @@ From the copies (`grep "SYCL port"`, and the switches only the copies read):
 
 Fixes of dpct's own output (lost `cudaStreamQuery` answers, `DPCT_CHECK_ERROR(ext_oneapi_empty())` always 0) are not
 carried: the real code calls the CUDA API and the compat layer answers it.
+
+## State 28 Nov evening: everything compiles; the link misses 170 symbols (sycl/S3-undefined.txt)
+
+`prefill.cpp` and `generate.cpp` are now built the option C way: our real file plus the Intel pieces, by
+`sycl/tools/rebuild_prefill.py` and `sycl/tools/rebuild_generate.py` (rerun them after our files change).  generate's
+pieces: `--stream-experts` (our GGUF-mapped source; the SYCL copy's pinned host mirror is not carried), the xe-driver
+PCIe rule (no pinned mirror, so the share defaults to 0 on xe), the non-resident share for the prompt path, leaving
+without unwinding at exit, graph warm-up at start, `logprobs=K`.  Not carried yet: the pinned host mirror
+(STRATA_MIRROR_MIB / LEND_MIRROR), the split-headroom pick (STRATA_SPLIT_HEADROOM), refuse_exit at start-up refusals,
+the usage dump, STRATA_DBG_DRAFT.
+
+Next:
+1. verify.cpp the same way (ours + Intel pieces): the merged one compiles but lost Verifier methods (set_logit_bias,
+   evict_batch_graph, nan_guard_on, note_nonfinite ...).  Its pieces: stepped windows (capture_segments, step hooks),
+   eager replay, STRATA_WINDOW_SYNC, warm(), the debug ladders, the 256-expert router, chain_overlap off.
+2. S3 with SYCLomatic (/home/intel/syclomatic/x/bin/dpct, 21.0.0): re-migrate the changed .cu files (tools/migrate.sh)
+   and 3-way merge onto the .dp.cpp copies (tools/merge_upstream.py), then the new .cu files.
