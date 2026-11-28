@@ -44,7 +44,7 @@ void latent_plan_rows(int32_t* tok, const int32_t* dst, const int32_t* counts, c
         sycl::ext::oneapi::experimental::use_root_sync};
 
     strata::q_of(stream)
-        ->parallel_for<dpct_kernel_name<class latent_plan_rows_k_ed98b9>>(
+        ->parallel_for<dpct_kernel_name<class latent_plan_rows_k_2d257c>>(
             sycl::nd_range<3>(sycl::range(1, 1, 64), sycl::range(1, 1, 64)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {
                 latent_plan_rows_k(tok, dst, counts, ids, labels_dev, (int)E,
@@ -360,7 +360,7 @@ void latent_dequant_packed_f16(const uint8_t* src, int64_t rows, int cols, uint1
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class latent_dequant_packed_f16_k_c4255f>>(
+                dpct_kernel_name<class latent_dequant_packed_f16_k_8178c1>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((n + 127) / 128)) *
                         sycl::range(1, 1, 128),
@@ -390,7 +390,7 @@ void latent_scale_rows(float* x, const float* s, int64_t rows, int cols, void* s
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class latent_scale_rows_k_1019bf>>(
+            ->parallel_for<dpct_kernel_name<class latent_scale_rows_k_62d2a8>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((n + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -412,7 +412,7 @@ void latent_dequant_f16(const uint8_t* src, int64_t rows, int cols, int fmt, uin
             {sycl::aspect::fp16});
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class latent_dequant_f16_k_7f9bae>>(
+            ->parallel_for<dpct_kernel_name<class latent_dequant_f16_k_cde24a>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((nb + 127) / 128)) *
                         sycl::range(1, 1, 128),
@@ -440,7 +440,7 @@ void latent_u_repack_q4(uint8_t* u, int64_t rows, int ELL, void* stream) {
                     sycl::range(smem), cgh);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class latent_u_repack_q4_k_a4ee6b>>(
+                    dpct_kernel_name<class latent_u_repack_q4_k_28092e>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1,
                                     (unsigned)((rows + warps - 1) / warps)) *
@@ -481,7 +481,7 @@ void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* id
                 {sycl::aspect::fp16});
 
             strata::q_of(stream)
-                ->parallel_for<dpct_kernel_name<class latent_u_p4_k_233515>>(
+                ->parallel_for<dpct_kernel_name<class latent_u_p4_k_20296a>>(
                     sycl::nd_range<3>(
                         gp * sycl::range(1, 1, warps_per_block * 32),
                         sycl::range(1, 1, warps_per_block * 32)),
@@ -504,7 +504,7 @@ void latent_u_grouped(const uint8_t* u_q8, const uint8_t* ylq, const int32_t* id
             {sycl::aspect::fp16});
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class latent_u_k_346094>>(
+            ->parallel_for<dpct_kernel_name<class latent_u_k_2523bb>>(
                 sycl::nd_range<3>(grid *
                                       sycl::range(1, 1, warps_per_block * 32),
                                   sycl::range(1, 1, warps_per_block * 32)),
@@ -631,7 +631,7 @@ void latent_u_matvec(const uint8_t* u_q8, const uint8_t* hq, const int32_t* ids,
             {sycl::aspect::fp16});
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class latent_u_matvec_k_8d6618>>(
+            ->parallel_for<dpct_kernel_name<class latent_u_matvec_k_758243>>(
                 sycl::nd_range<3>(grid *
                                       sycl::range(1, 1, warps_per_block * 32),
                                   sycl::range(1, 1, warps_per_block * 32)),

@@ -1825,7 +1825,7 @@ dpct::err0 gdn_rec_chunked(float *state, const float *h, const float *gate,
                     sycl::range(kChunkPrepSmem), cgh);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class gdn_chunk_prep_kernel_5d68c8>>(
+                    dpct_kernel_name<class gdn_chunk_prep_kernel_00916e>>(
                     sycl::nd_range<3>(sycl::range(1, HK, (unsigned)nch) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
@@ -1854,7 +1854,7 @@ dpct::err0 gdn_rec_chunked(float *state, const float *h, const float *gate,
                     sycl::range(kChunkScanSmem), cgh);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class gdn_chunk_scan_kernel_c1c35f>>(
+                    dpct_kernel_name<class gdn_chunk_scan_kernel_860616>>(
                     sycl::nd_range<3>(sycl::range(1, S / GDV, HK) *
                                           sycl::range(1, 1, 128 * VPK),
                                       sycl::range(1, 1, 128 * VPK)),
@@ -3545,7 +3545,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
                         stage ? *stage : strata::kernels::KvHostPools{};
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class kv_append_kernel_850222>>(
+                    dpct_kernel_name<class kv_append_kernel_c23a83>>(
                     sycl::nd_range<3>(sycl::range(8, 2, (unsigned)T) *
                                           sycl::range(1, 1, 64),
                                       sycl::range(1, 1, 64)),
@@ -3608,7 +3608,7 @@ void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class to_f16_kernel_c8575f>>(
+            ->parallel_for<dpct_kernel_name<class to_f16_kernel_b90fe6>>(
                 sycl::nd_range<3>(sycl::range(1, 1,
                                               (unsigned)((n + 255) / 256 < 4096
                                                              ? (n + 255) / 256
@@ -3628,7 +3628,7 @@ void round_f16(const float* x, float* y, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class round_f16_kernel_877aa1>>(
+            ->parallel_for<dpct_kernel_name<class round_f16_kernel_51ce8a>>(
                 sycl::nd_range<3>(sycl::range(1, 1,
                                               (unsigned)((n + 255) / 256 < 4096
                                                              ? (n + 255) / 256
@@ -3648,7 +3648,7 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class to_bf16_kernel_44d81a>>(
+            ->parallel_for<dpct_kernel_name<class to_bf16_kernel_f7d984>>(
                 sycl::nd_range<3>(sycl::range(1, 1,
                                               (unsigned)((n + 255) / 256 < 4096
                                                              ? (n + 255) / 256
@@ -3669,7 +3669,7 @@ void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gr_norm_kernel_f38542>>(
+            ->parallel_for<dpct_kernel_name<class gr_norm_kernel_c8e3c6>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(T * HC)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -3693,7 +3693,7 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
                 auto ldx_ldx_D_ct6 = ldx > 0 ? ldx : D;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class gr_norm_rs_kernel_6c01ba>>(
+                    dpct_kernel_name<class gr_norm_rs_kernel_8cacde>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(T * HC)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
@@ -3714,7 +3714,7 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gr_mix_r_kernel_a64dc1>>(
+            ->parallel_for<dpct_kernel_name<class gr_mix_r_kernel_9fa216>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * N)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -3771,7 +3771,7 @@ bool gr_upmix(const uint16_t *lo16, const uint16_t *w_up, const float *R,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gr_upmix_cuda_kernel_ed52fb>>(
+            ->parallel_for<dpct_kernel_name<class gr_upmix_cuda_kernel_478ba1>>(
                 sycl::nd_range<3>(
                     sycl::range(1, (unsigned)((T + UC_BM - 1) / UC_BM),
                                 N / UC_BD) *
@@ -3804,7 +3804,7 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
                 auto ldx_ldx_D_ct9 = ldx > 0 ? ldx : D;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class gr_write_norm_rs_kernel_85f8e9>>(
+                    dpct_kernel_name<class gr_write_norm_rs_kernel_220c08>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(T * HC)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
@@ -3831,7 +3831,7 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
                 auto ldx_ldx_D_ct13 = ldx > 0 ? ldx : D;
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class gr_write_cvec_norm_rs_kernel_abf888>>(
+                    class gr_write_cvec_norm_rs_kernel_1177d6>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(T * HC)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
@@ -3856,7 +3856,7 @@ void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t*
             ->submit([&](sycl::handler &cgh) {
                 auto T_LR_ct3 = T * LR;
 
-                cgh.parallel_for<dpct_kernel_name<class gr_silu_kernel_f26d34>>(
+                cgh.parallel_for<dpct_kernel_name<class gr_silu_kernel_9b121e>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * LR)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
@@ -3874,7 +3874,7 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gr_mix_kernel_d9dd98>>(
+            ->parallel_for<dpct_kernel_name<class gr_mix_kernel_cb4154>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * N)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -3891,7 +3891,7 @@ void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gr_write_kernel_b96cec>>(
+            ->parallel_for<dpct_kernel_name<class gr_write_kernel_ac1ac7>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * D)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -3907,7 +3907,7 @@ void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gr_broadcast_kernel_3dedc6>>(
+            ->parallel_for<dpct_kernel_name<class gr_broadcast_kernel_2b66e9>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * D)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -3923,7 +3923,7 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_gates_kernel_e66d35>>(
+            ->parallel_for<dpct_kernel_name<class gdn_gates_kernel_3be2b4>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * HV)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -3940,7 +3940,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_conv_kernel_df787b>>(
+            ->parallel_for<dpct_kernel_name<class gdn_conv_kernel_716c2f>>(
                 sycl::nd_range<3>(sycl::range(1, 1, C / 128) *
                                       sycl::range(1, 1, 128),
                                   sycl::range(1, 1, 128)),
@@ -3956,7 +3956,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 
                 strata::q_of(stream)
                     ->parallel_for<
-                        dpct_kernel_name<class gdn_conv_l2_kernel_8e7204>>(
+                        dpct_kernel_name<class gdn_conv_l2_kernel_23bffd>>(
                         sycl::nd_range<3>(
                             sycl::range(
                                 1, (unsigned)((T + CONV_TILE - 1) / CONV_TILE),
@@ -3976,7 +3976,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 
                 strata::q_of(stream)
                     ->parallel_for<
-                        dpct_kernel_name<class gdn_conv_hist_kernel_385cc2>>(
+                        dpct_kernel_name<class gdn_conv_hist_kernel_3caeae>>(
                         sycl::nd_range<3>(sycl::range(1, 1, C / 128) *
                                               sycl::range(1, 1, 128),
                                           sycl::range(1, 1, 128)),
@@ -3993,7 +3993,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class gdn_conv_tiled_kernel_532f01>>(
+                    dpct_kernel_name<class gdn_conv_tiled_kernel_12e402>>(
                     sycl::nd_range<3>(
                         sycl::range(1,
                                     (unsigned)((T + CONV_TILE - 1) / CONV_TILE),
@@ -4010,7 +4010,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class gdn_conv_hist_kernel_1d5419>>(
+                    dpct_kernel_name<class gdn_conv_hist_kernel_02e3f7>>(
                     sycl::nd_range<3>(sycl::range(1, 1, C / 128) *
                                           sycl::range(1, 1, 128),
                                       sycl::range(1, 1, 128)),
@@ -4024,7 +4024,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_l2_kernel_d82250>>(
+            ->parallel_for<dpct_kernel_name<class gdn_l2_kernel_167cec>>(
                 sycl::nd_range<3>(sycl::range(1, (unsigned)T, 2 * HK) *
                                       sycl::range(1, 1, S),
                                   sycl::range(1, 1, S)),
@@ -4122,7 +4122,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_rec_kernel_923fed>>(
+            ->parallel_for<dpct_kernel_name<class gdn_rec_kernel_04644f>>(
                 sycl::nd_range<3>(sycl::range(1, 1, HV) * sycl::range(1, RG, S),
                                   sycl::range(1, RG, S)),
                 exp_props,
@@ -4144,7 +4144,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class gdn_rec_kh_kernel_c88399>>(
+                    dpct_kernel_name<class gdn_rec_kh_kernel_710299>>(
                     sycl::nd_range<3>(sycl::range(1, 1, HK * NCB) *
                                           sycl::range(1, RG, CB),
                                       sycl::range(1, RG, CB)),
@@ -4160,7 +4160,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class gdn_rec_cols_pipe_kernel_c6cea3>>(
+                    dpct_kernel_name<class gdn_rec_cols_pipe_kernel_e606f5>>(
                     sycl::nd_range<3>(sycl::range(1, 1, HV * NCB) *
                                           sycl::range(1, RG, CB),
                                       sycl::range(1, RG, CB)),
@@ -4173,7 +4173,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class gdn_rec_cols_kernel_496541>>(
+                    dpct_kernel_name<class gdn_rec_cols_kernel_019fb5>>(
                     sycl::nd_range<3>(sycl::range(1, 1, HV * NCB) *
                                           sycl::range(1, RG, CB),
                                       sycl::range(1, RG, CB)),
@@ -4187,7 +4187,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class gdn_out_norm_kernel_43e92c>>(
+                    dpct_kernel_name<class gdn_out_norm_kernel_dadd55>>(
                     sycl::nd_range<3>(sycl::range(1, HV, (unsigned)T) *
                                           sycl::range(1, 1, S),
                                       sycl::range(1, 1, S)),
@@ -4217,7 +4217,7 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class route_kernel_404de1,
+            ->parallel_for<dpct_kernel_name<class route_kernel_4a5e2c,
                                             dpct_kernel_scalar<16>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((T + 7) / 8)) *
                                       sycl::range(1, 1, 256),
@@ -4233,7 +4233,7 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class route_kernel_495838,
+            ->parallel_for<dpct_kernel_name<class route_kernel_c2de29,
                                             dpct_kernel_scalar<8>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((T + 7) / 8)) *
                                       sycl::range(1, 1, 256),
@@ -4254,7 +4254,7 @@ void standin_route(const float* logits, int32_t* ids, float* weights, int64_t T,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class standin_route_k_7c3a54>>(
+            ->parallel_for<dpct_kernel_name<class standin_route_k_910d31>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)T) *
                                       sycl::range(1, 1, 32),
                                   sycl::range(1, 1, 32)),
@@ -4279,7 +4279,7 @@ void standin_agree(const float* logits, int32_t* ids, float* weights, int64_t T,
                 auto T_ct2 = T * 10;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class standin_agree_mark_k_25e1cc>>(
+                    dpct_kernel_name<class standin_agree_mark_k_7efcf7>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * 10)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
@@ -4294,7 +4294,7 @@ void standin_agree(const float* logits, int32_t* ids, float* weights, int64_t T,
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class standin_agree_restore_k_2e11df>>(
+                dpct_kernel_name<class standin_agree_restore_k_df68a1>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((T + 127) / 128)) *
                         sycl::range(1, 1, 128),
@@ -4312,7 +4312,7 @@ void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* s
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class blob_dequant_kernel_d5ce36,
+            ->parallel_for<dpct_kernel_name<class blob_dequant_kernel_313e68,
                                             dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, blocks_for(1280LL * 640 + 2560LL * 160)) *
@@ -4330,7 +4330,7 @@ void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, voi
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class blob_dequant_kernel_6a8278,
+            ->parallel_for<dpct_kernel_name<class blob_dequant_kernel_a9df1e,
                                             dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, blocks_for(1280LL * 640 + 2560LL * 160)) *
@@ -4349,7 +4349,7 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class swiglu_il_kernel_98d495>>(
+            ->parallel_for<dpct_kernel_name<class swiglu_il_kernel_4e016d>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(n * 640)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4365,7 +4365,7 @@ void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void*
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class swiglu_pair_kernel_ab28da>>(
+            ->parallel_for<dpct_kernel_name<class swiglu_pair_kernel_3ad40e>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(n * 640)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4411,7 +4411,7 @@ void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class copy_f4_kernel_bb4110>>(
+            ->parallel_for<dpct_kernel_name<class copy_f4_kernel_088577>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)b) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4431,7 +4431,7 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class copy_i32_kernel_1c95ea>>(
+            ->parallel_for<dpct_kernel_name<class copy_i32_kernel_eb3096>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)(b < 256 ? b : 256)) *
                         sycl::range(1, 1, 256),
@@ -4449,7 +4449,7 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gather_rows16_kernel_d9d697>>(
+            ->parallel_for<dpct_kernel_name<class gather_rows16_kernel_c65ca4>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, blocks_for(n * (width / 8))) *
                         sycl::range(1, 1, 256),
@@ -4573,7 +4573,7 @@ void moe_combine_peer16(const float* Dm, const int32_t* slot, const float* w, co
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class moe_combine_peer16_kernel_a61509>>(
+                dpct_kernel_name<class moe_combine_peer16_kernel_0d8d7c>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * N)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4593,7 +4593,7 @@ void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk,
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class peer_gather_add_kernel_9a96ed>>(
+                dpct_kernel_name<class peer_gather_add_kernel_aaefec>>(
                 sycl::nd_range<3>(sycl::range(1, (unsigned)n_tok,
                                               (unsigned)((N + 255) / 256)) *
                                       sycl::range(1, 1, 256),
@@ -4612,7 +4612,7 @@ void sums_to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class sums_to_f16_kernel_3e218e>>(
+            ->parallel_for<dpct_kernel_name<class sums_to_f16_kernel_ab79fc>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(n)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4636,7 +4636,7 @@ void f16_to_f32_wide(float* dst, const uint16_t* src, int64_t n, void* stream) {
                 auto n_ct2 = n / 8;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class f16_to_f32_wide_kernel_d954f7>>(
+                    dpct_kernel_name<class f16_to_f32_wide_kernel_1f0b50>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks_for(n / 8)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
@@ -4657,7 +4657,7 @@ void moe_combine_peer(const float* Dm, const int32_t* slot, const float* w, cons
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class moe_combine_peer_kernel_34d5c9>>(
+                dpct_kernel_name<class moe_combine_peer_kernel_435522>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * N)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4676,7 +4676,7 @@ void peer_scatter_add(float* sum, const float* rows, const float* wk, const int3
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class peer_scatter_add_kernel_5a8a28>>(
+                dpct_kernel_name<class peer_scatter_add_kernel_dcbef7>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(n * N)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4696,7 +4696,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class moe_combine4_kernel_1c986f>>(
+                    dpct_kernel_name<class moe_combine4_kernel_52b120>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1, blocks_for(T * (N / 4))) *
                             sycl::range(1, 1, 256),
@@ -4717,7 +4717,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class moe_combine_kernel_60f865>>(
+            ->parallel_for<dpct_kernel_name<class moe_combine_kernel_4f1e3f>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * N)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4734,7 +4734,7 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class rms_rows_kernel_c88408>>(
+            ->parallel_for<dpct_kernel_name<class rms_rows_kernel_b8ca35>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)rows) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4767,7 +4767,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
                 auto strata_kernels_mrope_table_ct11 =
                     strata::kernels::mrope_table();
 
-                cgh.parallel_for<dpct_kernel_name<class rope_kernel_4d58b9,
+                cgh.parallel_for<dpct_kernel_name<class rope_kernel_c82482,
                                                   dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(T * heads)) *
                                           sycl::range(1, 1, 32),
@@ -4788,7 +4788,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
                 auto strata_kernels_mrope_table_ct11 =
                     strata::kernels::mrope_table();
 
-                cgh.parallel_for<dpct_kernel_name<class rope_kernel_4d58b9,
+                cgh.parallel_for<dpct_kernel_name<class rope_kernel_beef7c,
                                                   dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(T * heads)) *
                                           sycl::range(1, 1, 32),
@@ -4809,7 +4809,7 @@ void split_q(const float* q_full, float* q, int64_t T, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class split_q_kernel_83c16c>>(
+            ->parallel_for<dpct_kernel_name<class split_q_kernel_aded3e>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * 24 * 256)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4829,7 +4829,7 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
                 auto ld16_ld16_ct4 = ld16 > 0 ? ld16 : 24 * 256;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class gate_attn_kernel_3fc329>>(
+                    dpct_kernel_name<class gate_attn_kernel_90c0a7>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1, blocks_for(T * 24 * 256)) *
                             sycl::range(1, 1, 256),

@@ -241,7 +241,7 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_conv_l2_kernel_44cd0c>>(
+            ->parallel_for<dpct_kernel_name<class gdn_conv_l2_kernel_641daa>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(channels / S)) *
                                       sycl::range(1, 1, S),
                                   sycl::range(1, 1, S)),
@@ -276,7 +276,7 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_ab_kernel_c211b9>>(
+            ->parallel_for<dpct_kernel_name<class gdn_ab_kernel_4861c1>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((2 * h_v + 7) / 8)) *
                         sycl::range(1, 1, 256),
@@ -318,7 +318,7 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_step_norm_kernel_51bed3>>(
+            ->parallel_for<dpct_kernel_name<class gdn_step_norm_kernel_0f2b15>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)h_v) *
                                       sycl::range(1, RG, S),
                                   sycl::range(1, RG, S)),

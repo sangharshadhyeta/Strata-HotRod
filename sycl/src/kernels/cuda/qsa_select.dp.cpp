@@ -781,7 +781,7 @@ static bool block_scores_simt(const float *pooled, const float *dead,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         stream->parallel_for<
-            dpct_kernel_name<class block_scores_simt_kernel_4cb7f3,
+            dpct_kernel_name<class block_scores_simt_kernel_84fe18,
                              dpct_kernel_scalar<32>, dpct_kernel_scalar<128>,
                              dpct_kernel_scalar<16>, dpct_kernel_scalar<8>>>(
             sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
@@ -795,7 +795,7 @@ static bool block_scores_simt(const float *pooled, const float *dead,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         stream->parallel_for<
-            dpct_kernel_name<class block_scores_simt_kernel_dcb6c8,
+            dpct_kernel_name<class block_scores_simt_kernel_b12507,
                              dpct_kernel_scalar<32>, dpct_kernel_scalar<64>,
                              dpct_kernel_scalar<32>, dpct_kernel_scalar<4>>>(
             sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
@@ -810,7 +810,7 @@ static bool block_scores_simt(const float *pooled, const float *dead,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         stream->parallel_for<
-            dpct_kernel_name<class block_scores_tail_kernel_70dfaa>>(
+            dpct_kernel_name<class block_scores_tail_kernel_42ca31>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                   sycl::range(1, 1, 32),
                               sycl::range(1, 1, 32)),
@@ -2429,7 +2429,7 @@ bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead
                 auto scores_early_exit_ct5 = scores_early_exit();
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class block_scores_slots_kernel_79e16f>>(
+                    dpct_kernel_name<class block_scores_slots_kernel_9af779>>(
                     sycl::nd_range<3>(sycl::range(1, (unsigned)nq, 256) *
                                           sycl::range(1, 1, SCORE_WARPS * 32),
                                       sycl::range(1, 1, SCORE_WARPS * 32)),
@@ -2694,7 +2694,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 st->parallel_for<
-                    dpct_kernel_name<class block_scores_halve_kernel_13390d,
+                    dpct_kernel_name<class block_scores_halve_kernel_bd1ef2,
                                      dpct_kernel_scalar<4>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, 256) *
                                           sycl::range(1, 1, SCORE_WARPS * 32),
@@ -2711,7 +2711,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 st->parallel_for<
-                    dpct_kernel_name<class block_scores_halve_kernel_743175,
+                    dpct_kernel_name<class block_scores_halve_kernel_df11e1,
                                      dpct_kernel_scalar<8>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, 256) *
                                           sycl::range(1, 1, SCORE_WARPS * 32),
@@ -2728,7 +2728,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 st->parallel_for<
-                    dpct_kernel_name<class block_scores_halve_kernel_67365e,
+                    dpct_kernel_name<class block_scores_halve_kernel_16679c,
                                      dpct_kernel_scalar<16>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, 256) *
                                           sycl::range(1, 1, SCORE_WARPS * 32),
@@ -2748,7 +2748,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                             sycl::ext::oneapi::experimental::use_root_sync};
 
                     st->parallel_for<
-                        dpct_kernel_name<class block_scores_halve_kernel_13055b,
+                        dpct_kernel_name<class block_scores_halve_kernel_fb1ef4,
                                          dpct_kernel_scalar<16>>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, 256) *
@@ -2772,7 +2772,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                             sycl::ext::oneapi::experimental::use_root_sync};
 
                     st->parallel_for<
-                        dpct_kernel_name<class block_scores_halve_kernel_71c4b0,
+                        dpct_kernel_name<class block_scores_halve_kernel_701dee,
                                          dpct_kernel_scalar<4>>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, 256) *
@@ -2791,7 +2791,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                             sycl::ext::oneapi::experimental::use_root_sync};
 
                     st->parallel_for<
-                        dpct_kernel_name<class block_scores_halve_kernel_996314,
+                        dpct_kernel_name<class block_scores_halve_kernel_8c63c4,
                                          dpct_kernel_scalar<8>>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, 256) *
@@ -2810,7 +2810,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                             sycl::ext::oneapi::experimental::use_root_sync};
 
                     st->parallel_for<
-                        dpct_kernel_name<class block_scores_halve_kernel_73bb4e,
+                        dpct_kernel_name<class block_scores_halve_kernel_a36aa3,
                                          dpct_kernel_scalar<16>>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, 256) *
@@ -2848,7 +2848,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                     auto scores_early_exit_ct7 = scores_early_exit();
 
                     cgh.parallel_for<dpct_kernel_name<
-                        class block_scores_multi_kernel_dea7d4>>(
+                        class block_scores_multi_kernel_a5908d>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, 256) *
                                 sycl::range(1, 1, SCORE_WARPS * 32),
@@ -2918,7 +2918,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class block_scores_thread_kernel_c63617>>(
+                    dpct_kernel_name<class block_scores_thread_kernel_952779>>(
                     sycl::nd_range<3>(tgrid * sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
                     exp_props,
@@ -2935,7 +2935,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class block_scores_tail_kernel_70dfaa>>(
+                    dpct_kernel_name<class block_scores_tail_kernel_2831df>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -2968,7 +2968,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class block_scores_kernel_925c9d>>(
+            ->parallel_for<dpct_kernel_name<class block_scores_kernel_756a1c>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, SCORE_WARPS * 32),
                                   sycl::range(1, 1, SCORE_WARPS * 32)),
                 exp_props,
@@ -3001,7 +3001,7 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class block_scores_rows_kernel_dfdfe8,
+        st->parallel_for<dpct_kernel_name<class block_scores_rows_kernel_9d3a36,
                                           dpct_kernel_scalar<1>>>(
             sycl::nd_range<3>(sycl::range(1, 1, 256) *
                                   sycl::range(1, 1, SCORE_WARPS * 32),
@@ -3015,7 +3015,7 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class block_scores_rows_kernel_191402,
+        st->parallel_for<dpct_kernel_name<class block_scores_rows_kernel_696e37,
                                           dpct_kernel_scalar<2>>>(
             sycl::nd_range<3>(sycl::range(1, 1, 256) *
                                   sycl::range(1, 1, SCORE_WARPS * 32),
@@ -3029,7 +3029,7 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class block_scores_rows_kernel_4183e2,
+        st->parallel_for<dpct_kernel_name<class block_scores_rows_kernel_99f2cd,
                                           dpct_kernel_scalar<3>>>(
             sycl::nd_range<3>(sycl::range(1, 1, 256) *
                                   sycl::range(1, 1, SCORE_WARPS * 32),
@@ -3043,7 +3043,7 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class block_scores_rows_kernel_8dabdd,
+        st->parallel_for<dpct_kernel_name<class block_scores_rows_kernel_7a8162,
                                           dpct_kernel_scalar<4>>>(
             sycl::nd_range<3>(sycl::range(1, 1, 256) *
                                   sycl::range(1, 1, SCORE_WARPS * 32),
@@ -3086,7 +3086,7 @@ void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const i
                 auto early_ct7 = early;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class block_scores_multi_kernel_dea7d4>>(
+                    dpct_kernel_name<class block_scores_multi_kernel_1489d0>>(
                     sycl::nd_range<3>(sycl::range(1, 1, 256) *
                                           sycl::range(1, 1, SCORE_WARPS * 32),
                                       sycl::range(1, 1, SCORE_WARPS * 32)),
@@ -3202,7 +3202,7 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
 
                         strata::q_of(stream)
                             ->parallel_for<dpct_kernel_name<
-                                class block_scores_simt2_kernel_a029aa,
+                                class block_scores_simt2_kernel_e66788,
                                 dpct_kernel_scalar<32>,
                                 dpct_kernel_scalar<128>>>(
                                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
@@ -3224,7 +3224,7 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
 
                         strata::q_of(stream)
                             ->parallel_for<dpct_kernel_name<
-                                class block_scores_simt2_kernel_fa74c2,
+                                class block_scores_simt2_kernel_122814,
                                 dpct_kernel_scalar<64>,
                                 dpct_kernel_scalar<64>>>(
                                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
@@ -3243,7 +3243,7 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
 
                     strata::q_of(stream)
                         ->parallel_for<dpct_kernel_name<
-                            class block_scores_tail_kernel_70dfaa>>(
+                            class block_scores_tail_kernel_52ba40>>(
                             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                                   sycl::range(1, 1, 32),
                                               sycl::range(1, 1, 32)),
@@ -3311,7 +3311,7 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
                     sycl::range(bytes), cgh);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class block_scores_tc_kernel_bc5f07>>(
+                    dpct_kernel_name<class block_scores_tc_kernel_f4f1fd>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, 128),
                                       sycl::range(1, 1, 128)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -3329,7 +3329,7 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class block_scores_tail_kernel_70dfaa>>(
+                dpct_kernel_name<class block_scores_tail_kernel_9ade95>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                       sycl::range(1, 1, 32),
                                   sycl::range(1, 1, 32)),
@@ -3373,7 +3373,7 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class block_topk_kernel_213104>>(
+            ->parallel_for<dpct_kernel_name<class block_topk_kernel_79eb96>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                       sycl::range(1, 1, TOPK_T),
                                   sycl::range(1, 1, TOPK_T)),
@@ -3992,7 +3992,7 @@ bool qsa_block_topk_split(const float *scores, const int32_t *steps, int64_t nq,
         hist_ptr[dev] = nullptr;
         return false;
     }
-    if (s->memset(hist_ptr[dev], 0, (size_t) nq * 4 * 256 * sizeof(int))) != 0) return false;
+    s->memset(hist_ptr[dev], 0, (size_t) nq * 4 * 256 * sizeof(int));   // (cudaMemsetAsync; SYCL reports by exception)
     const dpct::dim3 grid((unsigned)nch, (unsigned)nq);
     {
         g_sp_hist.init(*s);
@@ -4006,7 +4006,7 @@ bool qsa_block_topk_split(const float *scores, const int32_t *steps, int64_t nq,
             auto g_sp_state_acc_ct1 = g_sp_state.get_access(cgh);
 
             cgh.parallel_for<dpct_kernel_name<
-                class topk_split_hist_kernel_f641ed, dpct_kernel_scalar<0>>>(
+                class topk_split_hist_kernel_41b92a, dpct_kernel_scalar<0>>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, SP_T),
                                   sycl::range(1, 1, SP_T)),
                 exp_props,
@@ -4030,7 +4030,7 @@ bool qsa_block_topk_split(const float *scores, const int32_t *steps, int64_t nq,
             auto g_sp_state_acc_ct1 = g_sp_state.get_access(cgh);
 
             cgh.parallel_for<dpct_kernel_name<
-                class topk_split_hist_kernel_54c31e, dpct_kernel_scalar<1>>>(
+                class topk_split_hist_kernel_882804, dpct_kernel_scalar<1>>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, SP_T),
                                   sycl::range(1, 1, SP_T)),
                 exp_props,
@@ -4054,7 +4054,7 @@ bool qsa_block_topk_split(const float *scores, const int32_t *steps, int64_t nq,
             auto g_sp_state_acc_ct1 = g_sp_state.get_access(cgh);
 
             cgh.parallel_for<dpct_kernel_name<
-                class topk_split_hist_kernel_c35db5, dpct_kernel_scalar<2>>>(
+                class topk_split_hist_kernel_a1e7d0, dpct_kernel_scalar<2>>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, SP_T),
                                   sycl::range(1, 1, SP_T)),
                 exp_props,
@@ -4078,7 +4078,7 @@ bool qsa_block_topk_split(const float *scores, const int32_t *steps, int64_t nq,
             auto g_sp_state_acc_ct1 = g_sp_state.get_access(cgh);
 
             cgh.parallel_for<dpct_kernel_name<
-                class topk_split_hist_kernel_d30c9c, dpct_kernel_scalar<3>>>(
+                class topk_split_hist_kernel_08181d, dpct_kernel_scalar<3>>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, SP_T),
                                   sycl::range(1, 1, SP_T)),
                 exp_props,
@@ -4104,7 +4104,7 @@ bool qsa_block_topk_split(const float *scores, const int32_t *steps, int64_t nq,
             auto g_sp_cnt_acc_ct1 = g_sp_cnt.get_access(cgh);
 
             cgh.parallel_for<
-                dpct_kernel_name<class topk_split_count_kernel_f9d157>>(
+                dpct_kernel_name<class topk_split_count_kernel_ff1a5f>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, SP_T),
                                   sycl::range(1, 1, SP_T)),
                 exp_props,
@@ -4128,7 +4128,7 @@ bool qsa_block_topk_split(const float *scores, const int32_t *steps, int64_t nq,
             auto g_sp_cnt_acc_ct1 = g_sp_cnt.get_access(cgh);
 
             cgh.parallel_for<
-                dpct_kernel_name<class topk_split_emit_kernel_3dc9e6>>(
+                dpct_kernel_name<class topk_split_emit_kernel_efccdd>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, SP_T),
                                   sycl::range(1, 1, SP_T)),
                 exp_props,
@@ -4645,7 +4645,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
                         auto g_tk_fail_ptr_ct1 = g_tk_fail.get_ptr();
 
                         cgh.parallel_for<dpct_kernel_name<
-                            class block_topk_sample_kernel_9277f4>>(
+                            class block_topk_sample_kernel_f2805c>>(
                             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                                   sycl::range(1, 1, TK_T),
                                               sycl::range(1, 1, TK_T)),
@@ -4675,7 +4675,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
                         auto g_tk_fail_ptr_ct1 = g_tk_fail.get_ptr();
 
                         cgh.parallel_for<dpct_kernel_name<
-                            class block_topk_wide_kernel_5162c4,
+                            class block_topk_wide_kernel_b155ef,
                             dpct_kernel_scalar<true>>>(
                             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                                   sycl::range(1, 1, TK_T),
@@ -4707,7 +4707,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
                     auto g_tk_fail_ptr_ct1 = g_tk_fail.get_ptr();
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class block_topk_wide_kernel_5162c4,
+                        dpct_kernel_name<class block_topk_wide_kernel_7b2d76,
                                          dpct_kernel_scalar<false>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                               sycl::range(1, 1, TK_T),
@@ -4733,7 +4733,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_97b37d,
+            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_310715,
                                             dpct_kernel_scalar<TK_PER>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                       sycl::range(1, 1, TK_T),
@@ -4755,7 +4755,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_cdd089,
+            ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_287022,
                                             dpct_kernel_scalar<TK_PER_MAX>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nq) *
                                       sycl::range(1, 1, TK_T),

@@ -128,7 +128,7 @@ void route_prior_top10(const float* logits, const int32_t* res_layer, float lamb
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class route_prior_k_8873b1>>(
+            ->parallel_for<dpct_kernel_name<class route_prior_k_efe13e>>(
                 sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
                                       sycl::range(1, 1, 32),
                                   sycl::range(1, 1, 32)),

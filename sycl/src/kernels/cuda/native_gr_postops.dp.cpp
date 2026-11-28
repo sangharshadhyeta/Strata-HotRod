@@ -173,7 +173,7 @@ void native_gr_down_silu(float* lo, int hc_lr, int hc, void* stream) {
             ->submit([&](sycl::handler &cgh) {
                 auto float_hc_ct2 = 1.0f / float(hc);
 
-                cgh.parallel_for<dpct_kernel_name<class down_silu_24f4fb>>(
+                cgh.parallel_for<dpct_kernel_name<class down_silu_97f95f>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks(hc_lr)) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -204,7 +204,7 @@ void native_gr_pre_gated_multi(const float* xn, float* gate, float* mixed,
             ->submit([&](sycl::handler &cgh) {
                 auto float_hc_ct5 = 1.0f / float(hc);
 
-                cgh.parallel_for<dpct_kernel_name<class pre_gated_e6e3d1,
+                cgh.parallel_for<dpct_kernel_name<class pre_gated_ae125d,
                                                   dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -221,7 +221,7 @@ void native_gr_pre_gated_multi(const float* xn, float* gate, float* mixed,
             ->submit([&](sycl::handler &cgh) {
                 auto float_hc_ct5 = 1.0f / float(hc);
 
-                cgh.parallel_for<dpct_kernel_name<class pre_gated_10bc88,
+                cgh.parallel_for<dpct_kernel_name<class pre_gated_fb1c5f,
                                                   dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -253,7 +253,7 @@ void native_gr_post_multi(const float* residual, const float* block_out, const f
             ->submit([&](sycl::handler &cgh) {
                 auto float_hc_ct6 = 1.0f / float(hc);
 
-                cgh.parallel_for<dpct_kernel_name<class post_a7f844>>(
+                cgh.parallel_for<dpct_kernel_name<class post_32eef3>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {

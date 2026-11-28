@@ -760,7 +760,7 @@ void bf16_to_f16(const uint16_t *in, uint16_t *out, int64_t n,
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
-        st->parallel_for<dpct_kernel_name<class bf16_to_f16_kernel_a0031a>>(
+        st->parallel_for<dpct_kernel_name<class bf16_to_f16_kernel_588057>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((n + 255) / 256)) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -1152,7 +1152,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                         auto n_K_ct2 = n * K;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class f16_to_bf16_kernel_f2fb73>>(
+                            dpct_kernel_name<class f16_to_bf16_kernel_30c370>>(
                             sycl::nd_range<3>(
                                 sycl::range(1, 1,
                                             (unsigned)((n * K + 255) / 256)) *

@@ -995,7 +995,7 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             strata::q_of(stream)
-                ->parallel_for<dpct_kernel_name<class quant_act_kernel_da6c97>>(
+                ->parallel_for<dpct_kernel_name<class quant_act_kernel_a7a0a2>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks(nblk, 8)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
@@ -1039,7 +1039,7 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
                         sycl::range((size_t)n_expert * 4), cgh);
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class count_kernel_9919e0>>(
+                        dpct_kernel_name<class count_kernel_40e334>>(
                         sycl::nd_range<3>(sycl::range(1, 1, nb) *
                                               sycl::range(1, 1, 1024),
                                           sycl::range(1, 1, 1024)),
@@ -1062,7 +1062,7 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            s->parallel_for<dpct_kernel_name<class scan_kernel_7ed98e>>(
+            s->parallel_for<dpct_kernel_name<class scan_kernel_0e577e>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((n_expert + 31) / 32 * 32)),
                     sycl::range(1, 1, (unsigned)((n_expert + 31) / 32 * 32))),
@@ -1076,7 +1076,7 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            s->parallel_for<dpct_kernel_name<class place_kernel_cf784d>>(
+            s->parallel_for<dpct_kernel_name<class place_kernel_d91615>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks(n, 256)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -1122,7 +1122,7 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
             sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                 sycl::range(smem_bytes(true)), cgh);
 
-            cgh.parallel_for<dpct_kernel_name<class expert_kernel_f38977,
+            cgh.parallel_for<dpct_kernel_name<class expert_kernel_524891,
                                               dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, g_gu) *
                                       sycl::range(1, 1, THREADS),
@@ -1153,7 +1153,7 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
             sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                 sycl::range(smem_bytes(false)), cgh);
 
-            cgh.parallel_for<dpct_kernel_name<class expert_kernel_e2d106,
+            cgh.parallel_for<dpct_kernel_name<class expert_kernel_8ccd87,
                                               dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, g_d) *
                                       sycl::range(1, 1, THREADS),

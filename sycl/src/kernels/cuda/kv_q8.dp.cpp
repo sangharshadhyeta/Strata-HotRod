@@ -172,7 +172,7 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
                 could not be deduced. You need to update this code.
                 */
                 cgh.parallel_for<dpct_kernel_name<
-                    class kv_append_q8_kernel_b60fdc,
+                    class kv_append_q8_kernel_b5e7c7,
                     dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, KV_Q8_GROUP),
                                       sycl::range(1, 1, KV_Q8_GROUP)),
@@ -208,7 +208,7 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
                     host ? *host : KvHostPools{};
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class kv_append_q8_kernel_b60fdc,
+                    dpct_kernel_name<class kv_append_q8_kernel_9872c8,
                                      dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, KV_Q8_GROUP),
                                       sycl::range(1, 1, KV_Q8_GROUP)),
@@ -238,7 +238,7 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class kv_gather_q8_kernel_84cbb3>>(
+            ->parallel_for<dpct_kernel_name<class kv_gather_q8_kernel_32a265>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),

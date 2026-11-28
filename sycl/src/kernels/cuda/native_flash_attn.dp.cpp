@@ -345,7 +345,7 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
             {sycl::aspect::fp16});
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class attend_9d5505>>(
+            ->parallel_for<dpct_kernel_name<class attend_cf593a>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 24) * sycl::range(1, 4, 32),
                                   sycl::range(1, 4, 32)),
                 exp_props,

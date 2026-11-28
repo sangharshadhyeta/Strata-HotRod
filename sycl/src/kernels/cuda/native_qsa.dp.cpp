@@ -183,7 +183,7 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
-                dpct_kernel_name<class norm_5d08bf, dpct_kernel_scalar<256>>>(
+                dpct_kernel_name<class norm_6addbe, dpct_kernel_scalar<256>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_rows)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -204,7 +204,7 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
-                dpct_kernel_name<class norm_127936, dpct_kernel_scalar<1024>>>(
+                dpct_kernel_name<class norm_8b60a1, dpct_kernel_scalar<1024>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_rows)) *
                                       sycl::range(1, 1, 1024),
                                   sycl::range(1, 1, 1024)),
@@ -229,7 +229,7 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class norm_grouped_b5907a,
+            ->parallel_for<dpct_kernel_name<class norm_grouped_43110c,
                                             dpct_kernel_scalar<256>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_rows)) *
                                       sycl::range(1, 1, 256),
@@ -251,7 +251,7 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class norm_grouped_927e80,
+            ->parallel_for<dpct_kernel_name<class norm_grouped_b3c9f8,
                                             dpct_kernel_scalar<1024>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_rows)) *
                                       sycl::range(1, 1, 1024),
@@ -274,7 +274,7 @@ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class gate_148967>>(
+            ->parallel_for<dpct_kernel_name<class gate_e75fba>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, unsigned((count + 255) / 256)) *
                         sycl::range(1, 1, 256),

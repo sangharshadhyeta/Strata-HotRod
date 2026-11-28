@@ -442,7 +442,7 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class route_96e6fb>>(
+            ->parallel_for<dpct_kernel_name<class route_48bee2>>(
                 sycl::nd_range<3>(sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
@@ -561,7 +561,7 @@ void native_router_gemv_top10_fused(const float* x, int64_t ldx, const uint16_t*
                 auto g_fused_done_ct8 = g_fused_done;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class router_gemv_top10_fused_k_be4e7f>>(
+                    dpct_kernel_name<class router_gemv_top10_fused_k_5a8c11>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1, (unsigned)(512 / kFusedRows)) *
                             sycl::range(1, 1, kFusedThreads),
@@ -615,7 +615,7 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class route_topk_afef96,
+            ->parallel_for<dpct_kernel_name<class route_topk_4bec5e,
                                             dpct_kernel_scalar<256>,
                                             dpct_kernel_scalar<8>>>(
                 sycl::nd_range<3>(
@@ -1421,7 +1421,7 @@ void native_route_tally(const float* logits, const int32_t* ids, const float* we
         sycl::ext::oneapi::experimental::use_root_sync};
 
     ((sycl::queue *)(strata::q_of(stream)))
-        ->parallel_for<dpct_kernel_name<class route_tally_k_c40327>>(
+        ->parallel_for<dpct_kernel_name<class route_tally_k_e4fdd4>>(
             sycl::nd_range<3>(sycl::range(1, 1, n_tok) * sycl::range(1, 1, 32),
                               sycl::range(1, 1, 32)),
             exp_props,
@@ -1525,7 +1525,7 @@ void mtp_slot_remap(const float* logits, int32_t* ids, const int32_t* d_slot, in
         sycl::ext::oneapi::experimental::use_root_sync};
 
     ((sycl::queue *)(strata::q_of(stream)))
-        ->parallel_for<dpct_kernel_name<class mtp_slot_remap_k_73ddc8>>(
+        ->parallel_for<dpct_kernel_name<class mtp_slot_remap_k_0c3481>>(
             sycl::nd_range<3>(sycl::range(1, 1, n_tok) * sycl::range(1, 1, 32),
                               sycl::range(1, 1, 32)),
             exp_props,
@@ -1572,7 +1572,7 @@ void mtp_zc_mark(const int32_t* ids, const int32_t* d_slot, int n_tok, uint8_t* 
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class mtp_zc_mark_k_64680a>>(
+            ->parallel_for<dpct_kernel_name<class mtp_zc_mark_k_e2dba6>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (n_thr + block - 1) / block) *
                         sycl::range(1, 1, block),
@@ -1648,7 +1648,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                     sub != nullptr ? *sub : SubfitRoute{};
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class route_resident_k_fe4b05>>(
+                    dpct_kernel_name<class route_resident_k_dbe4e9>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tok) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -2105,7 +2105,7 @@ void native_route_mask(float* logits, int32_t* ids, float* weights, const uint8_
                 const SubfitRoute sub_nullptr_sub_SubfitRoute_ct22 =
                     sub != nullptr ? *sub : SubfitRoute{};
 
-                cgh.parallel_for<dpct_kernel_name<class route_mask_k_a42056>>(
+                cgh.parallel_for<dpct_kernel_name<class route_mask_k_f29d13>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tok) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -2493,7 +2493,7 @@ void native_route_post(const RoutePostArgs& r, void* stream) {
                 auto g_grp_bonus_ptr_ct1 = g_grp_bonus.get_ptr();
                 auto g_grp_stats_ptr_ct1 = g_grp_stats.get_ptr();
 
-                cgh.parallel_for<dpct_kernel_name<class route_post_k_a7e4cc>>(
+                cgh.parallel_for<dpct_kernel_name<class route_post_k_a1dd2d>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)r.n_tok) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -2711,7 +2711,7 @@ void route_pred_bias_add(float* logits, const float* bias, int n_tok, void* stre
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class pred_bias_add_k_6dc71a>>(
+            ->parallel_for<dpct_kernel_name<class pred_bias_add_k_521b72>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (n_tok * 512 + 255) / 256) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -2830,7 +2830,7 @@ void route_pred_edge_skip(const float* pred_logits, int32_t* pred_ids, const int
                 auto g_pred_skip_ct4 = g_pred_skip;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class pred_edge_skip_k_bf292b>>(
+                    dpct_kernel_name<class pred_edge_skip_k_875c65>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tok) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -3019,7 +3019,7 @@ void route_pred_tail_read(const int32_t* res_layer, int32_t* pred_ids, int n_tok
                 auto g_pred_tail_ct5 = g_pred_tail;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class pred_tail_read_k_472d9c>>(
+                    dpct_kernel_name<class pred_tail_read_k_e664b7>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tok) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -3144,7 +3144,7 @@ void route_pred_select(const RoutePredDist (&dd)[kRoutePredDists], int n_tok, in
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class route_pred_sel_k_bf96b3>>(
+            ->parallel_for<dpct_kernel_name<class route_pred_sel_k_b7d87b>>(
                 sycl::nd_range<3>(
                     sycl::range(1, kRoutePredDists, (unsigned)n_tok) *
                         sycl::range(1, 1, 32),
@@ -4282,7 +4282,7 @@ void la_learn_forward_at(int64_t l, int dist, const float* x, int n, void* strea
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        cs->parallel_for<dpct_kernel_name<class la_fwd_u_k_5dd72e>>(
+        cs->parallel_for<dpct_kernel_name<class la_fwd_u_k_6c50b8>>(
             sycl::nd_range<3>(sycl::range(1, 1, kLaRows) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -4295,7 +4295,7 @@ void la_learn_forward_at(int64_t l, int dist, const float* x, int n, void* strea
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        cs->parallel_for<dpct_kernel_name<class la_fwd_pred_k_ef1bd5>>(
+        cs->parallel_for<dpct_kernel_name<class la_fwd_pred_k_ee9a56>>(
             sycl::nd_range<3>(sycl::range(1, 1, (n * kLaE + 255) / 256) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -4374,7 +4374,7 @@ void la_learn_window_end(void* stream) {
             ->submit([&](sycl::handler &cgh) {
                 auto g_la_st_ct0 = g_la->st;
 
-                cgh.parallel_for<dpct_kernel_name<class la_b_wend_k_270a3f>>(
+                cgh.parallel_for<dpct_kernel_name<class la_b_wend_k_f4b218>>(
                     sycl::nd_range<3>(sycl::range(1, 1, 1),
                                       sycl::range(1, 1, 1)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -4501,7 +4501,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
                 auto s_kst_ct0 = s.kst;
                 auto s_kacc_ct1 = s.kacc;
 
-                cgh.parallel_for<dpct_kernel_name<class la_b_mark_k_27a4c0>>(
+                cgh.parallel_for<dpct_kernel_name<class la_b_mark_k_5d042c>>(
                     sycl::nd_range<3>(sycl::range(1, 1, 1),
                                       sycl::range(1, 1, 1)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -4520,7 +4520,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        sd_s->parallel_for<dpct_kernel_name<class la_b_rank_k_a05720>>(
+        sd_s->parallel_for<dpct_kernel_name<class la_b_rank_k_b35f73>>(
             sycl::nd_range<3>(sycl::range(1, s.L, n) * sycl::range(1, 1, kLaE),
                               sycl::range(1, 1, kLaE)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -4538,7 +4538,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        sd_s->parallel_for<dpct_kernel_name<class la_b_score_k_bd5246>>(
+        sd_s->parallel_for<dpct_kernel_name<class la_b_score_k_86f351>>(
             sycl::nd_range<3>(sycl::range(kLaSlots, s.Nsd, n) *
                                   sycl::range(1, 1, kLaE),
                               sycl::range(1, 1, kLaE)),
@@ -4553,7 +4553,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            sd_s->parallel_for<dpct_kernel_name<class la_b_prep_k_ee8047>>(
+            sd_s->parallel_for<dpct_kernel_name<class la_b_prep_k_5ac2b0>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (s.Nset + 63) / 64) *
                                       sycl::range(1, 1, 64),
                                   sycl::range(1, 1, 64)),
@@ -4572,7 +4572,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            sd_s->parallel_for<dpct_kernel_name<class la_b_grad_k_7c45bd>>(
+            sd_s->parallel_for<dpct_kernel_name<class la_b_grad_k_27a2c6>>(
                 sycl::nd_range<3>(sycl::range(1, s.Nset, n) *
                                       sycl::range(1, 1, kLaE),
                                   sycl::range(1, 1, kLaE)),
@@ -4588,7 +4588,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            sd_s->parallel_for<dpct_kernel_name<class la_b_upd_b_k_da8f49>>(
+            sd_s->parallel_for<dpct_kernel_name<class la_b_upd_b_k_4e24a9>>(
                 sycl::nd_range<3>(sycl::range(1, s.Nset, 32) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4602,7 +4602,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            sd_s->parallel_for<dpct_kernel_name<class la_b_upd_a_k_cd0c94>>(
+            sd_s->parallel_for<dpct_kernel_name<class la_b_upd_a_k_3a92e1>>(
                 sycl::nd_range<3>(sycl::range(1, s.Nset, (s.H + 255) / 256) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -4617,7 +4617,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        sd_s->parallel_for<dpct_kernel_name<class la_b_decide_k_6e4b48>>(
+        sd_s->parallel_for<dpct_kernel_name<class la_b_decide_k_707180>>(
             sycl::nd_range<3>(sycl::range(1, 1, 256), sycl::range(1, 1, 256)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {
                 la_b_decide_k(a);
@@ -4629,7 +4629,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        sd_s->parallel_for<dpct_kernel_name<class la_b_reinit_k_5cc7eb>>(
+        sd_s->parallel_for<dpct_kernel_name<class la_b_reinit_k_6ca487>>(
             sycl::nd_range<3>(sycl::range(1, s.Nsd, 160) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -4642,7 +4642,7 @@ static void la_batch(LaLearn& s, const int* res, int n, const int* dist, int Nd,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        sd_s->parallel_for<dpct_kernel_name<class la_b_end_k_e9b791>>(
+        sd_s->parallel_for<dpct_kernel_name<class la_b_end_k_221a93>>(
             sycl::nd_range<3>(sycl::range(1, 1, 1), sycl::range(1, 1, 1)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {
                 la_b_end_k(a);
@@ -5279,7 +5279,7 @@ void la_mtp_forward(const float* x, int n, void* stream) {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        cs->parallel_for<dpct_kernel_name<class la_fwd_u_k_ea21fe>>(
+        cs->parallel_for<dpct_kernel_name<class la_fwd_u_k_d13701>>(
             sycl::nd_range<3>(sycl::range(1, 1, kLaRows) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -5292,7 +5292,7 @@ void la_mtp_forward(const float* x, int n, void* stream) {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        cs->parallel_for<dpct_kernel_name<class la_fwd_pred_k_b64818>>(
+        cs->parallel_for<dpct_kernel_name<class la_fwd_pred_k_5ae583>>(
             sycl::nd_range<3>(sycl::range(1, 1, (n * kLaE + 255) / 256) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -5305,7 +5305,7 @@ void la_mtp_forward(const float* x, int n, void* stream) {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        cs->parallel_for<dpct_kernel_name<class la_mtp_pub_k_b05e97>>(
+        cs->parallel_for<dpct_kernel_name<class la_mtp_pub_k_0c7f41>>(
             sycl::nd_range<3>(sycl::range(1, 1, 128), sycl::range(1, 1, 128)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {
                 la_mtp_pub_k(m.pids, n, m.pred_d);

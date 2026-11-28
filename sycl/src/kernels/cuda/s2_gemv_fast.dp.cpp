@@ -191,7 +191,7 @@ void s2_gemv_fast(const uint16_t *x, const uint8_t *codes, const float *scales,
                 sycl::range(smem), cgh);
             auto c_codes_acc_ct1 = c_codes.get_access(cgh);
 
-            cgh.parallel_for<dpct_kernel_name<class s2_gemv_fast_kernel_3b9618,
+            cgh.parallel_for<dpct_kernel_name<class s2_gemv_fast_kernel_755738,
                                               dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_out) *
                                       sycl::range(1, 1, threads_per_row),
@@ -223,7 +223,7 @@ void s2_gemv_fast(const uint16_t *x, const uint8_t *codes, const float *scales,
                 sycl::range(smem), cgh);
             auto c_codes_acc_ct1 = c_codes.get_access(cgh);
 
-            cgh.parallel_for<dpct_kernel_name<class s2_gemv_fast_kernel_61f77f,
+            cgh.parallel_for<dpct_kernel_name<class s2_gemv_fast_kernel_706bf2,
                                               dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_out) *
                                       sycl::range(1, 1, threads_per_row),

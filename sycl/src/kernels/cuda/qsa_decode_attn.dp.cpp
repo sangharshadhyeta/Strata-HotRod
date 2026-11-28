@@ -1224,7 +1224,7 @@ void launch_merge(int v2, const float *part_acc, const float *part_m,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class attn_merge_v2_kernel_63769a,
+        st->parallel_for<dpct_kernel_name<class attn_merge_v2_kernel_1f4265,
                                           dpct_kernel_scalar<kMergeU>>>(
             sycl::nd_range<3>(sycl::range(1, n_q, n_head) *
                                   sycl::range(1, 1, HD),
@@ -1237,7 +1237,7 @@ void launch_merge(int v2, const float *part_acc, const float *part_m,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_831918>>(
+        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_0ad632>>(
             sycl::nd_range<3>(sycl::range(1, n_q, n_head) *
                                   sycl::range(1, 1, HD),
                               sycl::range(1, 1, HD)),
@@ -1311,7 +1311,7 @@ void launch_chunks_batch(const float *q, const QsaAttnPools &pools,
       DPCT1050: The template argument of the dpct_kernel_name could not be deduced. You need to update this code.
       */
     cgh.parallel_for<dpct_kernel_name<
-        class attn_chunk_kernel_ded9bf, dpct_kernel_scalar<M>,
+        class attn_chunk_kernel_3a99f0, dpct_kernel_scalar<M>,
         dpct_kernel_scalar<true>, dpct_placeholder /*Fix the type mannually*/,
         dpct_placeholder /*Fix the type mannually*/>>(
         sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
@@ -1370,7 +1370,7 @@ void launch_chunks_batch(const float *q, const QsaAttnPools &pools,
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<
-            dpct_kernel_name<class attn_chunk_q8_v3_kernel_a3014f>>(
+            dpct_kernel_name<class attn_chunk_q8_v3_kernel_c25def>>(
             sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
                               sycl::range(1, 1, THREADS)),
             exp_props,
@@ -1661,7 +1661,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
 
         st->parallel_for<
-            dpct_kernel_name<class attn_chunk_q8_v3_kernel_7f76e1>>(
+            dpct_kernel_name<class attn_chunk_q8_v3_kernel_05be5a>>(
             sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
                               sycl::range(1, 1, THREADS)),
             exp_props,

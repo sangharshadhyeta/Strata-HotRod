@@ -145,7 +145,7 @@ bool RemoteExpertOpt::reduce(RemoteExperts& remote, const void* metadata, std::s
         ((sycl::queue *)(remote.stream_))->submit([&](sycl::handler &cgh) {
             const float *remote_d_out__ct0 = remote.d_out_;
 
-            cgh.parallel_for<dpct_kernel_name<class reduce_experts_fbba89>>(
+            cgh.parallel_for<dpct_kernel_name<class reduce_experts_3bf02c>>(
                 sycl::nd_range<3>(sycl::range(1, tokens_, (H + 255) / 256) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -186,7 +186,7 @@ void RemoteExpertOpt::copy_rows(float* dst, const float* src, int token_begin, i
     strata::q_of(stream)->submit([&](sycl::handler &cgh) {
         const int32_t *m_mask__token_begin_K_ct2 = m_mask_ + token_begin * K;
 
-        cgh.parallel_for<dpct_kernel_name<class copy_cpu_rows_c400ff>>(
+        cgh.parallel_for<dpct_kernel_name<class copy_cpu_rows_8b4442>>(
             sycl::nd_range<3>(sycl::range(1, 1, tokens * K) *
                                   sycl::range(1, 1, 128),
                               sycl::range(1, 1, 128)),

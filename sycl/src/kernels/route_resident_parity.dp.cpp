@@ -261,7 +261,7 @@ static int run_for(int ne) {
                 auto kExperts_ct9 = kExperts;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class route_resident_ref_k_13e017>>(
+                    dpct_kernel_name<class route_resident_ref_k_e457fa>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (n_tok + 63) / 64) *
                                           sycl::range(1, 1, 64),
                                       sycl::range(1, 1, 64)),

@@ -336,7 +336,7 @@ int main() {
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             stream->parallel_for<
-                dpct_kernel_name<class route_resident_ref_k_d20bdc>>(
+                dpct_kernel_name<class route_resident_ref_k_fc072b>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     route_resident_ref_k(d_logits, d_ids, d_w, d_res, n_tok,

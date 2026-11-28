@@ -404,7 +404,7 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
             ->submit([&](sycl::handler &cgh) {
                 auto mrope_table_ct18 = mrope_table();
 
-                cgh.parallel_for<dpct_kernel_name<class append_182f95,
+                cgh.parallel_for<dpct_kernel_name<class append_5bb684,
                                                   dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -428,7 +428,7 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
             ->submit([&](sycl::handler &cgh) {
                 auto mrope_table_ct18 = mrope_table();
 
-                cgh.parallel_for<dpct_kernel_name<class append_182f95,
+                cgh.parallel_for<dpct_kernel_name<class append_bc714c,
                                                   dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -492,7 +492,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class append_first_ea2d1f,
+            st->parallel_for<dpct_kernel_name<class append_first_ad6386,
                                               dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -507,7 +507,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class append_first_ea2d1f,
+            st->parallel_for<dpct_kernel_name<class append_first_40b35d,
                                               dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -528,7 +528,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class append_blocks_a6c94e,
+        st->parallel_for<dpct_kernel_name<class append_blocks_367634,
                                           dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(hi - first + 1)) *
                                   sycl::range(1, 1, THREADS),
@@ -545,7 +545,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class append_blocks_a6c94e,
+        st->parallel_for<dpct_kernel_name<class append_blocks_5c80c6,
                                           dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(hi - first + 1)) *
                                   sycl::range(1, 1, THREADS),
@@ -562,7 +562,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class append_tail_e0658e>>(
+        st->parallel_for<dpct_kernel_name<class append_tail_edc349>>(
             sycl::nd_range<3>(sycl::range(1, 1, R - 1) * sycl::range(1, 1, D),
                               sycl::range(1, 1, D)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {

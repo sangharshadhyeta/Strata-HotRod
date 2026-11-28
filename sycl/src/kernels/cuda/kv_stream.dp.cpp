@@ -325,7 +325,7 @@ void kv_stream_reset(const KvStreamMap& m, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class reset_kernel_f02a82>>(
+            ->parallel_for<dpct_kernel_name<class reset_kernel_b7e566>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 128) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -372,7 +372,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class resolve_kernel_148a81>>(
+            ->parallel_for<dpct_kernel_name<class resolve_kernel_e0709b>>(
                 sycl::nd_range<3>(sycl::range(1, 1, RT), sycl::range(1, 1, RT)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
@@ -391,7 +391,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                 auto runs_of_slots_host_fmt_s_ct1 =
                     runs_of(slots, host, fmt, s);
 
-                cgh.parallel_for<dpct_kernel_name<class copy_kernel_4bb253>>(
+                cgh.parallel_for<dpct_kernel_name<class copy_kernel_f62511>>(
                     sycl::nd_range<3>(sycl::range(1, 1, 96) *
                                           sycl::range(1, 1, 128),
                                       sycl::range(1, 1, 128)),
@@ -409,7 +409,7 @@ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void*
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class ring_kernel_f9df1d>>(
+            ->parallel_for<dpct_kernel_name<class ring_kernel_a63420>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 64) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),

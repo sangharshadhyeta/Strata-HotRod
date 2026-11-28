@@ -202,7 +202,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            s->parallel_for<dpct_kernel_name<class copy16_kernel_b12127>>(
+            s->parallel_for<dpct_kernel_name<class copy16_kernel_156a8d>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks(2 * na + nc)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -219,7 +219,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            s->parallel_for<dpct_kernel_name<class copy1_kernel_c557f3>>(
+            s->parallel_for<dpct_kernel_name<class copy1_kernel_ee4ff0>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks(2 * na + nc)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -244,7 +244,7 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class strata_q2_kernel_793a65>>(
+            ->parallel_for<dpct_kernel_name<class strata_q2_kernel_bf9307>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, blocks(1280LL * 40 + 2560LL * 10)) *
                         sycl::range(1, 1, 256),
@@ -269,7 +269,7 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class swiglu_kernel_3f7a6f>>(
+            ->parallel_for<dpct_kernel_name<class swiglu_kernel_ebc408>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks(rows * n_ff)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -292,7 +292,7 @@ void iota(int32_t* dst, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class iota_kernel_9245a0>>(
+            ->parallel_for<dpct_kernel_name<class iota_kernel_2099b9>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks(n)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),

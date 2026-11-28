@@ -144,7 +144,7 @@ void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class bf16_gemv_warp_kernel_1fb910>>(
+                    dpct_kernel_name<class bf16_gemv_warp_kernel_a1c8f3>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -167,7 +167,7 @@ void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class bf16_gemv_naive_kernel_7678d1>>(
+                dpct_kernel_name<class bf16_gemv_naive_kernel_adaf99>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -193,7 +193,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class bf16_gemv_warp_kernel_1f3015>>(
+                    dpct_kernel_name<class bf16_gemv_warp_kernel_82aa37>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -232,7 +232,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
                     sycl::range((size_t)threads_per_row * sizeof(float)), cgh);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class bf16_gemv_split_kernel_adfacf>>(
+                    dpct_kernel_name<class bf16_gemv_split_kernel_392c7e>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                           sycl::range(1, 1, threads_per_row),
                                       sycl::range(1, 1, threads_per_row)),

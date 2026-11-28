@@ -278,7 +278,7 @@ void launch_sigmoid_scale_rows(float *out, const float *g, int n_embd,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             cs->parallel_for<
-                dpct_kernel_name<class sigmoid_scale_rows_vec4_kernel_723a94>>(
+                dpct_kernel_name<class sigmoid_scale_rows_vec4_kernel_0243f5>>(
                 sycl::nd_range<3>(
                     sycl::range(1, (unsigned)n_tok,
                                 (unsigned)((n4 + THREADS - 1) / THREADS)) *
@@ -294,7 +294,7 @@ void launch_sigmoid_scale_rows(float *out, const float *g, int n_embd,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cs->parallel_for<
-            dpct_kernel_name<class sigmoid_scale_rows_kernel_26f4a0>>(
+            dpct_kernel_name<class sigmoid_scale_rows_kernel_43b005>>(
             sycl::nd_range<3>(
                 sycl::range(1, (unsigned)n_tok,
                             (unsigned)((n_embd + THREADS - 1) / THREADS)) *
@@ -343,7 +343,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             cs->parallel_for<
-                dpct_kernel_name<class native_swiglu_kernel_c4e755>>(
+                dpct_kernel_name<class native_swiglu_kernel_bfd018>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((n + THREADS - 1) / THREADS)) *
                         sycl::range(1, 1, THREADS),
@@ -399,7 +399,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                         auto g_t_ct0 = g + t;
 
                         cgh.parallel_for<dpct_kernel_name<
-                            class native_scalar_sigmoid_kernel_9552ea>>(
+                            class native_scalar_sigmoid_kernel_78a31f>>(
                             sycl::nd_range<3>(sycl::range(1, 1, 1),
                                               sycl::range(1, 1, 1)),
                             exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -419,7 +419,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                     auto g_t_ct2 = g + t;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class scalar_gate_kernel_76bc5d>>(
+                        dpct_kernel_name<class scalar_gate_kernel_2c4fc8>>(
                         sycl::nd_range<3>(sycl::range(1, 1, 256),
                                           sycl::range(1, 1, 256)),
                         exp_props,
@@ -436,7 +436,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class scale_rows_kernel_4f17ec>>(
+            cs->parallel_for<dpct_kernel_name<class scale_rows_kernel_281741>>(
                 sycl::nd_range<3>(
                     sycl::range(1, (unsigned)n_tok,
                                 (unsigned)((n_embd + THREADS - 1) / THREADS)) *
@@ -559,7 +559,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class native_swiglu_kernel_75dcdc>>(
+                    dpct_kernel_name<class native_swiglu_kernel_77b226>>(
                     sycl::nd_range<3>(sycl::range(1, 1, g_ff) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -574,7 +574,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
                 {sycl::aspect::fp64});
 
             strata::q_of(stream)
-                ->parallel_for<dpct_kernel_name<class swiglu_kernel_fbfcfe>>(
+                ->parallel_for<dpct_kernel_name<class swiglu_kernel_e3dee5>>(
                     sycl::nd_range<3>(sycl::range(1, 1, g_ff) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -625,7 +625,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class scalar_gate_kernel_82de77>>(
+                    dpct_kernel_name<class scalar_gate_kernel_42b48c>>(
                     sycl::nd_range<3>(sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
                     exp_props,
@@ -640,7 +640,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             strata::q_of(stream)
-                ->parallel_for<dpct_kernel_name<class scale_kernel_a41a71>>(
+                ->parallel_for<dpct_kernel_name<class scale_kernel_62b025>>(
                     sycl::nd_range<3>(sycl::range(1, 1, g_embd) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -686,7 +686,7 @@ void moe_combine(const float *parts, const float *weights, const float *shared,
                     tap ? *tap : MoeLearnTap{};
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class moe_combine_kernel_c03916>>(
+                    dpct_kernel_name<class moe_combine_kernel_4a8634>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),

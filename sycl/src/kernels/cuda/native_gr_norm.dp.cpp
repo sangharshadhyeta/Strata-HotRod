@@ -120,7 +120,7 @@ void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, f
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cuda_stream->parallel_for<dpct_kernel_name<
-            class weighted_rms_norm_60b509, dpct_kernel_scalar<256>>>(
+            class weighted_rms_norm_6ff364, dpct_kernel_scalar<256>>>(
             sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
             exp_props,
@@ -138,7 +138,7 @@ void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, f
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cuda_stream->parallel_for<dpct_kernel_name<
-            class weighted_rms_norm_9382c8, dpct_kernel_scalar<1024>>>(
+            class weighted_rms_norm_849f92, dpct_kernel_scalar<1024>>>(
             sycl::nd_range<3>(grid * sycl::range(1, 1, 1024),
                               sycl::range(1, 1, 1024)),
             exp_props,

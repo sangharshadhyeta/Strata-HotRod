@@ -142,7 +142,7 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
                 auto mrope_table_ct8 = mrope_table();
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class rope_neox_kernel_e291c2>>(
+                    dpct_kernel_name<class rope_neox_kernel_e583a7>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                           sycl::range(1, 1, threads),
                                       sycl::range(1, 1, threads)),

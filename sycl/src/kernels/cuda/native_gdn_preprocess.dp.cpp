@@ -245,7 +245,7 @@ void native_gdn_conv_silu(float* history, const float* input, const float* weigh
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class conv_silu_1ba4e6>>(
+            ->parallel_for<dpct_kernel_name<class conv_silu_b0a83f>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, unsigned((channels + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -269,7 +269,7 @@ void native_gdn_l2_norm(float* input, int64_t rows, int64_t cols, float epsilon,
                 auto epsilon_S_ct1 = epsilon / S;
                 auto sqrtf_float_S_ct2 = 1.0f / sqrtf(float(S));
 
-                cgh.parallel_for<dpct_kernel_name<class l2_norm_bcf2af>>(
+                cgh.parallel_for<dpct_kernel_name<class l2_norm_b291ad>>(
                     sycl::nd_range<3>(sycl::range(1, 1, unsigned(rows)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),
@@ -290,7 +290,7 @@ void native_gdn_beta_gate(float* beta, int64_t heads, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class beta_sigmoid_fcf68f>>(
+            ->parallel_for<dpct_kernel_name<class beta_sigmoid_53aedd>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, unsigned((heads + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -316,7 +316,7 @@ void native_gdn_gate(const float* alpha, const float* dt, const float* ssm_a,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class gate_softplus_a95cee>>(
+            ->parallel_for<dpct_kernel_name<class gate_softplus_9fe61d>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, unsigned((heads + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -343,7 +343,7 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class out_norm_a49e35>>(
+            ->parallel_for<dpct_kernel_name<class out_norm_6db8e8>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(heads)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),

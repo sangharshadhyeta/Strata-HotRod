@@ -441,7 +441,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
                     auto n_b_threads_ct1 = n - b * threads;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class poison_kernel_58fc0a>>(
+                        dpct_kernel_name<class poison_kernel_17d8a8>>(
                         sycl::nd_range<3>(sycl::range(1, 1, (unsigned)chunk) *
                                               sycl::range(1, 1, threads),
                                           sycl::range(1, 1, threads)),

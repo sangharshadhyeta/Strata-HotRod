@@ -113,7 +113,7 @@ void s2_gemv_quads(const uint16_t *x, const uint8_t *codes, const float *scales,
                 sycl::range(smem), cgh);
 
             cgh.parallel_for<
-                dpct_kernel_name<class s2_gemv_quads_kernel_5797f4>>(
+                dpct_kernel_name<class s2_gemv_quads_kernel_545afc>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_out) *
                                       sycl::range(1, 1, threads_per_row),
                                   sycl::range(1, 1, threads_per_row)),

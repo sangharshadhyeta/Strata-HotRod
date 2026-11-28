@@ -1714,7 +1714,7 @@ bool launch_i8(const float *q, const QsaAttnPools &pools, const int32_t *ids,
                 auto attn_q0_s_n_head_HD_ct7 = attn + q0 * s.n_head * HD;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class prompt_attn_i8_kernel_c3d463>>(
+                    dpct_kernel_name<class prompt_attn_i8_kernel_14da17>>(
                     sycl::nd_range<3>(
                         sycl::range(1, (unsigned)s.n_head_kv, (unsigned)nb) *
                             sycl::range(1, 1, THREADS),
@@ -2273,7 +2273,7 @@ bool launch_i8v3(const float *q, const QsaAttnPools &pools, const int32_t *ids,
                 auto attn_q0_s_n_head_HD_ct7 = attn + q0 * s.n_head * HD;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class prompt_attn_i8v3_kernel_fb4144>>(
+                    dpct_kernel_name<class prompt_attn_i8v3_kernel_da69e4>>(
                     sycl::nd_range<3>(
                         sycl::range(1, (unsigned)s.n_head_kv, (unsigned)nb) *
                             sycl::range(1, 1, THREADS),
@@ -2355,7 +2355,7 @@ bool launch(const float *q, const QsaAttnPools &pools, const int32_t *ids,
                 auto attn_q0_s_n_head_HD_ct7 = attn + q0 * s.n_head * HD;
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class prompt_attn_kernel_e09b15,
+                    class prompt_attn_kernel_a5b00d,
                     dpct_kernel_scalar<KV_MODE>, dpct_kernel_scalar<PF>>>(
                     sycl::nd_range<3>(
                         sycl::range(1, (unsigned)s.n_head_kv, (unsigned)nb) *
@@ -3202,7 +3202,7 @@ bool qsa_decode_attn_split(const float *q, const QsaAttnPools &pools,
                 sycl::range(bytes), cgh);
 
             cgh.parallel_for<
-                dpct_kernel_name<class decode_attn_i8_split_kernel_23a550>>(
+                dpct_kernel_name<class decode_attn_i8_split_kernel_33f767>>(
                 sycl::nd_range<3>(sycl::range((unsigned)nsp,
                                               (unsigned)s.n_head_kv,
                                               (unsigned)n_q) *
@@ -3225,7 +3225,7 @@ bool qsa_decode_attn_split(const float *q, const QsaAttnPools &pools,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         st->parallel_for<
-            dpct_kernel_name<class decode_attn_merge_kernel_44e1f7>>(
+            dpct_kernel_name<class decode_attn_merge_kernel_ab2300>>(
             sycl::nd_range<3>(
                 sycl::range(1, (unsigned)s.n_head, (unsigned)n_q) *
                     sycl::range(1, 1, HD),

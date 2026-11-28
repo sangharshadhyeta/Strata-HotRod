@@ -3727,7 +3727,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
-                class mmvq_multi_kernel_8df6c9, dpct_kernel_scalar<TY>,
+                class mmvq_multi_kernel_ddf1e2, dpct_kernel_scalar<TY>,
                 dpct_kernel_scalar<1>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3751,7 +3751,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
-                class mmvq_multi_kernel_9c43f2, dpct_kernel_scalar<TY>,
+                class mmvq_multi_kernel_377e3a, dpct_kernel_scalar<TY>,
                 dpct_kernel_scalar<2>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3775,7 +3775,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
-                class mmvq_multi_kernel_f8d14a, dpct_kernel_scalar<TY>,
+                class mmvq_multi_kernel_a573c5, dpct_kernel_scalar<TY>,
                 dpct_kernel_scalar<3>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3799,7 +3799,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
-                class mmvq_multi_kernel_88cd9a, dpct_kernel_scalar<TY>,
+                class mmvq_multi_kernel_f63dea, dpct_kernel_scalar<TY>,
                 dpct_kernel_scalar<4>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3823,7 +3823,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
-                class mmvq_multi_kernel_d55b02, dpct_kernel_scalar<TY>,
+                class mmvq_multi_kernel_522c9a, dpct_kernel_scalar<TY>,
                 dpct_kernel_scalar<5>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3847,7 +3847,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
-                class mmvq_multi_kernel_3404b2, dpct_kernel_scalar<TY>,
+                class mmvq_multi_kernel_25685b, dpct_kernel_scalar<TY>,
                 dpct_kernel_scalar<6>, dpct_kernel_scalar<STAGE_GRID>,
                 dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3873,7 +3873,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
             s->submit([&](sycl::handler &cgh) {
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class mmvq_multi_kernel_1f7e16, dpct_kernel_scalar<TY>,
+                    class mmvq_multi_kernel_a4d898, dpct_kernel_scalar<TY>,
                     dpct_kernel_scalar<1>, dpct_kernel_scalar<STAGE_GRID>,
                     dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3898,7 +3898,7 @@ void launch_mmvq_multi_nc(dpct::dim3 grid, dpct::dim3 block, dpct::queue_ptr s,
             s->submit([&](sycl::handler &cgh) {
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class mmvq_multi_kernel_95b544, dpct_kernel_scalar<TY>,
+                    class mmvq_multi_kernel_9deb67, dpct_kernel_scalar<TY>,
                     dpct_kernel_scalar<8>, dpct_kernel_scalar<STAGE_GRID>,
                     dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(grid * block, block), exp_props,
@@ -3929,7 +3929,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
 
         s->submit([&](sycl::handler &cgh) {
 
-            cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_c04bb8,
+            cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_4a4d0f,
                                               dpct_kernel_scalar<TY>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
                 [=](sycl::nd_item<3> item_ct1)
@@ -3950,7 +3950,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
 
         s->submit([&](sycl::handler &cgh) {
 
-            cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_18057f,
+            cgh.parallel_for<dpct_kernel_name<class mmvq_kernel_9bf3fb,
                                               dpct_kernel_scalar<TY>>>(
                 sycl::nd_range<3>(grid * block, block), exp_props,
                 [=](sycl::nd_item<3> item_ct1)
@@ -4452,7 +4452,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
-                class s26_gu_l_kernel_46f2dc, dpct_kernel_scalar<LT>,
+                class s26_gu_l_kernel_dd13dc, dpct_kernel_scalar<LT>,
                 dpct_kernel_scalar<LX>, dpct_kernel_scalar<RG>,
                 dpct_kernel_scalar<SL>, dpct_kernel_scalar<TS>>>(
                 sycl::nd_range<3>(ggu * sycl::range(1, 1, 256),
@@ -4470,7 +4470,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_a7b554>>(
+        s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_b9e3da>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -4484,7 +4484,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             s->parallel_for<
-                dpct_kernel_name<class swiglu_entries_kernel_a4959c>>(
+                dpct_kernel_name<class swiglu_entries_kernel_ae559a>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -4499,7 +4499,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
-                dpct_kernel_name<class quantize_q8_1_kernel_6b0f01>>(
+                dpct_kernel_name<class quantize_q8_1_kernel_84e906>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -4521,7 +4521,7 @@ void s26_launch_l(const NativeExpertLayout &L, int64_t cap_groups,
         s->submit([&](sycl::handler &cgh) {
 
             cgh.parallel_for<dpct_kernel_name<
-                class s26_down_l_kernel_669590, dpct_kernel_scalar<LX>,
+                class s26_down_l_kernel_7cc145, dpct_kernel_scalar<LX>,
                 dpct_kernel_scalar<RD>, dpct_kernel_scalar<SL>,
                 dpct_kernel_scalar<TS>, dpct_kernel_scalar<BD>>>(
                 sycl::nd_range<3>(gd * sycl::range(1, 1, 256),
@@ -4909,7 +4909,7 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<
-            dpct_kernel_name<class s27_gu_kernel_7906c8, dpct_kernel_scalar<TG>,
+            dpct_kernel_name<class s27_gu_kernel_8ce00b, dpct_kernel_scalar<TG>,
                              dpct_kernel_scalar<LX>, dpct_kernel_scalar<RG>,
                              dpct_kernel_scalar<TS>>>(
             sycl::nd_range<3>(ggu * sycl::range(1, 1, 256),
@@ -4924,7 +4924,7 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_a7f255>>(
+        s->parallel_for<dpct_kernel_name<class s26_swiglu_q8_1_kernel_592063>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -4939,7 +4939,7 @@ void s27_launch(const NativeExpertLayout &L, int64_t cap_groups,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         s->parallel_for<
-            dpct_kernel_name<class s27_down_kernel_d38356,
+            dpct_kernel_name<class s27_down_kernel_60024e,
                              dpct_kernel_scalar<TD>, dpct_kernel_scalar<LX>,
                              dpct_kernel_scalar<RD>, dpct_kernel_scalar<TS>>>(
             sycl::nd_range<3>(gd * sycl::range(1, 1, 256),
@@ -5156,7 +5156,7 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class quantize_q8_1_kernel_422964>>(
+            ->parallel_for<dpct_kernel_name<class quantize_q8_1_kernel_34de7e>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((n + 255) / 256)) *
                         sycl::range(1, 1, 256),
@@ -5287,7 +5287,7 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
                 auto n_ct1 = n / 16;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class nvfp4_dequant_sub_kernel_71585d>>(
+                    dpct_kernel_name<class nvfp4_dequant_sub_kernel_ceaef0>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1, (unsigned)((n / 16 + 255) / 256)) *
                             sycl::range(1, 1, 256),
@@ -5310,7 +5310,7 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
             ->submit([&](sycl::handler &cgh) {
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class dequant_flat_kernel_c7cec2, sycl::half>>(
+                    class dequant_flat_kernel_8f9ca0, sycl::half>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(n / 256)) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -5352,7 +5352,7 @@ void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* to
             ->submit([&](sycl::handler &cgh) {
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class embed_rows_kernel_284a43>>(
+                    dpct_kernel_name<class embed_rows_kernel_a1e87d>>(
                     sycl::nd_range<3>(sycl::range(1, (unsigned)n_tok,
                                                   (unsigned)(n_embd / 256)) *
                                           sycl::range(1, 1, 32),
@@ -5381,7 +5381,7 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
             ->submit([&](sycl::handler &cgh) {
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class dequant_flat_kernel_9052bc, float>>(
+                    dpct_kernel_name<class dequant_flat_kernel_649534, float>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)(n / 256)) *
                                           sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
@@ -5415,7 +5415,7 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
                 auto n_ff_n_embd_ct2 = n_ff * (n_embd / 16);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class nvfp4_dequant_gu_kernel_8db5fb>>(
+                    dpct_kernel_name<class nvfp4_dequant_gu_kernel_3620ab>>(
                     sycl::nd_range<3>(
                         sycl::range(
                             1, 2,
@@ -5441,7 +5441,7 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
             ->submit([&](sycl::handler &cgh) {
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class dequant_gu_kernel_2397ca>>(
+                    dpct_kernel_name<class dequant_gu_kernel_97191f>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 2, (unsigned)(n_ff * per_row)) *
                             sycl::range(1, 1, 32),
@@ -5488,7 +5488,7 @@ void iq_dequant_expert_f16(int gt, int dt, const void* gate, const void* up, con
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(strata::q_of(stream)->get_device(), {sycl::aspect::fp16});
         strata::q_of(stream)->submit([&](sycl::handler &cgh) {
-            cgh.parallel_for<dpct_kernel_name<class dequant_expert_kernel_7d2c41>>(
+            cgh.parallel_for<dpct_kernel_name<class dequant_expert_kernel_5d8422>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned) (gu_wgs + d_wgs)) * sycl::range(1, 1, 32),
                                   sycl::range(1, 1, 32)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -6238,7 +6238,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 s->parallel_for<
-                    dpct_kernel_name<class swiglu_entries_kernel_a4959c>>(
+                    dpct_kernel_name<class swiglu_entries_kernel_eda327>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                             sycl::range(1, 1, 256),
@@ -6254,7 +6254,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                                              {sycl::aspect::fp16});
 
                 s->parallel_for<
-                    dpct_kernel_name<class quantize_q8_1_kernel_f68c59>>(
+                    dpct_kernel_name<class quantize_q8_1_kernel_2df8da>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                             sycl::range(1, 1, 256),
@@ -6270,7 +6270,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             s->parallel_for<
-                dpct_kernel_name<class swiglu_q8_1_entries_kernel_115291>>(
+                dpct_kernel_name<class swiglu_q8_1_entries_kernel_a7368c>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((nh + 255) / 256)) *
                         sycl::range(1, 1, 256),

@@ -1567,7 +1567,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class gr_norm_split_kernel_200589>>(
+        st->parallel_for<dpct_kernel_name<class gr_norm_split_kernel_f5e7c3>>(
             sycl::nd_range<3>(sycl::range(1, HC, (unsigned)n_tok) *
                                   sycl::range(1, 1, THREADS),
                               sycl::range(1, 1, THREADS)),
@@ -1579,7 +1579,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_2f4d93>>(
+        st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_cb45d4>>(
             sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
                                   sycl::range(1, 1, THREADS),
                               sycl::range(1, 1, THREADS)),
@@ -1626,7 +1626,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                         sycl::range(smem), cgh);
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class gr_down_staged_kernel_41b428,
+                        dpct_kernel_name<class gr_down_staged_kernel_3782dc,
                                          dpct_kernel_scalar<4>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
@@ -1654,7 +1654,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     could not be deduced. You need to update this code.
                     */
                     cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_staged_kernel_41b428>>(
+                        class gr_down_staged_kernel_e326b8>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
                                           sycl::range(1, 1, THREADS)),
@@ -1683,7 +1683,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     could not be deduced. You need to update this code.
                     */
                     cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_4a9670,
+                        class gr_down_multi_kernel_b237a4,
                         dpct_kernel_scalar<1280>, dpct_kernel_scalar<4>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
@@ -1702,7 +1702,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                 auto exp_props = sycl::ext::oneapi::experimental::properties{
                     sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class gr_up_fast_kernel_ec286a>>(
+        st->parallel_for<dpct_kernel_name<class gr_up_fast_kernel_b5c60d>>(
             sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
                                   sycl::range(1, 1, THREADS),
                               sycl::range(1, 1, THREADS)),
@@ -1739,7 +1739,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     could not be deduced. You need to update this code.
                     */
                     cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_6a749c,
+                        class gr_down_multi_kernel_03c925,
                         dpct_kernel_scalar<1280>, dpct_kernel_scalar<1280>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
@@ -1765,7 +1765,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                         sycl::range(smem), cgh);
 
                     cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_2d8885,
+                        class gr_down_multi_kernel_81c754,
                         dpct_kernel_scalar<2560>, dpct_kernel_scalar<4>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
@@ -1785,7 +1785,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     sycl::ext::oneapi::experimental::use_root_sync};
 
             st->parallel_for<dpct_kernel_name<
-                class gr_up_multi_kernel_135a5c, dpct_kernel_scalar<3>,
+                class gr_up_multi_kernel_44f5c9, dpct_kernel_scalar<3>,
                 dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
                                       sycl::range(1, 1, THREADS),
@@ -1807,7 +1807,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
                     could not be deduced. You need to update this code.
                     */
                     cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_df2ead,
+                        class gr_down_multi_kernel_5b8cd8,
                         dpct_kernel_scalar<2560>, dpct_kernel_scalar<2560>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                               sycl::range(1, 1, THREADS),
@@ -1929,7 +1929,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                     sycl::range(sm), cgh);
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class gr_down_v3_kernel_c14ff7, dpct_kernel_scalar<2>>>(
+                    class gr_down_v3_kernel_cbd36b, dpct_kernel_scalar<2>>>(
                     sycl::nd_range<3>(sycl::range(1, HC * 2, LR / WARPS + 1) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -1952,7 +1952,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                     sycl::range(sm), cgh);
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class gr_down_v3_kernel_88bc89, dpct_kernel_scalar<1>>>(
+                    class gr_down_v3_kernel_fc14a8, dpct_kernel_scalar<1>>>(
                     sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -1972,7 +1972,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_6e945c,
+            st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_178ab3,
                                               dpct_kernel_scalar<2>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
                                       sycl::range(1, 1, THREADS),
@@ -1986,7 +1986,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_716779,
+            st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_7b8a11,
                                               dpct_kernel_scalar<1>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
                                       sycl::range(1, 1, THREADS),
@@ -2016,7 +2016,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 sycl::nd_range<3>(sycl::range(1, 1, n_tok * HC) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
                 [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_norm_split_port_kernel(m); });
         else
-        st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_2f4d92>>(
+        st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_5c45c6>>(
             sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
                                   sycl::range(1, 1, THREADS),
                               sycl::range(1, 1, THREADS)),
@@ -2082,7 +2082,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                 sycl::range((size_t)n_tok * TILE * sizeof(float)), cgh);
             cgh.parallel_for<
-                dpct_kernel_name<class gr_down_multi_kernel_7f5820, dpct_kernel_scalar<TILE>>>(
+                dpct_kernel_name<class gr_down_multi_kernel_26829b, dpct_kernel_scalar<TILE>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS * DOWN_SPLIT + 1) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -2109,7 +2109,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                     sycl::range((size_t)ct * TILE * sizeof(float)), cgh);
                 cgh.parallel_for<
-                    dpct_kernel_name<class gr_down_multi_kernel_88cb86, dpct_kernel_scalar<TILE>>>(
+                    dpct_kernel_name<class gr_down_multi_kernel_c9fa0e, dpct_kernel_scalar<TILE>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS * DOWN_SPLIT + 1) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -2198,7 +2198,7 @@ void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, 
         sycl::ext::oneapi::experimental::use_root_sync};
 
     strata::q_of(stream)
-        ->parallel_for<dpct_kernel_name<class gr_dequant_q8_0_kernel_a0eddf>>(
+        ->parallel_for<dpct_kernel_name<class gr_dequant_q8_0_kernel_585758>>(
             sycl::nd_range<3>(
                 sycl::range(1, 1, (unsigned)((n_blocks + 7) / 8)) *
                     sycl::range(1, 1, 256),
@@ -2213,7 +2213,7 @@ void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks
         sycl::ext::oneapi::experimental::use_root_sync};
 
     strata::q_of(stream)
-        ->parallel_for<dpct_kernel_name<class gr_quantize_q8_0_kernel_32a3e6>>(
+        ->parallel_for<dpct_kernel_name<class gr_quantize_q8_0_kernel_58f33e>>(
             sycl::nd_range<3>(
                 sycl::range(1, 1, (unsigned)((n_blocks + 7) / 8)) *
                     sycl::range(1, 1, 256),
@@ -2257,7 +2257,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class gr_down_kernel_a5fa71,
+            st->parallel_for<dpct_kernel_name<class gr_down_kernel_ac3b28,
                                               dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                       sycl::range(1, 1, THREADS),
@@ -2272,7 +2272,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class gr_up_kernel_fe3258,
+            st->parallel_for<dpct_kernel_name<class gr_up_kernel_252dd5,
                                               dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
                                       sycl::range(1, 1, THREADS),
@@ -2293,7 +2293,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
   deduced. You need to update this code.
   */
                 parallel_for<dpct_kernel_name<
-                    class gr_down_kernel_a5fa71,
+                    class gr_down_kernel_c60e1c,
                     dpct_placeholder /*Fix the type mannually*/>>(
                     sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
                                           sycl::range(1, 1, THREADS),
@@ -2313,7 +2313,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
   deduced. You need to update this code.
   */
                 parallel_for<dpct_kernel_name<
-                    class gr_up_kernel_fe3258,
+                    class gr_up_kernel_b975ef,
                     dpct_placeholder /*Fix the type mannually*/>>(
                     sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
                                           sycl::range(1, 1, THREADS),
@@ -2631,7 +2631,7 @@ void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long l
         sycl::ext::oneapi::experimental::use_root_sync};
 
     strata::q_of(stream)
-        ->parallel_for<dpct_kernel_name<class hc_q8_bf16_kernel_1fa426>>(
+        ->parallel_for<dpct_kernel_name<class hc_q8_bf16_kernel_e8b26a>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)((n + 255) / 256)) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),

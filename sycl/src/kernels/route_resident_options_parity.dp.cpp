@@ -398,7 +398,7 @@ int main(int argc, char** argv) {
                     strata::kernels::route_cfg_device();
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class route_resident_old_k_c6517e>>(
+                    dpct_kernel_name<class route_resident_old_k_06cdef>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1, (unsigned)((n + 31) / 32)) *
                             sycl::range(1, 1, 32),

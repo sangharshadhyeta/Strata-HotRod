@@ -134,7 +134,7 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class step_134598>>(
+            ->parallel_for<dpct_kernel_name<class step_0f7b82>>(
                 sycl::nd_range<3>(sycl::range(S / 4, 1, unsigned(shape.h_v)) *
                                       sycl::range(1, 4, 32),
                                   sycl::range(1, 4, 32)),

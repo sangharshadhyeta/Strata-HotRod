@@ -1619,7 +1619,7 @@ void launch(int ww, unsigned grid, const Batch &b, const NativeGeom &g,
                         sycl::range(smem_bytes(T, 4, host_astages())), cgh);
 
                     cgh.parallel_for<dpct_kernel_name<
-                        class native_kernel_dd9f78, dpct_kernel_scalar<T>,
+                        class native_kernel_37c1a2, dpct_kernel_scalar<T>,
                         dpct_kernel_scalar<GU>, dpct_kernel_scalar<4>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                               sycl::range(1, 1, THREADS),
@@ -1668,7 +1668,7 @@ void launch(int ww, unsigned grid, const Batch &b, const NativeGeom &g,
                         sycl::range(smem_bytes(T, 2, host_astages())), cgh);
 
                     cgh.parallel_for<dpct_kernel_name<
-                        class native_kernel_d860c4, dpct_kernel_scalar<T>,
+                        class native_kernel_3ec395, dpct_kernel_scalar<T>,
                         dpct_kernel_scalar<GU>, dpct_kernel_scalar<2>>>(
                         sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                               sycl::range(1, 1, THREADS),
@@ -1742,7 +1742,7 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 
             strata::q_of(stream)
                 ->parallel_for<
-                    dpct_kernel_name<class quant_act_nat_kernel_7d58c5>>(
+                    dpct_kernel_name<class quant_act_nat_kernel_e64341>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks(nblk, 8)) *
                                           sycl::range(1, 1, 256),
                                       sycl::range(1, 1, 256)),

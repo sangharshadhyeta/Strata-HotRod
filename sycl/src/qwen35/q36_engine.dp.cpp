@@ -2187,7 +2187,7 @@ struct Engine {
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 ((sycl::queue *)(st))
-                    ->parallel_for<dpct_kernel_name<class k_gemv_f32_689897>>(
+                    ->parallel_for<dpct_kernel_name<class k_gemv_f32_48cd2f>>(
                         sycl::nd_range<3>(sycl::range(1, T, rows8(n_out)) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -2214,7 +2214,7 @@ struct Engine {
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 ((sycl::queue *)(st))
-                    ->parallel_for<dpct_kernel_name<class k_sgemm_nt_ed21b5,
+                    ->parallel_for<dpct_kernel_name<class k_sgemm_nt_a54c2c,
                                                     dpct_kernel_scalar<4>>>(
                         sycl::nd_range<3>(sycl::range(splits, gy, gx) *
                                               sycl::range(1, 1, 256),
@@ -2228,7 +2228,7 @@ struct Engine {
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 ((sycl::queue *)(st))
-                    ->parallel_for<dpct_kernel_name<class k_sgemm_nt_4ef434,
+                    ->parallel_for<dpct_kernel_name<class k_sgemm_nt_eb3d15,
                                                     dpct_kernel_scalar<1>>>(
                         sycl::nd_range<3>(sycl::range(splits, gy, gx) *
                                               sycl::range(1, 1, 256),
@@ -2248,7 +2248,7 @@ struct Engine {
                     auto int64_t_T_n_out_ct2 = (int64_t)T * n_out;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class k_sum_splits_8993aa>>(
+                        dpct_kernel_name<class k_sum_splits_ced6cd>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, grid1((int64_t)T * n_out)) *
                                 sycl::range(1, 1, kThreads),
@@ -2290,7 +2290,7 @@ struct Engine {
                 auto x16_ct1 = x16;
                 auto int64_t_n_T_ct2 = (int64_t)n * T;
 
-                cgh.parallel_for<dpct_kernel_name<class k_to_f16_d5b02b>>(
+                cgh.parallel_for<dpct_kernel_name<class k_to_f16_811603>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid1((int64_t)n * T)) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -2473,7 +2473,7 @@ struct Engine {
                         auto m_eps_ct5 = m->eps;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_add_rms_13272b>>(
+                            dpct_kernel_name<class k_add_rms_931790>>(
                             sycl::nd_range<3>(sycl::range(1, 1, T) *
                                                   sycl::range(1, 1, kThreads),
                                               sycl::range(1, 1, kThreads)),
@@ -2528,7 +2528,7 @@ struct Engine {
                 auto h_ct3 = h;
                 auto m_eps_ct5 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_add_rms_aac036>>(
+                cgh.parallel_for<dpct_kernel_name<class k_add_rms_598544>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -2677,7 +2677,7 @@ the work-group size if needed.
                 const int32_t *ids_ct0 = ids;
                 auto m_g_n_expert_ct3 = (int)m->g.n_expert;
 
-                cgh.parallel_for<dpct_kernel_name<class k_group_hy_84fb4e>>(
+                cgh.parallel_for<dpct_kernel_name<class k_group_hy_4ec491>>(
                     sycl::nd_range<3>(sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -2694,7 +2694,7 @@ the work-group size if needed.
                 const int32_t *ids_ct0 = ids;
                 auto m_g_n_expert_ct3 = (int)m->g.n_expert;
 
-                cgh.parallel_for<dpct_kernel_name<class k_group_bffb06>>(
+                cgh.parallel_for<dpct_kernel_name<class k_group_5235d9>>(
                     sycl::nd_range<3>(sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -2951,7 +2951,7 @@ the work-group size if needed.
                     auto vh__ct9 = vh_;
                     auto m_eps_ct11 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_moe_out_b2bc4b>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_moe_out_6b752a>>(
                         sycl::nd_range<3>(sycl::range(1, 1, T) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -3019,7 +3019,7 @@ the work-group size if needed.
                 const float *ewts_ct3 = ewts;
                 auto m_eps_ct11 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_moe_out_f4b45f>>(
+                cgh.parallel_for<dpct_kernel_name<class k_moe_out_68b422>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3072,7 +3072,7 @@ the work-group size if needed.
                 ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
                     const float *h_ct2 = h;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_gdn_ab_381d0f>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_gdn_ab_065cdd>>(
                         sycl::nd_range<3>(sycl::range(1, T, rows8(2 * HV)) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -3092,7 +3092,7 @@ the work-group size if needed.
                             sycl::ext::oneapi::experimental::use_root_sync};
 
                     ((sycl::queue *)(st))
-                        ->parallel_for<dpct_kernel_name<class k_gdn_gb_7ed2cb>>(
+                        ->parallel_for<dpct_kernel_name<class k_gdn_gb_95549d>>(
                             sycl::nd_range<3>(
                                 sycl::range(1, 1, grid1((int64_t)HV * T)) *
                                     sycl::range(1, 1, kThreads),
@@ -3119,7 +3119,7 @@ the work-group size if needed.
                         const int32_t *d_gcnt_ct12 = d_gcnt;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_conv_seq_91b9af>>(
+                            dpct_kernel_name<class k_conv_seq_6685cd>>(
                             sycl::nd_range<3>(sycl::range(1, rows_G, C / 128) *
                                                   sycl::range(1, 1, 128),
                                               sycl::range(1, 1, 128)),
@@ -3157,7 +3157,7 @@ the work-group size if needed.
                         const int32_t *d_gcnt_ct16 = d_gcnt;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_gdn_seq_a32567>>(
+                            dpct_kernel_name<class k_gdn_seq_e442db>>(
                             sycl::nd_range<3>(sycl::range(1, rows_G, HV) *
                                                   sycl::range(1, 4, 128),
                                               sycl::range(1, 4, 128)),
@@ -3193,7 +3193,7 @@ the work-group size if needed.
                         auto verify_ct8 = !verify;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_conv_seq_a09337>>(
+                            dpct_kernel_name<class k_conv_seq_82b009>>(
                             sycl::nd_range<3>(sycl::range(1, tiles, C / 128) *
                                                   sycl::range(1, 1, 128),
                                               sycl::range(1, 1, 128)),
@@ -3224,7 +3224,7 @@ the work-group size if needed.
                             auto gdn_y_ct5 = gdn_y;
 
                             cgh.parallel_for<
-                                dpct_kernel_name<class k_gdn_seq_cols_cb2fde>>(
+                                dpct_kernel_name<class k_gdn_seq_cols_392bcf>>(
                                 sycl::nd_range<3>(
                                     sycl::range(1, kGdnColGroups, HV) *
                                         sycl::range(1, 16, 128 / kGdnColGroups),
@@ -3247,7 +3247,7 @@ the work-group size if needed.
                             auto gdn_y_ct4 = gdn_y;
 
                             cgh.parallel_for<
-                                dpct_kernel_name<class k_gdn_norm_77f5a5>>(
+                                dpct_kernel_name<class k_gdn_norm_3c0d7a>>(
                                 sycl::nd_range<3>(sycl::range(1, T, HV) *
                                                       sycl::range(1, 1, 128),
                                                   sycl::range(1, 1, 128)),
@@ -3278,7 +3278,7 @@ the work-group size if needed.
                         auto verify_ct12 = !verify;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_gdn_seq_dd773a>>(
+                            dpct_kernel_name<class k_gdn_seq_06f97c>>(
                             sycl::nd_range<3>(sycl::range(1, 1, HV) *
                                                   sycl::range(1, 4, 128),
                                               sycl::range(1, 4, 128)),
@@ -3330,7 +3330,7 @@ the work-group size if needed.
                     auto mtab_now_ct18 = mtab_now;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class k_attn_prep_95791f>>(
+                        dpct_kernel_name<class k_attn_prep_d2e9f9>>(
                         sycl::nd_range<3>(sycl::range(1, T, H + HKV) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -3369,7 +3369,7 @@ the work-group size if needed.
                         auto ctx_ct4 = ctx;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_kv_f16_1d70c7>>(
+                            dpct_kernel_name<class k_kv_f16_ebafc6>>(
                             sycl::nd_range<3>(
                                 sycl::range(1, 1,
                                             grid1((int64_t)HKV * P * HD)) *
@@ -3395,7 +3395,7 @@ the work-group size if needed.
                         auto int64_t_T_H_HD_ct2 = (int64_t)T * H * HD;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_to_f16_7e1a15>>(
+                            dpct_kernel_name<class k_to_f16_df3f63>>(
                             sycl::nd_range<3>(
                                 sycl::range(1, 1, grid1((int64_t)T * H * HD)) *
                                     sycl::range(1, 1, kThreads),
@@ -3439,7 +3439,7 @@ the work-group size if needed.
                             auto sqrtf_float_HD_ct6 = 1.0f / sqrtf((float)HD);
 
                             cgh.parallel_for<dpct_kernel_name<
-                                class k_attn_softmax16_d92d73>>(
+                                class k_attn_softmax16_819e26>>(
                                 sycl::nd_range<3>(
                                     sycl::range(1, H, nt) *
                                         sycl::range(1, 1, kThreads),
@@ -3480,7 +3480,7 @@ the work-group size if needed.
                         auto int64_t_T_H_HD_ct2 = (int64_t)T * H * HD;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_gate_mul_e73703>>(
+                            dpct_kernel_name<class k_gate_mul_ed582a>>(
                             sycl::nd_range<3>(
                                 sycl::range(1, 1, grid1((int64_t)T * H * HD)) *
                                     sycl::range(1, 1, kThreads),
@@ -3518,7 +3518,7 @@ the work-group size if needed.
                             auto pl_ct12 = pl;
 
                             cgh.parallel_for<
-                                dpct_kernel_name<class k_attn_part_9fdbf3>>(
+                                dpct_kernel_name<class k_attn_part_48e6cb>>(
                                 sycl::nd_range<3>(
                                     sycl::range(1, nt * H, nc) *
                                         sycl::range(1, 1, kChunkCells),
@@ -3553,7 +3553,7 @@ the work-group size if needed.
                             auto att_ct8 = att;
 
                             cgh.parallel_for<
-                                dpct_kernel_name<class k_attn_merge_34c11c>>(
+                                dpct_kernel_name<class k_attn_merge_be744a>>(
                                 sycl::nd_range<3>(sycl::range(1, 1, nt * H) *
                                                       sycl::range(1, 1, HD),
                                                   sycl::range(1, 1, HD)),
@@ -3601,7 +3601,7 @@ the work-group size if needed.
                     auto rcnt_ct2 = rcnt;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class k_route_count_77c552>>(
+                        dpct_kernel_name<class k_route_count_3d7030>>(
                         sycl::nd_range<3>(sycl::range(1, 1, grid1(n_ent)) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -3621,7 +3621,7 @@ the work-group size if needed.
                     auto rmax_ct4 = rmax;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class k_route_scan_e93ad1>>(
+                        dpct_kernel_name<class k_route_scan_d0ad4d>>(
                         sycl::nd_range<3>(sycl::range(1, 1, 32),
                                           sycl::range(1, 1, 32)),
                         exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -3642,7 +3642,7 @@ the work-group size if needed.
                     auto rinv_ct6 = rinv;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class k_route_scatter_d86a67>>(
+                        dpct_kernel_name<class k_route_scatter_772af5>>(
                         sycl::nd_range<3>(sycl::range(1, 1, grid1(n_ent)) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -3705,7 +3705,7 @@ the work-group size if needed.
                 auto x16_ct1 = x16;
                 auto int64_t_N_T_ct2 = (int64_t)N * T;
 
-                cgh.parallel_for<dpct_kernel_name<class k_to_f16_2af0b7>>(
+                cgh.parallel_for<dpct_kernel_name<class k_to_f16_8a5f55>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid1((int64_t)N * T)) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3734,7 +3734,7 @@ the work-group size if needed.
                     auto shh_ct2 = shh;
                     auto int64_t_T_FS_ct3 = (int64_t)T * FS;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_swiglu_2a6085>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_swiglu_9e0a47>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, grid1((int64_t)T * FS)) *
                                 sycl::range(1, 1, kThreads),
@@ -3779,7 +3779,7 @@ the work-group size if needed.
                 const float *d_img_ct1 = d_img;
                 const int32_t *d_map_ct2 = d_map;
 
-                cgh.parallel_for<dpct_kernel_name<class k_put_rows_f5086d>>(
+                cgh.parallel_for<dpct_kernel_name<class k_put_rows_7fb4fa>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3798,7 +3798,7 @@ the work-group size if needed.
                 auto h_ct2 = h;
                 auto m_eps_ct4 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_b16aca>>(
+                cgh.parallel_for<dpct_kernel_name<class k_rms_5b3a72>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3827,7 +3827,7 @@ the work-group size if needed.
                 auto amv_ct3 = amv;
                 auto ami_ct4 = ami;
 
-                cgh.parallel_for<dpct_kernel_name<class k_argmax_a76bf5>>(
+                cgh.parallel_for<dpct_kernel_name<class k_argmax_6b9674>>(
                     sycl::nd_range<3>(sycl::range(1, n, kArgBlocks) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3846,7 +3846,7 @@ the work-group size if needed.
                 auto amv_ct3 = amv;
                 auto ami_ct4 = ami;
 
-                cgh.parallel_for<dpct_kernel_name<class k_argmax_417804>>(
+                cgh.parallel_for<dpct_kernel_name<class k_argmax_32b450>>(
                     sycl::nd_range<3>(sycl::range(1, n, 1) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3892,7 +3892,7 @@ the work-group size if needed.
                 auto amv_ct3 = amv;
                 auto ami_ct4 = ami;
 
-                cgh.parallel_for<dpct_kernel_name<class k_argmax_1590a8>>(
+                cgh.parallel_for<dpct_kernel_name<class k_argmax_bba135>>(
                     sycl::nd_range<3>(sycl::range(1, 1, kArgBlocks) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3913,7 +3913,7 @@ the work-group size if needed.
                 auto amv_ct3 = amv;
                 auto ami_ct4 = ami;
 
-                cgh.parallel_for<dpct_kernel_name<class k_argmax_cbf834>>(
+                cgh.parallel_for<dpct_kernel_name<class k_argmax_d92afc>>(
                     sycl::nd_range<3>(sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -3941,7 +3941,7 @@ the work-group size if needed.
                 const float *d_img_ct1 = d_img;
                 const int32_t *d_map_ct2 = d_map;
 
-                cgh.parallel_for<dpct_kernel_name<class k_put_rows_d9e181>>(
+                cgh.parallel_for<dpct_kernel_name<class k_put_rows_cdd7f7>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3961,7 +3961,7 @@ the work-group size if needed.
                 auto N_ct4 = 2 * N;
                 auto m_eps_ct6 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_68d5b1>>(
+                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_1802ea>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3981,7 +3981,7 @@ the work-group size if needed.
                 auto N_ct4 = 2 * N;
                 auto m_eps_ct6 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_d51ec8>>(
+                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_d0bd2e>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -4002,7 +4002,7 @@ the work-group size if needed.
                 auto h_ct2 = h;
                 auto m_eps_ct4 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_1f836d>>(
+                cgh.parallel_for<dpct_kernel_name<class k_rms_16a6a3>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -4034,7 +4034,7 @@ the work-group size if needed.
                     auto HK_ct5 = 2 * HK;
                     auto m_eps_ct6 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_conv_seq_15178c>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_conv_seq_9b2f25>>(
                         sycl::nd_range<3>(sycl::range(1, 1, C / 128) *
                                               sycl::range(1, 1, 128),
                                           sycl::range(1, 1, 128)),
@@ -4066,7 +4066,7 @@ the work-group size if needed.
                     const float *z_ct5 = z;
                     auto m_eps_ct7 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_gdn_seq_da881a>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_gdn_seq_d90a7b>>(
                         sycl::nd_range<3>(sycl::range(1, 1, HV) *
                                               sycl::range(1, 4, 128),
                                           sycl::range(1, 4, 128)),
@@ -4788,7 +4788,7 @@ the work-group size if needed.
                         const int32_t *d_gcnt_ct12 = d_gcnt;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_conv_seq_d45698>>(
+                            dpct_kernel_name<class k_conv_seq_708bf2>>(
                             sycl::nd_range<3>(sycl::range(1, G, C / 128) *
                                                   sycl::range(1, 1, 128),
                                               sycl::range(1, 1, 128)),
@@ -4827,7 +4827,7 @@ the work-group size if needed.
                         const int32_t *d_gcnt_ct16 = d_gcnt;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_gdn_seq_4ebfca>>(
+                            dpct_kernel_name<class k_gdn_seq_88059c>>(
                             sycl::nd_range<3>(sycl::range(1, G, HV) *
                                                   sycl::range(1, 4, 128),
                                               sycl::range(1, 4, 128)),
@@ -4929,7 +4929,7 @@ the work-group size if needed.
                     auto N_ct4 = 2 * N;
                     auto m_eps_ct6 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_dde534>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_fb0d5e>>(
                         sycl::nd_range<3>(sycl::range(1, 1, T) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -4950,7 +4950,7 @@ the work-group size if needed.
                     auto N_ct4 = 2 * N;
                     auto m_eps_ct6 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_259376>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_c8390c>>(
                         sycl::nd_range<3>(sycl::range(1, 1, T) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -4971,7 +4971,7 @@ the work-group size if needed.
                     auto h_ct2 = h;
                     auto m_eps_ct4 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_rms_1ec95e>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_rms_823057>>(
                         sycl::nd_range<3>(sycl::range(1, 1, T) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -4993,7 +4993,7 @@ the work-group size if needed.
                     auto amv_ct3 = amv;
                     auto ami_ct4 = ami;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_argmax_8d3c07>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_argmax_a04f5e>>(
                         sycl::nd_range<3>(sycl::range(1, T, kArgBlocks) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -5014,7 +5014,7 @@ the work-group size if needed.
                     auto amv_ct3 = amv;
                     auto ami_ct4 = ami;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_argmax_ced836>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_argmax_9332b9>>(
                         sycl::nd_range<3>(sycl::range(1, T, 1) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),

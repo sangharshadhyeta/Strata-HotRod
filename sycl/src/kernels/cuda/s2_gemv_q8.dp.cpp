@@ -115,7 +115,7 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
                     sycl::range(smem), cgh);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class s2_gemv_q8_kernel_b9a814>>(
+                    dpct_kernel_name<class s2_gemv_q8_kernel_a04f4f>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_out) *
                                           sycl::range(1, 1, threads_per_row),
                                       sycl::range(1, 1, threads_per_row)),

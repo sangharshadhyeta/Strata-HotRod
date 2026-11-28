@@ -65,7 +65,7 @@ void s2_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         dpct::get_in_order_queue()
-            .parallel_for<dpct_kernel_name<class s2_gemv_kernel_163eb8>>(
+            .parallel_for<dpct_kernel_name<class s2_gemv_kernel_0aa6e5>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)blocks) *
                                       sycl::range(1, 1, threads),
                                   sycl::range(1, 1, threads)),

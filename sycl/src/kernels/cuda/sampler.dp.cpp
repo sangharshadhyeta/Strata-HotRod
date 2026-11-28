@@ -1843,7 +1843,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                         sycl::range(shmem), cgh);
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class sampler_greedy_kernel_5b2c3f>>(
+                        dpct_kernel_name<class sampler_greedy_kernel_cbb284>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, (unsigned)n_tokens) *
                                 sycl::range(1, 1, gthreads),
@@ -1878,7 +1878,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                     sycl::range(shmem), cgh);
 
-                cgh.parallel_for<dpct_kernel_name<class sampler_kernel_ebb5aa>>(
+                cgh.parallel_for<dpct_kernel_name<class sampler_kernel_97712c>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tokens) *
                                           sycl::range(1, 1, 1024),
                                       sycl::range(1, 1, 1024)),
@@ -1912,7 +1912,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 
                 strata::q_of(stream)
                     ->parallel_for<dpct_kernel_name<
-                        class sampler_split_part_kernel_cc5673>>(
+                        class sampler_split_part_kernel_f9aaa3>>(
                         sycl::nd_range<3>(
                             sycl::range(1, (unsigned)n_tokens,
                                         (unsigned)n_blocks) *
@@ -1933,7 +1933,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 
                 strata::q_of(stream)
                     ->parallel_for<dpct_kernel_name<
-                        class sampler_split_merge_kernel_b17bd4>>(
+                        class sampler_split_merge_kernel_f1fccf>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, (unsigned)n_tokens) *
                                 sycl::range(1, 1, 32),
@@ -1962,7 +1962,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                         sycl::range(shmem), cgh);
 
                     cgh.parallel_for<dpct_kernel_name<
-                        class sampler_one_block_kernel_79fa88>>(
+                        class sampler_one_block_kernel_82b325>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, (unsigned)n_tokens) *
                                 sycl::range(1, 1, 1024),
@@ -2016,7 +2016,7 @@ void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapp
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class coupled_stage_kernel_113245>>(
+            ->parallel_for<dpct_kernel_name<class coupled_stage_kernel_45478a>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -2056,7 +2056,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
                 cgh);
 
             cgh.parallel_for<
-                dpct_kernel_name<class coupled_penalize_kernel_6ca8a2>>(
+                dpct_kernel_name<class coupled_penalize_kernel_f4a555>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1024),
                                   sycl::range(1, 1, 1024)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -2076,7 +2076,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
             sycl::ext::oneapi::experimental::use_root_sync};
 
         s->parallel_for<
-            dpct_kernel_name<class sampler_split_part_kernel_cc5674>>(
+            dpct_kernel_name<class sampler_split_part_kernel_bb7581>>(
             sycl::nd_range<3>(sycl::range(1, 1u, (unsigned)n_blocks) *
                                   sycl::range(1, 1, kSplitWarps * 32),
                               sycl::range(1, 1, kSplitWarps * 32)),
@@ -2093,7 +2093,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
             sycl::ext::oneapi::experimental::use_root_sync};
         sampler_require_fp64(s->get_device());
 
-        s->parallel_for<dpct_kernel_name<class coupled_merge_kernel_1fbeb1>>(
+        s->parallel_for<dpct_kernel_name<class coupled_merge_kernel_9f53b9>>(
             sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
             exp_props,
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
@@ -2125,7 +2125,7 @@ bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const in
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class sampler_split_part_kernel_fb28a3>>(
+                dpct_kernel_name<class sampler_split_part_kernel_ea0eb6>>(
                 sycl::nd_range<3>(
                     sycl::range(1, (unsigned)n_tokens, (unsigned)n_blocks) *
                         sycl::range(1, 1, kSplitWarps * 32),
@@ -2147,7 +2147,7 @@ bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const in
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class spec_verify_merge_kernel_18cb53>>(
+                dpct_kernel_name<class spec_verify_merge_kernel_3fa880>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tokens) *
                                       sycl::range(1, 1, 32),
                                   sycl::range(1, 1, 32)),
@@ -2199,7 +2199,7 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
                 cgh);
 
             cgh.parallel_for<
-                dpct_kernel_name<class coupled_penalize_kernel_6ca8a2>>(
+                dpct_kernel_name<class coupled_penalize_kernel_436bc6>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1024),
                                   sycl::range(1, 1, 1024)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -2217,7 +2217,7 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
             sycl::ext::oneapi::experimental::use_root_sync};
 
         s->parallel_for<
-            dpct_kernel_name<class sampler_split_part_kernel_46d0f5>>(
+            dpct_kernel_name<class sampler_split_part_kernel_737573>>(
             sycl::nd_range<3>(sycl::range(1, 1u, (unsigned)n_blocks) *
                                   sycl::range(1, 1, kSplitWarps * 32),
                               sycl::range(1, 1, kSplitWarps * 32)),
@@ -2239,7 +2239,7 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
                 qrows + (size_t)j * strata::core::kSpecQStride;
 
             cgh.parallel_for<
-                dpct_kernel_name<class spec_draft_merge_kernel_ce1edc>>(
+                dpct_kernel_name<class spec_draft_merge_kernel_4d91e2>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)

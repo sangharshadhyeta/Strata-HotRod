@@ -281,7 +281,7 @@ void cvec_apply(float *R, int64_t layer, int64_t T, int64_t r_ld,
                 auto g_cvec_n_embd_ct6 = (int)g_cvec.n_embd;
                 auto g_cvec_hc_ct7 = (int)g_cvec.hc;
 
-                cgh.parallel_for<dpct_kernel_name<class cvec_kernel_a17328>>(
+                cgh.parallel_for<dpct_kernel_name<class cvec_kernel_9357e5>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
                     exp_props,

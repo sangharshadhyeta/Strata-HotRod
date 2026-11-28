@@ -268,7 +268,7 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
                         tap ? *tap : MoeLearnTap{};
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class combine_k10_vec4_bd48fc>>(
+                        dpct_kernel_name<class combine_k10_vec4_5cdfb7>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, unsigned((n4 + 127) / 128)) *
                                 sycl::range(1, 1, 128),
@@ -297,7 +297,7 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
                 could not be deduced. You need to update this code.
                 */
                 cgh.parallel_for<dpct_kernel_name<
-                    class combine_3ed626,
+                    class combine_a08ba5,
                     dpct_kernel_scalar<false>,
                     dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(
@@ -351,7 +351,7 @@ void native_moe_combine_multi_hits_added(const float* parts, const float* hits, 
                     tap ? *tap : MoeLearnTap{};
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class combine_k10_vec4_hits_982445>>(
+                    dpct_kernel_name<class combine_k10_vec4_hits_524f2d>>(
                     sycl::nd_range<3>(sycl::range(1, (unsigned)n_tok,
                                                   unsigned((n4 + 127) / 128)) *
                                           sycl::range(1, 1, 128),
@@ -405,7 +405,7 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
                         tap ? *tap : MoeLearnTap{};
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class combine_k10_vec4_fa405a>>(
+                        dpct_kernel_name<class combine_k10_vec4_6f5ae7>>(
                         sycl::nd_range<3>(
                             sycl::range(1, (unsigned)n_tok,
                                         unsigned((n4 + 127) / 128)) *
@@ -435,7 +435,7 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
                 could not be deduced. You need to update this code.
                 */
                 cgh.parallel_for<dpct_kernel_name<
-                    class combine_42722c,
+                    class combine_cda8a7,
                     dpct_kernel_scalar<false>,
                     dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(
@@ -484,7 +484,7 @@ void native_moe_combine_multi_hits_gated(const float* hits, const float* weights
                 MoeLearnTap tap_tap_MoeLearnTap_ct7 =
                     tap ? *tap : MoeLearnTap{};
 
-                cgh.parallel_for<dpct_kernel_name<class combine_2f00ac,
+                cgh.parallel_for<dpct_kernel_name<class combine_f5d91a,
                                                   dpct_kernel_scalar<true>,
                                                   dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(
@@ -534,7 +534,7 @@ void native_moe_combine_multi_hits(const float* hits, const float* weights, cons
   deduced. You need to update this code.
   */
             parallel_for<
-                dpct_kernel_name<class combine_a2ddbc, dpct_kernel_scalar<true>,
+                dpct_kernel_name<class combine_47937f, dpct_kernel_scalar<true>,
                                  dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, (unsigned)n_tok,
                                               unsigned((n_embd + 255) / 256)) *

@@ -765,7 +765,7 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
                     sycl::range(smem), cgh);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class router_top10_kernel_3e0655>>(
+                    dpct_kernel_name<class router_top10_kernel_3e7c8a>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tokens) *
                                           sycl::range(1, 1, threads),
                                       sycl::range(1, 1, threads)),

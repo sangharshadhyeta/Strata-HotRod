@@ -144,7 +144,7 @@ void subfit_apply(const SubfitApplyArgs& a, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class k_subfit_apply_327d6a>>(
+            ->parallel_for<dpct_kernel_name<class k_subfit_apply_98d9f4>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)a.n) *
                                       sycl::range(1, 1, kThreads),
                                   sycl::range(1, 1, kThreads)),

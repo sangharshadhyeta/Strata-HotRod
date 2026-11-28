@@ -299,7 +299,7 @@ void ple_history_advance(float* hist, const float* normalized, void* stream) {
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class history_advance_kernel_204159>>(
+                dpct_kernel_name<class history_advance_kernel_ddccee>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (NG_HC_DIM + THREADS - 1) / THREADS) *
                         sycl::range(1, 1, THREADS),
@@ -442,7 +442,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
-                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_e2f600>>(
+                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_8dd315>>(
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -463,7 +463,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
-                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_92a6ef>>(
+                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_b78113>>(
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -493,7 +493,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class to_bf16_kernel_ab93ff>>(
+            st->parallel_for<dpct_kernel_name<class to_bf16_kernel_3f9ef5>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (n_embd + THREADS - 1) / THREADS) *
                         sycl::range(1, 1, THREADS),
@@ -508,7 +508,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
-            st->parallel_for<dpct_kernel_name<class bf16_gemv_kernel_47d04d>>(
+            st->parallel_for<dpct_kernel_name<class bf16_gemv_kernel_4050d4>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (n_embd + THREADS - 1) / THREADS) *
                         sycl::range(1, 1, THREADS),
@@ -537,7 +537,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto sqrtf_float_n_embd_ct4 = 1.0f / sqrtf((float)n_embd);
 
-                cgh.parallel_for<dpct_kernel_name<class gate_kernel_ce83eb>>(
+                cgh.parallel_for<dpct_kernel_name<class gate_kernel_3e9930>>(
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -553,7 +553,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class bcast_kernel_79d1c2>>(
+            st->parallel_for<dpct_kernel_name<class bcast_kernel_bfb420>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (hc_dim + THREADS - 1) / THREADS) *
                         sycl::range(1, 1, THREADS),
@@ -571,7 +571,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
-                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_dda9b4>>(
+                cgh.parallel_for<dpct_kernel_name<class gnorm_kernel_e3ca91>>(
                     sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -592,7 +592,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
                 auto NGRAM_SIZE_ct6 = NGRAM_SIZE;
                 auto NG_HIST_ct7 = NG_HIST;
 
-                cgh.parallel_for<dpct_kernel_name<class conv_kernel_f83a85>>(
+                cgh.parallel_for<dpct_kernel_name<class conv_kernel_7ce5a9>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1, (hc_dim + THREADS - 1) / THREADS) *
                             sycl::range(1, 1, THREADS),
@@ -608,7 +608,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            st->parallel_for<dpct_kernel_name<class add3_kernel_26c4c6>>(
+            st->parallel_for<dpct_kernel_name<class add3_kernel_510b22>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (hc_dim + THREADS - 1) / THREADS) *
                         sycl::range(1, 1, THREADS),

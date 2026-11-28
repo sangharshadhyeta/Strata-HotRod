@@ -28,7 +28,7 @@ void qsa_block_scores_reference(const float* pooled, const float* dead, const fl
                     auto early_ct7 = early;
 
                     cgh.parallel_for<dpct_kernel_name<
-                        class block_scores_multi_kernel_1d7117>>(
+                        class block_scores_multi_kernel_d564eb>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, 256) *
                                 sycl::range(1, 1, SCORE_WARPS * 32),
@@ -64,7 +64,7 @@ void qsa_block_scores_reference(const float* pooled, const float* dead, const fl
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class block_scores_kernel_86943d>>(
+            ->parallel_for<dpct_kernel_name<class block_scores_kernel_e97e46>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, SCORE_WARPS * 32),
                                   sycl::range(1, 1, SCORE_WARPS * 32)),
                 exp_props,

@@ -255,7 +255,7 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
             ->submit([&](sycl::handler &cgh) {
                 auto ct3 = 1.0f / 16.0f;
 
-                cgh.parallel_for<dpct_kernel_name<class fwht256_kernel_d551a1>>(
+                cgh.parallel_for<dpct_kernel_name<class fwht256_kernel_a2d9e5>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)num_blocks) *
                                           sycl::range(1, rows_per_block, 32),
                                       sycl::range(1, rows_per_block, 32)),
@@ -287,7 +287,7 @@ void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table,
                     host ? *host : KvHostPools{};
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class kv_append_q4_kernel_f256b8>>(
+                    dpct_kernel_name<class kv_append_q4_kernel_6a2239>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, 32),
                                       sycl::range(1, 1, 32)),
                     exp_props,
@@ -324,7 +324,7 @@ void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cs->parallel_for<
-            dpct_kernel_name<class kv_append_q4_batch_kernel_11c37a>>(
+            dpct_kernel_name<class kv_append_q4_batch_kernel_ef503e>>(
             sycl::nd_range<3>(grid * sycl::range(1, 1, 32),
                               sycl::range(1, 1, 32)),
             exp_props,
@@ -350,7 +350,7 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* 
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class kv_gather_q4_kernel_300c16>>(
+            ->parallel_for<dpct_kernel_name<class kv_gather_q4_kernel_fff192>>(
                 sycl::nd_range<3>(sycl::range(1, 1, num_blocks) *
                                       sycl::range(1, rows_per_block, 32),
                                   sycl::range(1, rows_per_block, 32)),

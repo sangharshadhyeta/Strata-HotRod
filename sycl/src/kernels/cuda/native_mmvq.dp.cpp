@@ -2161,7 +2161,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
         constexpr int ROWS = 1;   // SYCL port: one row per work-group (more groups: the kernel is latency-bound here)
         const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
         s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_646c3d, F,
+            class native_mmvq_multi_kernel_2af762, F,
             dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<NW>,
             dpct_kernel_scalar<2>>>(
             sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, NW, WARP),
@@ -2201,7 +2201,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
     if (rows1 && n_in / F::DIV >= F::BPI) {
         if (s26_tsum_on()) {
             s->parallel_for<dpct_kernel_name<
-                class native_mmvq_multi_kernel_2a7dda, F,
+                class native_mmvq_multi_kernel_896758, F,
                 dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<WARPS>,
                 dpct_kernel_scalar<1>, dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads, threads),
@@ -2211,7 +2211,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
                 });
         } else {
             s->parallel_for<dpct_kernel_name<
-                class native_mmvq_multi_kernel_23124e, F,
+                class native_mmvq_multi_kernel_b56cb9, F,
                 dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<WARPS>,
                 dpct_kernel_scalar<1>, dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads, threads),
@@ -2226,7 +2226,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
     const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
     if (s26_tsum_on()) {
         s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_279861, F,
+            class native_mmvq_multi_kernel_76d7f9, F,
             dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<WARPS>,
             dpct_kernel_scalar<ROWS>, dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
@@ -2236,7 +2236,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
             });
     } else {
         s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_75e8ad, F, dpct_kernel_scalar<NCOLS>,
+            class native_mmvq_multi_kernel_0fe35e, F, dpct_kernel_scalar<NCOLS>,
             dpct_kernel_scalar<WARPS>, dpct_kernel_scalar<ROWS>,
             dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
@@ -2527,7 +2527,7 @@ void launch_il(const void *weights, const void *x_il, float *y, int n_in,
                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class native_mmvq_il_kernel_86e8fa, I,
+                    class native_mmvq_il_kernel_0af350, I,
                     dpct_kernel_scalar<1>, dpct_kernel_scalar<R>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                           sycl::range(1, 1, 4 * WARP),
@@ -2803,7 +2803,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class native_small_mmvq_kernel_95f41f, Weight,
+                    class native_small_mmvq_kernel_3475e6, Weight,
                     dpct_kernel_scalar<Qi>, dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads,
                                       threads),
@@ -2830,7 +2830,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
 
             cgh.parallel_for<dpct_kernel_name<
-                class native_small_mmvq_kernel_d00fb9, Weight,
+                class native_small_mmvq_kernel_78dfd1, Weight,
                 dpct_kernel_scalar<Qi>, dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                                   threads),
@@ -2996,7 +2996,7 @@ void q8_packed_launch(const Q8Packed &w, const Q81Block *x, float *y,
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
-        s->parallel_for<dpct_kernel_name<class native_q8_0_packed_kernel_851f07,
+        s->parallel_for<dpct_kernel_name<class native_q8_0_packed_kernel_457435,
                                          dpct_kernel_scalar<NCOLS>,
                                          dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
@@ -3017,7 +3017,7 @@ DPCT1050: The template argument of the dpct_kernel_name could not be
 deduced. You need to update this code.
 */
             parallel_for<
-                dpct_kernel_name<class native_q8_0_packed_kernel_56c826,
+                dpct_kernel_name<class native_q8_0_packed_kernel_636aa2,
                                  dpct_kernel_scalar<NCOLS>,
                                  dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
@@ -3200,7 +3200,7 @@ void q6_packed_launch(const Q6Packed &w, const Q81Block *x, float *y,
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
-        s->parallel_for<dpct_kernel_name<class native_q6_k_packed_kernel_ee650b,
+        s->parallel_for<dpct_kernel_name<class native_q6_k_packed_kernel_f81741,
                                          dpct_kernel_scalar<NCOLS>,
                                          dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
@@ -3221,7 +3221,7 @@ DPCT1050: The template argument of the dpct_kernel_name could not be
 deduced. You need to update this code.
 */
             parallel_for<
-                dpct_kernel_name<class native_q6_k_packed_kernel_ca2554,
+                dpct_kernel_name<class native_q6_k_packed_kernel_5c6f26,
                                  dpct_kernel_scalar<NCOLS>,
                                  dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
@@ -3772,7 +3772,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
-                dpct_kernel_name<class native_quantize_q8_1_kernel_b480d2>>(
+                dpct_kernel_name<class native_quantize_q8_1_kernel_447588>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, QUANT_THREADS),
                                   sycl::range(1, 1, QUANT_THREADS)),
@@ -3805,7 +3805,7 @@ void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<
-                class native_swiglu_quantize_q8_1_kernel_85e13e>>(
+                class native_swiglu_quantize_q8_1_kernel_14ce2c>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, QUANT_THREADS),
                                   sycl::range(1, 1, QUANT_THREADS)),
@@ -3851,7 +3851,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
-                dpct_kernel_name<class native_q5_k_mmvq_kernel_b1d5a2,
+                dpct_kernel_name<class native_q5_k_mmvq_kernel_f30647,
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -3870,7 +3870,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
-        s->parallel_for<dpct_kernel_name<class native_q5_k_mmvq_kernel_938b09,
+        s->parallel_for<dpct_kernel_name<class native_q5_k_mmvq_kernel_61edce,
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -4009,7 +4009,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_c7de00,
+            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_bee24f,
                                              dpct_kernel_scalar<1>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, WARPS * WARP),
@@ -4024,7 +4024,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_76dac9,
+            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_fef371,
                                              dpct_kernel_scalar<2>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, WARPS * WARP),
@@ -4039,7 +4039,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_293ed5,
+            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_0d93b8,
                                              dpct_kernel_scalar<3>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, WARPS * WARP),
@@ -4054,7 +4054,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_c08cb5,
+            s->parallel_for<dpct_kernel_name<class q2_0_warp_rows_kernel_834527,
                                              dpct_kernel_scalar<4>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, WARPS * WARP),
@@ -4091,7 +4091,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             s->parallel_for<
-                dpct_kernel_name<class native_q2_0_mmvq_kernel_dec305,
+                dpct_kernel_name<class native_q2_0_mmvq_kernel_efdc30,
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -4109,7 +4109,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        s->parallel_for<dpct_kernel_name<class native_q2_0_mmvq_kernel_ef5f5c,
+        s->parallel_for<dpct_kernel_name<class native_q2_0_mmvq_kernel_655ae2,
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -4164,7 +4164,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             s->parallel_for<
-                dpct_kernel_name<class native_q3_k_mmvq_kernel_208be9,
+                dpct_kernel_name<class native_q3_k_mmvq_kernel_59fbff,
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -4182,7 +4182,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        s->parallel_for<dpct_kernel_name<class native_q3_k_mmvq_kernel_926817,
+        s->parallel_for<dpct_kernel_name<class native_q3_k_mmvq_kernel_b797ef,
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -4243,7 +4243,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class native_iq4_xs_mmvq_kernel_22a688,
+                    dpct_kernel_name<class native_iq4_xs_mmvq_kernel_faf6ff,
                                      dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads,
                                       threads),
@@ -4270,7 +4270,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
 
             cgh.parallel_for<
-                dpct_kernel_name<class native_iq4_xs_mmvq_kernel_3ba00d,
+                dpct_kernel_name<class native_iq4_xs_mmvq_kernel_0775e8,
                                  dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                                   threads),
@@ -4330,7 +4330,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
             s->parallel_for<
-                dpct_kernel_name<class native_q4_k_mmvq_kernel_da128d,
+                dpct_kernel_name<class native_q4_k_mmvq_kernel_f127cc,
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -4349,7 +4349,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
             sycl::ext::oneapi::experimental::use_root_sync};
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
-        s->parallel_for<dpct_kernel_name<class native_q4_k_mmvq_kernel_b29f4f,
+        s->parallel_for<dpct_kernel_name<class native_q4_k_mmvq_kernel_dd03ca,
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -4435,7 +4435,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             s->parallel_for<
-                dpct_kernel_name<class native_q6_k_mmvq_kernel_4d887f,
+                dpct_kernel_name<class native_q6_k_mmvq_kernel_68aa29,
                                  dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
                 exp_props,
@@ -4453,7 +4453,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        s->parallel_for<dpct_kernel_name<class native_q6_k_mmvq_kernel_19484e,
+        s->parallel_for<dpct_kernel_name<class native_q6_k_mmvq_kernel_dc4099,
                                          dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
                               threads),
@@ -4516,7 +4516,7 @@ void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_ab153b, F, dpct_kernel_scalar<NCOLS>,
+            class native_mmvq_multi_kernel_796c92, F, dpct_kernel_scalar<NCOLS>,
             dpct_kernel_scalar<WARPS>, dpct_kernel_scalar<1>,
             dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(2 * n_out)) * threads,
@@ -4538,7 +4538,7 @@ void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
 
         s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_50d9c5, F, dpct_kernel_scalar<NCOLS>,
+            class native_mmvq_multi_kernel_761aa0, F, dpct_kernel_scalar<NCOLS>,
             dpct_kernel_scalar<WARPS>, dpct_kernel_scalar<1>,
             dpct_kernel_scalar<false>, dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(sycl::range(1, 1, unsigned(2 * n_out)) * threads,
@@ -4681,7 +4681,7 @@ void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in,
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
-                dpct_kernel_name<class native_quantize_q8_1_il_kernel_b29322>>(
+                dpct_kernel_name<class native_quantize_q8_1_il_kernel_ef187c>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 unsigned((n_total + QUANT_THREADS - 1) /
@@ -4716,7 +4716,7 @@ void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols,
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
-                dpct_kernel_name<class native_q8_1_interleave_kernel_8e6363>>(
+                dpct_kernel_name<class native_q8_1_interleave_kernel_e1e5c4>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, unsigned((n_total + 255) / 256)) *
                         sycl::range(1, 1, 256),

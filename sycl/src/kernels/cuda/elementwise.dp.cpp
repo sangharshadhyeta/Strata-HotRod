@@ -214,7 +214,7 @@ void embedding_gather(const uint8_t* codes, const float* scales, const float* of
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class embedding_gather_kernel_40b387>>(
+                dpct_kernel_name<class embedding_gather_kernel_afbb3f>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n)) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -236,7 +236,7 @@ void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* ga
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_gate_kernel_de22c0>>(
+            ->parallel_for<dpct_kernel_name<class gdn_gate_kernel_fa21c1>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n)) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -255,7 +255,7 @@ void scale_inplace(float* x, int64_t n, float s, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class scale_kernel_501571>>(
+            ->parallel_for<dpct_kernel_name<class scale_kernel_9da0bb>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n)) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -274,7 +274,7 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class add_kernel_95886e>>(
+            ->parallel_for<dpct_kernel_name<class add_kernel_f224b5>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n)) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -293,7 +293,7 @@ void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class to_f16_kernel_ba0968>>(
+            ->parallel_for<dpct_kernel_name<class to_f16_kernel_7828ae>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n)) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -312,7 +312,7 @@ void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class to_bf16_kernel_7b22d1>>(
+            ->parallel_for<dpct_kernel_name<class to_bf16_kernel_5f37e5>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n)) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -334,7 +334,7 @@ void silu_inplace(float* x, int64_t n, void* stream) {
             {sycl::aspect::fp64});
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class silu_kernel_4d1386>>(
+            ->parallel_for<dpct_kernel_name<class silu_kernel_7f270e>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n)) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -402,7 +402,7 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class doorbell_wait_kernel_47b360>>(
+            ->parallel_for<dpct_kernel_name<class doorbell_wait_kernel_387b80>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1), sycl::range(1, 1, 1)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     doorbell_wait_kernel(d_flag, d_seq, spin_max);
@@ -500,7 +500,7 @@ void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t
                 auto width_ct3 = width / 4;
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class scatter_rows_kernel_7d83a1>>(
+                    dpct_kernel_name<class scatter_rows_kernel_f75370>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n) *
                                           sycl::range(1, 1, 128),
                                       sycl::range(1, 1, 128)),
@@ -528,7 +528,7 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
                 auto width_ct2 = width / 4;
 
                 cgh.parallel_for<dpct_kernel_name<
-                    class copy_rows_from_mapped_kernel_9530d4>>(
+                    class copy_rows_from_mapped_kernel_fbb41b>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)rows) *
                                           sycl::range(1, 1, 128),
                                       sycl::range(1, 1, 128)),
@@ -555,7 +555,7 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class copy_from_mapped_kernel_82951a>>(
+                dpct_kernel_name<class copy_from_mapped_kernel_fef721>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -752,7 +752,7 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class doorbell_publish_value_kernel_9bdb22>>(
+                dpct_kernel_name<class doorbell_publish_value_kernel_b2e8a0>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1024),
                                   sycl::range(1, 1, 1024)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -779,7 +779,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class doorbell_publish_kernel_8b5bad>>(
+                dpct_kernel_name<class doorbell_publish_kernel_84feed>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1024),
                                   sycl::range(1, 1, 1024)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -808,7 +808,7 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class doorbell_publish_res_kernel_85b9b3>>(
+                dpct_kernel_name<class doorbell_publish_res_kernel_198038>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1024),
                                   sycl::range(1, 1, 1024)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -901,7 +901,7 @@ void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class copy_from_mapped_multi_kernel_66c71e>>(
+                dpct_kernel_name<class copy_from_mapped_multi_kernel_031038>>(
                 sycl::nd_range<3>(sycl::range(1, (unsigned)n, bx < 1 ? 1 : bx) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -921,7 +921,7 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class copy_i32_from_mapped_kernel_a44acc>>(
+                dpct_kernel_name<class copy_i32_from_mapped_kernel_c89926>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 128),
                                   sycl::range(1, 1, 128)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -946,7 +946,7 @@ void doorbell_ring(uint32_t* d_seq, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class doorbell_ring_kernel_b862a4>>(
+            ->parallel_for<dpct_kernel_name<class doorbell_ring_kernel_9f4f29>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1), sycl::range(1, 1, 1)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     doorbell_ring_kernel(d_seq);
@@ -968,7 +968,7 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class rms_norm_weighted_kernel_b603f5>>(
+                dpct_kernel_name<class rms_norm_weighted_kernel_5e90ea>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                       sycl::range(1, 1, warps_per_block * 32),
                                   sycl::range(1, 1, warps_per_block * 32)),

@@ -276,7 +276,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
             ->submit([&](sycl::handler &cgh) {
                 auto mrope_table_ct12 = mrope_table();
 
-                cgh.parallel_for<dpct_kernel_name<class apply_b955ef,
+                cgh.parallel_for<dpct_kernel_name<class apply_5c80e5,
                                                   dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, threads),
                                       sycl::range(1, 1, threads)),
@@ -301,7 +301,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
             ->submit([&](sycl::handler &cgh) {
                 auto mrope_table_ct12 = mrope_table();
 
-                cgh.parallel_for<dpct_kernel_name<class apply_b955ef,
+                cgh.parallel_for<dpct_kernel_name<class apply_5f3316,
                                                   dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(grid * sycl::range(1, 1, threads),
                                       sycl::range(1, 1, threads)),
@@ -358,7 +358,7 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
             ->submit([&](sycl::handler &cgh) {
                 auto mrope_table_ct14 = mrope_table();
 
-                cgh.parallel_for<dpct_kernel_name<class norm_rope_kernel_c8b2b8,
+                cgh.parallel_for<dpct_kernel_name<class norm_rope_kernel_64a4b0,
                                                   dpct_kernel_scalar<true>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, unsigned(rows)) *
                                           sycl::range(1, 1, 256),
@@ -381,7 +381,7 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
             ->submit([&](sycl::handler &cgh) {
                 auto mrope_table_ct14 = mrope_table();
 
-                cgh.parallel_for<dpct_kernel_name<class norm_rope_kernel_f9c8ef,
+                cgh.parallel_for<dpct_kernel_name<class norm_rope_kernel_b05d57,
                                                   dpct_kernel_scalar<false>>>(
                     sycl::nd_range<3>(sycl::range(1, 1, unsigned(rows)) *
                                           sycl::range(1, 1, 256),

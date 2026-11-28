@@ -419,7 +419,7 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
                 parallel_for<dpct_kernel_name<
-                    class bf16_f32_mmvf_rows_kernel_ff3610,
+                    class bf16_f32_mmvf_rows_kernel_4a1555,
                     dpct_kernel_scalar<B>, dpct_kernel_scalar<4>,
                     dpct_kernel_scalar<RPB>, dpct_kernel_scalar<true>,
                     dpct_kernel_scalar<false>>>(
@@ -447,7 +447,7 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
                 parallel_for<dpct_kernel_name<
-                    class bf16_f32_mmvf_rows_kernel_1b1bb5,
+                    class bf16_f32_mmvf_rows_kernel_87e500,
                     dpct_kernel_scalar<B>, dpct_kernel_scalar<8>,
                     dpct_kernel_scalar<RPB>, dpct_kernel_scalar<true>,
                     dpct_kernel_scalar<false>>>(
@@ -477,7 +477,7 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
             parallel_for<dpct_kernel_name<
-                class bf16_f32_mmvf_rows_kernel_7ff80d, dpct_kernel_scalar<B>,
+                class bf16_f32_mmvf_rows_kernel_5ba542, dpct_kernel_scalar<B>,
                 dpct_kernel_scalar<4>, dpct_kernel_scalar<RPB>,
                 dpct_kernel_scalar<false>,
                 dpct_kernel_scalar<false>>>(
@@ -504,7 +504,7 @@ the work-group size if needed.
   deduced. You need to update this code.
   */
             parallel_for<dpct_kernel_name<
-                class bf16_f32_mmvf_rows_kernel_13db68, dpct_kernel_scalar<B>,
+                class bf16_f32_mmvf_rows_kernel_a5f13f, dpct_kernel_scalar<B>,
                 dpct_kernel_scalar<8>, dpct_kernel_scalar<RPB>,
                 dpct_kernel_scalar<false>,
                 dpct_kernel_scalar<false>>>(

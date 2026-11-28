@@ -119,7 +119,7 @@ void subfit_shadow_xi(const int32_t* ids, const float* mixed0, const int32_t* ga
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class k_shadow_xi_836113>>(
+            ->parallel_for<dpct_kernel_name<class k_shadow_xi_cc0df2>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks < 1 ? 1 : blocks) *
                                       sycl::range(1, 1, kThreads),
                                   sycl::range(1, 1, kThreads)),
@@ -136,7 +136,7 @@ void subfit_shadow_y(const float* parts, const int32_t* gate, int layer, int64_t
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class k_shadow_y_31dd47>>(
+            ->parallel_for<dpct_kernel_name<class k_shadow_y_1f5fc8>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)(blocks < 1 ? 1 : blocks)) *
                         sycl::range(1, 1, kThreads),
@@ -157,7 +157,7 @@ void subfit_capture_x(const float* mixed, const int32_t* rec, const int32_t* gat
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class k_capture_x_b68be5>>(
+            ->parallel_for<dpct_kernel_name<class k_capture_x_01946d>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, kThreads),
                                   sycl::range(1, 1, kThreads)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -172,7 +172,7 @@ void subfit_probe_pre(const int32_t* ids, const int32_t* rec, const int32_t* gat
         sycl::ext::oneapi::experimental::use_root_sync};
 
     ((sycl::queue *)(strata::q_of(stream)))
-        ->parallel_for<dpct_kernel_name<class k_probe_pre_decc41>>(
+        ->parallel_for<dpct_kernel_name<class k_probe_pre_3fa99f>>(
             sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {
                 k_probe_pre(ids, rec, gate, layer, K, pre, clean, flag);
@@ -186,7 +186,7 @@ void subfit_probe_post(const int32_t* ids, const float* w, const int32_t* res, c
         sycl::ext::oneapi::experimental::use_root_sync};
 
     ((sycl::queue *)(strata::q_of(stream)))
-        ->parallel_for<dpct_kernel_name<class k_probe_post_7c80ae>>(
+        ->parallel_for<dpct_kernel_name<class k_probe_post_632f11>>(
             sycl::nd_range<3>(sycl::range(1, 1, kThreads),
                               sycl::range(1, 1, kThreads)),
             exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -202,7 +202,7 @@ void subfit_probe_y(const float* parts, const int32_t* gate, int64_t K_N, float*
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class k_probe_y_c85d62>>(
+            ->parallel_for<dpct_kernel_name<class k_probe_y_96730e>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)(blocks < 1 ? 1 : blocks)) *
                         sycl::range(1, 1, kThreads),

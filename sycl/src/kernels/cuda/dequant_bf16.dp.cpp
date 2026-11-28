@@ -269,7 +269,7 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
             auto ld_ct5 = ld;                                                  \
             auto out_ct6 = out;                                                \
                                                                                \
-            cgh.parallel_for<dpct_kernel_name<class dequant_kernel_ec9311,     \
+            cgh.parallel_for<dpct_kernel_name<class dequant_kernel_050109,     \
                                               dpct_kernel_scalar<TY>, T,       \
                                               dpct_kernel_scalar<true>>>(      \
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *                    \
@@ -294,7 +294,7 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
             auto ld_ct5 = ld;                                                  \
             auto out_ct6 = out;                                                \
                                                                                \
-            cgh.parallel_for<dpct_kernel_name<class dequant_kernel_ec9311,     \
+            cgh.parallel_for<dpct_kernel_name<class dequant_kernel_104662,     \
                                               dpct_kernel_scalar<TY>, T,       \
                                               dpct_kernel_scalar<false>>>(     \
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *                    \

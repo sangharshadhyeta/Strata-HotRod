@@ -504,7 +504,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
-            st->parallel_for<dpct_kernel_name<class gr_norm_kernel_588e81,
+            st->parallel_for<dpct_kernel_name<class gr_norm_kernel_66c47c,
                                               dpct_kernel_scalar<true>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                       sycl::range(1, 1, THREADS),
@@ -521,7 +521,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             st->parallel_for<
-                dpct_kernel_name<class gr_down_kernel_6ff92b, float>>(
+                dpct_kernel_name<class gr_down_kernel_1672af, float>>(
                 sycl::nd_range<3>(sycl::range(1, 1, hc_lr) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -537,7 +537,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             st->parallel_for<
-                dpct_kernel_name<class gr_gate_kernel_abf73c, float>>(
+                dpct_kernel_name<class gr_gate_kernel_8fa095, float>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (hc_dim + WARPS - 1) / WARPS) *
                         sycl::range(1, 1, THREADS),
@@ -556,7 +556,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
             dpct::has_capability_or_fail(st->get_device(),
                                          {sycl::aspect::fp64});
 
-            st->parallel_for<dpct_kernel_name<class gr_norm_kernel_70bea5,
+            st->parallel_for<dpct_kernel_name<class gr_norm_kernel_07653f,
                                               dpct_kernel_scalar<false>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, hc) *
                                       sycl::range(1, 1, THREADS),
@@ -573,7 +573,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             st->parallel_for<
-                dpct_kernel_name<class gr_down_kernel_518fbb, uint16_t>>(
+                dpct_kernel_name<class gr_down_kernel_fa1165, uint16_t>>(
                 sycl::nd_range<3>(sycl::range(1, 1, hc_lr) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -589,7 +589,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             st->parallel_for<
-                dpct_kernel_name<class gr_gate_kernel_feafeb, uint16_t>>(
+                dpct_kernel_name<class gr_gate_kernel_631941, uint16_t>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (hc_dim + WARPS - 1) / WARPS) *
                         sycl::range(1, 1, THREADS),
@@ -607,7 +607,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class gr_mean_kernel_f4c4e8>>(
+        st->parallel_for<dpct_kernel_name<class gr_mean_kernel_e96070>>(
             sycl::nd_range<3>(
                 sycl::range(1, 1, (n_embd + THREADS - 1) / THREADS) *
                     sycl::range(1, 1, THREADS),
@@ -634,7 +634,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             st->parallel_for<
-                dpct_kernel_name<class gr_inject_kernel_569ce0, float>>(
+                dpct_kernel_name<class gr_inject_kernel_48375a, float>>(
                 sycl::nd_range<3>(sycl::range(1, 1, nthreads),
                                   sycl::range(1, 1, nthreads)),
                 exp_props,
@@ -655,7 +655,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             st->parallel_for<
-                dpct_kernel_name<class gr_inject_kernel_d9aa02, uint16_t>>(
+                dpct_kernel_name<class gr_inject_kernel_478ad8, uint16_t>>(
                 sycl::nd_range<3>(sycl::range(1, 1, nthreads),
                                   sycl::range(1, 1, nthreads)),
                 exp_props,
@@ -758,7 +758,7 @@ void gr_write(const float *R, const float *block_out, const float *inject,
                     sycl::range((size_t)s.hc * sizeof(float)), cgh);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class gr_write_kernel_bd7975>>(
+                    dpct_kernel_name<class gr_write_kernel_1f2596>>(
                     sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),

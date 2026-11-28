@@ -294,7 +294,7 @@ void native_qsa_score(const float* pooled,const float* query,const float* bias,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class score_kernel_59cd1b>>(
+            ->parallel_for<dpct_kernel_name<class score_kernel_3f686d>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 unsigned((max_blocks + ROWS - 1) / ROWS)) *

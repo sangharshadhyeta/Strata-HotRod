@@ -878,7 +878,7 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
                     host ? *host : KvHostPools{};
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class kv_append_kernel_19f129>>(
+                    dpct_kernel_name<class kv_append_kernel_36128e>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid_for(n, THREADS)) *
                                           sycl::range(1, 1, THREADS),
                                       sycl::range(1, 1, THREADS)),
@@ -915,7 +915,7 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
             {sycl::aspect::fp64});
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class qsa_index_kernel_bb65cd>>(
+            ->parallel_for<dpct_kernel_name<class qsa_index_kernel_2e3786>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)max_blocks) *
                                       sycl::range(1, 1, threads),
                                   sycl::range(1, 1, threads)),
@@ -950,7 +950,7 @@ void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, co
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class topk_kernel_97d5c9>>(
+            ->parallel_for<dpct_kernel_name<class topk_kernel_c24d03>>(
                 sycl::nd_range<3>(sycl::range(1, 1, TOPK_THREADS),
                                   sycl::range(1, 1, TOPK_THREADS)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -975,7 +975,7 @@ void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class kv_gather_kernel_3473e7>>(
+            ->parallel_for<dpct_kernel_name<class kv_gather_kernel_62ec24>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(total, 256)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -1050,7 +1050,7 @@ void qsa_attend_step(const float *q, const uint16_t *k_scratch,
                     sycl::range(smem), cgh);
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class qsa_attend_kernel_6a355d>>(
+                    dpct_kernel_name<class qsa_attend_kernel_b7ca80>>(
                     sycl::nd_range<3>(
                         sycl::range(1, 1, (unsigned)s.n_head) *
                             sycl::range(1, 1, (unsigned)s.head_dim),
@@ -1138,7 +1138,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
                 auto mrope_table_ct14 = mrope_table();
 
                 cgh.parallel_for<
-                    dpct_kernel_name<class indexer_key_append_kernel_9e74e0>>(
+                    dpct_kernel_name<class indexer_key_append_kernel_5af0cf>>(
                     sycl::nd_range<3>(sycl::range(1, 1, threads),
                                       sycl::range(1, 1, threads)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -1236,7 +1236,7 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class qsa_gate_apply_f32_kernel_7cff4f>>(
+                dpct_kernel_name<class qsa_gate_apply_f32_kernel_1d38d7>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n, 256)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
@@ -1261,7 +1261,7 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class qsa_gate_apply_kernel_650dec>>(
+                dpct_kernel_name<class qsa_gate_apply_kernel_6ebf83>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n, 256)) *
                                       sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),

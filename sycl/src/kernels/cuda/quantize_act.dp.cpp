@@ -319,7 +319,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
             {sycl::aspect::fp64});
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class quantize_q8_0_kernel_5451b9>>(
+            ->parallel_for<dpct_kernel_name<class quantize_q8_0_kernel_8a085a>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                       sycl::range(1, 1, threads),
                                   sycl::range(1, 1, threads)),
@@ -363,7 +363,7 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class quantize_q8_0_scaled_kernel_caf6f4>>(
+                dpct_kernel_name<class quantize_q8_0_scaled_kernel_9f5cc5>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                       sycl::range(1, 1, threads),
                                   sycl::range(1, 1, threads)),
@@ -393,7 +393,7 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class dequant_q8_0_kernel_154e61>>(
+            ->parallel_for<dpct_kernel_name<class dequant_q8_0_kernel_b1c847>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                       sycl::range(1, 1, threads),
                                   sycl::range(1, 1, threads)),
@@ -425,7 +425,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class quantize_q8_K_kernel_7aadb2>>(
+            ->parallel_for<dpct_kernel_name<class quantize_q8_K_kernel_f8d468>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                       sycl::range(1, 1, threads),
                                   sycl::range(1, 1, threads)),
@@ -453,7 +453,7 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class dequant_q8_K_kernel_e03426>>(
+            ->parallel_for<dpct_kernel_name<class dequant_q8_K_kernel_3cb99a>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *
                                       sycl::range(1, 1, threads),
                                   sycl::range(1, 1, threads)),

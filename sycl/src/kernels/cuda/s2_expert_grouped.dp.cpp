@@ -785,7 +785,7 @@ void launch_hit_gu(bool fast, const uint8_t *blob_base,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class gu_pair_kernel_787004>>(
+            cs->parallel_for<dpct_kernel_name<class gu_pair_kernel_9d4f4d>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
                         sycl::range(1, 1, THREADS),
@@ -804,7 +804,7 @@ void launch_hit_gu(bool fast, const uint8_t *blob_base,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class gu_kernel_55bc52>>(
+            cs->parallel_for<dpct_kernel_name<class gu_kernel_4846b7>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((rows + warps - 1) / warps)) *
                         sycl::range(1, 1, THREADS),
@@ -832,7 +832,7 @@ void launch_hit_down(bool fast, const uint8_t *blob_base,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class down_pair_kernel_7d15d9>>(
+            cs->parallel_for<dpct_kernel_name<class down_pair_kernel_48ebac>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
                         sycl::range(1, 1, THREADS),
@@ -851,7 +851,7 @@ void launch_hit_down(bool fast, const uint8_t *blob_base,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class down_kernel_b3587f>>(
+            cs->parallel_for<dpct_kernel_name<class down_kernel_4f7ca9>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (unsigned)((rows + warps - 1) / warps)) *
                         sycl::range(1, 1, THREADS),
@@ -911,7 +911,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_792534>>(
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_1ea56d>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                       sycl::range(1, 1, THREADS),
                                   sycl::range(1, 1, THREADS)),
@@ -1034,7 +1034,7 @@ void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_exp
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class hit_select_kernel_f87f42>>(
+            ->parallel_for<dpct_kernel_name<class hit_select_kernel_f1b5f2>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
@@ -1068,7 +1068,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_5aa9a9>>(
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_30df99>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((pairs + THREADS - 1) / THREADS)) *
@@ -1098,7 +1098,7 @@ void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class hit_select_multi_kernel_4749ea>>(
+                dpct_kernel_name<class hit_select_multi_kernel_ab22a7>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 128),
                                   sycl::range(1, 1, 128)),
                 exp_props,
@@ -1133,7 +1133,7 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_a0c31a>>(
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_532b1f>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((pairs + THREADS - 1) / THREADS)) *
@@ -1626,7 +1626,7 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
 
         strata::q_of(stream)
             ->parallel_for<
-                dpct_kernel_name<class group_resident_kernel_5c38b8>>(
+                dpct_kernel_name<class group_resident_kernel_8176c3>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 128),
                                   sycl::range(1, 1, 128)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -1646,7 +1646,7 @@ void moe_group_ptr(const int32_t* ids, int n, int k_per_tok, const unsigned long
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class group_ptr_kernel_e4d1d3>>(
+            ->parallel_for<dpct_kernel_name<class group_ptr_kernel_a2b7d2>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 128),
                                   sycl::range(1, 1, 128)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -1677,7 +1677,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             cs->parallel_for<
-                dpct_kernel_name<class gu_grouped_t_kernel_998f94>>(
+                dpct_kernel_name<class gu_grouped_t_kernel_0551c5>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
                 exp_props,
@@ -1691,7 +1691,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class gu_grouped_kernel_c9eb4d>>(
+            cs->parallel_for<dpct_kernel_name<class gu_grouped_kernel_15d493>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
                 exp_props,
@@ -1720,7 +1720,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             cs->parallel_for<dpct_kernel_name<
-                class swiglu_quantize_q8_0_scaled_kernel_1271ea>>(
+                class swiglu_quantize_q8_0_scaled_kernel_523b3d>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((n_blocks + warps - 1) / warps)) *
@@ -1740,7 +1740,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_90849f>>(
+            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_7d2c49>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((pairs + THREADS - 1) / THREADS)) *
@@ -1763,7 +1763,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             cs->parallel_for<
-                dpct_kernel_name<class down_grouped_t_kernel_12b16d>>(
+                dpct_kernel_name<class down_grouped_t_kernel_dc2457>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
                 exp_props,
@@ -1777,7 +1777,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                 sycl::ext::oneapi::experimental::use_root_sync};
 
             cs->parallel_for<
-                dpct_kernel_name<class down_grouped_kernel_ea4417>>(
+                dpct_kernel_name<class down_grouped_kernel_1cac00>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
                 exp_props,
@@ -1802,7 +1802,7 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class add_hits_kernel_50cbcb>>(
+            ->parallel_for<dpct_kernel_name<class add_hits_kernel_b5a6ec>>(
                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
                                   sycl::range(1, 1, 256)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -1841,7 +1841,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
             auto H_ct3 = H / 32;
 
             cgh.parallel_for<
-                dpct_kernel_name<class activation_correction_kernel_ca15a9>>(
+                dpct_kernel_name<class activation_correction_kernel_4c6de1>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (H / 32 + THREADS - 1) / THREADS) *
                         sycl::range(1, 1, THREADS),
@@ -1858,7 +1858,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cs->parallel_for<
-            dpct_kernel_name<class cpu_order_projection_kernel_2fbdd9,
+            dpct_kernel_name<class cpu_order_projection_kernel_2746f5,
                              dpct_kernel_scalar<false>>>(
             sycl::nd_range<3>(
                 sycl::range(1, 1,
@@ -1894,7 +1894,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
             auto int_n_hits_FF_ct1 = (int)n_hits * FF;
 
             cgh.parallel_for<
-                dpct_kernel_name<class cpu_order_swiglu_kernel_4d84ce>>(
+                dpct_kernel_name<class cpu_order_swiglu_kernel_e4b5bf>>(
                 sycl::nd_range<3>(
                     sycl::range(
                         1, 1,
@@ -1915,7 +1915,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
             auto int_n_hits_FF_ct4 = (int)n_hits * (FF / 32);
 
             cgh.parallel_for<
-                dpct_kernel_name<class cpu_order_quantize_kernel_7d1393>>(
+                dpct_kernel_name<class cpu_order_quantize_kernel_31cb53>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1,
                                 (unsigned)((n_hits * (FF / 32) + THREADS - 1) /
@@ -1934,7 +1934,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
             sycl::ext::oneapi::experimental::use_root_sync};
 
         cs->parallel_for<
-            dpct_kernel_name<class cpu_order_projection_kernel_2e007a,
+            dpct_kernel_name<class cpu_order_projection_kernel_a611b6,
                              dpct_kernel_scalar<true>>>(
             sycl::nd_range<3>(
                 sycl::range(1, 1,

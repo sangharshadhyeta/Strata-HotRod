@@ -352,7 +352,7 @@ void native_ple_postops(const float* projected_key, const float* hidden,
         st->submit([&](sycl::handler &cgh) {
             auto std_sqrt_float_N_ct3 = 1.0f / std::sqrt(float(N));
 
-            cgh.parallel_for<dpct_kernel_name<class gate_kernel_f8e4fc>>(
+            cgh.parallel_for<dpct_kernel_name<class gate_kernel_b1fa02>>(
                 sycl::nd_range<3>(sycl::range(1, 1, H) * sycl::range(1, 1, 512),
                                   sycl::range(1, 1, 512)),
                 exp_props,
@@ -367,7 +367,7 @@ void native_ple_postops(const float* projected_key, const float* hidden,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class broadcast_kernel_50d78d>>(
+        st->parallel_for<dpct_kernel_name<class broadcast_kernel_f9d58e>>(
             sycl::nd_range<3>(sycl::range(1, 1, D / 256) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -381,7 +381,7 @@ void native_ple_postops(const float* projected_key, const float* hidden,
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class conv_residual_kernel_6182eb>>(
+        st->parallel_for<dpct_kernel_name<class conv_residual_kernel_ba1f13>>(
             sycl::nd_range<3>(sycl::range(1, 1, D / 256) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -409,7 +409,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class rms_rep_kernel_dde36c>>(
+        st->parallel_for<dpct_kernel_name<class rms_rep_kernel_6172ef>>(
             sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 1024),
                               sycl::range(1, 1, 1024)),
             exp_props,
@@ -426,7 +426,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class rms_rep_kernel_9b5d94>>(
+        st->parallel_for<dpct_kernel_name<class rms_rep_kernel_c130f4>>(
             sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 1024),
                               sycl::range(1, 1, 1024)),
             exp_props,
@@ -446,7 +446,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
         st->submit([&](sycl::handler &cgh) {
             auto std_sqrt_float_N_ct3 = 1.0f / std::sqrt(float(N));
 
-            cgh.parallel_for<dpct_kernel_name<class gate_kernel_558e90>>(
+            cgh.parallel_for<dpct_kernel_name<class gate_kernel_086651>>(
                 sycl::nd_range<3>(sycl::range(1, 1, rows) *
                                       sycl::range(1, 1, 512),
                                   sycl::range(1, 1, 512)),
@@ -462,7 +462,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class broadcast_batch_kernel_24ebaf>>(
+        st->parallel_for<dpct_kernel_name<class broadcast_batch_kernel_20ca8d>>(
             sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -479,7 +479,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class rms_rep_kernel_e4e0bd>>(
+        st->parallel_for<dpct_kernel_name<class rms_rep_kernel_8f6fb2>>(
             sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 1024),
                               sycl::range(1, 1, 1024)),
             exp_props,
@@ -492,7 +492,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
             sycl::ext::oneapi::experimental::use_root_sync};
 
         st->parallel_for<
-            dpct_kernel_name<class conv_residual_batch_kernel_3906fe>>(
+            dpct_kernel_name<class conv_residual_batch_kernel_6a5960>>(
             sycl::nd_range<3>(sycl::range(1, 1, blocks) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
@@ -505,7 +505,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        st->parallel_for<dpct_kernel_name<class history_batch_kernel_8243c6>>(
+        st->parallel_for<dpct_kernel_name<class history_batch_kernel_b2b034>>(
             sycl::nd_range<3>(sycl::range(1, 1, D / 256) *
                                   sycl::range(1, 1, 256),
                               sycl::range(1, 1, 256)),
